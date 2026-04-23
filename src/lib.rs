@@ -36,6 +36,7 @@ pub mod pps;
 pub mod ptl;
 pub mod slice_header;
 pub mod sps;
+pub mod transform;
 pub mod vps;
 
 use oxideav_codec::{CodecInfo, CodecRegistry};
