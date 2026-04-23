@@ -26,6 +26,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod aps;
 pub mod bitreader;
 pub mod decoder;
 pub mod nal;
