@@ -29,6 +29,7 @@
 pub mod bitreader;
 pub mod decoder;
 pub mod nal;
+pub mod pps;
 pub mod ptl;
 pub mod sps;
 pub mod vps;
