@@ -30,6 +30,7 @@ pub mod bitreader;
 pub mod decoder;
 pub mod nal;
 pub mod ptl;
+pub mod sps;
 pub mod vps;
 
 use oxideav_codec::{CodecInfo, CodecRegistry};
