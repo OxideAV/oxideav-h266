@@ -31,6 +31,7 @@ pub mod bitreader;
 pub mod cabac;
 pub mod ctx;
 pub mod decoder;
+pub mod intra;
 pub mod nal;
 pub mod picture_header;
 pub mod pps;

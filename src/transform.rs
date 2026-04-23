@@ -467,6 +467,180 @@ fn apply_matrix<const N: usize>(matrix: &[[i16; N]; N], non_zero_s: usize, x: &[
     y
 }
 
+/// Table 39 — (trTypeHor, trTypeVer) from `mts_idx` (§8.7.4.1).
+pub fn mts_idx_to_tr_types(mts_idx: u8) -> Option<(TrType, TrType)> {
+    let map = |t: u8| match t {
+        0 => Some(TrType::DctII),
+        1 => Some(TrType::DstVII),
+        2 => Some(TrType::DctVIII),
+        _ => None,
+    };
+    match mts_idx {
+        0 => Some((TrType::DctII, TrType::DctII)),
+        1 => Some((map(1)?, map(1)?)),
+        2 => Some((map(2)?, map(1)?)),
+        3 => Some((map(1)?, map(2)?)),
+        4 => Some((map(2)?, map(2)?)),
+        _ => None,
+    }
+}
+
+/// Implicit-MTS kernel selection (eqs. 1167 / 1168 of §8.7.4.1).
+/// Returns `(trTypeHor, trTypeVer)` based purely on TB width / height.
+/// Used when `implicitMtsEnabled == 1 && cu_sbt_flag == 0`.
+pub fn implicit_mts_tr_types(n_tb_w: u32, n_tb_h: u32) -> (TrType, TrType) {
+    let tr_h = if (4..=16).contains(&n_tb_w) {
+        TrType::DstVII
+    } else {
+        TrType::DctII
+    };
+    let tr_v = if (4..=16).contains(&n_tb_h) {
+        TrType::DstVII
+    } else {
+        TrType::DctII
+    };
+    (tr_h, tr_v)
+}
+
+/// Spec-exact clamp helper — CoeffMin / CoeffMax per §7.4.11.9
+/// (Log2TransformRange = 15 with default config, giving
+/// `[-(1<<15), (1<<15)-1]`).
+#[inline]
+fn clip_coeff(v: i32) -> i32 {
+    v.clamp(COEFF_MIN, COEFF_MAX)
+}
+
+/// `CoeffMin` per §7.4.11.9 at `Log2TransformRange = 15`.
+pub const COEFF_MIN: i32 = -(1 << 15);
+/// `CoeffMax` per §7.4.11.9 at `Log2TransformRange = 15`.
+pub const COEFF_MAX: i32 = (1 << 15) - 1;
+
+/// Apply the separable 2D inverse transform (§8.7.4.1) with the spec's
+/// mid-shift of 7 (eq. 1173) and final bdShift (eqs. 1174 / 1175).
+///
+/// Inputs:
+/// * `n_tb_w`, `n_tb_h` — transform-block dimensions (each ∈ {4, 8, 16,
+///   32} for this increment).
+/// * `non_zero_w`, `non_zero_h` — non-zero coefficient ranges (eqs.
+///   1171 / 1172; caller computes from `trType`).
+/// * `tr_type_hor`, `tr_type_ver` — kernel selectors.
+/// * `d` — row-major TB of scaled transform coefficients, length
+///   `n_tb_w * n_tb_h`.
+/// * `bit_depth` — BitDepth of the current component (the spec's
+///   `BitDepth` from §7.4.3.4).
+/// * `log2_transform_range` — spec's `Log2TransformRange` (default 15).
+///
+/// Output: row-major residual array of the same dimensions.
+///
+/// Handles the degenerate `nTbH == 1` / `nTbW == 1` cases per §8.7.4.1
+/// steps 3 / 5.
+pub fn inverse_transform_2d(
+    n_tb_w: usize,
+    n_tb_h: usize,
+    non_zero_w: usize,
+    non_zero_h: usize,
+    tr_type_hor: TrType,
+    tr_type_ver: TrType,
+    d: &[i32],
+    bit_depth: u32,
+    log2_transform_range: u32,
+) -> Result<Vec<i32>> {
+    if d.len() != n_tb_w * n_tb_h {
+        return Err(Error::invalid(format!(
+            "h266 2D xfm: input array length {} != {}x{}",
+            d.len(),
+            n_tb_w,
+            n_tb_h
+        )));
+    }
+    // Step 1 — vertical 1D transform for each non-zero column when
+    // nTbH > 1. Result is `e[x][y]`, held as a row-major
+    // `n_tb_w * n_tb_h` buffer.
+    let e = if n_tb_h > 1 {
+        let mut e = vec![0i32; n_tb_w * n_tb_h];
+        for x in 0..non_zero_w {
+            // Gather d[x][y] for y = 0..non_zero_h - 1.
+            let mut col = vec![0i32; non_zero_h];
+            for y in 0..non_zero_h {
+                col[y] = d[y * n_tb_w + x];
+            }
+            let out = one_d_transform(tr_type_ver, n_tb_h, non_zero_h, &col)?;
+            for y in 0..n_tb_h {
+                e[y * n_tb_w + x] = out[y];
+            }
+        }
+        e
+    } else {
+        // nTbH == 1: e is not used; g[x][0] = d[x][0] per step 3.
+        Vec::new()
+    };
+    // Step 2 — mid-shift of 7 applied to e[x][y] to get g[x][y] (nTbH &
+    // nTbW both > 1). Clip to [CoeffMin, CoeffMax].
+    let g = if n_tb_h > 1 && n_tb_w > 1 {
+        let mut g = vec![0i32; non_zero_w * n_tb_h];
+        for y in 0..n_tb_h {
+            for x in 0..non_zero_w {
+                let e_xy = e[y * n_tb_w + x];
+                g[y * non_zero_w + x] = clip_coeff((e_xy + 64) >> 7);
+            }
+        }
+        g
+    } else if n_tb_h == 1 {
+        // Step 3 — g[x][0] = d[x][0].
+        let mut g = vec![0i32; non_zero_w];
+        for x in 0..non_zero_w {
+            g[x] = d[x];
+        }
+        g
+    } else {
+        // n_tb_w == 1: r[0][y] = e[0][y] per step 5. Put this into g so
+        // the step-4 branch is a no-op.
+        let mut g = vec![0i32; n_tb_h];
+        for y in 0..n_tb_h {
+            g[y] = e[y * n_tb_w];
+        }
+        g
+    };
+    // Step 4 / 5 — horizontal 1D transform per row, or passthrough
+    // when nTbW == 1.
+    let r = if n_tb_w > 1 {
+        let mut r = vec![0i32; n_tb_w * n_tb_h];
+        let stride = if n_tb_h > 1 { non_zero_w } else { non_zero_w };
+        for y in 0..n_tb_h {
+            let row_slice = if n_tb_h > 1 {
+                &g[y * stride..y * stride + stride]
+            } else {
+                // nTbH == 1: single row g[0..non_zero_w].
+                &g[..non_zero_w]
+            };
+            let out = one_d_transform(tr_type_hor, n_tb_w, non_zero_w, row_slice)?;
+            for x in 0..n_tb_w {
+                r[y * n_tb_w + x] = out[x];
+            }
+        }
+        r
+    } else {
+        // nTbW == 1: r[0][y] = e[0][y] — we stored that into g above.
+        let mut r = vec![0i32; n_tb_h];
+        for y in 0..n_tb_h {
+            r[y] = g[y];
+        }
+        r
+    };
+    // Step 6 — bdShift + rounding.
+    let bd_shift = if n_tb_h > 1 && n_tb_w > 1 {
+        5 + log2_transform_range - bit_depth
+    } else {
+        6 + log2_transform_range - bit_depth
+    };
+    let round = 1i32 << (bd_shift - 1);
+    let mut res = vec![0i32; n_tb_w * n_tb_h];
+    for i in 0..(n_tb_w * n_tb_h) {
+        res[i] = (r[i] + round) >> bd_shift;
+    }
+    Ok(res)
+}
+
 /// Apply the 32-point DST-VII using the two 16-column sub-tables
 /// (eqs. 1188 / 1190: rows 0..15 from COL_0_15, rows 16..31 from
 /// COL_16_31, both indexed by `[row][n]` with n=0..15 — i.e. the
@@ -690,5 +864,108 @@ mod tests {
     fn dct_ii_64_is_unsupported() {
         let x = vec![0i32; 64];
         assert!(one_d_transform(TrType::DctII, 64, 64, &x).is_err());
+    }
+
+    /// MTS table 39 lookup. Only index 0 maps (DCT-II, DCT-II); others
+    /// pick DST-VII / DCT-VIII per the spec table.
+    #[test]
+    fn mts_idx_table_39() {
+        assert_eq!(
+            mts_idx_to_tr_types(0),
+            Some((TrType::DctII, TrType::DctII))
+        );
+        assert_eq!(
+            mts_idx_to_tr_types(1),
+            Some((TrType::DstVII, TrType::DstVII))
+        );
+        assert_eq!(
+            mts_idx_to_tr_types(2),
+            Some((TrType::DctVIII, TrType::DstVII))
+        );
+        assert_eq!(
+            mts_idx_to_tr_types(3),
+            Some((TrType::DstVII, TrType::DctVIII))
+        );
+        assert_eq!(
+            mts_idx_to_tr_types(4),
+            Some((TrType::DctVIII, TrType::DctVIII))
+        );
+        assert_eq!(mts_idx_to_tr_types(5), None);
+    }
+
+    /// Implicit MTS picks DST-VII for dimensions in 4..=16 and DCT-II
+    /// otherwise.
+    #[test]
+    fn implicit_mts_dimension_thresholds() {
+        assert_eq!(
+            implicit_mts_tr_types(4, 4),
+            (TrType::DstVII, TrType::DstVII)
+        );
+        assert_eq!(
+            implicit_mts_tr_types(16, 16),
+            (TrType::DstVII, TrType::DstVII)
+        );
+        assert_eq!(
+            implicit_mts_tr_types(32, 32),
+            (TrType::DctII, TrType::DctII)
+        );
+        assert_eq!(
+            implicit_mts_tr_types(16, 32),
+            (TrType::DstVII, TrType::DctII)
+        );
+    }
+
+    /// 2D inverse transform DC round-trip: a single DC coefficient in
+    /// the top-left corner produces a constant residual (up to the
+    /// mid-shift + bdShift rounding). Use DCT-II at N=4 where
+    /// transMatrix[*][0] = 64 so the 1D transforms yield 64*k in every
+    /// row/col, then the composition adds 64 / shift >> 7 and
+    /// 1<<(bdShift-1) / bdShift shifts.
+    #[test]
+    fn inverse_2d_dct_ii_dc_impulse() {
+        // d[0][0] = 100, rest zero. nTbW = nTbH = 4.
+        let mut d = vec![0i32; 16];
+        d[0] = 100;
+        // bitDepth = 10, Log2TransformRange = 15.
+        let res = inverse_transform_2d(
+            4,
+            4,
+            1, // non_zero_w: only DC column has non-zero
+            1, // non_zero_h: only DC row has non-zero
+            TrType::DctII,
+            TrType::DctII,
+            &d,
+            10,
+            15,
+        )
+        .unwrap();
+        // Manual derivation:
+        //   Step 1: vertical DCT-II on column x=0 with y=0..0. nonZeroH=1, nTbH=4.
+        //     e[x=0][y] = DCT_II[y][0] * d[0][0] = 64 * 100 = 6400 for y=0..3.
+        //   Step 2: g[0][y] = ((6400 + 64) >> 7) = (6464 >> 7) = 50.
+        //   Step 4: horizontal DCT-II on row y with g[0..0][y] (nonZeroW=1).
+        //     r[x][y] = DCT_II[x][0] * g[0][y] = 64 * 50 = 3200 for x=0..3.
+        //   Step 6: bdShift = 5 + 15 - 10 = 10; round = 512.
+        //     res[x][y] = (3200 + 512) >> 10 = 3712 >> 10 = 3.
+        for v in &res {
+            assert_eq!(*v, 3);
+        }
+    }
+
+    #[test]
+    fn inverse_2d_rejects_bad_input() {
+        let d = vec![0i32; 10]; // wrong size for 4x4
+        assert!(inverse_transform_2d(
+            4,
+            4,
+            4,
+            4,
+            TrType::DctII,
+            TrType::DctII,
+            &d,
+            10,
+            15
+        )
+        .is_err());
     }
 }
