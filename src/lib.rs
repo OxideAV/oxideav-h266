@@ -30,8 +30,10 @@ pub mod aps;
 pub mod bitreader;
 pub mod decoder;
 pub mod nal;
+pub mod picture_header;
 pub mod pps;
 pub mod ptl;
+pub mod slice_header;
 pub mod sps;
 pub mod vps;
 
