@@ -28,6 +28,7 @@
 
 pub mod aps;
 pub mod bitreader;
+pub mod cabac;
 pub mod decoder;
 pub mod nal;
 pub mod picture_header;
