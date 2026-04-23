@@ -1,0 +1,19 @@
+[package]
+name = "oxideav-h266"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-h266"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust H.266 / VVC (ITU-T H.266 | ISO/IEC 23090-3) bitstream parser + decoder scaffold for oxideav"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-h266"
+keywords = ["multimedia", "video", "h266", "vvc", "codec"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
+oxideav-pixfmt = "0.1"
