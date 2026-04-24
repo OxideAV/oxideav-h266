@@ -27,6 +27,11 @@
 //! * `last_sig_coeff_x_prefix` — Table 120 (69 ctxIdx).
 //! * `last_sig_coeff_y_prefix` — Table 121 (69 ctxIdx).
 //! * `tu_y_coded_flag` — Table 112 (12 ctxIdx).
+//! * `tu_cb_coded_flag` — Table 113 (6 ctxIdx).
+//! * `tu_cr_coded_flag` — Table 114 (9 ctxIdx).
+//! * `cu_qp_delta_abs` — Table 115 (6 ctxIdx).
+//! * `cu_chroma_qp_offset_flag` — Table 116 (3 ctxIdx).
+//! * `cu_chroma_qp_offset_idx` — Table 117 (3 ctxIdx).
 //! * `par_level_flag` — Table 124 (99 ctxIdx).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
@@ -53,6 +58,11 @@ pub enum SyntaxCtx {
     LastSigCoeffXPrefix,
     LastSigCoeffYPrefix,
     TuYCodedFlag,
+    TuCbCodedFlag,
+    TuCrCodedFlag,
+    CuQpDeltaAbs,
+    CuChromaQpOffsetFlag,
+    CuChromaQpOffsetIdx,
     ParLevelFlag,
 }
 
@@ -107,6 +117,26 @@ pub const INTRA_CHROMA_PRED_MODE_SHIFT: &[u8] = &[5, 5, 5];
 /// Table 112 — `tu_y_coded_flag` (12 ctxIdx).
 pub const TU_Y_CODED_FLAG_INIT: &[u8] = &[15, 12, 5, 7, 23, 5, 20, 7, 15, 6, 5, 14];
 pub const TU_Y_CODED_FLAG_SHIFT: &[u8] = &[5, 1, 8, 9, 5, 1, 8, 9, 5, 1, 8, 9];
+
+/// Table 113 — `tu_cb_coded_flag` (6 ctxIdx).
+pub const TU_CB_CODED_FLAG_INIT: &[u8] = &[12, 21, 25, 28, 25, 37];
+pub const TU_CB_CODED_FLAG_SHIFT: &[u8] = &[5, 0, 5, 0, 5, 0];
+
+/// Table 114 — `tu_cr_coded_flag` (9 ctxIdx).
+pub const TU_CR_CODED_FLAG_INIT: &[u8] = &[33, 28, 36, 25, 29, 45, 9, 36, 45];
+pub const TU_CR_CODED_FLAG_SHIFT: &[u8] = &[2, 1, 0, 2, 1, 0, 2, 1, 0];
+
+/// Table 115 — `cu_qp_delta_abs` (6 ctxIdx).
+pub const CU_QP_DELTA_ABS_INIT: &[u8] = &[35, 35, 35, 35, 35, 35];
+pub const CU_QP_DELTA_ABS_SHIFT: &[u8] = &[8, 8, 8, 8, 8, 8];
+
+/// Table 116 — `cu_chroma_qp_offset_flag` (3 ctxIdx).
+pub const CU_CHROMA_QP_OFFSET_FLAG_INIT: &[u8] = &[35, 35, 35];
+pub const CU_CHROMA_QP_OFFSET_FLAG_SHIFT: &[u8] = &[8, 8, 8];
+
+/// Table 117 — `cu_chroma_qp_offset_idx` (3 ctxIdx).
+pub const CU_CHROMA_QP_OFFSET_IDX_INIT: &[u8] = &[35, 35, 35];
+pub const CU_CHROMA_QP_OFFSET_IDX_SHIFT: &[u8] = &[8, 8, 8];
 
 /// Table 120 — `last_sig_coeff_x_prefix` (69 ctxIdx).
 pub const LAST_SIG_X_PREFIX_INIT: &[u8] = &[
@@ -247,6 +277,16 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::LastSigCoeffXPrefix => (LAST_SIG_X_PREFIX_INIT, LAST_SIG_X_PREFIX_SHIFT),
         SyntaxCtx::LastSigCoeffYPrefix => (LAST_SIG_Y_PREFIX_INIT, LAST_SIG_Y_PREFIX_SHIFT),
         SyntaxCtx::TuYCodedFlag => (TU_Y_CODED_FLAG_INIT, TU_Y_CODED_FLAG_SHIFT),
+        SyntaxCtx::TuCbCodedFlag => (TU_CB_CODED_FLAG_INIT, TU_CB_CODED_FLAG_SHIFT),
+        SyntaxCtx::TuCrCodedFlag => (TU_CR_CODED_FLAG_INIT, TU_CR_CODED_FLAG_SHIFT),
+        SyntaxCtx::CuQpDeltaAbs => (CU_QP_DELTA_ABS_INIT, CU_QP_DELTA_ABS_SHIFT),
+        SyntaxCtx::CuChromaQpOffsetFlag => (
+            CU_CHROMA_QP_OFFSET_FLAG_INIT,
+            CU_CHROMA_QP_OFFSET_FLAG_SHIFT,
+        ),
+        SyntaxCtx::CuChromaQpOffsetIdx => {
+            (CU_CHROMA_QP_OFFSET_IDX_INIT, CU_CHROMA_QP_OFFSET_IDX_SHIFT)
+        }
         SyntaxCtx::ParLevelFlag => (PAR_LEVEL_FLAG_INIT, PAR_LEVEL_FLAG_SHIFT),
     };
     let n = init.len().min(shift.len());
@@ -293,6 +333,11 @@ mod tests {
             SyntaxCtx::LastSigCoeffXPrefix,
             SyntaxCtx::LastSigCoeffYPrefix,
             SyntaxCtx::TuYCodedFlag,
+            SyntaxCtx::TuCbCodedFlag,
+            SyntaxCtx::TuCrCodedFlag,
+            SyntaxCtx::CuQpDeltaAbs,
+            SyntaxCtx::CuChromaQpOffsetFlag,
+            SyntaxCtx::CuChromaQpOffsetIdx,
             SyntaxCtx::ParLevelFlag,
         ] {
             let (i, s) = table_for(kind);

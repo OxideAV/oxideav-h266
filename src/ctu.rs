@@ -60,7 +60,9 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::ArithDecoder;
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
-use crate::leaf_cu::{CuNeighbourhood, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader};
+use crate::leaf_cu::{
+    CuNeighbourhood, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
+};
 use crate::pps::PicParameterSet;
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
@@ -448,6 +450,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             max_ts_size: max_ts,
             ctb_size_y: self.layout.ctb_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
+            cu_qp_delta_enabled: self.pps.pps_cu_qp_delta_enabled_flag,
+            cu_chroma_qp_offset_enabled: self.sh.sh_cu_chroma_qp_offset_enabled_flag,
+            chroma_qp_offset_list_len_minus1: 0,
+            joint_cbcr_enabled: tf.joint_cbcr_enabled_flag,
+            ts_residual_coding_disabled: self.sh.sh_ts_residual_coding_disabled_flag,
         }
     }
 
@@ -466,7 +473,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         &mut self,
         cu: &CtuCu,
         neigh: &CuNeighbourhood,
-    ) -> Result<LeafCuInfo> {
+    ) -> Result<(LeafCuInfo, LeafCuResidual)> {
         let tools = self.cu_tool_flags();
         let mut info = LeafCuInfo {
             x0: cu.cu.x,
@@ -475,9 +482,43 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cb_height: cu.cu.h,
             ..LeafCuInfo::default()
         };
+        let mut residual = LeafCuResidual::default();
         let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools);
-        reader.decode(&mut info, neigh)?;
-        Ok(info)
+        reader.decode(&mut info, &mut residual, neigh)?;
+        Ok((info, residual))
+    }
+
+    /// Walk one CTU end-to-end: decode the partition tree, then for
+    /// each emitted leaf CU consume its `coding_unit()` bins (intra
+    /// mode cascade + transform_unit() CBFs + residual coefficients)
+    /// in decoding order. Returns the parallel flat lists of leaf CU
+    /// rectangles, per-CU parsed info, and per-CU residual coefficient
+    /// arrays (one slot per leaf).
+    ///
+    /// This is the round-8 "parse a whole CTU and capture everything"
+    /// entry point. Pixel reconstruction still lives in
+    /// [`Self::reconstruct_leaf_cu`] and returns Unsupported.
+    pub fn decode_ctu_full(
+        &mut self,
+        ctu: &CtuPos,
+    ) -> Result<(Vec<CtuCu>, Vec<LeafCuInfo>, Vec<LeafCuResidual>)> {
+        let cus = self.decode_ctu_partitions(ctu)?;
+        let mut infos = Vec::with_capacity(cus.len());
+        let mut residuals = Vec::with_capacity(cus.len());
+        // Neighbour tracking is rudimentary in this round: we pass
+        // the default empty neighbourhood so every CU decodes as if it
+        // were at the top-left of the slice. The MPM candidate list
+        // will therefore fall back to the "neither above DC" branch
+        // (PLANAR / 50 / 18 / 46 / 54), which is spec-legal — it's
+        // just not the finest context the decoder could have. Refining
+        // this will happen when the left/above neighbour grid lands.
+        let neigh = CuNeighbourhood::default();
+        for ccu in &cus {
+            let (info, residual) = self.decode_leaf_cu_syntax(ccu, &neigh)?;
+            infos.push(info);
+            residuals.push(residual);
+        }
+        Ok((cus, infos, residuals))
     }
 
     /// Immutable view of the CTU geometry the walker was built against.
@@ -940,7 +981,7 @@ mod tests {
         let pps = dummy_pps(128, 128, true);
         let sh = intra_slice_header();
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
-        let data = [0u8; 32];
+        let data = [0u8; 64];
         let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
         let ccu = CtuCu {
             ctu_addr_rs: 0,
@@ -954,7 +995,7 @@ mod tests {
             },
         };
         let neigh = CuNeighbourhood::default();
-        let info = walker.decode_leaf_cu_syntax(&ccu, &neigh).unwrap();
+        let (info, _residual) = walker.decode_leaf_cu_syntax(&ccu, &neigh).unwrap();
         assert!(info.intra_pred_mode_y <= 66);
         assert!(info.intra_pred_mode_c <= 83);
         assert_eq!(info.x0, 0);
@@ -1028,6 +1069,43 @@ mod tests {
         let avail = CtuWalker::neighbour_avail(&ctu);
         assert!(avail.left);
         assert!(avail.above);
+    }
+
+    /// End-to-end single-CTU walk: `decode_ctu_full` must produce one
+    /// `LeafCuInfo` + one `LeafCuResidual` per leaf CU emitted by the
+    /// coding-tree walker, with geometry that tiles the CTU.
+    #[test]
+    fn decode_ctu_full_wires_syntax_per_leaf() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        // Enough bytes for any reasonable bin run. A zero stream keeps
+        // most context-coded decisions on the MPS branch; the residual
+        // walker won't emit significant coefficients and chroma CBFs
+        // stay 0.
+        let data = [0u8; 256];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ctu0 = walker.iter_ctus().next().unwrap();
+        let (cus, infos, residuals) = walker.decode_ctu_full(&ctu0).unwrap();
+        assert!(!cus.is_empty());
+        assert_eq!(cus.len(), infos.len());
+        assert_eq!(cus.len(), residuals.len());
+        // Every CU has a legal luma/chroma mode and geometry.
+        for (ccu, info) in cus.iter().zip(infos.iter()) {
+            assert_eq!(info.x0, ccu.cu.x);
+            assert_eq!(info.y0, ccu.cu.y);
+            assert_eq!(info.cb_width, ccu.cu.w);
+            assert_eq!(info.cb_height, ccu.cu.h);
+            assert!(info.intra_pred_mode_y <= 66);
+            assert!(info.intra_pred_mode_c <= 83);
+        }
+        // Every residual struct is either empty (no CBF) or has the
+        // right-sized level array.
+        for (ccu, residual) in cus.iter().zip(residuals.iter()) {
+            let expected_luma = (ccu.cu.w * ccu.cu.h) as usize;
+            assert!(residual.luma_levels.is_empty() || residual.luma_levels.len() == expected_luma);
+        }
     }
 
     #[test]

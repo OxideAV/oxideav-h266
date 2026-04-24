@@ -24,10 +24,20 @@
 //!   coding_tree dispatch that surfaces `Error::Unsupported` for any
 //!   construct below the partition tree (reconstruction, in-loop filters).
 //! * [`leaf_cu`] — per-CU syntax reads from `coding_unit()` (§7.3.11.5)
-//!   plus the §8.4.2 / §8.4.3 luma / chroma intra-mode derivations. The
-//!   module is "parse + derive, don't reconstruct": it captures the
-//!   MPM cascade, MIP flags, ISP split selector and chroma mode in a
-//!   [`leaf_cu::LeafCuInfo`] for later reconstruction rounds.
+//!   plus the §8.4.2 / §8.4.3 luma / chroma intra-mode derivations, now
+//!   extended with the `transform_unit()` CBF + `cu_qp_delta` reads and
+//!   a single-TB residual walker driver. The module is still "parse +
+//!   derive, don't reconstruct": it captures the MPM cascade, MIP flags,
+//!   ISP split selector, chroma mode, CBFs, quantised levels and
+//!   `LastSignificantCoeff{X,Y}` in a [`leaf_cu::LeafCuInfo`] +
+//!   [`leaf_cu::LeafCuResidual`] pair for later reconstruction rounds.
+//! * [`residual`] — `tu_y/cb/cr_coded_flag`, `cu_qp_delta_abs`,
+//!   `cu_chroma_qp_offset_*`, `last_sig_coeff_{x,y}_{prefix,suffix}`
+//!   and the per-sub-block `sb_coded_flag` / `sig_coeff_flag` /
+//!   `par_level_flag` / `abs_level_gtx_flag` / `coeff_sign_flag` /
+//!   `abs_remainder` reads (§7.3.11.10 / §7.3.11.11). Drives a
+//!   coefficient-level array that later rounds will feed into dequant
+//!   + inverse transform.
 //!
 //! ## Spec reference
 //!

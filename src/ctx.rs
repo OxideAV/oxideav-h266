@@ -208,6 +208,109 @@ pub fn ctx_inc_sig_coeff_flag_ts(loc_num_sig: u32) -> u32 {
     60 + loc_num_sig
 }
 
+/// ctxInc for `tu_y_coded_flag` per §9.3.4.2.5.
+///
+/// * `bdpcm_y` — `BdpcmFlag[x0][y0][0]`.
+/// * `isp_split` — `IntraSubPartitionsSplitType != ISP_NO_SPLIT`.
+/// * `prev_tu_cbf_y` — `tu_y_coded_flag` of the previous luma TU in the
+///   same CU (inferred 0 when this is the first TU, or when ISP is off).
+pub fn ctx_inc_tu_y_coded_flag(bdpcm_y: bool, isp_split: bool, prev_tu_cbf_y: bool) -> u32 {
+    if bdpcm_y {
+        1
+    } else if !isp_split {
+        0
+    } else {
+        2 + (prev_tu_cbf_y as u32)
+    }
+}
+
+/// ctxInc for `tu_cb_coded_flag` per Table 127 — simply the
+/// `intra_bdpcm_chroma_flag` bit (1 if BDPCM-chroma, else 0).
+pub fn ctx_inc_tu_cb_coded_flag(bdpcm_chroma: bool) -> u32 {
+    if bdpcm_chroma {
+        1
+    } else {
+        0
+    }
+}
+
+/// ctxInc for `tu_cr_coded_flag` per Table 127:
+/// `bdpcm_chroma ? 2 : tu_cb_coded_flag`.
+pub fn ctx_inc_tu_cr_coded_flag(bdpcm_chroma: bool, tu_cb_coded_flag: bool) -> u32 {
+    if bdpcm_chroma {
+        2
+    } else {
+        tu_cb_coded_flag as u32
+    }
+}
+
+/// ctxInc for `cu_qp_delta_abs` per Table 127: bin 0 ctx 0, bins 1-4 ctx 1.
+pub fn ctx_inc_cu_qp_delta_abs(bin_idx: u32) -> u32 {
+    if bin_idx == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// ctxInc for `cu_chroma_qp_offset_flag` — fixed 0 (Table 127).
+pub fn ctx_inc_cu_chroma_qp_offset_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `cu_chroma_qp_offset_idx` — fixed 0 (Table 127).
+pub fn ctx_inc_cu_chroma_qp_offset_idx() -> u32 {
+    0
+}
+
+/// ctxInc for `last_sig_coeff_x_prefix` / `last_sig_coeff_y_prefix`
+/// per §9.3.4.2.4 eqs. 1555 / 1556.
+///
+/// * `bin_idx` — current bin index within the TR prefix.
+/// * `c_idx` — colour component (0 = luma, 1/2 = chroma).
+/// * `log2_tb_size` — `Log2FullTbWidth` for the X prefix,
+///   `Log2FullTbHeight` for the Y prefix.
+pub fn ctx_inc_last_sig_coeff_prefix(bin_idx: u32, c_idx: u32, log2_tb_size: u32) -> u32 {
+    // offsetY[] = {0, 0, 3, 6, 10, 15} indexed by log2TbSize - 1.
+    const OFFSET_Y: [u32; 6] = [0, 0, 3, 6, 10, 15];
+    let (ctx_offset, ctx_shift) = if c_idx == 0 {
+        let idx = log2_tb_size.saturating_sub(1) as usize;
+        let off = if idx < OFFSET_Y.len() {
+            OFFSET_Y[idx]
+        } else {
+            15
+        };
+        let shift = (log2_tb_size + 1) >> 2;
+        (off, shift)
+    } else {
+        // Chroma: ctxOffset = 20, ctxShift = Clip3(0, 2, 2 * log2TbSize >> 3).
+        let shift = ((2 * log2_tb_size) >> 3).min(2);
+        (20, shift)
+    };
+    (bin_idx >> ctx_shift) + ctx_offset
+}
+
+/// csbfCtx derivation fragment for `sb_coded_flag` — §9.3.4.2.6 eqs.
+/// 1564 / 1565 / 1566 / 1567. Regular residual coding (no transform-skip)
+/// path: the "right/below" neighbour form is used, capped at 1.
+///
+/// * `right_sb_coded` — `sb_coded_flag[xS+1][yS]` (0 if xS is at the
+///   right edge of the sub-block grid).
+/// * `below_sb_coded` — `sb_coded_flag[xS][yS+1]`.
+pub fn csbf_ctx_regular(right_sb_coded: bool, below_sb_coded: bool) -> u32 {
+    right_sb_coded as u32 + below_sb_coded as u32
+}
+
+/// ctxInc for `sb_coded_flag` in regular residual coding — §9.3.4.2.6
+/// eqs. 1569 / 1570.
+pub fn ctx_inc_sb_coded_flag_regular(c_idx: u32, csbf_ctx: u32) -> u32 {
+    if c_idx == 0 {
+        csbf_ctx.min(1)
+    } else {
+        2 + csbf_ctx.min(1)
+    }
+}
+
 /// ctxInc for `abs_level_gtx_flag[n][0]` (a.k.a. `abs_level_gt_1_flag`)
 /// in regular residual coding (§9.3.4.2.9 eqs. 1582 / 1583 / 1584).
 ///
@@ -437,5 +540,80 @@ mod tests {
     fn sig_coeff_flag_ts_is_offset_60() {
         assert_eq!(ctx_inc_sig_coeff_flag_ts(0), 60);
         assert_eq!(ctx_inc_sig_coeff_flag_ts(4), 64);
+    }
+
+    /// tu_y_coded_flag: bdpcm forces 1, no-ISP gives 0, ISP propagates
+    /// the previous-TU CBF.
+    #[test]
+    fn tu_y_coded_flag_ctx_inc_branches() {
+        assert_eq!(ctx_inc_tu_y_coded_flag(true, false, false), 1);
+        assert_eq!(ctx_inc_tu_y_coded_flag(false, false, true), 0);
+        assert_eq!(ctx_inc_tu_y_coded_flag(false, true, false), 2);
+        assert_eq!(ctx_inc_tu_y_coded_flag(false, true, true), 3);
+    }
+
+    /// tu_cb_coded_flag: ctxInc = intra_bdpcm_chroma_flag.
+    #[test]
+    fn tu_cb_coded_flag_ctx_inc_branches() {
+        assert_eq!(ctx_inc_tu_cb_coded_flag(false), 0);
+        assert_eq!(ctx_inc_tu_cb_coded_flag(true), 1);
+    }
+
+    /// tu_cr_coded_flag: bdpcm_chroma → 2; else → tu_cb_coded_flag.
+    #[test]
+    fn tu_cr_coded_flag_ctx_inc_branches() {
+        assert_eq!(ctx_inc_tu_cr_coded_flag(false, false), 0);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(false, true), 1);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(true, false), 2);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(true, true), 2);
+    }
+
+    /// cu_qp_delta_abs: bin 0 ctx 0, rest ctx 1.
+    #[test]
+    fn cu_qp_delta_abs_ctx_inc_branches() {
+        assert_eq!(ctx_inc_cu_qp_delta_abs(0), 0);
+        assert_eq!(ctx_inc_cu_qp_delta_abs(1), 1);
+        assert_eq!(ctx_inc_cu_qp_delta_abs(4), 1);
+    }
+
+    /// last_sig_coeff_prefix: luma 4×4 TB at binIdx 0 has log2TbSize=2,
+    /// so ctxOffset = offsetY[1] = 0, ctxShift = (2+1)>>2 = 0,
+    /// ctxInc = 0 + 0 = 0.
+    #[test]
+    fn last_sig_coeff_prefix_luma_4x4_bin_0() {
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(0, 0, 2), 0);
+    }
+
+    /// last_sig_coeff_prefix: luma 32-wide TB at binIdx 4 has
+    /// log2TbSize=5, ctxOffset = offsetY[4] = 10, ctxShift = 6>>2 = 1,
+    /// ctxInc = (4 >> 1) + 10 = 12.
+    #[test]
+    fn last_sig_coeff_prefix_luma_32_bin_4() {
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(4, 0, 5), 12);
+    }
+
+    /// last_sig_coeff_prefix chroma: offset 20, shift = Clip3(0, 2, 2 * log2 >> 3).
+    /// At log2 = 4 → shift = 8 >> 3 = 1. binIdx=3 → (3>>1)+20 = 21.
+    #[test]
+    fn last_sig_coeff_prefix_chroma_16_bin_3() {
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(3, 1, 4), 21);
+    }
+
+    /// csbfCtx regular form: counts right/below coded flags.
+    #[test]
+    fn csbf_ctx_regular_counts_coded_neighbours() {
+        assert_eq!(csbf_ctx_regular(false, false), 0);
+        assert_eq!(csbf_ctx_regular(true, false), 1);
+        assert_eq!(csbf_ctx_regular(false, true), 1);
+        assert_eq!(csbf_ctx_regular(true, true), 2);
+    }
+
+    /// sb_coded_flag regular: luma caps at 1; chroma gets +2 offset.
+    #[test]
+    fn sb_coded_flag_regular_ctx_inc_branches() {
+        assert_eq!(ctx_inc_sb_coded_flag_regular(0, 0), 0);
+        assert_eq!(ctx_inc_sb_coded_flag_regular(0, 2), 1);
+        assert_eq!(ctx_inc_sb_coded_flag_regular(1, 0), 2);
+        assert_eq!(ctx_inc_sb_coded_flag_regular(1, 2), 3);
     }
 }

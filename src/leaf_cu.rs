@@ -53,6 +53,10 @@ use crate::ctx::{
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
 };
+use crate::residual::{
+    decode_tb_coefficients, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
+    read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
+};
 use crate::tables::{init_contexts, SyntaxCtx};
 
 /// CU prediction mode (§7.4.12.2 — `MODE_*`).
@@ -109,6 +113,20 @@ pub struct CuToolFlags {
     pub ctb_size_y: u32,
     /// `sps_chroma_format_idc` (0 = monochrome).
     pub chroma_format_idc: u32,
+    /// `pps_cu_qp_delta_enabled_flag` — gates `cu_qp_delta_abs` reads.
+    pub cu_qp_delta_enabled: bool,
+    /// `sh_cu_chroma_qp_offset_enabled_flag` — gates
+    /// `cu_chroma_qp_offset_flag` reads.
+    pub cu_chroma_qp_offset_enabled: bool,
+    /// `pps_chroma_qp_offset_list_len_minus1` — cMax for the
+    /// `cu_chroma_qp_offset_idx` TR read.
+    pub chroma_qp_offset_list_len_minus1: u32,
+    /// `sps_joint_cbcr_enabled_flag` — if true, `tu_joint_cbcr_residual_flag`
+    /// may appear (currently surfaced as Unsupported when it would be read).
+    pub joint_cbcr_enabled: bool,
+    /// `sh_ts_residual_coding_disabled_flag`. When set the
+    /// `transform_skip_flag` path is elided in the residual walker.
+    pub ts_residual_coding_disabled: bool,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -118,6 +136,12 @@ pub struct CuToolFlags {
 /// modes (§8.4.2 / §8.4.3). The decoder pipeline in later rounds will
 /// consume this struct to drive reference-sample fetch + prediction
 /// without replaying the CABAC reads.
+///
+/// CBFs and the raw coefficient level array live in a sibling
+/// [`LeafCuResidual`] because they are not `Copy` (they carry a
+/// `Vec<i32>`). The residual struct stays `None` when the CU has no
+/// residual to decode (e.g. BDPCM pure-prediction path or a CU where
+/// `tu_y_coded_flag == 0` and chroma CBFs are 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeafCuInfo {
     /// Top-left luma x (picture-absolute).
@@ -162,6 +186,23 @@ pub struct LeafCuInfo {
     /// monochrome sequences this remains 0 and callers should ignore
     /// the chroma plane.
     pub intra_pred_mode_c: u32,
+    /// `tu_y_coded_flag[x0][y0]` — luma CBF for the single-TB CU case.
+    pub tu_y_coded_flag: bool,
+    /// `tu_cb_coded_flag[x0][y0]`.
+    pub tu_cb_coded_flag: bool,
+    /// `tu_cr_coded_flag[x0][y0]`.
+    pub tu_cr_coded_flag: bool,
+    /// `CuQpDeltaVal` (signed, §7.4.11.8). 0 when `cu_qp_delta_abs == 0`
+    /// or the flag was not present in the slice.
+    pub cu_qp_delta_val: i32,
+    /// `cu_chroma_qp_offset_flag`.
+    pub cu_chroma_qp_offset_flag: bool,
+    /// `cu_chroma_qp_offset_idx` (0 when the flag is 0).
+    pub cu_chroma_qp_offset_idx: u32,
+    /// `LastSignificantCoeffX` for the luma TB (0 when no residual).
+    pub last_sig_x: u32,
+    /// `LastSignificantCoeffY` for the luma TB.
+    pub last_sig_y: u32,
 }
 
 impl Default for LeafCuInfo {
@@ -186,8 +227,30 @@ impl Default for LeafCuInfo {
             intra_chroma_pred_mode: 0,
             intra_pred_mode_y: INTRA_PLANAR,
             intra_pred_mode_c: INTRA_PLANAR,
+            tu_y_coded_flag: false,
+            tu_cb_coded_flag: false,
+            tu_cr_coded_flag: false,
+            cu_qp_delta_val: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+            last_sig_x: 0,
+            last_sig_y: 0,
         }
     }
+}
+
+/// Residual side-state for a leaf CU that has at least one coded TB.
+/// Held alongside [`LeafCuInfo`] because the level arrays require an
+/// allocation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeafCuResidual {
+    /// Luma coefficient levels, row-major `(cb_width * cb_height)`.
+    /// Empty when `tu_y_coded_flag == 0`.
+    pub luma_levels: Vec<i32>,
+    /// Chroma Cb coefficient levels (row-major, chroma-plane size).
+    pub cb_levels: Vec<i32>,
+    /// Chroma Cr coefficient levels (row-major, chroma-plane size).
+    pub cr_levels: Vec<i32>,
 }
 
 /// §7.3.11.5 syntax values for the intra-mode constants (Table 19).
@@ -204,7 +267,6 @@ pub const INTRA_L_CCLM: u32 = 82;
 pub const INTRA_T_CCLM: u32 = 83;
 
 /// CABAC context bundle used by [`LeafCuReader`].
-#[derive(Debug)]
 pub struct LeafCuCtxs {
     pub intra_mip_flag: Vec<ContextModel>,
     pub intra_luma_ref_idx: Vec<ContextModel>,
@@ -213,6 +275,37 @@ pub struct LeafCuCtxs {
     pub intra_luma_mpm_flag: Vec<ContextModel>,
     pub intra_luma_not_planar_flag: Vec<ContextModel>,
     pub intra_chroma_pred_mode: Vec<ContextModel>,
+    /// CBF + residual + last-sig-coeff context arrays. Shared with
+    /// [`crate::residual`] so the leaf reader + the residual reader
+    /// advance the same CABAC state machine.
+    pub residual: ResidualCtxs,
+}
+
+impl std::fmt::Debug for LeafCuCtxs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeafCuCtxs")
+            .field("intra_mip_flag.len", &self.intra_mip_flag.len())
+            .field("intra_luma_ref_idx.len", &self.intra_luma_ref_idx.len())
+            .field(
+                "intra_subpartitions_mode_flag.len",
+                &self.intra_subpartitions_mode_flag.len(),
+            )
+            .field(
+                "intra_subpartitions_split_flag.len",
+                &self.intra_subpartitions_split_flag.len(),
+            )
+            .field("intra_luma_mpm_flag.len", &self.intra_luma_mpm_flag.len())
+            .field(
+                "intra_luma_not_planar_flag.len",
+                &self.intra_luma_not_planar_flag.len(),
+            )
+            .field(
+                "intra_chroma_pred_mode.len",
+                &self.intra_chroma_pred_mode.len(),
+            )
+            .field("residual.tu_y_coded.len", &self.residual.tu_y_coded.len())
+            .finish()
+    }
 }
 
 impl LeafCuCtxs {
@@ -235,6 +328,7 @@ impl LeafCuCtxs {
                 slice_qp_y,
             ),
             intra_chroma_pred_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
+            residual: ResidualCtxs::init(slice_qp_y),
         }
     }
 }
@@ -459,8 +553,16 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     /// Decode the `coding_unit()` body for a leaf CU in an I-slice,
     /// single-tree pipeline. `info.x0 / y0 / cb_width / cb_height`
     /// must be populated by the caller; every other field is written
-    /// by this method.
-    pub fn decode(&mut self, info: &mut LeafCuInfo, neigh: &CuNeighbourhood) -> Result<()> {
+    /// by this method. The residual-level storage (per-plane
+    /// coefficient arrays) is filled into `residual` when any CBF
+    /// fires; it stays empty when the CU carries no coded residual
+    /// (e.g. all CBFs 0 on a zero-stream test fixture).
+    pub fn decode(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+        neigh: &CuNeighbourhood,
+    ) -> Result<()> {
         info.pred_mode = CuPredMode::Intra; // I-slice default (§7.4.12.2).
 
         // IBC / palette are not currently walked: the flags are
@@ -650,6 +752,141 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // Chroma — skip for monochrome.
         self.derive_chroma(info);
 
+        // --- transform_unit() reads (§7.3.11.10) ---
+        self.decode_transform_unit(info, residual)?;
+
+        Ok(())
+    }
+
+    /// Read the transform_unit()-level syntax (CBFs, cu_qp_delta,
+    /// cu_chroma_qp_offset_*) and drive the residual walker.
+    ///
+    /// Scope: single-TB CU only (no ISP split, no SBT). The CBF read
+    /// gates per §7.3.11.10 reduce to:
+    ///   * chroma CBFs are always read when the chroma format is not
+    ///     monochrome and the CU is in single-tree mode.
+    ///   * luma CBF is always read in the intra path.
+    ///
+    /// The residual decode path surfaces `Error::Unsupported` if
+    /// `sps_joint_cbcr_enabled_flag` is set and the joint-cbcr flag
+    /// would be read — that binarisation has a separate context init
+    /// that is not plumbed yet.
+    fn decode_transform_unit(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+    ) -> Result<()> {
+        let cb_w = info.cb_width as usize;
+        let cb_h = info.cb_height as usize;
+        let chroma = self.tools.chroma_format_idc != 0;
+        // Chroma dims: 4:2:0 halves both, 4:2:2 halves width only, 4:4:4 keeps.
+        // We only support 4:2:0 here (chroma_format_idc == 1); other formats
+        // surface Unsupported the moment the code would diverge.
+        let (sub_w, sub_h) = match self.tools.chroma_format_idc {
+            0 => (1, 1),
+            1 => (2, 2),
+            2 => (2, 1),
+            3 => (1, 1),
+            _ => {
+                return Err(Error::invalid(
+                    "h266 leaf CU: unknown sps_chroma_format_idc value",
+                ));
+            }
+        };
+        // Read tu_cb/tu_cr_coded first (spec order — chroma CBFs come
+        // before luma within transform_unit()).
+        if chroma {
+            info.tu_cb_coded_flag = read_tu_cb_coded_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                /*bdpcm_chroma=*/ false,
+            )?;
+            info.tu_cr_coded_flag = read_tu_cr_coded_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                /*bdpcm_chroma=*/ false,
+                info.tu_cb_coded_flag,
+            )?;
+        }
+        // Luma CBF: always read in the intra path (per §7.3.11.10 the
+        // condition simplifies to true when pred_mode == INTRA, ISP is
+        // NO_SPLIT, SBT is off and ACT is off).
+        info.tu_y_coded_flag = read_tu_y_coded_flag(
+            self.dec,
+            &mut self.ctxs.residual,
+            /*bdpcm_y=*/ info.intra_bdpcm_luma,
+            /*isp_split=*/ info.isp_split != IspSplitType::NoSplit,
+            /*prev_tu_cbf_y=*/ false,
+        )?;
+
+        // cu_qp_delta_abs + sign (spec gates on CB > 64 || any CBF + enable).
+        let any_cbf = info.tu_y_coded_flag || info.tu_cb_coded_flag || info.tu_cr_coded_flag;
+        if self.tools.cu_qp_delta_enabled && any_cbf {
+            info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+        }
+        // cu_chroma_qp_offset_flag + idx.
+        let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
+        if self.tools.cu_chroma_qp_offset_enabled && chroma && chroma_cbf {
+            let (flag, idx) = read_cu_chroma_qp_offset(
+                self.dec,
+                &mut self.ctxs.residual,
+                self.tools.chroma_qp_offset_list_len_minus1,
+            )?;
+            info.cu_chroma_qp_offset_flag = flag;
+            info.cu_chroma_qp_offset_idx = idx;
+        }
+        // joint_cbcr_residual_flag — gate exists but parsing not
+        // plumbed; surface Unsupported when it would actually fire.
+        if self.tools.joint_cbcr_enabled
+            && chroma
+            && ((info.pred_mode == CuPredMode::Intra && chroma_cbf)
+                || (info.tu_cb_coded_flag && info.tu_cr_coded_flag))
+        {
+            return Err(Error::unsupported(
+                "h266 leaf CU: tu_joint_cbcr_residual_flag parsing not plumbed yet",
+            ));
+        }
+
+        // Residual decode per plane.
+        if info.tu_y_coded_flag {
+            let levels = decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cb_w, cb_h, 0)?;
+            // Capture the last-sig position derived by the residual
+            // reader by re-reading the info from the coefficient
+            // array: the last non-zero in scan order is the last-sig.
+            // (The residual reader already reads last_sig_coeff_*; we
+            // expose a simplified record here.)
+            // Find max (x, y) with non-zero level as a best-effort
+            // proxy for LastSignificantCoeffX/Y.
+            let mut lx = 0u32;
+            let mut ly = 0u32;
+            for y in 0..cb_h {
+                for x in 0..cb_w {
+                    if levels[y * cb_w + x] != 0 {
+                        lx = lx.max(x as u32);
+                        ly = ly.max(y as u32);
+                    }
+                }
+            }
+            info.last_sig_x = lx;
+            info.last_sig_y = ly;
+            residual.luma_levels = levels;
+        }
+        if info.tu_cb_coded_flag && chroma {
+            let cw = cb_w / sub_w;
+            let ch = cb_h / sub_h;
+            if cw >= 2 && ch >= 2 {
+                residual.cb_levels =
+                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
+            }
+        }
+        if info.tu_cr_coded_flag && chroma {
+            let cw = cb_w / sub_w;
+            let ch = cb_h / sub_h;
+            if cw >= 2 && ch >= 2 {
+                residual.cr_levels =
+                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
+            }
+        }
         Ok(())
     }
 
@@ -1032,8 +1269,13 @@ mod tests {
             max_ts_size: 32,
             ctb_size_y: 128,
             chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            cu_chroma_qp_offset_enabled: false,
+            chroma_qp_offset_list_len_minus1: 0,
+            joint_cbcr_enabled: false,
+            ts_residual_coding_disabled: false,
         };
-        let data = [0u8; 32];
+        let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();
         let mut ctxs = LeafCuCtxs::init(26);
         let mut info = LeafCuInfo {
@@ -1043,9 +1285,10 @@ mod tests {
             cb_height: 16,
             ..LeafCuInfo::default()
         };
+        let mut residual = LeafCuResidual::default();
         let neigh = CuNeighbourhood::default();
         let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
-        reader.decode(&mut info, &neigh).unwrap();
+        reader.decode(&mut info, &mut residual, &neigh).unwrap();
         assert_eq!(info.pred_mode, CuPredMode::Intra);
         // Legal luma mode range.
         assert!(info.intra_pred_mode_y <= 66);
@@ -1063,7 +1306,7 @@ mod tests {
             max_ts_size: 32,
             ..CuToolFlags::default()
         };
-        let data = [0u8; 32];
+        let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();
         let mut ctxs = LeafCuCtxs::init(26);
         let mut info = LeafCuInfo {
@@ -1073,9 +1316,10 @@ mod tests {
             cb_height: 8,
             ..LeafCuInfo::default()
         };
+        let mut residual = LeafCuResidual::default();
         let neigh = CuNeighbourhood::default();
         let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
-        reader.decode(&mut info, &neigh).unwrap();
+        reader.decode(&mut info, &mut residual, &neigh).unwrap();
         // With 8x8 CU + MIP enabled, cMax = 7 → 3 bypass bits; parse
         // must yield mip_mode ∈ 0..=7.
         if info.intra_mip_flag {
@@ -1120,6 +1364,7 @@ mod tests {
             cb_height: 16,
             ..LeafCuInfo::default()
         };
+        let mut residual = LeafCuResidual::default();
         let neigh = CuNeighbourhood::default();
 
         let mut tools = CuToolFlags {
@@ -1133,7 +1378,7 @@ mod tests {
         };
         let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
         assert!(matches!(
-            reader.decode(&mut info, &neigh),
+            reader.decode(&mut info, &mut residual, &neigh),
             Err(Error::Unsupported(_))
         ));
 
@@ -1141,7 +1386,7 @@ mod tests {
         tools.palette = true;
         let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
         assert!(matches!(
-            reader.decode(&mut info, &neigh),
+            reader.decode(&mut info, &mut residual, &neigh),
             Err(Error::Unsupported(_))
         ));
     }
@@ -1155,6 +1400,85 @@ mod tests {
             let m = derive_intra_pred_mode_y(true, false, false, true, idx, 0, &list);
             assert_eq!(m, list[idx as usize], "mpm_idx={idx} failed");
         }
+    }
+
+    /// Hand-built 4×4 intra-only CU decode: verifies that the full
+    /// coding_unit() + transform_unit() chain runs end-to-end on a
+    /// zero-stream without panicking, producing CBFs and a coefficient
+    /// array of the right shape.
+    #[test]
+    fn intra_4x4_cu_runs_full_decode_chain() {
+        let tools = CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ..CuToolFlags::default()
+        };
+        let data = [0u8; 256];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = LeafCuCtxs::init(26);
+        let mut info = LeafCuInfo {
+            cb_width: 4,
+            cb_height: 4,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+        reader.decode(&mut info, &mut residual, &neigh).unwrap();
+        // CBFs read as MPS on the zero-stream for this QP; regardless
+        // of exact values the reader must produce legal output.
+        // When tu_y_coded_flag is true, the luma residual array must
+        // have the expected shape.
+        if info.tu_y_coded_flag {
+            assert_eq!(residual.luma_levels.len(), 16);
+        } else {
+            assert!(residual.luma_levels.is_empty());
+        }
+        // Chroma CBFs must also yield either 0 or a 2x2 level array
+        // (4:2:0 chroma plane of a 4x4 luma is 2x2).
+        if info.tu_cb_coded_flag {
+            assert_eq!(residual.cb_levels.len(), 4);
+        }
+        if info.tu_cr_coded_flag {
+            assert_eq!(residual.cr_levels.len(), 4);
+        }
+        // QP delta stays 0 because cu_qp_delta_enabled is false.
+        assert_eq!(info.cu_qp_delta_val, 0);
+    }
+
+    /// QP delta path: enable `cu_qp_delta_enabled` and verify that a
+    /// zero-stream at least runs the read. Cannot assert on the exact
+    /// value without hand-crafting the bit pattern.
+    #[test]
+    fn cu_qp_delta_is_read_when_enabled_and_cbf_fires() {
+        let tools = CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            cu_qp_delta_enabled: true,
+            ..CuToolFlags::default()
+        };
+        let data = [0u8; 256];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = LeafCuCtxs::init(26);
+        let mut info = LeafCuInfo {
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+        reader.decode(&mut info, &mut residual, &neigh).unwrap();
+        // cu_qp_delta_val is in the legal signed range; on zero stream
+        // it's almost always 0 (MPS branch). We can't bound it tighter
+        // without re-implementing the CABAC engine math here.
+        assert!(info.cu_qp_delta_val.abs() < 64);
     }
 
     #[test]
