@@ -42,6 +42,7 @@ pub mod opi;
 pub mod picture_header;
 pub mod pps;
 pub mod ptl;
+pub mod ref_pic_list;
 pub mod reconstruct;
 pub mod residual;
 pub mod scan;
