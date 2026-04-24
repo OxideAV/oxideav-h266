@@ -74,6 +74,7 @@ pub mod ctu;
 pub mod ctx;
 pub mod dci;
 pub mod decoder;
+pub mod encoder;
 pub mod hrd;
 pub mod intra;
 pub mod leaf_cu;
