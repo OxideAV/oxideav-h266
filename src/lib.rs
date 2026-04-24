@@ -36,6 +36,7 @@ pub mod nal;
 pub mod picture_header;
 pub mod pps;
 pub mod ptl;
+pub mod scan;
 pub mod slice_header;
 pub mod sps;
 pub mod tables;
