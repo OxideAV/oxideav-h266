@@ -27,7 +27,7 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::nal::NalUnitType;
-use crate::picture_header::{parse_picture_header, PictureHeader};
+use crate::picture_header::{parse_picture_header, PictureHeaderLead};
 use crate::pps::PicParameterSet;
 use crate::sps::SeqParameterSet;
 
@@ -35,7 +35,7 @@ use crate::sps::SeqParameterSet;
 pub struct SliceHeader {
     pub sh_picture_header_in_slice_header_flag: bool,
     /// Present only when `sh_picture_header_in_slice_header_flag == 1`.
-    pub embedded_picture_header: Option<PictureHeader>,
+    pub embedded_picture_header: Option<PictureHeaderLead>,
     /// Remaining RBSP bytes after the parsed leading bits.
     pub payload_tail: Vec<u8>,
     /// Bit offset within `payload_tail[0]` where the tail begins.
@@ -119,7 +119,7 @@ impl SliceType {
 #[derive(Clone, Debug, Default)]
 pub struct StatefulSliceHeader {
     pub sh_picture_header_in_slice_header_flag: bool,
-    pub embedded_picture_header: Option<PictureHeader>,
+    pub embedded_picture_header: Option<PictureHeaderLead>,
     /// `sh_subpic_id` (§7.4.8) — `None` when not transmitted.
     pub sh_subpic_id: Option<u32>,
     /// Slice type (§7.4.8). `I` when `ph_inter_slice_allowed_flag == 0`.
