@@ -1137,7 +1137,7 @@ fn parse_tool_flags(
 ///   (`AbsDeltaPocSt = abs_delta_poc_st + (gated ? 0 : 1)`).
 /// * `log2_max_pic_order_cnt_lsb_minus4` — width of `rpls_poc_lsb_lt`
 ///   (§7.4.11: `u(v)` with `v = log2_max_pic_order_cnt_lsb_minus4 + 4`).
-pub(crate) fn parse_ref_pic_list_struct(
+pub fn parse_ref_pic_list_struct(
     br: &mut BitReader<'_>,
     list_idx: u8,
     rpls_idx: u32,

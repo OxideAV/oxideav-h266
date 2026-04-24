@@ -16,7 +16,12 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::sps::{RefPicListEntry as SpsRefPicListEntry, RefPicListStruct, SeqParameterSet};
+use crate::bitreader::BitReader;
+use crate::pps::PicParameterSet;
+use crate::sps::{
+    parse_ref_pic_list_struct, RefPicListEntry as SpsRefPicListEntry, RefPicListStruct,
+    SeqParameterSet,
+};
 
 /// Classification of a built [`RefPicListEntry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +194,197 @@ pub fn build_ref_pic_list(inputs: &RefPicListInputs<'_>) -> Result<Vec<BuiltRefP
         }
     }
     Ok(out)
+}
+
+/// Result of parsing a header-level `ref_pic_lists()` block (§7.3.9).
+///
+/// Two sub-shapes exist for each list `i`:
+///
+/// * `rpl_sps_flag[i] == 1` — the header selects one of the SPS-owned
+///   `ref_pic_list_struct` candidates by index. The chosen struct is
+///   referred to as `RplsIdx[i]` below, matching the spec's variable.
+/// * `rpl_sps_flag[i] == 0` — the header inlines a brand-new
+///   `ref_pic_list_struct(i, sps_num_ref_pic_lists[i])` which we keep
+///   alongside the parsed struct. Per §7.4.10, `RplsIdx[i]` equals
+///   `sps_num_ref_pic_lists[i]` in that case.
+#[derive(Clone, Debug)]
+pub struct HeaderRefPicList {
+    /// True when the list was selected from the SPS candidates
+    /// (`rpl_sps_flag[i] == 1`). False when inlined in the header.
+    pub rpl_sps_flag: bool,
+    /// `rpl_idx[i]` when signalled / inferred, `None` when the list was
+    /// inlined (§7.3.9: the "synthesised" candidate index is
+    /// `sps_num_ref_pic_lists[i]`).
+    pub rpl_idx: Option<u32>,
+    /// Effective `RplsIdx[i]` (equation 146). Always populated — for
+    /// inline lists this is `sps_num_ref_pic_lists[i]`.
+    pub rpls_idx: u32,
+    /// Cloned / parsed `ref_pic_list_struct()`. When `rpl_sps_flag ==
+    /// 1` this is a clone of the SPS-owned struct; when inlined it is
+    /// a freshly parsed one. Either way the caller can feed it to
+    /// [`build_ref_pic_list`] without additional lookups.
+    pub rpls: RefPicListStruct,
+    /// Per-LTRP side-channel info transmitted by the header after the
+    /// RPL struct (§7.3.9). Length equals `rpls.num_ltrp_entries()`.
+    pub lt_info: Vec<LongTermHeaderInfo>,
+}
+
+/// Parse a header-level `ref_pic_lists()` block (§7.3.9) starting at the
+/// reader's current bit position. The reader is advanced past the block
+/// (byte alignment is *not* applied — the caller resumes with whatever
+/// syntax follows `ref_pic_lists()` in the containing PH / slice header).
+///
+/// Behaviour notes:
+///
+/// * `rpl_sps_flag[i]` is only signalled when the SPS carries at least
+///   one candidate for list `i` (and, for `i = 1`, when
+///   `pps_rpl1_idx_present_flag == 1`). Otherwise §7.4.10 inference
+///   rules apply.
+/// * When `rpl_sps_flag[i]` is inferred to `rpl_sps_flag[0]` (§7.4.10),
+///   the `rpl_idx[i]` value is likewise inferred to `rpl_idx[0]`.
+/// * Per §7.4.10, when `rpl_sps_flag[i] == 1` and
+///   `sps_num_ref_pic_lists[i] == 1`, `rpl_idx[i]` is not transmitted
+///   and is inferred to 0.
+pub fn parse_ref_pic_lists(
+    br: &mut BitReader<'_>,
+    sps: &SeqParameterSet,
+    pps: &PicParameterSet,
+) -> Result<[HeaderRefPicList; 2]> {
+    // Start with list 0 so that list-1 inference can refer to it (§7.4.10).
+    let mut out: [Option<HeaderRefPicList>; 2] = [None, None];
+
+    // Effective `sps_num_ref_pic_lists[i]` with the "rpl1_same_as_rpl0"
+    // aliasing applied: per §7.4.3.4 list 1 mirrors list 0 under that
+    // flag, and the SPS parser populates ref_pic_lists[1] via the
+    // alias. We read the raw SPS count array but cap list 1 to the
+    // length of the populated candidate set so indexing stays valid.
+    let num_rpls: [u32; 2] = [
+        sps.tool_flags.num_ref_pic_lists[0],
+        sps.tool_flags.num_ref_pic_lists[1],
+    ];
+
+    for i in 0..2 {
+        let signalled = num_rpls[i] > 0 && (i == 0 || pps.pps_rpl1_idx_present_flag);
+        let rpl_sps_flag = if signalled {
+            br.u1()? == 1
+        } else if num_rpls[i] == 0 {
+            // §7.4.10: inferred to 0 when sps_num_ref_pic_lists[i] == 0.
+            false
+        } else {
+            // §7.4.10: i == 1, pps_rpl1_idx_present_flag == 0 → mirror list 0.
+            out[0]
+                .as_ref()
+                .map(|p| p.rpl_sps_flag)
+                .unwrap_or(false)
+        };
+
+        let (rpl_idx_signalled, rpls): (Option<u32>, RefPicListStruct) = if rpl_sps_flag {
+            // Pick from the SPS candidates.
+            let signalled_idx = num_rpls[i] > 1 && (i == 0 || pps.pps_rpl1_idx_present_flag);
+            let rpl_idx = if signalled_idx {
+                let w = ceil_log2(num_rpls[i]);
+                let v = br.u(w)?;
+                if v >= num_rpls[i] {
+                    return Err(Error::invalid(format!(
+                        "h266 RPL: rpl_idx[{i}] = {v} out of range (sps_num_ref_pic_lists = {})",
+                        num_rpls[i]
+                    )));
+                }
+                Some(v)
+            } else if num_rpls[i] == 1 {
+                Some(0)
+            } else {
+                // num_rpls[i] > 1 && i == 1 && !pps_rpl1_idx_present_flag
+                // → inferred to rpl_idx[0].
+                out[0]
+                    .as_ref()
+                    .and_then(|p| p.rpl_idx)
+                    .map(Some)
+                    .unwrap_or(Some(0))
+            };
+            let idx = rpl_idx.unwrap_or(0);
+            // List 1 may have empty candidate storage under
+            // `rpl1_same_as_rpl0_flag`; fall back to list 0's candidates
+            // in that case to mirror the spec's aliasing.
+            let candidates = if sps.tool_flags.ref_pic_lists[i].is_empty() {
+                &sps.tool_flags.ref_pic_lists[0]
+            } else {
+                &sps.tool_flags.ref_pic_lists[i]
+            };
+            let rpls = candidates
+                .get(idx as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid(format!(
+                        "h266 RPL: rpl_idx[{i}] = {idx} references missing SPS candidate"
+                    ))
+                })?;
+            (rpl_idx, rpls)
+        } else {
+            // Inline: ref_pic_list_struct(i, sps_num_ref_pic_lists[i]).
+            let rpls = parse_ref_pic_list_struct(
+                br,
+                i as u8,
+                num_rpls[i],
+                num_rpls[i],
+                sps.tool_flags.long_term_ref_pics_flag,
+                sps.tool_flags.inter_layer_prediction_enabled_flag,
+                pps.pps_weighted_pred_flag,
+                pps.pps_weighted_bipred_flag,
+                sps.sps_log2_max_pic_order_cnt_lsb_minus4,
+            )?;
+            (None, rpls)
+        };
+
+        let rpls_idx = if rpl_sps_flag {
+            rpl_idx_signalled.unwrap_or(0)
+        } else {
+            num_rpls[i]
+        };
+
+        // Per-LT side-channel info. Width of poc_lsb_lt equals
+        // sps_log2_max_pic_order_cnt_lsb_minus4 + 4 bits (§7.4.10).
+        let poc_lsb_width = sps.sps_log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
+        let mut lt_info: Vec<LongTermHeaderInfo> =
+            Vec::with_capacity(rpls.num_ltrp_entries());
+        for _ in 0..rpls.num_ltrp_entries() {
+            let poc_lsb_lt_header = if rpls.ltrp_in_header_flag {
+                br.u(poc_lsb_width)?
+            } else {
+                0
+            };
+            let delta_poc_msb_cycle_present = br.u1()? == 1;
+            let delta_poc_msb_cycle_lt = if delta_poc_msb_cycle_present {
+                br.ue()?
+            } else {
+                0
+            };
+            lt_info.push(LongTermHeaderInfo {
+                poc_lsb_lt_header,
+                delta_poc_msb_cycle_present,
+                delta_poc_msb_cycle_lt,
+            });
+        }
+
+        out[i] = Some(HeaderRefPicList {
+            rpl_sps_flag,
+            rpl_idx: rpl_idx_signalled,
+            rpls_idx,
+            rpls,
+            lt_info,
+        });
+    }
+
+    // `out` is guaranteed populated by the loop above.
+    Ok([out[0].take().unwrap(), out[1].take().unwrap()])
+}
+
+/// `Ceil(Log2(n))` with the VVC convention `Ceil(Log2(0)) = 0`.
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        return 0;
+    }
+    32 - (n - 1).leading_zeros()
 }
 
 /// Convenience wrapper that resolves `rpl_sps_flag[i]` / `rpl_idx[i]`
@@ -375,5 +571,216 @@ mod tests {
         // STRP(-1): pocBase is the *last STRP*'s POC (22) → 21.
         assert_eq!(out[3].kind, RefPicKind::ShortTerm);
         assert_eq!(out[3].poc, 21);
+    }
+
+    // ---- Header-level ref_pic_lists() tests ----
+
+    fn push_u(bits: &mut Vec<u8>, v: u64, n: u32) {
+        for i in (0..n).rev() {
+            bits.push(((v >> i) & 1) as u8);
+        }
+    }
+    fn push_ue(bits: &mut Vec<u8>, value: u32) {
+        let code_num = value as u64 + 1;
+        let mut zeros: u32 = 0;
+        while (1u64 << (zeros + 1)) <= code_num {
+            zeros += 1;
+        }
+        for _ in 0..zeros {
+            bits.push(0);
+        }
+        push_u(bits, code_num, zeros + 1);
+    }
+    fn pack(bits: &[u8]) -> Vec<u8> {
+        let mut padded = bits.to_vec();
+        while padded.len() % 8 != 0 {
+            padded.push(0);
+        }
+        let mut out = Vec::with_capacity(padded.len() / 8);
+        for chunk in padded.chunks(8) {
+            let mut b = 0u8;
+            for (i, &bit) in chunk.iter().enumerate() {
+                b |= bit << (7 - i);
+            }
+            out.push(b);
+        }
+        out
+    }
+
+    fn synth_sps_pps() -> (crate::sps::SeqParameterSet, crate::pps::PicParameterSet) {
+        use crate::sps::{PartitionConstraints, ToolFlags};
+        let mut sps = crate::sps::SeqParameterSet {
+            sps_seq_parameter_set_id: 0,
+            sps_video_parameter_set_id: 0,
+            sps_max_sublayers_minus1: 0,
+            sps_chroma_format_idc: 1,
+            sps_log2_ctu_size_minus5: 2,
+            sps_ptl_dpb_hrd_params_present_flag: false,
+            profile_tier_level: None,
+            sps_gdr_enabled_flag: false,
+            sps_ref_pic_resampling_enabled_flag: false,
+            sps_res_change_in_clvs_allowed_flag: false,
+            sps_pic_width_max_in_luma_samples: 320,
+            sps_pic_height_max_in_luma_samples: 240,
+            conformance_window: None,
+            sps_subpic_info_present_flag: false,
+            sps_bitdepth_minus8: 2,
+            sps_entropy_coding_sync_enabled_flag: false,
+            sps_entry_point_offsets_present_flag: false,
+            sps_log2_max_pic_order_cnt_lsb_minus4: 4,
+            sps_poc_msb_cycle_flag: false,
+            sps_poc_msb_cycle_len_minus1: 0,
+            sps_num_extra_ph_bytes: 0,
+            sps_num_extra_sh_bytes: 0,
+            sps_sublayer_dpb_params_flag: false,
+            dpb_parameters: None,
+            partition_constraints: PartitionConstraints::default(),
+            tool_flags: ToolFlags::default(),
+            subpic_info: None,
+            sps_timing_hrd_params_present_flag: false,
+            general_timing_hrd: None,
+            sps_sublayer_cpb_params_present_flag: false,
+            ols_timing_hrd: None,
+            sps_field_seq_flag: false,
+            sps_vui_parameters_present_flag: false,
+            vui_payload: Vec::new(),
+            sps_extension_flag: false,
+            sps_range_extension_flag: false,
+            sps_extension_7bits: 0,
+        };
+        sps.tool_flags.num_ref_pic_lists = [2, 1];
+        sps.tool_flags.ref_pic_lists[0] = vec![
+            RefPicListStruct {
+                entries: vec![strp(1)],
+                ltrp_in_header_flag: false,
+            },
+            RefPicListStruct {
+                entries: vec![strp(-1)],
+                ltrp_in_header_flag: false,
+            },
+        ];
+        sps.tool_flags.ref_pic_lists[1] = vec![RefPicListStruct {
+            entries: vec![strp(2)],
+            ltrp_in_header_flag: false,
+        }];
+        let pps = crate::pps::PicParameterSet {
+            pps_pic_parameter_set_id: 0,
+            pps_seq_parameter_set_id: 0,
+            pps_mixed_nalu_types_in_pic_flag: false,
+            pps_pic_width_in_luma_samples: 320,
+            pps_pic_height_in_luma_samples: 240,
+            conformance_window: None,
+            scaling_window: None,
+            pps_output_flag_present_flag: false,
+            pps_no_pic_partition_flag: true,
+            pps_subpic_id_mapping_present_flag: false,
+            pps_rect_slice_flag: true,
+            pps_single_slice_per_subpic_flag: true,
+            pps_loop_filter_across_slices_enabled_flag: false,
+            pps_cabac_init_present_flag: false,
+            pps_num_ref_idx_default_active_minus1: [0, 0],
+            pps_rpl1_idx_present_flag: true,
+            pps_weighted_pred_flag: false,
+            pps_weighted_bipred_flag: false,
+            pps_ref_wraparound_enabled_flag: false,
+            pps_pic_width_minus_wraparound_offset: 0,
+            pps_init_qp_minus26: 0,
+            pps_cu_qp_delta_enabled_flag: false,
+            pps_chroma_tool_offsets_present_flag: false,
+            pps_cb_qp_offset: 0,
+            pps_cr_qp_offset: 0,
+            pps_joint_cbcr_qp_offset_present_flag: false,
+            pps_joint_cbcr_qp_offset_value: 0,
+            pps_slice_chroma_qp_offsets_present_flag: false,
+            pps_cu_chroma_qp_offset_list_enabled_flag: false,
+            pps_deblocking_filter_control_present_flag: false,
+            pps_deblocking_filter_override_enabled_flag: false,
+            pps_deblocking_filter_disabled_flag: false,
+            pps_dbf_info_in_ph_flag: true,
+            pps_rpl_info_in_ph_flag: true,
+            pps_sao_info_in_ph_flag: true,
+            pps_alf_info_in_ph_flag: true,
+            pps_wp_info_in_ph_flag: true,
+            pps_qp_delta_info_in_ph_flag: true,
+            pps_picture_header_extension_present_flag: false,
+            pps_slice_header_extension_present_flag: false,
+            pps_extension_flag: false,
+        };
+        (sps, pps)
+    }
+
+    /// List 0: rpl_sps_flag = 1, rpl_idx = 1 (selecting the second SPS
+    /// candidate). List 1: rpl_sps_flag = 1, rpl_idx = 0 (the single
+    /// candidate, inference applies).
+    #[test]
+    fn parses_rpl_sps_flag_selection() {
+        use crate::bitreader::BitReader;
+        let (sps, pps) = synth_sps_pps();
+        let mut bits: Vec<u8> = Vec::new();
+        // List 0: rpl_sps_flag = 1, rpl_idx width = ceil(log2(2)) = 1.
+        push_u(&mut bits, 1, 1);
+        push_u(&mut bits, 1, 1);
+        // List 1: rpl_sps_flag = 1 (pps_rpl1_idx_present_flag = 1, num = 1).
+        // rpl_idx not signalled (num = 1 → inferred to 0).
+        push_u(&mut bits, 1, 1);
+        // Pad.
+        push_u(&mut bits, 0, 5);
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let rpl = parse_ref_pic_lists(&mut br, &sps, &pps).unwrap();
+        assert!(rpl[0].rpl_sps_flag);
+        assert_eq!(rpl[0].rpl_idx, Some(1));
+        assert_eq!(rpl[0].rpls_idx, 1);
+        assert_eq!(rpl[0].rpls.entries.len(), 1);
+        assert!(rpl[1].rpl_sps_flag);
+        assert_eq!(rpl[1].rpl_idx, Some(0));
+    }
+
+    /// Inline list 0 (rpl_sps_flag = 0): parses a 1-entry STRP struct
+    /// from the header. List 1 is still SPS-selected.
+    #[test]
+    fn parses_inline_rpl_struct() {
+        use crate::bitreader::BitReader;
+        let (mut sps, mut pps) = synth_sps_pps();
+        // Only allow one SPS candidate on list 0 to simplify.
+        sps.tool_flags.num_ref_pic_lists = [1, 1];
+        sps.tool_flags.ref_pic_lists[0] = vec![RefPicListStruct {
+            entries: vec![strp(3)],
+            ltrp_in_header_flag: false,
+        }];
+        pps.pps_rpl1_idx_present_flag = true;
+        let mut bits: Vec<u8> = Vec::new();
+        // List 0: rpl_sps_flag = 0 (inline).
+        push_u(&mut bits, 0, 1);
+        // Inline ref_pic_list_struct(0, 1):
+        //   num_ref_entries = 1 (ue = 010? no, ue(1) = "010" → value 1)
+        push_ue(&mut bits, 1);
+        // ltrp_in_header_flag not transmitted (long_term_ref_pics_flag = 0).
+        // Entry loop (1 iteration):
+        //   no inter-layer flag (sps_inter_layer_prediction_enabled_flag = 0).
+        //   no st_ref_pic_flag (sps_long_term_ref_pics_flag = 0, inferred true).
+        //   abs_delta_poc_st = 0 → ue "1" (1 bit).
+        push_ue(&mut bits, 0);
+        // abs = abs_delta_poc_st + 1 = 1 > 0, strp_entry_sign_flag present.
+        push_u(&mut bits, 0, 1); // sign = 0 → positive.
+        // List 1: rpl_sps_flag = 1 (num = 1, single SPS candidate).
+        push_u(&mut bits, 1, 1);
+        // rpl_idx inferred to 0 (num = 1).
+        // No LT info block.
+        push_u(&mut bits, 0, 3); // pad
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let rpl = parse_ref_pic_lists(&mut br, &sps, &pps).unwrap();
+        assert!(!rpl[0].rpl_sps_flag);
+        assert_eq!(rpl[0].rpl_idx, None);
+        assert_eq!(rpl[0].rpls_idx, 1);
+        assert_eq!(rpl[0].rpls.entries.len(), 1);
+        match rpl[0].rpls.entries[0] {
+            crate::sps::RefPicListEntry::ShortTerm {
+                delta_poc_val_st, ..
+            } => assert_eq!(delta_poc_val_st, 1),
+            other => panic!("unexpected entry {other:?}"),
+        }
+        assert!(rpl[1].rpl_sps_flag);
     }
 }
