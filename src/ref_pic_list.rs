@@ -705,6 +705,7 @@ mod tests {
             pps_picture_header_extension_present_flag: false,
             pps_slice_header_extension_present_flag: false,
             pps_extension_flag: false,
+            partition: None,
         };
         (sps, pps)
     }

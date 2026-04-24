@@ -122,6 +122,12 @@ pub struct StatefulSliceHeader {
     pub embedded_picture_header: Option<PictureHeaderLead>,
     /// `sh_subpic_id` (§7.4.8) — `None` when not transmitted.
     pub sh_subpic_id: Option<u32>,
+    /// `sh_slice_address` (§7.4.8). 0 when not transmitted (single-slice
+    /// / single-tile case).
+    pub sh_slice_address: u32,
+    /// `sh_num_tiles_in_slice_minus1` — emitted only under raster-scan
+    /// multi-tile slices.
+    pub sh_num_tiles_in_slice_minus1: u32,
     /// Slice type (§7.4.8). `I` when `ph_inter_slice_allowed_flag == 0`.
     pub sh_slice_type: SliceType,
     pub sh_no_output_of_prior_pics_flag: bool,
@@ -249,11 +255,6 @@ pub fn parse_slice_header_stateful(
     if rbsp.is_empty() {
         return Err(Error::invalid("h266 SH: empty RBSP"));
     }
-    if !pps.pps_no_pic_partition_flag {
-        return Err(Error::unsupported(
-            "h266 SH: stateful parser requires pps_no_pic_partition_flag = 1",
-        ));
-    }
     let mut br = BitReader::new(rbsp);
     let sh_picture_header_in_slice_header_flag = br.u1()? == 1;
     let embedded_picture_header = if sh_picture_header_in_slice_header_flag {
@@ -282,12 +283,45 @@ pub fn parse_slice_header_stateful(
         None
     };
 
-    // sh_slice_address / sh_extra_bit / sh_num_tiles_in_slice_minus1:
-    // the first and third are skipped because the single-slice assumption
-    // implies `NumSlicesInSubpic == 1` and `NumTilesInPic == 1`. The
-    // sh_extra_bit loop still runs — the SPS holds the count.
+    // sh_slice_address width (§7.4.8): Ceil(Log2(NumSlicesInSubpic)) when
+    // rect-slice, Ceil(Log2(NumTilesInPic)) otherwise. The field is only
+    // emitted when the relevant count is > 1.
+    let num_tiles_in_pic = pps
+        .partition
+        .as_ref()
+        .map(|p| p.num_tiles_in_pic)
+        .unwrap_or(1);
+    // NumSlicesInSubpic[CurrSubpicIdx]. CurrSubpicIdx = 0 when subpic
+    // info is absent (§9075 of the spec). Full subpic-aware lookup is
+    // future work; with a single-subpic stream the first entry is
+    // always correct.
+    let num_slices_in_subpic = pps
+        .partition
+        .as_ref()
+        .and_then(|p| p.num_slices_in_subpic.first().copied())
+        .unwrap_or(1);
+    let emit_slice_address = (pps.pps_rect_slice_flag && num_slices_in_subpic > 1)
+        || (!pps.pps_rect_slice_flag && num_tiles_in_pic > 1);
+    let mut sh_slice_address: u32 = 0;
+    if emit_slice_address {
+        let width = if pps.pps_rect_slice_flag {
+            ceil_log2(num_slices_in_subpic)
+        } else {
+            ceil_log2(num_tiles_in_pic)
+        };
+        sh_slice_address = br.u(width)?;
+    }
+
+    // sh_extra_bit loop (SPS-side count).
     for _ in 0..ph_state.num_extra_sh_bits {
         let _ = br.u1()?;
+    }
+
+    // sh_num_tiles_in_slice_minus1 — only when the slice spans more
+    // than one tile under the raster-scan layout (§7.3.7).
+    let mut sh_num_tiles_in_slice_minus1: u32 = 0;
+    if !pps.pps_rect_slice_flag && num_tiles_in_pic - sh_slice_address > 1 {
+        sh_num_tiles_in_slice_minus1 = br.ue()?;
     }
 
     // sh_slice_type — only transmitted when `ph_inter_slice_allowed_flag`.
@@ -310,6 +344,8 @@ pub fn parse_slice_header_stateful(
     out.sh_picture_header_in_slice_header_flag = sh_picture_header_in_slice_header_flag;
     out.embedded_picture_header = embedded_picture_header;
     out.sh_subpic_id = sh_subpic_id;
+    out.sh_slice_address = sh_slice_address;
+    out.sh_num_tiles_in_slice_minus1 = sh_num_tiles_in_slice_minus1;
     out.sh_slice_type = sh_slice_type;
     out.sh_no_output_of_prior_pics_flag = sh_no_output_of_prior_pics_flag;
 
@@ -483,6 +519,14 @@ pub fn parse_slice_header_stateful(
     };
     out.trailing_bit_offset = bit_off;
     Ok(out)
+}
+
+/// `Ceil(Log2(n))` per the VVC convention (`Ceil(Log2(0)) = 0`).
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        return 0;
+    }
+    32 - (n - 1).leading_zeros()
 }
 
 /// Build a fresh byte-aligned buffer that contains the bits of `rbsp`
@@ -674,6 +718,7 @@ mod tests {
             pps_picture_header_extension_present_flag: false,
             pps_slice_header_extension_present_flag: false,
             pps_extension_flag: false,
+            partition: None,
         };
         (sps, pps)
     }
@@ -828,6 +873,50 @@ mod tests {
         assert!(sh.sh_dep_quant_used_flag);
         assert!(!sh.sh_sign_data_hiding_used_flag);
         assert!(!sh.sh_ts_residual_coding_disabled_flag);
+    }
+
+    /// Multi-tile partitioned PPS: when NumTilesInPic > 1 under
+    /// raster-scan slices, sh_slice_address + sh_num_tiles_in_slice_minus1
+    /// must be read.
+    #[test]
+    fn stateful_reads_slice_address_under_partition() {
+        use crate::pps::PicPartition;
+        let (sps, mut pps) = synthetic_sps_pps();
+        pps.pps_rect_slice_flag = false; // raster scan
+        pps.partition = Some(PicPartition {
+            log2_ctu_size_minus5: 2,
+            explicit_col_widths: vec![1, 1],
+            explicit_row_heights: vec![1],
+            col_width_ctbs: vec![1, 1],
+            row_height_ctbs: vec![1],
+            num_tile_columns: 2,
+            num_tile_rows: 1,
+            num_tiles_in_pic: 2,
+            pps_loop_filter_across_tiles_enabled_flag: false,
+            num_slices_in_pic: 1,
+            slice_top_left_tile_idx: vec![],
+            num_slices_in_subpic: vec![1],
+            tile_idx_delta_present_flag: false,
+        });
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        // sh_slice_address is ceil(log2(NumTilesInPic)) = 1 bit.
+        push_u(&mut bits, 1, 1); // sh_slice_address = 1 (second tile)
+        // sh_num_tiles_in_slice_minus1: NumTilesInPic - slice_address = 1,
+        // so `> 1` fails → not emitted.
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert_eq!(sh.sh_slice_address, 1);
+        assert_eq!(sh.sh_num_tiles_in_slice_minus1, 0);
     }
 
     /// sh_slice_header_extension path: with the PPS extension flag set,
