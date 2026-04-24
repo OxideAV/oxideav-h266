@@ -155,10 +155,39 @@ pub struct StatefulSliceHeader {
     pub sh_cb_tc_offset_div2: i32,
     pub sh_cr_beta_offset_div2: i32,
     pub sh_cr_tc_offset_div2: i32,
-    /// Raw tail bytes remaining after the deblocking block — includes
-    /// sh_dep_quant / sh_sign_data_hiding / ts_residual_coding_disabled,
-    /// the reverse_last_sig_coeff flag, slice-header extension bytes,
-    /// entry-point offsets, and byte_alignment().
+    /// `sh_dep_quant_used_flag` (§7.4.8). Inferred to 0 when not present.
+    pub sh_dep_quant_used_flag: bool,
+    /// `sh_sign_data_hiding_used_flag` (§7.4.8). Inferred to 0 when
+    /// not present (including when `sh_dep_quant_used_flag == 1`).
+    pub sh_sign_data_hiding_used_flag: bool,
+    /// `sh_ts_residual_coding_disabled_flag` — gated by TS +
+    /// !dep_quant + !sign-hiding. Inferred to 0 when absent.
+    pub sh_ts_residual_coding_disabled_flag: bool,
+    /// `sh_ts_residual_coding_rice_idx_minus1` (§7.4.8). Only read when
+    /// `sps_ts_residual_coding_rice_present_in_sh_flag` is set, which
+    /// lives in the SPS range extension block. Our SPS parser does not
+    /// walk the range extension, so the flag is effectively 0 and this
+    /// field stays 0.
+    pub sh_ts_residual_coding_rice_idx_minus1: u8,
+    /// `sh_reverse_last_sig_coeff_flag` — same caveat as the rice idx
+    /// above (gated by `sps_reverse_last_sig_coeff_enabled_flag`).
+    pub sh_reverse_last_sig_coeff_flag: bool,
+    /// Raw bytes of `sh_slice_header_extension_data_byte[]`. Length
+    /// equals the transmitted `sh_slice_header_extension_length`.
+    pub sh_slice_header_extension_bytes: Vec<u8>,
+    /// `sh_entry_offset_len_minus1 + 1` (valid only when
+    /// `num_entry_points > 0`). Captured so downstream walkers can
+    /// decode `sh_entry_point_offset_minus1[]` without re-parsing.
+    pub sh_entry_offset_len: u8,
+    /// `sh_entry_point_offset_minus1[i] + 1` — length = `NumEntryPoints`.
+    pub sh_entry_point_offsets: Vec<u64>,
+    /// Bit position of the first `byte_alignment()` bit within the
+    /// input RBSP, i.e. where the `rbsp_slice_trailing_bits()` starts.
+    /// Useful for callers that want to locate the start of the CABAC
+    /// slice data.
+    pub byte_alignment_bit_pos: u64,
+    /// Raw tail bytes remaining *after* `byte_alignment()` (i.e. the
+    /// start of the coded slice data payload).
     pub trailing_bits: Vec<u8>,
     pub trailing_bit_offset: u8,
 }
@@ -375,7 +404,75 @@ pub fn parse_slice_header_stateful(
         }
     }
 
-    // Capture the remainder as trailing bytes for a future increment.
+    // sh_dep_quant_used_flag, sh_sign_data_hiding_used_flag,
+    // sh_ts_residual_coding_disabled_flag, sh_ts_residual_coding_rice_idx_minus1,
+    // sh_reverse_last_sig_coeff_flag — §7.3.7 tail. The SPS range-extension
+    // gates (`sps_ts_residual_coding_rice_present_in_sh_flag`,
+    // `sps_reverse_last_sig_coeff_enabled_flag`) are not yet parsed by
+    // our SPS, so both are treated as 0 (the inference when
+    // `sps_range_extension_flag == 0`, §7.4.3.22).
+    if sps.tool_flags.dep_quant_enabled_flag {
+        out.sh_dep_quant_used_flag = br.u1()? == 1;
+    }
+    if sps.tool_flags.sign_data_hiding_enabled_flag && !out.sh_dep_quant_used_flag {
+        out.sh_sign_data_hiding_used_flag = br.u1()? == 1;
+    }
+    if sps.tool_flags.transform_skip_enabled_flag
+        && !out.sh_dep_quant_used_flag
+        && !out.sh_sign_data_hiding_used_flag
+    {
+        out.sh_ts_residual_coding_disabled_flag = br.u1()? == 1;
+    }
+    // sh_ts_residual_coding_rice_idx_minus1 / sh_reverse_last_sig_coeff_flag
+    // are gated by range-extension SPS flags that default to 0; left unset.
+
+    // Slice-header extension: length + data bytes.
+    if pps.pps_slice_header_extension_present_flag {
+        let ext_len = br.ue()?;
+        if ext_len > 256 {
+            return Err(Error::invalid(format!(
+                "h266 SH: sh_slice_header_extension_length out of range ({ext_len})"
+            )));
+        }
+        for _ in 0..ext_len {
+            out.sh_slice_header_extension_bytes.push(br.u(8)? as u8);
+        }
+    }
+
+    // Entry-point offsets (§7.4.8). Under the single-slice / single-tile
+    // assumption enforced at the top of this function (NumTilesInPic = 1,
+    // NumSlicesInSubpic = 1), NumEntryPoints is 0 whenever
+    // sps_entry_point_offsets_present_flag = 0. When the flag is set and
+    // the slice spans more than one CTU row with entropy-coding-sync, the
+    // count is non-zero — derivation needs the full CTU layout that the
+    // current scaffold does not carry. We refuse the ambiguous case so
+    // the caller can't silently consume the wrong number of bits.
+    if sps.sps_entry_point_offsets_present_flag && sps.sps_entropy_coding_sync_enabled_flag {
+        return Err(Error::unsupported(
+            "h266 SH: entry-point offsets with entropy-coding-sync are not yet walked",
+        ));
+    }
+    // NumEntryPoints = 0 in every supported configuration → skip the
+    // entire `if( NumEntryPoints > 0 )` block.
+
+    // byte_alignment() — §7.3.2.17: a single "1" bit followed by zero or
+    // more "0" bits until byte aligned.
+    out.byte_alignment_bit_pos = br.bit_position();
+    let stop_bit = br.u1()?;
+    if stop_bit != 1 {
+        return Err(Error::invalid(
+            "h266 SH: byte_alignment stop bit != 1",
+        ));
+    }
+    while br.bit_position() % 8 != 0 {
+        let pad = br.u1()?;
+        if pad != 0 {
+            return Err(Error::invalid(
+                "h266 SH: byte_alignment padding bit != 0",
+            ));
+        }
+    }
+
     let bit_pos = br.bit_position();
     let byte_off = (bit_pos / 8) as usize;
     let bit_off = (bit_pos % 8) as u8;
@@ -480,6 +577,14 @@ mod tests {
             out.push(b);
         }
         out
+    }
+    /// Append a `byte_alignment()` (a single `1` bit + zero pad to byte
+    /// boundary) to the bit vector. Mirrors §7.3.2.17.
+    fn push_byte_align(bits: &mut Vec<u8>) {
+        bits.push(1);
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
     }
 
     /// Build a synthetic SPS + PPS pair suitable for exercising the
@@ -594,6 +699,7 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
         push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_byte_align(&mut bits);
         let bytes = pack(&bits);
 
         let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
@@ -601,6 +707,8 @@ mod tests {
         assert_eq!(sh.sh_slice_type, SliceType::I);
         assert!(!sh.sh_no_output_of_prior_pics_flag);
         assert_eq!(sh.sh_qp_delta, 0);
+        assert!(!sh.sh_dep_quant_used_flag);
+        assert!(sh.sh_slice_header_extension_bytes.is_empty());
     }
 
     /// Inter slice (B, sh_slice_type = 0). ph_inter_slice_allowed = 1 →
@@ -622,6 +730,7 @@ mod tests {
         push_ue(&mut bits, 0); // sh_slice_type = B
                                 // no sh_no_output_of_prior_pics_flag (NalUnitType::TrailNut)
         push_u(&mut bits, 1, 1); // sh_cabac_init_flag = 1
+        push_byte_align(&mut bits);
         let bytes = pack(&bits);
 
         let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
@@ -648,6 +757,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
         push_u(&mut bits, 1, 1); // sh_sao_luma_used_flag
         push_u(&mut bits, 1, 1); // sh_sao_chroma_used_flag
+        push_byte_align(&mut bits);
         let bytes = pack(&bits);
 
         let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
@@ -679,6 +789,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // sh_deblocking_filter_disabled_flag = 0
         push_se(&mut bits, 2); // sh_luma_beta_offset_div2
         push_se(&mut bits, -1); // sh_luma_tc_offset_div2
+        push_byte_align(&mut bits);
         let bytes = pack(&bits);
 
         let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
@@ -686,5 +797,67 @@ mod tests {
         assert!(!sh.sh_deblocking_filter_disabled_flag);
         assert_eq!(sh.sh_luma_beta_offset_div2, 2);
         assert_eq!(sh.sh_luma_tc_offset_div2, -1);
+    }
+
+    /// sh_dep_quant_used_flag path: with sps_dep_quant_enabled_flag set,
+    /// the stateful parser must read the flag. Once set it suppresses
+    /// sh_sign_data_hiding_used_flag + sh_ts_residual_coding_disabled_flag.
+    #[test]
+    fn stateful_tail_reads_dep_quant_and_gates_followers() {
+        let (mut sps, pps) = synthetic_sps_pps();
+        sps.tool_flags.dep_quant_enabled_flag = true;
+        sps.tool_flags.sign_data_hiding_enabled_flag = true;
+        sps.tool_flags.transform_skip_enabled_flag = true;
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_u(&mut bits, 1, 1); // sh_dep_quant_used_flag = 1
+        // sh_sign_data_hiding_used_flag + sh_ts_residual_coding_disabled_flag
+        // both suppressed because dep_quant == 1.
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(sh.sh_dep_quant_used_flag);
+        assert!(!sh.sh_sign_data_hiding_used_flag);
+        assert!(!sh.sh_ts_residual_coding_disabled_flag);
+    }
+
+    /// sh_slice_header_extension path: with the PPS extension flag set,
+    /// the parser reads ext_len + ext_len bytes of opaque data.
+    #[test]
+    fn stateful_tail_reads_slice_header_extension() {
+        let (sps, mut pps) = synthetic_sps_pps();
+        pps.pps_slice_header_extension_present_flag = true;
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        // sh_slice_header_extension_length = 2 → ue "011".
+        push_ue(&mut bits, 2);
+        for _ in 0..8 {
+            bits.push(1); // sh_slice_header_extension_data_byte[0] = 0xFF
+        }
+        for _ in 0..8 {
+            bits.push(0); // sh_slice_header_extension_data_byte[1] = 0x00
+        }
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert_eq!(sh.sh_slice_header_extension_bytes, vec![0xFF, 0x00]);
     }
 }
