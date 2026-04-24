@@ -35,6 +35,7 @@ pub mod coding_tree;
 pub mod ctx;
 pub mod dci;
 pub mod decoder;
+pub mod hrd;
 pub mod intra;
 pub mod nal;
 pub mod opi;
