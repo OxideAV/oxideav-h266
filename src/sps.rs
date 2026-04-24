@@ -30,6 +30,10 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::hrd::{
+    parse_general_timing_hrd_parameters, parse_ols_timing_hrd_parameters,
+    GeneralTimingHrdParameters, OlsTimingHrdParameters,
+};
 use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
 
 #[derive(Clone, Debug)]
@@ -60,6 +64,70 @@ pub struct SeqParameterSet {
     pub dpb_parameters: Option<DpbParameters>,
     pub partition_constraints: PartitionConstraints,
     pub tool_flags: ToolFlags,
+    /// Subpicture info block (§7.4.3.4). `None` when
+    /// `sps_subpic_info_present_flag == 0`.
+    pub subpic_info: Option<SubpicInfo>,
+    /// `sps_timing_hrd_params_present_flag` — only transmitted when
+    /// `sps_ptl_dpb_hrd_params_present_flag == 1`.
+    pub sps_timing_hrd_params_present_flag: bool,
+    /// `general_timing_hrd_parameters()` block from §7.3.5.1. Present
+    /// when `sps_timing_hrd_params_present_flag == 1`.
+    pub general_timing_hrd: Option<GeneralTimingHrdParameters>,
+    /// `sps_sublayer_cpb_params_present_flag` — controls `firstSubLayer`
+    /// passed to `ols_timing_hrd_parameters()`.
+    pub sps_sublayer_cpb_params_present_flag: bool,
+    /// `ols_timing_hrd_parameters()` block from §7.3.5.2. Present
+    /// alongside `general_timing_hrd`.
+    pub ols_timing_hrd: Option<OlsTimingHrdParameters>,
+    /// `sps_field_seq_flag` (§7.4.3.4).
+    pub sps_field_seq_flag: bool,
+    /// `sps_vui_parameters_present_flag` (§7.4.3.4). When set, the
+    /// `vui_parameters()` bytes are captured verbatim in
+    /// [`Self::vui_payload`] (the reference decoder treats them as
+    /// opaque — see ITU-T H.274).
+    pub sps_vui_parameters_present_flag: bool,
+    /// Raw VUI payload bytes. The first byte starts at
+    /// `vui_payload_bit_offset` within the SPS RBSP — kept for
+    /// later increments that wire the H.274 parser in.
+    pub vui_payload: Vec<u8>,
+    /// `sps_extension_flag` (§7.4.3.4).
+    pub sps_extension_flag: bool,
+    /// `sps_range_extension_flag` — only transmitted under
+    /// `sps_extension_flag == 1`.
+    pub sps_range_extension_flag: bool,
+    /// `sps_extension_7bits` (§7.4.3.4).
+    pub sps_extension_7bits: u8,
+}
+
+/// Subpicture info block (§7.4.3.4, gated by
+/// `sps_subpic_info_present_flag == 1`).
+#[derive(Clone, Debug, Default)]
+pub struct SubpicInfo {
+    pub num_subpics_minus1: u32,
+    pub independent_subpics_flag: bool,
+    pub subpic_same_size_flag: bool,
+    pub subpics: Vec<SubpicEntry>,
+    pub subpic_id_len_minus1: u32,
+    pub subpic_id_mapping_explicitly_signalled_flag: bool,
+    pub subpic_id_mapping_present_flag: bool,
+    /// `sps_subpic_id[i]` values when the mapping is signalled in-SPS.
+    pub subpic_ids: Vec<u32>,
+}
+
+/// Per-subpicture entry. Fields inherit the spec's inference rules
+/// (§7.4.3.4, subpic block): a missing top-left offset is inferred
+/// to 0 or a position derived from the same-size grid; a missing
+/// width/height defaults to the residual of the picture-relative CTU
+/// grid; `treated_as_pic_flag` defaults to 1 and
+/// `loop_filter_across_subpic_enabled_flag` to 0 when not present.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SubpicEntry {
+    pub ctu_top_left_x: u32,
+    pub ctu_top_left_y: u32,
+    pub width_minus1: u32,
+    pub height_minus1: u32,
+    pub treated_as_pic_flag: bool,
+    pub loop_filter_across_subpic_enabled_flag: bool,
 }
 
 /// SPS conformance-cropping window (§7.4.3.4).
@@ -412,15 +480,23 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         None
     };
     let sps_subpic_info_present_flag = br.u1()? == 1;
-    if sps_subpic_info_present_flag {
-        // The subpic sub-syntax contains u(v) fields whose width is
-        // derived from `CtbSizeY` and the picture dimensions. Decoding
-        // those correctly is out of foundation scope; we surface an
-        // Unsupported error so callers know the SPS parse was aborted.
-        return Err(Error::unsupported(
-            "h266 SPS: sps_subpic_info_present_flag = 1 (subpicture streams not yet supported)",
-        ));
-    }
+    // CtbSizeY = 1 << (log2_ctu_size_minus5 + 5).
+    let ctb_size_y: u32 = 1u32 << (sps_log2_ctu_size_minus5 as u32 + 5);
+    let subpic_info = if sps_subpic_info_present_flag {
+        if sps_res_change_in_clvs_allowed_flag {
+            return Err(Error::invalid(
+                "h266 SPS: sps_res_change_in_clvs_allowed_flag == 1 disallows sps_subpic_info_present_flag == 1",
+            ));
+        }
+        Some(parse_subpic_info(
+            &mut br,
+            sps_pic_width_max_in_luma_samples,
+            sps_pic_height_max_in_luma_samples,
+            ctb_size_y,
+        )?)
+    } else {
+        None
+    };
     let sps_bitdepth_minus8 = br.ue()?;
     if sps_bitdepth_minus8 > 8 {
         return Err(Error::invalid(format!(
@@ -472,9 +548,87 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         sps_log2_max_pic_order_cnt_lsb_minus4,
     )?;
 
-    // The rest of the SPS (HRD timing, VUI payload, sps_extension_*) is
-    // intentionally not parsed by this scaffold. Callers that need it
-    // will extend the parser in a follow-up increment.
+    // ---- HRD timing block (§7.3.2.4 / §7.3.5) ----
+    let mut sps_timing_hrd_params_present_flag = false;
+    let mut general_timing_hrd: Option<GeneralTimingHrdParameters> = None;
+    let mut sps_sublayer_cpb_params_present_flag = false;
+    let mut ols_timing_hrd: Option<OlsTimingHrdParameters> = None;
+    if sps_ptl_dpb_hrd_params_present_flag {
+        sps_timing_hrd_params_present_flag = br.u1()? == 1;
+        if sps_timing_hrd_params_present_flag {
+            let g = parse_general_timing_hrd_parameters(&mut br)?;
+            if sps_max_sublayers_minus1 > 0 {
+                sps_sublayer_cpb_params_present_flag = br.u1()? == 1;
+            }
+            let first_sub_layer = if sps_sublayer_cpb_params_present_flag {
+                0u8
+            } else {
+                sps_max_sublayers_minus1
+            };
+            let o = parse_ols_timing_hrd_parameters(
+                &mut br,
+                &g,
+                first_sub_layer,
+                sps_max_sublayers_minus1,
+            )?;
+            general_timing_hrd = Some(g);
+            ols_timing_hrd = Some(o);
+        }
+    }
+
+    // ---- field_seq / VUI / extension tail (§7.3.2.4) ----
+    let sps_field_seq_flag = br.u1()? == 1;
+    let sps_vui_parameters_present_flag = br.u1()? == 1;
+    let vui_payload = if sps_vui_parameters_present_flag {
+        let payload_size = br.ue()? + 1;
+        // vui_alignment_zero_bits to the next byte boundary.
+        while !br.is_byte_aligned() {
+            if br.u1()? != 0 {
+                return Err(Error::invalid(
+                    "h266 SPS: sps_vui_alignment_zero_bit shall be 0",
+                ));
+            }
+        }
+        // Cap payload_size — runaway values would exhaust the buffer.
+        let max_vui = (br.bits_remaining() / 8) as u32;
+        if payload_size > max_vui {
+            return Err(Error::invalid(format!(
+                "h266 SPS: sps_vui_payload_size_minus1 + 1 ({payload_size}) exceeds remaining bytes ({max_vui})"
+            )));
+        }
+        let mut buf = Vec::with_capacity(payload_size as usize);
+        for _ in 0..payload_size {
+            buf.push(br.u(8)? as u8);
+        }
+        buf
+    } else {
+        Vec::new()
+    };
+    let sps_extension_flag = br.u1()? == 1;
+    let mut sps_range_extension_flag = false;
+    let mut sps_extension_7bits: u8 = 0;
+    if sps_extension_flag {
+        sps_range_extension_flag = br.u1()? == 1;
+        sps_extension_7bits = br.u(7)? as u8;
+        if sps_range_extension_flag {
+            // §7.3.2.5 defines `sps_range_extension()`. The foundation
+            // pass does not implement it — surface an Unsupported error
+            // so callers can detect the condition.
+            return Err(Error::unsupported(
+                "h266 SPS: sps_range_extension() not yet implemented",
+            ));
+        }
+    }
+    // `if (sps_extension_7bits) while(more_rbsp_data()) u(1)` — consume
+    // the extension-data flag tail. Our `has_more_rbsp_data` probe
+    // already handles the stop-bit detection, so this loop is a no-op
+    // when only the rbsp_stop_one_bit remains.
+    if sps_extension_7bits != 0 {
+        while br.has_more_rbsp_data() {
+            br.u1()?;
+        }
+    }
+
     Ok(SeqParameterSet {
         sps_seq_parameter_set_id,
         sps_video_parameter_set_id,
@@ -502,6 +656,152 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         dpb_parameters,
         partition_constraints,
         tool_flags,
+        subpic_info,
+        sps_timing_hrd_params_present_flag,
+        general_timing_hrd,
+        sps_sublayer_cpb_params_present_flag,
+        ols_timing_hrd,
+        sps_field_seq_flag,
+        sps_vui_parameters_present_flag,
+        vui_payload,
+        sps_extension_flag,
+        sps_range_extension_flag,
+        sps_extension_7bits,
+    })
+}
+
+/// Helper: `Ceil( Log2( n ) )` for non-negative `n` (spec §4 notation).
+/// Zero and one map to 0; otherwise returns the smallest non-negative
+/// integer `k` such that `(1 << k) >= n`.
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        return 0;
+    }
+    32 - (n - 1).leading_zeros()
+}
+
+/// Parse the subpicture block from §7.4.3.4 (gated by
+/// `sps_subpic_info_present_flag == 1`).
+fn parse_subpic_info(
+    br: &mut BitReader<'_>,
+    pic_width_max: u32,
+    pic_height_max: u32,
+    ctb_size_y: u32,
+) -> Result<SubpicInfo> {
+    let num_subpics_minus1 = br.ue()?;
+    // §7.4.3.4: sps_num_subpics_minus1 < MaxSlicesPerAu. MaxSlicesPerAu
+    // is profile-dependent but ≤ 600; we accept up to 4095 to stay
+    // forward-compatible without inviting runaway allocation.
+    if num_subpics_minus1 > 4095 {
+        return Err(Error::invalid(format!(
+            "h266 SPS: sps_num_subpics_minus1 out of range ({num_subpics_minus1})"
+        )));
+    }
+    let (independent_subpics_flag, subpic_same_size_flag) = if num_subpics_minus1 > 0 {
+        (br.u1()? == 1, br.u1()? == 1)
+    } else {
+        // When not present they are inferred to 1 and 0 respectively
+        // (§7.4.3.4, subpic semantics).
+        (true, false)
+    };
+
+    let tmp_width_val = (pic_width_max + ctb_size_y - 1) / ctb_size_y;
+    let tmp_height_val = (pic_height_max + ctb_size_y - 1) / ctb_size_y;
+    let top_left_x_len = ceil_log2(tmp_width_val);
+    let top_left_y_len = ceil_log2(tmp_height_val);
+    let width_len = top_left_x_len;
+    let height_len = top_left_y_len;
+
+    let mut subpics: Vec<SubpicEntry> = Vec::with_capacity((num_subpics_minus1 + 1) as usize);
+    // numSubpicCols derived when subpic_same_size_flag == 1.
+    let mut num_subpic_cols: u32 = 1;
+    for i in 0..=num_subpics_minus1 {
+        let mut entry = SubpicEntry::default();
+        if !subpic_same_size_flag || i == 0 {
+            if i > 0 && pic_width_max > ctb_size_y && top_left_x_len > 0 {
+                entry.ctu_top_left_x = br.u(top_left_x_len)?;
+            }
+            if i > 0 && pic_height_max > ctb_size_y && top_left_y_len > 0 {
+                entry.ctu_top_left_y = br.u(top_left_y_len)?;
+            }
+            if i < num_subpics_minus1 && pic_width_max > ctb_size_y && width_len > 0 {
+                entry.width_minus1 = br.u(width_len)?;
+            } else {
+                // Inferred residual (§7.4.3.4): tmpWidthVal - top_left_x - 1.
+                entry.width_minus1 = tmp_width_val
+                    .saturating_sub(entry.ctu_top_left_x)
+                    .saturating_sub(1);
+            }
+            if i < num_subpics_minus1 && pic_height_max > ctb_size_y && height_len > 0 {
+                entry.height_minus1 = br.u(height_len)?;
+            } else {
+                entry.height_minus1 = tmp_height_val
+                    .saturating_sub(entry.ctu_top_left_y)
+                    .saturating_sub(1);
+            }
+        } else {
+            // subpic_same_size_flag == 1 and i > 0 → all geometry is
+            // derived from entry 0 plus the subpicture index.
+            let w0 = subpics[0].width_minus1 + 1;
+            let h0 = subpics[0].height_minus1 + 1;
+            if i == 1 {
+                // Compute numSubpicCols exactly once, when we have the
+                // first entry's geometry in hand (equation 37).
+                num_subpic_cols = tmp_width_val / w0;
+                if num_subpic_cols == 0 {
+                    return Err(Error::invalid(
+                        "h266 SPS: subpic_same_size_flag => tmpWidthVal / (w0+1) must be > 0",
+                    ));
+                }
+            }
+            entry.ctu_top_left_x = (i % num_subpic_cols) * w0;
+            entry.ctu_top_left_y = (i / num_subpic_cols) * h0;
+            entry.width_minus1 = subpics[0].width_minus1;
+            entry.height_minus1 = subpics[0].height_minus1;
+        }
+        if !independent_subpics_flag {
+            entry.treated_as_pic_flag = br.u1()? == 1;
+            entry.loop_filter_across_subpic_enabled_flag = br.u1()? == 1;
+        } else {
+            // Inferred per §7.4.3.4.
+            entry.treated_as_pic_flag = true;
+            entry.loop_filter_across_subpic_enabled_flag = false;
+        }
+        subpics.push(entry);
+    }
+
+    let subpic_id_len_minus1 = br.ue()?;
+    if subpic_id_len_minus1 > 15 {
+        return Err(Error::invalid(format!(
+            "h266 SPS: sps_subpic_id_len_minus1 out of range ({subpic_id_len_minus1})"
+        )));
+    }
+    let subpic_id_mapping_explicitly_signalled_flag = br.u1()? == 1;
+    let (subpic_id_mapping_present_flag, subpic_ids) =
+        if subpic_id_mapping_explicitly_signalled_flag {
+            let present = br.u1()? == 1;
+            let mut ids = Vec::new();
+            if present {
+                let id_width = subpic_id_len_minus1 + 1;
+                ids.reserve((num_subpics_minus1 + 1) as usize);
+                for _ in 0..=num_subpics_minus1 {
+                    ids.push(br.u(id_width)?);
+                }
+            }
+            (present, ids)
+        } else {
+            (false, Vec::new())
+        };
+
+    Ok(SubpicInfo {
+        num_subpics_minus1,
+        independent_subpics_flag,
+        subpic_same_size_flag,
+        subpics,
+        subpic_id_len_minus1,
+        subpic_id_mapping_explicitly_signalled_flag,
+        subpic_id_mapping_present_flag,
+        subpic_ids,
     })
 }
 
@@ -1088,6 +1388,13 @@ mod tests {
         push_u(&mut bits, 0, 1); // dep_quant
         push_u(&mut bits, 0, 1); // sign_data_hiding
         push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
+                                 // Tail block (§7.3.2.4): no HRD timing (ptl_dpb_hrd=0 →
+                                 // sps_timing_hrd_params_present_flag is not emitted), then
+                                 // sps_field_seq_flag=0, sps_vui_parameters_present_flag=0,
+                                 // sps_extension_flag=0.
+        push_u(&mut bits, 0, 1); // sps_field_seq_flag
+        push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
+        push_u(&mut bits, 0, 1); // sps_extension_flag
         bits
     }
 
@@ -1140,10 +1447,124 @@ mod tests {
         assert!(!t.virtual_boundaries_enabled_flag);
     }
 
+    /// An SPS with `sps_subpic_info_present_flag = 1` and a single
+    /// subpicture (num_subpics_minus1 = 0) parses successfully, with
+    /// the derived geometry inferred from the picture dimensions.
     #[test]
-    fn subpic_streams_are_rejected() {
-        // Same preamble as above but flip subpic_info_present to 1; the
-        // parser should return Unsupported before reading anything else.
+    fn single_subpicture_sps_parses() {
+        // Build a minimal SPS but flip subpic_info_present = 1 and
+        // supply `sps_num_subpics_minus1 = 0` + `sps_subpic_id_len_minus1 = 0`
+        // + `sps_subpic_id_mapping_explicitly_signalled_flag = 0`. Nothing
+        // in the per-subpicture loop is transmitted because all gates
+        // close on i == 0 / i == num_subpics_minus1.
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 4); // vps_id
+        push_u(&mut bits, 0, 3); // max_sublayers
+        push_u(&mut bits, 1, 2); // chroma = 4:2:0
+        push_u(&mut bits, 2, 2); // log2_ctu - 5 = 2 → CTB = 128
+        push_u(&mut bits, 0, 1); // ptl_present
+        push_u(&mut bits, 0, 1); // gdr
+        push_u(&mut bits, 0, 1); // ref_pic_resampling (=> no res_change)
+        push_ue(&mut bits, 320); // width
+        push_ue(&mut bits, 240); // height
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 1, 1); // subpic_info_present = 1
+                                 // Subpic block: num_subpics_minus1 = 0 → no indep/same flags,
+                                 // no per-entry loop body.
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0); // subpic_id_len_minus1 = 0
+        push_u(&mut bits, 0, 1); // subpic_id_mapping_explicitly_signalled_flag = 0
+                                 // Continue with the usual identifier tail.
+        push_ue(&mut bits, 2); // bitdepth_minus8
+        push_u(&mut bits, 0, 1); // entropy_coding_sync
+        push_u(&mut bits, 0, 1); // entry_point_offsets
+        push_u(&mut bits, 4, 4); // log2_max_poc_lsb_minus4 = 4
+        push_u(&mut bits, 0, 1); // poc_msb_cycle
+        push_u(&mut bits, 0, 2); // num_extra_ph_bytes
+        push_u(&mut bits, 0, 2); // num_extra_sh_bytes
+                                 // Partition constraints — all-zero.
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1);
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // qtbtt_dual_tree_intra = 0
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // max_luma_transform_size_64 (CtbSizeY=128)
+                                 // Tool flags — mirror build_minimal_sps_bits' minimal tail.
+        push_u(&mut bits, 0, 1); // transform_skip
+        push_u(&mut bits, 0, 1); // mts
+        push_u(&mut bits, 0, 1); // lfnst
+        push_u(&mut bits, 0, 1); // joint_cbcr
+        push_u(&mut bits, 1, 1); // same_qp_table_for_chroma
+        push_se(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // sao
+        push_u(&mut bits, 0, 1); // alf
+        push_u(&mut bits, 0, 1); // lmcs
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // long_term_ref_pics
+        push_u(&mut bits, 0, 1); // idr_rpl
+        push_u(&mut bits, 0, 1); // rpl1_same_as_rpl0
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_u(&mut bits, 0, 1); // temporal_mvp
+        push_u(&mut bits, 0, 1); // amvr
+        push_u(&mut bits, 0, 1); // bdof
+        push_u(&mut bits, 0, 1); // smvd
+        push_u(&mut bits, 0, 1); // dmvr
+        push_u(&mut bits, 0, 1); // mmvd
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // sbt
+        push_u(&mut bits, 0, 1); // affine
+        push_u(&mut bits, 0, 1); // bcw
+        push_u(&mut bits, 0, 1); // ciip
+        push_u(&mut bits, 0, 1); // gpm
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // isp
+        push_u(&mut bits, 0, 1); // mrl
+        push_u(&mut bits, 0, 1); // mip
+        push_u(&mut bits, 0, 1); // cclm
+        push_u(&mut bits, 0, 1); // chroma_horizontal_collocated
+        push_u(&mut bits, 0, 1); // chroma_vertical_collocated
+        push_u(&mut bits, 0, 1); // palette
+        push_u(&mut bits, 0, 1); // ibc
+        push_u(&mut bits, 0, 1); // ladf
+        push_u(&mut bits, 0, 1); // explicit_scaling_list
+        push_u(&mut bits, 0, 1); // dep_quant
+        push_u(&mut bits, 0, 1); // sign_data_hiding
+        push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
+        push_u(&mut bits, 0, 1); // sps_field_seq_flag
+        push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
+        push_u(&mut bits, 0, 1); // sps_extension_flag
+
+        let bytes = pack(&bits);
+        let sps = parse_sps(&bytes).unwrap();
+        assert!(sps.sps_subpic_info_present_flag);
+        let sp = sps.subpic_info.as_ref().expect("subpic block parsed");
+        assert_eq!(sp.num_subpics_minus1, 0);
+        assert_eq!(sp.subpics.len(), 1);
+        // Inferred: treated_as_pic_flag = 1 (independent subpics flag
+        // inferred to 1), loop-filter flag = 0.
+        assert!(sp.subpics[0].treated_as_pic_flag);
+        assert!(!sp.subpics[0].loop_filter_across_subpic_enabled_flag);
+        // tmpWidthVal = ceil(320/128) = 3, height = ceil(240/128) = 2.
+        // Since i == 0 and i == num_subpics_minus1, width/height are
+        // inferred to (tmpWidthVal - top_left - 1), i.e. full grid.
+        assert_eq!(sp.subpics[0].width_minus1, 2);
+        assert_eq!(sp.subpics[0].height_minus1, 1);
+        assert!(!sp.subpic_id_mapping_explicitly_signalled_flag);
+    }
+
+    /// SPS with `sps_res_change_in_clvs_allowed_flag = 1` cannot have
+    /// subpic info — the parser rejects that combination.
+    #[test]
+    fn subpic_info_with_res_change_rejected() {
         let mut bits: Vec<u8> = Vec::new();
         push_u(&mut bits, 0, 4); // sps_id
         push_u(&mut bits, 0, 4); // vps_id
@@ -1152,9 +1573,10 @@ mod tests {
         push_u(&mut bits, 0, 2); // log2_ctu - 5 = 0 → 32
         push_u(&mut bits, 0, 1); // ptl_present
         push_u(&mut bits, 0, 1); // gdr
-        push_u(&mut bits, 0, 1); // ref_pic_resampling
-        push_ue(&mut bits, 320); // width
-        push_ue(&mut bits, 240); // height
+        push_u(&mut bits, 1, 1); // ref_pic_resampling = 1
+        push_u(&mut bits, 1, 1); // res_change_in_clvs_allowed = 1
+        push_ue(&mut bits, 320);
+        push_ue(&mut bits, 240);
         push_u(&mut bits, 0, 1); // conformance_window_flag
         push_u(&mut bits, 1, 1); // subpic_info_present = 1
         let bytes = pack(&bits);
@@ -1257,6 +1679,10 @@ mod tests {
         push_u(&mut bits, 0, 1); // dep_quant
         push_u(&mut bits, 0, 1); // sign_data_hiding
         push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
+                                 // Tail: field_seq=0, vui=0, ext=0.
+        push_u(&mut bits, 0, 1); // sps_field_seq_flag
+        push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
+        push_u(&mut bits, 0, 1); // sps_extension_flag
 
         let bytes = pack(&bits);
         let sps = parse_sps(&bytes).unwrap();
@@ -1363,6 +1789,10 @@ mod tests {
         push_u(bits, 0, 1); // dep_quant
         push_u(bits, 0, 1); // sign_data_hiding
         push_u(bits, 0, 1); // virtual_boundaries_enabled
+                            // Tail: no HRD (ptl_dpb_hrd=0), field_seq=0, vui=0, ext=0.
+        push_u(bits, 0, 1); // sps_field_seq_flag
+        push_u(bits, 0, 1); // sps_vui_parameters_present_flag
+        push_u(bits, 0, 1); // sps_extension_flag
     }
 
     #[test]
@@ -1600,6 +2030,10 @@ mod tests {
         push_u(&mut bits, 0, 1); // dep_quant
         push_u(&mut bits, 0, 1); // sign_data_hiding
         push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
+                                 // Tail: field_seq=0, vui=0, ext=0.
+        push_u(&mut bits, 0, 1); // sps_field_seq_flag
+        push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
+        push_u(&mut bits, 0, 1); // sps_extension_flag
 
         let bytes = pack(&bits);
         let sps = parse_sps(&bytes).unwrap();
