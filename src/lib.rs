@@ -29,6 +29,7 @@
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;
+pub mod coding_tree;
 pub mod ctx;
 pub mod decoder;
 pub mod intra;
