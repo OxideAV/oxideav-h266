@@ -17,6 +17,8 @@
 //!   header parsing (§7.3.1.2), emulation-prevention byte stripping.
 //! * [`decoder`] — registry factory; returns `Error::Unsupported` for any
 //!   packet that would require pixel output (no CTU reconstruction yet).
+//! * [`dci`] — Decoding Capability Information parser (§7.3.2.1).
+//! * [`opi`] — Operating Point Information parser (§7.3.2.2).
 //!
 //! ## Spec reference
 //!
@@ -31,9 +33,11 @@ pub mod bitreader;
 pub mod cabac;
 pub mod coding_tree;
 pub mod ctx;
+pub mod dci;
 pub mod decoder;
 pub mod intra;
 pub mod nal;
+pub mod opi;
 pub mod picture_header;
 pub mod pps;
 pub mod ptl;
