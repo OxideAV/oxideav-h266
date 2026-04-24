@@ -115,6 +115,174 @@ pub fn predict_dc(
     Ok(vec![dc; n_tb_w * n_tb_h])
 }
 
+/// Fill missing reference samples per §8.4.5.2.8.
+///
+/// Spec-exact substitution: the top-left, above, and left arrays are
+/// padded from the nearest available sample. In this foundation
+/// implementation the caller passes pre-populated arrays with the
+/// "missing" mask; we scan for the first available sample and
+/// replicate from there. When none are available, replicate
+/// `1 << (BitDepth - 1)` (mid-grey).
+///
+/// * `above[x]`, `left[y]` — current reference-sample values (in-place).
+/// * `above_avail[x]`, `left_avail[y]` — `true` if the sample exists.
+/// * `top_left_avail` — availability of `p[-1][-1]`.
+/// * `mid` — fallback sample = `1 << (BitDepth - 1)`.
+pub fn substitute_references(
+    above: &mut [i16],
+    left: &mut [i16],
+    top_left: &mut i16,
+    above_avail: &[bool],
+    left_avail: &[bool],
+    top_left_avail: bool,
+    mid: i16,
+) {
+    let any_above = above_avail.iter().any(|&b| b);
+    let any_left = left_avail.iter().any(|&b| b);
+    // First available sample (scan order: top-left → above → left).
+    let mut first: Option<i16> = None;
+    if top_left_avail {
+        first = Some(*top_left);
+    } else if any_above {
+        for (i, &av) in above_avail.iter().enumerate() {
+            if av {
+                first = Some(above[i]);
+                break;
+            }
+        }
+    } else if any_left {
+        for (i, &av) in left_avail.iter().enumerate() {
+            if av {
+                first = Some(left[i]);
+                break;
+            }
+        }
+    }
+    let fallback = first.unwrap_or(mid);
+    if !top_left_avail {
+        *top_left = fallback;
+    }
+    for (i, &av) in above_avail.iter().enumerate() {
+        if !av {
+            above[i] = fallback;
+        }
+    }
+    for (i, &av) in left_avail.iter().enumerate() {
+        if !av {
+            left[i] = fallback;
+        }
+    }
+}
+
+/// Angular intra prediction — minimal subset (§8.4.5.2.13).
+///
+/// Only the five cardinal / diagonal modes are supported in this
+/// foundation increment:
+///
+/// * Mode 2 — bottom-left diagonal.
+/// * Mode 18 — pure horizontal.
+/// * Mode 34 — top-left diagonal (45° down-right from the above
+///   reference).
+/// * Mode 50 — pure vertical.
+/// * Mode 66 — top-right diagonal.
+///
+/// The general interpolation pipeline (wide-angle remap, reference
+/// filter, 4-tap cubic / Gaussian filter) is not yet implemented —
+/// this subset uses nearest-neighbour sampling so it can produce
+/// plausible output for sanity tests.
+pub fn predict_angular(
+    n_tb_w: usize,
+    n_tb_h: usize,
+    mode: u32,
+    refs: &IntraRefs<'_>,
+) -> Result<Vec<i16>> {
+    let w = n_tb_w;
+    let h = n_tb_h;
+    match mode {
+        18 => {
+            // Horizontal: each row takes its left-reference sample.
+            if refs.left.len() < h {
+                return Err(Error::invalid("h266 intra horizontal: left too short"));
+            }
+            let mut out = vec![0i16; w * h];
+            for y in 0..h {
+                let v = refs.left[y];
+                for x in 0..w {
+                    out[y * w + x] = v;
+                }
+            }
+            Ok(out)
+        }
+        50 => {
+            // Vertical: each column takes its above-reference sample.
+            if refs.above.len() < w {
+                return Err(Error::invalid("h266 intra vertical: above too short"));
+            }
+            let mut out = vec![0i16; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    out[y * w + x] = refs.above[x];
+                }
+            }
+            Ok(out)
+        }
+        2 => {
+            // Bottom-left diagonal: pred[y][x] = left[y + x + 1] with
+            // clamp to the last available left sample.
+            if refs.left.len() < h {
+                return Err(Error::invalid("h266 intra mode 2: left too short"));
+            }
+            let mut out = vec![0i16; w * h];
+            let max_i = refs.left.len() - 1;
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = core::cmp::min(y + x + 1, max_i);
+                    out[y * w + x] = refs.left[idx];
+                }
+            }
+            Ok(out)
+        }
+        66 => {
+            // Top-right diagonal: pred[y][x] = above[y + x + 1].
+            if refs.above.len() < w {
+                return Err(Error::invalid("h266 intra mode 66: above too short"));
+            }
+            let mut out = vec![0i16; w * h];
+            let max_i = refs.above.len() - 1;
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = core::cmp::min(y + x + 1, max_i);
+                    out[y * w + x] = refs.above[idx];
+                }
+            }
+            Ok(out)
+        }
+        34 => {
+            // Top-left diagonal: pred[y][x] selects from the main
+            // reference running along the top-left diagonal —
+            // above[x - y - 1] when x > y else left[y - x - 1]; the
+            // corner sample `p[-1][-1]` covers x == y.
+            let mut out = vec![0i16; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let v = if x > y {
+                        refs.above[x - y - 1]
+                    } else if y > x {
+                        refs.left[y - x - 1]
+                    } else {
+                        refs.top_left
+                    };
+                    out[y * w + x] = v;
+                }
+            }
+            Ok(out)
+        }
+        other => Err(Error::unsupported(format!(
+            "h266 intra: angular mode {other} not in minimal subset (2/18/34/50/66)"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +392,158 @@ mod tests {
             top_left: 0,
         };
         assert!(predict_planar(4, 4, &refs).is_err());
+    }
+
+    /// Mode 18 (horizontal): each row equals the left[y] value.
+    #[test]
+    fn angular_mode_18_horizontal_replicates_rows() {
+        let above = vec![0i16; 5];
+        let left = vec![10, 20, 30, 40, 50];
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 0,
+        };
+        let p = predict_angular(4, 4, 18, &refs).unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(p[y * 4 + x], left[y]);
+            }
+        }
+    }
+
+    /// Mode 50 (vertical): each column equals the above[x] value.
+    #[test]
+    fn angular_mode_50_vertical_replicates_cols() {
+        let above = vec![10, 20, 30, 40, 50];
+        let left = vec![0i16; 5];
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 0,
+        };
+        let p = predict_angular(4, 4, 50, &refs).unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(p[y * 4 + x], above[x]);
+            }
+        }
+    }
+
+    /// Mode 2 (bottom-left diagonal): pred[y][x] = left[y + x + 1].
+    #[test]
+    fn angular_mode_2_bottom_left_diagonal() {
+        let above = vec![0i16; 5];
+        let left: Vec<i16> = (0..9).map(|i| i * 10).collect();
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 0,
+        };
+        let p = predict_angular(4, 4, 2, &refs).unwrap();
+        assert_eq!(p[0], 10); // y=0, x=0 → left[1] = 10
+        assert_eq!(p[3], 40); // y=0, x=3 → left[4] = 40
+        assert_eq!(p[12], 40); // y=3, x=0 → left[4] = 40
+    }
+
+    /// Mode 66 (top-right diagonal): pred[y][x] = above[y + x + 1].
+    #[test]
+    fn angular_mode_66_top_right_diagonal() {
+        let above: Vec<i16> = (0..9).map(|i| i * 10).collect();
+        let left = vec![0i16; 5];
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 0,
+        };
+        let p = predict_angular(4, 4, 66, &refs).unwrap();
+        assert_eq!(p[0], 10);
+        assert_eq!(p[3], 40);
+        assert_eq!(p[12], 40);
+    }
+
+    /// Mode 34 (top-left diagonal): diagonal axis = top-left;
+    /// x == y cells take the corner; x > y comes from above; x < y
+    /// comes from left.
+    #[test]
+    fn angular_mode_34_top_left_diagonal() {
+        let above: Vec<i16> = (1..=5).map(|i| i * 10).collect();
+        let left: Vec<i16> = (1..=5).map(|i| i * 100).collect();
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 7,
+        };
+        let p = predict_angular(4, 4, 34, &refs).unwrap();
+        // Diagonal cells (x == y) all get the corner.
+        assert_eq!(p[0 * 4 + 0], 7);
+        assert_eq!(p[1 * 4 + 1], 7);
+        // x > y → above[x - y - 1].
+        assert_eq!(p[0 * 4 + 1], above[0]);
+        assert_eq!(p[0 * 4 + 3], above[2]);
+        // y > x → left[y - x - 1].
+        assert_eq!(p[1 * 4 + 0], left[0]);
+        assert_eq!(p[3 * 4 + 0], left[2]);
+    }
+
+    /// Reference substitution: all unavailable → fallback to mid-grey.
+    #[test]
+    fn substitute_all_unavailable_fallback_to_mid() {
+        let mut above = [0i16; 5];
+        let mut left = [0i16; 5];
+        let mut top_left = 0i16;
+        let above_avail = [false; 5];
+        let left_avail = [false; 5];
+        substitute_references(
+            &mut above,
+            &mut left,
+            &mut top_left,
+            &above_avail,
+            &left_avail,
+            false,
+            512,
+        );
+        assert_eq!(top_left, 512);
+        assert!(above.iter().all(|&v| v == 512));
+        assert!(left.iter().all(|&v| v == 512));
+    }
+
+    /// Reference substitution: one available sample replicates.
+    #[test]
+    fn substitute_single_available_replicates() {
+        let mut above = [0i16; 5];
+        let mut left = [0i16; 5];
+        let mut top_left = 0i16;
+        above[2] = 100;
+        let mut above_avail = [false; 5];
+        above_avail[2] = true;
+        let left_avail = [false; 5];
+        substitute_references(
+            &mut above,
+            &mut left,
+            &mut top_left,
+            &above_avail,
+            &left_avail,
+            false,
+            512,
+        );
+        assert_eq!(top_left, 100);
+        assert_eq!(above[0], 100);
+        assert_eq!(above[2], 100); // already-available sample kept.
+        assert_eq!(above[4], 100);
+        assert!(left.iter().all(|&v| v == 100));
+    }
+
+    /// Unsupported angular mode surfaces an error.
+    #[test]
+    fn unsupported_angular_mode_errors() {
+        let above = vec![0i16; 5];
+        let left = vec![0i16; 5];
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 0,
+        };
+        assert!(predict_angular(4, 4, 10, &refs).is_err());
     }
 }
