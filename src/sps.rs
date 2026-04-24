@@ -20,10 +20,12 @@
 //! * `sps_subpic_info_present_flag == 1` streams — the subpic syntax
 //!   contains `u(v)` fields whose width depends on `CtbSizeY`; we return
 //!   `Error::Unsupported` before touching them (§7.3.2.4, subpic block),
-//! * `ref_pic_list_struct()` — we refuse SPSes that signal any
-//!   `sps_num_ref_pic_lists[i]` > 0 (the structure needs its own parser),
 //! * HRD timing, VUI payload, and `sps_extension_*`. The tail reader
 //!   stops after the virtual-boundaries block.
+//!
+//! Round 3 adds `ref_pic_list_struct(listIdx, rplsIdx)` (§7.3.10 /
+//! §7.4.11) so SPSes that signal one or more candidate reference-picture
+//! lists (ST / LT / ILRP mixtures) can be walked end-to-end.
 
 use oxideav_core::{Error, Result};
 
@@ -135,6 +137,79 @@ pub struct PartitionConstraints {
     pub max_luma_transform_size_64_flag: bool,
 }
 
+/// A single entry of `ref_pic_list_struct(listIdx, rplsIdx)` — §7.3.10 /
+/// §7.4.11. An entry is exactly one of:
+///
+/// * **ST** (short-term reference) — carries `abs_delta_poc_st` and an
+///   optional `strp_entry_sign_flag`. The composed signed POC delta is
+///   exposed as [`RefPicListEntry::delta_poc_val_st`] (equation 151).
+/// * **LT** (long-term reference) — either the LSB is listed inline as
+///   `rpls_poc_lsb_lt` (when `ltrp_in_header_flag == 0`) or is deferred
+///   to the containing PH/slice header (when `ltrp_in_header_flag == 1`).
+/// * **ILRP** (inter-layer reference) — indexes the direct-reference-layer
+///   list via `ilrp_idx`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefPicListEntry {
+    /// Short-term reference picture entry (§7.4.11).
+    /// `abs_delta_poc_st` is the raw syntax element; `delta_poc_val_st`
+    /// already has equation (150) applied (+1 when not gated by weighted
+    /// pred on i != 0) and sign inversion from `strp_entry_sign_flag`.
+    ShortTerm {
+        abs_delta_poc_st: u32,
+        strp_entry_sign_flag: bool,
+        /// Signed POC delta `DeltaPocValSt` (equation 151). `None` when
+        /// `AbsDeltaPocSt == 0` because the sign flag is absent and the
+        /// delta is defined as 0.
+        delta_poc_val_st: i32,
+    },
+    /// Long-term reference picture entry (§7.4.11). When
+    /// `ltrp_in_header_flag` was 1 the POC LSB is deferred to the
+    /// containing PH/SH; the `poc_lsb_lt` field is then `None`.
+    LongTerm { poc_lsb_lt: Option<u32> },
+    /// Inter-layer reference picture entry. `ilrp_idx` indexes the
+    /// direct-reference-layer list (§7.4.11).
+    InterLayer { ilrp_idx: u32 },
+}
+
+impl RefPicListEntry {
+    pub fn is_short_term(&self) -> bool {
+        matches!(self, RefPicListEntry::ShortTerm { .. })
+    }
+    pub fn is_long_term(&self) -> bool {
+        matches!(self, RefPicListEntry::LongTerm { .. })
+    }
+    pub fn is_inter_layer(&self) -> bool {
+        matches!(self, RefPicListEntry::InterLayer { .. })
+    }
+}
+
+/// `ref_pic_list_struct(listIdx, rplsIdx)` — §7.3.10.
+///
+/// `num_ref_entries` is always equal to `entries.len()`. `ltrp_in_header_flag`
+/// is the *effective* value after inference (§7.4.11: inferred to 1 when
+/// `rplsIdx == sps_num_ref_pic_lists[listIdx]` and
+/// `sps_long_term_ref_pics_flag == 1`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefPicListStruct {
+    pub entries: Vec<RefPicListEntry>,
+    pub ltrp_in_header_flag: bool,
+}
+
+impl RefPicListStruct {
+    /// Number of LTRP entries in this list (§7.4.11, equation 149).
+    pub fn num_ltrp_entries(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_long_term()).count()
+    }
+
+    pub fn num_strp_entries(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_short_term()).count()
+    }
+
+    pub fn num_ilrp_entries(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_inter_layer()).count()
+    }
+}
+
 /// SPS tool-enable flags (§7.3.2.4 tail).
 ///
 /// These are the gates slice / picture headers consult to decide which
@@ -171,6 +246,11 @@ pub struct ToolFlags {
     pub rpl1_same_as_rpl0_flag: bool,
     /// `sps_num_ref_pic_lists[i]` for i = 0 and (if signalled) i = 1.
     pub num_ref_pic_lists: [u32; 2],
+    /// `ref_pic_list_struct(listIdx, rplsIdx)` per §7.3.10 — outer index
+    /// is `listIdx` (0 or 1), inner index is `rplsIdx`. When
+    /// `rpl1_same_as_rpl0_flag` is set, only `ref_pic_lists[0]` is
+    /// populated and the caller is expected to alias list 1 to list 0.
+    pub ref_pic_lists: [Vec<RefPicListStruct>; 2],
 
     // Inter / motion tools.
     pub ref_wraparound_enabled_flag: bool,
@@ -389,6 +469,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         sps_chroma_format_idc,
         sps_video_parameter_set_id,
         partition_constraints.max_luma_transform_size_64_flag,
+        sps_log2_max_pic_order_cnt_lsb_minus4,
     )?;
 
     // The rest of the SPS (HRD timing, VUI payload, sps_extension_*) is
@@ -528,6 +609,7 @@ fn parse_tool_flags(
     chroma_format_idc: u8,
     video_parameter_set_id: u8,
     max_luma_transform_size_64_flag: bool,
+    log2_max_pic_order_cnt_lsb_minus4: u8,
 ) -> Result<ToolFlags> {
     let mut t = ToolFlags::default();
 
@@ -591,16 +673,29 @@ fn parse_tool_flags(
     let rpl_loops = if t.rpl1_same_as_rpl0_flag { 1 } else { 2 };
     for i in 0..rpl_loops {
         let n = br.ue()?;
-        t.num_ref_pic_lists[i] = n;
-        if n > 0 {
-            // `ref_pic_list_struct(i, j)` is a non-trivial syntax
-            // (LTRPs, inter-layer flags, delta POCs); parsing it is out
-            // of scope for this increment. Surface Unsupported so the
-            // caller does not silently consume misaligned bits.
-            return Err(Error::unsupported(
-                "h266 SPS: sps_num_ref_pic_lists > 0 — ref_pic_list_struct() not yet parsed",
-            ));
+        // §7.4.3.4: sps_num_ref_pic_lists[i] shall be in the range of 0
+        // to 64, inclusive. Reject runaway ue(v) before we allocate.
+        if n > 64 {
+            return Err(Error::invalid(format!(
+                "h266 SPS: sps_num_ref_pic_lists[{i}] out of range ({n})"
+            )));
         }
+        t.num_ref_pic_lists[i] = n;
+        let mut lists = Vec::with_capacity(n as usize);
+        for j in 0..n {
+            lists.push(parse_ref_pic_list_struct(
+                br,
+                i as u8,
+                j,
+                n,
+                t.long_term_ref_pics_flag,
+                t.inter_layer_prediction_enabled_flag,
+                t.weighted_pred_flag,
+                t.weighted_bipred_flag,
+                log2_max_pic_order_cnt_lsb_minus4,
+            )?);
+        }
+        t.ref_pic_lists[i] = lists;
     }
 
     // -- inter / motion tools --
@@ -728,6 +823,126 @@ fn parse_tool_flags(
         }
     }
     Ok(t)
+}
+
+/// Parse a single `ref_pic_list_struct(listIdx, rplsIdx)` — §7.3.10.
+///
+/// * `list_idx` / `rpls_idx` — outer / inner indices as referenced by the
+///   spec. `num_ref_pic_lists_listidx` is the value of
+///   `sps_num_ref_pic_lists[listIdx]` — needed to decide whether
+///   `ltrp_in_header_flag` is transmitted or inferred per §7.4.11.
+/// * `long_term_ref_pics_flag` / `inter_layer_prediction_enabled_flag` —
+///   SPS tool gates that control which sub-flags are present.
+/// * `weighted_pred_flag` / `weighted_bipred_flag` — feed equation 150
+///   (`AbsDeltaPocSt = abs_delta_poc_st + (gated ? 0 : 1)`).
+/// * `log2_max_pic_order_cnt_lsb_minus4` — width of `rpls_poc_lsb_lt`
+///   (§7.4.11: `u(v)` with `v = log2_max_pic_order_cnt_lsb_minus4 + 4`).
+pub(crate) fn parse_ref_pic_list_struct(
+    br: &mut BitReader<'_>,
+    list_idx: u8,
+    rpls_idx: u32,
+    num_ref_pic_lists_listidx: u32,
+    long_term_ref_pics_flag: bool,
+    inter_layer_prediction_enabled_flag: bool,
+    weighted_pred_flag: bool,
+    weighted_bipred_flag: bool,
+    log2_max_pic_order_cnt_lsb_minus4: u8,
+) -> Result<RefPicListStruct> {
+    let _ = list_idx; // reserved for future cross-list validation hooks.
+    let num_ref_entries = br.ue()?;
+    // §7.4.11: num_ref_entries shall be <= MaxDpbSize + 13. MaxDpbSize is
+    // profile-dependent (A.4.2) but is capped at 8 for any defined level,
+    // so the hard upper bound is 21. We accept a slightly higher
+    // threshold (32) to stay forward-compatible, and reject grossly
+    // out-of-range values to avoid runaway allocation.
+    if num_ref_entries > 32 {
+        return Err(Error::invalid(format!(
+            "h266 RPL[{list_idx}][{rpls_idx}]: num_ref_entries out of range ({num_ref_entries})"
+        )));
+    }
+
+    // `ltrp_in_header_flag` is only transmitted when the list *could*
+    // carry LTRPs (sps_long_term_ref_pics_flag == 1) and we are not on
+    // the synthesized "picture-header supplies the list" candidate
+    // (rplsIdx < sps_num_ref_pic_lists[listIdx]) and there is at least
+    // one entry. Otherwise §7.4.11 infers it to 1 when LT refs are
+    // enabled and rplsIdx == sps_num_ref_pic_lists[listIdx], else 0.
+    let ltrp_in_header_flag = if long_term_ref_pics_flag
+        && rpls_idx < num_ref_pic_lists_listidx
+        && num_ref_entries > 0
+    {
+        br.u1()? == 1
+    } else if long_term_ref_pics_flag && rpls_idx == num_ref_pic_lists_listidx {
+        true
+    } else {
+        false
+    };
+
+    let poc_lsb_lt_width = log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
+
+    let mut entries = Vec::with_capacity(num_ref_entries as usize);
+    for i in 0..num_ref_entries {
+        let inter_layer_ref_pic_flag = if inter_layer_prediction_enabled_flag {
+            br.u1()? == 1
+        } else {
+            false
+        };
+        if !inter_layer_ref_pic_flag {
+            // Default: entry is an STRP (st_ref_pic_flag inferred to 1
+            // when not present — §7.4.11).
+            let st_ref_pic_flag = if long_term_ref_pics_flag {
+                br.u1()? == 1
+            } else {
+                true
+            };
+            if st_ref_pic_flag {
+                let abs_delta_poc_st = br.ue()?;
+                // §7.4.11: abs_delta_poc_st shall be in [0, 2^15 - 1].
+                if abs_delta_poc_st > 0x7FFF {
+                    return Err(Error::invalid(format!(
+                        "h266 RPL[{list_idx}][{rpls_idx}][{i}]: abs_delta_poc_st out of range ({abs_delta_poc_st})"
+                    )));
+                }
+                // Equation (150): +1 unless gated by weighted pred on i>0.
+                let gated =
+                    (weighted_pred_flag || weighted_bipred_flag) && i != 0;
+                let abs = if gated {
+                    abs_delta_poc_st
+                } else {
+                    abs_delta_poc_st + 1
+                };
+                let (sign_flag, delta) = if abs > 0 {
+                    let s = br.u1()? == 1;
+                    let signed = if s { -(abs as i32) } else { abs as i32 };
+                    (s, signed)
+                } else {
+                    (false, 0)
+                };
+                entries.push(RefPicListEntry::ShortTerm {
+                    abs_delta_poc_st,
+                    strp_entry_sign_flag: sign_flag,
+                    delta_poc_val_st: delta,
+                });
+            } else {
+                // LT entry. POC LSB is either inlined (u(v)) or deferred
+                // to the containing PH/slice header.
+                let poc_lsb_lt = if !ltrp_in_header_flag {
+                    Some(br.u(poc_lsb_lt_width)?)
+                } else {
+                    None
+                };
+                entries.push(RefPicListEntry::LongTerm { poc_lsb_lt });
+            }
+        } else {
+            let ilrp_idx = br.ue()?;
+            entries.push(RefPicListEntry::InterLayer { ilrp_idx });
+        }
+    }
+
+    Ok(RefPicListStruct {
+        entries,
+        ltrp_in_header_flag,
+    })
 }
 
 #[cfg(test)]
@@ -1052,62 +1267,252 @@ mod tests {
         assert!(t.lmcs_enabled_flag);
     }
 
+    /// Common preamble used by the rpl tests — emits everything from the
+    /// SPS identifier block through the `long_term_ref_pics_flag` gate,
+    /// parameterised on the three flags that change RPL semantics.
+    fn emit_sps_preamble_for_rpl(
+        bits: &mut Vec<u8>,
+        long_term: bool,
+        inter_layer: bool,
+        weighted_pred: bool,
+    ) {
+        push_u(bits, 0, 4); // sps_id
+                            // `inter_layer_prediction_enabled_flag` is only transmitted when
+                            // `vps_id > 0`, so use vps_id=1 when we want ILRP support.
+        push_u(bits, if inter_layer { 1 } else { 0 }, 4); // vps_id
+        push_u(bits, 0, 3); // max_sublayers_minus1
+        push_u(bits, 1, 2); // chroma = 4:2:0
+        push_u(bits, 2, 2); // log2_ctu - 5 = 2 → CTB=128
+        push_u(bits, 0, 1); // ptl_dpb_hrd_present
+        push_u(bits, 0, 1); // gdr
+        push_u(bits, 0, 1); // ref_pic_resampling
+        push_ue(bits, 320);
+        push_ue(bits, 240);
+        push_u(bits, 0, 1); // conformance_window
+        push_u(bits, 0, 1); // subpic_info_present
+        push_ue(bits, 2); // bitdepth_minus8 = 2 (10-bit)
+        push_u(bits, 0, 1); // entropy_coding_sync
+        push_u(bits, 0, 1); // entry_point_offsets
+        push_u(bits, 4, 4); // log2_max_poc_lsb_minus4 = 4 → 8-bit LSB
+        push_u(bits, 0, 1); // poc_msb_cycle_flag
+        push_u(bits, 0, 2); // num_extra_ph_bytes
+        push_u(bits, 0, 2); // num_extra_sh_bytes
+
+        // Partition constraints — all-zero.
+        push_ue(bits, 0);
+        push_u(bits, 0, 1);
+        push_ue(bits, 0);
+        push_ue(bits, 0);
+        push_u(bits, 0, 1); // qtbtt_dual_tree_intra = 0
+        push_ue(bits, 0);
+        push_ue(bits, 0);
+        push_u(bits, 0, 1); // max_luma_transform_size_64 = 0
+
+        // Tool flags up through long_term_ref_pics_flag / ILRP / idr_rpl /
+        // rpl1_same_as_rpl0.
+        push_u(bits, 0, 1); // transform_skip
+        push_u(bits, 0, 1); // mts
+        push_u(bits, 0, 1); // lfnst
+        push_u(bits, 0, 1); // joint_cbcr
+        push_u(bits, 1, 1); // same_qp_table_for_chroma → 1 QP table
+        push_se(bits, 0);
+        push_ue(bits, 0);
+        push_ue(bits, 0);
+        push_ue(bits, 0);
+        push_u(bits, 0, 1); // sao
+        push_u(bits, 0, 1); // alf (=> no ccalf)
+        push_u(bits, 0, 1); // lmcs
+        push_u(bits, if weighted_pred { 1 } else { 0 }, 1); // weighted_pred
+        push_u(bits, 0, 1); // weighted_bipred
+        push_u(bits, if long_term { 1 } else { 0 }, 1); // long_term_ref_pics
+        if inter_layer {
+            // vps_id > 0 → transmit inter_layer_prediction_enabled_flag.
+            push_u(bits, 1, 1);
+        }
+        push_u(bits, 0, 1); // idr_rpl_present
+        push_u(bits, 1, 1); // rpl1_same_as_rpl0 = 1 (single loop over i=0)
+    }
+
+    fn emit_sps_tail_after_rpl(bits: &mut Vec<u8>) {
+        // ref_wraparound through virtual_boundaries_enabled — everything
+        // off except tools implicitly required by §7.3.2.4 ordering.
+        push_u(bits, 0, 1); // ref_wraparound
+        push_u(bits, 0, 1); // temporal_mvp (=> no sbtmvp)
+        push_u(bits, 0, 1); // amvr
+        push_u(bits, 0, 1); // bdof
+        push_u(bits, 0, 1); // smvd
+        push_u(bits, 0, 1); // dmvr
+        push_u(bits, 0, 1); // mmvd
+        push_ue(bits, 0); // six_minus_max_num_merge_cand
+        push_u(bits, 0, 1); // sbt
+        push_u(bits, 0, 1); // affine
+        push_u(bits, 0, 1); // bcw
+        push_u(bits, 0, 1); // ciip
+        push_u(bits, 0, 1); // gpm
+        push_ue(bits, 0); // log2_parallel_merge_level
+        push_u(bits, 0, 1); // isp
+        push_u(bits, 0, 1); // mrl
+        push_u(bits, 0, 1); // mip
+        push_u(bits, 0, 1); // cclm
+        push_u(bits, 0, 1); // chroma_horizontal_collocated
+        push_u(bits, 0, 1); // chroma_vertical_collocated
+        push_u(bits, 0, 1); // palette
+        push_u(bits, 0, 1); // ibc
+        push_u(bits, 0, 1); // ladf
+        push_u(bits, 0, 1); // explicit_scaling_list
+        push_u(bits, 0, 1); // dep_quant
+        push_u(bits, 0, 1); // sign_data_hiding
+        push_u(bits, 0, 1); // virtual_boundaries_enabled
+    }
+
     #[test]
-    fn ref_pic_list_struct_streams_are_unsupported() {
-        // Minimal SPS where num_ref_pic_lists[0] = 1; parsing should
-        // surface Unsupported because ref_pic_list_struct() isn't
-        // implemented yet.
+    fn rpl_st_only_two_entries_parses() {
+        // sps_long_term_ref_pics_flag = 0, no ILRP. One list of two STRPs
+        // with deltas +1 and -2. Because weighted_pred=0 the AbsDeltaPocSt
+        // formula is `abs_delta_poc_st + 1` for every i → we encode 0 / 1
+        // to get magnitudes 1 / 2.
         let mut bits: Vec<u8> = Vec::new();
-        push_u(&mut bits, 0, 4);
-        push_u(&mut bits, 0, 4);
-        push_u(&mut bits, 0, 3);
-        push_u(&mut bits, 1, 2);
-        push_u(&mut bits, 2, 2);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_ue(&mut bits, 320);
-        push_ue(&mut bits, 240);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_ue(&mut bits, 2);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 4, 4);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 2);
-        push_u(&mut bits, 0, 2);
-        // Partition constraints.
+        emit_sps_preamble_for_rpl(&mut bits, false, false, false);
+        // num_ref_pic_lists[0] = 1 (rpl1_same_as_rpl0=1 so only one loop).
+        push_ue(&mut bits, 1);
+        // ---- ref_pic_list_struct(0, 0) ----
+        push_ue(&mut bits, 2); // num_ref_entries = 2
+                               // long_term=0 → no ltrp_in_header_flag, no st_ref_pic_flag.
+                               // Entry 0: abs_delta_poc_st = 0 → Abs = 0+1 = 1, sign=0 (+1)
         push_ue(&mut bits, 0);
-        push_u(&mut bits, 0, 1);
-        push_ue(&mut bits, 0);
-        push_ue(&mut bits, 0);
-        push_u(&mut bits, 0, 1);
-        push_ue(&mut bits, 0);
-        push_ue(&mut bits, 0);
-        push_u(&mut bits, 0, 1);
-        // Tool flags up to num_ref_pic_lists[0] = 1.
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 1, 1);
-        push_se(&mut bits, 0);
-        push_ue(&mut bits, 0);
-        push_ue(&mut bits, 0);
-        push_ue(&mut bits, 0);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1);
-        push_u(&mut bits, 0, 1); // rpl1_same_as_rpl0 = 0
-        push_ue(&mut bits, 1); // num_ref_pic_lists[0] = 1 → Unsupported
+        push_u(&mut bits, 0, 1); // strp_entry_sign_flag (+)
+                                 // Entry 1: abs_delta_poc_st = 1 → Abs = 1+1 = 2, sign=1 (-2)
+        push_ue(&mut bits, 1);
+        push_u(&mut bits, 1, 1); // strp_entry_sign_flag (-)
+        emit_sps_tail_after_rpl(&mut bits);
+
         let bytes = pack(&bits);
-        let err = parse_sps(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+        let sps = parse_sps(&bytes).unwrap();
+        assert_eq!(sps.tool_flags.num_ref_pic_lists, [1, 0]);
+        let l0 = &sps.tool_flags.ref_pic_lists[0];
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l0[0].entries.len(), 2);
+        // When LT refs are disabled the inferred ltrp_in_header_flag is 0.
+        assert!(!l0[0].ltrp_in_header_flag);
+        match l0[0].entries[0] {
+            RefPicListEntry::ShortTerm {
+                abs_delta_poc_st,
+                strp_entry_sign_flag,
+                delta_poc_val_st,
+            } => {
+                assert_eq!(abs_delta_poc_st, 0);
+                assert!(!strp_entry_sign_flag);
+                assert_eq!(delta_poc_val_st, 1);
+            }
+            other => panic!("entry 0 must be STRP, got {other:?}"),
+        }
+        match l0[0].entries[1] {
+            RefPicListEntry::ShortTerm {
+                abs_delta_poc_st,
+                strp_entry_sign_flag,
+                delta_poc_val_st,
+            } => {
+                assert_eq!(abs_delta_poc_st, 1);
+                assert!(strp_entry_sign_flag);
+                assert_eq!(delta_poc_val_st, -2);
+            }
+            other => panic!("entry 1 must be STRP, got {other:?}"),
+        }
+        assert_eq!(l0[0].num_strp_entries(), 2);
+        assert_eq!(l0[0].num_ltrp_entries(), 0);
+        assert_eq!(l0[0].num_ilrp_entries(), 0);
+    }
+
+    #[test]
+    fn rpl_lt_only_inline_poc_lsb_parses() {
+        // sps_long_term_ref_pics_flag = 1, ltrp_in_header_flag = 0, two
+        // LTRP entries with 8-bit POC LSBs (log2_max_poc_lsb_minus4=4).
+        let mut bits: Vec<u8> = Vec::new();
+        emit_sps_preamble_for_rpl(&mut bits, true, false, false);
+        push_ue(&mut bits, 1); // num_ref_pic_lists[0] = 1
+                               // ---- ref_pic_list_struct(0, 0) ----
+                               // rplsIdx=0 < num_ref_pic_lists_listidx=1 and num_ref_entries>0 →
+                               // ltrp_in_header_flag is transmitted.
+        push_ue(&mut bits, 2); // num_ref_entries = 2
+        push_u(&mut bits, 0, 1); // ltrp_in_header_flag = 0 → POC LSBs inlined.
+                                 // Entry 0: st_ref_pic_flag = 0 → LT with inlined POC LSB.
+        push_u(&mut bits, 0, 1);
+        push_u(&mut bits, 0xA5, 8); // rpls_poc_lsb_lt[0] = 0xA5
+                                    // Entry 1: st_ref_pic_flag = 0 → LT with inlined POC LSB.
+        push_u(&mut bits, 0, 1);
+        push_u(&mut bits, 0x42, 8); // rpls_poc_lsb_lt[1] = 0x42
+        emit_sps_tail_after_rpl(&mut bits);
+
+        let bytes = pack(&bits);
+        let sps = parse_sps(&bytes).unwrap();
+        let rpl = &sps.tool_flags.ref_pic_lists[0][0];
+        assert!(!rpl.ltrp_in_header_flag);
+        assert_eq!(rpl.entries.len(), 2);
+        assert_eq!(rpl.num_ltrp_entries(), 2);
+        assert_eq!(rpl.num_strp_entries(), 0);
+        match rpl.entries[0] {
+            RefPicListEntry::LongTerm { poc_lsb_lt } => {
+                assert_eq!(poc_lsb_lt, Some(0xA5));
+            }
+            other => panic!("entry 0 must be LTRP, got {other:?}"),
+        }
+        match rpl.entries[1] {
+            RefPicListEntry::LongTerm { poc_lsb_lt } => {
+                assert_eq!(poc_lsb_lt, Some(0x42));
+            }
+            other => panic!("entry 1 must be LTRP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpl_mixed_st_lt_ilrp_parses() {
+        // long_term=1, ILRP enabled, ltrp_in_header=1 so LT entries defer
+        // their POC LSB. Build an RPL with 3 entries: ST (+3), ILRP idx=2,
+        // LT (deferred).
+        let mut bits: Vec<u8> = Vec::new();
+        emit_sps_preamble_for_rpl(&mut bits, true, true, false);
+        push_ue(&mut bits, 1); // num_ref_pic_lists[0] = 1
+                               // ---- ref_pic_list_struct(0, 0) ----
+        push_ue(&mut bits, 3); // num_ref_entries = 3
+        push_u(&mut bits, 1, 1); // ltrp_in_header_flag = 1 → no inlined POC LSB
+                                 // Entry 0: ILRP flag=0 → not ILRP; st_ref_pic_flag=1 → STRP; Abs=2+1=3.
+        push_u(&mut bits, 0, 1); // inter_layer_ref_pic_flag
+        push_u(&mut bits, 1, 1); // st_ref_pic_flag
+        push_ue(&mut bits, 2); // abs_delta_poc_st → Abs = 3
+        push_u(&mut bits, 0, 1); // sign = 0 → +3
+                                 // Entry 1: ILRP flag=1 → ilrp_idx = 2
+        push_u(&mut bits, 1, 1);
+        push_ue(&mut bits, 2);
+        // Entry 2: ILRP flag=0, st_ref_pic_flag=0 → LT, deferred POC LSB.
+        push_u(&mut bits, 0, 1);
+        push_u(&mut bits, 0, 1);
+        emit_sps_tail_after_rpl(&mut bits);
+
+        let bytes = pack(&bits);
+        let sps = parse_sps(&bytes).unwrap();
+        let t = &sps.tool_flags;
+        assert!(t.long_term_ref_pics_flag);
+        assert!(t.inter_layer_prediction_enabled_flag);
+        let rpl = &t.ref_pic_lists[0][0];
+        assert!(rpl.ltrp_in_header_flag);
+        assert_eq!(rpl.entries.len(), 3);
+        assert_eq!(rpl.num_strp_entries(), 1);
+        assert_eq!(rpl.num_ltrp_entries(), 1);
+        assert_eq!(rpl.num_ilrp_entries(), 1);
+        match rpl.entries[0] {
+            RefPicListEntry::ShortTerm {
+                delta_poc_val_st, ..
+            } => assert_eq!(delta_poc_val_st, 3),
+            other => panic!("entry 0 must be STRP, got {other:?}"),
+        }
+        match rpl.entries[1] {
+            RefPicListEntry::InterLayer { ilrp_idx } => assert_eq!(ilrp_idx, 2),
+            other => panic!("entry 1 must be ILRP, got {other:?}"),
+        }
+        match rpl.entries[2] {
+            RefPicListEntry::LongTerm { poc_lsb_lt } => assert_eq!(poc_lsb_lt, None),
+            other => panic!("entry 2 must be LTRP, got {other:?}"),
+        }
     }
 
     #[test]
