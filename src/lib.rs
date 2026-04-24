@@ -23,6 +23,11 @@
 //!   geometry + neighbour availability, slice-scope CABAC init, and
 //!   coding_tree dispatch that surfaces `Error::Unsupported` for any
 //!   construct below the partition tree (reconstruction, in-loop filters).
+//! * [`leaf_cu`] — per-CU syntax reads from `coding_unit()` (§7.3.11.5)
+//!   plus the §8.4.2 / §8.4.3 luma / chroma intra-mode derivations. The
+//!   module is "parse + derive, don't reconstruct": it captures the
+//!   MPM cascade, MIP flags, ISP split selector and chroma mode in a
+//!   [`leaf_cu::LeafCuInfo`] for later reconstruction rounds.
 //!
 //! ## Spec reference
 //!
@@ -61,6 +66,7 @@ pub mod dci;
 pub mod decoder;
 pub mod hrd;
 pub mod intra;
+pub mod leaf_cu;
 pub mod nal;
 pub mod opi;
 pub mod picture_header;

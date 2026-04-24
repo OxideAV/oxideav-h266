@@ -107,6 +107,64 @@ pub fn ctx_inc_intra_luma_mpm_flag() -> u32 {
     0
 }
 
+/// ctxInc for `intra_luma_not_planar_flag[x0][y0]` — Table 132 gives
+/// `!intra_subpartitions_mode_flag` at binIdx 0 (so ctx 0 when ISP is
+/// enabled for the current CU, ctx 1 when ISP is disabled).
+pub fn ctx_inc_intra_luma_not_planar_flag(intra_subpartitions_mode_flag: bool) -> u32 {
+    if intra_subpartitions_mode_flag {
+        0
+    } else {
+        1
+    }
+}
+
+/// ctxInc for `intra_mip_flag` per §9.3.4.2.1 Table 132 + §9.3.4.2.2
+/// eq. 1551 + Table 133.
+///
+/// If `|log2(cbWidth) - log2(cbHeight)| > 1` the spec forces `ctxInc = 3`
+/// (a dedicated context for highly non-square blocks). Otherwise the
+/// `condL` / `condA` conditions take the neighbouring `IntraMipFlag`
+/// values.
+pub fn ctx_inc_intra_mip_flag(
+    cb_width: u32,
+    cb_height: u32,
+    available_l: bool,
+    available_a: bool,
+    left_mip: bool,
+    above_mip: bool,
+) -> u32 {
+    let log2_w = cb_width.trailing_zeros() as i32;
+    let log2_h = cb_height.trailing_zeros() as i32;
+    if (log2_w - log2_h).abs() > 1 {
+        return 3;
+    }
+    let cond_l = available_l && left_mip;
+    let cond_a = available_a && above_mip;
+    (cond_l as u32) + (cond_a as u32)
+}
+
+/// ctxInc for `intra_chroma_pred_mode` — Table 132 gives ctxInc 0 at
+/// binIdx 0; binIdx 1 and 2 are bypass-coded.
+pub fn ctx_inc_intra_chroma_pred_mode() -> u32 {
+    0
+}
+
+/// ctxInc for `intra_luma_ref_idx` — Table 132 entries are (0, 1) for
+/// binIdx 0 and 1 respectively.
+pub fn ctx_inc_intra_luma_ref_idx(bin_idx: u32) -> u32 {
+    bin_idx.min(1)
+}
+
+/// ctxInc for `intra_subpartitions_mode_flag` — fixed 0 (Table 132).
+pub fn ctx_inc_intra_subpartitions_mode_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `intra_subpartitions_split_flag` — fixed 0 (Table 132).
+pub fn ctx_inc_intra_subpartitions_split_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///
@@ -270,6 +328,48 @@ mod tests {
     #[test]
     fn intra_luma_mpm_flag_has_single_context() {
         assert_eq!(ctx_inc_intra_luma_mpm_flag(), 0);
+    }
+
+    #[test]
+    fn intra_luma_not_planar_flag_inverts_isp() {
+        assert_eq!(ctx_inc_intra_luma_not_planar_flag(false), 1);
+        assert_eq!(ctx_inc_intra_luma_not_planar_flag(true), 0);
+    }
+
+    #[test]
+    fn intra_mip_flag_non_square_forces_ctx3() {
+        // 16x4 → log2W=4, log2H=2 → |diff|=2 > 1 → ctx=3.
+        assert_eq!(ctx_inc_intra_mip_flag(16, 4, true, true, true, true), 3);
+        // 4x16 → symmetric.
+        assert_eq!(ctx_inc_intra_mip_flag(4, 16, false, false, false, false), 3);
+    }
+
+    #[test]
+    fn intra_mip_flag_square_counts_neighbours() {
+        // No neighbours → 0.
+        assert_eq!(ctx_inc_intra_mip_flag(8, 8, false, false, true, true), 0);
+        // Left available with MIP → 1.
+        assert_eq!(ctx_inc_intra_mip_flag(8, 8, true, false, true, false), 1);
+        // Both available with MIP → 2.
+        assert_eq!(ctx_inc_intra_mip_flag(8, 8, true, true, true, true), 2);
+    }
+
+    #[test]
+    fn intra_luma_ref_idx_ctx_inc_by_bin() {
+        assert_eq!(ctx_inc_intra_luma_ref_idx(0), 0);
+        assert_eq!(ctx_inc_intra_luma_ref_idx(1), 1);
+        assert_eq!(ctx_inc_intra_luma_ref_idx(2), 1);
+    }
+
+    #[test]
+    fn intra_chroma_pred_mode_has_single_context() {
+        assert_eq!(ctx_inc_intra_chroma_pred_mode(), 0);
+    }
+
+    #[test]
+    fn intra_subpartitions_flags_have_fixed_ctx() {
+        assert_eq!(ctx_inc_intra_subpartitions_mode_flag(), 0);
+        assert_eq!(ctx_inc_intra_subpartitions_split_flag(), 0);
     }
 
     /// sig_coeff_flag for luma DC position (xC=yC=0): d=0, so d_term=8,

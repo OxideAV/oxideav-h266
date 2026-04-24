@@ -30,7 +30,11 @@
 //!   [`coding_tree::TreeCtxs::init`]).
 //! * [`CtuWalker`] — orchestrator that iterates CTUs, calls
 //!   [`coding_tree::TreeWalker`] for each CTU, and surfaces
-//!   `Error::Unsupported` when asked to reconstruct a leaf CU.
+//!   `Error::Unsupported` when asked to reconstruct a leaf CU. Exposes
+//!   [`CtuWalker::decode_leaf_cu_syntax`] for callers that want to
+//!   consume a leaf's `coding_unit()` bins into a
+//!   [`crate::leaf_cu::LeafCuInfo`] without proceeding to pixel
+//!   reconstruction.
 //!
 //! What this scaffold does **not** yet do:
 //!
@@ -56,6 +60,7 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::ArithDecoder;
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
+use crate::leaf_cu::{CuNeighbourhood, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader};
 use crate::pps::PicParameterSet;
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
@@ -317,6 +322,7 @@ pub struct CtuWalker<'a, 'b> {
     sh: &'a StatefulSliceHeader,
     cabac: SliceCabacState,
     arith: ArithDecoder<'b>,
+    leaf_ctxs: LeafCuCtxs,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -400,6 +406,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let slice_qp = SliceQpY::derive(sps, pps, sh, ph_qp_delta);
         let cabac_state = SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag);
         let arith = ArithDecoder::new(cabac_payload)?;
+        let leaf_ctxs = LeafCuCtxs::init(slice_qp.as_init_qp());
 
         Ok(Self {
             layout,
@@ -408,7 +415,69 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             sh,
             cabac: cabac_state,
             arith,
+            leaf_ctxs,
         })
+    }
+
+    /// Build a [`CuToolFlags`] snapshot from the parameter-set views
+    /// for the leaf-CU reader. Derived values (`MaxTbSizeY` /
+    /// `MinTbSizeY` / `MaxTsSize`) use the spec defaults:
+    ///
+    /// * `MaxTbSizeY = sps_max_luma_transform_size_64_flag ? 64 : 32`
+    ///   (we proxy this off the SPS tool flag directly; the
+    ///   `sps_max_luma_transform_size_64_flag` bit lives in
+    ///   `partition_constraints` and is not yet surfaced, so we use
+    ///   the conservative 64 value here until a Round-8 PR surfaces
+    ///   the flag explicitly).
+    /// * `MinTbSizeY = 1 << 2 = 4` (§7.4.3.4 eq. 41).
+    /// * `MaxTsSize = 1 << (log2_transform_skip_max_size_minus2 + 2)`.
+    /// * `CtbSizeY = 1 << ctb_log2_size_y`.
+    pub fn cu_tool_flags(&self) -> CuToolFlags {
+        let tf = &self.sps.tool_flags;
+        let max_ts = 1u32 << (tf.log2_transform_skip_max_size_minus2 + 2);
+        CuToolFlags {
+            ibc: tf.ibc_enabled_flag,
+            palette: tf.palette_enabled_flag,
+            bdpcm: tf.bdpcm_enabled_flag,
+            mip: tf.mip_enabled_flag,
+            mrl: tf.mrl_enabled_flag,
+            isp: tf.isp_enabled_flag,
+            act: tf.act_enabled_flag,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: max_ts,
+            ctb_size_y: self.layout.ctb_size_y,
+            chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
+        }
+    }
+
+    /// Decode the syntax elements for a single leaf CU and derive its
+    /// luma / chroma intra prediction modes per §8.4.2 / §8.4.3.
+    /// Consumes CABAC bins from the walker's arithmetic decoder — it
+    /// is the caller's responsibility to invoke this **in decoding
+    /// order** immediately after the coding-tree walker emits the leaf.
+    ///
+    /// Neighbour availability is encoded in `neigh`; the scaffold
+    /// currently does not track a per-CU neighbour grid, so callers
+    /// that have not wired one up yet can pass
+    /// [`CuNeighbourhood::default()`] to get planar-initialised
+    /// candidates (the §8.4.2 default list).
+    pub fn decode_leaf_cu_syntax(
+        &mut self,
+        cu: &CtuCu,
+        neigh: &CuNeighbourhood,
+    ) -> Result<LeafCuInfo> {
+        let tools = self.cu_tool_flags();
+        let mut info = LeafCuInfo {
+            x0: cu.cu.x,
+            y0: cu.cu.y,
+            cb_width: cu.cu.w,
+            cb_height: cu.cu.h,
+            ..LeafCuInfo::default()
+        };
+        let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools);
+        reader.decode(&mut info, neigh)?;
+        Ok(info)
     }
 
     /// Immutable view of the CTU geometry the walker was built against.
@@ -860,6 +929,50 @@ mod tests {
             assert!(ccu.cu.y + ccu.cu.h <= ctu0.y0 + ctu0.height_luma);
             assert_eq!(ccu.ctu_addr_rs, ctu0.ctu_addr_rs);
         }
+    }
+
+    #[test]
+    fn decode_leaf_cu_syntax_returns_legal_mode() {
+        // With all intra tools disabled (the default SPS fixture),
+        // the reader must still produce a legal luma / chroma mode
+        // without panicking on the CABAC state.
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh = CuNeighbourhood::default();
+        let info = walker.decode_leaf_cu_syntax(&ccu, &neigh).unwrap();
+        assert!(info.intra_pred_mode_y <= 66);
+        assert!(info.intra_pred_mode_c <= 83);
+        assert_eq!(info.x0, 0);
+        assert_eq!(info.cb_width, 16);
+    }
+
+    #[test]
+    fn cu_tool_flags_snapshot_carries_ctb_and_chroma() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let tools = walker.cu_tool_flags();
+        assert_eq!(tools.ctb_size_y, 128);
+        assert_eq!(tools.chroma_format_idc, 1);
+        assert_eq!(tools.min_tb_size_y, 4);
     }
 
     #[test]

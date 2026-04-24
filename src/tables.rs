@@ -13,7 +13,13 @@
 //! * `split_cu_flag` — Table 59 (27 ctxIdx).
 //! * `split_qt_flag` — Table 60 (18 ctxIdx).
 //! * `pred_mode_flag` — Table 66 (4 ctxIdx).
+//! * `intra_mip_flag` — Table 71 (12 ctxIdx).
+//! * `intra_luma_ref_idx` — Table 72 (6 ctxIdx).
+//! * `intra_subpartitions_mode_flag` — Table 73 (3 ctxIdx).
+//! * `intra_subpartitions_split_flag` — Table 74 (3 ctxIdx).
 //! * `intra_luma_mpm_flag` — Table 75 (3 ctxIdx).
+//! * `intra_luma_not_planar_flag` — Table 76 (6 ctxIdx).
+//! * `intra_chroma_pred_mode` — Table 81 (3 ctxIdx).
 //! * `sig_coeff_flag` — Table 123 (189 ctxIdx).
 //! * `sb_coded_flag` — Table 122 (21 ctxIdx).
 //! * `abs_level_gtx_flag` — Table 125 (216 ctxIdx).
@@ -33,7 +39,13 @@ pub enum SyntaxCtx {
     SplitCuFlag,
     SplitQtFlag,
     PredModeFlag,
+    IntraMipFlag,
+    IntraLumaRefIdx,
+    IntraSubpartitionsModeFlag,
+    IntraSubpartitionsSplitFlag,
     IntraLumaMpmFlag,
+    IntraLumaNotPlanarFlag,
+    IntraChromaPredMode,
     SigCoeffFlag,
     SbCodedFlag,
     AbsLevelGtxFlag,
@@ -64,9 +76,33 @@ pub const SPLIT_QT_FLAG_SHIFT: &[u8] =
 pub const PRED_MODE_FLAG_INIT: &[u8] = &[40, 35, 40, 35];
 pub const PRED_MODE_FLAG_SHIFT: &[u8] = &[5, 1, 5, 1];
 
+/// Table 71 — `intra_mip_flag` (12 ctxIdx).
+pub const INTRA_MIP_FLAG_INIT: &[u8] = &[33, 49, 50, 25, 41, 57, 58, 26, 56, 57, 50, 26];
+pub const INTRA_MIP_FLAG_SHIFT: &[u8] = &[9, 10, 9, 6, 9, 10, 9, 6, 9, 10, 9, 6];
+
+/// Table 72 — `intra_luma_ref_idx` (6 ctxIdx).
+pub const INTRA_LUMA_REF_IDX_INIT: &[u8] = &[25, 60, 25, 58, 25, 59];
+pub const INTRA_LUMA_REF_IDX_SHIFT: &[u8] = &[5, 8, 5, 8, 5, 8];
+
+/// Table 73 — `intra_subpartitions_mode_flag` (3 ctxIdx).
+pub const INTRA_SP_MODE_FLAG_INIT: &[u8] = &[33, 33, 33];
+pub const INTRA_SP_MODE_FLAG_SHIFT: &[u8] = &[9, 9, 9];
+
+/// Table 74 — `intra_subpartitions_split_flag` (3 ctxIdx).
+pub const INTRA_SP_SPLIT_FLAG_INIT: &[u8] = &[43, 36, 43];
+pub const INTRA_SP_SPLIT_FLAG_SHIFT: &[u8] = &[2, 2, 2];
+
 /// Table 75 — `intra_luma_mpm_flag` (3 ctxIdx).
 pub const INTRA_LUMA_MPM_FLAG_INIT: &[u8] = &[45, 36, 44];
 pub const INTRA_LUMA_MPM_FLAG_SHIFT: &[u8] = &[6, 6, 6];
+
+/// Table 76 — `intra_luma_not_planar_flag` (6 ctxIdx).
+pub const INTRA_LUMA_NOT_PLANAR_FLAG_INIT: &[u8] = &[13, 28, 12, 20, 13, 6];
+pub const INTRA_LUMA_NOT_PLANAR_FLAG_SHIFT: &[u8] = &[1, 5, 1, 5, 1, 5];
+
+/// Table 81 — `intra_chroma_pred_mode` (3 ctxIdx).
+pub const INTRA_CHROMA_PRED_MODE_INIT: &[u8] = &[34, 25, 25];
+pub const INTRA_CHROMA_PRED_MODE_SHIFT: &[u8] = &[5, 5, 5];
 
 /// Table 112 — `tu_y_coded_flag` (12 ctxIdx).
 pub const TU_Y_CODED_FLAG_INIT: &[u8] = &[15, 12, 5, 7, 23, 5, 20, 7, 15, 6, 5, 14];
@@ -188,7 +224,22 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::SplitCuFlag => (SPLIT_CU_FLAG_INIT, SPLIT_CU_FLAG_SHIFT),
         SyntaxCtx::SplitQtFlag => (SPLIT_QT_FLAG_INIT, SPLIT_QT_FLAG_SHIFT),
         SyntaxCtx::PredModeFlag => (PRED_MODE_FLAG_INIT, PRED_MODE_FLAG_SHIFT),
+        SyntaxCtx::IntraMipFlag => (INTRA_MIP_FLAG_INIT, INTRA_MIP_FLAG_SHIFT),
+        SyntaxCtx::IntraLumaRefIdx => (INTRA_LUMA_REF_IDX_INIT, INTRA_LUMA_REF_IDX_SHIFT),
+        SyntaxCtx::IntraSubpartitionsModeFlag => {
+            (INTRA_SP_MODE_FLAG_INIT, INTRA_SP_MODE_FLAG_SHIFT)
+        }
+        SyntaxCtx::IntraSubpartitionsSplitFlag => {
+            (INTRA_SP_SPLIT_FLAG_INIT, INTRA_SP_SPLIT_FLAG_SHIFT)
+        }
         SyntaxCtx::IntraLumaMpmFlag => (INTRA_LUMA_MPM_FLAG_INIT, INTRA_LUMA_MPM_FLAG_SHIFT),
+        SyntaxCtx::IntraLumaNotPlanarFlag => (
+            INTRA_LUMA_NOT_PLANAR_FLAG_INIT,
+            INTRA_LUMA_NOT_PLANAR_FLAG_SHIFT,
+        ),
+        SyntaxCtx::IntraChromaPredMode => {
+            (INTRA_CHROMA_PRED_MODE_INIT, INTRA_CHROMA_PRED_MODE_SHIFT)
+        }
         SyntaxCtx::SigCoeffFlag => (SIG_COEFF_FLAG_INIT, SIG_COEFF_FLAG_SHIFT),
         SyntaxCtx::SbCodedFlag => (SB_CODED_FLAG_INIT, SB_CODED_FLAG_SHIFT),
         SyntaxCtx::AbsLevelGtxFlag => (ABS_LEVEL_GTX_FLAG_INIT, ABS_LEVEL_GTX_FLAG_SHIFT),
@@ -228,7 +279,13 @@ mod tests {
             SyntaxCtx::SplitCuFlag,
             SyntaxCtx::SplitQtFlag,
             SyntaxCtx::PredModeFlag,
+            SyntaxCtx::IntraMipFlag,
+            SyntaxCtx::IntraLumaRefIdx,
+            SyntaxCtx::IntraSubpartitionsModeFlag,
+            SyntaxCtx::IntraSubpartitionsSplitFlag,
             SyntaxCtx::IntraLumaMpmFlag,
+            SyntaxCtx::IntraLumaNotPlanarFlag,
+            SyntaxCtx::IntraChromaPredMode,
             SyntaxCtx::SigCoeffFlag,
             SyntaxCtx::SbCodedFlag,
             SyntaxCtx::AbsLevelGtxFlag,
