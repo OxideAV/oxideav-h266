@@ -38,6 +38,7 @@ pub mod pps;
 pub mod ptl;
 pub mod slice_header;
 pub mod sps;
+pub mod tables;
 pub mod transform;
 pub mod vps;
 
