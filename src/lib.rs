@@ -33,11 +33,19 @@
 //!   [`leaf_cu::LeafCuResidual`] pair for later reconstruction rounds.
 //! * [`residual`] — `tu_y/cb/cr_coded_flag`, `cu_qp_delta_abs`,
 //!   `cu_chroma_qp_offset_*`, `last_sig_coeff_{x,y}_{prefix,suffix}`
-//!   and the per-sub-block `sb_coded_flag` / `sig_coeff_flag` /
-//!   `par_level_flag` / `abs_level_gtx_flag` / `coeff_sign_flag` /
-//!   `abs_remainder` reads (§7.3.11.10 / §7.3.11.11). Drives a
-//!   coefficient-level array that later rounds will feed into dequant
-//!   + inverse transform.
+//!   and the full §7.3.11.11 three-pass residual walker
+//!   (`sb_coded_flag` / `sig_coeff_flag` / `par_level_flag` /
+//!   `abs_level_gtx_flag` / `abs_remainder` / `dec_abs_level` /
+//!   `coeff_sign_flag`). Spec-exact ctxInc with the §9.3.4.2.7
+//!   `locNumSig` / `locSumAbsPass1` neighbourhood accumulators, the
+//!   §9.3.3.2 `locSumAbs` + Table 128 Rice-parameter derivation, and
+//!   the `remBinsPass1` budget (eq. 5018).
+//! * [`dequant`] — §8.7.3 scaled-transform-coefficient derivation
+//!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
+//!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
+//!   `ScalingMatrixRec` expansion via eq. 1149 / eq. 1150
+//!   (`matrixSize × matrixSize` → `nTbW × nTbH`). Transform-skip and
+//!   BDPCM accumulation still surface `Error::Unsupported`.
 //!
 //! ## Spec reference
 //!
@@ -74,6 +82,7 @@ pub mod ctu;
 pub mod ctx;
 pub mod dci;
 pub mod decoder;
+pub mod dequant;
 pub mod encoder;
 pub mod hrd;
 pub mod intra;

@@ -375,6 +375,137 @@ pub fn ctx_inc_abs_level_gt_3_flag(
     ) + 32
 }
 
+/// ctxInc for `par_level_flag[n]` in regular residual coding — shares
+/// the §9.3.4.2.9 derivation with `abs_level_gtx_flag[n][0]` (same
+/// inputs, same output). This wrapper simply calls
+/// [`ctx_inc_abs_level_gt_1_flag`] so call sites document intent.
+pub fn ctx_inc_par_level_flag(
+    c_idx: u32,
+    x_c: u32,
+    y_c: u32,
+    last_sig_x: u32,
+    last_sig_y: u32,
+    loc_num_sig: u32,
+    loc_sum_abs_pass1: u32,
+) -> u32 {
+    ctx_inc_abs_level_gt_1_flag(
+        c_idx,
+        x_c,
+        y_c,
+        last_sig_x,
+        last_sig_y,
+        loc_num_sig,
+        loc_sum_abs_pass1,
+    )
+}
+
+/// §9.3.4.2.7 derivation of `(locNumSig, locSumAbsPass1)` for regular
+/// (non-transform-skip) residual coding, given a `AbsLevelPass1[]` and
+/// `sig_coeff_flag[]` array in row-major `(n_tb_w * n_tb_h)` layout.
+///
+/// Returns `(locNumSig, locSumAbsPass1)`. Reads the 5-sample
+/// forward-diagonal neighbourhood: (xC+1,yC), (xC+2,yC), (xC+1,yC+1),
+/// (xC,yC+1), (xC,yC+2), each guarded against the `Log2ZoTbWidth /
+/// Log2ZoTbHeight` edge per the pseudo-code.
+pub fn loc_num_sig_and_sum_abs_pass1(
+    x_c: u32,
+    y_c: u32,
+    abs_level_pass1: &[u32],
+    sig_coeff_flag: &[bool],
+    log2_zo_tb_w: u32,
+    log2_zo_tb_h: u32,
+    n_tb_w: u32,
+) -> (u32, u32) {
+    let mut loc_num_sig = 0u32;
+    let mut loc_sum = 0u32;
+    let w_max = 1u32 << log2_zo_tb_w;
+    let h_max = 1u32 << log2_zo_tb_h;
+    let at = |xc: u32, yc: u32| -> usize { (yc as usize) * (n_tb_w as usize) + (xc as usize) };
+    if x_c < w_max - 1 {
+        loc_num_sig += sig_coeff_flag[at(x_c + 1, y_c)] as u32;
+        loc_sum += abs_level_pass1[at(x_c + 1, y_c)];
+        if x_c < w_max - 2 {
+            loc_num_sig += sig_coeff_flag[at(x_c + 2, y_c)] as u32;
+            loc_sum += abs_level_pass1[at(x_c + 2, y_c)];
+        }
+        if y_c < h_max - 1 {
+            loc_num_sig += sig_coeff_flag[at(x_c + 1, y_c + 1)] as u32;
+            loc_sum += abs_level_pass1[at(x_c + 1, y_c + 1)];
+        }
+    }
+    if y_c < h_max - 1 {
+        loc_num_sig += sig_coeff_flag[at(x_c, y_c + 1)] as u32;
+        loc_sum += abs_level_pass1[at(x_c, y_c + 1)];
+        if y_c < h_max - 2 {
+            loc_num_sig += sig_coeff_flag[at(x_c, y_c + 2)] as u32;
+            loc_sum += abs_level_pass1[at(x_c, y_c + 2)];
+        }
+    }
+    (loc_num_sig, loc_sum)
+}
+
+/// §9.3.3.2 derivation of `locSumAbs` for Rice-parameter lookup. This
+/// is the neighbourhood for `abs_remainder[]` / `dec_abs_level[]`
+/// binarisation. Same shape as [`loc_num_sig_and_sum_abs_pass1`] but
+/// reads the full `AbsLevel[]` (post-pass-2) array and falls back to
+/// `hist_value` at the zo-edge (not `Log2ZoTb*` but `Log2FullTb*`, per
+/// the spec — at this level they are identical when zero-out is off).
+pub fn loc_sum_abs_rice(
+    x_c: u32,
+    y_c: u32,
+    abs_level: &[u32],
+    log2_full_tb_w: u32,
+    log2_full_tb_h: u32,
+    n_tb_w: u32,
+    hist_value: u32,
+) -> u32 {
+    let mut loc_sum = 0u32;
+    let w_max = 1u32 << log2_full_tb_w;
+    let h_max = 1u32 << log2_full_tb_h;
+    let at = |xc: u32, yc: u32| -> usize { (yc as usize) * (n_tb_w as usize) + (xc as usize) };
+    if x_c < w_max - 1 {
+        loc_sum += abs_level[at(x_c + 1, y_c)];
+        if x_c < w_max - 2 {
+            loc_sum += abs_level[at(x_c + 2, y_c)];
+        } else {
+            loc_sum += hist_value;
+        }
+        if y_c < h_max - 1 {
+            loc_sum += abs_level[at(x_c + 1, y_c + 1)];
+        } else {
+            loc_sum += hist_value;
+        }
+    } else {
+        loc_sum += 2 * hist_value;
+    }
+    if y_c < h_max - 1 {
+        loc_sum += abs_level[at(x_c, y_c + 1)];
+        if y_c < h_max - 2 {
+            loc_sum += abs_level[at(x_c, y_c + 2)];
+        } else {
+            loc_sum += hist_value;
+        }
+    } else {
+        loc_sum += hist_value;
+    }
+    loc_sum
+}
+
+/// Table 128 lookup of `cRiceParam` from `locSumAbs`, after the
+/// §9.3.3.2 Clip3(0, 31, (locSumAbs >> shiftVal) − baseLevel * 5)
+/// normalisation has been applied by the caller.
+///
+/// The spec tabulates the full 0..31 range and maps it to 0..3
+/// piecewise: 0..6 → 0, 7..13 → 1, 14..27 → 2, 28..31 → 3.
+pub fn rice_param_from_loc_sum_abs(loc_sum_abs_clipped: u32) -> u32 {
+    match loc_sum_abs_clipped {
+        0..=6 => 0,
+        7..=13 => 1,
+        14..=27 => 2,
+        _ => 3,
+    }
+}
+
 /// ctxInc for `coeff_sign_flag` in transform-skip mode (§9.3.4.2.10
 /// eqs. 1588 / 1589 / 1590). In regular residual coding
 /// `coeff_sign_flag` is bypass-coded, so this context-variable path is
@@ -615,5 +746,63 @@ mod tests {
         assert_eq!(ctx_inc_sb_coded_flag_regular(0, 2), 1);
         assert_eq!(ctx_inc_sb_coded_flag_regular(1, 0), 2);
         assert_eq!(ctx_inc_sb_coded_flag_regular(1, 2), 3);
+    }
+
+    /// par_level_flag shares §9.3.4.2.9 with abs_level_gt_1_flag — same
+    /// inputs must give identical ctxInc.
+    #[test]
+    fn par_level_flag_matches_gt1() {
+        let a = ctx_inc_par_level_flag(0, 1, 2, 3, 3, 1, 2);
+        let b = ctx_inc_abs_level_gt_1_flag(0, 1, 2, 3, 3, 1, 2);
+        assert_eq!(a, b);
+    }
+
+    /// locNumSig / locSumAbsPass1 on a 4×4 TB with a single sig at
+    /// (1, 0) (abs=1) and otherwise zero: at position (0, 0) we look at
+    /// (1,0),(2,0),(1,1),(0,1),(0,2) — only (1,0) is sig, sum = 1.
+    #[test]
+    fn loc_num_sig_and_sum_small_tb() {
+        let mut sig = vec![false; 16];
+        let mut a1 = vec![0u32; 16];
+        sig[1] = true; // (1,0)
+        a1[1] = 1;
+        let (n, s) = loc_num_sig_and_sum_abs_pass1(0, 0, &a1, &sig, 2, 2, 4);
+        assert_eq!(n, 1);
+        assert_eq!(s, 1);
+    }
+
+    /// locNumSig / locSumAbsPass1 at the right-edge column (xC = w-1)
+    /// must not include (xC+1, *) lookups.
+    #[test]
+    fn loc_num_sig_right_edge_skips_forward_neighbour() {
+        let sig = vec![true; 16];
+        let a1 = vec![2u32; 16];
+        // (3, 0) on a 4×4 TB: no xC+1 branch; y-branches only read
+        // (3, 1), (3, 2) → sum = 4, count = 2.
+        let (n, s) = loc_num_sig_and_sum_abs_pass1(3, 0, &a1, &sig, 2, 2, 4);
+        assert_eq!(n, 2);
+        assert_eq!(s, 4);
+    }
+
+    /// Table 128 Rice-parameter lookup.
+    #[test]
+    fn rice_param_table_128() {
+        assert_eq!(rice_param_from_loc_sum_abs(0), 0);
+        assert_eq!(rice_param_from_loc_sum_abs(6), 0);
+        assert_eq!(rice_param_from_loc_sum_abs(7), 1);
+        assert_eq!(rice_param_from_loc_sum_abs(13), 1);
+        assert_eq!(rice_param_from_loc_sum_abs(14), 2);
+        assert_eq!(rice_param_from_loc_sum_abs(27), 2);
+        assert_eq!(rice_param_from_loc_sum_abs(28), 3);
+        assert_eq!(rice_param_from_loc_sum_abs(31), 3);
+    }
+
+    /// locSumAbsRice on an all-zero neighbourhood with hist_value = 0
+    /// returns 0 even at the zo-edges (all fallback values are 0).
+    #[test]
+    fn loc_sum_abs_rice_zero_neighbourhood() {
+        let a = vec![0u32; 16];
+        assert_eq!(loc_sum_abs_rice(3, 3, &a, 2, 2, 4, 0), 0);
+        assert_eq!(loc_sum_abs_rice(0, 0, &a, 2, 2, 4, 0), 0);
     }
 }
