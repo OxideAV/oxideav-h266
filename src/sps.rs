@@ -1167,16 +1167,14 @@ pub fn parse_ref_pic_list_struct(
     // (rplsIdx < sps_num_ref_pic_lists[listIdx]) and there is at least
     // one entry. Otherwise §7.4.11 infers it to 1 when LT refs are
     // enabled and rplsIdx == sps_num_ref_pic_lists[listIdx], else 0.
-    let ltrp_in_header_flag = if long_term_ref_pics_flag
-        && rpls_idx < num_ref_pic_lists_listidx
-        && num_ref_entries > 0
-    {
-        br.u1()? == 1
-    } else if long_term_ref_pics_flag && rpls_idx == num_ref_pic_lists_listidx {
-        true
-    } else {
-        false
-    };
+    let ltrp_in_header_flag =
+        if long_term_ref_pics_flag && rpls_idx < num_ref_pic_lists_listidx && num_ref_entries > 0 {
+            br.u1()? == 1
+        } else if long_term_ref_pics_flag && rpls_idx == num_ref_pic_lists_listidx {
+            true
+        } else {
+            false
+        };
 
     let poc_lsb_lt_width = log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
 
@@ -1204,8 +1202,7 @@ pub fn parse_ref_pic_list_struct(
                     )));
                 }
                 // Equation (150): +1 unless gated by weighted pred on i>0.
-                let gated =
-                    (weighted_pred_flag || weighted_bipred_flag) && i != 0;
+                let gated = (weighted_pred_flag || weighted_bipred_flag) && i != 0;
                 let abs = if gated {
                     abs_delta_poc_st
                 } else {

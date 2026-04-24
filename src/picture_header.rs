@@ -761,7 +761,7 @@ mod tests {
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 0, 1); // ph_gdr_pic_flag
         push_u(&mut bits, 0, 1); // ph_inter_slice_allowed_flag = 0
-        // ph_pic_parameter_set_id = 0 → ue "1"
+                                 // ph_pic_parameter_set_id = 0 → ue "1"
         push_ue(&mut bits, 0);
         // ph_pic_order_cnt_lsb: 8 bits (log2_max = 4 + 4 = 8).
         push_u(&mut bits, 0b0000_0101, 8);
@@ -781,11 +781,11 @@ mod tests {
         // ph_inter_slice_allowed_flag = 0 → skip whole inter block.
         // pps_qp_delta_info_in_ph_flag = 1 → read ph_qp_delta.
         push_ue(&mut bits, 0); // ph_qp_delta = 0 → se "1"
-        // sps_joint_cbcr_enabled_flag = 0 → skip sign flag.
-        // sps_sao_enabled_flag = 0 → skip.
-        // pps_dbf_info_in_ph_flag = 1 → read deblocking block gate.
+                               // sps_joint_cbcr_enabled_flag = 0 → skip sign flag.
+                               // sps_sao_enabled_flag = 0 → skip.
+                               // pps_dbf_info_in_ph_flag = 1 → read deblocking block gate.
         push_u(&mut bits, 0, 1); // ph_deblocking_params_present_flag = 0
-        // pps_picture_header_extension_present_flag = 0 → skip.
+                                 // pps_picture_header_extension_present_flag = 0 → skip.
         let bytes = pack(&bits);
         let ph = parse_picture_header_stateful(&bytes, &sps, &pps).unwrap();
         assert!(ph.ph_gdr_or_irap_pic_flag);
@@ -810,7 +810,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // ph_inter_slice_allowed = 0
         push_ue(&mut bits, 0);
         push_u(&mut bits, 0, 8); // ph_pic_order_cnt_lsb = 0
-        // ph_qp_delta = 0
+                                 // ph_qp_delta = 0
         push_ue(&mut bits, 0);
         // sao_luma + sao_chroma
         push_u(&mut bits, 1, 1);

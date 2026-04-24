@@ -52,6 +52,7 @@ pub struct Cu {
 }
 
 /// CABAC context arrays used by the coding-tree walker.
+#[derive(Debug)]
 pub struct TreeCtxs {
     pub split_cu: Vec<ContextModel>,
     pub split_qt: Vec<ContextModel>,
@@ -112,7 +113,8 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         mtt_depth: u32,
     ) -> Result<()> {
         // At the minimum CU size we stop without reading a split flag.
-        let at_min = w.trailing_zeros() <= self.min_cb_log2 || h.trailing_zeros() <= self.min_cb_log2;
+        let at_min =
+            w.trailing_zeros() <= self.min_cb_log2 || h.trailing_zeros() <= self.min_cb_log2;
         if at_min {
             self.out.push(Cu {
                 x,
@@ -127,9 +129,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         // split_cu_flag — ctxInc uses availability of L/A neighbours
         // (treated as unavailable at the root here) and partition
         // allowance flags (all allowed at the root of a large CU).
-        let split_cu_inc = ctx_inc_split_cu_flag(
-            false, false, 0, 0, w, h, 1, 1, 1, 1, 1,
-        ) as usize;
+        let split_cu_inc = ctx_inc_split_cu_flag(false, false, 0, 0, w, h, 1, 1, 1, 1, 1) as usize;
         let split_cu_ctx_n = self.ctxs.split_cu.len() - 1;
         let split_cu = self
             .dec
@@ -201,10 +201,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
 
 /// Read an `intra_luma_mpm_flag` bin. Exposed for unit tests and for
 /// the intra-predict selector when it is wired up.
-pub fn read_intra_luma_mpm_flag(
-    dec: &mut ArithDecoder<'_>,
-    ctxs: &mut TreeCtxs,
-) -> Result<u32> {
+pub fn read_intra_luma_mpm_flag(dec: &mut ArithDecoder<'_>, ctxs: &mut TreeCtxs) -> Result<u32> {
     let inc = ctx_inc_intra_luma_mpm_flag() as usize;
     dec.decode_decision(&mut ctxs.intra_luma_mpm[inc])
 }
@@ -212,10 +209,7 @@ pub fn read_intra_luma_mpm_flag(
 /// Read a `pred_mode_flag` bin at the root of an intra-inter-capable
 /// CU. Always returns 1 in an I-slice because pred_mode_flag is never
 /// signalled there — but exposed for completeness.
-pub fn read_pred_mode_flag(
-    dec: &mut ArithDecoder<'_>,
-    ctxs: &mut TreeCtxs,
-) -> Result<u32> {
+pub fn read_pred_mode_flag(dec: &mut ArithDecoder<'_>, ctxs: &mut TreeCtxs) -> Result<u32> {
     let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
     dec.decode_decision(&mut ctxs.pred_mode[inc])
 }
@@ -255,6 +249,16 @@ mod tests {
         let walker = TreeWalker::new(&mut dec, &mut ctxs);
         // 4x4 is the minimum CB size for luma (MinCbLog2SizeY = 2).
         let cus = walker.walk(0, 0, 4, 4).unwrap();
-        assert_eq!(cus, vec![Cu { x: 0, y: 0, w: 4, h: 4, cqt_depth: 0, mtt_depth: 0 }]);
+        assert_eq!(
+            cus,
+            vec![Cu {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+                cqt_depth: 0,
+                mtt_depth: 0
+            }]
+        );
     }
 }

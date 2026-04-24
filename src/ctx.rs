@@ -55,11 +55,13 @@ pub fn ctx_inc_split_cu_flag(
 ) -> u32 {
     let cond_l = available_l && cb_height_left < cb_height;
     let cond_a = available_a && cb_width_above < cb_width;
-    let ctx_set_idx =
-        (allow_split_bt_ver + allow_split_bt_hor + allow_split_tt_ver + allow_split_tt_hor
-            + 2 * allow_split_qt
-            - 1)
-            / 2;
+    let ctx_set_idx = (allow_split_bt_ver
+        + allow_split_bt_hor
+        + allow_split_tt_ver
+        + allow_split_tt_hor
+        + 2 * allow_split_qt
+        - 1)
+        / 2;
     (cond_l as u32) + (cond_a as u32) + ctx_set_idx * 3
 }
 
@@ -239,12 +241,10 @@ mod tests {
     fn split_cu_flag_basic() {
         // No neighbours → cond_l = cond_a = 0; allow_split_qt = 1 gives
         // ctxSetIdx = (0 + 0 + 0 + 0 + 2 - 1) / 2 = 0.
-        let inc =
-            ctx_inc_split_cu_flag(false, false, 0, 0, 128, 128, 0, 0, 0, 0, 1);
+        let inc = ctx_inc_split_cu_flag(false, false, 0, 0, 128, 128, 0, 0, 0, 0, 1);
         assert_eq!(inc, 0);
         // Both neighbours available and smaller than current → cond_l = cond_a = 1.
-        let inc =
-            ctx_inc_split_cu_flag(true, true, 64, 64, 128, 128, 1, 1, 1, 1, 1);
+        let inc = ctx_inc_split_cu_flag(true, true, 64, 64, 128, 128, 1, 1, 1, 1, 1);
         // ctxSetIdx = (1+1+1+1+2-1)/2 = 5/2 = 2. inc = 1 + 1 + 2*3 = 8.
         assert_eq!(inc, 8);
     }

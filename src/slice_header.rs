@@ -496,16 +496,12 @@ pub fn parse_slice_header_stateful(
     out.byte_alignment_bit_pos = br.bit_position();
     let stop_bit = br.u1()?;
     if stop_bit != 1 {
-        return Err(Error::invalid(
-            "h266 SH: byte_alignment stop bit != 1",
-        ));
+        return Err(Error::invalid("h266 SH: byte_alignment stop bit != 1"));
     }
     while br.bit_position() % 8 != 0 {
         let pad = br.u1()?;
         if pad != 0 {
-            return Err(Error::invalid(
-                "h266 SH: byte_alignment padding bit != 0",
-            ));
+            return Err(Error::invalid("h266 SH: byte_alignment padding bit != 0"));
         }
     }
 
@@ -773,7 +769,7 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
         push_ue(&mut bits, 0); // sh_slice_type = B
-                                // no sh_no_output_of_prior_pics_flag (NalUnitType::TrailNut)
+                               // no sh_no_output_of_prior_pics_flag (NalUnitType::TrailNut)
         push_u(&mut bits, 1, 1); // sh_cabac_init_flag = 1
         push_byte_align(&mut bits);
         let bytes = pack(&bits);
@@ -864,8 +860,8 @@ mod tests {
         push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
         push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
         push_u(&mut bits, 1, 1); // sh_dep_quant_used_flag = 1
-        // sh_sign_data_hiding_used_flag + sh_ts_residual_coding_disabled_flag
-        // both suppressed because dep_quant == 1.
+                                 // sh_sign_data_hiding_used_flag + sh_ts_residual_coding_disabled_flag
+                                 // both suppressed because dep_quant == 1.
         push_byte_align(&mut bits);
         let bytes = pack(&bits);
 
@@ -907,10 +903,10 @@ mod tests {
         };
         let mut bits: Vec<u8> = Vec::new();
         push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
-        // sh_slice_address is ceil(log2(NumTilesInPic)) = 1 bit.
+                                 // sh_slice_address is ceil(log2(NumTilesInPic)) = 1 bit.
         push_u(&mut bits, 1, 1); // sh_slice_address = 1 (second tile)
-        // sh_num_tiles_in_slice_minus1: NumTilesInPic - slice_address = 1,
-        // so `> 1` fails → not emitted.
+                                 // sh_num_tiles_in_slice_minus1: NumTilesInPic - slice_address = 1,
+                                 // so `> 1` fails → not emitted.
         push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
         push_byte_align(&mut bits);
         let bytes = pack(&bits);
@@ -935,7 +931,7 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
         push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
-        // sh_slice_header_extension_length = 2 → ue "011".
+                                 // sh_slice_header_extension_length = 2 → ue "011".
         push_ue(&mut bits, 2);
         for _ in 0..8 {
             bits.push(1); // sh_slice_header_extension_data_byte[0] = 0xFF

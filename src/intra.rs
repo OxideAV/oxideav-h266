@@ -41,11 +41,7 @@ pub struct IntraRefs<'a> {
 /// INTRA_PLANAR (§8.4.5.2.11).
 ///
 /// `pred[y * n_tb_w + x]` is the row-major output array.
-pub fn predict_planar(
-    n_tb_w: usize,
-    n_tb_h: usize,
-    refs: &IntraRefs<'_>,
-) -> Result<Vec<i16>> {
+pub fn predict_planar(n_tb_w: usize, n_tb_h: usize, refs: &IntraRefs<'_>) -> Result<Vec<i16>> {
     if refs.above.len() < n_tb_w + 1 || refs.left.len() < n_tb_h + 1 {
         return Err(Error::invalid(
             "h266 intra planar: reference arrays too short",
@@ -67,11 +63,9 @@ pub fn predict_planar(
         for x in 0..n_tb_w {
             let p_a = refs.above[x] as i32; // p[x][-1]
             let p_l = refs.left[y] as i32; // p[-1][y]
-            // eq. 330 / 331
-            let pred_v = ((n_tb_h as i32 - 1 - y as i32) * p_a + (y as i32 + 1) * p_bl)
-                << log2_w;
-            let pred_h = ((n_tb_w as i32 - 1 - x as i32) * p_l + (x as i32 + 1) * p_tr)
-                << log2_h;
+                                           // eq. 330 / 331
+            let pred_v = ((n_tb_h as i32 - 1 - y as i32) * p_a + (y as i32 + 1) * p_bl) << log2_w;
+            let pred_h = ((n_tb_w as i32 - 1 - x as i32) * p_l + (x as i32 + 1) * p_tr) << log2_h;
             // eq. 332
             let p = (pred_v + pred_h + round) >> shift;
             pred[y * n_tb_w + x] = p as i16;
@@ -84,11 +78,7 @@ pub fn predict_planar(
 ///
 /// `pred[y * n_tb_w + x]` is the row-major output array, all samples
 /// set to the same dcVal.
-pub fn predict_dc(
-    n_tb_w: usize,
-    n_tb_h: usize,
-    refs: &IntraRefs<'_>,
-) -> Result<Vec<i16>> {
+pub fn predict_dc(n_tb_w: usize, n_tb_h: usize, refs: &IntraRefs<'_>) -> Result<Vec<i16>> {
     if refs.above.len() < n_tb_w || refs.left.len() < n_tb_h {
         return Err(Error::invalid("h266 intra DC: reference arrays too short"));
     }

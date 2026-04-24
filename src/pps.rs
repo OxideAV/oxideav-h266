@@ -189,10 +189,8 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         let log2_ctu_size_minus5 = br.u(2)? as u8;
         let ctb_log2 = log2_ctu_size_minus5 as u32 + 5;
         let ctb_size = 1u32 << ctb_log2;
-        let pic_width_ctbs =
-            (pps_pic_width_in_luma_samples + ctb_size - 1) / ctb_size;
-        let pic_height_ctbs =
-            (pps_pic_height_in_luma_samples + ctb_size - 1) / ctb_size;
+        let pic_width_ctbs = (pps_pic_width_in_luma_samples + ctb_size - 1) / ctb_size;
+        let pic_height_ctbs = (pps_pic_height_in_luma_samples + ctb_size - 1) / ctb_size;
         if pic_width_ctbs == 0 || pic_height_ctbs == 0 {
             return Err(Error::invalid(
                 "h266 PPS: partition block with zero CTB-count picture dimensions",
@@ -234,10 +232,8 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
 
         // §6.5.1 equations 14 / 15: repeat the last explicit width /
         // height until the picture is covered.
-        let col_width_ctbs =
-            derive_tile_sizes(&explicit_col_widths, pic_width_ctbs);
-        let row_height_ctbs =
-            derive_tile_sizes(&explicit_row_heights, pic_height_ctbs);
+        let col_width_ctbs = derive_tile_sizes(&explicit_col_widths, pic_width_ctbs);
+        let row_height_ctbs = derive_tile_sizes(&explicit_row_heights, pic_height_ctbs);
         let num_tile_columns = col_width_ctbs.len() as u32;
         let num_tile_rows = row_height_ctbs.len() as u32;
         let num_tiles_in_pic = num_tile_columns.saturating_mul(num_tile_rows);
@@ -293,17 +289,12 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
                 if !last_col {
                     slice_w = br.ue()? + 1;
                 }
-                if !last_row
-                    && (pps_tile_idx_delta_present_flag || tile_x == 0)
-                {
+                if !last_row && (pps_tile_idx_delta_present_flag || tile_x == 0) {
                     slice_h = br.ue()? + 1;
                 }
                 slice_widths.push(slice_w);
                 slice_heights.push(slice_h);
-                if slice_w == 1
-                    && slice_h == 1
-                    && row_height_ctbs[tile_y as usize] > 1
-                {
+                if slice_w == 1 && slice_h == 1 && row_height_ctbs[tile_y as usize] > 1 {
                     let pps_num_exp_slices_in_tile = br.ue()?;
                     if pps_num_exp_slices_in_tile > row_height_ctbs[tile_y as usize] {
                         return Err(Error::invalid(format!(
@@ -339,10 +330,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
             }
             slice_top_left_tile_idx.push(tile_idx as u32);
         }
-        if !pps_rect_slice_flag
-            || pps_single_slice_per_subpic_flag
-            || num_slices_in_pic > 1
-        {
+        if !pps_rect_slice_flag || pps_single_slice_per_subpic_flag || num_slices_in_pic > 1 {
             pps_loop_filter_across_slices_enabled_flag = br.u1()? == 1;
         }
 
@@ -672,8 +660,8 @@ mod tests {
         push_ue(&mut bits, 0); // pps_tile_column_width_minus1[0] = 0 → width 1
         push_ue(&mut bits, 0); // pps_tile_column_width_minus1[1] = 0 → width 1
         push_ue(&mut bits, 0); // pps_tile_row_height_minus1[0] = 0 → height 1
-                                // NumTileColumns = 2, NumTileRows = 1 → NumTilesInPic = 2.
-                                // (NumTilesInPic > 1) branch:
+                               // NumTileColumns = 2, NumTileRows = 1 → NumTilesInPic = 2.
+                               // (NumTilesInPic > 1) branch:
         push_u(&mut bits, 1, 1); // pps_loop_filter_across_tiles_enabled_flag
         push_u(&mut bits, 1, 1); // pps_rect_slice_flag
                                  // (pps_rect_slice_flag) branch:

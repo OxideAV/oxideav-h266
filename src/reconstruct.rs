@@ -227,7 +227,8 @@ mod tests {
         let d = dequantise_block(&c, 4, 4, 30, 8).unwrap();
 
         // Inverse 2D DCT-II on the dequantised coefficients.
-        let res = inverse_transform_2d(4, 4, 1, 1, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+        let res =
+            inverse_transform_2d(4, 4, 1, 1, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
 
         // Reconstruct into a 4x4 plane.
         let mut plane = vec![0u8; 16];

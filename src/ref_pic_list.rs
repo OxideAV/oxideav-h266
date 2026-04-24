@@ -272,10 +272,7 @@ pub fn parse_ref_pic_lists(
             false
         } else {
             // §7.4.10: i == 1, pps_rpl1_idx_present_flag == 0 → mirror list 0.
-            out[0]
-                .as_ref()
-                .map(|p| p.rpl_sps_flag)
-                .unwrap_or(false)
+            out[0].as_ref().map(|p| p.rpl_sps_flag).unwrap_or(false)
         };
 
         let (rpl_idx_signalled, rpls): (Option<u32>, RefPicListStruct) = if rpl_sps_flag {
@@ -311,14 +308,11 @@ pub fn parse_ref_pic_lists(
             } else {
                 &sps.tool_flags.ref_pic_lists[i]
             };
-            let rpls = candidates
-                .get(idx as usize)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::invalid(format!(
-                        "h266 RPL: rpl_idx[{i}] = {idx} references missing SPS candidate"
-                    ))
-                })?;
+            let rpls = candidates.get(idx as usize).cloned().ok_or_else(|| {
+                Error::invalid(format!(
+                    "h266 RPL: rpl_idx[{i}] = {idx} references missing SPS candidate"
+                ))
+            })?;
             (rpl_idx, rpls)
         } else {
             // Inline: ref_pic_list_struct(i, sps_num_ref_pic_lists[i]).
@@ -345,8 +339,7 @@ pub fn parse_ref_pic_lists(
         // Per-LT side-channel info. Width of poc_lsb_lt equals
         // sps_log2_max_pic_order_cnt_lsb_minus4 + 4 bits (§7.4.10).
         let poc_lsb_width = sps.sps_log2_max_pic_order_cnt_lsb_minus4 as u32 + 4;
-        let mut lt_info: Vec<LongTermHeaderInfo> =
-            Vec::with_capacity(rpls.num_ltrp_entries());
+        let mut lt_info: Vec<LongTermHeaderInfo> = Vec::with_capacity(rpls.num_ltrp_entries());
         for _ in 0..rpls.num_ltrp_entries() {
             let poc_lsb_lt_header = if rpls.ltrp_in_header_flag {
                 br.u(poc_lsb_width)?
@@ -764,7 +757,7 @@ mod tests {
         push_ue(&mut bits, 0);
         // abs = abs_delta_poc_st + 1 = 1 > 0, strp_entry_sign_flag present.
         push_u(&mut bits, 0, 1); // sign = 0 → positive.
-        // List 1: rpl_sps_flag = 1 (num = 1, single SPS candidate).
+                                 // List 1: rpl_sps_flag = 1 (num = 1, single SPS candidate).
         push_u(&mut bits, 1, 1);
         // rpl_idx inferred to 0 (num = 1).
         // No LT info block.

@@ -870,10 +870,7 @@ mod tests {
     /// pick DST-VII / DCT-VIII per the spec table.
     #[test]
     fn mts_idx_table_39() {
-        assert_eq!(
-            mts_idx_to_tr_types(0),
-            Some((TrType::DctII, TrType::DctII))
-        );
+        assert_eq!(mts_idx_to_tr_types(0), Some((TrType::DctII, TrType::DctII)));
         assert_eq!(
             mts_idx_to_tr_types(1),
             Some((TrType::DstVII, TrType::DstVII))
@@ -955,17 +952,8 @@ mod tests {
     #[test]
     fn inverse_2d_rejects_bad_input() {
         let d = vec![0i32; 10]; // wrong size for 4x4
-        assert!(inverse_transform_2d(
-            4,
-            4,
-            4,
-            4,
-            TrType::DctII,
-            TrType::DctII,
-            &d,
-            10,
-            15
-        )
-        .is_err());
+        assert!(
+            inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 10, 15).is_err()
+        );
     }
 }

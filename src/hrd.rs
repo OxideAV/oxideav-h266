@@ -370,7 +370,7 @@ mod tests {
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 1, 1); // low_delay_hrd_flag = 1
-                                  // NAL sublayer_hrd_parameters: one CPB, no DU branch.
+                                 // NAL sublayer_hrd_parameters: one CPB, no DU branch.
         push_ue(&mut bits, 17); // bit_rate_value_minus1
         push_ue(&mut bits, 33); // cpb_size_value_minus1
         push_u(&mut bits, 1, 1); // cbr_flag

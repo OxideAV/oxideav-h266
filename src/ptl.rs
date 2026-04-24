@@ -101,7 +101,10 @@ pub fn parse_profile_tier_level(
 /// position correctly so the surrounding PTL / VPS / SPS parse stays
 /// aligned. `gci_present_flag` is exposed; if false, the syntax is empty
 /// except for the byte-alignment zeros.
-fn parse_general_constraints_info(br: &mut BitReader<'_>, ptl: &mut ProfileTierLevel) -> Result<()> {
+fn parse_general_constraints_info(
+    br: &mut BitReader<'_>,
+    ptl: &mut ProfileTierLevel,
+) -> Result<()> {
     ptl.gci_present_flag = br.u1()? == 1;
     if ptl.gci_present_flag {
         // 3 general flags.

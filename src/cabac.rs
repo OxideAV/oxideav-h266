@@ -276,11 +276,7 @@ impl<'a> ArithDecoder<'a> {
     /// Top-level DecodeBin dispatch (§9.3.4.3.1). `ctx = None` plus
     /// `bypass_flag = false` selects the DecodeTerminate path, as
     /// specified by the (ctxTable=0, ctxIdx=0) convention.
-    pub fn decode_bin(
-        &mut self,
-        ctx: Option<&mut ContextModel>,
-        bypass_flag: bool,
-    ) -> Result<u32> {
+    pub fn decode_bin(&mut self, ctx: Option<&mut ContextModel>, bypass_flag: bool) -> Result<u32> {
         if bypass_flag {
             return self.decode_bypass();
         }

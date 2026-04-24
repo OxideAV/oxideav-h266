@@ -175,8 +175,7 @@ pub const ABS_LEVEL_GTX_FLAG_SHIFT: &[u8] = &[
 pub const COEFF_SIGN_FLAG_INIT: &[u8] = &[
     12, 17, 46, 28, 25, 46, 5, 10, 53, 43, 25, 46, 35, 25, 46, 28, 33, 38,
 ];
-pub const COEFF_SIGN_FLAG_SHIFT: &[u8] =
-    &[1, 4, 4, 5, 8, 8, 1, 4, 4, 5, 8, 8, 1, 4, 4, 5, 8, 8];
+pub const COEFF_SIGN_FLAG_SHIFT: &[u8] = &[1, 4, 4, 5, 8, 8, 1, 4, 4, 5, 8, 8, 1, 4, 4, 5, 8, 8];
 
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
