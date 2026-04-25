@@ -7,7 +7,7 @@
 //! and — as they land in subsequent increments — `vps`, `sps`, `pps`,
 //! `aps`, `picture_header`, `slice_header`).
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::CODEC_ID_STR;

@@ -102,8 +102,8 @@ pub mod tables;
 pub mod transform;
 pub mod vps;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Canonical oxideav codec id for H.266 / VVC.
 pub const CODEC_ID_STR: &str = "h266";
