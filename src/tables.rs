@@ -33,6 +33,10 @@
 //! * `cu_chroma_qp_offset_flag` — Table 116 (3 ctxIdx).
 //! * `cu_chroma_qp_offset_idx` — Table 117 (3 ctxIdx).
 //! * `par_level_flag` — Table 124 (99 ctxIdx).
+//! * `sao_merge_left_flag` / `sao_merge_up_flag` — Table 57 (3 ctxIdx, one
+//!   per initType).
+//! * `sao_type_idx_luma` / `sao_type_idx_chroma` — Table 58 (3 ctxIdx, one
+//!   per initType).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
@@ -64,6 +68,12 @@ pub enum SyntaxCtx {
     CuChromaQpOffsetFlag,
     CuChromaQpOffsetIdx,
     ParLevelFlag,
+    /// Table 57 — `sao_merge_left_flag` and `sao_merge_up_flag` share the
+    /// same 3-entry table (one ctxIdx per initType).
+    SaoMergeFlag,
+    /// Table 58 — `sao_type_idx_luma` and `sao_type_idx_chroma` share the
+    /// same 3-entry table (one ctxIdx per initType).
+    SaoTypeIdx,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -243,6 +253,24 @@ pub const COEFF_SIGN_FLAG_INIT: &[u8] = &[
 ];
 pub const COEFF_SIGN_FLAG_SHIFT: &[u8] = &[1, 4, 4, 5, 8, 8, 1, 4, 4, 5, 8, 8, 1, 4, 4, 5, 8, 8];
 
+/// Table 57 — `sao_merge_left_flag` / `sao_merge_up_flag` (3 ctxIdx,
+/// one per initType ∈ {0, 1, 2}). Both syntax elements share Table 57
+/// per Table 51. From the spec table:
+///   initType  | 0  | 1  | 2 |
+///   initValue | 60 | 60 | 2 |
+///   shiftIdx  |  0 |  0 | 0 |
+pub const SAO_MERGE_FLAG_INIT: &[u8] = &[60, 60, 2];
+pub const SAO_MERGE_FLAG_SHIFT: &[u8] = &[0, 0, 0];
+
+/// Table 58 — `sao_type_idx_luma` / `sao_type_idx_chroma` (3 ctxIdx,
+/// one per initType ∈ {0, 1, 2}). Both share Table 58 per Table 51.
+/// From the spec table:
+///   initType  | 0  | 1 | 2 |
+///   initValue | 13 | 5 | 2 |
+///   shiftIdx  |  4 | 4 | 4 |
+pub const SAO_TYPE_IDX_INIT: &[u8] = &[13, 5, 2];
+pub const SAO_TYPE_IDX_SHIFT: &[u8] = &[4, 4, 4];
+
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
     // par_level_flag) span multiple PDF rows; we keep the in-tree
@@ -288,6 +316,8 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
             (CU_CHROMA_QP_OFFSET_IDX_INIT, CU_CHROMA_QP_OFFSET_IDX_SHIFT)
         }
         SyntaxCtx::ParLevelFlag => (PAR_LEVEL_FLAG_INIT, PAR_LEVEL_FLAG_SHIFT),
+        SyntaxCtx::SaoMergeFlag => (SAO_MERGE_FLAG_INIT, SAO_MERGE_FLAG_SHIFT),
+        SyntaxCtx::SaoTypeIdx => (SAO_TYPE_IDX_INIT, SAO_TYPE_IDX_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -339,6 +369,8 @@ mod tests {
             SyntaxCtx::CuChromaQpOffsetFlag,
             SyntaxCtx::CuChromaQpOffsetIdx,
             SyntaxCtx::ParLevelFlag,
+            SyntaxCtx::SaoMergeFlag,
+            SyntaxCtx::SaoTypeIdx,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);

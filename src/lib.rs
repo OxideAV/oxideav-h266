@@ -50,12 +50,14 @@
 //!   filters with Table 43 β/tC). Wired into
 //!   [`ctu::CtuWalker::apply_in_loop_filters`].
 //! * [`sao`] — §8.8.4 sample adaptive offset (Edge Offset + Band
-//!   Offset, Table 10 / Table 11 / Table 44). The `sao(rx, ry)` syntax
-//!   parser is not yet implemented (needs Table 58 CABAC contexts);
-//!   per-CTB parameters can be supplied programmatically via
-//!   [`ctu::CtuWalker::set_sao_picture`] for fixture-driven tests. The
-//!   apply pass runs after deblocking inside
-//!   [`ctu::CtuWalker::apply_in_loop_filters`].
+//!   Offset, Table 10 / Table 11 / Table 44). The apply pass runs after
+//!   deblocking inside [`ctu::CtuWalker::apply_in_loop_filters`].
+//! * [`sao_syntax`] — §7.3.11.3 `sao(rx, ry)` CABAC parser (Tables 57 /
+//!   58 + Table 132 ctxInc + merge inference). Wired into
+//!   [`ctu::CtuWalker::decode_picture_into`] so the per-CTB params are
+//!   populated automatically from the slice CABAC stream; tests may
+//!   still inject programmatic params via
+//!   [`ctu::CtuWalker::set_sao_picture`].
 //! * [`dequant`] — §8.7.3 scaled-transform-coefficient derivation
 //!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
 //!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
@@ -113,6 +115,7 @@ pub mod reconstruct;
 pub mod ref_pic_list;
 pub mod residual;
 pub mod sao;
+pub mod sao_syntax;
 pub mod scan;
 pub mod slice_header;
 pub mod sps;

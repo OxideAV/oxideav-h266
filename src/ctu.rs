@@ -79,6 +79,7 @@ use crate::leaf_cu::{
 use crate::pps::PicParameterSet;
 use crate::reconstruct::{reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
 use crate::sao::{apply_sao, SaoConfig, SaoPicture};
+use crate::sao_syntax::{decode_sao_ctb, SaoCtxs, SaoSyntaxConfig};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
 use crate::transform::{implicit_mts_tr_types, inverse_transform_2d, TrType};
@@ -410,11 +411,16 @@ pub struct CtuWalker<'a, 'b> {
     /// [`Self::apply_in_loop_filters`].
     deblock_cus: Vec<DeblockCu>,
     /// Per-CTB SAO parameters consumed by [`Self::apply_in_loop_filters`].
-    /// Defaults to "all CTBs not applied"; callers (and integration
-    /// tests) populate the array explicitly via [`Self::set_sao_picture`]
-    /// since the round-13 walker does not yet decode the §7.3.11.3
-    /// `sao(rx, ry)` syntax (waiting on Table 58 CABAC contexts).
+    /// Defaults to "all CTBs not applied". The round-14 walker can
+    /// optionally invoke [`Self::decode_sao_for_ctu`] before
+    /// [`Self::decode_ctu_partitions`] to populate this array from the
+    /// §7.3.11.3 `sao(rx, ry)` CABAC syntax; otherwise callers (and
+    /// integration tests) may populate it programmatically via
+    /// [`Self::set_sao_picture`].
     sao_picture: SaoPicture,
+    /// CABAC contexts for the §7.3.11.3 SAO syntax. Lives on the walker
+    /// so each per-CTU call advances the same engine.
+    sao_ctxs: SaoCtxs,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -502,6 +508,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
         let sao_picture =
             SaoPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
+        let sao_ctxs = SaoCtxs::init(slice_qp.as_init_qp());
         Ok(Self {
             layout,
             sps,
@@ -512,6 +519,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             leaf_ctxs,
             deblock_cus: Vec::new(),
             sao_picture,
+            sao_ctxs,
         })
     }
 
@@ -540,6 +548,59 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// Read-only view of the current per-picture SAO parameter array.
     pub fn sao_picture(&self) -> &SaoPicture {
         &self.sao_picture
+    }
+
+    /// Decode the §7.3.11.3 `sao(rx, ry)` syntax for the supplied CTU
+    /// position and fold the result into the walker's [`SaoPicture`].
+    ///
+    /// The spec walker invokes this at the start of `coding_tree_unit()`
+    /// — i.e. *before* the partition tree — when SAO is enabled by the
+    /// slice header (`sh_sao_luma_used_flag` or `sh_sao_chroma_used_flag`).
+    /// Tile / slice / sub-picture boundary handling collapses to the
+    /// single-tile / single-slice rule today: `leftCtbAvailable = rx > 0`
+    /// and `upCtbAvailable = ry > 0 && !FirstCtbRowInSlice` (the
+    /// `FirstCtbRowInSlice` term reduces to "ry > 0" in the single-slice
+    /// case).
+    ///
+    /// Skipping this call (or calling it before [`Self::set_sao_picture`])
+    /// leaves the per-CTB params at their constructor defaults — every
+    /// CTB classifies as `SaoTypeIdx::NotApplied`, so SAO becomes a
+    /// no-op even when the slice flags are on. The caller is expected
+    /// to invoke this exactly once per CTU in slice order before
+    /// [`Self::decode_ctu_partitions`] / [`Self::decode_ctu_full`] for
+    /// the same CTU, since the SAO syntax sits *before* the partition
+    /// tree in the CABAC byte stream (§7.3.11.2).
+    pub fn decode_sao_for_ctu(&mut self, ctu: &CtuPos) -> Result<()> {
+        if !self.sh.sh_sao_luma_used_flag && !self.sh.sh_sao_chroma_used_flag {
+            return Ok(());
+        }
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let cfg = SaoSyntaxConfig {
+            luma_used: self.sh.sh_sao_luma_used_flag,
+            chroma_used: self.sh.sh_sao_chroma_used_flag,
+            chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
+            bit_depth,
+            slice_type: self.sh.sh_slice_type,
+            sh_cabac_init_flag: self.cabac.sh_cabac_init_flag,
+        };
+        // Single-slice / single-tile fixture: the spec's
+        // `leftCtbAvailable` / `upCtbAvailable` checks (§7.3.11.3)
+        // reduce to "in the picture and not the first CTU of the
+        // current slice row".
+        let left_avail = ctu.x_ctb > 0;
+        let up_avail = ctu.y_ctb > 0;
+        let params = decode_sao_ctb(
+            &mut self.arith,
+            &mut self.sao_ctxs,
+            &cfg,
+            &self.sao_picture,
+            ctu.x_ctb,
+            ctu.y_ctb,
+            left_avail,
+            up_avail,
+        )?;
+        self.sao_picture.set(ctu.x_ctb, ctu.y_ctb, params);
+        Ok(())
     }
 
     /// Build a [`CuToolFlags`] snapshot from the parameter-set views
@@ -1085,6 +1146,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     pub fn decode_picture_into(&mut self, out: &mut PictureBuffer) -> Result<()> {
         let ctus: Vec<CtuPos> = self.iter_ctus().collect();
         for ctu in &ctus {
+            // §7.3.11.2: `sao(rx, ry)` is decoded at the start of every
+            // CTU (before the partition tree). The helper short-circuits
+            // when both sao_*_used_flags are 0.
+            self.decode_sao_for_ctu(ctu)?;
             let (cus, infos, residuals) = self.decode_ctu_full(ctu)?;
             for ((ccu, info), residual) in cus.iter().zip(infos.iter()).zip(residuals.iter()) {
                 self.reconstruct_leaf_cu(ccu, info, residual, out)?;

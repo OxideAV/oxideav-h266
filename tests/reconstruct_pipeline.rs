@@ -371,6 +371,40 @@ fn ctu_walker_apply_sao_no_op_when_flag_off() {
     assert_eq!(out.luma.samples, snapshot);
 }
 
+/// SAO CABAC syntax wiring: when `sh_sao_luma_used_flag = 1` and the
+/// CTU walker drives `decode_picture_into`, the `sao(rx, ry)` helper
+/// must be invoked once per CTU and the resulting per-CTB params must
+/// land in `walker.sao_picture()`. The all-zero CABAC payload causes
+/// the deterministic context biases (Table 57 / Table 58 init at QP 32)
+/// to produce a fixed `SaoTypeIdx` for the first CTU — we just check
+/// that the array is no longer the default-empty placeholder.
+#[test]
+fn ctu_walker_decodes_sao_syntax_on_zero_stream() {
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let mut sh = intra_slice_header();
+    sh.sh_sao_luma_used_flag = true;
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    // Zero stream: see sao_syntax::decode_sao_ctb_merge_left_inherits
+    // for the bias maths — ivlOffset=0 + Table-57 MPS=1 means the merge
+    // bits resolve to 1 wherever they're emitted, so the very first CTU
+    // (no merge available) parses sao_type_idx_luma straight away.
+    let payload = [0u8; 256];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(32, 32, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+    // Layout is 1×1 CTU at 32×32. The first CTU's parsed SAO params
+    // must be a non-default value because the syntax walker ran (the
+    // contextual bin0 of sao_type_idx_luma on a zero stream resolves
+    // to 1 → SaoTypeIdx is BandOffset or EdgeOffset, never NotApplied).
+    let first = walker.sao_picture().get(0, 0);
+    assert_ne!(
+        first.luma.sao_type_idx,
+        SaoTypeIdx::NotApplied,
+        "expected SAO syntax to populate the first CTB"
+    );
+}
+
 /// Decoder-facing programmatic SAO API: an EO horizontal class on a
 /// hand-painted alternating pattern produces the spec's category-1 /
 /// category-4 shifts. This is the same shape exercised by the unit test
