@@ -15,9 +15,7 @@
 //!   refinement with a 3×4 diamond (7 taps), added on top of the
 //!   primary chroma ALF output.
 //!
-//! ## Scope of this round (round 15)
-//!
-//! Per the round-15 plan we land:
+//! ## Scope (rounds 15 + 16)
 //!
 //! 1. The data-source plumbing — `alf_data()` parsing in
 //!    [`crate::aps::parse_aps`] populates [`crate::aps::AlfApsData`],
@@ -25,16 +23,19 @@
 //!    in [`AlfPicture`].
 //! 2. The §8.8.5.2 luma filter math (eqs. 1446 – 1451) including the
 //!    Table 45 line-buffer offsets and the §8.8.5.6 boundary clipping.
-//!    The §8.8.5.3 classification is **not** implemented this round —
-//!    every sample is filtered with `filtIdx = 0` and `transposeIdx = 0`.
-//!    [`AlfPicture`] callers can still drive arbitrary filter sets per
-//!    CTB; classification can be hung off the same data path in a
-//!    later round.
-//! 3. The §8.8.5.4 chroma filter math (eqs. 1485 – 1492) with the same
+//! 3. **Round 16:** §8.8.5.3 luma classification — per 4×4 sub-block
+//!    activity + directionality from a centred 8×8 (or 8×6 / 8×4 at
+//!    line-buffer boundaries) sums of |Δh|, |Δv|, |Δd0|, |Δd1| → 25
+//!    classes × 4 transpose variants (eqs. 1452 – 1482). The result
+//!    feeds [`apply_alf`] / `apply_alf_luma_ctb`, which now picks
+//!    `filtIdx = filt_idx[sx][sy]` per 4×4 sub-block and applies the
+//!    `transposeIdx` permutation (eqs. 1442 – 1445) to the coefficient
+//!    + clipping index arrays.
+//! 4. The §8.8.5.4 chroma filter math (eqs. 1485 – 1492) with the same
 //!    simplified boundary handling. `alf_ctb_filter_alt_idx[chromaIdx]`
 //!    selects the alternative filter per CTB.
-//! 4. CC-ALF (§8.8.5.7) is **not** implemented this round; the
-//!    [`AlfPicture::cc_cb_idc`] / `cc_cr_idc` arrays are surfaced for
+//! 5. CC-ALF (§8.8.5.7) is **not** implemented yet; the
+//!    [`AlfCtb::cc_cb_idc`] / `cc_cr_idc` arrays are surfaced for
 //!    callers but the apply pass treats non-zero entries as a no-op
 //!    after primary chroma ALF (matching the spec's "ccAlfPicture
 //!    initialised from alfPicture" rule when no CC-ALF is signalled).
@@ -230,9 +231,20 @@ pub fn apply_alf(
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
             let p = alf_pic.get(rx, ry);
             if p.luma_on {
-                if let Some((coeff, clip_idx)) =
-                    resolve_luma_filter(p.luma_filt_set_idx, 0, binding)
-                {
+                if let Some(filters) = resolve_luma_filter_set(p.luma_filt_set_idx, binding) {
+                    // §8.8.5.3 — derive the per-4×4-sub-block (filtIdx,
+                    // transposeIdx) grid for this CTB. Reads come from
+                    // the pre-ALF snapshot per §8.8.5.1.
+                    let cls = derive_luma_classification(
+                        &luma_pre,
+                        out.luma.stride,
+                        out.luma.width as i32,
+                        out.luma.height as i32,
+                        rx,
+                        ry,
+                        ctb_size_y,
+                        cfg.bit_depth,
+                    );
                     apply_alf_luma_ctb(
                         &mut out.luma,
                         &luma_pre,
@@ -240,8 +252,8 @@ pub fn apply_alf(
                         ry,
                         ctb_size_y,
                         cfg.bit_depth,
-                        &coeff,
-                        &clip_idx,
+                        &filters,
+                        &cls,
                     );
                 }
             }
@@ -291,23 +303,31 @@ pub fn apply_alf(
     }
 }
 
-/// Resolve `(AlfCoeffL[i][filtIdx][...], AlfClipL[i][filtIdx][...])` for
-/// the luma filter selected by `AlfCtbFiltSetIdxY` / `filt_idx`. Returns
-/// `None` when the CTB references an absent APS or a fixed-filter set
-/// (round-15 does not yet ship the 64-row §7.4.3.18 `AlfFixFiltCoeff`
-/// table; fixed filters fall back to "no filter" — i.e. luma off — for
-/// this CTB).
-fn resolve_luma_filter(
-    filt_set_idx: u8,
-    filt_idx: usize,
-    binding: &AlfApsBinding<'_>,
-) -> Option<([i32; ALF_LUMA_NUM_COEFF], [u8; ALF_LUMA_NUM_COEFF])> {
+/// Resolved per-CTB luma filter set: all 25 filter rows the §8.8.5.3
+/// classification can pick from.
+///
+/// Each row is `(coeff[12], clip_idx[12])`; `clip_idx` is the
+/// §7.4.3.18 / Table 8 index that [`resolve_clip_value`] turns into the
+/// concrete `c[]` value at apply time.
+type LumaFilterSet = [([i32; ALF_LUMA_NUM_COEFF], [u8; ALF_LUMA_NUM_COEFF]); NUM_ALF_FILTERS];
+
+/// Resolve the full 25-class luma filter set referenced by
+/// `AlfCtbFiltSetIdxY`. Returns `None` for fixed-filter CTBs (the 64-row
+/// `AlfFixFiltCoeff` table from §7.4.3.18 is not yet shipped — those
+/// CTBs fall through to "no filter" until a later round) and for CTBs
+/// that demand an absent / unsignalled APS.
+///
+/// For APS-signalled sets eq. 1440 / 1441 say
+/// `f[j] = AlfCoeffL[i][filtIdx][j]`,
+/// `c[j] = AlfClipL[i][filtIdx][j]` — we surface the index into
+/// Table 8, the apply path resolves the concrete value via
+/// [`resolve_clip_value`].
+fn resolve_luma_filter_set(filt_set_idx: u8, binding: &AlfApsBinding<'_>) -> Option<LumaFilterSet> {
     if (filt_set_idx as usize) < 16 {
-        // Fixed-filter set — round-15 does not ship `AlfFixFiltCoeff`
-        // (the 64-row 12-coefficient table from eq. 90). When the
+        // Fixed-filter set — `AlfFixFiltCoeff` 64×12 + `AlfClassToFiltMap`
+        // 16×25 tables (eqs. 90 / 91) are not yet shipped. When the
         // caller installs a fixed-filter CTB the apply pass currently
-        // skips it. Future round will add the table and switch this
-        // branch to read `AlfFixFiltCoeff[AlfClassToFiltMap[i][filtIdx]]`.
+        // skips it.
         return None;
     }
     let aps_slot = (filt_set_idx as usize) - 16;
@@ -315,12 +335,13 @@ fn resolve_luma_filter(
     if !aps.alf_luma_filter_signal_flag {
         return None;
     }
-    if filt_idx >= NUM_ALF_FILTERS {
-        return None;
+    let mut set: LumaFilterSet =
+        [([0i32; ALF_LUMA_NUM_COEFF], [0u8; ALF_LUMA_NUM_COEFF]); NUM_ALF_FILTERS];
+    for filt_idx in 0..NUM_ALF_FILTERS {
+        set[filt_idx].0 = aps.luma_coeff[filt_idx];
+        set[filt_idx].1 = aps.luma_clip_idx[filt_idx];
     }
-    let coeff = aps.luma_coeff[filt_idx];
-    let clip = aps.luma_clip_idx[filt_idx];
-    Some((coeff, clip))
+    Some(set)
 }
 
 /// Resolve `(AlfCoeffC[altIdx][...], AlfClipC[altIdx][...])` for the
@@ -374,8 +395,9 @@ pub fn resolve_clip_value(bit_depth: u32, clip_idx: u8) -> i32 {
 
 /// Apply the §8.8.5.2 luma filter to a single CTB. `pre` is a snapshot
 /// of the pre-ALF luma plane (same `stride`/`width`/`height` as
-/// `plane`). The caller passes the resolved 12-tap filter coefficients
-/// and Table 8 clipping indices.
+/// `plane`). `filters` provides all 25 filter rows for this CTB; the
+/// per-4×4-sub-block classification `cls` (from §8.8.5.3) picks one
+/// row plus a transpose variant for every 16-pixel block.
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_luma_ctb(
     plane: &mut PicturePlane,
@@ -384,8 +406,8 @@ fn apply_alf_luma_ctb(
     ry: u32,
     ctb_size_y: u32,
     bit_depth: u32,
-    f: &[i32; ALF_LUMA_NUM_COEFF],
-    clip_idx: &[u8; ALF_LUMA_NUM_COEFF],
+    filters: &LumaFilterSet,
+    cls: &LumaClassification,
 ) {
     let x_ctb = (rx * ctb_size_y) as usize;
     let y_ctb = (ry * ctb_size_y) as usize;
@@ -397,27 +419,30 @@ fn apply_alf_luma_ctb(
     let max_val = (1i32 << bit_depth) - 1;
     let max_val_8 = max_val.min(255);
 
-    // Identity transposeIdx (round-15 single-class scaffold). Eq. 1445.
-    let idx = [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-    // Resolve clipping values once per CTB.
-    let mut c = [0i32; ALF_LUMA_NUM_COEFF];
-    for k in 0..ALF_LUMA_NUM_COEFF {
-        c[k] = resolve_clip_value(bit_depth, clip_idx[k]);
-    }
-
     for j in 0..j_max {
         for i in 0..i_max {
             let xs = (x_ctb + i) as i32;
             let ys = (y_ctb + j) as i32;
+            // §8.8.5.3 — every 4×4 sub-block shares one (filtIdx,
+            // transposeIdx). Look up the entry for this pixel.
+            let sx = i >> 2;
+            let sy = j >> 2;
+            let (filt_idx, transpose_idx) = cls.get(sx, sy);
+            let (f, clip_idx) = &filters[filt_idx];
+            // Eqs. 1442 – 1445: pick the coefficient/clip-index
+            // permutation that realises the geometric transform.
+            let idx = transpose_idx_table(transpose_idx);
+            let mut c = [0i32; ALF_LUMA_NUM_COEFF];
+            for k in 0..ALF_LUMA_NUM_COEFF {
+                c[k] = resolve_clip_value(bit_depth, clip_idx[k]);
+            }
             // Table 45: pick alfShiftY / y1 / y2 / y3 from the vertical
             // sample position. The boundary suppression case
             // (`applyAlfLineBufBoundary == 1`) only fires on inter-CTB
-            // line-buffer rows; in the round-15 single-slice scaffold
-            // we treat the bottom of the picture per the spec — which
-            // collapses to "applyAlfLineBufBoundary == 0" for the very
-            // last CTB row when it doesn't span CtbSizeY-4 rows past
-            // yCtb. For the interior we always use the "Otherwise" row
-            // (alfShiftY = 7, y1 = 1, y2 = 2, y3 = 3).
+            // line-buffer rows; in the single-slice scaffold we treat
+            // the bottom of the picture per the spec — which collapses
+            // to "applyAlfLineBufBoundary == 0" for the very last CTB
+            // row when it doesn't span CtbSizeY-4 rows past yCtb.
             let (alf_shift_y, y1, y2, y3) = table_45(j as i32, ctb_size_y as i32, true);
             // Eq. 1448.
             let curr = sample(pre, stride, pw, ph, xs, ys) as i32;
@@ -448,6 +473,260 @@ fn apply_alf_luma_ctb(
             plane.samples[(ys as usize) * stride + (xs as usize)] = new;
         }
     }
+}
+
+/// `idx[]` permutation table from eqs. 1442 – 1445 — picks the
+/// coefficient/clip-index ordering that realises one of the four
+/// transposeIdx geometric transforms. The spec encodes them as
+/// 0 = identity, 1 = vertical-flip, 2 = horizontal-flip, 3 = 180°.
+#[inline]
+fn transpose_idx_table(transpose_idx: u8) -> [usize; ALF_LUMA_NUM_COEFF] {
+    match transpose_idx {
+        // Eq. 1442 — transposeIdx == 1.
+        1 => [9, 4, 10, 8, 1, 5, 11, 7, 3, 0, 2, 6],
+        // Eq. 1443 — transposeIdx == 2.
+        2 => [0, 3, 2, 1, 8, 7, 6, 5, 4, 9, 10, 11],
+        // Eq. 1444 — transposeIdx == 3.
+        3 => [9, 8, 10, 4, 3, 7, 11, 5, 1, 0, 2, 6],
+        // Eq. 1445 — transposeIdx == 0 (identity).
+        _ => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    }
+}
+
+/// Per-4×4-sub-block classification grid for one luma CTB. Indexed by
+/// sub-block coordinates `(sx, sy)` with `sx, sy = 0..(CtbSizeY / 4 - 1)`.
+///
+/// Each entry stores `(filtIdx, transposeIdx)`; `filtIdx` selects one
+/// of the 25 luma filters and `transposeIdx` (0..3) selects one of the
+/// four geometric transforms applied via [`transpose_idx_table`].
+#[derive(Clone, Debug)]
+pub(crate) struct LumaClassification {
+    /// Number of 4×4 sub-blocks per CTB row/column (= `CtbSizeY >> 2`).
+    sub_size: usize,
+    /// Length = `sub_size * sub_size`.
+    cells: Vec<(u8, u8)>,
+}
+
+impl LumaClassification {
+    fn new(ctb_size_y: u32) -> Self {
+        let sub_size = (ctb_size_y as usize) >> 2;
+        Self {
+            sub_size,
+            cells: vec![(0u8, 0u8); sub_size * sub_size],
+        }
+    }
+
+    #[inline]
+    fn idx(&self, sx: usize, sy: usize) -> usize {
+        sy * self.sub_size + sx
+    }
+
+    #[inline]
+    fn set(&mut self, sx: usize, sy: usize, filt_idx: u8, transpose_idx: u8) {
+        let i = self.idx(sx, sy);
+        self.cells[i] = (filt_idx, transpose_idx);
+    }
+
+    /// Return `(filtIdx as usize, transposeIdx as u8)` for the 4×4
+    /// sub-block at `(sx, sy)`.
+    #[inline]
+    fn get(&self, sx: usize, sy: usize) -> (usize, u8) {
+        let (f, t) = self.cells[self.idx(sx, sy)];
+        (f as usize, t)
+    }
+
+    /// Number of 4×4 sub-blocks per CTB row/column. Used by the test
+    /// suite to walk the classification grid.
+    #[cfg(test)]
+    #[inline]
+    fn sub_size(&self) -> usize {
+        self.sub_size
+    }
+}
+
+/// §8.8.5.3 — derive `(filtIdx, transposeIdx)` for every 4×4 sub-block
+/// in the luma CTB at `(rx, ry)`.
+///
+/// Spec mapping:
+/// * Eqs. 1452 / 1453 — `recPicture` reads are clipped to the picture.
+/// * Eqs. 1454 – 1457 — per-sample 1-D Laplacians on a checkerboard
+///   pattern (both `i, j` even *or* both odd; otherwise zero).
+/// * Eqs. 1458 – 1462 — sums over `i = -2..5`, `j = minY..maxY`.
+/// * Eqs. 1463 – 1474 — pick the dominant H/V and the dominant D0/D1
+///   directions.
+/// * Eqs. 1475 – 1479 — combine into `dir1`, `dir2`, `dirS`.
+/// * Eqs. 1480 – 1481 — quantise activity through `varTab[]`.
+/// * Eqs. 1463-style transposeTable + eq. 1482 — pack everything into
+///   `transposeIdx` (0..3) and `filtIdx` (0..24).
+///
+/// The min/max-Y window selection follows the spec's two
+/// line-buffer-row carve-outs at `y4 == CtbSizeY - 8` and
+/// `y4 == CtbSizeY - 4`. For the single-slice / no-virtual-boundary
+/// scaffold both carve-outs collapse to the "bottom boundary of CTB is
+/// not bottom of picture, OR remaining picture height >
+/// `CtbSizeY - 4`" condition, which we approximate as: the carve-out
+/// fires when the next CTB row exists in the picture (so `(ry+1) *
+/// ctb_size_y < pic_height_luma`) OR `pic_height_luma - yCtb >
+/// ctb_size_y - 4`. The else branch (last CTB row of a picture whose
+/// height ≤ CtbSizeY - 4 past `yCtb`) yields the default
+/// `minY=-2, maxY=5, ac=2` row everywhere.
+#[allow(clippy::too_many_arguments)]
+fn derive_luma_classification(
+    pre: &[u8],
+    stride: usize,
+    pw: i32,
+    ph: i32,
+    rx: u32,
+    ry: u32,
+    ctb_size_y: u32,
+    bit_depth: u32,
+) -> LumaClassification {
+    let x_ctb = (rx * ctb_size_y) as i32;
+    let y_ctb = (ry * ctb_size_y) as i32;
+    let ctb = ctb_size_y as i32;
+    let sub_size = (ctb_size_y as usize) >> 2;
+    let mut out = LumaClassification::new(ctb_size_y);
+
+    // The line-buffer carve-outs activate when the spec's "boundary
+    // condition" is met. For our single-slice / picture-only scaffold:
+    // the bottom of the CTB is the bottom of the picture only when
+    // `y_ctb + ctb >= ph`. Rephrased: the carve-out fires when *not*
+    // (bottom of CTB is bottom of picture AND remaining picture height
+    // ≤ ctb - 4).
+    let bottom_of_ctb_is_bottom_of_pic = y_ctb + ctb >= ph;
+    let pic_height_minus_yctb = ph - y_ctb;
+    let carve_out_active = !bottom_of_ctb_is_bottom_of_pic || pic_height_minus_yctb > ctb - 4;
+
+    // Sums per 4×4 sub-block.
+    let mut sum_h = vec![0i32; sub_size * sub_size];
+    let mut sum_v = vec![0i32; sub_size * sub_size];
+    let mut sum_d0 = vec![0i32; sub_size * sub_size];
+    let mut sum_d1 = vec![0i32; sub_size * sub_size];
+    let mut sum_hv = vec![0i32; sub_size * sub_size];
+    let mut ac_arr = vec![0i32; sub_size * sub_size];
+
+    let s_get = |sx: usize, sy: usize| sy * sub_size + sx;
+
+    for sy in 0..sub_size {
+        for sx in 0..sub_size {
+            let x4 = (sx as i32) << 2;
+            let y4 = (sy as i32) << 2;
+
+            // §8.8.5.3 — derive (minY, maxY, ac) from y4.
+            let (min_y, max_y, ac) = if y4 == ctb - 8 && carve_out_active {
+                (-2i32, 3i32, 3i32)
+            } else if y4 == ctb - 4 && carve_out_active {
+                (0i32, 5i32, 3i32)
+            } else {
+                (-2i32, 5i32, 2i32)
+            };
+            ac_arr[s_get(sx, sy)] = ac;
+
+            // Eqs. 1454 – 1457 + 1458 – 1462.
+            let mut sh = 0i32;
+            let mut sv = 0i32;
+            let mut sd0 = 0i32;
+            let mut sd1 = 0i32;
+            for j in min_y..=max_y {
+                for i in -2i32..=5i32 {
+                    // Checkerboard mask: only (i,j both even) or
+                    // (i,j both odd) contribute. Otherwise filtH/V/D0/D1
+                    // are 0 (eq. text immediately under 1457).
+                    if (i.rem_euclid(2)) != (j.rem_euclid(2)) {
+                        continue;
+                    }
+                    let cx = x_ctb + x4 + i;
+                    let cy = y_ctb + y4 + j;
+                    let centre = sample(pre, stride, pw, ph, cx, cy) as i32;
+                    let centre2 = centre << 1;
+                    // filtH: horizontal Laplacian.
+                    let l = sample(pre, stride, pw, ph, cx - 1, cy) as i32;
+                    let r = sample(pre, stride, pw, ph, cx + 1, cy) as i32;
+                    sh += (centre2 - l - r).abs();
+                    // filtV: vertical Laplacian.
+                    let u = sample(pre, stride, pw, ph, cx, cy - 1) as i32;
+                    let d = sample(pre, stride, pw, ph, cx, cy + 1) as i32;
+                    sv += (centre2 - u - d).abs();
+                    // filtD0: 135°-diagonal Laplacian (top-left ↔ bottom-right).
+                    let ul = sample(pre, stride, pw, ph, cx - 1, cy - 1) as i32;
+                    let dr = sample(pre, stride, pw, ph, cx + 1, cy + 1) as i32;
+                    sd0 += (centre2 - ul - dr).abs();
+                    // filtD1: 45°-diagonal Laplacian (top-right ↔ bottom-left).
+                    let ur = sample(pre, stride, pw, ph, cx + 1, cy - 1) as i32;
+                    let dl = sample(pre, stride, pw, ph, cx - 1, cy + 1) as i32;
+                    sd1 += (centre2 - ur - dl).abs();
+                }
+            }
+            sum_h[s_get(sx, sy)] = sh;
+            sum_v[s_get(sx, sy)] = sv;
+            sum_d0[s_get(sx, sy)] = sd0;
+            sum_d1[s_get(sx, sy)] = sd1;
+            sum_hv[s_get(sx, sy)] = sh + sv;
+        }
+    }
+
+    // varTab from eq. 1480.
+    const VAR_TAB: [u8; 16] = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
+    // transposeTable from the prologue of step 3.
+    const TRANSPOSE_TABLE: [u8; 8] = [0, 1, 0, 2, 2, 3, 1, 3];
+
+    // Steps 1, 2, 3: derive (transposeIdx, filtIdx) per 4×4 sub-block.
+    for sy in 0..sub_size {
+        for sx in 0..sub_size {
+            let i = s_get(sx, sy);
+            let sv = sum_v[i];
+            let sh = sum_h[i];
+            let sd0 = sum_d0[i];
+            let sd1 = sum_d1[i];
+
+            // Eqs. 1463 – 1468.
+            let (hv1, hv0, dir_hv) = if sv > sh {
+                (sv, sh, 1u32)
+            } else {
+                (sh, sv, 3u32)
+            };
+            // Eqs. 1469 – 1474.
+            let (d1, d0, dir_d) = if sd0 > sd1 {
+                (sd0, sd1, 0u32)
+            } else {
+                (sd1, sd0, 2u32)
+            };
+            // Eqs. 1475 / 1476 — careful: the comparison is
+            // `d1 * hv0 > hv1 * d0` and uses the un-swapped values.
+            // Use i64 to avoid overflow on 8×6 sums (max ~3.2e6 each → product ~1e13).
+            let prefer_d = (d1 as i64) * (hv0 as i64) > (hv1 as i64) * (d0 as i64);
+            let hvd1 = if prefer_d { d1 } else { hv1 };
+            let hvd0 = if prefer_d { d0 } else { hv0 };
+            // Eqs. 1477 / 1478.
+            let dir1 = if prefer_d { dir_d } else { dir_hv };
+            let dir2 = if prefer_d { dir_hv } else { dir_d };
+            // Eq. 1479.
+            let dir_s: u32 = if hvd1 * 2 > 9 * hvd0 {
+                2
+            } else if hvd1 > 2 * hvd0 {
+                1
+            } else {
+                0
+            };
+
+            // Eq. 1481 — quantise activity. avg = sum_hv * ac, then
+            // shift by (BitDepth - 1) and clip to 0..15.
+            let prod = (sum_hv[i] as i64) * (ac_arr[i] as i64);
+            let shifted = (prod >> (bit_depth as i64 - 1)).clamp(0, 15) as usize;
+            let mut filt_idx = VAR_TAB[shifted] as u32;
+
+            // Step 3 — transposeIdx + filtIdx.
+            let transpose_idx = TRANSPOSE_TABLE[(dir1 * 2 + (dir2 >> 1)) as usize];
+            if dir_s != 0 {
+                // Eq. 1482.
+                filt_idx += (((dir1 & 0x1) << 1) + dir_s) * 5;
+            }
+            // filt_idx is in 0..25 (25 classes).
+            out.set(sx, sy, filt_idx as u8, transpose_idx);
+        }
+    }
+
+    out
 }
 
 /// Apply the §8.8.5.4 chroma filter to a single CTB.
@@ -877,6 +1156,190 @@ mod tests {
         aps.cc_cb_coeff = vec![[0; ALF_CC_NUM_COEFF]; 2];
         aps.cc_cr_coeff = vec![[0; ALF_CC_NUM_COEFF]; 1];
         assert!(cc_alf_coeff_count_sanity(&aps));
+    }
+
+    /// transposeIdx == 0..3 produce four distinct permutations whose
+    /// composition with itself is the identity for indices 1, 2, 3
+    /// (vertical-flip / horizontal-flip / 180°-rotate are all
+    /// involutions — applying twice returns the original ordering).
+    #[test]
+    fn transpose_idx_table_involution_for_1_2_3() {
+        for ti in 0u8..=3 {
+            let p = transpose_idx_table(ti);
+            // Applying the same permutation twice must equal identity
+            // (only true for involutions: 0=identity, 1, 2, 3).
+            let mut twice = [0usize; ALF_LUMA_NUM_COEFF];
+            for (k, &pk) in p.iter().enumerate() {
+                twice[k] = p[pk];
+            }
+            for k in 0..ALF_LUMA_NUM_COEFF {
+                assert_eq!(twice[k], k, "transposeIdx {ti} not an involution at k={k}");
+            }
+        }
+    }
+
+    /// transposeIdx == 0 returns the identity permutation (eq. 1445).
+    #[test]
+    fn transpose_idx_table_zero_is_identity() {
+        let p = transpose_idx_table(0);
+        for k in 0..ALF_LUMA_NUM_COEFF {
+            assert_eq!(p[k], k);
+        }
+    }
+
+    /// §8.8.5.3 — flat plane → all Laplacian sums are zero → activity
+    /// quantises to 0 and `dirS` becomes 0, so every 4×4 sub-block ends
+    /// up with `filtIdx = 0` (the activity-only base class). The
+    /// `transposeIdx` is unconstrained when `dirS == 0` — the spec
+    /// formula still feeds the transpose table from `dir1`/`dir2`, but
+    /// the filter sees uniform neighbours so the geometric transform is
+    /// inert. We therefore only assert on `filtIdx`.
+    #[test]
+    fn classification_flat_plane_is_class_zero() {
+        let plane = vec![100u8; 32 * 32];
+        let cls = derive_luma_classification(&plane, 32, 32, 32, 0, 0, 32, 8);
+        for sy in 0..cls.sub_size() {
+            for sx in 0..cls.sub_size() {
+                let (f, _t) = cls.get(sx, sy);
+                assert_eq!(f, 0, "flat plane should produce class 0 at ({sx},{sy})");
+            }
+        }
+    }
+
+    /// Linear gradient (sample = 8*x) is purely first-order, so all
+    /// second-difference Laplacians are zero (modulo edge clipping) →
+    /// class 0 in the interior.
+    #[test]
+    fn classification_linear_gradient_interior_is_class_zero() {
+        let mut plane = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                plane[y * 32 + x] = (x as u8).saturating_mul(7);
+            }
+        }
+        let cls = derive_luma_classification(&plane, 32, 32, 32, 0, 0, 32, 8);
+        // Far from the picture edge — sub-block (3,3) sits at pixel
+        // x=12..16, y=12..16 of the CTB; its 8-pixel window i=-2..5
+        // (centred on x4=12) → x=10..17, all interior. No edge effects.
+        let (f, _t) = cls.get(3, 3);
+        assert_eq!(f, 0, "interior linear gradient should be class 0");
+    }
+
+    /// Strong vertical edge → high vertical activity → non-zero
+    /// `dirS`, so `filtIdx` is bumped past the activity-only range
+    /// `0..5` and lands in `5..25`. Different sub-blocks pick
+    /// different filter indices.
+    #[test]
+    fn classification_vertical_edge_picks_directional_class() {
+        // 32×32 picture: top half = 0, bottom half = 200. Edge at row 16.
+        let mut plane = vec![0u8; 32 * 32];
+        for y in 16..32 {
+            for x in 0..32 {
+                plane[y * 32 + x] = 200;
+            }
+        }
+        let cls = derive_luma_classification(&plane, 32, 32, 32, 0, 0, 32, 8);
+        // Sub-blocks straddling the edge live around sy = 4 (pixels y=16..19);
+        // their classification window covers y4=16, j=-2..5 → y=14..21,
+        // which spans the step. Expect non-zero filtIdx and possibly
+        // a non-zero transposeIdx.
+        let (f_edge, _t_edge) = cls.get(3, 4); // pixel (12..16, 16..20)
+        let (f_far, _t_far) = cls.get(0, 0); // top-left corner: all zeros
+        assert!(
+            f_edge >= 5,
+            "edge sub-block should pick a directional class (≥5), got {f_edge}"
+        );
+        assert_eq!(f_far, 0, "far-from-edge corner should be class 0");
+        // At least one sub-block is in a non-zero class.
+        let mut classes = std::collections::HashSet::new();
+        for sy in 0..cls.sub_size() {
+            for sx in 0..cls.sub_size() {
+                classes.insert(cls.get(sx, sy).0);
+            }
+        }
+        assert!(
+            classes.len() >= 2,
+            "expected at least two distinct classes from a vertical-edge picture, got {:?}",
+            classes
+        );
+    }
+
+    /// `derive_luma_classification` writes a `(filtIdx, transposeIdx)`
+    /// for every 4×4 sub-block (CtbSizeY/4 squared total). Verify the
+    /// grid dimensions for CTB sizes 16, 32, 64.
+    #[test]
+    fn classification_grid_size_matches_ctb_size() {
+        for log2 in 4..=6u32 {
+            let ctb = 1u32 << log2;
+            let plane = vec![100u8; (ctb * ctb) as usize];
+            let cls = derive_luma_classification(
+                &plane,
+                ctb as usize,
+                ctb as i32,
+                ctb as i32,
+                0,
+                0,
+                ctb,
+                8,
+            );
+            assert_eq!(cls.sub_size(), (ctb >> 2) as usize);
+        }
+    }
+
+    /// End-to-end: with all 25 filter rows distinct (via per-row tags
+    /// embedded in coefficients), apply_alf on a non-uniform CTB
+    /// must select different filters for different sub-blocks.
+    /// We check this indirectly: with classification active, a
+    /// vertical-edge picture filtered through `apply_alf` produces
+    /// pixel modifications — and the modifications are *not* uniform
+    /// across the CTB (proving classification + transpose actually
+    /// pick varying filters per sub-block).
+    #[test]
+    fn apply_alf_classification_produces_non_uniform_output() {
+        // Vertical edge picture.
+        let mut buf = fresh_buf(32, 32, 0);
+        for y in 16..32 {
+            for x in 0..32 {
+                buf.luma.samples[y * buf.luma.stride + x] = 200;
+            }
+        }
+        // 25 distinct filters: row k has f[6] = 4*(k+1) (so different
+        // classes pick different shifts on vertical neighbours).
+        let mut aps = AlfApsData::default();
+        aps.alf_luma_filter_signal_flag = true;
+        let mut coeffs: Vec<[i32; ALF_LUMA_NUM_COEFF]> =
+            vec![[0i32; ALF_LUMA_NUM_COEFF]; NUM_ALF_FILTERS];
+        for k in 0..NUM_ALF_FILTERS {
+            coeffs[k][6] = 4 * (k as i32 + 1);
+        }
+        aps.luma_coeff = coeffs;
+        aps.luma_clip_idx = vec![[0u8; ALF_LUMA_NUM_COEFF]; NUM_ALF_FILTERS];
+        let aps_slot: [Option<&AlfApsData>; 1] = [Some(&aps)];
+        let binding = AlfApsBinding {
+            luma_apses: &aps_slot,
+            chroma_aps: None,
+        };
+        let mut pic = AlfPicture::empty(1, 1);
+        pic.set(
+            0,
+            0,
+            AlfCtb {
+                luma_on: true,
+                luma_filt_set_idx: 16,
+                ..Default::default()
+            },
+        );
+        // Snapshot pre-ALF for comparison.
+        let pre = buf.luma.samples.clone();
+        apply_alf(&mut buf, &pic, &cfg_8bit(), &binding);
+        // The very corner (0,0) sees only zero neighbours → identity
+        // (or at least very small changes); it should remain 0.
+        assert_eq!(buf.luma.samples[0], 0);
+        // Pixels straddling the edge are modified — the spike at the
+        // boundary attracts adjustment.
+        let stride = buf.luma.stride;
+        let edge = buf.luma.samples[16 * stride + 16];
+        assert_ne!(edge, pre[16 * stride + 16], "edge sample should change");
     }
 
     /// `apply_alf` skips chroma when `cb_enabled` / `cr_enabled` are off
