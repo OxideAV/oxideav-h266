@@ -4,6 +4,15 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-h266/compare/v0.0.2...v0.0.3) - 2026-04-24
+
+### Other
+
+- spec-exact residual ctxInc + 3-pass walker + §8.7.3 dequant
+- forward-bitstream encoder scaffold (VPS/SPS/PPS/PH/IDR)
+- CBF reads + last-sig-coeff + sub-block residual walker
+- leaf-CU syntax reader + MPM/chroma intra-mode derivation
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-h266/compare/v0.0.1...v0.0.2) - 2026-04-24
 
 ### Other
