@@ -67,6 +67,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
 use crate::cabac::ArithDecoder;
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
@@ -421,6 +422,12 @@ pub struct CtuWalker<'a, 'b> {
     /// CABAC contexts for the §7.3.11.3 SAO syntax. Lives on the walker
     /// so each per-CTU call advances the same engine.
     sao_ctxs: SaoCtxs,
+    /// Per-CTB ALF on/off + filter-set selection consumed by
+    /// [`Self::apply_in_loop_filters`]. Defaults to "all CTBs ALF off".
+    /// The round-15 walker does not yet parse the §7.3.11.2 ALF CABAC
+    /// bins; callers (and integration tests) populate this array
+    /// programmatically via [`Self::set_alf_picture`].
+    alf_picture: AlfPicture,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -480,11 +487,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ));
         }
         // Deferred features that would change the per-CTU pipeline shape.
-        if sh.sh_alf_enabled_flag {
-            return Err(Error::unsupported(
-                "h266 CTU walker: per-slice ALF not supported yet",
-            ));
-        }
+        // ALF (`sh_alf_enabled_flag`) is now accepted: the §8.8.5 apply
+        // pass runs after SAO and the per-CTB on/off + filter selection
+        // lives in [`Self::alf_picture`]. The round-15 walker leaves it
+        // at the empty default (every CTB ALF-off), so ALF is a no-op
+        // unless callers programmatically populate it. The per-CTB
+        // §7.3.11.2 CABAC bins and the §8.8.5.3 classification will
+        // come in later rounds.
         if sh.sh_lmcs_used_flag {
             return Err(Error::unsupported(
                 "h266 CTU walker: LMCS (luma mapping / chroma scaling) not supported yet",
@@ -509,6 +518,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let sao_picture =
             SaoPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
         let sao_ctxs = SaoCtxs::init(slice_qp.as_init_qp());
+        let alf_picture =
+            AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
         Ok(Self {
             layout,
             sps,
@@ -520,6 +531,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             deblock_cus: Vec::new(),
             sao_picture,
             sao_ctxs,
+            alf_picture,
         })
     }
 
@@ -548,6 +560,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// Read-only view of the current per-picture SAO parameter array.
     pub fn sao_picture(&self) -> &SaoPicture {
         &self.sao_picture
+    }
+
+    /// Inject a per-picture ALF parameter array. Replaces the default
+    /// "all CTBs ALF off" snapshot installed by [`Self::begin_slice`].
+    /// Used by integration tests (and by future round-N callers) that
+    /// drive ALF without going through the unimplemented per-CTB CABAC
+    /// parser. The picture's CTB grid must match the layout's
+    /// `pic_width_in_ctbs_y` / `pic_height_in_ctbs_y`.
+    pub fn set_alf_picture(&mut self, alf_pic: AlfPicture) -> Result<()> {
+        if alf_pic.pic_width_in_ctbs_y != self.layout.pic_width_in_ctbs_y
+            || alf_pic.pic_height_in_ctbs_y != self.layout.pic_height_in_ctbs_y
+        {
+            return Err(Error::invalid(format!(
+                "h266 ALF: per-picture grid {}x{} does not match layout {}x{}",
+                alf_pic.pic_width_in_ctbs_y,
+                alf_pic.pic_height_in_ctbs_y,
+                self.layout.pic_width_in_ctbs_y,
+                self.layout.pic_height_in_ctbs_y,
+            )));
+        }
+        self.alf_picture = alf_pic;
+        Ok(())
+    }
+
+    /// Read-only view of the current per-picture ALF parameter array.
+    pub fn alf_picture(&self) -> &AlfPicture {
+        &self.alf_picture
     }
 
     /// Decode the §7.3.11.3 `sao(rx, ry)` syntax for the supplied CTU
@@ -1159,9 +1198,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     }
 
     /// Apply the §8.8 in-loop filters to a partially-reconstructed
-    /// picture. Runs deblocking (§8.8.3) followed by SAO (§8.8.4); ALF
-    /// (§8.8.5) remains pending and is skipped (it is a no-op when
-    /// `sh_alf_enabled_flag = 0`, which the constructor enforces).
+    /// picture. Runs deblocking (§8.8.3) followed by SAO (§8.8.4) and
+    /// then ALF (§8.8.5). Wraps [`Self::apply_in_loop_filters_with_alf`]
+    /// with an empty [`AlfApsBinding`]; with no APSes bound the ALF
+    /// pass is necessarily a no-op (every CTB falls through the "APS
+    /// missing → luma off" branch). Tests drive ALF via the
+    /// `_with_alf` variant.
     ///
     /// The CU records consumed by the deblocker are accumulated by
     /// [`Self::reconstruct_leaf_cu`]; calling
@@ -1171,8 +1213,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// `sh_sao_chroma_used_flag` and the per-CTB params installed via
     /// [`Self::set_sao_picture`]; with the default empty SAO picture
     /// every CTB classifies as `SaoTypeIdx::NotApplied` and SAO is a
-    /// no-op even when the slice flags are on.
+    /// no-op even when the slice flags are on. The ALF pass is gated
+    /// on `sh_alf_enabled_flag` and the per-CTB params installed via
+    /// [`Self::set_alf_picture`]; with the default empty ALF picture
+    /// every CTB has `luma_on = cb_on = cr_on = false` and ALF is a
+    /// no-op even when the slice flag is on.
     pub fn apply_in_loop_filters(&mut self, out: &mut PictureBuffer) -> Result<()> {
+        self.apply_in_loop_filters_with_alf(out, &AlfApsBinding::default())
+    }
+
+    /// Variant of [`Self::apply_in_loop_filters`] that accepts an
+    /// [`AlfApsBinding`] so callers (and integration tests) can supply
+    /// the resolved ALF APSes referenced by `sh_alf_aps_id_luma[]` and
+    /// `sh_alf_aps_id_chroma`. With a non-empty binding and a
+    /// populated [`AlfPicture`] the §8.8.5.2 / §8.8.5.4 filters
+    /// actually run.
+    pub fn apply_in_loop_filters_with_alf(
+        &mut self,
+        out: &mut PictureBuffer,
+        alf_binding: &AlfApsBinding<'_>,
+    ) -> Result<()> {
         // Resolve deblock parameters from the slice header (§7.4.8) +
         // the picture header / PPS fall-backs already applied during
         // parse.
@@ -1209,8 +1269,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
         };
         apply_sao(out, &self.sao_picture, &sao_cfg);
-        // ALF (§8.8.5) — gated on `sh_alf_enabled_flag`, which the
-        // CTU-walker constructor already rejects (see `begin_slice`).
+        // ALF (§8.8.5) — runs after SAO per §8.8.5.1. Gated on
+        // `sh_alf_enabled_flag`. Per-CTB on/off + filter selection
+        // comes from `alf_picture`, which the round-15 walker leaves
+        // at the empty default unless an integration test populates
+        // it.
+        let alf_cfg = AlfConfig {
+            alf_enabled: self.sh.sh_alf_enabled_flag,
+            cb_enabled: self.sh.sh_alf_cb_enabled_flag,
+            cr_enabled: self.sh.sh_alf_cr_enabled_flag,
+            bit_depth,
+            ctb_log2_size_y: self.layout.ctb_log2_size_y,
+            chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
+        };
+        apply_alf(out, &self.alf_picture, &alf_cfg, alf_binding);
         Ok(())
     }
 }
@@ -1494,18 +1566,18 @@ mod tests {
     }
 
     #[test]
-    fn walker_rejects_alf_lmcs_dep_quant_scaling_list() {
+    fn walker_rejects_lmcs_dep_quant_scaling_list() {
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 8];
 
+        // ALF is now accepted (round-15) — the apply pass runs after
+        // SAO with an empty AlfPicture by default, so it's a no-op
+        // unless callers programmatically populate it.
         let mut sh = intra_slice_header();
         sh.sh_alf_enabled_flag = true;
-        assert!(matches!(
-            CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err(),
-            Error::Unsupported(_)
-        ));
+        assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).is_ok());
 
         let mut sh = intra_slice_header();
         sh.sh_lmcs_used_flag = true;

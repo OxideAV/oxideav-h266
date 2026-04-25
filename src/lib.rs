@@ -58,6 +58,11 @@
 //!   populated automatically from the slice CABAC stream; tests may
 //!   still inject programmatic params via
 //!   [`ctu::CtuWalker::set_sao_picture`].
+//! * [`alf`] — §8.8.5 adaptive loop filter apply pass. Owns
+//!   [`alf::AlfPicture`] (per-CTB on/off + filter-set selection) and
+//!   the §8.8.5.2 luma + §8.8.5.4 chroma diamond-filter math; consumes
+//!   the [`aps::AlfApsData`] populated by the ALF APS parser.
+//!   Classification (§8.8.5.3) and CC-ALF (§8.8.5.7) remain pending.
 //! * [`dequant`] — §8.7.3 scaled-transform-coefficient derivation
 //!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
 //!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
@@ -92,6 +97,7 @@
 #![allow(clippy::erasing_op)]
 #![allow(clippy::same_item_push)]
 
+pub mod alf;
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;

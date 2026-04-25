@@ -10,6 +10,8 @@
 //! mid-grey fill and the inverse-transform pipeline runs end-to-end
 //! without producing measurable noise.
 
+use oxideav_h266::alf::{AlfApsBinding, AlfCtb, AlfPicture};
+use oxideav_h266::aps::{AlfApsData, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS};
 use oxideav_h266::ctu::{CtuLayout, CtuWalker};
 use oxideav_h266::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use oxideav_h266::pps::PicParameterSet;
@@ -430,4 +432,153 @@ fn ctu_walker_set_sao_picture_grid_check() {
     let p = walker.sao_picture().get(0, 0);
     assert_eq!(p.luma.sao_type_idx, SaoTypeIdx::NotApplied);
     assert_eq!(p.luma.eo_class, SaoEoClass::Horizontal);
+}
+
+/// ALF wiring through the CTU walker: the round-15 walker accepts
+/// `sh_alf_enabled_flag = 1` and runs the §8.8.5 apply pass after SAO.
+/// With the default empty AlfPicture the apply pass is a no-op (every
+/// CTB has `luma_on = false`), so the post-decode picture is identical
+/// to the deblock+SAO output.
+#[test]
+fn ctu_walker_apply_alf_no_op_with_empty_picture() {
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let mut sh = intra_slice_header();
+    sh.sh_alf_enabled_flag = true;
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(32, 32, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+    let snapshot = out.luma.samples.clone();
+    walker.apply_in_loop_filters(&mut out).unwrap();
+    assert_eq!(out.luma.samples, snapshot);
+}
+
+/// ALF wiring with an explicit ALF APS binding: install a per-CTB ALF
+/// "luma on" record that points at APS slot 0, with a non-zero filter
+/// coefficient that would shift samples on a non-flat plane. Decode
+/// produces a near-flat picture, so the spike must come from the
+/// `apply_in_loop_filters_with_alf` path.
+#[test]
+fn ctu_walker_apply_alf_runs_with_aps_binding() {
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let mut sh = intra_slice_header();
+    sh.sh_alf_enabled_flag = true;
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(32, 32, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+    // Inject a known spike so the §8.8.5.2 filter math has something
+    // to act on (otherwise the post-decode flat picture short-circuits
+    // every filter contribution to 0).
+    let stride = out.luma.stride;
+    out.luma.samples[16 * stride + 16] = 200;
+    // Build an APS with all-zero coefficients except f[6] (vertical
+    // y1 pair) — that produces a deterministic deviation at the spike
+    // and identity everywhere else (see alf::tests::nonzero_coeff_…).
+    let mut row = [0i32; ALF_LUMA_NUM_COEFF];
+    row[6] = 32;
+    let aps = AlfApsData {
+        alf_luma_filter_signal_flag: true,
+        luma_coeff: vec![row; NUM_ALF_FILTERS],
+        luma_clip_idx: vec![[0u8; ALF_LUMA_NUM_COEFF]; NUM_ALF_FILTERS],
+        ..Default::default()
+    };
+    let aps_slot: [Option<&AlfApsData>; 1] = [Some(&aps)];
+    let binding = AlfApsBinding {
+        luma_apses: &aps_slot,
+        chroma_aps: None,
+    };
+    // Mark CTB (0,0) ALF-on with `AlfCtbFiltSetIdxY = 16` (= APS slot 0).
+    let mut alf_pic = AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
+    alf_pic.set(
+        0,
+        0,
+        AlfCtb {
+            luma_on: true,
+            luma_filt_set_idx: 16,
+            ..Default::default()
+        },
+    );
+    walker.set_alf_picture(alf_pic).unwrap();
+    let before_centre = out.luma.samples[16 * stride + 16];
+    assert_eq!(before_centre, 200);
+    walker
+        .apply_in_loop_filters_with_alf(&mut out, &binding)
+        .unwrap();
+    let after_centre = out.luma.samples[16 * stride + 16];
+    assert_ne!(after_centre, 200, "ALF should have modified the centre");
+}
+
+/// `set_alf_picture` rejects a per-picture array whose CTB grid does
+/// not match the layout — symmetrical to `set_sao_picture`.
+#[test]
+fn ctu_walker_set_alf_picture_grid_check() {
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let bad = AlfPicture::empty(2, 2);
+    assert!(walker.set_alf_picture(bad).is_err());
+    let good = AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
+    assert!(walker.set_alf_picture(good).is_ok());
+    assert_eq!(walker.alf_picture().pic_width_in_ctbs_y, 1);
+    assert_eq!(walker.alf_picture().pic_height_in_ctbs_y, 1);
+    assert!(walker.alf_picture().is_all_off());
+}
+
+/// Chroma ALF wiring: install a per-CTB Cb-on record + a chroma APS
+/// with all-zero coefficients. On the post-decode (flat) chroma plane
+/// the filter math is identity, but the apply pass should still have
+/// dispatched into the chroma branch (we observe via a programmatic
+/// chroma spike).
+#[test]
+fn ctu_walker_chroma_alf_runs_with_chroma_aps() {
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let mut sh = intra_slice_header();
+    sh.sh_alf_enabled_flag = true;
+    sh.sh_alf_cb_enabled_flag = true;
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(32, 32, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+    let cb_stride = out.cb.stride;
+    out.cb.samples[5 * cb_stride + 5] = 200;
+    // Chroma APS with f[0] = 64 (vertical y2 pair).
+    let mut row = [0i32; ALF_CHROMA_NUM_COEFF];
+    row[0] = 64;
+    let aps = AlfApsData {
+        alf_chroma_filter_signal_flag: true,
+        alf_chroma_num_alt_filters_minus1: 0,
+        chroma_coeff: vec![row; 1],
+        chroma_clip_idx: vec![[0u8; ALF_CHROMA_NUM_COEFF]; 1],
+        ..Default::default()
+    };
+    let binding = AlfApsBinding {
+        luma_apses: &[],
+        chroma_aps: Some(&aps),
+    };
+    let mut alf_pic = AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
+    alf_pic.set(
+        0,
+        0,
+        AlfCtb {
+            cb_on: true,
+            cb_alt_idx: 0,
+            ..Default::default()
+        },
+    );
+    walker.set_alf_picture(alf_pic).unwrap();
+    walker
+        .apply_in_loop_filters_with_alf(&mut out, &binding)
+        .unwrap();
+    let after = out.cb.samples[5 * cb_stride + 5];
+    assert_ne!(after, 200, "chroma ALF should have moved the spike");
 }
