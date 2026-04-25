@@ -16,7 +16,12 @@
 //! * [`nal`] — start-code scanner, length-prefix iterator, 2-byte NAL
 //!   header parsing (§7.3.1.2), emulation-prevention byte stripping.
 //! * [`decoder`] — registry factory; returns `Error::Unsupported` for any
-//!   packet that would require pixel output (no CTU reconstruction yet).
+//!   packet that would require pixel output. The
+//!   [`ctu::CtuWalker::reconstruct_leaf_cu`] / [`ctu::CtuWalker::decode_picture_into`]
+//!   path now produces real reconstructed luma samples for the
+//!   intra-only single-tile single-slice subset (PLANAR / DC / cardinal
+//!   angular modes + DCT-II inverse transform), but the framework-level
+//!   packet → frame glue is still pending and surfaces Unsupported.
 //! * [`dci`] — Decoding Capability Information parser (§7.3.2.1).
 //! * [`opi`] — Operating Point Information parser (§7.3.2.2).
 //! * [`ctu`] — CTU walker scaffold: picture → CTU-address scan, per-CTU
