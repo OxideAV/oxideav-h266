@@ -6,6 +6,20 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **Forward-side CABAC engine** (`cabac_enc::ArithEncoder`) — round-16
+  primitive that mirrors the §9.3.4.3 decoder. `encode_decision` /
+  `encode_bypass` / `encode_terminate` + `finish()` produce a byte
+  stream that round-trips bit-identically through `cabac::ArithDecoder`,
+  with shared `ContextModel` so the §9.3.4.3.2.2 dual-exponential
+  probability state stays in lockstep. Validated by 11 self-tests
+  including a 4096-bin pseudo-random stress and an integration test
+  using the real `tables::SyntaxCtx` bundles.
+- **Forward DCT-II + flat quantisation** (`transform_fwd`) — encoder
+  duals of `transform::inverse_transform_2d` and
+  `dequant::dequantize_tb_flat`. `forward_dct_ii_1d` /
+  `forward_dct_ii_2d` apply the 64×64 trMatrix transposed (the
+  matrix is orthogonal up to scale per §8.7.4.5);
+  `quantize_tb_flat` is the integer dual of eq. 1155.
 - §8.8.4 SAO (sample adaptive offset) — Edge Offset (4 classes per
   Table 11) and Band Offset modes per §8.8.4.2 eqs. 1424 – 1435 +
   Table 44. Per-CTB params consumed via the new `sao::SaoPicture` /

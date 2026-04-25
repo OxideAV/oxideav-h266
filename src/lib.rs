@@ -69,6 +69,18 @@
 //!   `ScalingMatrixRec` expansion via eq. 1149 / eq. 1150
 //!   (`matrixSize × matrixSize` → `nTbW × nTbH`). Transform-skip and
 //!   BDPCM accumulation still surface `Error::Unsupported`.
+//! * [`cabac_enc`] — round-16 forward-side CABAC engine (`encode_decision`
+//!   / `encode_bypass` / `encode_terminate` + `finish`). Uses
+//!   high-precision interval tracking so the emitted byte stream
+//!   round-trips bit-identically through [`cabac::ArithDecoder`].
+//!   Shares [`cabac::ContextModel`] with the decoder so probability
+//!   state stays in lockstep.
+//! * [`transform_fwd`] — round-16 forward-side DCT-II + flat
+//!   quantisation primitives ([`transform_fwd::forward_dct_ii_1d`] /
+//!   [`transform_fwd::forward_dct_ii_2d`] /
+//!   [`transform_fwd::quantize_tb_flat`]). Encoder-side duals of
+//!   [`transform`] / [`dequant`]; future rounds wire these into the
+//!   per-TB residual emit pipeline.
 //!
 //! ## Spec reference
 //!
@@ -101,6 +113,7 @@ pub mod alf;
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;
+pub mod cabac_enc;
 pub mod coding_tree;
 pub mod ctu;
 pub mod ctx;
@@ -127,6 +140,7 @@ pub mod slice_header;
 pub mod sps;
 pub mod tables;
 pub mod transform;
+pub mod transform_fwd;
 pub mod vps;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
