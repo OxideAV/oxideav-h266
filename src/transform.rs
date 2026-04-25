@@ -441,13 +441,16 @@ pub fn one_d_transform(
         (TrType::DctVIII, 8) => Ok(apply_matrix(&DCT_VIII_8, non_zero_s, x)),
         (TrType::DctVIII, 16) => Ok(apply_matrix(&DCT_VIII_16, non_zero_s, x)),
         (TrType::DctVIII, 32) => Ok(apply_dct_viii_32(non_zero_s, x)),
-        // DCT-II
-        (TrType::DctII, 4) | (TrType::DctII, 8) | (TrType::DctII, 16) | (TrType::DctII, 32) => {
-            Ok(apply_dct_ii(n_tb_s, non_zero_s, x))
-        }
-        (TrType::DctII, 64) => Err(Error::unsupported(
-            "h266 transform: DCT-II size 64 not yet implemented",
-        )),
+        // DCT-II — sizes 4, 8, 16, 32 use the column-stride sampling of
+        // the 64×64 trMatrix (eq. 1177); size 64 reads it directly via
+        // §8.7.4.2 eq. 1184 (the dct_ii_entry helper already covers
+        // m,n ∈ 0..63 by chaining the 0..15 + 16..31 sub-tables and the
+        // §8.7.4.5 antisymmetry reflections).
+        (TrType::DctII, 4)
+        | (TrType::DctII, 8)
+        | (TrType::DctII, 16)
+        | (TrType::DctII, 32)
+        | (TrType::DctII, 64) => Ok(apply_dct_ii(n_tb_s, non_zero_s, x)),
         _ => Err(Error::unsupported(format!(
             "h266 transform: unsupported (trType={:?}, nTbS={n_tb_s})",
             tr_type
@@ -859,11 +862,26 @@ mod tests {
         assert_eq!(y, expected);
     }
 
-    /// Size 64 DCT-II still unsupported.
+    /// Size 64 DCT-II is now wired through the full 64×64 trMatrix
+    /// (§8.7.4.2 eq. 1184). A pure-zero input round-trips to the
+    /// zero vector, and a DC impulse picks out the first column
+    /// (constant `64` per the spec's normalisation).
     #[test]
-    fn dct_ii_64_is_unsupported() {
+    fn dct_ii_64_zero_input_is_zero() {
         let x = vec![0i32; 64];
-        assert!(one_d_transform(TrType::DctII, 64, 64, &x).is_err());
+        let y = one_d_transform(TrType::DctII, 64, 64, &x).unwrap();
+        assert_eq!(y, vec![0i32; 64]);
+    }
+
+    /// Size 64 DCT-II DC impulse: column `n=0` of the trMatrix is the
+    /// constant `64` per §8.7.4.5; a non-zero coefficient at index 0
+    /// therefore broadcasts that constant across the output.
+    #[test]
+    fn dct_ii_64_dc_impulse_broadcasts_constant() {
+        let mut x = vec![0i32; 64];
+        x[0] = 100;
+        let y = one_d_transform(TrType::DctII, 64, 64, &x).unwrap();
+        assert!(y.iter().all(|&v| v == 64 * 100), "got {:?}", &y[..8]);
     }
 
     /// MTS table 39 lookup. Only index 0 maps (DCT-II, DCT-II); others

@@ -11,7 +11,7 @@
 //! without producing measurable noise.
 
 use oxideav_h266::ctu::{CtuLayout, CtuWalker};
-use oxideav_h266::pps::{PicParameterSet, PicPartition};
+use oxideav_h266::pps::PicParameterSet;
 use oxideav_h266::reconstruct::PictureBuffer;
 use oxideav_h266::slice_header::{SliceType, StatefulSliceHeader};
 use oxideav_h266::sps::{PartitionConstraints, SeqParameterSet, ToolFlags};
@@ -101,7 +101,9 @@ fn dummy_pps(pic_w: u32, pic_h: u32) -> PicParameterSet {
         pps_picture_header_extension_present_flag: false,
         pps_slice_header_extension_present_flag: false,
         pps_extension_flag: false,
-        partition: Some(PicPartition::default()),
+        // Single-slice fixture: pps_no_pic_partition_flag == 1 means
+        // the partition struct must be absent.
+        partition: None,
     }
 }
 
@@ -174,4 +176,42 @@ fn picture_buffer_constructs_yuv420() {
     assert!(buf.luma.samples.iter().all(|&v| v == 17));
     assert!(buf.cb.samples.iter().all(|&v| v == 128));
     assert!(buf.cr.samples.iter().all(|&v| v == 128));
+}
+
+/// End-to-end IDR reconstruction must paint chroma planes too — not
+/// just luma. The seed used to mark "untouched" chroma is overridden
+/// to a sentinel value so the assertion catches the case where the
+/// chroma path is silently skipped.
+#[test]
+fn decode_picture_into_paints_chroma_planes() {
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(32, 32, 0);
+    // Sentinel seed for chroma so we can detect writes (the default
+    // `yuv420_filled` constructor seeds chroma to 128, the exact value
+    // the prediction produces at the picture edge — that would mask
+    // the test).
+    for v in out.cb.samples.iter_mut() {
+        *v = 7;
+    }
+    for v in out.cr.samples.iter_mut() {
+        *v = 7;
+    }
+    walker.decode_picture_into(&mut out).unwrap();
+    let cb_overwritten = out.cb.samples.iter().filter(|&&v| v != 7).count();
+    let cr_overwritten = out.cr.samples.iter().filter(|&&v| v != 7).count();
+    assert!(
+        cb_overwritten > out.cb.samples.len() / 2,
+        "expected most Cb samples to be painted, got {cb_overwritten} / {}",
+        out.cb.samples.len()
+    );
+    assert!(
+        cr_overwritten > out.cr.samples.len() / 2,
+        "expected most Cr samples to be painted, got {cr_overwritten} / {}",
+        out.cr.samples.len()
+    );
 }

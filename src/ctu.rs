@@ -94,6 +94,54 @@ pub(crate) fn nearest_supported_angular(mode: u32) -> u32 {
         .unwrap_or(crate::leaf_cu::INTRA_PLANAR)
 }
 
+/// Map an `IntraPredModeC` (§8.4.3 output, range 0..=83) to one of the
+/// directional intra modes the per-sample chroma predictor understands
+/// in this scaffold (PLANAR, DC, or one of the cardinal angulars
+/// `{2, 18, 34, 50, 66}`).
+///
+/// CCLM modes (`81..=83`) are not yet wired — they collapse to PLANAR.
+/// Non-cardinal angular modes (anything outside the cardinal set) are
+/// snapped to the nearest cardinal via [`nearest_supported_angular`],
+/// matching the luma-side fallback used by
+/// [`CtuWalker::reconstruct_leaf_cu`].
+pub(crate) fn chroma_pred_mode_for_predict(mode_c: u32) -> u32 {
+    use crate::leaf_cu::{INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM};
+    match mode_c {
+        INTRA_PLANAR => INTRA_PLANAR,
+        INTRA_DC => INTRA_DC,
+        // CCLM (§8.4.5.2.14) needs the luma reconstruction + linear
+        // model derivation; not in this round.
+        INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM => INTRA_PLANAR,
+        m @ 2..=66 => {
+            if matches!(m, 2 | 18 | 34 | 50 | 66) {
+                m
+            } else {
+                nearest_supported_angular(m)
+            }
+        }
+        _ => INTRA_PLANAR,
+    }
+}
+
+/// §8.7.1 chroma QP derivation — minimal identity mapping.
+///
+/// Returns the per-component chroma QP (Qp′Cb / Qp′Cr) given luma QP
+/// `qp_y`, the PPS picture-level chroma offsets, and any slice/CU
+/// chroma offsets. The full §8.7.1 path threads this through Table 4
+/// (the SPS-supplied chroma-QP mapping table) and adds the bit-depth
+/// offset; this scaffold uses the spec's identity mapping
+/// (`QpC = QpY`) plus the additive PPS / slice / CU offsets, which is
+/// exactly the §8.7.1 result when `same_qp_table_for_chroma_flag == 1`
+/// with the default (identity) table.
+///
+/// `qp_offset` is the sum `pps_cb_qp_offset + sh_cb_qp_offset
+/// + cu_chroma_qp_offset` (or the Cr equivalent). The result is
+/// clamped to the spec's `[0, 63]` range.
+#[inline]
+pub(crate) fn chroma_qp_identity(qp_y: i32, qp_offset: i32) -> i32 {
+    (qp_y + qp_offset).clamp(0, 63)
+}
+
 /// CTU grid geometry derived from SPS + PPS (§7.4.3.4 / §7.4.3.5).
 ///
 /// The entry-level quantities a walker needs before even touching the
@@ -682,6 +730,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let x0 = cu.cu.x as usize;
         let y0 = cu.cu.y as usize;
 
+        // Per §7.4.10.5 / §8.7.4.1 the largest single TB is `MaxTbSizeY`
+        // (≤ 64). When a leaf CU exceeds that size the spec splits it
+        // into multiple transform units (`maxTbSize`-aligned tiling);
+        // that multi-TB-per-CU walker is not yet wired, so surface a
+        // precise Unsupported instead of trying to feed a 128-tall TB
+        // into an inverse transform that doesn't exist.
+        if n_tb_w > 64 || n_tb_h > 64 {
+            return Err(Error::unsupported(format!(
+                "h266 reconstruct_leaf_cu: leaf CU {}x{} exceeds MaxTbSizeY=64; \
+                 multi-TB-per-CU tiling (§7.4.10.5) not yet wired",
+                n_tb_w, n_tb_h,
+            )));
+        }
+
         // 1. Reference samples from the partially-reconstructed plane.
         // Availability follows the simple slice-edge rule (§6.4.4 in the
         // single-slice case): top / left exist when not on a picture
@@ -748,21 +810,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // the encoder scaffold and matches the Common Test
             // Conditions baseline. nTbS in {4, 8, 16, 32} are
             // supported by inverse_transform_2d today.
-            let (tr_h, tr_v) = if n_tb_w <= 32 && n_tb_h <= 32 {
-                (TrType::DctII, TrType::DctII)
-            } else {
-                // 64-wide / 64-tall TBs need the size-64 DCT-II that
-                // [`crate::transform`] does not implement yet. Snap to
-                // the implicit-MTS picker, which falls back to DCT-II
-                // for sizes > 16; the size-64 path will bail out the
-                // moment it tries to call into the transform. Surface
-                // a precise Unsupported instead.
-                return Err(Error::unsupported(format!(
-                    "h266 reconstruct_leaf_cu: TB size {}x{} requires DCT-II 64 (§8.7.4.2 \
-                     eq. 1184) which is pending",
-                    n_tb_w, n_tb_h,
-                )));
-            };
+            // DCT-II / DCT-II for nTbS ∈ {4, 8, 16, 32, 64}. The size-64
+            // path is now wired through `apply_dct_ii` against the full
+            // 64×64 trMatrix (§8.7.4.2 eq. 1184).
+            let (tr_h, tr_v) = (TrType::DctII, TrType::DctII);
             let _ = implicit_mts_tr_types(n_tb_w as u32, n_tb_h as u32);
             inverse_transform_2d(
                 n_tb_w, n_tb_h, n_tb_w, n_tb_h, tr_h, tr_v, &d, bit_depth, 15,
@@ -777,6 +828,182 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             &mut out.luma.samples,
             out.luma.stride,
             out.luma.height,
+            x0,
+            y0,
+            &pred,
+            &residual_samples,
+            n_tb_w,
+            n_tb_h,
+            bit_depth,
+        )?;
+
+        // 6. Chroma planes (4:2:0 only — single-tree, monochrome formats
+        // skip this whole block). Both Cb and Cr go through the same
+        // §8.4 / §8.7 pipeline as luma, just at half spatial resolution
+        // and with the §8.4.3 chroma intra-mode mapping already baked
+        // into `info.intra_pred_mode_c`.
+        if self.sps.sps_chroma_format_idc == 1 {
+            self.reconstruct_chroma_plane(
+                /*c_idx=*/ 1,
+                cu,
+                info,
+                &residual.cb_levels,
+                info.tu_cb_coded_flag,
+                bit_depth,
+                out,
+            )?;
+            self.reconstruct_chroma_plane(
+                /*c_idx=*/ 2,
+                cu,
+                info,
+                &residual.cr_levels,
+                info.tu_cr_coded_flag,
+                bit_depth,
+                out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reconstruct a single chroma TB (Cb when `c_idx == 1`, Cr when
+    /// `c_idx == 2`) into the corresponding plane of `out`.
+    ///
+    /// Pipeline mirrors the luma path: §8.4.5.2.8 reference fetch on
+    /// the half-resolution chroma plane, PLANAR / DC / cardinal-angular
+    /// intra prediction (`info.intra_pred_mode_c` mapped via
+    /// [`chroma_pred_mode_for_predict`]; CCLM and non-cardinal angulars
+    /// are snapped to PLANAR / nearest-cardinal as a placeholder),
+    /// §8.7.3 flat-list dequant (with the §8.7.1 chroma QP — currently
+    /// the identity mapping `QpC = QpY + pps_chroma_qp_offset
+    /// + cu_chroma_qp_offset`), §8.7.4.1 separable DCT-II inverse
+    /// transform, and §8.7.5.1 reconstruct + clip.
+    ///
+    /// Chroma TBs smaller than 4×4 (e.g. when the luma CU is 4×4 with
+    /// 4:2:0 → 2×2 chroma) have no coded residual emitted by the leaf
+    /// reader and bypass dequant + inverse transform — the prediction
+    /// is written through unchanged. This keeps the path stable for
+    /// minimum-CB sizes without touching the still-pending size-2
+    /// transform support.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_chroma_plane(
+        &self,
+        c_idx: u32,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        levels: &[i32],
+        coded_flag: bool,
+        bit_depth: u32,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        // 4:2:0 chroma sub-sampling: half in both directions.
+        let n_tb_w = (cu.cu.w as usize) / 2;
+        let n_tb_h = (cu.cu.h as usize) / 2;
+        let x0 = (cu.cu.x as usize) / 2;
+        let y0 = (cu.cu.y as usize) / 2;
+        if n_tb_w == 0 || n_tb_h == 0 {
+            return Ok(());
+        }
+        // Pick the destination plane up front so the borrow on `out`
+        // does not have to follow the plane-by-plane reconstruction.
+        let plane = match c_idx {
+            1 => &mut out.cb,
+            2 => &mut out.cr,
+            _ => return Ok(()),
+        };
+
+        // 1. Reference samples from the partially-reconstructed chroma
+        // plane. Same picture-edge rule as luma in the single-slice
+        // case.
+        let above_avail = y0 > 0;
+        let left_avail = x0 > 0;
+        let refs = OwnedIntraRefs::from_plane(
+            plane,
+            x0,
+            y0,
+            n_tb_w,
+            n_tb_h,
+            above_avail,
+            left_avail,
+            bit_depth,
+        );
+        let refs_view = IntraRefs {
+            above: &refs.above,
+            left: &refs.left,
+            top_left: refs.top_left,
+        };
+
+        // 2. Intra prediction. Map the §8.4.3 derived `IntraPredModeC`
+        // through the cardinal-only fallback used by the luma path.
+        let mapped = chroma_pred_mode_for_predict(info.intra_pred_mode_c);
+        let pred = match mapped {
+            INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+            INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
+            mode @ (2 | 18 | 34 | 50 | 66) => predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?,
+            _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+        };
+
+        // 3. Dequantise + 4. inverse 2D transform when there is a coded
+        // chroma TB and the chroma TB is at least 4 samples on a side.
+        // Sizes 2×2 / 2×4 / 4×2 still go through the prediction path
+        // but skip dequant + IDCT (the leaf reader does not emit the
+        // residual for those sizes today, and the transform module
+        // does not yet implement size-2 kernels).
+        let residual_samples: Vec<i32> =
+            if coded_flag && !levels.is_empty() && n_tb_w >= 4 && n_tb_h >= 4 {
+                // §8.7.1 chroma QP: identity mapping qPi → QpC, plus the
+                // additive PPS / slice / CU offsets. Slice-level chroma
+                // offsets (`sh_cb_qp_offset` / `sh_cr_qp_offset`) are
+                // captured in the slice header but not yet plumbed to this
+                // call site; only the PPS + CU offsets contribute today.
+                let pps_offset = match c_idx {
+                    1 => self.pps.pps_cb_qp_offset,
+                    2 => self.pps.pps_cr_qp_offset,
+                    _ => 0,
+                };
+                let cu_offset = if info.cu_chroma_qp_offset_flag {
+                    // Per §7.4.10.6 the CU offset value is read from the
+                    // PPS chroma-offset list; the list itself is not yet
+                    // plumbed (round-10 surfaces the flag + index only).
+                    // Identity value 0 is the safe default.
+                    0
+                } else {
+                    0
+                };
+                let qp = chroma_qp_identity(self.cabac.slice_qp_y.0, pps_offset + cu_offset);
+                let params = DequantParams {
+                    bit_depth,
+                    log2_transform_range: 15,
+                    n_tb_w: n_tb_w as u32,
+                    n_tb_h: n_tb_h as u32,
+                    qp,
+                    dep_quant: false,
+                    transform_skip: false,
+                    bdpcm: false,
+                };
+                let d = dequantize_tb_flat(levels, &params)?;
+                // DCT-II both axes — chroma never picks an MTS kernel
+                // explicitly; implicit-MTS would only apply to luma intra
+                // (§8.7.4.4). Sizes ∈ {4, 8, 16, 32, 64} are all covered.
+                inverse_transform_2d(
+                    n_tb_w,
+                    n_tb_h,
+                    n_tb_w,
+                    n_tb_h,
+                    TrType::DctII,
+                    TrType::DctII,
+                    &d,
+                    bit_depth,
+                    15,
+                )?
+            } else {
+                vec![0i32; n_tb_w * n_tb_h]
+            };
+
+        // 5. Reconstruct + clip into the chroma plane.
+        reconstruct_tb_into(
+            &mut plane.samples,
+            plane.stride,
+            plane.height,
             x0,
             y0,
             &pred,
@@ -1252,6 +1479,92 @@ mod tests {
             }
         }
         assert!(wrote, "reconstruct must paint into the destination plane");
+    }
+
+    /// Chroma planes (4:2:0 → 8×8 chroma TB for a 16×16 luma CU) must
+    /// also be reconstructed by `reconstruct_leaf_cu`. We seed Cb / Cr
+    /// to a sentinel value (17) and verify the targeted CU rectangle
+    /// was overwritten — the §8.4.5.2.8 mid-grey substitution at the
+    /// picture edge plus PLANAR/DC prediction lands every chroma sample
+    /// at 128, which is observably different from the seed.
+    #[test]
+    fn reconstruct_leaf_cu_writes_chroma_planes() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh = CuNeighbourhood::default();
+        let (info, residual) = walker.decode_leaf_cu_syntax(&ccu, &neigh).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        // Override the chroma seed so we can detect writes.
+        for v in out.cb.samples.iter_mut() {
+            *v = 17;
+        }
+        for v in out.cr.samples.iter_mut() {
+            *v = 17;
+        }
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .unwrap();
+        // A 16×16 luma CU corresponds to an 8×8 chroma TB at (0, 0)
+        // in the chroma planes. The picture-edge case substitutes
+        // mid-grey (128) for unavailable refs and PLANAR / DC of a
+        // mid-grey-only neighbourhood collapses to 128 everywhere.
+        for y in 0..8 {
+            for x in 0..8 {
+                let cb = out.cb.samples[y * 64 + x];
+                let cr = out.cr.samples[y * 64 + x];
+                assert_ne!(cb, 17, "chroma Cb at ({x},{y}) was not written");
+                assert_ne!(cr, 17, "chroma Cr at ({x},{y}) was not written");
+            }
+        }
+        // Outside the CU rectangle the seed must still be visible
+        // (no over-write past the CU's chroma footprint).
+        assert_eq!(out.cb.samples[0 * 64 + 8], 17);
+        assert_eq!(out.cb.samples[8 * 64 + 0], 17);
+    }
+
+    /// `chroma_pred_mode_for_predict` collapses CCLM modes to PLANAR
+    /// and snaps non-cardinal angulars to the nearest cardinal. PLANAR /
+    /// DC / cardinals pass through verbatim.
+    #[test]
+    fn chroma_pred_mode_mapping_collapses_cclm_and_snaps_angulars() {
+        use crate::leaf_cu::{INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM};
+        assert_eq!(chroma_pred_mode_for_predict(INTRA_PLANAR), INTRA_PLANAR);
+        assert_eq!(chroma_pred_mode_for_predict(INTRA_DC), INTRA_DC);
+        assert_eq!(chroma_pred_mode_for_predict(50), 50);
+        assert_eq!(chroma_pred_mode_for_predict(2), 2);
+        assert_eq!(chroma_pred_mode_for_predict(66), 66);
+        // Non-cardinal angular -> snap to nearest cardinal (matches
+        // the luma fallback).
+        assert_eq!(chroma_pred_mode_for_predict(40), 34);
+        // CCLM modes collapse to PLANAR until §8.4.5.2.14 lands.
+        assert_eq!(chroma_pred_mode_for_predict(INTRA_LT_CCLM), INTRA_PLANAR);
+        assert_eq!(chroma_pred_mode_for_predict(INTRA_L_CCLM), INTRA_PLANAR);
+        assert_eq!(chroma_pred_mode_for_predict(INTRA_T_CCLM), INTRA_PLANAR);
+    }
+
+    /// `chroma_qp_identity` is a clamp-only identity mapping today
+    /// (`QpC = QpY + offset`, clipped to `[0, 63]`).
+    #[test]
+    fn chroma_qp_identity_clips_to_legal_range() {
+        assert_eq!(chroma_qp_identity(20, 0), 20);
+        assert_eq!(chroma_qp_identity(20, 5), 25);
+        assert_eq!(chroma_qp_identity(60, 5), 63); // saturates
+        assert_eq!(chroma_qp_identity(0, -3), 0); // clamps from below
     }
 
     /// The unsupported-error escape hatch still fires for the MIP path
