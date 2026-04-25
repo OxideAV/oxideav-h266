@@ -446,7 +446,8 @@ pub fn one_d_transform(
         // §8.7.4.2 eq. 1184 (the dct_ii_entry helper already covers
         // m,n ∈ 0..63 by chaining the 0..15 + 16..31 sub-tables and the
         // §8.7.4.5 antisymmetry reflections).
-        (TrType::DctII, 4)
+        (TrType::DctII, 2)
+        | (TrType::DctII, 4)
         | (TrType::DctII, 8)
         | (TrType::DctII, 16)
         | (TrType::DctII, 32)
@@ -827,6 +828,69 @@ mod tests {
         let x = [0, 1, 0, 0];
         let y = one_d_transform(TrType::DctII, 4, 2, &x).unwrap();
         assert_eq!(y, vec![83, 36, -36, -83]);
+    }
+
+    /// DCT-II size-2: stride = 32. The two columns of trMatrix used are
+    /// `dct_ii_entry(i, 0)` and `dct_ii_entry(i, 32)` for i ∈ {0, 1}.
+    /// At column 0 the spec's first row of transMatrixCol0to15 is all
+    /// `64`s. At column 32 the row 0 is `[64, -64, 64, ...]`. So:
+    ///   y[0] = trMat[0][0] * x[0] + trMat[0][32] * x[1] = 64*x[0] + 64*x[1]
+    ///   y[1] = trMat[1][0] * x[0] + trMat[1][32] * x[1] = 64*x[0] + (-64)*x[1]
+    /// (Spec uses transMatrix[m][n] indexing, with n the input/coefficient
+    /// index and m the output/spatial index.)
+    #[test]
+    fn dct_ii_size2_dc_impulse() {
+        // x = [1, 0]: y = (64, 64) — broadcast DC.
+        let x = [1, 0];
+        let y = one_d_transform(TrType::DctII, 2, 1, &x).unwrap();
+        assert_eq!(y, vec![64, 64]);
+    }
+
+    /// DCT-II size-2 AC impulse: x = [0, 1] picks the column at offset 32.
+    /// Per the spec's column 32 = `[64, -64, ...]`, the size-2 output is
+    /// `[64, -64]`.
+    #[test]
+    fn dct_ii_size2_ac_impulse() {
+        let x = [0, 1];
+        let y = one_d_transform(TrType::DctII, 2, 2, &x).unwrap();
+        assert_eq!(y, vec![64, -64]);
+    }
+
+    /// 2D DCT-II at 2×2 round-trips through `inverse_transform_2d`. A
+    /// single non-zero DC coefficient must produce a constant result
+    /// vector of length 4 after both 1D passes and the bd-shift.
+    /// At bit_depth=8, log2_transform_range=15: bd_shift = 5+15-8 = 12.
+    /// Vertical pass: e[0][y] = 64*100 = 6400 broadcast.
+    /// Step 2 mid-shift: g[y][0] = (6400 + 64) >> 7 = 50.
+    /// Horizontal: r_row = [64*50, 64*50] = [3200, 3200].
+    /// Step 6: (3200 + 2048) >> 12 = 1.
+    #[test]
+    fn inverse_2d_dct_ii_2x2_dc() {
+        let mut d = vec![0i32; 4];
+        d[0] = 100;
+        let r = inverse_transform_2d(2, 2, 1, 1, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+        // All four samples must be equal — the size-2 DC propagation
+        // produces a flat 2x2 block.
+        assert_eq!(r, vec![1, 1, 1, 1]);
+    }
+
+    /// 2D DCT-II at 2×4 (asymmetric) — exercises the size-2 vertical path
+    /// against the existing size-4 horizontal path.
+    #[test]
+    fn inverse_2d_dct_ii_2x4_runs() {
+        let d = vec![0i32; 8];
+        let r = inverse_transform_2d(2, 4, 2, 4, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+        // All-zero input → all-zero output.
+        assert_eq!(r, vec![0i32; 8]);
+    }
+
+    /// 2D DCT-II at 4×2 — exercises the size-2 horizontal path against
+    /// the existing size-4 vertical path.
+    #[test]
+    fn inverse_2d_dct_ii_4x2_runs() {
+        let d = vec![0i32; 8];
+        let r = inverse_transform_2d(4, 2, 4, 2, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+        assert_eq!(r, vec![0i32; 8]);
     }
 
     /// DCT-II linearity.

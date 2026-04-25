@@ -49,6 +49,13 @@
 //!   horizontal pass per CU, short-tap luma + weak/strong chroma
 //!   filters with Table 43 β/tC). Wired into
 //!   [`ctu::CtuWalker::apply_in_loop_filters`].
+//! * [`sao`] — §8.8.4 sample adaptive offset (Edge Offset + Band
+//!   Offset, Table 10 / Table 11 / Table 44). The `sao(rx, ry)` syntax
+//!   parser is not yet implemented (needs Table 58 CABAC contexts);
+//!   per-CTB parameters can be supplied programmatically via
+//!   [`ctu::CtuWalker::set_sao_picture`] for fixture-driven tests. The
+//!   apply pass runs after deblocking inside
+//!   [`ctu::CtuWalker::apply_in_loop_filters`].
 //! * [`dequant`] — §8.7.3 scaled-transform-coefficient derivation
 //!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
 //!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
@@ -105,6 +112,7 @@ pub mod ptl;
 pub mod reconstruct;
 pub mod ref_pic_list;
 pub mod residual;
+pub mod sao;
 pub mod scan;
 pub mod slice_header;
 pub mod sps;

@@ -4,6 +4,18 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- §8.8.4 SAO (sample adaptive offset) — Edge Offset (4 classes per
+  Table 11) and Band Offset modes per §8.8.4.2 eqs. 1424 – 1435 +
+  Table 44. Per-CTB params consumed via the new `sao::SaoPicture` /
+  `SaoCtbParams` types and `CtuWalker::set_sao_picture`. Wired into
+  `CtuWalker::apply_in_loop_filters` after deblocking.
+- DCT-II size-2 inverse transform — re-uses the 64×64 trMatrix entries
+  at columns 0 / 32. Unblocks 2×2 / 2×4 / 4×2 chroma TBs (4×4 / 4×8 /
+  8×4 luma CUs under 4:2:0); the chroma reconstruction path now runs
+  dequant + IDCT for those sizes instead of the previous bypass.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-h266/compare/v0.0.3...v0.0.4) - 2026-04-25
 
 ### Other

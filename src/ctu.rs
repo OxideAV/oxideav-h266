@@ -78,6 +78,7 @@ use crate::leaf_cu::{
 };
 use crate::pps::PicParameterSet;
 use crate::reconstruct::{reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
+use crate::sao::{apply_sao, SaoConfig, SaoPicture};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
 use crate::transform::{implicit_mts_tr_types, inverse_transform_2d, TrType};
@@ -408,6 +409,12 @@ pub struct CtuWalker<'a, 'b> {
     /// every time a fresh walker is constructed; consumed by
     /// [`Self::apply_in_loop_filters`].
     deblock_cus: Vec<DeblockCu>,
+    /// Per-CTB SAO parameters consumed by [`Self::apply_in_loop_filters`].
+    /// Defaults to "all CTBs not applied"; callers (and integration
+    /// tests) populate the array explicitly via [`Self::set_sao_picture`]
+    /// since the round-13 walker does not yet decode the §7.3.11.3
+    /// `sao(rx, ry)` syntax (waiting on Table 58 CABAC contexts).
+    sao_picture: SaoPicture,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -493,6 +500,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let arith = ArithDecoder::new(cabac_payload)?;
         let leaf_ctxs = LeafCuCtxs::init(slice_qp.as_init_qp());
 
+        let sao_picture =
+            SaoPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
         Ok(Self {
             layout,
             sps,
@@ -502,7 +511,35 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             arith,
             leaf_ctxs,
             deblock_cus: Vec::new(),
+            sao_picture,
         })
+    }
+
+    /// Inject a per-picture SAO parameter array. Replaces the default
+    /// "all CTBs not applied" snapshot installed by [`Self::begin_slice`].
+    /// Used by integration tests (and by future round-N callers) that
+    /// drive SAO without going through the unimplemented §7.3.11.3
+    /// CABAC parser. The picture's CTB grid must match the layout's
+    /// `pic_width_in_ctbs_y` / `pic_height_in_ctbs_y`.
+    pub fn set_sao_picture(&mut self, sao_pic: SaoPicture) -> Result<()> {
+        if sao_pic.pic_width_in_ctbs_y != self.layout.pic_width_in_ctbs_y
+            || sao_pic.pic_height_in_ctbs_y != self.layout.pic_height_in_ctbs_y
+        {
+            return Err(Error::invalid(format!(
+                "h266 SAO: per-picture grid {}x{} does not match layout {}x{}",
+                sao_pic.pic_width_in_ctbs_y,
+                sao_pic.pic_height_in_ctbs_y,
+                self.layout.pic_width_in_ctbs_y,
+                self.layout.pic_height_in_ctbs_y,
+            )));
+        }
+        self.sao_picture = sao_pic;
+        Ok(())
+    }
+
+    /// Read-only view of the current per-picture SAO parameter array.
+    pub fn sao_picture(&self) -> &SaoPicture {
+        &self.sao_picture
     }
 
     /// Build a [`CuToolFlags`] snapshot from the parameter-set views
@@ -905,12 +942,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// + cu_chroma_qp_offset`), §8.7.4.1 separable DCT-II inverse
     /// transform, and §8.7.5.1 reconstruct + clip.
     ///
-    /// Chroma TBs smaller than 4×4 (e.g. when the luma CU is 4×4 with
-    /// 4:2:0 → 2×2 chroma) have no coded residual emitted by the leaf
-    /// reader and bypass dequant + inverse transform — the prediction
-    /// is written through unchanged. This keeps the path stable for
-    /// minimum-CB sizes without touching the still-pending size-2
-    /// transform support.
+    /// Chroma TBs of size 2×2 / 2×4 / 4×2 (which arise when the luma
+    /// CU is 4×4 / 4×8 / 8×4 with 4:2:0 sub-sampling) now go through
+    /// the same DCT-II path as the larger sizes — the size-2 kernel was
+    /// added to [`crate::transform::one_d_transform`] in round 13. The
+    /// chroma path will run dequant + inverse transform whenever the
+    /// leaf reader emitted a coded residual, regardless of TB size.
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_chroma_plane(
         &self,
@@ -970,13 +1007,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
 
         // 3. Dequantise + 4. inverse 2D transform when there is a coded
-        // chroma TB and the chroma TB is at least 4 samples on a side.
-        // Sizes 2×2 / 2×4 / 4×2 still go through the prediction path
-        // but skip dequant + IDCT (the leaf reader does not emit the
-        // residual for those sizes today, and the transform module
-        // does not yet implement size-2 kernels).
+        // chroma TB. Round-13 added size-2 DCT-II support, so the
+        // 2×2 / 2×4 / 4×2 chroma sizes (from 4×4 / 4×8 / 8×4 luma CUs
+        // under 4:2:0) now go through the dequant + IDCT pipeline
+        // alongside the 4+ sizes.
         let residual_samples: Vec<i32> =
-            if coded_flag && !levels.is_empty() && n_tb_w >= 4 && n_tb_h >= 4 {
+            if coded_flag && !levels.is_empty() && n_tb_w >= 2 && n_tb_h >= 2 {
                 // §8.7.1 chroma QP: identity mapping qPi → QpC, plus the
                 // additive PPS / slice / CU offsets. Slice-level chroma
                 // offsets (`sh_cb_qp_offset` / `sh_cr_qp_offset`) are
@@ -1058,16 +1094,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     }
 
     /// Apply the §8.8 in-loop filters to a partially-reconstructed
-    /// picture. Round-12 wires only the §8.8.3 deblocking pass; SAO
-    /// (§8.8.4) and ALF (§8.8.5) remain pending and are skipped (they
-    /// are no-ops when their slice / SPS enable-flags are off, which
-    /// holds in every fixture this scaffold currently emits).
+    /// picture. Runs deblocking (§8.8.3) followed by SAO (§8.8.4); ALF
+    /// (§8.8.5) remains pending and is skipped (it is a no-op when
+    /// `sh_alf_enabled_flag = 0`, which the constructor enforces).
     ///
     /// The CU records consumed by the deblocker are accumulated by
     /// [`Self::reconstruct_leaf_cu`]; calling
     /// `apply_in_loop_filters` before any picture-decode call is
     /// therefore a no-op (the empty CU list never finds a neighbour
-    /// pair).
+    /// pair). The SAO pass is gated on `sh_sao_luma_used_flag` /
+    /// `sh_sao_chroma_used_flag` and the per-CTB params installed via
+    /// [`Self::set_sao_picture`]; with the default empty SAO picture
+    /// every CTB classifies as `SaoTypeIdx::NotApplied` and SAO is a
+    /// no-op even when the slice flags are on.
     pub fn apply_in_loop_filters(&mut self, out: &mut PictureBuffer) -> Result<()> {
         // Resolve deblock parameters from the slice header (§7.4.8) +
         // the picture header / PPS fall-backs already applied during
@@ -1093,17 +1132,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             &params,
             self.sps.sps_chroma_format_idc as u32,
         );
-        // SAO (§8.8.4) — needs sh_sao_*_used_flag + per-CTB
-        // SaoTypeIdx / SaoEoClass / SaoOffsetVal arrays from the
-        // slice header. Not emitted by the round-12 syntax walker
-        // yet; running the spec's "type 0" no-op is the spec-correct
-        // path when those parameters are absent.
+        // SAO (§8.8.4) — runs after deblocking per §8.8.4.1. Per-CTB
+        // SaoTypeIdx / SaoEoClass / SaoOffsetVal arrays come from
+        // `sao_picture`, which the round-13 walker leaves at the empty
+        // default unless an integration test explicitly populates it.
+        let sao_cfg = SaoConfig {
+            luma_used: self.sh.sh_sao_luma_used_flag,
+            chroma_used: self.sh.sh_sao_chroma_used_flag,
+            bit_depth,
+            ctb_log2_size_y: self.layout.ctb_log2_size_y,
+            chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
+        };
+        apply_sao(out, &self.sao_picture, &sao_cfg);
         // ALF (§8.8.5) — gated on `sh_alf_enabled_flag`, which the
         // CTU-walker constructor already rejects (see `begin_slice`).
-        let _ = (
-            self.sh.sh_sao_luma_used_flag,
-            self.sh.sh_sao_chroma_used_flag,
-        );
         Ok(())
     }
 }
