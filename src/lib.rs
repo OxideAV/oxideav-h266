@@ -45,6 +45,10 @@
 //!   `locNumSig` / `locSumAbsPass1` neighbourhood accumulators, the
 //!   §9.3.3.2 `locSumAbs` + Table 128 Rice-parameter derivation, and
 //!   the `remBinsPass1` budget (eq. 5018).
+//! * [`deblock`] — §8.8.3 in-loop deblocking filter (vertical-then-
+//!   horizontal pass per CU, short-tap luma + weak/strong chroma
+//!   filters with Table 43 β/tC). Wired into
+//!   [`ctu::CtuWalker::apply_in_loop_filters`].
 //! * [`dequant`] — §8.7.3 scaled-transform-coefficient derivation
 //!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
 //!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
@@ -86,6 +90,7 @@ pub mod coding_tree;
 pub mod ctu;
 pub mod ctx;
 pub mod dci;
+pub mod deblock;
 pub mod decoder;
 pub mod dequant;
 pub mod encoder;

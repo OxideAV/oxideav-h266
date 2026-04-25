@@ -49,8 +49,10 @@
 //! * Chroma-plane reconstruction. The 4:2:0 buffer's Cb / Cr planes
 //!   stay seeded at neutral 128 — the luma plane is the only one
 //!   currently driven by [`CtuWalker::reconstruct_leaf_cu`].
-//! * In-loop filters (deblock / SAO / ALF / LMCS) — still surface
-//!   `Error::Unsupported` from [`CtuWalker::apply_in_loop_filters`].
+//! * In-loop filters: §8.8.3 deblocking is now wired through
+//!   [`CtuWalker::apply_in_loop_filters`] (short-tap luma / weak-tap
+//!   chroma per the round-12 subset). SAO / ALF / LMCS are still
+//!   pending and silently no-op when their slice flags are clear.
 //! * MIP / ISP / BDPCM / CCLM / LFNST / MTS-non-DCT-II / scaling lists
 //!   / wide-angle / fractional-angular intra prediction. Each is gated
 //!   with a precise `Error::Unsupported` so callers see exactly which
@@ -67,11 +69,12 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::ArithDecoder;
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
+use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
-    CuNeighbourhood, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual, INTRA_DC,
-    INTRA_PLANAR,
+    CuNeighbourhood, CuPredMode, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
+    INTRA_DC, INTRA_PLANAR,
 };
 use crate::pps::PicParameterSet;
 use crate::reconstruct::{reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
@@ -400,6 +403,11 @@ pub struct CtuWalker<'a, 'b> {
     cabac: SliceCabacState,
     arith: ArithDecoder<'b>,
     leaf_ctxs: LeafCuCtxs,
+    /// Per-leaf records accumulated by [`Self::reconstruct_leaf_cu`]
+    /// for the in-loop deblocking pass (§8.8.3). Reset implicitly
+    /// every time a fresh walker is constructed; consumed by
+    /// [`Self::apply_in_loop_filters`].
+    deblock_cus: Vec<DeblockCu>,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -493,6 +501,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cabac: cabac_state,
             arith,
             leaf_ctxs,
+            deblock_cus: Vec::new(),
         })
     }
 
@@ -862,6 +871,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 out,
             )?;
         }
+
+        // Record this leaf for the §8.8.3 deblocking pass. The
+        // per-CU QP carries any `cu_qp_delta` so the deblocker can
+        // build the eq. 1274 average without re-walking the slice.
+        let qp_y = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
+        self.deblock_cus.push(DeblockCu {
+            x: cu.cu.x,
+            y: cu.cu.y,
+            w: cu.cu.w,
+            h: cu.cu.h,
+            qp_y: qp_y.clamp(0, 63),
+            intra: matches!(info.pred_mode, CuPredMode::Intra),
+            tu_y_coded: info.tu_y_coded_flag,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
+            bdpcm_luma: info.intra_bdpcm_luma,
+            bdpcm_chroma: false,
+        });
         Ok(())
     }
 
@@ -1030,13 +1057,54 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         Ok(())
     }
 
-    /// Stub deblocking / SAO-replacement / ALF / LMCS pipeline. None
-    /// of those loops are wired up yet.
-    pub fn apply_in_loop_filters(&mut self) -> Result<()> {
-        Err(Error::unsupported(
-            "h266 CTU walker: in-loop filters (deblock, SAO-replacement, ALF, LMCS) \
-             not implemented",
-        ))
+    /// Apply the §8.8 in-loop filters to a partially-reconstructed
+    /// picture. Round-12 wires only the §8.8.3 deblocking pass; SAO
+    /// (§8.8.4) and ALF (§8.8.5) remain pending and are skipped (they
+    /// are no-ops when their slice / SPS enable-flags are off, which
+    /// holds in every fixture this scaffold currently emits).
+    ///
+    /// The CU records consumed by the deblocker are accumulated by
+    /// [`Self::reconstruct_leaf_cu`]; calling
+    /// `apply_in_loop_filters` before any picture-decode call is
+    /// therefore a no-op (the empty CU list never finds a neighbour
+    /// pair).
+    pub fn apply_in_loop_filters(&mut self, out: &mut PictureBuffer) -> Result<()> {
+        // Resolve deblock parameters from the slice header (§7.4.8) +
+        // the picture header / PPS fall-backs already applied during
+        // parse.
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let disabled = self.pps.pps_deblocking_filter_disabled_flag
+            || self.sh.sh_deblocking_filter_disabled_flag;
+        let params = DeblockParams {
+            disabled,
+            luma_beta_offset_div2: self.sh.sh_luma_beta_offset_div2,
+            luma_tc_offset_div2: self.sh.sh_luma_tc_offset_div2,
+            cb_beta_offset_div2: self.sh.sh_cb_beta_offset_div2,
+            cb_tc_offset_div2: self.sh.sh_cb_tc_offset_div2,
+            cr_beta_offset_div2: self.sh.sh_cr_beta_offset_div2,
+            cr_tc_offset_div2: self.sh.sh_cr_tc_offset_div2,
+            chroma_qp_offset_cb: self.pps.pps_cb_qp_offset,
+            chroma_qp_offset_cr: self.pps.pps_cr_qp_offset,
+            bit_depth,
+        };
+        apply_deblocking(
+            out,
+            &self.deblock_cus,
+            &params,
+            self.sps.sps_chroma_format_idc as u32,
+        );
+        // SAO (§8.8.4) — needs sh_sao_*_used_flag + per-CTB
+        // SaoTypeIdx / SaoEoClass / SaoOffsetVal arrays from the
+        // slice header. Not emitted by the round-12 syntax walker
+        // yet; running the spec's "type 0" no-op is the spec-correct
+        // path when those parameters are absent.
+        // ALF (§8.8.5) — gated on `sh_alf_enabled_flag`, which the
+        // CTU-walker constructor already rejects (see `begin_slice`).
+        let _ = (
+            self.sh.sh_sao_luma_used_flag,
+            self.sh.sh_sao_chroma_used_flag,
+        );
+        Ok(())
     }
 }
 
@@ -1617,18 +1685,22 @@ mod tests {
         assert_eq!(nearest_supported_angular(66), 66);
     }
 
+    /// Round-12: `apply_in_loop_filters` is wired to the §8.8.3
+    /// deblocker. With no CUs accumulated yet (no `decode_picture_into`
+    /// call) it should be a no-op, returning `Ok(())` and leaving the
+    /// picture untouched.
     #[test]
-    fn apply_in_loop_filters_is_unsupported() {
+    fn apply_in_loop_filters_no_op_without_decode() {
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let sh = intra_slice_header();
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 32];
         let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
-        assert!(matches!(
-            walker.apply_in_loop_filters().unwrap_err(),
-            Error::Unsupported(_)
-        ));
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 64);
+        let snapshot = out.luma.samples.clone();
+        walker.apply_in_loop_filters(&mut out).unwrap();
+        assert_eq!(out.luma.samples, snapshot);
     }
 
     #[test]

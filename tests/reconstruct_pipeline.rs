@@ -11,6 +11,7 @@
 //! without producing measurable noise.
 
 use oxideav_h266::ctu::{CtuLayout, CtuWalker};
+use oxideav_h266::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use oxideav_h266::pps::PicParameterSet;
 use oxideav_h266::reconstruct::PictureBuffer;
 use oxideav_h266::slice_header::{SliceType, StatefulSliceHeader};
@@ -165,6 +166,67 @@ fn decode_picture_into_32x32_single_ctu() {
     assert!(nonzero > out.luma.samples.len() / 2);
 }
 
+/// Synthetic high-Q fixture that paints a 4-sample block-edge stripe
+/// (98 / 102) across two adjacent CUs. Before deblock the seam reads
+/// 98 → 102; after the §8.8.3 deblock pass the boundary samples must
+/// have moved closer to each other (canonical "block edge smoothed"
+/// behaviour). Picture-edge columns must remain unchanged.
+#[test]
+fn deblock_smooths_synthetic_block_edge_fixture() {
+    let mut buf = PictureBuffer::yuv420_filled(32, 32, 98);
+    for y in 0..32 {
+        for x in 16..32 {
+            buf.luma.samples[y * 32 + x] = 102;
+        }
+    }
+    // Snapshot the seam columns *before* deblock to compare against.
+    let before_p = buf.luma.samples[16 * 32 + 15] as i32;
+    let before_q = buf.luma.samples[16 * 32 + 16] as i32;
+    let cus = vec![
+        DeblockCu {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 32,
+            qp_y: 32,
+            intra: true,
+            tu_y_coded: true,
+            tu_cb_coded: false,
+            tu_cr_coded: false,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        },
+        DeblockCu {
+            x: 16,
+            y: 0,
+            w: 16,
+            h: 32,
+            qp_y: 32,
+            intra: true,
+            tu_y_coded: true,
+            tu_cb_coded: false,
+            tu_cr_coded: false,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        },
+    ];
+    let params = DeblockParams {
+        disabled: false,
+        bit_depth: 8,
+        ..Default::default()
+    };
+    apply_deblocking(&mut buf, &cus, &params, 1);
+    let after_p = buf.luma.samples[16 * 32 + 15] as i32;
+    let after_q = buf.luma.samples[16 * 32 + 16] as i32;
+    // P side moved from 98 toward 102.
+    assert!(after_p > before_p, "p side: {before_p} → {after_p}");
+    // Q side moved from 102 toward 98.
+    assert!(after_q < before_q, "q side: {before_q} → {after_q}");
+    // Picture-edge column unchanged.
+    assert_eq!(buf.luma.samples[16 * 32], 98);
+    assert_eq!(buf.luma.samples[16 * 32 + 31], 102);
+}
+
 /// `OwnedIntraRefs::from_plane` falls back to mid-grey when both edges
 /// are unavailable — the spec's substitution rule (§8.4.5.2.8).
 #[test]
@@ -176,6 +238,29 @@ fn picture_buffer_constructs_yuv420() {
     assert!(buf.luma.samples.iter().all(|&v| v == 17));
     assert!(buf.cb.samples.iter().all(|&v| v == 128));
     assert!(buf.cr.samples.iter().all(|&v| v == 128));
+}
+
+/// End-to-end IDR reconstruction followed by the §8.8.3 deblocking
+/// pass: must run cleanly, produce non-trivial luma data, and leave
+/// edge samples within valid 8-bit range. The combination of
+/// `decode_picture_into` + `apply_in_loop_filters` is the call sequence
+/// the higher-level decoder will use per IDR.
+#[test]
+fn decode_picture_into_then_deblock() {
+    let sps = dummy_sps(0, 64, 64);
+    let pps = dummy_pps(64, 64);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 1024];
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(64, 64, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+    walker.apply_in_loop_filters(&mut out).unwrap();
+    // Sanity: every sample must still sit in 8-bit range and most must
+    // be non-zero (the deblock pass only smooths — it cannot zero out
+    // the painted picture).
+    let nonzero = out.luma.samples.iter().filter(|&&v| v != 0).count();
+    assert!(nonzero > out.luma.samples.len() / 2);
 }
 
 /// End-to-end IDR reconstruction must paint chroma planes too — not
