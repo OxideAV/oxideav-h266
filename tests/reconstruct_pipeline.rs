@@ -491,6 +491,8 @@ fn ctu_walker_apply_alf_runs_with_aps_binding() {
     let binding = AlfApsBinding {
         luma_apses: &aps_slot,
         chroma_aps: None,
+        cc_cb_aps: None,
+        cc_cr_aps: None,
     };
     // Mark CTB (0,0) ALF-on with `AlfCtbFiltSetIdxY = 16` (= APS slot 0).
     let mut alf_pic = AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
@@ -564,6 +566,8 @@ fn ctu_walker_chroma_alf_runs_with_chroma_aps() {
     let binding = AlfApsBinding {
         luma_apses: &[],
         chroma_aps: Some(&aps),
+        cc_cb_aps: None,
+        cc_cr_aps: None,
     };
     let mut alf_pic = AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
     alf_pic.set(

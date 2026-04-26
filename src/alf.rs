@@ -122,9 +122,13 @@ impl AlfPicture {
     }
 
     /// True when no CTB enables ALF for any component — the apply pass
-    /// can short-circuit.
+    /// can short-circuit. Includes the CC-ALF `idc` arrays so a slice
+    /// that runs CC-ALF without primary chroma ALF (allowed by the
+    /// spec) still gets its second pass.
     pub fn is_all_off(&self) -> bool {
-        self.ctbs.iter().all(|c| !c.luma_on && !c.cb_on && !c.cr_on)
+        self.ctbs
+            .iter()
+            .all(|c| !c.luma_on && !c.cb_on && !c.cr_on && c.cc_cb_idc == 0 && c.cc_cr_idc == 0)
     }
 }
 
@@ -174,6 +178,13 @@ pub struct AlfApsBinding<'a> {
     pub luma_apses: &'a [Option<&'a AlfApsData>],
     /// APS bound by `sh_alf_aps_id_chroma`. `None` disables chroma ALF.
     pub chroma_aps: Option<&'a AlfApsData>,
+    /// APS bound by `sh_alf_cc_cb_aps_id` (CC-ALF for Cb). `None`
+    /// disables CC-ALF for Cb across the picture; per-CTB
+    /// `alf_ctb_cc_cb_idc` is then ignored.
+    pub cc_cb_aps: Option<&'a AlfApsData>,
+    /// APS bound by `sh_alf_cc_cr_aps_id` (CC-ALF for Cr). `None`
+    /// disables CC-ALF for Cr.
+    pub cc_cr_aps: Option<&'a AlfApsData>,
 }
 
 impl Default for AlfApsBinding<'_> {
@@ -181,6 +192,8 @@ impl Default for AlfApsBinding<'_> {
         Self {
             luma_apses: &[],
             chroma_aps: None,
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         }
     }
 }
@@ -301,6 +314,164 @@ pub fn apply_alf(
             }
         }
     }
+
+    // §8.8.5.1 second pass — CC-ALF runs after primary chroma ALF and
+    // reads from the *pre-luma-ALF* `recPictureL`. The accumulated
+    // delta is added to the post-chroma-ALF chroma plane.
+    if cfg.chroma_format_idc != 0 {
+        for ry in 0..alf_pic.pic_height_in_ctbs_y {
+            for rx in 0..alf_pic.pic_width_in_ctbs_y {
+                let p = alf_pic.get(rx, ry);
+                if cfg.cb_enabled && p.cc_cb_idc != 0 {
+                    if let Some(aps) = binding.cc_cb_aps {
+                        let filt_idx = (p.cc_cb_idc - 1) as usize;
+                        if filt_idx < aps.cc_cb_coeff.len() {
+                            let coeff = &aps.cc_cb_coeff[filt_idx];
+                            apply_cc_alf_ctb(
+                                &mut out.cb,
+                                &luma_pre,
+                                out.luma.stride,
+                                out.luma.width as u32,
+                                out.luma.height as u32,
+                                rx,
+                                ry,
+                                ctb_size_y,
+                                sub_w,
+                                sub_h,
+                                cfg.bit_depth,
+                                coeff,
+                            );
+                        }
+                    }
+                }
+                if cfg.cr_enabled && p.cc_cr_idc != 0 {
+                    if let Some(aps) = binding.cc_cr_aps {
+                        let filt_idx = (p.cc_cr_idc - 1) as usize;
+                        if filt_idx < aps.cc_cr_coeff.len() {
+                            let coeff = &aps.cc_cr_coeff[filt_idx];
+                            apply_cc_alf_ctb(
+                                &mut out.cr,
+                                &luma_pre,
+                                out.luma.stride,
+                                out.luma.width as u32,
+                                out.luma.height as u32,
+                                rx,
+                                ry,
+                                ctb_size_y,
+                                sub_w,
+                                sub_h,
+                                cfg.bit_depth,
+                                coeff,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply §8.8.5.7 cross-component ALF to a single chroma CTB.
+///
+/// `chroma` is the post-chroma-ALF plane being modified; `luma_pre` is
+/// the **pre-luma-ALF** luma snapshot referenced by eq. 1515 as
+/// `recPictureL`. `coeff[0..6]` are the seven CcAlfCoeff filter taps.
+///
+/// Per eq. 1517 the `(SubHeightC == 1 && y ∈ {CtbSizeY-3, CtbSizeY-4})`
+/// guard suppresses the modification on the two near-bottom luma rows
+/// of a 4:2:2 / 4:4:4 CTB; in 4:2:0 (`SubHeightC == 2`) the guard
+/// never fires so it collapses to "always add scaledSum".
+#[allow(clippy::too_many_arguments)]
+fn apply_cc_alf_ctb(
+    chroma: &mut PicturePlane,
+    luma_pre: &[u8],
+    luma_stride: usize,
+    luma_w: u32,
+    luma_h: u32,
+    rx: u32,
+    ry: u32,
+    ctb_size_y: u32,
+    sub_w: u32,
+    sub_h: u32,
+    bit_depth: u32,
+    coeff: &[i32; ALF_CC_NUM_COEFF],
+) {
+    let cc_alf_width = (ctb_size_y / sub_w) as usize;
+    let cc_alf_height = (ctb_size_y / sub_h) as usize;
+    let x_ctb_c = ((rx * ctb_size_y) / sub_w) as usize;
+    let y_ctb_c = ((ry * ctb_size_y) / sub_h) as usize;
+    let i_max = cc_alf_width.min(chroma.width.saturating_sub(x_ctb_c));
+    let j_max = cc_alf_height.min(chroma.height.saturating_sub(y_ctb_c));
+    let max_val = (1i32 << bit_depth) - 1;
+    let max_val_8 = max_val.min(255);
+    let half = 1i32 << (bit_depth - 1);
+    let pw = luma_w as i32;
+    let ph = luma_h as i32;
+
+    for y in 0..j_max {
+        for x in 0..i_max {
+            // Map chroma → luma per eq. 1510.
+            let xl = ((x_ctb_c + x) as i32) * (sub_w as i32);
+            let yl = ((y_ctb_c + y) as i32) * (sub_h as i32);
+
+            // Table 47 yP1 / yP2: in the single-slice / no-virtual-
+            // boundary scaffold `applyAlfLineBufBoundary` is treated as
+            // 1 for non-bottom CTBs (the line-buffer carve-out fires
+            // inside the CTB) and 0 for the picture-bottom row.
+            let y_line = (y as i32) * (sub_h as i32);
+            let apply_lbb = !(yl + (ctb_size_y as i32) >= ph
+                && (ph - (y_ctb_c as i32) * (sub_h as i32)) <= (ctb_size_y as i32) - 4);
+            let (y_p1, y_p2) = cc_alf_table_47(y_line, ctb_size_y as i32, apply_lbb);
+
+            // Eq. 1513.
+            let curr_chroma = chroma.samples[(y_ctb_c + y) * chroma.stride + (x_ctb_c + x)] as i32;
+            // Centre luma sample for delta calculation.
+            let centre = sample(luma_pre, luma_stride, pw, ph, xl, yl) as i32;
+            // Eq. 1515 — seven luma-deltas weighted by f[0..6].
+            let mut sum: i32 = 0;
+            sum +=
+                coeff[0] * (sample(luma_pre, luma_stride, pw, ph, xl, yl - y_p1) as i32 - centre);
+            sum += coeff[1] * (sample(luma_pre, luma_stride, pw, ph, xl - 1, yl) as i32 - centre);
+            sum += coeff[2] * (sample(luma_pre, luma_stride, pw, ph, xl + 1, yl) as i32 - centre);
+            sum += coeff[3]
+                * (sample(luma_pre, luma_stride, pw, ph, xl - 1, yl + y_p1) as i32 - centre);
+            sum +=
+                coeff[4] * (sample(luma_pre, luma_stride, pw, ph, xl, yl + y_p1) as i32 - centre);
+            sum += coeff[5]
+                * (sample(luma_pre, luma_stride, pw, ph, xl + 1, yl + y_p1) as i32 - centre);
+            sum +=
+                coeff[6] * (sample(luma_pre, luma_stride, pw, ph, xl, yl + y_p2) as i32 - centre);
+            // Eq. 1516.
+            let scaled_sum = ((sum + 64) >> 7).clamp(-half, half - 1);
+            // Eq. 1517 — suppression rule for `SubHeightC == 1` rows.
+            let suppress = sub_h == 1
+                && (y_line == (ctb_size_y as i32) - 3 || y_line == (ctb_size_y as i32) - 4);
+            let new = if suppress {
+                curr_chroma
+            } else {
+                curr_chroma + scaled_sum
+            };
+            // Eq. 1518.
+            let new = new.clamp(0, max_val).min(max_val_8) as u8;
+            chroma.samples[(y_ctb_c + y) * chroma.stride + (x_ctb_c + x)] = new;
+        }
+    }
+}
+
+/// Table 47 — yP1 / yP2 vertical luma offsets for CC-ALF. Indexed by
+/// `y * SubHeightC` and `applyAlfLineBufBoundary`.
+#[inline]
+fn cc_alf_table_47(y_line: i32, ctb_size_y: i32, apply_lbb: bool) -> (i32, i32) {
+    if apply_lbb {
+        // Two carve-outs near the bottom of the CTB.
+        if y_line == ctb_size_y - 5 || y_line == ctb_size_y - 4 {
+            return (0, 0);
+        }
+        if y_line == ctb_size_y - 6 || y_line == ctb_size_y - 3 {
+            return (1, 1);
+        }
+    }
+    (1, 2)
 }
 
 /// Resolved per-CTB luma filter set: all 25 filter rows the §8.8.5.3
@@ -312,23 +483,38 @@ pub fn apply_alf(
 type LumaFilterSet = [([i32; ALF_LUMA_NUM_COEFF], [u8; ALF_LUMA_NUM_COEFF]); NUM_ALF_FILTERS];
 
 /// Resolve the full 25-class luma filter set referenced by
-/// `AlfCtbFiltSetIdxY`. Returns `None` for fixed-filter CTBs (the 64-row
-/// `AlfFixFiltCoeff` table from §7.4.3.18 is not yet shipped — those
-/// CTBs fall through to "no filter" until a later round) and for CTBs
-/// that demand an absent / unsignalled APS.
+/// `AlfCtbFiltSetIdxY`.
 ///
-/// For APS-signalled sets eq. 1440 / 1441 say
-/// `f[j] = AlfCoeffL[i][filtIdx][j]`,
-/// `c[j] = AlfClipL[i][filtIdx][j]` — we surface the index into
-/// Table 8, the apply path resolves the concrete value via
-/// [`resolve_clip_value`].
+/// * `filt_set_idx < 16` — fixed-filter set per eqs. 90 / 91 / 1437 /
+///   1438. Coefficients come from `AlfFixFiltCoeff[ AlfClassToFiltMap[
+///   filt_set_idx ][ filtIdx ] ]`; the spec sets `c[j] = 2^BitDepth`
+///   so the per-sample clip is effectively disabled (the linear
+///   filter path). We surface clipIdx 0 for every coefficient — that
+///   maps via [`resolve_clip_value`] to `1 << BitDepth`, the same
+///   no-op clipping the spec specifies.
+/// * `filt_set_idx >= 16` — APS-signalled set per eqs. 1439 / 1440 /
+///   1441. Coefficients + clipIdx come from `AlfCoeffL` / `AlfClipL`
+///   in the bound APS.
+///
+/// Returns `None` when the requested APS slot is empty / unsignalled.
 fn resolve_luma_filter_set(filt_set_idx: u8, binding: &AlfApsBinding<'_>) -> Option<LumaFilterSet> {
     if (filt_set_idx as usize) < 16 {
-        // Fixed-filter set — `AlfFixFiltCoeff` 64×12 + `AlfClassToFiltMap`
-        // 16×25 tables (eqs. 90 / 91) are not yet shipped. When the
-        // caller installs a fixed-filter CTB the apply pass currently
-        // skips it.
-        return None;
+        // Fixed-filter set — eq. 1437 / 1438. Build all 25 class rows
+        // by walking AlfClassToFiltMap[filt_set_idx][class] for class
+        // ∈ 0..25 and copying the corresponding 12-tap row out of
+        // ALF_FIX_FILT_COEFF. clipIdx 0 → `resolve_clip_value` returns
+        // `2^BitDepth`, the spec's "no clipping" sentinel for the
+        // fixed-filter linear path.
+        let mut set: LumaFilterSet =
+            [([0i32; ALF_LUMA_NUM_COEFF], [0u8; ALF_LUMA_NUM_COEFF]); NUM_ALF_FILTERS];
+        for class in 0..NUM_ALF_FILTERS {
+            let coeff_row = crate::alf_fixed::fixed_filter_coeff_row(filt_set_idx, class as u8)?;
+            for j in 0..ALF_LUMA_NUM_COEFF {
+                set[class].0[j] = coeff_row[j] as i32;
+                set[class].1[j] = 0;
+            }
+        }
+        return Some(set);
     }
     let aps_slot = (filt_set_idx as usize) - 16;
     let aps = binding.luma_apses.get(aps_slot).and_then(|s| *s)?;
@@ -915,10 +1101,13 @@ mod tests {
         assert!(buf.luma.samples.iter().all(|&v| v == 100));
     }
 
-    /// Fixed-filter-set CTBs are currently treated as luma-off (the
-    /// 64-row AlfFixFiltCoeff table is not yet shipped in this round).
+    /// Fixed-filter-set CTBs (idx < 16) now resolve through eqs. 90 /
+    /// 91 / 1437 / 1438 (`AlfFixFiltCoeff` + `AlfClassToFiltMap`). On a
+    /// flat plane every clipped neighbour-delta is 0, so even with
+    /// non-zero coefficients the filter output equals `curr` and the
+    /// plane stays unchanged.
     #[test]
-    fn fixed_filter_set_falls_through() {
+    fn fixed_filter_set_is_identity_on_flat_plane() {
         let mut buf = fresh_buf(32, 32, 100);
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -926,13 +1115,50 @@ mod tests {
             0,
             AlfCtb {
                 luma_on: true,
-                luma_filt_set_idx: 0, // < 16 → fixed filter
+                luma_filt_set_idx: 0, // < 16 → fixed-filter set 0
                 ..Default::default()
             },
         );
         apply_alf(&mut buf, &pic, &cfg_8bit(), &AlfApsBinding::default());
-        // Luma untouched.
+        // Flat plane → all neighbour-deltas are 0 → sum stays 0 → curr
+        // unchanged.
         assert!(buf.luma.samples.iter().all(|&v| v == 100));
+    }
+
+    /// On a non-flat plane the fixed-filter set should produce *some*
+    /// change in the output (proves the table wiring isn't a no-op).
+    /// We use a single-pixel "spike" rather than a step edge — the
+    /// 7×7 diamond's centre-symmetric tap pairs cancel on a step
+    /// (the filter is direction-symmetric) but not on a delta.
+    #[test]
+    fn fixed_filter_set_modifies_non_flat_plane() {
+        let mut buf = fresh_buf(32, 32, 100);
+        let stride = buf.luma.stride;
+        // Single asymmetric spike — placed off-centre so the per-tap
+        // pairs see asymmetric neighbours.
+        buf.luma.samples[15 * stride + 15] = 250;
+        let before = buf.luma.samples.clone();
+        let mut pic = AlfPicture::empty(1, 1);
+        pic.set(
+            0,
+            0,
+            AlfCtb {
+                luma_on: true,
+                luma_filt_set_idx: 5, // arbitrary fixed-filter set
+                ..Default::default()
+            },
+        );
+        apply_alf(&mut buf, &pic, &cfg_8bit(), &AlfApsBinding::default());
+        // At least one sample must have changed (the spike redistributes
+        // energy via the diamond filter).
+        assert!(
+            buf.luma
+                .samples
+                .iter()
+                .zip(before.iter())
+                .any(|(a, b)| a != b),
+            "fixed-filter apply must modify at least one sample on a non-flat plane",
+        );
     }
 
     /// All-zero filter coefficients on a flat plane → output unchanged
@@ -949,6 +1175,8 @@ mod tests {
         let binding = AlfApsBinding {
             luma_apses: &aps_slot,
             chroma_aps: None,
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         };
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -982,6 +1210,8 @@ mod tests {
         let binding = AlfApsBinding {
             luma_apses: &aps_slot,
             chroma_aps: None,
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         };
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -1021,6 +1251,8 @@ mod tests {
         let binding = AlfApsBinding {
             luma_apses: &aps_slot,
             chroma_aps: None,
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         };
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -1067,12 +1299,15 @@ mod tests {
         }
     }
 
-    /// AlfApsBinding default has empty luma APS list and no chroma APS.
+    /// AlfApsBinding default has empty luma APS list, no chroma APS,
+    /// and no CC-ALF APSes (Cb / Cr).
     #[test]
     fn binding_default_is_empty() {
         let b = AlfApsBinding::default();
         assert!(b.luma_apses.is_empty());
         assert!(b.chroma_aps.is_none());
+        assert!(b.cc_cb_aps.is_none());
+        assert!(b.cc_cr_aps.is_none());
     }
 
     /// Chroma ALF identity: zero-coefficient chroma filter on a flat
@@ -1088,6 +1323,8 @@ mod tests {
         let binding = AlfApsBinding {
             luma_apses: &[],
             chroma_aps: Some(&aps),
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         };
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -1318,6 +1555,8 @@ mod tests {
         let binding = AlfApsBinding {
             luma_apses: &aps_slot,
             chroma_aps: None,
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         };
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -1359,6 +1598,8 @@ mod tests {
         let binding = AlfApsBinding {
             luma_apses: &[],
             chroma_aps: Some(&aps),
+            cc_cb_aps: None,
+            cc_cr_aps: None,
         };
         let mut pic = AlfPicture::empty(1, 1);
         pic.set(
@@ -1374,5 +1615,133 @@ mod tests {
         apply_alf(&mut buf, &pic, &cfg, &binding);
         // Chroma is left alone — the spike survives.
         assert_eq!(buf.cb.samples[5 * buf.cb.stride + 5], 200);
+    }
+
+    /// CC-ALF identity: zero-coefficient cross-component filter on a
+    /// flat luma plane leaves the chroma plane unchanged.
+    #[test]
+    fn cc_alf_zero_coeff_is_identity() {
+        let mut buf = fresh_buf(32, 32, 100);
+        // Mark Cb with a known non-default value.
+        for v in buf.cb.samples.iter_mut() {
+            *v = 64;
+        }
+        let mut aps = AlfApsData::default();
+        aps.cc_cb_coeff = vec![[0i32; ALF_CC_NUM_COEFF]; 1];
+        let binding = AlfApsBinding {
+            luma_apses: &[],
+            chroma_aps: None,
+            cc_cb_aps: Some(&aps),
+            cc_cr_aps: None,
+        };
+        let mut pic = AlfPicture::empty(1, 1);
+        pic.set(
+            0,
+            0,
+            AlfCtb {
+                cc_cb_idc: 1, // → CC-ALF filter index 0
+                ..Default::default()
+            },
+        );
+        let mut cfg = cfg_8bit();
+        cfg.cb_enabled = true;
+        apply_alf(&mut buf, &pic, &cfg, &binding);
+        // Chroma stays at 64 since every luma-delta is zero on a flat
+        // plane → sum=0 → curr+0=curr.
+        assert!(buf.cb.samples.iter().all(|&v| v == 64));
+    }
+
+    /// CC-ALF on a non-flat luma + non-zero coefficient → at least one
+    /// chroma sample must be modified.
+    #[test]
+    fn cc_alf_non_zero_coeff_modifies_chroma() {
+        let mut buf = fresh_buf(32, 32, 100);
+        // Vertical step in luma: left half = 50, right half = 200.
+        for y in 0..32 {
+            for x in 16..32 {
+                buf.luma.samples[y * 32 + x] = 200;
+            }
+        }
+        // Flat chroma at 128.
+        let before_cb = buf.cb.samples.clone();
+        let mut aps = AlfApsData::default();
+        let mut row = [0i32; ALF_CC_NUM_COEFF];
+        row[1] = 16; // tap on the immediate left luma neighbour
+        row[2] = -16; // tap on the immediate right luma neighbour
+        aps.cc_cb_coeff = vec![row; 1];
+        let binding = AlfApsBinding {
+            luma_apses: &[],
+            chroma_aps: None,
+            cc_cb_aps: Some(&aps),
+            cc_cr_aps: None,
+        };
+        let mut pic = AlfPicture::empty(1, 1);
+        pic.set(
+            0,
+            0,
+            AlfCtb {
+                cc_cb_idc: 1,
+                ..Default::default()
+            },
+        );
+        let mut cfg = cfg_8bit();
+        cfg.cb_enabled = true;
+        apply_alf(&mut buf, &pic, &cfg, &binding);
+        assert!(
+            buf.cb
+                .samples
+                .iter()
+                .zip(before_cb.iter())
+                .any(|(a, b)| a != b),
+            "CC-ALF must modify at least one chroma sample on a non-flat luma plane",
+        );
+    }
+
+    /// CC-ALF respects the per-CTB `cc_cb_idc == 0` gate (no-op).
+    #[test]
+    fn cc_alf_skipped_when_idc_zero() {
+        let mut buf = fresh_buf(32, 32, 100);
+        for v in buf.cb.samples.iter_mut() {
+            *v = 64;
+        }
+        let mut aps = AlfApsData::default();
+        let mut row = [0i32; ALF_CC_NUM_COEFF];
+        row[0] = 50;
+        aps.cc_cb_coeff = vec![row; 1];
+        let binding = AlfApsBinding {
+            luma_apses: &[],
+            chroma_aps: None,
+            cc_cb_aps: Some(&aps),
+            cc_cr_aps: None,
+        };
+        let mut pic = AlfPicture::empty(1, 1);
+        // cc_cb_idc default = 0 → CC-ALF off for this CTB.
+        pic.set(0, 0, AlfCtb::default());
+        let mut cfg = cfg_8bit();
+        cfg.cb_enabled = true;
+        apply_alf(&mut buf, &pic, &cfg, &binding);
+        assert!(buf.cb.samples.iter().all(|&v| v == 64));
+    }
+
+    /// Table 47: with `applyAlfLineBufBoundary == 0` the answer is
+    /// always (1, 2) regardless of the y-position carve-outs.
+    #[test]
+    fn cc_alf_table_47_no_line_buffer_collapses() {
+        for y in 0..32 {
+            assert_eq!(cc_alf_table_47(y, 32, false), (1, 2));
+        }
+    }
+
+    /// Table 47 carve-outs: (CtbSizeY-5, CtbSizeY-4) → (0, 0);
+    /// (CtbSizeY-6, CtbSizeY-3) → (1, 1).
+    #[test]
+    fn cc_alf_table_47_carve_outs() {
+        let ctb = 32;
+        assert_eq!(cc_alf_table_47(ctb - 5, ctb, true), (0, 0));
+        assert_eq!(cc_alf_table_47(ctb - 4, ctb, true), (0, 0));
+        assert_eq!(cc_alf_table_47(ctb - 6, ctb, true), (1, 1));
+        assert_eq!(cc_alf_table_47(ctb - 3, ctb, true), (1, 1));
+        // Non-carve-out positions still get (1, 2).
+        assert_eq!(cc_alf_table_47(0, ctb, true), (1, 2));
     }
 }

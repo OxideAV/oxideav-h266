@@ -61,8 +61,15 @@
 //! * [`alf`] — §8.8.5 adaptive loop filter apply pass. Owns
 //!   [`alf::AlfPicture`] (per-CTB on/off + filter-set selection) and
 //!   the §8.8.5.2 luma + §8.8.5.4 chroma diamond-filter math; consumes
-//!   the [`aps::AlfApsData`] populated by the ALF APS parser.
-//!   Classification (§8.8.5.3) and CC-ALF (§8.8.5.7) remain pending.
+//!   the [`aps::AlfApsData`] populated by the ALF APS parser. The
+//!   §8.8.5.3 classification (25 classes × 4 transposes), the
+//!   §7.4.3.18 fixed-filter family (`AlfFixFiltCoeff` /
+//!   `AlfClassToFiltMap` from [`alf_fixed`]), and the §8.8.5.7 CC-ALF
+//!   second-pass cross-component refinement all run end-to-end.
+//! * [`alf_fixed`] — `AlfFixFiltCoeff[64][12]` and
+//!   `AlfClassToFiltMap[16][25]` (§7.4.3.18 eqs. 90 / 91). Wired into
+//!   the §8.8.5.2 apply pass via [`alf::AlfApsBinding`] for the
+//!   `AlfCtbFiltSetIdxY < 16` fixed-filter branch.
 //! * [`dequant`] — §8.7.3 scaled-transform-coefficient derivation
 //!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
 //!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
@@ -110,6 +117,7 @@
 #![allow(clippy::same_item_push)]
 
 pub mod alf;
+pub mod alf_fixed;
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;

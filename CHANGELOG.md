@@ -6,6 +6,19 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **ALF fixed-filter family + CC-ALF apply** — round-17 wins.
+  `alf_fixed::ALF_FIX_FILT_COEFF` (64 × 12) and
+  `ALF_CLASS_TO_FILT_MAP` (16 × 25) ship the §7.4.3.18 eqs. 90 / 91
+  tables, transposed at transcription time so in-code indexing matches
+  the spec's symbolic `[i][j]` / `[m][n]` convention. The §8.8.5.2
+  `resolve_luma_filter_set` now resolves `AlfCtbFiltSetIdxY < 16` via
+  the fixed-filter path (eqs. 1437 / 1438) — previously surfaced as
+  "luma off". CC-ALF (§8.8.5.7) runs as a second `apply_alf` pass
+  reading the pre-luma-ALF snapshot per eq. 1515; Table 47 yP1 / yP2
+  vertical offsets and the eq. 1517 `SubHeightC == 1` row-suppression
+  guard land alongside. `AlfApsBinding` gains `cc_cb_aps` / `cc_cr_aps`
+  slots + `is_all_off` now considers `cc_*_idc` so CC-ALF-only CTBs
+  trigger the apply pass.
 - **Forward-side CABAC engine** (`cabac_enc::ArithEncoder`) — round-16
   primitive that mirrors the §9.3.4.3 decoder. `encode_decision` /
   `encode_bypass` / `encode_terminate` + `finish()` produce a byte
