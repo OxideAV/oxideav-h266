@@ -77,6 +77,7 @@ use crate::leaf_cu::{
     CuNeighbourhood, CuPredMode, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
     INTRA_DC, INTRA_PLANAR,
 };
+use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
 use crate::reconstruct::{reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
 use crate::sao::{apply_sao, SaoConfig, SaoPicture};
@@ -851,14 +852,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        // MIP / ISP are out of scope for this round — leaf-CU syntax
-        // surfaces these only when SPS opts in, so the typical
-        // intra-only fixture never hits these branches.
-        if info.intra_mip_flag {
-            return Err(Error::unsupported(
-                "h266 reconstruct_leaf_cu: MIP prediction (§8.4.5.2.15) not yet wired",
-            ));
-        }
+        // ISP is out of scope for this round — leaf-CU syntax surfaces
+        // it only when SPS opts in, so the typical intra-only fixture
+        // never hits this branch. MIP (§8.4.5.2.2) IS now wired below
+        // through the [`crate::mip`] module; the prediction step
+        // dispatches on `info.intra_mip_flag` and replaces the angular /
+        // PLANAR / DC prediction with the matrix-based variant. The
+        // residual / dequant / inverse-transform / reconstruct pipeline
+        // is unchanged — MIP only affects the prediction-block
+        // generation in step 2 below.
         if info.isp_split != crate::leaf_cu::IspSplitType::NoSplit {
             return Err(Error::unsupported(
                 "h266 reconstruct_leaf_cu: ISP split (§8.4.5.2.5) not yet wired",
@@ -912,23 +914,50 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             top_left: refs.top_left,
         };
 
-        // 2. Intra prediction.
-        let pred = match info.intra_pred_mode_y {
-            INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
-            INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
-            mode @ (2 | 18 | 34 | 50 | 66) => predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?,
-            // Fallback: angular mode outside the implemented cardinal
-            // subset. Snap to the nearest cardinal/diagonal so the CU
-            // still gets a plausible prediction; the accumulated
-            // residual will absorb the difference (lossy but stable).
-            mode if (2..=66).contains(&mode) => {
-                let snapped = nearest_supported_angular(mode);
-                predict_angular(n_tb_w, n_tb_h, snapped, &refs_view)?
+        // 2. Intra prediction. MIP (§8.4.5.2.2) is dispatched first
+        // when the leaf-CU parser flagged it: `info.intra_mip_mode`
+        // lives in a separate mode namespace from the angular /
+        // PLANAR / DC modes, so we cannot fall through to the angular
+        // path. The MIP helper takes the unfiltered reference rows
+        // directly (refs.above[0..n_tb_w] and refs.left[0..n_tb_h]) —
+        // the §8.4.5.2.8 / §8.4.5.2.9 substitution has already been
+        // applied by [`OwnedIntraRefs::from_plane`].
+        let pred: Vec<i16> = if info.intra_mip_flag {
+            // refs.above has length n_tb_w + 1 (includes the extra
+            // sample at column nTbW used by PLANAR). MIP only consumes
+            // refT[0..nTbW-1], so we slice off the trailing sample.
+            let ref_t: &[i16] = &refs.above[..n_tb_w];
+            let ref_l: &[i16] = &refs.left[..n_tb_h];
+            predict_mip(
+                n_tb_w,
+                n_tb_h,
+                info.intra_mip_mode,
+                info.intra_mip_transposed_flag,
+                ref_t,
+                ref_l,
+                bit_depth,
+            )?
+        } else {
+            match info.intra_pred_mode_y {
+                INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+                INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
+                mode @ (2 | 18 | 34 | 50 | 66) => {
+                    predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?
+                }
+                // Fallback: angular mode outside the implemented
+                // cardinal subset. Snap to the nearest cardinal /
+                // diagonal so the CU still gets a plausible
+                // prediction; the accumulated residual will absorb the
+                // difference (lossy but stable).
+                mode if (2..=66).contains(&mode) => {
+                    let snapped = nearest_supported_angular(mode);
+                    predict_angular(n_tb_w, n_tb_h, snapped, &refs_view)?
+                }
+                // Anything else is a spec-illegal mode; prefer PLANAR
+                // over bailing the whole picture so the stream still
+                // produces pixels.
+                _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
             }
-            // Anything else is a spec-illegal mode; prefer PLANAR over
-            // bailing the whole picture so the stream still produces
-            // pixels.
-            _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
         };
 
         // 3. Dequantise + 4. inverse 2D transform when there is a coded
@@ -1832,10 +1861,13 @@ mod tests {
         assert_eq!(chroma_qp_identity(0, -3), 0); // clamps from below
     }
 
-    /// The unsupported-error escape hatch still fires for the MIP path
-    /// even though the surrounding pipeline now succeeds.
+    /// MIP-flagged CU now flows through the §8.4.5.2.2 matrix-based
+    /// prediction in [`crate::mip::predict_mip`] instead of surfacing
+    /// `Error::Unsupported`. With an empty residual (`tu_y_coded_flag
+    /// == false`) the reconstructed luma plane should change away from
+    /// its zero-fill seed at the MIP CU's footprint.
     #[test]
-    fn reconstruct_leaf_cu_mip_is_unsupported() {
+    fn reconstruct_leaf_cu_mip_runs_pipeline() {
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let sh = intra_slice_header();
@@ -1861,12 +1893,71 @@ mod tests {
             ..LeafCuInfo::default()
         };
         info.intra_mip_flag = true;
+        info.intra_mip_transposed_flag = false;
+        info.intra_mip_mode = 0; // valid for any mipSizeId (sz2 has 6 modes).
         let residual = LeafCuResidual::default();
         let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
-        let err = walker
+        walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
-            .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+            .expect("MIP path should succeed");
+        // 1. With ALL-zero references (above_avail == false &&
+        //    left_avail == false because the CU is at x=0/y=0), the
+        //    `OwnedIntraRefs::from_plane` substitution fills the
+        //    references with mid-grey (1 << (BitDepth - 1)). For an
+        //    8-bit pipeline that's 128. The MIP `p[]` then collapses
+        //    to all zeros (eq. 268), `oW = 32`, and predMip[x][y] =
+        //    pTemp[0] = 128 for every pixel. So the destination plane
+        //    should now contain `128` over the 16×16 CU footprint.
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    out.luma.get(x, y).unwrap(),
+                    128,
+                    "MIP-on-zero-refs should fill with mid-grey at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// MIP with a non-zero `intra_mip_mode` and a transposed flag still
+    /// flows through the pipeline without panicking (parser-level
+    /// invariants only — covers the size-id dispatch and transpose
+    /// branches in [`crate::mip::predict_mip`]).
+    #[test]
+    fn reconstruct_leaf_cu_mip_transposed_runs_pipeline() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        // 8x8 → mipSizeId = 1 → 8 valid modes.
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        info.intra_mip_flag = true;
+        info.intra_mip_transposed_flag = true;
+        info.intra_mip_mode = 3;
+        let residual = LeafCuResidual::default();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("MIP transposed path should succeed");
     }
 
     /// BDPCM-luma path through `reconstruct_leaf_cu`: when the leaf

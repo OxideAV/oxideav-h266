@@ -6,6 +6,26 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **MIP — Matrix-based Intra Prediction** — round-19 win.
+  `mip::predict_mip` runs the §8.4.5.2.2 pipeline end to end:
+  §8.4.5.2.3 boundary downsampling (rectangular box filter), the
+  matrix-vector product against the `mWeight` tables (§8.4.5.2.4), the
+  `intra_mip_transposed_flag` block transpose, and §8.4.5.2.5
+  upsampling (separable horizontal then vertical) for blocks larger
+  than `predSize`. The 30 weight matrices (16 / 8 / 6 modes for
+  `mipSizeId = 0 / 1 / 2`, all values in [0, 127]) come straight from
+  ITU-T H.266 (V4, 01/2026) Tables 276..305 and live in `mip_tables`.
+  Wired into `ctu::CtuWalker::reconstruct_leaf_cu` so leaf CUs flagged
+  with `intra_mip_flag` reconstruct end to end instead of surfacing
+  `Error::Unsupported`. Covered by 18 lib unit tests (size-id
+  derivation, downsampling identity / box-filter, weight-table value
+  range, spec-row spot-checks, constant-reference invariants for
+  4×4 / 8×8 / 16×16 / 16×8 / 8×16 / 64×64, upsampling identity,
+  transpose changes output, output-range clipping, error paths) plus
+  2 CTU-level smoke tests
+  (`reconstruct_leaf_cu_mip_runs_pipeline` and
+  `reconstruct_leaf_cu_mip_transposed_runs_pipeline`).
+
 - **ALF fixed-filter family + CC-ALF apply** — round-17 wins.
   `alf_fixed::ALF_FIX_FILT_COEFF` (64 × 12) and
   `ALF_CLASS_TO_FILT_MAP` (16 × 25) ship the §7.4.3.18 eqs. 90 / 91

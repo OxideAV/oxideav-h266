@@ -91,6 +91,16 @@
 //!   [`transform_fwd::quantize_tb_flat`]). Encoder-side duals of
 //!   [`transform`] / [`dequant`]; future rounds wire these into the
 //!   per-TB residual emit pipeline.
+//! * [`mip`] — round-19 §8.4.5.2.2 Matrix-based Intra Prediction
+//!   (MIP). [`mip::predict_mip`] runs the boundary downsampling
+//!   (§8.4.5.2.3), 32-bit matrix-vector product against the spec
+//!   weight tables (§8.4.5.2.4), optional transpose, and §8.4.5.2.5
+//!   upsampling. Wired into [`ctu::CtuWalker::reconstruct_leaf_cu`]
+//!   so leaf CUs flagged with `intra_mip_flag` reconstruct end to end
+//!   instead of surfacing `Error::Unsupported`.
+//! * [`mip_tables`] — §8.4.5.2.4 weight matrices for all 30 MIP modes
+//!   (sizeId 0: 16 modes, sizeId 1: 8 modes, sizeId 2: 6 modes),
+//!   transcribed from ITU-T H.266 (V4, 01/2026) Tables 276..305.
 //!
 //! ## Spec reference
 //!
@@ -136,6 +146,8 @@ pub mod encoder;
 pub mod hrd;
 pub mod intra;
 pub mod leaf_cu;
+pub mod mip;
+pub mod mip_tables;
 pub mod nal;
 pub mod opi;
 pub mod picture_header;
