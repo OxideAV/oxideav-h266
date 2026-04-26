@@ -107,6 +107,27 @@ pub fn ctx_inc_intra_luma_mpm_flag() -> u32 {
     0
 }
 
+/// ctxInc for `intra_bdpcm_luma_flag` — Table 132 column gives a single
+/// context (0) at binIdx 0; no neighbour adjustment is used.
+pub fn ctx_inc_intra_bdpcm_luma_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `intra_bdpcm_luma_dir_flag` — Table 132 single context.
+pub fn ctx_inc_intra_bdpcm_luma_dir_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `intra_bdpcm_chroma_flag` — Table 132 single context.
+pub fn ctx_inc_intra_bdpcm_chroma_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `intra_bdpcm_chroma_dir_flag` — Table 132 single context.
+pub fn ctx_inc_intra_bdpcm_chroma_dir_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `intra_luma_not_planar_flag[x0][y0]` — Table 132 gives
 /// `!intra_subpartitions_mode_flag` at binIdx 0 (so ctx 0 when ISP is
 /// enabled for the current CU, ctx 1 when ISP is disabled).

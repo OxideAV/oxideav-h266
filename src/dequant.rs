@@ -13,9 +13,11 @@
 //! caller; this scaffold takes a pre-built `m[x][y]` array instead.
 //!
 //! Transform-skip (§8.7.3.1 with `rectNonTsFlag = 0`, `bdShift = 10`)
-//! and BDPCM accumulation (eqs. 1153 / 1154) are intentionally left
-//! to future rounds — the public entry points here return
-//! `Error::Unsupported` for those paths.
+//! and BDPCM accumulation (eqs. 1153 / 1154) are now implemented; both
+//! dequantise paths consume the [`DequantParams::transform_skip`] /
+//! [`DequantParams::bdpcm`] flags and apply the spec-exact eqs.
+//! `BdpcmDir` is wired via [`DequantParams::bdpcm_dir`] (false →
+//! horizontal eq. 1153, true → vertical eq. 1154).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
@@ -162,13 +164,19 @@ pub struct DequantParams {
     /// `sh_dep_quant_used_flag` — only affects the `bdShift` +1 term
     /// and `ls[x][y]` ladder shift (eqs. 1143 / 1151 / 1152).
     pub dep_quant: bool,
-    /// `transform_skip_flag[x][y][cIdx]`. When set, this scaffold
-    /// currently returns `Error::Unsupported`.
+    /// `transform_skip_flag[x][y][cIdx]`. When set, the spec uses the
+    /// shorter `bdShift = 10`, `rectNonTsFlag = 0` ladder and the qP is
+    /// clipped to `QpPrimeTsMin` from below (eqs. 1144 – 1146). This
+    /// scaffold treats `qp` as already clipped (callers handle the
+    /// `QpPrimeTsMin` floor at parse time).
     pub transform_skip: bool,
-    /// `BdpcmFlag[x][y][cIdx]`. When set, this scaffold currently
-    /// returns `Error::Unsupported` (BDPCM accumulation eq. 1153 /
-    /// 1154 is not wired yet).
+    /// `BdpcmFlag[x][y][cIdx]`. When set, eqs. 1153 / 1154 accumulate
+    /// `dz[x][y]` along the prediction direction before scaling.
     pub bdpcm: bool,
+    /// `BdpcmDir[x][y][cIdx]` — false = horizontal accumulation
+    /// (eq. 1153), true = vertical accumulation (eq. 1154). Only
+    /// consulted when `bdpcm` is true.
+    pub bdpcm_dir: bool,
 }
 
 impl DequantParams {
@@ -184,6 +192,7 @@ impl DequantParams {
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
+            bdpcm_dir: false,
         }
     }
 }
@@ -209,16 +218,6 @@ fn clip3(lo: i32, hi: i32, x: i64) -> i32 {
 /// shape, clipped to the `Log2TransformRange` signed range per
 /// eq. 1156.
 pub fn dequantize_tb_flat(levels: &[i32], params: &DequantParams) -> Result<Vec<i32>> {
-    if params.transform_skip {
-        return Err(Error::unsupported(
-            "h266 dequant: transform-skip scaling (§8.7.3, bdShift=10) not implemented yet",
-        ));
-    }
-    if params.bdpcm {
-        return Err(Error::unsupported(
-            "h266 dequant: BDPCM accumulation (eqs. 1153 / 1154) not implemented yet",
-        ));
-    }
     let w = params.n_tb_w as usize;
     let h = params.n_tb_h as usize;
     if levels.len() != w * h {
@@ -233,46 +232,79 @@ pub fn dequantize_tb_flat(levels: &[i32], params: &DequantParams) -> Result<Vec<
     }
     let log2_w = w.trailing_zeros();
     let log2_h = h.trailing_zeros();
-    // eq. 1142
-    let rect_non_ts = (((log2_w + log2_h) & 1) == 1) as u32;
-    // eq. 1143: bdShift = BitDepth + rectNonTsFlag + (log2W+log2H)/2 + 10 − Log2TransformRange + dep_quant
-    let bd_shift =
-        (params.bit_depth as i32 + rect_non_ts as i32 + ((log2_w + log2_h) as i32) / 2 + 10
-            - params.log2_transform_range as i32
-            + params.dep_quant as i32)
-            .max(0) as u32;
+    // eqs. 1142 / 1143 vs. 1145 / 1146 — transform-skip forces
+    // rectNonTsFlag = 0 and bdShift = 10.
+    let (rect_non_ts, bd_shift) = if params.transform_skip {
+        (0u32, 10u32)
+    } else {
+        let rect_non_ts = (((log2_w + log2_h) & 1) == 1) as u32;
+        let bd_shift =
+            (params.bit_depth as i32 + rect_non_ts as i32 + ((log2_w + log2_h) as i32) / 2 + 10
+                - params.log2_transform_range as i32
+                + params.dep_quant as i32)
+                .max(0) as u32;
+        (rect_non_ts, bd_shift)
+    };
     // eq. 1147
-    let bd_offset = 1i64 << (bd_shift.saturating_sub(1));
-    // Guard against negative / overly small shifts.
-    let bd_offset = if bd_shift == 0 { 0 } else { bd_offset };
-
+    let bd_offset = if bd_shift == 0 {
+        0
+    } else {
+        1i64 << (bd_shift - 1)
+    };
     // levelScale[rectNonTsFlag][qP%6] << (qP/6) — or the dep_quant
-    // variant that uses (qP+1)%6 / (qP+1)/6 (eq. 1151).
-    let (q_mod, q_div) = if params.dep_quant {
+    // variant that uses (qP+1)%6 / (qP+1)/6 (eq. 1151). dep_quant is
+    // ignored in transform-skip mode (eq. 1152).
+    let (q_mod, q_div) = if params.dep_quant && !params.transform_skip {
         ((params.qp + 1).rem_euclid(6) as u32, (params.qp + 1) / 6)
     } else {
         (params.qp.rem_euclid(6) as u32, params.qp / 6)
     };
     let level_scale = LEVEL_SCALE[rect_non_ts as usize][q_mod as usize] as i64;
     // For flat scaling list, m[x][y] = 16 everywhere (spec NOTE on
-    // eq. 1148).
+    // eq. 1148; transform_skip = 1 also forces m = 16).
     let m = 16i64;
-    // Shift is non-negative per spec (qP ≥ 0 post-Clip3). We still
-    // clamp to 0 for robustness.
     let q_shift = q_div.max(0) as u32;
     let ls = (m * level_scale) << q_shift;
 
     let (coeff_min, coeff_max) = coeff_min_max(params.log2_transform_range);
 
+    // BDPCM accumulation (eqs. 1153 / 1154) is applied to dz BEFORE the
+    // scaling step. Build a working dz[] buffer (in-place is fine because
+    // accumulation uses the previously-updated cell).
+    let mut dz = vec![0i64; levels.len()];
+    for (i, &v) in levels.iter().enumerate() {
+        dz[i] = v as i64;
+    }
+    if params.bdpcm {
+        if !params.bdpcm_dir {
+            // Horizontal accumulation (eq. 1153): dz[x][y] += dz[x-1][y]
+            // for x > 0, with Clip3 to the CoeffMin/CoeffMax range.
+            for y in 0..h {
+                for x in 1..w {
+                    let sum = dz[y * w + x - 1] + dz[y * w + x];
+                    dz[y * w + x] = clip3(coeff_min, coeff_max, sum) as i64;
+                }
+            }
+        } else {
+            // Vertical accumulation (eq. 1154): dz[x][y] += dz[x][y-1]
+            // for y > 0.
+            for y in 1..h {
+                for x in 0..w {
+                    let sum = dz[(y - 1) * w + x] + dz[y * w + x];
+                    dz[y * w + x] = clip3(coeff_min, coeff_max, sum) as i64;
+                }
+            }
+        }
+    }
+
     let mut out = vec![0i32; levels.len()];
     for y in 0..h {
         for x in 0..w {
-            let dz = levels[y * w + x] as i64;
             // eq. 1155: dnc = (dz * ls + bdOffset) >> bdShift.
             let dnc = if bd_shift == 0 {
-                dz * ls
+                dz[y * w + x] * ls
             } else {
-                (dz * ls + bd_offset) >> bd_shift
+                (dz[y * w + x] * ls + bd_offset) >> bd_shift
             };
             out[y * w + x] = clip3(coeff_min, coeff_max, dnc);
         }
@@ -289,16 +321,6 @@ pub fn dequantize_tb_with_scaling_list(
     m: &[u32],
     params: &DequantParams,
 ) -> Result<Vec<i32>> {
-    if params.transform_skip {
-        return Err(Error::unsupported(
-            "h266 dequant: transform-skip scaling (§8.7.3, bdShift=10) not implemented yet",
-        ));
-    }
-    if params.bdpcm {
-        return Err(Error::unsupported(
-            "h266 dequant: BDPCM accumulation (eqs. 1153 / 1154) not implemented yet",
-        ));
-    }
     let w = params.n_tb_w as usize;
     let h = params.n_tb_h as usize;
     if levels.len() != w * h || m.len() != w * h {
@@ -313,18 +335,24 @@ pub fn dequantize_tb_with_scaling_list(
     }
     let log2_w = w.trailing_zeros();
     let log2_h = h.trailing_zeros();
-    let rect_non_ts = (((log2_w + log2_h) & 1) == 1) as u32;
-    let bd_shift =
-        (params.bit_depth as i32 + rect_non_ts as i32 + ((log2_w + log2_h) as i32) / 2 + 10
-            - params.log2_transform_range as i32
-            + params.dep_quant as i32)
-            .max(0) as u32;
+    // Transform-skip overrides per §8.7.3 eqs. 1145 / 1146.
+    let (rect_non_ts, bd_shift) = if params.transform_skip {
+        (0u32, 10u32)
+    } else {
+        let rect_non_ts = (((log2_w + log2_h) & 1) == 1) as u32;
+        let bd_shift =
+            (params.bit_depth as i32 + rect_non_ts as i32 + ((log2_w + log2_h) as i32) / 2 + 10
+                - params.log2_transform_range as i32
+                + params.dep_quant as i32)
+                .max(0) as u32;
+        (rect_non_ts, bd_shift)
+    };
     let bd_offset = if bd_shift == 0 {
         0
     } else {
         1i64 << (bd_shift - 1)
     };
-    let (q_mod, q_div) = if params.dep_quant {
+    let (q_mod, q_div) = if params.dep_quant && !params.transform_skip {
         ((params.qp + 1).rem_euclid(6) as u32, (params.qp + 1) / 6)
     } else {
         (params.qp.rem_euclid(6) as u32, params.qp / 6)
@@ -333,16 +361,38 @@ pub fn dequantize_tb_with_scaling_list(
     let q_shift = q_div.max(0) as u32;
     let (coeff_min, coeff_max) = coeff_min_max(params.log2_transform_range);
 
+    // BDPCM accumulation on dz before scaling.
+    let mut dz = vec![0i64; levels.len()];
+    for (i, &v) in levels.iter().enumerate() {
+        dz[i] = v as i64;
+    }
+    if params.bdpcm {
+        if !params.bdpcm_dir {
+            for y in 0..h {
+                for x in 1..w {
+                    let sum = dz[y * w + x - 1] + dz[y * w + x];
+                    dz[y * w + x] = clip3(coeff_min, coeff_max, sum) as i64;
+                }
+            }
+        } else {
+            for y in 1..h {
+                for x in 0..w {
+                    let sum = dz[(y - 1) * w + x] + dz[y * w + x];
+                    dz[y * w + x] = clip3(coeff_min, coeff_max, sum) as i64;
+                }
+            }
+        }
+    }
+
     let mut out = vec![0i32; levels.len()];
     for y in 0..h {
         for x in 0..w {
-            let dz = levels[y * w + x] as i64;
             let mxy = m[y * w + x] as i64;
             let ls = (mxy * level_scale) << q_shift;
             let dnc = if bd_shift == 0 {
-                dz * ls
+                dz[y * w + x] * ls
             } else {
-                (dz * ls + bd_offset) >> bd_shift
+                (dz[y * w + x] * ls + bd_offset) >> bd_shift
             };
             out[y * w + x] = clip3(coeff_min, coeff_max, dnc);
         }
@@ -420,20 +470,91 @@ mod tests {
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
+            bdpcm_dir: false,
         };
         let d = dequantize_tb_flat(&levels, &params).unwrap();
         assert_eq!(d[0], 288);
     }
 
-    /// Transform-skip path surfaces Unsupported.
+    /// Transform-skip dequant: §8.7.3 eqs. 1145 / 1146 force
+    /// rectNonTsFlag = 0 and bdShift = 10. With the flat scaling list,
+    /// `m = 16` and bdOffset = 1<<9 = 512. At qP = 26, levelScale[0][2]
+    /// = 51, q_shift = 4, ls = 16 * 51 << 4 = 13056. Level = 1 maps to
+    /// (13056 + 512) >> 10 = 13568 >> 10 = 13.
     #[test]
-    fn dequant_flat_transform_skip_is_unsupported() {
-        let levels = vec![0i32; 16];
+    fn dequant_flat_transform_skip_4x4_qp26() {
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1;
         let params = DequantParams {
             transform_skip: true,
             ..DequantParams::luma_8bit(4, 4, 26)
         };
-        assert!(dequantize_tb_flat(&levels, &params).is_err());
+        let d = dequantize_tb_flat(&levels, &params).unwrap();
+        assert_eq!(d[0], 13);
+    }
+
+    /// BDPCM horizontal accumulation (eq. 1153) on a row of 1's: after
+    /// accumulation `dz` becomes [1, 2, 3, 4] before scaling. With
+    /// transform-skip + qP=26 4×4 the row scales 1, 2, 3, 4 → 13, 26,
+    /// 40, 53 (each (dz*13056 + 512) >> 10).
+    #[test]
+    fn dequant_flat_bdpcm_horizontal_row() {
+        let mut levels = vec![0i32; 16];
+        for x in 0..4 {
+            levels[x] = 1;
+        }
+        let params = DequantParams {
+            transform_skip: true,
+            bdpcm: true,
+            bdpcm_dir: false,
+            ..DequantParams::luma_8bit(4, 4, 26)
+        };
+        let d = dequantize_tb_flat(&levels, &params).unwrap();
+        // (1*13056 + 512) >> 10 = 13
+        // (2*13056 + 512) >> 10 = 26568 >> 10 = 25 (NOT 26 — round down)
+        // Recompute: 2 * 13056 = 26112; 26112 + 512 = 26624; 26624 >> 10 = 26.
+        // (3*13056 + 512) >> 10 = (39168 + 512) >> 10 = 39680 >> 10 = 38.
+        // (4*13056 + 512) >> 10 = (52224 + 512) >> 10 = 52736 >> 10 = 51.
+        assert_eq!(d[0], 13);
+        assert_eq!(d[1], 26);
+        assert_eq!(d[2], 38);
+        assert_eq!(d[3], 51);
+    }
+
+    /// BDPCM vertical accumulation (eq. 1154) on a column of 1's: each
+    /// row accumulates downwards.
+    #[test]
+    fn dequant_flat_bdpcm_vertical_column() {
+        let mut levels = vec![0i32; 16];
+        for y in 0..4 {
+            levels[y * 4] = 1;
+        }
+        let params = DequantParams {
+            transform_skip: true,
+            bdpcm: true,
+            bdpcm_dir: true,
+            ..DequantParams::luma_8bit(4, 4, 26)
+        };
+        let d = dequantize_tb_flat(&levels, &params).unwrap();
+        // Same scaling per cell, accumulated dz = 1, 2, 3, 4 down col 0.
+        assert_eq!(d[0 * 4 + 0], 13);
+        assert_eq!(d[1 * 4 + 0], 26);
+        assert_eq!(d[2 * 4 + 0], 38);
+        assert_eq!(d[3 * 4 + 0], 51);
+    }
+
+    /// BDPCM with all-zero levels remains all-zero post-accumulation.
+    #[test]
+    fn dequant_flat_bdpcm_zero_input_stays_zero() {
+        let levels = vec![0i32; 16];
+        let params = DequantParams {
+            transform_skip: true,
+            bdpcm: true,
+            bdpcm_dir: false,
+            ..DequantParams::luma_8bit(4, 4, 26)
+        };
+        let d = dequantize_tb_flat(&levels, &params).unwrap();
+        assert!(d.iter().all(|&v| v == 0));
     }
 
     /// Bad input length surfaces Invalid.
@@ -457,6 +578,7 @@ mod tests {
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
+            bdpcm_dir: false,
         };
         assert!(dequantize_tb_flat(&levels, &params).is_err());
     }

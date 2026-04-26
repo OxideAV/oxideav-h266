@@ -74,8 +74,11 @@
 //!   (eqs. 1141 – 1156). Flat scaling list, the `levelScale[]` table
 //!   (eq. 1148), Table 38 scaling-matrix `id` derivation, and
 //!   `ScalingMatrixRec` expansion via eq. 1149 / eq. 1150
-//!   (`matrixSize × matrixSize` → `nTbW × nTbH`). Transform-skip and
-//!   BDPCM accumulation still surface `Error::Unsupported`.
+//!   (`matrixSize × matrixSize` → `nTbW × nTbH`). Transform-skip
+//!   (eqs. 1145 / 1146 — `bdShift = 10`, `rectNonTsFlag = 0`) and
+//!   BDPCM accumulation (eqs. 1153 / 1154) are now wired through
+//!   [`DequantParams::transform_skip`] / [`DequantParams::bdpcm`] /
+//!   [`DequantParams::bdpcm_dir`].
 //! * [`cabac_enc`] — round-16 forward-side CABAC engine (`encode_decision`
 //!   / `encode_bypass` / `encode_terminate` + `finish`). Uses
 //!   high-precision interval tracking so the emitted byte stream

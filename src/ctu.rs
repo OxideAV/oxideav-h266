@@ -851,8 +851,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        // MIP / ISP / BDPCM are out of scope for this round — leaf-CU
-        // syntax surfaces these only when SPS opts in, so the typical
+        // MIP / ISP are out of scope for this round — leaf-CU syntax
+        // surfaces these only when SPS opts in, so the typical
         // intra-only fixture never hits these branches.
         if info.intra_mip_flag {
             return Err(Error::unsupported(
@@ -864,11 +864,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 "h266 reconstruct_leaf_cu: ISP split (§8.4.5.2.5) not yet wired",
             ));
         }
-        if info.intra_bdpcm_luma {
-            return Err(Error::unsupported(
-                "h266 reconstruct_leaf_cu: intra BDPCM (§8.7.3 eq. 1153) not yet wired",
-            ));
-        }
+        // BDPCM (§7.4.5.1 / §8.7.3 eqs. 1153-1154) is now wired below
+        // — the prediction is a pure horizontal/vertical replication of
+        // the reference samples (per §8.4.2 BdpcmDir → ANGULAR18 / 50)
+        // and the residual goes through transform-skip dequant with
+        // the BDPCM accumulation pass enabled.
 
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let n_tb_w = cu.cu.w as usize;
@@ -938,6 +938,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         {
             let qp = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
             let qp = qp.clamp(0, 63);
+            // BDPCM forces transform-skip and the eq. 1153 / 1154
+            // accumulation pass; the inverse transform is bypassed
+            // (the dz post-accumulation IS the residual).
             let params = DequantParams {
                 bit_depth,
                 log2_transform_range: 15,
@@ -945,25 +948,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 n_tb_h: n_tb_h as u32,
                 qp,
                 dep_quant: false,
-                transform_skip: false,
-                bdpcm: false,
+                transform_skip: info.intra_bdpcm_luma,
+                bdpcm: info.intra_bdpcm_luma,
+                bdpcm_dir: info.intra_bdpcm_luma_dir,
             };
             let d = dequantize_tb_flat(&residual.luma_levels, &params)?;
-            // For the first cut we always pick DCT-II / DCT-II per
-            // §8.7.4.4 (the `mts_idx == 0` branch). Implicit MTS
-            // would substitute DST-VII for small intra TBs, but
-            // sticking with DCT-II keeps the path symmetrical with
-            // the encoder scaffold and matches the Common Test
-            // Conditions baseline. nTbS in {4, 8, 16, 32} are
-            // supported by inverse_transform_2d today.
-            // DCT-II / DCT-II for nTbS ∈ {4, 8, 16, 32, 64}. The size-64
-            // path is now wired through `apply_dct_ii` against the full
-            // 64×64 trMatrix (§8.7.4.2 eq. 1184).
-            let (tr_h, tr_v) = (TrType::DctII, TrType::DctII);
-            let _ = implicit_mts_tr_types(n_tb_w as u32, n_tb_h as u32);
-            inverse_transform_2d(
-                n_tb_w, n_tb_h, n_tb_w, n_tb_h, tr_h, tr_v, &d, bit_depth, 15,
-            )?
+            if info.intra_bdpcm_luma {
+                // Transform-skip + BDPCM: the dequantised d[] is the
+                // residual sample array directly (§8.7.4.6 — when
+                // transform_skip_flag is 1, res[x][y] = d[x][y] >> 0).
+                d
+            } else {
+                // For the first cut we always pick DCT-II / DCT-II per
+                // §8.7.4.4 (the `mts_idx == 0` branch). Implicit MTS
+                // would substitute DST-VII for small intra TBs, but
+                // sticking with DCT-II keeps the path symmetrical with
+                // the encoder scaffold and matches the Common Test
+                // Conditions baseline. nTbS in {4, 8, 16, 32} are
+                // supported by inverse_transform_2d today.
+                // DCT-II / DCT-II for nTbS ∈ {4, 8, 16, 32, 64}. The size-64
+                // path is now wired through `apply_dct_ii` against the full
+                // 64×64 trMatrix (§8.7.4.2 eq. 1184).
+                let (tr_h, tr_v) = (TrType::DctII, TrType::DctII);
+                let _ = implicit_mts_tr_types(n_tb_w as u32, n_tb_h as u32);
+                inverse_transform_2d(
+                    n_tb_w, n_tb_h, n_tb_w, n_tb_h, tr_h, tr_v, &d, bit_depth, 15,
+                )?
+            }
         } else {
             vec![0i32; n_tb_w * n_tb_h]
         };
@@ -1140,24 +1151,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_h: n_tb_h as u32,
                     qp,
                     dep_quant: false,
-                    transform_skip: false,
-                    bdpcm: false,
+                    transform_skip: info.intra_bdpcm_chroma,
+                    bdpcm: info.intra_bdpcm_chroma,
+                    bdpcm_dir: info.intra_bdpcm_chroma_dir,
                 };
                 let d = dequantize_tb_flat(levels, &params)?;
-                // DCT-II both axes — chroma never picks an MTS kernel
-                // explicitly; implicit-MTS would only apply to luma intra
-                // (§8.7.4.4). Sizes ∈ {4, 8, 16, 32, 64} are all covered.
-                inverse_transform_2d(
-                    n_tb_w,
-                    n_tb_h,
-                    n_tb_w,
-                    n_tb_h,
-                    TrType::DctII,
-                    TrType::DctII,
-                    &d,
-                    bit_depth,
-                    15,
-                )?
+                if info.intra_bdpcm_chroma {
+                    // Transform-skip + BDPCM: bypass the inverse
+                    // transform; d[] is the chroma residual directly.
+                    d
+                } else {
+                    // DCT-II both axes — chroma never picks an MTS kernel
+                    // explicitly; implicit-MTS would only apply to luma intra
+                    // (§8.7.4.4). Sizes ∈ {4, 8, 16, 32, 64} are all covered.
+                    inverse_transform_2d(
+                        n_tb_w,
+                        n_tb_h,
+                        n_tb_w,
+                        n_tb_h,
+                        TrType::DctII,
+                        TrType::DctII,
+                        &d,
+                        bit_depth,
+                        15,
+                    )?
+                }
             } else {
                 vec![0i32; n_tb_w * n_tb_h]
             };
@@ -1849,6 +1867,108 @@ mod tests {
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    /// BDPCM-luma path through `reconstruct_leaf_cu`: when the leaf
+    /// info has `intra_bdpcm_luma == true`, the call must succeed
+    /// (no longer surface Unsupported), the prediction mode is one of
+    /// ANGULAR18 / ANGULAR50, the residual goes through the
+    /// transform-skip + accumulation dequant, and the destination luma
+    /// plane is written without panicking.
+    #[test]
+    fn reconstruct_leaf_cu_bdpcm_luma_runs_pipeline() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        // Hand-build a BDPCM-luma leaf with empty residual (tu_y_coded
+        // == false ⇒ skip dequant). Direction = vertical → ANGULAR50.
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        info.intra_bdpcm_luma = true;
+        info.intra_bdpcm_luma_dir = true;
+        info.intra_pred_mode_y = crate::leaf_cu::INTRA_ANGULAR50;
+        let residual = LeafCuResidual::default();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .unwrap();
+        // ANGULAR50 (vertical) on a fresh mid-grey-substituted block
+        // replicates above[x] down each column. With no above samples
+        // available (picture-edge), §8.4.5.2.8 substitutes mid-grey
+        // (1 << (BitDepth-1) = 512 at 10-bit). The destination plane
+        // is u8 so the value is shifted down 2 bits → 128.
+        let mid_u8: u8 = 128;
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(out.luma.samples[y * 128 + x], mid_u8);
+            }
+        }
+    }
+
+    /// BDPCM-luma with a horizontal direction picks ANGULAR18 (pure
+    /// horizontal replication of left[y]).
+    #[test]
+    fn reconstruct_leaf_cu_bdpcm_luma_horizontal_uses_angular18() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        info.intra_bdpcm_luma = true;
+        info.intra_bdpcm_luma_dir = false;
+        info.intra_pred_mode_y = crate::leaf_cu::INTRA_ANGULAR18;
+        let residual = LeafCuResidual::default();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .unwrap();
+        // Same picture-edge mid-grey behaviour as the vertical case —
+        // there are no real prior samples so both directions collapse
+        // to the constant fill (10-bit mid-grey 512 → u8 128).
+        let mid_u8: u8 = 128;
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(out.luma.samples[y * 128 + x], mid_u8);
+            }
+        }
     }
 
     /// The fallback angular-snap helper picks the closest cardinal

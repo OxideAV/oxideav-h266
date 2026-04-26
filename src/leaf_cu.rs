@@ -49,6 +49,8 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
+    ctx_inc_intra_bdpcm_chroma_dir_flag, ctx_inc_intra_bdpcm_chroma_flag,
+    ctx_inc_intra_bdpcm_luma_dir_flag, ctx_inc_intra_bdpcm_luma_flag,
     ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
@@ -158,6 +160,11 @@ pub struct LeafCuInfo {
     pub intra_bdpcm_luma: bool,
     /// `BdpcmDir[x0][y0][0]` — direction (false = horizontal, true = vertical).
     pub intra_bdpcm_luma_dir: bool,
+    /// `BdpcmFlag[x0][y0][1..2]` — BDPCM applied to both Cb and Cr.
+    pub intra_bdpcm_chroma: bool,
+    /// `BdpcmDir[x0][y0][1..2]` — chroma BDPCM direction (false = horizontal,
+    /// true = vertical).
+    pub intra_bdpcm_chroma_dir: bool,
     /// `IntraMipFlag[x0][y0]`.
     pub intra_mip_flag: bool,
     /// `intra_mip_transposed_flag`.
@@ -215,6 +222,8 @@ impl Default for LeafCuInfo {
             pred_mode: CuPredMode::Intra,
             intra_bdpcm_luma: false,
             intra_bdpcm_luma_dir: false,
+            intra_bdpcm_chroma: false,
+            intra_bdpcm_chroma_dir: false,
             intra_mip_flag: false,
             intra_mip_transposed_flag: false,
             intra_mip_mode: 0,
@@ -268,6 +277,10 @@ pub const INTRA_T_CCLM: u32 = 83;
 
 /// CABAC context bundle used by [`LeafCuReader`].
 pub struct LeafCuCtxs {
+    pub intra_bdpcm_luma_flag: Vec<ContextModel>,
+    pub intra_bdpcm_luma_dir_flag: Vec<ContextModel>,
+    pub intra_bdpcm_chroma_flag: Vec<ContextModel>,
+    pub intra_bdpcm_chroma_dir_flag: Vec<ContextModel>,
     pub intra_mip_flag: Vec<ContextModel>,
     pub intra_luma_ref_idx: Vec<ContextModel>,
     pub intra_subpartitions_mode_flag: Vec<ContextModel>,
@@ -312,6 +325,13 @@ impl LeafCuCtxs {
     /// Build all context arrays using the supplied SliceQpY.
     pub fn init(slice_qp_y: i32) -> Self {
         Self {
+            intra_bdpcm_luma_flag: init_contexts(SyntaxCtx::IntraBdpcmLumaFlag, slice_qp_y),
+            intra_bdpcm_luma_dir_flag: init_contexts(SyntaxCtx::IntraBdpcmLumaDirFlag, slice_qp_y),
+            intra_bdpcm_chroma_flag: init_contexts(SyntaxCtx::IntraBdpcmChromaFlag, slice_qp_y),
+            intra_bdpcm_chroma_dir_flag: init_contexts(
+                SyntaxCtx::IntraBdpcmChromaDirFlag,
+                slice_qp_y,
+            ),
             intra_mip_flag: init_contexts(SyntaxCtx::IntraMipFlag, slice_qp_y),
             intra_luma_ref_idx: init_contexts(SyntaxCtx::IntraLumaRefIdx, slice_qp_y),
             intra_subpartitions_mode_flag: init_contexts(
@@ -594,16 +614,34 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             && info.cb_width <= self.tools.max_ts_size
             && info.cb_height <= self.tools.max_ts_size;
         if bdpcm_gate {
-            // Table 132 — ctxInc 0; use the mip_flag table as a simple
-            // single-context holder (same "solo ctxIdx" shape).
-            // The spec has a dedicated Table 69 init; we reuse the
-            // mip-flag context slot for the flag read since this round
-            // does not surface bdpcm-specific init values. If BDPCM is
-            // disabled (the default in our test fixtures), this branch
-            // is not taken.
-            return Err(Error::unsupported(
-                "h266 leaf CU: BDPCM luma flag parsing needs Table 69 init (not plumbed yet)",
-            ));
+            // Table 132 — ctxInc 0; Table 69 init values plumbed via
+            // SyntaxCtx::IntraBdpcmLumaFlag.
+            let inc = ctx_inc_intra_bdpcm_luma_flag() as usize;
+            let n = self.ctxs.intra_bdpcm_luma_flag.len() - 1;
+            let bit = self
+                .dec
+                .decode_decision(&mut self.ctxs.intra_bdpcm_luma_flag[inc.min(n)])?;
+            info.intra_bdpcm_luma = bit == 1;
+            if info.intra_bdpcm_luma {
+                // intra_bdpcm_luma_dir_flag — Table 70.
+                let inc = ctx_inc_intra_bdpcm_luma_dir_flag() as usize;
+                let n = self.ctxs.intra_bdpcm_luma_dir_flag.len() - 1;
+                let bit = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.intra_bdpcm_luma_dir_flag[inc.min(n)])?;
+                info.intra_bdpcm_luma_dir = bit == 1;
+                // §8.4.2 / §8.4.3: BdpcmDir == 0 → ANGULAR18 (horizontal),
+                // BdpcmDir == 1 → ANGULAR50 (vertical). Chroma is derived
+                // independently if intra_bdpcm_chroma_flag fires later;
+                // otherwise the §8.4.3 mapping below uses this luma mode.
+                info.intra_pred_mode_y = if info.intra_bdpcm_luma_dir {
+                    INTRA_ANGULAR50
+                } else {
+                    INTRA_ANGULAR18
+                };
+                self.derive_chroma(info);
+                return Ok(());
+            }
         }
 
         // intra_mip_flag.
@@ -894,6 +932,45 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if self.tools.chroma_format_idc == 0 {
             info.intra_pred_mode_c = 0;
             return;
+        }
+        // intra_bdpcm_chroma_flag — gated by:
+        //   cbW/SubWidthC <= MaxTsSize && cbH/SubHeightC <= MaxTsSize
+        //   && sps_bdpcm_enabled_flag && !cu_act_enabled_flag.
+        // We approximate SubWidthC/SubHeightC as 2 for 4:2:0 (the only
+        // chroma layout currently supported by reconstruct_leaf_cu).
+        let (sub_w, sub_h) = match self.tools.chroma_format_idc {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let bdpcm_chroma_gate = self.tools.bdpcm
+            && info.cb_width / sub_w <= self.tools.max_ts_size
+            && info.cb_height / sub_h <= self.tools.max_ts_size;
+        if bdpcm_chroma_gate {
+            let inc = ctx_inc_intra_bdpcm_chroma_flag() as usize;
+            let n = self.ctxs.intra_bdpcm_chroma_flag.len() - 1;
+            let bit = self
+                .dec
+                .decode_decision(&mut self.ctxs.intra_bdpcm_chroma_flag[inc.min(n)])
+                .unwrap_or(0);
+            info.intra_bdpcm_chroma = bit == 1;
+            if info.intra_bdpcm_chroma {
+                let inc = ctx_inc_intra_bdpcm_chroma_dir_flag() as usize;
+                let n = self.ctxs.intra_bdpcm_chroma_dir_flag.len() - 1;
+                let bit = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.intra_bdpcm_chroma_dir_flag[inc.min(n)])
+                    .unwrap_or(0);
+                info.intra_bdpcm_chroma_dir = bit == 1;
+                // Chroma uses the same vertical/horizontal mapping as
+                // luma BDPCM (§7.4.5.1 + chroma derivation in §8.4.3).
+                info.intra_pred_mode_c = if info.intra_bdpcm_chroma_dir {
+                    INTRA_ANGULAR50
+                } else {
+                    INTRA_ANGULAR18
+                };
+                return;
+            }
         }
         // Read intra_chroma_pred_mode — Table 130, bin 0 ctx, bins 1-2 bypass.
         // If MIP is active the chroma derivation path inherits luma
@@ -1325,6 +1402,95 @@ mod tests {
         if info.intra_mip_flag {
             assert!(info.intra_mip_mode <= 7);
         }
+    }
+
+    /// BDPCM-luma path: when `sps_bdpcm_enabled_flag` is set and the
+    /// CU fits inside `MaxTsSize`, the reader consumes the
+    /// `intra_bdpcm_luma_flag` (Table 69) and — when set — the
+    /// `intra_bdpcm_luma_dir_flag` (Table 70). The luma intra mode is
+    /// then derived per §8.4.2 from `BdpcmDir`: 0 → ANGULAR18,
+    /// 1 → ANGULAR50. With a zero-only stream the LPS path is not
+    /// taken, so the flag stays at 0; the test still verifies the new
+    /// code path no longer surfaces Unsupported (compared to r17
+    /// behaviour).
+    #[test]
+    fn bdpcm_luma_flag_parses_zero_stream_does_not_error() {
+        let tools = CuToolFlags {
+            bdpcm: true,
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ..CuToolFlags::default()
+        };
+        let data = [0u8; 64];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = LeafCuCtxs::init(26);
+        let mut info = LeafCuInfo {
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+        // The CU fits the BDPCM gate, the flag is read, and the
+        // pipeline must not surface the previous "Table 69 init not
+        // plumbed" Unsupported.
+        let res = reader.decode(&mut info, &mut residual, &neigh);
+        match res {
+            Ok(()) => {}
+            Err(Error::Unsupported(msg)) => {
+                assert!(
+                    !msg.contains("BDPCM"),
+                    "BDPCM flag parsing should no longer be Unsupported: {msg}"
+                );
+            }
+            Err(_) => {
+                // Other errors (e.g. truncated bitstream past the CU
+                // header) are acceptable — we only care that BDPCM is
+                // not the blocker.
+            }
+        }
+        // When BDPCM-luma did fire, the derived intra mode must be one
+        // of the two angular modes mandated by §8.4.2.
+        if info.intra_bdpcm_luma {
+            assert!(
+                info.intra_pred_mode_y == INTRA_ANGULAR18
+                    || info.intra_pred_mode_y == INTRA_ANGULAR50
+            );
+        }
+    }
+
+    /// Tools that disable BDPCM at the SPS level (`sps_bdpcm_enabled_flag
+    /// == 0`) leave the BDPCM flag unread and `intra_bdpcm_luma`
+    /// stays at the default `false`.
+    #[test]
+    fn bdpcm_disabled_skips_flag_read() {
+        let tools = CuToolFlags {
+            bdpcm: false,
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ..CuToolFlags::default()
+        };
+        let data = [0u8; 64];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = LeafCuCtxs::init(26);
+        let mut info = LeafCuInfo {
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+        let _ = reader.decode(&mut info, &mut residual, &neigh);
+        assert!(!info.intra_bdpcm_luma);
+        assert!(!info.intra_bdpcm_luma_dir);
     }
 
     // === MPM-remainder swap + skip behaviour end-to-end via derivation ===

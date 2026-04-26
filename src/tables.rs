@@ -13,6 +13,10 @@
 //! * `split_cu_flag` — Table 59 (27 ctxIdx).
 //! * `split_qt_flag` — Table 60 (18 ctxIdx).
 //! * `pred_mode_flag` — Table 66 (4 ctxIdx).
+//! * `intra_bdpcm_luma_flag` — Table 69 (3 ctxIdx).
+//! * `intra_bdpcm_luma_dir_flag` — Table 70 (3 ctxIdx).
+//! * `intra_bdpcm_chroma_flag` — Table 77 (3 ctxIdx).
+//! * `intra_bdpcm_chroma_dir_flag` — Table 78 (3 ctxIdx).
 //! * `intra_mip_flag` — Table 71 (12 ctxIdx).
 //! * `intra_luma_ref_idx` — Table 72 (6 ctxIdx).
 //! * `intra_subpartitions_mode_flag` — Table 73 (3 ctxIdx).
@@ -48,6 +52,10 @@ pub enum SyntaxCtx {
     SplitCuFlag,
     SplitQtFlag,
     PredModeFlag,
+    IntraBdpcmLumaFlag,
+    IntraBdpcmLumaDirFlag,
+    IntraBdpcmChromaFlag,
+    IntraBdpcmChromaDirFlag,
     IntraMipFlag,
     IntraLumaRefIdx,
     IntraSubpartitionsModeFlag,
@@ -95,6 +103,22 @@ pub const SPLIT_QT_FLAG_SHIFT: &[u8] =
 /// Table 66 — `pred_mode_flag` (4 ctxIdx).
 pub const PRED_MODE_FLAG_INIT: &[u8] = &[40, 35, 40, 35];
 pub const PRED_MODE_FLAG_SHIFT: &[u8] = &[5, 1, 5, 1];
+
+/// Table 69 — `intra_bdpcm_luma_flag` (3 ctxIdx, one per initType).
+pub const INTRA_BDPCM_LUMA_FLAG_INIT: &[u8] = &[19, 40, 19];
+pub const INTRA_BDPCM_LUMA_FLAG_SHIFT: &[u8] = &[1, 1, 1];
+
+/// Table 70 — `intra_bdpcm_luma_dir_flag` (3 ctxIdx, one per initType).
+pub const INTRA_BDPCM_LUMA_DIR_FLAG_INIT: &[u8] = &[35, 36, 21];
+pub const INTRA_BDPCM_LUMA_DIR_FLAG_SHIFT: &[u8] = &[4, 4, 4];
+
+/// Table 77 — `intra_bdpcm_chroma_flag` (3 ctxIdx, one per initType).
+pub const INTRA_BDPCM_CHROMA_FLAG_INIT: &[u8] = &[1, 0, 0];
+pub const INTRA_BDPCM_CHROMA_FLAG_SHIFT: &[u8] = &[1, 1, 1];
+
+/// Table 78 — `intra_bdpcm_chroma_dir_flag` (3 ctxIdx, one per initType).
+pub const INTRA_BDPCM_CHROMA_DIR_FLAG_INIT: &[u8] = &[27, 13, 28];
+pub const INTRA_BDPCM_CHROMA_DIR_FLAG_SHIFT: &[u8] = &[0, 0, 0];
 
 /// Table 71 — `intra_mip_flag` (12 ctxIdx).
 pub const INTRA_MIP_FLAG_INIT: &[u8] = &[33, 49, 50, 25, 41, 57, 58, 26, 56, 57, 50, 26];
@@ -282,6 +306,18 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::SplitCuFlag => (SPLIT_CU_FLAG_INIT, SPLIT_CU_FLAG_SHIFT),
         SyntaxCtx::SplitQtFlag => (SPLIT_QT_FLAG_INIT, SPLIT_QT_FLAG_SHIFT),
         SyntaxCtx::PredModeFlag => (PRED_MODE_FLAG_INIT, PRED_MODE_FLAG_SHIFT),
+        SyntaxCtx::IntraBdpcmLumaFlag => (INTRA_BDPCM_LUMA_FLAG_INIT, INTRA_BDPCM_LUMA_FLAG_SHIFT),
+        SyntaxCtx::IntraBdpcmLumaDirFlag => (
+            INTRA_BDPCM_LUMA_DIR_FLAG_INIT,
+            INTRA_BDPCM_LUMA_DIR_FLAG_SHIFT,
+        ),
+        SyntaxCtx::IntraBdpcmChromaFlag => {
+            (INTRA_BDPCM_CHROMA_FLAG_INIT, INTRA_BDPCM_CHROMA_FLAG_SHIFT)
+        }
+        SyntaxCtx::IntraBdpcmChromaDirFlag => (
+            INTRA_BDPCM_CHROMA_DIR_FLAG_INIT,
+            INTRA_BDPCM_CHROMA_DIR_FLAG_SHIFT,
+        ),
         SyntaxCtx::IntraMipFlag => (INTRA_MIP_FLAG_INIT, INTRA_MIP_FLAG_SHIFT),
         SyntaxCtx::IntraLumaRefIdx => (INTRA_LUMA_REF_IDX_INIT, INTRA_LUMA_REF_IDX_SHIFT),
         SyntaxCtx::IntraSubpartitionsModeFlag => {
@@ -349,6 +385,10 @@ mod tests {
             SyntaxCtx::SplitCuFlag,
             SyntaxCtx::SplitQtFlag,
             SyntaxCtx::PredModeFlag,
+            SyntaxCtx::IntraBdpcmLumaFlag,
+            SyntaxCtx::IntraBdpcmLumaDirFlag,
+            SyntaxCtx::IntraBdpcmChromaFlag,
+            SyntaxCtx::IntraBdpcmChromaDirFlag,
             SyntaxCtx::IntraMipFlag,
             SyntaxCtx::IntraLumaRefIdx,
             SyntaxCtx::IntraSubpartitionsModeFlag,
