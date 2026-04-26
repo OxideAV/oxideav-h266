@@ -305,16 +305,11 @@ impl VvcEncoder {
     ///
     /// The `frame` is accepted for API parity with other encoders in
     /// the workspace, but its pixel data is **not** encoded — this
-    /// scaffold only emits the syntax skeleton. Frames with
-    /// dimensions mismatching [`EncoderConfig`] are rejected so the
-    /// API stays honest.
-    pub fn encode_idr_frame(&self, frame: &oxideav_core::VideoFrame) -> Result<Vec<u8>> {
-        if frame.width != self.config.width || frame.height != self.config.height {
-            return Err(Error::invalid(format!(
-                "h266 encoder: frame dimensions {}x{} do not match configured {}x{}",
-                frame.width, frame.height, self.config.width, self.config.height
-            )));
-        }
+    /// scaffold only emits the syntax skeleton. Frame dimensions live
+    /// on the stream's [`CodecParameters`](oxideav_core::CodecParameters)
+    /// and on this encoder's [`EncoderConfig`] — callers are responsible
+    /// for keeping those in sync.
+    pub fn encode_idr_frame(&self, _frame: &oxideav_core::VideoFrame) -> Result<Vec<u8>> {
         let mut bitstream = Vec::new();
         let vps = self.emit_vps()?;
         annex_b_wrap(&vps, &mut bitstream);
@@ -614,7 +609,7 @@ mod tests {
     use crate::slice_header::{parse_slice_header_stateful, PhState};
     use crate::sps::parse_sps;
     use crate::vps::parse_vps;
-    use oxideav_core::{PixelFormat, TimeBase, VideoFrame, VideoPlane};
+    use oxideav_core::{VideoFrame, VideoPlane};
 
     // ---- BitWriter / EP tests ----
 
@@ -681,11 +676,7 @@ mod tests {
         let y_stride = width as usize;
         let c_stride = (width / 2) as usize;
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width,
-            height,
             pts: None,
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 VideoPlane {
                     stride: y_stride,
@@ -724,10 +715,14 @@ mod tests {
     }
 
     #[test]
-    fn encoder_rejects_dimension_mismatch() {
+    fn encoder_ignores_frame_dimensions() {
+        // Slim VideoFrame no longer carries dimensions — the encoder
+        // can no longer validate them, so it accepts whatever planes
+        // the caller hands over (dimensions live on the stream's
+        // CodecParameters / `EncoderConfig`).
         let enc = VvcEncoder::new(EncoderConfig::new(320, 240)).unwrap();
         let frame = dummy_frame(160, 120);
-        assert!(enc.encode_idr_frame(&frame).is_err());
+        assert!(enc.encode_idr_frame(&frame).is_ok());
     }
 
     #[test]
