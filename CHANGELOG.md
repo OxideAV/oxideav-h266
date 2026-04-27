@@ -6,6 +6,30 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **CCLM — Cross-Component Linear Model intra prediction** — round-19
+  win. `cclm::predict_cclm` runs the §8.4.5.2.14 pipeline end to end:
+  the §6.4.4-style neighbour availability collapse (eqs. 359 – 362),
+  the §8.4.5.2.14 numIs4N / pickPosN derivation (eq. 364), the
+  down-sampled-luma kernels (eqs. 366 – 369; both
+  `sps_chroma_vertical_collocated_flag` branches wired), the selected
+  neighbour kernels (eqs. 370 – 377 with the `bCTUboundary` 3-tap
+  fallback per eq. 373), the 4-point min-max regression (eqs. 386 –
+  389), the `(a, b, k)` derivation including the `divSigTable[]` of
+  eq. 400 (eqs. 390 – 403), and the eq. 404 `Clip1` predictor. The
+  4:2:0 chroma surround is the supported configuration; 4:2:2 / 4:4:4
+  branches are wired in the helper but not exercised yet. Wired into
+  `ctu::CtuWalker::reconstruct_chroma_plane` so chroma TBs flagged
+  with `IntraPredModeC ∈ {81, 82, 83}` reconstruct end to end through
+  `INTRA_LT_CCLM` / `INTRA_L_CCLM` / `INTRA_T_CCLM` instead of being
+  collapsed to PLANAR. Covered by 13 lib unit tests in `cclm.rs`
+  (constant-neighbour identity, mid-grey fallback, mode validation,
+  divSigTable spot-check, pickPos derivation x3, 10-bit fallback,
+  `(a, b, k)` derivation diff-zero + spot-check, ramp recovery,
+  LumaPlane edge clamping, T_CCLM extended-top neighbour) plus 2
+  CTU-level smoke tests
+  (`reconstruct_leaf_cu_cclm_lt_runs_pipeline` and
+  `reconstruct_leaf_cu_cclm_t_picture_edge_writes_mid_grey`).
+
 - **MIP — Matrix-based Intra Prediction** — round-19 win.
   `mip::predict_mip` runs the §8.4.5.2.2 pipeline end to end:
   §8.4.5.2.3 boundary downsampling (rectangular box filter), the

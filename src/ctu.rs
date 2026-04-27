@@ -69,13 +69,14 @@ use oxideav_core::{Error, Result};
 
 use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
 use crate::cabac::ArithDecoder;
+use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
     CuNeighbourhood, CuPredMode, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
-    INTRA_DC, INTRA_PLANAR,
+    INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
 };
 use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
@@ -106,18 +107,23 @@ pub(crate) fn nearest_supported_angular(mode: u32) -> u32 {
 /// in this scaffold (PLANAR, DC, or one of the cardinal angulars
 /// `{2, 18, 34, 50, 66}`).
 ///
-/// CCLM modes (`81..=83`) are not yet wired — they collapse to PLANAR.
-/// Non-cardinal angular modes (anything outside the cardinal set) are
-/// snapped to the nearest cardinal via [`nearest_supported_angular`],
-/// matching the luma-side fallback used by
-/// [`CtuWalker::reconstruct_leaf_cu`].
+/// CCLM modes (`81..=83`) bypass this helper — the CCLM path in
+/// [`CtuWalker::reconstruct_chroma_plane`] runs the dedicated
+/// §8.4.5.2.14 predictor against the reconstructed luma plane. The
+/// helper still maps them to `PLANAR` as a safety fallback if CCLM
+/// derivation fails (e.g. neither neighbour available — eq. 365 covers
+/// that path inside CCLM, but PLANAR keeps the chroma plane
+/// numerically defined). Non-cardinal angular modes (anything outside
+/// the cardinal set) are snapped to the nearest cardinal via
+/// [`nearest_supported_angular`], matching the luma-side fallback
+/// used by [`CtuWalker::reconstruct_leaf_cu`].
 pub(crate) fn chroma_pred_mode_for_predict(mode_c: u32) -> u32 {
     use crate::leaf_cu::{INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM};
     match mode_c {
         INTRA_PLANAR => INTRA_PLANAR,
         INTRA_DC => INTRA_DC,
-        // CCLM (§8.4.5.2.14) needs the luma reconstruction + linear
-        // model derivation; not in this round.
+        // CCLM is dispatched separately by `reconstruct_chroma_plane`.
+        // Map to PLANAR here as the safety fallback.
         INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM => INTRA_PLANAR,
         m @ 2..=66 => {
             if matches!(m, 2 | 18 | 34 | 50 | 66) {
@@ -128,6 +134,82 @@ pub(crate) fn chroma_pred_mode_for_predict(mode_c: u32) -> u32 {
         }
         _ => INTRA_PLANAR,
     }
+}
+
+/// Build the chroma neighbour rows / columns that [`predict_cclm`] needs
+/// from the partially-reconstructed chroma plane. Returns `(top, left)`
+/// where `top` is empty when the top side is unavailable and `left` is
+/// empty when the left side is unavailable.
+///
+/// The lengths follow §8.4.5.2.14 numSampN derivation:
+///
+/// * `INTRA_LT_CCLM` — `top` has `n_tb_w` samples, `left` has `n_tb_h`.
+/// * `INTRA_T_CCLM`  — `top` has up to `n_tb_w + n_tb_h` samples
+///   (extending into the top-right neighbour), `left` is empty.
+/// * `INTRA_L_CCLM`  — `top` is empty, `left` has up to `n_tb_h + n_tb_w`
+///   samples (extending into the bottom-left neighbour).
+fn cclm_chroma_neighbours(
+    plane: &crate::reconstruct::PicturePlane,
+    x0: usize,
+    y0: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    above_avail: bool,
+    left_avail: bool,
+    mode: u32,
+) -> (Vec<i16>, Vec<i16>) {
+    let stride = plane.stride;
+    let plane_w = plane.width;
+    let plane_h = plane.height;
+    // Top side.
+    let top: Vec<i16> = if above_avail {
+        let want = match mode {
+            INTRA_T_CCLM => n_tb_w + n_tb_h,
+            _ => n_tb_w,
+        };
+        // Limit to what's actually inside the plane (the spec's
+        // numTopRight loop walks until availTR goes false; for the
+        // single-slice scaffold, "outside the picture" is the only way
+        // to lose availability).
+        let max_x = plane_w.saturating_sub(x0);
+        let actual = want.min(max_x);
+        let yref = y0.saturating_sub(1);
+        (0..actual)
+            .map(|i| {
+                let xi = x0 + i;
+                if xi < plane_w && y0 > 0 && yref < plane_h {
+                    plane.samples[yref * stride + xi] as i16
+                } else {
+                    0
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Left side.
+    let left: Vec<i16> = if left_avail {
+        let want = match mode {
+            INTRA_L_CCLM => n_tb_h + n_tb_w,
+            _ => n_tb_h,
+        };
+        let max_y = plane_h.saturating_sub(y0);
+        let actual = want.min(max_y);
+        let xref = x0.saturating_sub(1);
+        (0..actual)
+            .map(|i| {
+                let yi = y0 + i;
+                if x0 > 0 && yi < plane_h && xref < plane_w {
+                    plane.samples[yi * stride + xref] as i16
+                } else {
+                    0
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (top, left)
 }
 
 /// §8.7.1 chroma QP derivation — minimal identity mapping.
@@ -1107,6 +1189,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if n_tb_w == 0 || n_tb_h == 0 {
             return Ok(());
         }
+        // CCLM (§8.4.5.2.14) reads the reconstructed luma plane while
+        // the chroma plane is held mutably below. Snapshot the luma
+        // metadata up front so the immutable luma borrow can be created
+        // alongside the mutable chroma borrow without aliasing.
+        let mode_c = info.intra_pred_mode_c;
+        let is_cclm = matches!(mode_c, INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM);
+        let luma_samples_snapshot: Option<Vec<u8>> = if is_cclm {
+            Some(out.luma.samples.clone())
+        } else {
+            None
+        };
+        let luma_stride = out.luma.stride;
+        let luma_w = out.luma.width;
+        let luma_h = out.luma.height;
+
         // Pick the destination plane up front so the borrow on `out`
         // does not have to follow the plane-by-plane reconstruction.
         let plane = match c_idx {
@@ -1136,14 +1233,73 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             top_left: refs.top_left,
         };
 
-        // 2. Intra prediction. Map the §8.4.3 derived `IntraPredModeC`
-        // through the cardinal-only fallback used by the luma path.
-        let mapped = chroma_pred_mode_for_predict(info.intra_pred_mode_c);
-        let pred = match mapped {
-            INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
-            INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
-            mode @ (2 | 18 | 34 | 50 | 66) => predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?,
-            _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+        // 2. Intra prediction. CCLM (§8.4.5.2.14) is dispatched first
+        // when the §8.4.3 chroma-mode derivation produced one of the
+        // CCLM modes (81 / 82 / 83); the helper consumes the
+        // reconstructed luma plane snapshot taken just above. The
+        // remaining modes go through the cardinal-only fallback.
+        let pred = if is_cclm {
+            // Build the 4:2:0 chroma neighbour rows. Both `INTRA_T_CCLM`
+            // and `INTRA_L_CCLM` extend the corresponding side; the
+            // helper caps the lengths at the plane boundary.
+            let (top, left) = cclm_chroma_neighbours(
+                plane,
+                x0,
+                y0,
+                n_tb_w,
+                n_tb_h,
+                above_avail,
+                left_avail,
+                mode_c,
+            );
+            let luma_samples = luma_samples_snapshot.as_deref().unwrap_or(&[]);
+            // §8.4.5.2.14 honours bCTUboundary on the top side. CTU
+            // height in the chroma grid is `ctb_size_y / SubHeightC` —
+            // for 4:2:0 that's `ctb_size_y / 2`. The luma top-left
+            // (after eq. 358) is `y_tb_y = y0_chroma << 1`, and the
+            // boundary check uses `y_tb_y & (CtbSizeY - 1) == 0`.
+            let ctb_size_y = self.layout.ctb_size_y as usize;
+            let b_ctu_boundary = ctb_size_y > 0 && (((y0 << 1) & (ctb_size_y - 1)) == 0);
+            let inputs = CclmInputs {
+                mode: mode_c,
+                n_tb_w,
+                n_tb_h,
+                sub_width_c: 2,
+                sub_height_c: 2,
+                chroma_vertical_collocated_flag: self
+                    .sps
+                    .tool_flags
+                    .chroma_vertical_collocated_flag,
+                b_ctu_boundary,
+                bit_depth,
+                neigh_top_chroma: &top,
+                neigh_left_chroma: &left,
+                luma_plane: LumaPlane {
+                    samples: luma_samples,
+                    stride: luma_stride,
+                    width: luma_w,
+                    height: luma_h,
+                },
+                x_tb_c: x0,
+                y_tb_c: y0,
+            };
+            // Falls back to PLANAR if CCLM rejects the inputs (bad mode
+            // / zero-sized TB) — keeps the chroma plane numerically
+            // defined even on degenerate input.
+            match predict_cclm(&inputs) {
+                Ok(p) => p,
+                Err(_) => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+            }
+        } else {
+            let mapped = chroma_pred_mode_for_predict(mode_c);
+            match mapped {
+                INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+                INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
+                mode @ (2 | 18 | 34 | 50 | 66) => {
+                    predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?
+                }
+                _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+            }
         };
 
         // 3. Dequantise + 4. inverse 2D transform when there is a coded
@@ -1831,11 +1987,14 @@ mod tests {
         assert_eq!(out.cb.samples[8 * 64 + 0], 17);
     }
 
-    /// `chroma_pred_mode_for_predict` collapses CCLM modes to PLANAR
-    /// and snaps non-cardinal angulars to the nearest cardinal. PLANAR /
-    /// DC / cardinals pass through verbatim.
+    /// `chroma_pred_mode_for_predict` keeps PLANAR / DC / cardinal
+    /// angulars verbatim, snaps non-cardinal angulars to the nearest
+    /// cardinal, and falls CCLM back to PLANAR (the actual CCLM dispatch
+    /// happens in `reconstruct_chroma_plane` before this helper runs —
+    /// CCLM only hits this PLANAR fallback if the dedicated path
+    /// rejects its inputs).
     #[test]
-    fn chroma_pred_mode_mapping_collapses_cclm_and_snaps_angulars() {
+    fn chroma_pred_mode_mapping_keeps_planar_dc_and_snaps_angulars() {
         use crate::leaf_cu::{INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM};
         assert_eq!(chroma_pred_mode_for_predict(INTRA_PLANAR), INTRA_PLANAR);
         assert_eq!(chroma_pred_mode_for_predict(INTRA_DC), INTRA_DC);
@@ -1845,10 +2004,122 @@ mod tests {
         // Non-cardinal angular -> snap to nearest cardinal (matches
         // the luma fallback).
         assert_eq!(chroma_pred_mode_for_predict(40), 34);
-        // CCLM modes collapse to PLANAR until §8.4.5.2.14 lands.
+        // CCLM modes drop to PLANAR here as a safety fallback.
         assert_eq!(chroma_pred_mode_for_predict(INTRA_LT_CCLM), INTRA_PLANAR);
         assert_eq!(chroma_pred_mode_for_predict(INTRA_L_CCLM), INTRA_PLANAR);
         assert_eq!(chroma_pred_mode_for_predict(INTRA_T_CCLM), INTRA_PLANAR);
+    }
+
+    /// CCLM end-to-end: place a CU away from the picture edge so the
+    /// chroma + luma neighbours are inside the plane, set
+    /// `intra_pred_mode_c == INTRA_LT_CCLM`, and confirm the chroma
+    /// planes get written through the §8.4.5.2.14 path. With a flat
+    /// luma surround and a flat chroma neighbourhood, CCLM must
+    /// reproduce the chroma constant (diff == 0 → a == 0, b == minC).
+    #[test]
+    fn reconstruct_leaf_cu_cclm_lt_runs_pipeline() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // Place the CU at (32, 32) so left and above neighbours both
+        // exist (above_avail / left_avail derive from x0/y0 > 0).
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 32,
+                y: 32,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 32,
+            y0: 32,
+            cb_width: 16,
+            cb_height: 16,
+            intra_pred_mode_c: INTRA_LT_CCLM,
+            ..LeafCuInfo::default()
+        };
+        let residual = LeafCuResidual::default();
+        // Seed luma + chroma surround to a known value so CCLM's diff
+        // collapses to 0. Luma seed = 100; chroma seed = 60.
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        for v in out.cb.samples.iter_mut() {
+            *v = 60;
+        }
+        for v in out.cr.samples.iter_mut() {
+            *v = 70;
+        }
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("CCLM_LT path should succeed");
+        // Chroma TB is 8×8 at chroma-coords (16, 16). With diff == 0,
+        // every sample collapses to the chroma neighbour constant.
+        for cy in 0..8 {
+            for cx in 0..8 {
+                let cb = out.cb.samples[(16 + cy) * 64 + (16 + cx)];
+                let cr = out.cr.samples[(16 + cy) * 64 + (16 + cx)];
+                assert_eq!(cb, 60, "Cb at ({cx},{cy}) lost CCLM constant");
+                assert_eq!(cr, 70, "Cr at ({cx},{cy}) lost CCLM constant");
+            }
+        }
+    }
+
+    /// CCLM_T (top-only) on a CU at the very top picture edge falls
+    /// back to mid-grey because no top samples are available — the
+    /// helper signals this via empty `neigh_top_chroma`, which trips
+    /// the eq. 365 fallback. We seed chroma to an obviously-different
+    /// value to detect the write.
+    #[test]
+    fn reconstruct_leaf_cu_cclm_t_picture_edge_writes_mid_grey() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            intra_pred_mode_c: INTRA_T_CCLM,
+            ..LeafCuInfo::default()
+        };
+        let residual = LeafCuResidual::default();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        for v in out.cb.samples.iter_mut() {
+            *v = 17;
+        }
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("CCLM_T edge path should succeed");
+        // Mid-grey at 8 bits = 128.
+        for cy in 0..8 {
+            for cx in 0..8 {
+                assert_eq!(
+                    out.cb.samples[cy * 64 + cx],
+                    128,
+                    "CCLM_T edge fallback should paint mid-grey at ({cx},{cy})"
+                );
+            }
+        }
     }
 
     /// `chroma_qp_identity` is a clamp-only identity mapping today

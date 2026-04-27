@@ -101,6 +101,19 @@
 //! * [`mip_tables`] — §8.4.5.2.4 weight matrices for all 30 MIP modes
 //!   (sizeId 0: 16 modes, sizeId 1: 8 modes, sizeId 2: 6 modes),
 //!   transcribed from ITU-T H.266 (V4, 01/2026) Tables 276..305.
+//! * [`cclm`] — round-19 §8.4.5.2.14 Cross-Component Linear Model
+//!   intra prediction. [`cclm::predict_cclm`] runs the §6.4.4-style
+//!   neighbour-availability collapse, the eqs. 366 – 369 down-sampled
+//!   luma kernel (4:2:0 — collocated and non-collocated branches),
+//!   the eqs. 370 – 377 selected-neighbour kernels (incl. the
+//!   `bCTUboundary` 3-tap fallback per eq. 373), the 4-point min-max
+//!   regression of eqs. 386 – 389, the eqs. 390 – 403 `(a, b, k)`
+//!   derivation including the `divSigTable[]` of eq. 400, and the
+//!   eq. 404 `Clip1` predictor. Wired into
+//!   [`ctu::CtuWalker::reconstruct_chroma_plane`] so chroma TBs
+//!   flagged with `IntraPredModeC ∈ {81, 82, 83}` reconstruct end to
+//!   end through `INTRA_LT_CCLM` / `INTRA_L_CCLM` / `INTRA_T_CCLM`
+//!   instead of being collapsed to PLANAR.
 //!
 //! ## Spec reference
 //!
@@ -135,6 +148,7 @@ pub mod aps;
 pub mod bitreader;
 pub mod cabac;
 pub mod cabac_enc;
+pub mod cclm;
 pub mod coding_tree;
 pub mod ctu;
 pub mod ctx;
