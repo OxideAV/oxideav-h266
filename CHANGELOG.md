@@ -4,6 +4,25 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-h266/compare/v0.0.4...v0.0.5) - 2026-04-27
+
+### Other
+
+- CCLM intra prediction (§8.4.5.2.14)
+- round 19 — MIP intra mode (matrix-based intra prediction)
+- round 18 — BDPCM intra mode (luma + chroma)
+- round 17 — ALF fixed-filter family + CC-ALF apply
+- adopt slim VideoFrame shape
+- forward-side CABAC engine + forward DCT-II / flat quant
+- implement §8.8.5.3 luma classification (filtIdx + transposeIdx)
+- implement §8.8.5 adaptive loop filter (luma + chroma apply, ALF APS parser)
+- long luma 5/7-tap, chroma strong, §7.3.11.3 SAO CABAC parser
+- implement §8.8.4 sample adaptive offset (EO + BO) + size-2 DCT-II
+- implement §8.8.3 in-loop deblocking filter (short-tap)
+- wire chroma reconstruction (Cb / Cr) + DCT-II 64 (§8.7.4.2)
+- implement reconstruct_leaf_cu — intra prediction + inverse transform pipeline (§8.4 / §8.7)
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **CCLM — Cross-Component Linear Model intra prediction** — round-19
