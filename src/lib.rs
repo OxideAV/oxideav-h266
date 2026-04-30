@@ -159,6 +159,7 @@ pub mod dequant;
 pub mod encoder;
 pub mod hrd;
 pub mod intra;
+pub mod isp;
 pub mod leaf_cu;
 pub mod mip;
 pub mod mip_tables;

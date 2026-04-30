@@ -248,14 +248,47 @@ impl Default for LeafCuInfo {
     }
 }
 
+/// Per-subpartition luma residual entry used when ISP is active.
+///
+/// One [`LeafCuLumaSubpart`] is emitted per ISP subpartition, in
+/// spec walk order (top-to-bottom for `ISP_HOR_SPLIT`, left-to-right
+/// for `ISP_VER_SPLIT`). The `levels` array is row-major and sized
+/// `(n_w * n_h)`; it stays empty when the subpartition's
+/// `tu_y_coded_flag` is 0 (which can happen for partitions
+/// `0..numParts-2` — the last partition has its CBF inferred per
+/// `InferTuCbfLuma` if every prior partition was zero).
+///
+/// Spec: §8.4.5.1 eqs. 251 – 260 derive `n_w` / `n_h` per partition.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeafCuLumaSubpart {
+    /// Sub-TB width in luma samples.
+    pub n_w: u32,
+    /// Sub-TB height in luma samples.
+    pub n_h: u32,
+    /// CB-relative top-left luma position of the subpartition.
+    pub x_offset: u32,
+    /// CB-relative top-left luma position of the subpartition.
+    pub y_offset: u32,
+    /// Per-partition `tu_y_coded_flag[x0][y0]`.
+    pub tu_y_coded_flag: bool,
+    /// Coefficient levels (row-major), empty when not coded.
+    pub levels: Vec<i32>,
+}
+
 /// Residual side-state for a leaf CU that has at least one coded TB.
 /// Held alongside [`LeafCuInfo`] because the level arrays require an
 /// allocation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LeafCuResidual {
     /// Luma coefficient levels, row-major `(cb_width * cb_height)`.
-    /// Empty when `tu_y_coded_flag == 0`.
+    /// Empty when `tu_y_coded_flag == 0` or when ISP is active (in
+    /// which case [`Self::luma_subparts`] holds the per-partition
+    /// arrays instead).
     pub luma_levels: Vec<i32>,
+    /// Per-subpartition luma residual when ISP is active. Empty when
+    /// the CU is not ISP-split (in which case [`Self::luma_levels`]
+    /// holds the single-TB residual).
+    pub luma_subparts: Vec<LeafCuLumaSubpart>,
     /// Chroma Cb coefficient levels (row-major, chroma-plane size).
     pub cb_levels: Vec<i32>,
     /// Chroma Cr coefficient levels (row-major, chroma-plane size).
@@ -799,11 +832,16 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     /// Read the transform_unit()-level syntax (CBFs, cu_qp_delta,
     /// cu_chroma_qp_offset_*) and drive the residual walker.
     ///
-    /// Scope: single-TB CU only (no ISP split, no SBT). The CBF read
+    /// Scope: single-TB CU and ISP-split CU (no SBT). The CBF read
     /// gates per §7.3.11.10 reduce to:
     ///   * chroma CBFs are always read when the chroma format is not
-    ///     monochrome and the CU is in single-tree mode.
-    ///   * luma CBF is always read in the intra path.
+    ///     monochrome and the CU is in single-tree mode. For ISP CUs
+    ///     they are read **only on the last** subpartition (subTuIndex
+    ///     == NumIntraSubPartitions − 1).
+    ///   * luma CBF is always read in the intra path. For ISP CUs
+    ///     `tu_y_coded_flag` is read per subpartition; the last
+    ///     partition's CBF is inferred to 1 when every prior
+    ///     partition's CBF was 0 (§7.3.11.10's `InferTuCbfLuma`).
     ///
     /// The residual decode path surfaces `Error::Unsupported` if
     /// `sps_joint_cbcr_enabled_flag` is set and the joint-cbcr flag
@@ -814,6 +852,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         info: &mut LeafCuInfo,
         residual: &mut LeafCuResidual,
     ) -> Result<()> {
+        if info.isp_split != IspSplitType::NoSplit {
+            return self.decode_transform_unit_isp(info, residual);
+        }
         let cb_w = info.cb_width as usize;
         let cb_h = info.cb_height as usize;
         let chroma = self.tools.chroma_format_idc != 0;
@@ -925,6 +966,188 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
             }
         }
+        Ok(())
+    }
+
+    /// `transform_tree() + transform_unit()` walk for an ISP-split CU
+    /// (§7.3.11.9 + §7.3.11.10). Each subpartition issues its own
+    /// `transform_unit()` call with `subTuIndex = partIdx`; chroma
+    /// CBFs and chroma residuals are read only on the last
+    /// subpartition. The luma CBF for the last subpartition is
+    /// **inferred** to 1 when every prior subpartition reported
+    /// `tu_y_coded_flag == 0` (the spec's `InferTuCbfLuma`).
+    ///
+    /// This routine does *not* perform `cu_sbt_*` reads — ISP and SBT
+    /// are mutually exclusive (§7.3.11.5) and the leaf-CU path here
+    /// always has `cu_sbt_flag == 0`.
+    fn decode_transform_unit_isp(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+    ) -> Result<()> {
+        let cb_w = info.cb_width;
+        let cb_h = info.cb_height;
+        let chroma = self.tools.chroma_format_idc != 0;
+        let (sub_w, sub_h) = match self.tools.chroma_format_idc {
+            0 => (1u32, 1u32),
+            1 => (2, 2),
+            2 => (2, 1),
+            3 => (1, 1),
+            _ => {
+                return Err(Error::invalid(
+                    "h266 leaf CU ISP: unknown sps_chroma_format_idc value",
+                ));
+            }
+        };
+        let parts = crate::isp::iter_isp_partitions(info.isp_split, cb_w, cb_h);
+        if parts.is_empty() {
+            return Err(Error::invalid(
+                "h266 leaf CU ISP: subpartition walk produced no entries",
+            ));
+        }
+        let num_parts = parts.len();
+        residual.luma_subparts.clear();
+        residual.luma_subparts.reserve(num_parts);
+
+        // Walk subpartitions in order. We accumulate the per-part
+        // CBFs first to honour spec read ordering — chroma CBFs come
+        // *before* luma CBFs only on the last partition.
+        let mut infer_tu_cbf_luma = true;
+        let mut last_tu_cbf_y = false;
+        // Per-partition luma CBFs we read along the way. Chroma CBFs
+        // are deferred until the final partition.
+        let mut part_cbfs: Vec<bool> = Vec::with_capacity(num_parts);
+        // We also collect the full per-partition records so the
+        // residual decode (which interleaves with CBF reads in spec
+        // order) can be invoked at the right moment.
+        let mut sub_records: Vec<LeafCuLumaSubpart> = Vec::with_capacity(num_parts);
+
+        for (i, p) in parts.iter().enumerate() {
+            let is_last = i == num_parts - 1;
+
+            // Spec §7.3.11.10: chroma CBFs are read only on the last
+            // subpartition (and only for SINGLE_TREE / DUAL_TREE_CHROMA
+            // with chroma format != monochrome).
+            if is_last && chroma {
+                info.tu_cb_coded_flag = read_tu_cb_coded_flag(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    /*bdpcm_chroma=*/ false,
+                )?;
+                info.tu_cr_coded_flag = read_tu_cr_coded_flag(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    /*bdpcm_chroma=*/ false,
+                    info.tu_cb_coded_flag,
+                )?;
+            }
+
+            // Spec §7.3.11.10: tu_y_coded_flag read condition for ISP
+            // simplifies to `subTuIndex < NumIntraSubPartitions - 1
+            // || !InferTuCbfLuma`. When neither is true (last
+            // partition, all priors zero) the flag is inferred to 1.
+            let read_y_cbf = !is_last || !infer_tu_cbf_luma;
+            let cbf_y = if read_y_cbf {
+                read_tu_y_coded_flag(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    /*bdpcm_y=*/ info.intra_bdpcm_luma,
+                    /*isp_split=*/ true,
+                    /*prev_tu_cbf_y=*/ last_tu_cbf_y,
+                )?
+            } else {
+                true
+            };
+            last_tu_cbf_y = cbf_y;
+            // §7.3.11.10: InferTuCbfLuma stays true only while every
+            // partition has reported zero.
+            infer_tu_cbf_luma = infer_tu_cbf_luma && !cbf_y;
+            part_cbfs.push(cbf_y);
+
+            // The cu_qp_delta / cu_chroma_qp_offset reads are gated
+            // on the same conditions as the single-TB path; we read
+            // them on the first partition where the CBFs (or any of
+            // the size escapes) make them available, which for ISP
+            // means: as soon as we have a CBF == 1 in luma, or once
+            // chroma CBFs are read (last partition).
+            if i == num_parts - 1 {
+                // Defer to the trailing pass below.
+            }
+
+            // Decode this partition's luma residual now (spec orders
+            // residual_coding *after* the CBF reads of *this*
+            // partition's transform_unit; chroma CBFs only appear in
+            // the last partition's TU and the per-partition luma
+            // residual lives inside the same TU body).
+            let n_w = p.n_w as usize;
+            let n_h = p.n_h as usize;
+            let levels = if cbf_y {
+                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, n_w, n_h, 0)?
+            } else {
+                Vec::new()
+            };
+            sub_records.push(LeafCuLumaSubpart {
+                n_w: p.n_w,
+                n_h: p.n_h,
+                x_offset: p.x_offset,
+                y_offset: p.y_offset,
+                tu_y_coded_flag: cbf_y,
+                levels,
+            });
+        }
+
+        // The combined `tu_y_coded_flag` flag captured into `LeafCuInfo`
+        // is the OR across partitions: the deblocker / chroma-CBF
+        // logic only cares about "did this CU produce any luma
+        // residual".
+        info.tu_y_coded_flag = part_cbfs.iter().any(|&b| b);
+
+        // Trailing per-CU reads (cu_qp_delta_*, cu_chroma_qp_offset_*,
+        // joint_cbcr) — these are only signalled once per CU.
+        let any_cbf = info.tu_y_coded_flag || info.tu_cb_coded_flag || info.tu_cr_coded_flag;
+        if self.tools.cu_qp_delta_enabled && any_cbf {
+            info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+        }
+        let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
+        if self.tools.cu_chroma_qp_offset_enabled && chroma && chroma_cbf {
+            let (flag, idx) = read_cu_chroma_qp_offset(
+                self.dec,
+                &mut self.ctxs.residual,
+                self.tools.chroma_qp_offset_list_len_minus1,
+            )?;
+            info.cu_chroma_qp_offset_flag = flag;
+            info.cu_chroma_qp_offset_idx = idx;
+        }
+        if self.tools.joint_cbcr_enabled
+            && chroma
+            && ((info.pred_mode == CuPredMode::Intra && chroma_cbf)
+                || (info.tu_cb_coded_flag && info.tu_cr_coded_flag))
+        {
+            return Err(Error::unsupported(
+                "h266 leaf CU ISP: tu_joint_cbcr_residual_flag parsing not plumbed yet",
+            ));
+        }
+
+        // Chroma residuals (single-pass at the CU level — chroma is
+        // not split for ISP per eqs. 251 – 254).
+        if info.tu_cb_coded_flag && chroma {
+            let cw = (cb_w / sub_w) as usize;
+            let ch = (cb_h / sub_h) as usize;
+            if cw >= 2 && ch >= 2 {
+                residual.cb_levels =
+                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
+            }
+        }
+        if info.tu_cr_coded_flag && chroma {
+            let cw = (cb_w / sub_w) as usize;
+            let ch = (cb_h / sub_h) as usize;
+            if cw >= 2 && ch >= 2 {
+                residual.cr_levels =
+                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
+            }
+        }
+
+        residual.luma_subparts = sub_records;
         Ok(())
     }
 

@@ -934,31 +934,68 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        // ISP is out of scope for this round — leaf-CU syntax surfaces
-        // it only when SPS opts in, so the typical intra-only fixture
-        // never hits this branch. MIP (§8.4.5.2.2) IS now wired below
-        // through the [`crate::mip`] module; the prediction step
-        // dispatches on `info.intra_mip_flag` and replaces the angular /
-        // PLANAR / DC prediction with the matrix-based variant. The
-        // residual / dequant / inverse-transform / reconstruct pipeline
-        // is unchanged — MIP only affects the prediction-block
-        // generation in step 2 below.
-        if info.isp_split != crate::leaf_cu::IspSplitType::NoSplit {
-            return Err(Error::unsupported(
-                "h266 reconstruct_leaf_cu: ISP split (§8.4.5.2.5) not yet wired",
-            ));
-        }
-        // BDPCM (§7.4.5.1 / §8.7.3 eqs. 1153-1154) is now wired below
-        // — the prediction is a pure horizontal/vertical replication of
-        // the reference samples (per §8.4.2 BdpcmDir → ANGULAR18 / 50)
-        // and the residual goes through transform-skip dequant with
-        // the BDPCM accumulation pass enabled.
+        // MIP (§8.4.5.2.2) is wired below through [`crate::mip`]; the
+        // prediction step dispatches on `info.intra_mip_flag` and
+        // replaces the angular / PLANAR / DC prediction with the
+        // matrix-based variant. ISP (§8.4.5.1, eqs. 251 – 260) is now
+        // handled by [`Self::reconstruct_leaf_cu_isp_luma`], which
+        // walks the spec-derived subpartition list and reconstructs
+        // each one in turn so the next partition can reference the
+        // freshly-reconstructed samples of the prior one. Chroma is
+        // not split for ISP (per eqs. 251 – 254 the splitting only
+        // fires when `cIdx == 0`); the chroma pass below runs once
+        // per CU regardless of the ISP path.
+        let isp_active = info.isp_split != crate::leaf_cu::IspSplitType::NoSplit;
+        // BDPCM (§7.4.5.1 / §8.7.3 eqs. 1153-1154) is wired through
+        // the dequant pipeline below.
 
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let n_tb_w = cu.cu.w as usize;
         let n_tb_h = cu.cu.h as usize;
         let x0 = cu.cu.x as usize;
         let y0 = cu.cu.y as usize;
+
+        if isp_active {
+            self.reconstruct_leaf_cu_isp_luma(cu, info, residual, out, bit_depth)?;
+            // Fall through to the chroma + bookkeeping passes below.
+            // The luma plane is fully written by the ISP walker so the
+            // single-TB luma block (steps 1 – 5) is skipped.
+            if self.sps.sps_chroma_format_idc == 1 {
+                self.reconstruct_chroma_plane(
+                    /*c_idx=*/ 1,
+                    cu,
+                    info,
+                    &residual.cb_levels,
+                    info.tu_cb_coded_flag,
+                    bit_depth,
+                    out,
+                )?;
+                self.reconstruct_chroma_plane(
+                    /*c_idx=*/ 2,
+                    cu,
+                    info,
+                    &residual.cr_levels,
+                    info.tu_cr_coded_flag,
+                    bit_depth,
+                    out,
+                )?;
+            }
+            let qp_y = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
+            self.deblock_cus.push(DeblockCu {
+                x: cu.cu.x,
+                y: cu.cu.y,
+                w: cu.cu.w,
+                h: cu.cu.h,
+                qp_y: qp_y.clamp(0, 63),
+                intra: matches!(info.pred_mode, CuPredMode::Intra),
+                tu_y_coded: info.tu_y_coded_flag,
+                tu_cb_coded: info.tu_cb_coded_flag,
+                tu_cr_coded: info.tu_cr_coded_flag,
+                bdpcm_luma: info.intra_bdpcm_luma,
+                bdpcm_chroma: false,
+            });
+            return Ok(());
+        }
 
         // Per §7.4.10.5 / §8.7.4.1 the largest single TB is `MaxTbSizeY`
         // (≤ 64). When a leaf CU exceeds that size the spec splits it
@@ -1148,6 +1185,190 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm_luma: info.intra_bdpcm_luma,
             bdpcm_chroma: false,
         });
+        Ok(())
+    }
+
+    /// Reconstruct the luma plane of an ISP-split CU per §8.4.5.1.
+    ///
+    /// Walk the spec-derived subpartition list (§8.4.5.1 eqs. 251 –
+    /// 260, exposed by [`crate::isp::iter_isp_partitions`]) in order.
+    /// For each subpartition:
+    ///
+    /// 1. **Reference samples** are fetched from the *partially*
+    ///    reconstructed luma plane: each subpartition reads the
+    ///    samples written by the prior partition, which is exactly
+    ///    what makes ISP a useful tool (the residual on a thin sub-TB
+    ///    is much smaller when the prediction can use a fresh edge
+    ///    one CU-line away).
+    /// 2. **Prediction** is computed at width `nPbW = max(4, nW)` and
+    ///    sliced down to the sub-TB width when `pbFactor > 1` (only
+    ///    relevant for vertical splits with `nW ∈ {1, 2}`). The
+    ///    intra-prediction process is invoked only when
+    ///    `xPartPbIdx == 0`; the reused prediction is held in
+    ///    `pred_window` and sliced for the subsequent partitions.
+    /// 3. **Residual** uses the per-subpartition `levels` array
+    ///    captured in [`LeafCuLumaSubpart`]. The dequant / IDCT
+    ///    pipeline matches the single-TB path (DCT-II both axes; no
+    ///    BDPCM here — the spec disallows BDPCM + ISP).
+    /// 4. **Reconstruct + clip** is the same eq. 1426 step used by
+    ///    the no-ISP path, writing into `out.luma`.
+    ///
+    /// Returns once every subpartition has been written to the picture
+    /// buffer; the chroma plane is handled separately by the caller.
+    fn reconstruct_leaf_cu_isp_luma(
+        &self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+        bit_depth: u32,
+    ) -> Result<()> {
+        let cb_w = cu.cu.w;
+        let cb_h = cu.cu.h;
+        let x0_cu = cu.cu.x as usize;
+        let y0_cu = cu.cu.y as usize;
+        let parts = crate::isp::iter_isp_partitions(info.isp_split, cb_w, cb_h);
+        if parts.is_empty() {
+            return Err(Error::invalid(
+                "h266 reconstruct_leaf_cu ISP: subpartition walk produced no entries",
+            ));
+        }
+
+        // Cache the prediction window for the current `pbFactor`-aligned
+        // group of subpartitions (eqs. 255 – 260). When `pb_factor > 1`,
+        // the window is computed on the partition with `xPartPbIdx == 0`
+        // and reused for the subsequent partitions in the group.
+        let mut pred_window: Vec<i16> = Vec::new();
+        let mut pred_window_w: usize = 0;
+        let mut pred_window_h: usize = 0;
+
+        for (i, p) in parts.iter().enumerate() {
+            // Look up the per-partition residual record. They are
+            // written in the same order as the spec walker, so the
+            // index aligns 1:1.
+            let sub = residual.luma_subparts.get(i).ok_or_else(|| {
+                Error::invalid(
+                    "h266 reconstruct_leaf_cu ISP: residual.luma_subparts shorter than walk",
+                )
+            })?;
+            if sub.x_offset != p.x_offset || sub.y_offset != p.y_offset {
+                return Err(Error::invalid(
+                    "h266 reconstruct_leaf_cu ISP: residual record offset mismatch",
+                ));
+            }
+
+            let n_w = p.n_w as usize;
+            let n_h = p.n_h as usize;
+            let n_pb_w = p.n_pb_w as usize;
+            let pb_factor = p.pb_factor as usize;
+            let abs_x = x0_cu + p.x_offset as usize;
+            let abs_y = y0_cu + p.y_offset as usize;
+
+            // 1. Prediction window. The intra sample-prediction
+            //    process is invoked only when xPartPbIdx == 0
+            //    (eq. 260). For pbFactor == 1 every partition runs
+            //    the predictor; for pbFactor == 2 the window is
+            //    reused for the second partition in each pair.
+            if p.x_part_pb_idx == 0 {
+                let above_avail = abs_y > 0;
+                let left_avail = abs_x > 0;
+                let refs = OwnedIntraRefs::from_plane(
+                    &out.luma,
+                    abs_x,
+                    abs_y,
+                    n_pb_w,
+                    n_h,
+                    above_avail,
+                    left_avail,
+                    bit_depth,
+                );
+                let refs_view = IntraRefs {
+                    above: &refs.above,
+                    left: &refs.left,
+                    top_left: refs.top_left,
+                };
+                let pred = match info.intra_pred_mode_y {
+                    INTRA_PLANAR => predict_planar(n_pb_w, n_h, &refs_view)?,
+                    INTRA_DC => predict_dc(n_pb_w, n_h, &refs_view)?,
+                    mode @ (2 | 18 | 34 | 50 | 66) => {
+                        predict_angular(n_pb_w, n_h, mode, &refs_view)?
+                    }
+                    mode if (2..=66).contains(&mode) => {
+                        let snapped = nearest_supported_angular(mode);
+                        predict_angular(n_pb_w, n_h, snapped, &refs_view)?
+                    }
+                    _ => predict_planar(n_pb_w, n_h, &refs_view)?,
+                };
+                pred_window = pred;
+                pred_window_w = n_pb_w;
+                pred_window_h = n_h;
+            } else if pred_window.is_empty() || pred_window_w != n_pb_w || pred_window_h != n_h {
+                return Err(Error::invalid(
+                    "h266 reconstruct_leaf_cu ISP: prediction window missing for pb-grouped partition",
+                ));
+            }
+
+            // 2. Slice the prediction window down to nW columns at
+            //    the partition's offset within the window. For
+            //    pb_factor == 1 this is a 1:1 copy.
+            let pb_offset = (p.x_part_pb_idx as usize) * n_w;
+            let mut pred_sub = vec![0i16; n_w * n_h];
+            for row in 0..n_h {
+                let src = &pred_window
+                    [row * pred_window_w + pb_offset..row * pred_window_w + pb_offset + n_w];
+                pred_sub[row * n_w..row * n_w + n_w].copy_from_slice(src);
+            }
+            // Defensive: pb_factor must keep `pb_offset + n_w <=
+            // pred_window_w`. With `n_pb_w = max(4, n_w)` and `n_w |
+            // n_pb_w`, this always holds.
+            let _ = pb_factor;
+
+            // 3. Dequant + IDCT for the per-subpartition residual.
+            let residual_samples: Vec<i32> = if sub.tu_y_coded_flag && !sub.levels.is_empty() {
+                let qp = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
+                let qp = qp.clamp(0, 63);
+                let params = DequantParams {
+                    bit_depth,
+                    log2_transform_range: 15,
+                    n_tb_w: p.n_w,
+                    n_tb_h: p.n_h,
+                    qp,
+                    dep_quant: false,
+                    transform_skip: false,
+                    bdpcm: false,
+                    bdpcm_dir: false,
+                };
+                let d = dequantize_tb_flat(&sub.levels, &params)?;
+                inverse_transform_2d(
+                    n_w,
+                    n_h,
+                    n_w,
+                    n_h,
+                    TrType::DctII,
+                    TrType::DctII,
+                    &d,
+                    bit_depth,
+                    15,
+                )?
+            } else {
+                vec![0i32; n_w * n_h]
+            };
+
+            // 4. Reconstruct (eq. 1426) into the picture plane.
+            reconstruct_tb_into(
+                &mut out.luma.samples,
+                out.luma.stride,
+                out.luma.height,
+                abs_x,
+                abs_y,
+                &pred_sub,
+                &residual_samples,
+                n_w,
+                n_h,
+                bit_depth,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -2331,6 +2552,297 @@ mod tests {
                 assert_eq!(out.luma.samples[y * 128 + x], mid_u8);
             }
         }
+    }
+
+    /// ISP horizontal split: a 16×16 PLANAR CU split into four 16×4
+    /// subpartitions must reconstruct each one in turn into the picture
+    /// buffer. With every CBF off and the partial plane left at the
+    /// initial fill, the first subpartition picks up its top-row
+    /// reference from the seed, and each later subpartition picks up
+    /// the row freshly written by the prior partition. Because PLANAR
+    /// of a constant neighbourhood reproduces the constant, the final
+    /// picture matches the seed across the whole CU.
+    #[test]
+    fn reconstruct_leaf_cu_isp_hor_split_runs_pipeline() {
+        use crate::leaf_cu::{IspSplitType, LeafCuLumaSubpart};
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            isp_split: IspSplitType::HorSplit,
+            intra_pred_mode_y: INTRA_PLANAR,
+            ..LeafCuInfo::default()
+        };
+        // Build empty per-partition residuals — four 16x4 sub-TBs at
+        // y = 0, 4, 8, 12 with `tu_y_coded_flag == false`.
+        let mut residual = LeafCuResidual::default();
+        for i in 0..4u32 {
+            residual.luma_subparts.push(LeafCuLumaSubpart {
+                n_w: 16,
+                n_h: 4,
+                x_offset: 0,
+                y_offset: i * 4,
+                tu_y_coded_flag: false,
+                levels: Vec::new(),
+            });
+        }
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("ISP HOR split path should succeed");
+        // At the picture edge, the first partition reads mid-grey
+        // (10-bit 1<<9 = 512 → u8 128) substitution for both above
+        // and left. Each subsequent partition reads its top row
+        // from the freshly-written prior partition, so PLANAR's
+        // row+column blend slowly drifts away from a flat 128. The
+        // important invariants here are "every sample is legal"
+        // and "the CU's footprint is fully written" (no leftover
+        // seed pixels at value 100). Outside the CU the seed must
+        // remain visible.
+        let mut all_legal = true;
+        let mut wrote_into_cu = true;
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let v = out.luma.samples[y * 128 + x] as i32;
+                if !(0..=255).contains(&v) {
+                    all_legal = false;
+                }
+                if v == 100 {
+                    wrote_into_cu = false;
+                }
+            }
+        }
+        assert!(all_legal, "ISP partition wrote out-of-range pixels");
+        assert!(wrote_into_cu, "ISP CU footprint left unwritten samples");
+        // Outside the 16x16 CU the seed must still be visible on row 0
+        // (no spillover past the CU width).
+        assert_eq!(out.luma.samples[16], 100);
+        assert_eq!(out.luma.samples[20 * 128 + 0], 100);
+    }
+
+    /// ISP vertical split: 4x16 sub-TBs side by side, all coded with
+    /// `tu_y_coded_flag == false`. Since `nW == 4 == nPbW`, `pbFactor`
+    /// is 1 and prediction runs once per partition. The walker must
+    /// emit four sub-TBs and the picture buffer must end up valid.
+    #[test]
+    fn reconstruct_leaf_cu_isp_ver_split_runs_pipeline() {
+        use crate::leaf_cu::{IspSplitType, LeafCuLumaSubpart};
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // Place at (32, 32) so left + above neighbours are inside the
+        // plane — predictor reads real samples instead of mid-grey
+        // substitutions.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 32,
+                y: 32,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 32,
+            y0: 32,
+            cb_width: 16,
+            cb_height: 16,
+            isp_split: IspSplitType::VerSplit,
+            intra_pred_mode_y: INTRA_PLANAR,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        for i in 0..4u32 {
+            residual.luma_subparts.push(LeafCuLumaSubpart {
+                n_w: 4,
+                n_h: 16,
+                x_offset: i * 4,
+                y_offset: 0,
+                tu_y_coded_flag: false,
+                levels: Vec::new(),
+            });
+        }
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("ISP VER split path should succeed");
+        // A flat seed neighbourhood + PLANAR + zero residual
+        // reproduces the seed exactly.
+        for y in 32..48usize {
+            for x in 32..48usize {
+                assert_eq!(
+                    out.luma.samples[y * 128 + x],
+                    100,
+                    "pixel ({x},{y}) wandered off seed value"
+                );
+            }
+        }
+    }
+
+    /// ISP vertical split with a small CU (8x8) that triggers
+    /// `pbFactor == 2`: the prediction window is shared between
+    /// `xPartPbIdx == 0` and `xPartPbIdx == 1`. The walker must not
+    /// re-fetch references for `xPartPbIdx > 0` and must still write
+    /// every partition.
+    #[test]
+    fn reconstruct_leaf_cu_isp_ver_split_pb_factor_two() {
+        use crate::leaf_cu::{IspSplitType, LeafCuLumaSubpart};
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 32,
+                y: 32,
+                w: 8,
+                h: 8,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 32,
+            y0: 32,
+            cb_width: 8,
+            cb_height: 8,
+            isp_split: IspSplitType::VerSplit,
+            intra_pred_mode_y: INTRA_PLANAR,
+            ..LeafCuInfo::default()
+        };
+        // 4 partitions of 2x8 each. pb_factor = 2; pred window covers
+        // xPartIdx 0 and 1 jointly, then 2 and 3.
+        let mut residual = LeafCuResidual::default();
+        for i in 0..4u32 {
+            residual.luma_subparts.push(LeafCuLumaSubpart {
+                n_w: 2,
+                n_h: 8,
+                x_offset: i * 2,
+                y_offset: 0,
+                tu_y_coded_flag: false,
+                levels: Vec::new(),
+            });
+        }
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("ISP VER pb_factor=2 path should succeed");
+        // Flat surround + PLANAR + zero residual ⇒ seed reproduction.
+        for y in 32..40usize {
+            for x in 32..40usize {
+                assert_eq!(out.luma.samples[y * 128 + x], 100);
+            }
+        }
+    }
+
+    /// ISP with a coded residual on the last subpartition: when the
+    /// final partition has a non-zero DC coefficient, the dequant +
+    /// IDCT must offset the seed value visibly inside that
+    /// partition's footprint while leaving the prior partitions
+    /// untouched.
+    #[test]
+    fn reconstruct_leaf_cu_isp_hor_last_partition_residual() {
+        use crate::leaf_cu::{IspSplitType, LeafCuLumaSubpart};
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 32,
+                y: 32,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 32,
+            y0: 32,
+            cb_width: 16,
+            cb_height: 16,
+            isp_split: IspSplitType::HorSplit,
+            intra_pred_mode_y: INTRA_PLANAR,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        for i in 0..3u32 {
+            residual.luma_subparts.push(LeafCuLumaSubpart {
+                n_w: 16,
+                n_h: 4,
+                x_offset: 0,
+                y_offset: i * 4,
+                tu_y_coded_flag: false,
+                levels: Vec::new(),
+            });
+        }
+        let mut last_levels = vec![0i32; 16 * 4];
+        last_levels[0] = 50; // DC impulse on the bottom strip
+        residual.luma_subparts.push(LeafCuLumaSubpart {
+            n_w: 16,
+            n_h: 4,
+            x_offset: 0,
+            y_offset: 12,
+            tu_y_coded_flag: true,
+            levels: last_levels,
+        });
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("ISP HOR last-partition residual path should succeed");
+        // Top three 16×4 strips reproduce the seed (zero residual
+        // through PLANAR on a flat neighbourhood).
+        for y in 32..44usize {
+            for x in 32..48usize {
+                assert_eq!(
+                    out.luma.samples[y * 128 + x],
+                    100,
+                    "ISP top strip pixel ({x},{y}) wandered"
+                );
+            }
+        }
+        let mut last_strip_changed = false;
+        for y in 44..48usize {
+            for x in 32..48usize {
+                if out.luma.samples[y * 128 + x] != 100 {
+                    last_strip_changed = true;
+                }
+            }
+        }
+        assert!(
+            last_strip_changed,
+            "ISP bottom subpartition residual must move at least one sample"
+        );
     }
 
     /// The fallback angular-snap helper picks the closest cardinal

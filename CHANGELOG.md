@@ -6,6 +6,32 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **ISP — Intra Sub-Partitions** — round-20 win. New `isp` module
+  implements the §7.4.12.2 / §8.4.5.1 sub-partition derivation:
+  `num_intra_subpartitions` covers Table 13 (NoSplit → 1, (4,8) /
+  (8,4) → 2, else → 4) and `iter_isp_partitions` materialises the
+  per-partition `nW`, `nH`, `nPbW = max(4, nW)`, `pbFactor`,
+  `xPartIdx`, `yPartIdx`, `xPartPbIdx` from eqs. 251 – 260. The
+  leaf-CU reader gains `decode_transform_unit_isp` which walks each
+  subpartition's `transform_unit()` per §7.3.11.10: chroma CBFs are
+  read only on the last partition, `tu_y_coded_flag` is read per
+  partition with `InferTuCbfLuma` inferring 1 for the last partition
+  when every prior CBF was 0. `LeafCuResidual` gains
+  `luma_subparts: Vec<LeafCuLumaSubpart>` to carry the per-partition
+  geometry + level array. `ctu::CtuWalker::reconstruct_leaf_cu`
+  dispatches into `reconstruct_leaf_cu_isp_luma`, which walks the
+  subpartitions in spec order and reconstructs each one — predicting
+  off the partially-reconstructed plane so partition `i+1` reads
+  freshly-written samples from partition `i`. The `pbFactor == 2`
+  case (vertical splits with `nW ∈ {1, 2}`) caches the prediction
+  window across the paired partitions per eq. 260. Chroma stays
+  un-split (eqs. 251 – 254 only fire for `cIdx == 0`). 11 new tests
+  (7 in `isp::tests`, 4 in `ctu::tests`) cover the partition
+  geometry, ref-dimension derivation, CU walks for HOR/VER splits,
+  the small-CU two-partition cases, the `pbFactor == 2` window-share
+  path, and a CU with a non-zero residual landing only on the last
+  subpartition.
+
 - **CCLM — Cross-Component Linear Model intra prediction** — round-19
   win. `cclm::predict_cclm` runs the §8.4.5.2.14 pipeline end to end:
   the §6.4.4-style neighbour availability collapse (eqs. 359 – 362),
