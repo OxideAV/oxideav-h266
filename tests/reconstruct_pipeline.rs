@@ -963,6 +963,88 @@ fn decode_b_slice_writes_bipred_motion_field() {
     }
 }
 
+/// Round-24: HMVP table wiring at the walker level. After a P-slice
+/// decode containing a single inter (skip) CU, the walker's HMVP table
+/// must be populated with exactly one entry — the §8.5.2.16 update
+/// invariant. The entry's motion field must mirror the chosen merge
+/// candidate (zero MV, refIdxL0 = 0, predFlagL0 = 1, predFlagL1 = 0).
+///
+/// Pre-conditions verified:
+///   1. Slice begin reset: `walker.hmvp_table().len() == 0` immediately
+///      after `begin_slice` (per §7.3.11 `NumHmvpCand = 0` reset).
+///   2. After decode: exactly one HMVP entry, encoding the chosen MvField.
+#[test]
+fn decode_p_slice_populates_hmvp_table() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+    };
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, cabac_init_flag = 0
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut enc = ArithEncoder::new();
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+        .unwrap();
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_ctxs.len() - 1);
+    enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+        .unwrap();
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    // Slice-start invariant: HMVP table reset to empty per §7.3.11.
+    assert_eq!(
+        walker.hmvp_table().len(),
+        0,
+        "HMVP table must be empty at slice start (§7.3.11 NumHmvpCand = 0 reset)"
+    );
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // Post-decode invariant: exactly one HMVP entry (the lone inter CU).
+    let table = walker.hmvp_table();
+    assert_eq!(
+        table.len(),
+        1,
+        "HMVP table must contain exactly the single inter CU's MvField after decode"
+    );
+    let entry = table.entries[0];
+    assert!(entry.pred_flag_l0);
+    assert!(!entry.pred_flag_l1);
+    assert_eq!(entry.ref_idx_l0, 0);
+    assert_eq!(entry.mv_l0.x, 0);
+    assert_eq!(entry.mv_l0.y, 0);
+    assert!(entry.mode_inter);
+    assert!(entry.cu_skip_flag);
+}
+
 /// Chroma ALF wiring: install a per-CTB Cb-on record + a chroma APS
 /// with all-zero coefficients. On the post-decode (flat) chroma plane
 /// the filter math is identity, but the apply pass should still have

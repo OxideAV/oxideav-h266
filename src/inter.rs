@@ -15,12 +15,20 @@
 //!   `Log2ParMrgLevel` shared-merge collapse is applied per the spec
 //!   condition `xCb >> Log2ParMrgLevel == xNbX >> Log2ParMrgLevel &&
 //!   yCb >> Log2ParMrgLevel == yNbX >> Log2ParMrgLevel`.
-//! * [`build_merge_cand_list`] — §8.5.2.2 step 5 spatial-only
-//!   assembly + step 9 zero-MV padding. The §8.5.2.4 pairwise average
-//!   and §8.5.2.6 HMVP candidates are intentionally out of scope for
-//!   this round (they will land alongside more aggressive
-//!   merge-mode features in r22+); the temporal candidate (§8.5.2.11)
-//!   needs collocated-picture machinery and is also out of scope.
+//! * [`build_merge_cand_list`] — §8.5.2.2 step 5 spatial assembly +
+//!   step 7 HMVP insertion (round-24, §8.5.2.6) + step 9 zero-MV
+//!   padding. The §8.5.2.4 pairwise average and §8.5.2.11 temporal
+//!   collocated candidate are still r25+ scope.
+//! * [`HmvpTable`] — round-24 §8.5.2.6 / §8.5.2.16 history-based
+//!   motion vector predictor table. Per-slice circular buffer of up
+//!   to [`MAX_HMVP_CAND`] = 5 MvField records, reset to empty at
+//!   every CTU column tile-boundary per the §7.3.11 slice_data()
+//!   pseudocode. Merge derivation reads the table newest-to-oldest
+//!   (`HmvpCandList[NumHmvpCand − hMvpIdx]` walk); §8.5.2.16 update
+//!   pushes each just-decoded inter CU's motion field, slides
+//!   duplicates to the newest slot, and evicts the oldest entry only
+//!   when the buffer is at capacity and the incoming entry is not a
+//!   duplicate.
 //! * [`MergeData`] / [`InterCuInfo`] — parsed-syntax records produced
 //!   by the leaf-CU reader for cu_skip_flag / regular_merge_flag /
 //!   merge_idx; consumed by the CTU walker to drive merge derivation.
@@ -376,10 +384,9 @@ fn mvf_matches(a: &MvField, b: &MvField) -> bool {
         && a.mv_l1 == b.mv_l1
 }
 
-/// §8.5.2.2 step 5 + step 9 — spatial-only mergeCandList assembly with
-/// zero-MV padding to `MaxNumMergeCand` for **P-slices** (uni-pred
-/// pads). Pairwise average and HMVP are intentionally not yet wired
-/// (r24+ scope).
+/// §8.5.2.2 step 5 + step 7 + step 9 — spatial mergeCandList assembly
+/// with optional HMVP insertion (round-24) and zero-MV padding to
+/// `MaxNumMergeCand` for **P-slices** (uni-pred pads).
 ///
 /// The list is built in spec walk order:
 ///   1. If availableFlagB1 → push B1
@@ -387,15 +394,34 @@ fn mvf_matches(a: &MvField, b: &MvField) -> bool {
 ///   3. If availableFlagB0 → push B0
 ///   4. If availableFlagA0 → push A0
 ///   5. If availableFlagB2 → push B2
-///   6. While len < max → push zero-MV (refIdx 0).
+///   6. (round-24) Step 7: if `numCurrMergeCand < MaxNumMergeCand − 1`
+///      and `NumHmvpCand > 0`, invoke §8.5.2.6 to insert HMVP
+///      candidates (newest to oldest, with the spec's prune-against-
+///      A1/B1 rule for the two newest entries).
+///   7. While len < max → push zero-MV (refIdx 0).
+///
+/// Round-24 wires HMVP. Pairwise average (§8.5.2.4) and the temporal
+/// collocated candidate (§8.5.2.11) are still r25+ scope.
 pub fn build_merge_cand_list(
     spatial: &[SpatialMergeCandidate; 5],
     max_num_merge_cand: u32,
+    hmvp: Option<&HmvpTable>,
 ) -> Vec<MvField> {
     let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
     for cand in spatial {
         if cand.available && (out.len() as u32) < max_num_merge_cand {
             out.push(cand.field);
+        }
+    }
+    // §8.5.2.2 step 7 — HMVP insertion. Trigger condition mirrors the
+    // spec: `numCurrMergeCand < MaxNumMergeCand − 1 && NumHmvpCand > 0`.
+    // The §8.5.2.6 walk inserts entries from newest to oldest, prunes
+    // duplicates against A1/B1 (only for the two newest entries), and
+    // halts as soon as `numCurrMergeCand == MaxNumMergeCand − 1`. The
+    // last slot is reserved for the zero-MV pad below.
+    if let Some(table) = hmvp {
+        if (out.len() as u32) < max_num_merge_cand.saturating_sub(1) && !table.entries.is_empty() {
+            insert_hmvp_into_merge_list(&mut out, spatial, table, max_num_merge_cand);
         }
     }
     while (out.len() as u32) < max_num_merge_cand {
@@ -412,8 +438,9 @@ pub fn build_merge_cand_list(
     out
 }
 
-/// §8.5.2.2 step 5 + step 9 — spatial-only mergeCandList assembly with
-/// zero-MV bi-pred padding to `MaxNumMergeCand` for **B-slices**.
+/// §8.5.2.2 step 5 + step 7 + step 9 — spatial mergeCandList assembly
+/// with optional HMVP insertion (round-24) and zero-MV bi-pred padding
+/// to `MaxNumMergeCand` for **B-slices**.
 ///
 /// Spec §8.5.2.2 step 9 builds zero-MV bi-pred pads for B-slices
 /// (`zeroCandm = (mvL0 = 0, mvL1 = 0, refIdxL0 = m % NumRefL0,
@@ -422,15 +449,24 @@ pub fn build_merge_cand_list(
 /// drops out and every pad lands at `refIdxL0 = refIdxL1 = 0`.
 ///
 /// Walk order matches [`build_merge_cand_list`] for the spatial slots
-/// — only the zero-MV pad shape changes.
+/// + HMVP step 7 — only the zero-MV pad shape changes.
 pub fn build_merge_cand_list_b(
     spatial: &[SpatialMergeCandidate; 5],
     max_num_merge_cand: u32,
+    hmvp: Option<&HmvpTable>,
 ) -> Vec<MvField> {
     let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
     for cand in spatial {
         if cand.available && (out.len() as u32) < max_num_merge_cand {
             out.push(cand.field);
+        }
+    }
+    // §8.5.2.2 step 7 — HMVP insertion (B-slice path). Same gating as
+    // the P-slice variant; HMVP entries from a B-slice carry full L0 +
+    // L1 records, so no shape adjustment is needed.
+    if let Some(table) = hmvp {
+        if (out.len() as u32) < max_num_merge_cand.saturating_sub(1) && !table.entries.is_empty() {
+            insert_hmvp_into_merge_list(&mut out, spatial, table, max_num_merge_cand);
         }
     }
     while (out.len() as u32) < max_num_merge_cand {
@@ -447,6 +483,160 @@ pub fn build_merge_cand_list_b(
         });
     }
     out
+}
+
+// =====================================================================
+// §8.5.2.6 — Derivation process for history-based merging candidates
+// =====================================================================
+//
+// HmvpCandList is a per-slice circular buffer of up to 5 MvField
+// records. The §8.5.2.16 update process pushes the just-decoded inter
+// CU's motion field after every inter CU. Duplicate entries are
+// removed (and the buffer slid down) on insertion; once the buffer is
+// full the oldest entry is evicted.
+//
+// At merge-list build time §8.5.2.6 inserts candidates from newest to
+// oldest, halting once `numCurrMergeCand == MaxNumMergeCand − 1`.
+// Pruning against A1/B1 applies only to the **two newest** HMVP
+// entries (the spec's `hMvpIdx <= 2` guard).
+//
+// The HMVP table is reset to empty at every CTU column tile-boundary
+// per the §7.3.11 slice_data() pseudocode. For our single-tile fixture
+// the reset only happens at slice start.
+
+/// Maximum HMVP candidate count per §8.5.2.16 ("NumHmvpCand is equal
+/// to 5"). Treat as the buffer's hard cap.
+pub const MAX_HMVP_CAND: usize = 5;
+
+/// Per-slice history-based motion vector predictor table (§8.5.2.6 +
+/// §8.5.2.16). Keeps the most recent (up to [`MAX_HMVP_CAND`]) inter-
+/// CU motion records for the current slice in insertion order — the
+/// last entry is the most recently pushed.
+///
+/// Reset to empty at every CTU column tile-boundary per the §7.3.11
+/// slice_data() pseudocode (`NumHmvpCand = 0`).
+#[derive(Clone, Debug, Default)]
+pub struct HmvpTable {
+    /// Newest entry is at the *back* (`entries[len-1]`); oldest at the
+    /// *front* (`entries[0]`). The §8.5.2.6 walk reads back-to-front
+    /// (newest first) per its `HmvpCandList[NumHmvpCand − hMvpIdx]`
+    /// indexing with `hMvpIdx = 1..NumHmvpCand`.
+    pub entries: Vec<MvField>,
+}
+
+impl HmvpTable {
+    /// Create an empty HMVP table — equivalent to the spec's
+    /// `NumHmvpCand = 0` reset.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(MAX_HMVP_CAND),
+        }
+    }
+
+    /// Reset the table to empty. Called at every CTU column tile
+    /// boundary per §7.3.11.
+    pub fn reset(&mut self) {
+        self.entries.clear();
+    }
+
+    /// `NumHmvpCand` — the spec name for the current entry count.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true when the table is empty (`NumHmvpCand == 0`).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// §8.5.2.16 — Updating process for the history-based motion
+    /// vector predictor candidate list.
+    ///
+    /// Insert `cand` into the table:
+    ///   1. If an existing entry has the same motion vectors and
+    ///      reference indices (`mvf_matches`), drop that entry (slide
+    ///      the rest down).
+    ///   2. If the table is full (`NumHmvpCand == 5`), drop the oldest
+    ///      entry (front).
+    ///   3. Append `cand` at the back (newest position).
+    ///
+    /// The combined effect: a duplicate refresh promotes the existing
+    /// entry to the newest slot; the oldest entry is evicted only when
+    /// the table is at capacity and the incoming entry is not a
+    /// duplicate.
+    pub fn update_with(&mut self, cand: MvField) {
+        // Step 1 + 2 of the spec. Find any duplicate; if found, remove it
+        // (which also frees a slot, so the eviction-when-full branch
+        // doesn't run twice). Otherwise, evict the oldest if at capacity.
+        if let Some(pos) = self.entries.iter().position(|e| mvf_matches(e, &cand)) {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= MAX_HMVP_CAND {
+            // Spec eviction-when-full clause: drop HmvpCandList[0]
+            // (oldest), shifting indices 1..N down by one. `Vec::remove`
+            // handles the shift in one go.
+            self.entries.remove(0);
+        }
+        // Step 3: append at the back (newest slot).
+        self.entries.push(cand);
+    }
+}
+
+/// §8.5.2.6 — insert HMVP candidates into the merge list in newest-to-
+/// oldest order, with the spec's two-newest-entry prune against A1/B1.
+/// Halts as soon as `numCurrMergeCand == MaxNumMergeCand − 1` (i.e. one
+/// slot is reserved for the eventual zero-MV pad / pairwise average /
+/// temporal candidate) or the HMVP table is exhausted.
+///
+/// Spec text (§8.5.2.6 — reproduced for reviewer convenience):
+/// > For each candidate in `HmvpCandList[NumHmvpCand − hMvpIdx]` with
+/// > index `hMvpIdx = 1..NumHmvpCand`, the following ordered steps are
+/// > repeated until `numCurrMergeCand` is equal to `MaxNumMergeCand − 1`:
+/// >   1. The variable `sameMotion` is derived as follows:
+/// >      - If all of the following conditions are true for any
+/// >        merging candidate `N` with `N` being `A1` or `B1`,
+/// >        `sameMotion` is set equal to TRUE:
+/// >        - `hMvpIdx` is less than or equal to 2.
+/// >        - The candidate `HmvpCandList[NumHmvpCand − hMvpIdx]` and
+/// >          the merging candidate `N` have the same motion vectors
+/// >          and the same reference indices.
+/// >      - Otherwise, `sameMotion` is set equal to FALSE.
+/// >   2. When `sameMotion` is equal to FALSE, the candidate
+/// >      `HmvpCandList[NumHmvpCand − hMvpIdx]` is added to the
+/// >      merging candidate list.
+fn insert_hmvp_into_merge_list(
+    merge_list: &mut Vec<MvField>,
+    spatial: &[SpatialMergeCandidate; 5],
+    hmvp: &HmvpTable,
+    max_num_merge_cand: u32,
+) {
+    let halt_count = max_num_merge_cand.saturating_sub(1) as usize;
+    let n = hmvp.entries.len();
+    // §8.5.2.6 walks hMvpIdx = 1..NumHmvpCand (1-based), reading
+    // HmvpCandList[NumHmvpCand − hMvpIdx] — i.e. starts at the newest
+    // entry (index n - 1) and proceeds toward the oldest.
+    for h_mvp_idx in 1..=n {
+        if merge_list.len() >= halt_count {
+            break;
+        }
+        let entry = hmvp.entries[n - h_mvp_idx];
+        // Pruning rule applies only for the two newest entries
+        // (hMvpIdx ≤ 2). Compare against A1 (spatial[1]) and B1
+        // (spatial[0]) when those are available.
+        let mut same_motion = false;
+        if h_mvp_idx <= 2 {
+            let b1 = &spatial[0];
+            let a1 = &spatial[1];
+            if b1.available && mvf_matches(&entry, &b1.field) {
+                same_motion = true;
+            }
+            if !same_motion && a1.available && mvf_matches(&entry, &a1.field) {
+                same_motion = true;
+            }
+        }
+        if !same_motion {
+            merge_list.push(entry);
+        }
+    }
 }
 
 /// Parsed `merge_data()` syntax (round-21 subset — regular merge only).
@@ -1168,7 +1358,7 @@ mod tests {
     fn build_merge_list_pads_with_zero_mvs() {
         // No spatial candidates: list collapses to all zero-MV entries.
         let empty = [SpatialMergeCandidate::default(); 5];
-        let list = build_merge_cand_list(&empty, 6);
+        let list = build_merge_cand_list(&empty, 6, None);
         assert_eq!(list.len(), 6);
         for cand in &list {
             assert!(cand.pred_flag_l0);
@@ -1193,7 +1383,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let list = build_merge_cand_list(&spatials, 4);
+        let list = build_merge_cand_list(&spatials, 4, None);
         assert_eq!(list.len(), 4);
         // First entry is A1 (the only available spatial).
         assert_eq!(list[0].mv_l0.int_x(), 1);
@@ -1626,7 +1816,7 @@ mod tests {
     #[test]
     fn build_merge_cand_list_b_pads_with_bipred_zero_mvs() {
         let empty = [SpatialMergeCandidate::default(); 5];
-        let list = build_merge_cand_list_b(&empty, 6);
+        let list = build_merge_cand_list_b(&empty, 6, None);
         assert_eq!(list.len(), 6);
         for cand in &list {
             assert!(cand.pred_flag_l0);
@@ -1837,5 +2027,338 @@ mod tests {
             matches!(err, oxideav_core::Error::InvalidData(_)),
             "{err:?}"
         );
+    }
+
+    // ----- §8.5.2.6 / §8.5.2.16 HMVP tests (round-24) -------------------
+
+    /// Helper: synthesise an MvField with a distinctive L0 MV so we can
+    /// distinguish entries by inspection. Pred-flag-L0 set; L1 left at
+    /// the unavailable shape (round-23 P-slice convention).
+    fn dummy_mvf(dx: i32, dy: i32, ref_idx: i32) -> MvField {
+        MvField {
+            mv_l0: MotionVector::from_int_pel(dx, dy),
+            ref_idx_l0: ref_idx,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        }
+    }
+
+    /// `HmvpTable::new` starts empty (`NumHmvpCand == 0`) and `reset`
+    /// returns it to that state — pins the §7.3.11 slice-start /
+    /// CTU-column-tile-boundary semantics.
+    #[test]
+    fn hmvp_table_new_is_empty_and_reset_clears() {
+        let mut t = HmvpTable::new();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+        t.update_with(dummy_mvf(1, 0, 0));
+        assert_eq!(t.len(), 1);
+        t.reset();
+        assert!(t.is_empty());
+    }
+
+    /// §8.5.2.16 — fresh entries append at the back (newest slot) and
+    /// the table grows monotonically until it hits [`MAX_HMVP_CAND`].
+    #[test]
+    fn hmvp_update_appends_until_capacity() {
+        let mut t = HmvpTable::new();
+        for i in 0..MAX_HMVP_CAND as i32 {
+            t.update_with(dummy_mvf(i + 1, 0, 0));
+        }
+        assert_eq!(t.len(), MAX_HMVP_CAND);
+        // Newest entry is at the back.
+        assert_eq!(
+            t.entries.last().unwrap().mv_l0,
+            MotionVector::from_int_pel(MAX_HMVP_CAND as i32, 0)
+        );
+        // Oldest entry is at the front.
+        assert_eq!(
+            t.entries.first().unwrap().mv_l0,
+            MotionVector::from_int_pel(1, 0)
+        );
+    }
+
+    /// §8.5.2.16 — when the table is full and the new entry is *not* a
+    /// duplicate, evict the oldest entry (front) and append the new
+    /// entry at the back.
+    #[test]
+    fn hmvp_update_evicts_oldest_when_full() {
+        let mut t = HmvpTable::new();
+        for i in 0..MAX_HMVP_CAND as i32 {
+            t.update_with(dummy_mvf(i + 1, 0, 0));
+        }
+        // Push one more — oldest (mv (1,0)) should be evicted.
+        t.update_with(dummy_mvf(99, 0, 0));
+        assert_eq!(t.len(), MAX_HMVP_CAND);
+        assert_eq!(
+            t.entries.first().unwrap().mv_l0,
+            MotionVector::from_int_pel(2, 0),
+            "oldest entry (mv=1,0) must have been evicted"
+        );
+        assert_eq!(
+            t.entries.last().unwrap().mv_l0,
+            MotionVector::from_int_pel(99, 0)
+        );
+    }
+
+    /// §8.5.2.16 — duplicate insertion removes the existing entry from
+    /// its current position and appends the (logically same) entry at
+    /// the newest slot. Net effect: the duplicate is "promoted".
+    #[test]
+    fn hmvp_update_duplicate_promotes_to_newest() {
+        let mut t = HmvpTable::new();
+        // Push three entries, then re-push the middle one.
+        t.update_with(dummy_mvf(1, 0, 0));
+        t.update_with(dummy_mvf(2, 0, 0));
+        t.update_with(dummy_mvf(3, 0, 0));
+        t.update_with(dummy_mvf(2, 0, 0));
+        assert_eq!(t.len(), 3);
+        // Order should now be: (1,0), (3,0), (2,0) — (2,0) at the back.
+        assert_eq!(t.entries[0].mv_l0, MotionVector::from_int_pel(1, 0));
+        assert_eq!(t.entries[1].mv_l0, MotionVector::from_int_pel(3, 0));
+        assert_eq!(t.entries[2].mv_l0, MotionVector::from_int_pel(2, 0));
+    }
+
+    /// §8.5.2.16 — duplicate insertion when at capacity does NOT evict
+    /// the oldest entry (the dedup-and-promote path frees a slot, so
+    /// the eviction-when-full clause does not fire).
+    #[test]
+    fn hmvp_update_duplicate_at_capacity_keeps_oldest() {
+        let mut t = HmvpTable::new();
+        for i in 0..MAX_HMVP_CAND as i32 {
+            t.update_with(dummy_mvf(i + 1, 0, 0));
+        }
+        let oldest_before = t.entries.first().unwrap().mv_l0;
+        // Re-push the middle entry — duplicate path.
+        t.update_with(dummy_mvf(3, 0, 0));
+        assert_eq!(t.len(), MAX_HMVP_CAND);
+        assert_eq!(
+            t.entries.first().unwrap().mv_l0,
+            oldest_before,
+            "duplicate-at-capacity must NOT evict the oldest entry"
+        );
+        assert_eq!(
+            t.entries.last().unwrap().mv_l0,
+            MotionVector::from_int_pel(3, 0)
+        );
+    }
+
+    /// §8.5.2.6 — when no spatial candidates are available, all HMVP
+    /// entries should be inserted (no pruning needed) up to
+    /// `MaxNumMergeCand − 1`. The last slot is filled by the zero-MV
+    /// pad.
+    #[test]
+    fn merge_list_inserts_hmvp_no_pruning_when_no_spatials() {
+        let empty_spatials = [SpatialMergeCandidate::default(); 5];
+        let mut hmvp = HmvpTable::new();
+        // Fill HMVP with 3 distinctive entries: (1,0), (2,0), (3,0).
+        hmvp.update_with(dummy_mvf(1, 0, 0));
+        hmvp.update_with(dummy_mvf(2, 0, 0));
+        hmvp.update_with(dummy_mvf(3, 0, 0));
+        let list = build_merge_cand_list(&empty_spatials, 6, Some(&hmvp));
+        assert_eq!(list.len(), 6);
+        // First three entries are HMVP — newest first.
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(3, 0));
+        assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(2, 0));
+        assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(1, 0));
+        // Slots 3..6 are zero-MV pads (HMVP halts at MaxNumMergeCand−1
+        // = 5 — but we already filled 3 < 5, so slot 5 becomes the
+        // zero-MV pad alongside the rest).
+        for entry in &list[3..] {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+            assert!(entry.pred_flag_l0);
+        }
+    }
+
+    /// §8.5.2.6 — HMVP insertion halts at `MaxNumMergeCand − 1` (last
+    /// slot reserved for the zero-MV pad / pairwise / temporal). With
+    /// 5 HMVP entries and `MaxNumMergeCand == 4`, only 3 HMVP entries
+    /// land in the merge list (slots 0..2) — slot 3 is zero-MV pad.
+    #[test]
+    fn merge_list_hmvp_halts_one_short_of_max() {
+        let empty_spatials = [SpatialMergeCandidate::default(); 5];
+        let mut hmvp = HmvpTable::new();
+        for i in 0..5 {
+            hmvp.update_with(dummy_mvf(i + 1, 0, 0));
+        }
+        let list = build_merge_cand_list(&empty_spatials, 4, Some(&hmvp));
+        assert_eq!(list.len(), 4);
+        // 3 HMVP slots filled (newest first), then zero-MV pad.
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
+        assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(4, 0));
+        assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(3, 0));
+        assert_eq!(list[3].mv_l0, MotionVector::ZERO);
+    }
+
+    /// §8.5.2.6 — `sameMotion` pruning rule: when the **newest** HMVP
+    /// entry duplicates B1 (or A1), it is dropped from the merge list.
+    /// Pinning that the rule fires only for the two newest entries
+    /// (`hMvpIdx ≤ 2`).
+    #[test]
+    fn merge_list_hmvp_prunes_against_b1_when_newest() {
+        // Build a setup where B1 is available with mv = (5, 0) and the
+        // newest HMVP entry also encodes mv = (5, 0). The HMVP entry
+        // must be skipped.
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        spatials[0] = SpatialMergeCandidate {
+            available: true,
+            field: dummy_mvf(5, 0, 0),
+        };
+        let mut hmvp = HmvpTable::new();
+        hmvp.update_with(dummy_mvf(7, 0, 0)); // older
+        hmvp.update_with(dummy_mvf(5, 0, 0)); // newest — duplicates B1
+        let list = build_merge_cand_list(&spatials, 6, Some(&hmvp));
+        // Slot 0 = B1 = (5,0). Slot 1 should be the *older* HMVP entry
+        // (7,0) — newest (5,0) was pruned. Slots 2..5 are zero-MV pads.
+        assert_eq!(list.len(), 6);
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
+        assert_eq!(
+            list[1].mv_l0,
+            MotionVector::from_int_pel(7, 0),
+            "newest HMVP must have been pruned (matches B1)"
+        );
+        for entry in &list[2..] {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+        }
+    }
+
+    /// §8.5.2.6 — pruning fires only for the two newest entries
+    /// (`hMvpIdx ≤ 2`). A *third* HMVP entry that matches B1 must NOT
+    /// be pruned. Pin this so we don't over-prune older entries.
+    #[test]
+    fn merge_list_hmvp_does_not_prune_third_oldest_against_b1() {
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        spatials[0] = SpatialMergeCandidate {
+            available: true,
+            field: dummy_mvf(5, 0, 0),
+        };
+        let mut hmvp = HmvpTable::new();
+        // entries[0] (oldest) = (5, 0) — matches B1, hMvpIdx=3 → no prune
+        // entries[1]          = (8, 0) — distinct
+        // entries[2] (newest) = (9, 0) — distinct
+        hmvp.update_with(dummy_mvf(5, 0, 0));
+        hmvp.update_with(dummy_mvf(8, 0, 0));
+        hmvp.update_with(dummy_mvf(9, 0, 0));
+        let list = build_merge_cand_list(&spatials, 6, Some(&hmvp));
+        // slot 0 = B1 (5,0); slot 1..3 = HMVP newest-first
+        // (9,0), (8,0), (5,0) — the (5,0) entry survives because it
+        // sits at hMvpIdx = 3 (third newest).
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
+        assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(9, 0));
+        assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(8, 0));
+        assert_eq!(
+            list[3].mv_l0,
+            MotionVector::from_int_pel(5, 0),
+            "third-oldest HMVP must NOT be pruned (hMvpIdx>2 falls outside the rule)"
+        );
+    }
+
+    /// §8.5.2.2 step 7 trigger condition: HMVP insertion is gated by
+    /// `numCurrMergeCand < MaxNumMergeCand − 1`. When the spatial walk
+    /// already produced `MaxNumMergeCand − 1` entries, HMVP must NOT
+    /// run (the spec stops adding HMVP at that point and lets the
+    /// zero-MV pad close the chain).
+    ///
+    /// Setup: 5 spatial candidates available, all distinct → spatial
+    /// walk produces 5 entries. With `MaxNumMergeCand == 5` the
+    /// trigger condition `5 < 4` is FALSE → HMVP stays out.
+    #[test]
+    fn merge_list_hmvp_skipped_when_spatials_already_max_minus_one() {
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        for (i, slot) in spatials.iter_mut().enumerate() {
+            *slot = SpatialMergeCandidate {
+                available: true,
+                field: dummy_mvf(i as i32 + 1, 0, 0),
+            };
+        }
+        let mut hmvp = HmvpTable::new();
+        hmvp.update_with(dummy_mvf(99, 0, 0));
+        let list = build_merge_cand_list(&spatials, 5, Some(&hmvp));
+        // 5 slots; all 5 are spatial. HMVP entry (99, 0) must NOT
+        // appear — `5 < 4` is false.
+        assert_eq!(list.len(), 5);
+        for entry in &list {
+            assert_ne!(entry.mv_l0, MotionVector::from_int_pel(99, 0));
+        }
+    }
+
+    /// `build_merge_cand_list_b` integration with HMVP — the B-slice
+    /// path also picks up HMVP entries between spatials and the
+    /// bi-pred zero-MV pad. Pin the same insertion order: spatial
+    /// first, HMVP newest-first, bi-pred pad last.
+    #[test]
+    fn merge_list_b_inserts_hmvp_then_bipred_pad() {
+        let empty_spatials = [SpatialMergeCandidate::default(); 5];
+        let mut hmvp = HmvpTable::new();
+        // Push a single B-slice-shaped HMVP entry (both pred flags
+        // set, so the entry survives the unmodified-shape contract).
+        let bi_entry = MvField {
+            mv_l0: MotionVector::from_int_pel(2, 1),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(-1, 3),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        hmvp.update_with(bi_entry);
+        let list = build_merge_cand_list_b(&empty_spatials, 4, Some(&hmvp));
+        assert_eq!(list.len(), 4);
+        // Slot 0 = HMVP entry (carries both lists).
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(2, 1));
+        assert_eq!(list[0].mv_l1, MotionVector::from_int_pel(-1, 3));
+        assert!(list[0].pred_flag_l1);
+        // Slots 1..3 are bi-pred zero-MV pads (predFlagL0 = predFlagL1 = 1).
+        for entry in &list[1..] {
+            assert!(entry.pred_flag_l0);
+            assert!(entry.pred_flag_l1);
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+            assert_eq!(entry.mv_l1, MotionVector::ZERO);
+        }
+    }
+
+    /// `None` HMVP argument leaves the merge list shape byte-identical
+    /// to the round-23 spatial-only build path. Round-21/22 unit tests
+    /// pass `None` for backwards compatibility — pin that the result
+    /// matches the original shape (no HMVP entries injected).
+    #[test]
+    fn merge_list_with_none_hmvp_is_spatial_only_pad_only() {
+        let empty_spatials = [SpatialMergeCandidate::default(); 5];
+        let p_list = build_merge_cand_list(&empty_spatials, 5, None);
+        let b_list = build_merge_cand_list_b(&empty_spatials, 5, None);
+        assert_eq!(p_list.len(), 5);
+        assert_eq!(b_list.len(), 5);
+        // Every entry is a zero-MV pad.
+        for e in &p_list {
+            assert_eq!(e.mv_l0, MotionVector::ZERO);
+            assert!(!e.pred_flag_l1);
+        }
+        for e in &b_list {
+            assert_eq!(e.mv_l0, MotionVector::ZERO);
+            assert!(e.pred_flag_l1);
+        }
+    }
+
+    /// Edge case — an empty HMVP table is silently skipped (no panic /
+    /// no spurious zero-MV insertion). Pin against the §8.5.2.2 step 7
+    /// `NumHmvpCand > 0` gate.
+    #[test]
+    fn merge_list_empty_hmvp_skipped() {
+        let empty_spatials = [SpatialMergeCandidate::default(); 5];
+        let empty_hmvp = HmvpTable::new();
+        let list = build_merge_cand_list(&empty_spatials, 4, Some(&empty_hmvp));
+        // Empty HMVP → list is fully zero-MV padded.
+        assert_eq!(list.len(), 4);
+        for entry in &list {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+            assert!(entry.available);
+        }
     }
 }

@@ -6,6 +6,57 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **HMVP merge candidate insertion + table maintenance (round-24)** —
+  the §8.5.2.6 history-based merging-candidate derivation and the
+  §8.5.2.16 update process now land in `oxideav_h266::inter`. A new
+  [`HmvpTable`](src/inter.rs) per-slice circular buffer of up to 5
+  `MvField` records lives on the `CtuWalker` (reset to empty at
+  `begin_slice` per the §7.3.11 `NumHmvpCand = 0` slice-start rule;
+  for our single-tile fixture the CTU-column-tile-boundary reset
+  collapses to the slice-start reset). The signatures of
+  [`build_merge_cand_list`] and [`build_merge_cand_list_b`] gain a
+  trailing `Option<&HmvpTable>` argument: when `Some`, §8.5.2.2 step
+  7 now fires between the spatial walk and the zero-MV pad, invoking
+  [`insert_hmvp_into_merge_list`] which walks the HMVP table newest-
+  to-oldest (`HmvpCandList[NumHmvpCand − hMvpIdx]` with
+  `hMvpIdx = 1..NumHmvpCand`), prunes duplicates against B1 / A1
+  only for the two newest entries (`hMvpIdx ≤ 2`), and halts as soon
+  as `numCurrMergeCand == MaxNumMergeCand − 1` (last slot reserved
+  for the eventual zero-MV pad / pairwise / temporal candidate). The
+  §8.5.2.16 update is wired into `CtuWalker::reconstruct_leaf_cu_inter`
+  immediately after the per-CU motion-field broadcast: each just-
+  decoded inter CU's MvField calls
+  [`HmvpTable::update_with`](src/inter.rs), which removes any prior
+  duplicate (by `mvf_matches`) and appends the new entry at the
+  back, evicting the oldest (front) only when the buffer is at
+  capacity *and* no duplicate was found. A new
+  [`CtuWalker::hmvp_table`] read accessor exposes the table for
+  test inspection. Verified by 12 new lib unit tests
+  (`hmvp_table_new_is_empty_and_reset_clears`,
+  `hmvp_update_appends_until_capacity`,
+  `hmvp_update_evicts_oldest_when_full`,
+  `hmvp_update_duplicate_promotes_to_newest`,
+  `hmvp_update_duplicate_at_capacity_keeps_oldest`,
+  `merge_list_inserts_hmvp_no_pruning_when_no_spatials`,
+  `merge_list_hmvp_halts_one_short_of_max`,
+  `merge_list_hmvp_prunes_against_b1_when_newest`,
+  `merge_list_hmvp_does_not_prune_third_oldest_against_b1`,
+  `merge_list_hmvp_skipped_when_spatials_already_max_minus_one`,
+  `merge_list_b_inserts_hmvp_then_bipred_pad`,
+  `merge_list_with_none_hmvp_is_spatial_only_pad_only`,
+  `merge_list_empty_hmvp_skipped`) plus 1 new integration test
+  (`decode_p_slice_populates_hmvp_table` — pins both the slice-start
+  reset and the post-decode table contents after the all-skip
+  P-slice fixture). Out of scope for this round (still surfaces
+  `Error::Unsupported` upstream): the §8.5.2.4 pairwise-average
+  candidate, the §8.5.2.11 temporal collocated merge candidate (the
+  collocated-picture pointer plumbing via `sh_collocated_from_l0` /
+  `sh_collocated_ref_idx` lives in r25+), MMVD, CIIP, GPM, subblock
+  merge, AMVR, BCW (`bcwIdx != 0`), explicit weighted prediction
+  (§8.5.6.6.3), BDOF (§8.5.6.5), DMVR, PROF (§8.5.6.4), dual-tree
+  luma / chroma split, and the full inter residual decode
+  (`cu_coded_flag` + `transform_tree()`).
+
 - **B-slice merge / regular-merge subset (round-23)** — first bi-pred
   path lands. The CTU walker now accepts B-slices via `begin_slice`
   (the B-slice gate is dropped); a new `set_ref_pic_list_l1` mirror

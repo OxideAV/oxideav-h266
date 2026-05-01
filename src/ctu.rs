@@ -76,7 +76,7 @@ use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
     build_merge_cand_list, build_merge_cand_list_b, derive_spatial_merge_candidates,
     predict_chroma_block, predict_chroma_block_bipred, predict_luma_block,
-    predict_luma_block_bipred, MotionField, MvField, ReferencePicture,
+    predict_luma_block_bipred, HmvpTable, MotionField, MvField, ReferencePicture,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -533,6 +533,13 @@ pub struct CtuWalker<'a, 'b> {
     /// [`Self::reconstruct_leaf_cu`] for inter CUs and read back during
     /// the §8.5.2.3 spatial-merge derivation of subsequent CUs.
     motion_field: MotionField,
+    /// Round-24 per-slice HMVP table (§8.5.2.6 + §8.5.2.16). Reset
+    /// to empty at slice start (and at every CTU column tile-
+    /// boundary per the §7.3.11 slice_data() pseudocode — for our
+    /// single-tile fixture only the slice-start reset fires). The
+    /// inter CU walker reads this table during §8.5.2.2 step 7 and
+    /// updates it after each inter CU per §8.5.2.16.
+    hmvp: HmvpTable,
     /// `Log2ParMrgLevel` from `pps_log2_parallel_merge_level_minus2 + 2`
     /// (§7.4.3.5). Drives the spec's same-parallel-merge-tile
     /// neighbour-suppression rule.
@@ -666,6 +673,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ref_pic_list_l0: Vec::new(),
             ref_pic_list_l1: Vec::new(),
             motion_field,
+            hmvp: HmvpTable::new(),
             log2_par_mrg_level,
         })
     }
@@ -693,6 +701,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// emits.
     pub fn motion_field(&self) -> &MotionField {
         &self.motion_field
+    }
+
+    /// Read-only view of the round-24 HMVP table. Useful for tests that
+    /// want to assert the per-CU §8.5.2.16 update writes the inter path
+    /// performs after every inter CU (and the slice-start §7.3.11
+    /// reset state).
+    pub fn hmvp_table(&self) -> &HmvpTable {
+        &self.hmvp
     }
 
     /// Inject a per-picture SAO parameter array. Replaces the default
@@ -1347,12 +1363,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         );
         // Slice-aware merge list build: B-slice variants pad with
         // bi-pred zero-MV candidates per §8.5.2.2 step 9; P-slice
-        // variants pad with uni-pred zero-MV candidates.
+        // variants pad with uni-pred zero-MV candidates. Round-24
+        // also feeds the per-slice HMVP table through so §8.5.2.2
+        // step 7 (HMVP insertion per §8.5.2.6) lights up between
+        // the spatial slot fill and the zero-MV pad.
         let is_b = self.sh.sh_slice_type == SliceType::B;
         let mlist = if is_b {
-            build_merge_cand_list_b(&spatial, max_merge)
+            build_merge_cand_list_b(&spatial, max_merge, Some(&self.hmvp))
         } else {
-            build_merge_cand_list(&spatial, max_merge)
+            build_merge_cand_list(&spatial, max_merge, Some(&self.hmvp))
         };
         let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
         let chosen = mlist[idx];
@@ -1535,6 +1554,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
         self.motion_field
             .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, mvf);
+
+        // Round-24 §8.5.2.16 — push the just-decoded inter CU's
+        // motion field into the per-slice HMVP table. Subsequent
+        // CUs in the slice will see this entry through the §8.5.2.6
+        // walk during their merge-list assembly. Per the spec the
+        // update runs unconditionally for every inter CU (regular
+        // merge, MMVD, AMVP, etc.) — the round-23 subset only emits
+        // regular-merge inter CUs so we hit it here.
+        self.hmvp.update_with(mvf);
 
         // Record this CU for the deblocker. Inter CUs with cu_skip = 1
         // carry no residual, so all CBFs are 0.
