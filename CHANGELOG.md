@@ -6,6 +6,42 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **P-slice inter coding (round-21 subset)** — first inter path lands
+  for the smallest viable scope: `cu_skip_flag` + `general_merge_flag`
+  (inferred to 1 when skip) + `merge_data()` regular-merge subtree
+  (`merge_idx`). New `inter` module hosts the `MotionVector` /
+  `MvField` / `MotionField` per-4×4-block grid, `ReferencePicture`,
+  `derive_spatial_merge_candidates` (§8.5.2.3 — B1 → A1 → B0 → A0 →
+  B2 walk with the §6.4.4 availability + Log2ParMrgLevel suppression
+  + the spec's redundancy checks), `build_merge_cand_list` (§8.5.2.2
+  step 5 spatial-only assembly + step 9 zero-MV padding to
+  `MaxNumMergeCand`), and `mc_copy_block_int` for §8.5.6 integer-pel
+  motion compensation (luma + 4:2:0 chroma) with picture-edge clamping.
+  CABAC tables for `cu_skip_flag` (Table 64), `general_merge_flag`
+  (Table 82), `regular_merge_flag` (Table 102) and `merge_idx`
+  (Table 109) are wired through the new `LeafCuCtxs::init_with_init_type`
+  entry point with §9.3.2.2 / Table 51 init-type derivation
+  (I → 0; P → 1/2 from `sh_cabac_init_flag`; B → 2/1). The CTU walker
+  now accepts P-slices via `begin_slice` (B remains unsupported until
+  the bi-pred path lands), drives `set_ref_pic_list_l0` from the
+  caller, and `reconstruct_leaf_cu` dispatches into a new
+  `reconstruct_leaf_cu_inter` that builds the spatial merge list,
+  picks `mergeCandList[merge_idx]`, runs MC, and broadcasts the chosen
+  `MvField` across every 4×4 block of the CU so subsequent CUs read
+  it during their own merge derivation. 9 new lib unit tests
+  (`inter::tests`) + 2 new integration tests
+  (`decode_p_slice_all_skip_matches_reference` and
+  `decode_p_slice_writes_motion_field`) — the all-skip end-to-end
+  test synthesises a CABAC payload via
+  [`cabac_enc::ArithEncoder`](src/cabac_enc.rs) (split_cu_flag(0) →
+  cu_skip_flag(1) → merge_idx-bin0(0)) and verifies the decoded P
+  picture is byte-identical to a hand-painted reference frame. Out
+  of scope for this round (= still surfaces `Error::Unsupported`):
+  non-merge inter CUs (mvd_coding), non-skip merge CUs (cu_coded_flag
+  + residual), MMVD, CIIP, GPM, subblock merge, AMVR, BCW, fractional
+  MVs, B-slices, the §8.5.2.6 HMVP table, the §8.5.2.4 pairwise
+  average, and the §8.5.2.11 temporal collocated candidate.
+
 - **ISP — Intra Sub-Partitions** — round-20 win. New `isp` module
   implements the §7.4.12.2 / §8.4.5.1 sub-partition derivation:
   `num_intra_subpartitions` covers Table 13 (NoSplit → 1, (4,8) /

@@ -14,6 +14,7 @@ use oxideav_h266::alf::{AlfApsBinding, AlfCtb, AlfPicture};
 use oxideav_h266::aps::{AlfApsData, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS};
 use oxideav_h266::ctu::{CtuLayout, CtuWalker};
 use oxideav_h266::deblock::{apply_deblocking, DeblockCu, DeblockParams};
+use oxideav_h266::inter::ReferencePicture;
 use oxideav_h266::pps::PicParameterSet;
 use oxideav_h266::reconstruct::PictureBuffer;
 use oxideav_h266::sao::{SaoCtb, SaoCtbParams, SaoEoClass, SaoPicture, SaoTypeIdx};
@@ -532,6 +533,213 @@ fn ctu_walker_set_alf_picture_grid_check() {
     assert_eq!(walker.alf_picture().pic_width_in_ctbs_y, 1);
     assert_eq!(walker.alf_picture().pic_height_in_ctbs_y, 1);
     assert!(walker.alf_picture().is_all_off());
+}
+
+/// Round-21: a P-slice that encodes a single 8x8 all-skip CU produces a
+/// reconstructed picture identical to the supplied reference frame (plus
+/// any deblocking smoothing on a flat plane is a no-op). This is the
+/// smallest end-to-end smoke test for §8.5.2.2 spatial-merge derivation
+/// + §8.5.6 integer-pel motion compensation.
+///
+/// Bitstream synthesis: we use the workspace forward-CABAC encoder
+/// ([`oxideav_h266::cabac_enc::ArithEncoder`]) to drop the exact bin
+/// sequence the CTU walker will consume — split_cu_flag(0) → root CU
+/// stays unsplit at 8x8; cu_skip_flag(1) at Table 64 / ctxInc 0;
+/// general_merge_flag inferred 1; merge_idx bin0(0) at Table 109 /
+/// ctxInc 0 picks `mergeCandList[0]` = zero-MV / refIdx 0. With
+/// `MaxNumMergeCand = 6` >= 2 the merge_idx read does fire.
+#[test]
+fn decode_p_slice_all_skip_matches_reference() {
+    use oxideav_h266::cabac::ContextModel;
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_merge_idx};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    // ---- Reference (IDR) frame ------------------------------------------
+    // Paint a deterministic ramp into the reference picture so the
+    // post-decode buffer is uniquely identifiable. With all-skip + zero
+    // MV, the output of the P-slice decode must match this byte-for-byte.
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+    let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            ref_buf.luma.samples[y * 8 + x] = (10 + (y * 8 + x)) as u8;
+        }
+    }
+    for y in 0..(pic_h / 2) as usize {
+        for x in 0..(pic_w / 2) as usize {
+            ref_buf.cb.samples[y * 4 + x] = (90 + y * 4 + x) as u8;
+            ref_buf.cr.samples[y * 4 + x] = (170 + y * 4 + x) as u8;
+        }
+    }
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+    };
+
+    // ---- P-slice CABAC payload synthesis --------------------------------
+    // Slice QP = 26 (pps_init_qp_minus26 = 0; sh_qp_delta = 0). For
+    // sh_slice_type = P with sh_cabac_init_flag = 0, init_type = 1.
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, cabac_init_flag = 0
+                         // CTU is 32 (sps_log2_ctu_size_minus5 = 0), the picture is 8x8 so
+                         // the walker calls walk(0, 0, 8, 8). For an 8x8 root the leaf
+                         // walker reads split_cu_flag at depth 0 (since trailing_zeros(8) =
+                         // 3 > min_cb_log2 = 2). split_cu_flag's ctxInc with all neighbours
+                         // unavailable + the partition gate (no allowed splits at depth 0
+                         // beyond the root) lands at the formula in §9.3.4.2.2.
+                         //
+                         // Calling [`ctx_inc_split_cu_flag`] with the same args as the
+                         // walker keeps the encoder and decoder in lockstep.
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+
+    let mut enc = ArithEncoder::new();
+    // 1. split_cu_flag(0). ctxInc here mirrors the TreeWalker's call:
+    //    `ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1)`.
+    let split_inc =
+        oxideav_h266::ctx::ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_n_minus1 = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[split_inc.min(split_n_minus1)], 0)
+        .unwrap();
+
+    // 2. cu_skip_flag(1). ctxInc = (condL && availL) + (condA && availA)
+    //    = 0 (no neighbours). With init_type = 1 (P), the slot in the
+    //    9-entry table is `1 * 3 + 0 = 3`.
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+        .unwrap();
+    // 3. general_merge_flag is inferred to 1 — no bin emitted.
+    let _ = ctx_inc_general_merge_flag();
+    let _ = &mut general_merge_ctxs; // referenced by the parser when skip=0
+
+    // 4. merge_idx bin 0 = 0 → picks merge candidate 0 (zero-MV, refIdx 0).
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_n_minus1);
+    enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+        .unwrap();
+
+    // Terminate the stream cleanly so the decoder can read past the
+    // last bin without overrunning the byte boundary.
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header for a P-slice on a 8x8 picture --------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    let pps = dummy_pps(pic_w, pic_h);
+    let mut sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let _ = &mut sh;
+
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    // Avoid the cabac context model unused warning.
+    let _: &ContextModel = &cu_skip_ctxs[0];
+
+    // ---- Decode the P-slice ---------------------------------------------
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    // Seed the picture buffer with a sentinel so the test fails loudly
+    // if the inter path silently no-ops.
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // The decoded P-slice must match the reference (zero MV, single
+    // CU covering the whole picture, no residual). Apply deblocking
+    // for completeness — on a flat single CU it is a no-op.
+    walker.apply_in_loop_filters(&mut out).unwrap();
+
+    assert_eq!(
+        out.luma.samples, ref_buf.luma.samples,
+        "luma plane must equal reference frame after all-skip P-slice decode"
+    );
+    assert_eq!(
+        out.cb.samples, ref_buf.cb.samples,
+        "Cb plane must equal reference frame"
+    );
+    assert_eq!(
+        out.cr.samples, ref_buf.cr.samples,
+        "Cr plane must equal reference frame"
+    );
+}
+
+/// Round-21: P-slice merge derivation with a single CU should cleanly
+/// pad out to MaxNumMergeCand zero-MV entries when no spatial neighbours
+/// exist. Verified by inspecting the walker's per-picture motion field
+/// after decode: the chosen MvField for the (only) skip CU must carry
+/// ref_idx_l0 = 0 (the zero-MV pad slot).
+#[test]
+fn decode_p_slice_writes_motion_field() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+    };
+    // Synthesize the same all-skip stream as above.
+    let slice_qp = 26;
+    let init_type = 1u8;
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut enc = ArithEncoder::new();
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+        .unwrap();
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_ctxs.len() - 1);
+    enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+        .unwrap();
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // Inspect the motion field: every 4x4 block in the picture must
+    // carry the chosen zero-MV / refIdx 0 record from the merge list.
+    let mf = walker.motion_field();
+    for by in 0..mf.blocks_h {
+        for bx in 0..mf.blocks_w {
+            let f = mf.field[(by * mf.blocks_w + bx) as usize];
+            assert!(f.available, "block ({bx},{by}) must be marked available");
+            assert!(f.pred_flag_l0);
+            assert_eq!(f.ref_idx_l0, 0);
+            assert_eq!(f.mv_l0.x, 0);
+            assert_eq!(f.mv_l0.y, 0);
+            assert!(f.cu_skip_flag);
+            assert!(f.mode_inter);
+        }
+    }
 }
 
 /// Chroma ALF wiring: install a per-CTB Cb-on record + a chroma APS

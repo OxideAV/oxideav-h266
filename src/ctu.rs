@@ -73,6 +73,10 @@ use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
+use crate::inter::{
+    build_merge_cand_list, derive_spatial_merge_candidates, mc_copy_block_int, MotionField,
+    MvField, ReferencePicture,
+};
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
     CuNeighbourhood, CuPredMode, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
@@ -511,6 +515,20 @@ pub struct CtuWalker<'a, 'b> {
     /// bins; callers (and integration tests) populate this array
     /// programmatically via [`Self::set_alf_picture`].
     alf_picture: AlfPicture,
+    /// Round-21 reference-picture list 0. The merge-mode `merge_idx`
+    /// resolves to an `MvField` with `ref_idx_l0` indexing into this
+    /// list. Empty for I-slices; populated by callers via
+    /// [`Self::set_ref_pic_list_l0`] before `decode_picture_into`
+    /// for P-slices.
+    ref_pic_list_l0: Vec<ReferencePicture>,
+    /// Round-21 per-picture motion field — written by
+    /// [`Self::reconstruct_leaf_cu`] for inter CUs and read back during
+    /// the §8.5.2.3 spatial-merge derivation of subsequent CUs.
+    motion_field: MotionField,
+    /// `Log2ParMrgLevel` from `pps_log2_parallel_merge_level_minus2 + 2`
+    /// (§7.4.3.5). Drives the spec's same-parallel-merge-tile
+    /// neighbour-suppression rule.
+    log2_par_mrg_level: u32,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -551,15 +569,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ));
             }
         }
-        // I-slice only for the scaffold. P/B need inter-specific CABAC
-        // tables + reference picture list construction which are out
-        // of scope for this increment.
-        if sh.sh_slice_type != SliceType::I {
-            return Err(Error::unsupported(format!(
-                "h266 CTU walker: slice type {:?} not supported by scaffold \
-                 (intra-only path implemented; inter needs RPL + inter-CABAC tables)",
-                sh.sh_slice_type,
-            )));
+        // P-slices are now handled by the round-21 inter path (cu_skip
+        // + regular merge). B-slices remain unsupported because the
+        // round-21 merge subset is L0-only — bi-prediction needs the
+        // §8.5.2.2 step-4 second list invocation + the §8.5.6.4
+        // weighted bi-pred path, which land in r22+.
+        if sh.sh_slice_type == SliceType::B {
+            return Err(Error::unsupported(
+                "h266 CTU walker: B-slice not supported (round-21 inter is P / L0 only)",
+            ));
         }
         // Dual-tree luma/chroma separate partitioning is not yet
         // modelled.
@@ -596,13 +614,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let slice_qp = SliceQpY::derive(sps, pps, sh, ph_qp_delta);
         let cabac_state = SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag);
         let arith = ArithDecoder::new(cabac_payload)?;
-        let leaf_ctxs = LeafCuCtxs::init(slice_qp.as_init_qp());
+        // §9.3.2.2 / Table 51 — initType = 0 for I, otherwise picks
+        // 1 / 2 from `sh_cabac_init_flag` per the slice type. The same
+        // value drives the [`sao_syntax::SaoSyntaxConfig::init_type`]
+        // helper for the SAO bundle.
+        let init_type: u8 = match sh.sh_slice_type {
+            SliceType::I => 0,
+            SliceType::P => {
+                if sh.sh_cabac_init_flag {
+                    2
+                } else {
+                    1
+                }
+            }
+            SliceType::B => {
+                if sh.sh_cabac_init_flag {
+                    1
+                } else {
+                    2
+                }
+            }
+        };
+        let leaf_ctxs = LeafCuCtxs::init_with_init_type(slice_qp.as_init_qp(), init_type);
 
         let sao_picture =
             SaoPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
         let sao_ctxs = SaoCtxs::init(slice_qp.as_init_qp());
         let alf_picture =
             AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
+        let motion_field = MotionField::new(layout.pic_width_luma, layout.pic_height_luma);
+        // §7.4.3.5 — Log2ParMrgLevel = pps_log2_parallel_merge_level_minus2
+        // + 2. Our PPS parser does not yet surface that field, so we
+        // default to the spec minimum (2 → ParMrgLevel = 4) which is
+        // also the value our test fixture emits.
+        let log2_par_mrg_level: u32 = 2;
         Ok(Self {
             layout,
             sps,
@@ -615,7 +660,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             sao_picture,
             sao_ctxs,
             alf_picture,
+            ref_pic_list_l0: Vec::new(),
+            motion_field,
+            log2_par_mrg_level,
         })
+    }
+
+    /// Install the per-slice reference-picture list 0. P-slice callers
+    /// must invoke this before `decode_picture_into` so the round-21
+    /// inter path has a reference to copy from. Subsequent re-use of
+    /// the walker for another slice should reset this list — but the
+    /// walker is one-shot today (`begin_slice` builds a fresh one).
+    pub fn set_ref_pic_list_l0(&mut self, list: Vec<ReferencePicture>) {
+        self.ref_pic_list_l0 = list;
+    }
+
+    /// Read-only view of the round-21 motion field. Useful for tests
+    /// that want to assert the per-CU MvField writes the inter path
+    /// emits.
+    pub fn motion_field(&self) -> &MotionField {
+        &self.motion_field
     }
 
     /// Inject a per-picture SAO parameter array. Replaces the default
@@ -741,6 +805,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     pub fn cu_tool_flags(&self) -> CuToolFlags {
         let tf = &self.sps.tool_flags;
         let max_ts = 1u32 << (tf.log2_transform_skip_max_size_minus2 + 2);
+        let max_num_merge = 6u32.saturating_sub(tf.six_minus_max_num_merge_cand);
         CuToolFlags {
             ibc: tf.ibc_enabled_flag,
             palette: tf.palette_enabled_flag,
@@ -759,6 +824,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             chroma_qp_offset_list_len_minus1: 0,
             joint_cbcr_enabled: tf.joint_cbcr_enabled_flag,
             ts_residual_coding_disabled: self.sh.sh_ts_residual_coding_disabled_flag,
+            slice_is_inter: self.sh.sh_slice_type != SliceType::I,
+            max_num_merge_cand: max_num_merge,
         }
     }
 
@@ -809,20 +876,42 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let cus = self.decode_ctu_partitions(ctu)?;
         let mut infos = Vec::with_capacity(cus.len());
         let mut residuals = Vec::with_capacity(cus.len());
-        // Neighbour tracking is rudimentary in this round: we pass
-        // the default empty neighbourhood so every CU decodes as if it
-        // were at the top-left of the slice. The MPM candidate list
-        // will therefore fall back to the "neither above DC" branch
-        // (PLANAR / 50 / 18 / 46 / 54), which is spec-legal — it's
-        // just not the finest context the decoder could have. Refining
-        // this will happen when the left/above neighbour grid lands.
-        let neigh = CuNeighbourhood::default();
+        // Neighbour tracking for the round-21 inter path: cu_skip_flag's
+        // §9.3.4.2.2 ctxInc reads `CuSkipFlag[xNbX][yNbX]` from the
+        // motion-field grid the inter reconstruct pass writes. We sample
+        // it at (x-1, y) for the left neighbour and (x, y-1) for the
+        // above neighbour. Intra reads still flow through
+        // [`CuNeighbourhood::default()`] — refining the intra MPM
+        // neighbour grid is unrelated to this round.
         for ccu in &cus {
+            let neigh = self.compute_cu_neighbourhood(ccu);
             let (info, residual) = self.decode_leaf_cu_syntax(ccu, &neigh)?;
             infos.push(info);
             residuals.push(residual);
         }
         Ok((cus, infos, residuals))
+    }
+
+    /// Build a [`CuNeighbourhood`] for a CU at `ccu.cu.(x, y)` by
+    /// sampling the motion field (which carries the cu_skip_flag /
+    /// mode_inter propagation needed by §9.3.4.2.2). The intra-side
+    /// fields (`left` / `above` IntraNeighbour) stay default — the
+    /// round-21 inter walker does not need MPM neighbour info, and
+    /// the intra walker continues to use `CuNeighbourhood::default()`
+    /// via the explicit zero fall-back.
+    fn compute_cu_neighbourhood(&self, ccu: &CtuCu) -> CuNeighbourhood {
+        let x = ccu.cu.x as i32;
+        let y = ccu.cu.y as i32;
+        let left = self.motion_field.get_at_luma(x - 1, y);
+        let above = self.motion_field.get_at_luma(x, y - 1);
+        CuNeighbourhood {
+            left_available: x > 0,
+            above_available: y > 0,
+            left: None,
+            above: None,
+            left_cu_skip: left.available && left.cu_skip_flag,
+            above_cu_skip: above.available && above.cu_skip_flag,
+        }
     }
 
     /// Immutable view of the CTU geometry the walker was built against.
@@ -934,6 +1023,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        // Round-21 inter dispatch — runs the §8.5.2 spatial-merge
+        // derivation, picks `mergeCandList[merge_idx]`, and writes the
+        // MC'd block into the output buffer (luma + chroma). The
+        // motion field is updated so subsequent CUs can read this CU
+        // as an A/B neighbour during their own merge derivation.
+        if matches!(info.pred_mode, CuPredMode::Inter) {
+            return self.reconstruct_leaf_cu_inter(cu, info, out);
+        }
+
         // MIP (§8.4.5.2.2) is wired below through [`crate::mip`]; the
         // prediction step dispatches on `info.intra_mip_flag` and
         // replaces the angular / PLANAR / DC prediction with the
@@ -1183,6 +1281,151 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cb_coded: info.tu_cb_coded_flag,
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: info.intra_bdpcm_luma,
+            bdpcm_chroma: false,
+        });
+        Ok(())
+    }
+
+    /// Round-21 inter-CU reconstruction.
+    ///
+    /// Pipeline (P-slice, regular-merge subset only):
+    ///
+    /// 1. Build the §8.5.2.3 spatial-merge candidate list at the CU's
+    ///    `(xCb, yCb)` from the live [`MotionField`].
+    /// 2. Assemble the §8.5.2.2 mergeCandList (spatial only here +
+    ///    zero-MV padding to `MaxNumMergeCand`).
+    /// 3. Pick `mergeCandList[merge_idx]`; the resulting
+    ///    `(refIdxL0, mvL0)` drives §8.5.6 motion compensation.
+    /// 4. Run integer-pel MC ([`mc_copy_block_int`]) on luma and
+    ///    chroma planes — the round-21 fixture only exercises zero
+    ///    MVs, so MC collapses to a copy from the reference picture's
+    ///    co-located block. Fractional positions and the §8.5.6.3
+    ///    8-tap filter land in r22+ alongside non-merge inter CUs.
+    /// 5. Broadcast the chosen `MvField` across every 4x4 block in
+    ///    the CU so the next CU's merge derivation can read it.
+    /// 6. Append a zero-CBF [`DeblockCu`] record (skip CUs are coded
+    ///    without residual) so the deblocker sees the inter boundary.
+    fn reconstruct_leaf_cu_inter(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        let max_merge = self.cu_tool_flags().max_num_merge_cand;
+        let xcb = cu.cu.x as i32;
+        let ycb = cu.cu.y as i32;
+        let cb_w = cu.cu.w as i32;
+        let cb_h = cu.cu.h as i32;
+        let spatial = derive_spatial_merge_candidates(
+            xcb,
+            ycb,
+            cb_w,
+            cb_h,
+            &self.motion_field,
+            self.log2_par_mrg_level,
+        );
+        let mlist = build_merge_cand_list(&spatial, max_merge);
+        let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
+        let chosen = mlist[idx];
+
+        if !chosen.pred_flag_l0 {
+            return Err(Error::invalid(
+                "h266 inter: chosen merge candidate has predFlagL0 == 0; \
+                 round-21 P-slice path requires L0 prediction",
+            ));
+        }
+        if chosen.ref_idx_l0 < 0 || (chosen.ref_idx_l0 as usize) >= self.ref_pic_list_l0.len() {
+            return Err(Error::invalid(format!(
+                "h266 inter: refIdxL0 {} out of range — RefPicList0 has {} entries",
+                chosen.ref_idx_l0,
+                self.ref_pic_list_l0.len()
+            )));
+        }
+        if !chosen.mv_l0.is_integer_pel() {
+            return Err(Error::unsupported(format!(
+                "h266 inter: fractional-pel MV ({}/16, {}/16) not supported in round-21 \
+                 (8-tap luma filter / bilinear chroma interp not yet wired)",
+                chosen.mv_l0.x, chosen.mv_l0.y
+            )));
+        }
+
+        let ref_pic = &self.ref_pic_list_l0[chosen.ref_idx_l0 as usize];
+        let ref_x_l = xcb + chosen.mv_l0.int_x();
+        let ref_y_l = ycb + chosen.mv_l0.int_y();
+
+        // Luma MC.
+        mc_copy_block_int(
+            &mut out.luma,
+            cu.cu.x,
+            cu.cu.y,
+            cu.cu.w,
+            cu.cu.h,
+            &ref_pic.frame.luma,
+            ref_x_l,
+            ref_y_l,
+        )?;
+
+        // Chroma MC for 4:2:0. The MV's chroma components live at half
+        // luma resolution per §8.5.6.3.4 — for the integer-pel path
+        // here we just halve the integer offsets (round towards 0;
+        // round-21 only has zero MVs, so no rounding ambiguity).
+        if self.sps.sps_chroma_format_idc == 1 {
+            let cb_w_c = cu.cu.w / 2;
+            let cb_h_c = cu.cu.h / 2;
+            let cb_x_c = cu.cu.x / 2;
+            let cb_y_c = cu.cu.y / 2;
+            let ref_x_c = ref_x_l / 2;
+            let ref_y_c = ref_y_l / 2;
+            mc_copy_block_int(
+                &mut out.cb,
+                cb_x_c,
+                cb_y_c,
+                cb_w_c,
+                cb_h_c,
+                &ref_pic.frame.cb,
+                ref_x_c,
+                ref_y_c,
+            )?;
+            mc_copy_block_int(
+                &mut out.cr,
+                cb_x_c,
+                cb_y_c,
+                cb_w_c,
+                cb_h_c,
+                &ref_pic.frame.cr,
+                ref_x_c,
+                ref_y_c,
+            )?;
+        }
+
+        // Broadcast the chosen MvField across every 4x4 block of the
+        // CU. The cu_skip_flag flag is propagated so the next CU's
+        // §9.3.4.2.2 cu_skip_flag context picks it up correctly.
+        let mvf = MvField {
+            mv_l0: chosen.mv_l0,
+            ref_idx_l0: chosen.ref_idx_l0,
+            pred_flag_l0: true,
+            cu_skip_flag: info.inter.cu_skip_flag,
+            mode_inter: true,
+            available: true,
+        };
+        self.motion_field
+            .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, mvf);
+
+        // Record this CU for the deblocker. Inter CUs with cu_skip = 1
+        // carry no residual, so all CBFs are 0.
+        let qp_y = self.cabac.slice_qp_y.0;
+        self.deblock_cus.push(DeblockCu {
+            x: cu.cu.x,
+            y: cu.cu.y,
+            w: cu.cu.w,
+            h: cu.cu.h,
+            qp_y: qp_y.clamp(0, 63),
+            intra: false,
+            tu_y_coded: false,
+            tu_cb_coded: false,
+            tu_cr_coded: false,
+            bdpcm_luma: false,
             bdpcm_chroma: false,
         });
         Ok(())
@@ -1966,14 +2209,22 @@ mod tests {
     }
 
     #[test]
-    fn walker_rejects_inter_slice_types() {
+    fn walker_accepts_p_slice_rejects_b_slice() {
+        // Round-21: P-slices are now accepted via the inter path
+        // (cu_skip + regular merge). B-slices remain unsupported until
+        // the bi-pred path lands in r22+.
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
-        let mut sh = intra_slice_header();
-        sh.sh_slice_type = SliceType::P;
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 8];
-        let err = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err();
+        let mut sh_p = intra_slice_header();
+        sh_p.sh_slice_type = SliceType::P;
+        // P should construct fine — the inter walker will then drive
+        // cu_skip_flag etc. inside `decode_picture_into`.
+        assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh_p, 0, &data).is_ok());
+        let mut sh_b = intra_slice_header();
+        sh_b.sh_slice_type = SliceType::B;
+        let err = CtuWalker::begin_slice(&layout, &sps, &pps, &sh_b, 0, &data).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)));
     }
 

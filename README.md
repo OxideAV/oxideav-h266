@@ -42,11 +42,29 @@ oxideav-h266 = "0.0"
 
 ## Decode support
 
-**None.** Reconstruction (CTU walker, intra prediction, transforms,
-deblock, ALF, LMCS, SAO-replacement, reference picture lists, etc.)
-is out of scope for this foundation pass. The crate's `Decoder`
-registration returns `Error::Unsupported` for any packet that would
-require pixel output.
+The reconstruction pipeline is being built incrementally and now covers
+the **intra-only single-tile single-slice subset** plus the round-21
+**P-slice all-skip / regular-merge subset**:
+
+* **Intra**: PLANAR / DC / cardinal angular intra (modes 2, 18, 34, 50,
+  66) + MIP (§8.4.5.2.2 — all 30 weight matrices) + CCLM (§8.4.5.2.14)
+  + BDPCM + ISP (§8.4.5.1, all 4 split types).
+* **Inter (round-21)**: P-slice `cu_skip_flag` + `general_merge_flag`
+  inference + `merge_data()` regular-merge subset (`merge_idx`),
+  §8.5.2.3 spatial-merge candidate derivation (5-position
+  B1/A1/B0/A0/B2 list with redundancy checks), §8.5.2.2 mergeCandList
+  assembly with zero-MV padding, and §8.5.6 integer-pel motion
+  compensation. Single L0 reference, no fractional pel, no MMVD / GPM
+  / CIIP / AMVR / BCW yet.
+* **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
+  DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
+* **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
+  / shiftIdx tables for everything currently parsed (cu_skip /
+  general_merge / regular_merge / merge_idx now included).
+* **In-loop filters**: §8.8.3 deblocking, §8.8.4 SAO (Edge + Band
+  offset), §8.8.5 ALF including the fixed-filter family + CC-ALF.
+* **B-slices, non-skip merge, mvd_coding (non-merge inter), MMVD, GPM,
+  CIIP, AMVR, BCW**: still surface `Error::Unsupported`.
 
 ## Usage
 

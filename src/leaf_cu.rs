@@ -49,12 +49,13 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
-    ctx_inc_intra_bdpcm_chroma_dir_flag, ctx_inc_intra_bdpcm_chroma_flag,
-    ctx_inc_intra_bdpcm_luma_dir_flag, ctx_inc_intra_bdpcm_luma_flag,
-    ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+    ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_intra_bdpcm_chroma_dir_flag,
+    ctx_inc_intra_bdpcm_chroma_flag, ctx_inc_intra_bdpcm_luma_dir_flag,
+    ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
 };
+use crate::inter::{InterCuInfo, MergeData};
 use crate::residual::{
     decode_tb_coefficients, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
     read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
@@ -129,6 +130,14 @@ pub struct CuToolFlags {
     /// `sh_ts_residual_coding_disabled_flag`. When set the
     /// `transform_skip_flag` path is elided in the residual walker.
     pub ts_residual_coding_disabled: bool,
+    /// True for P/B-slices (i.e. `sh_slice_type != I`). Routes the
+    /// reader through the round-21 cu_skip_flag → merge_data path
+    /// instead of the I-slice intra path.
+    pub slice_is_inter: bool,
+    /// `MaxNumMergeCand` derived per §7.4.3.4 eq. 58 (`6 -
+    /// sps_six_minus_max_num_merge_cand`). Only meaningful when
+    /// `slice_is_inter == true`.
+    pub max_num_merge_cand: u32,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -210,6 +219,9 @@ pub struct LeafCuInfo {
     pub last_sig_x: u32,
     /// `LastSignificantCoeffY` for the luma TB.
     pub last_sig_y: u32,
+    /// Inter-coding side state populated by the P/B-slice parse path
+    /// (round-21). Empty/default when the CU is intra.
+    pub inter: InterCuInfo,
 }
 
 impl Default for LeafCuInfo {
@@ -244,6 +256,14 @@ impl Default for LeafCuInfo {
             cu_chroma_qp_offset_idx: 0,
             last_sig_x: 0,
             last_sig_y: 0,
+            inter: InterCuInfo {
+                cu_skip_flag: false,
+                general_merge_flag: false,
+                merge_data: MergeData {
+                    regular_merge_flag: false,
+                    merge_idx: 0,
+                },
+            },
         }
     }
 }
@@ -321,6 +341,24 @@ pub struct LeafCuCtxs {
     pub intra_luma_mpm_flag: Vec<ContextModel>,
     pub intra_luma_not_planar_flag: Vec<ContextModel>,
     pub intra_chroma_pred_mode: Vec<ContextModel>,
+    /// `cu_skip_flag` (Table 64) — full 9-entry bundle. The per-slice
+    /// `init_type` selects the slot used at parse time: `init_type * 3
+    /// + ctxInc`.
+    pub cu_skip_flag: Vec<ContextModel>,
+    /// `general_merge_flag` (Table 82) — 3-entry, indexed by
+    /// `init_type`.
+    pub general_merge_flag: Vec<ContextModel>,
+    /// `regular_merge_flag` (Table 102) — 4 entries spread across the
+    /// non-I initTypes (slots 0-1 for P, 2-3 for B). Indexed at parse
+    /// time as `(init_type - 1) * 2 + ctxInc` (init_type 1 / 2 only).
+    pub regular_merge_flag: Vec<ContextModel>,
+    /// `merge_idx` (Table 109) — 3-entry, indexed by `init_type`.
+    pub merge_idx: Vec<ContextModel>,
+    /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
+    /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
+    /// inter-syntax reads to pick the right slot inside the
+    /// per-Table CABAC bundles.
+    pub init_type: u8,
     /// CBF + residual + last-sig-coeff context arrays. Shared with
     /// [`crate::residual`] so the leaf reader + the residual reader
     /// advance the same CABAC state machine.
@@ -355,8 +393,18 @@ impl std::fmt::Debug for LeafCuCtxs {
 }
 
 impl LeafCuCtxs {
-    /// Build all context arrays using the supplied SliceQpY.
+    /// Build all context arrays using the supplied SliceQpY. Defaults
+    /// to `init_type = 0` (I-slice). For P/B-slices the caller must
+    /// invoke [`Self::init_with_init_type`] so the inter-syntax reads
+    /// land in the correct row of Tables 64 / 82 / 102 / 109.
     pub fn init(slice_qp_y: i32) -> Self {
+        Self::init_with_init_type(slice_qp_y, 0)
+    }
+
+    /// Build all context arrays using the supplied SliceQpY and the
+    /// per-slice `init_type` (§9.3.2.2 / Table 51 — 0 for I, 1 / 2 for
+    /// P / B based on `sh_cabac_init_flag`).
+    pub fn init_with_init_type(slice_qp_y: i32, init_type: u8) -> Self {
         Self {
             intra_bdpcm_luma_flag: init_contexts(SyntaxCtx::IntraBdpcmLumaFlag, slice_qp_y),
             intra_bdpcm_luma_dir_flag: init_contexts(SyntaxCtx::IntraBdpcmLumaDirFlag, slice_qp_y),
@@ -381,6 +429,11 @@ impl LeafCuCtxs {
                 slice_qp_y,
             ),
             intra_chroma_pred_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
+            cu_skip_flag: init_contexts(SyntaxCtx::CuSkipFlag, slice_qp_y),
+            general_merge_flag: init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp_y),
+            regular_merge_flag: init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp_y),
+            merge_idx: init_contexts(SyntaxCtx::MergeIdx, slice_qp_y),
+            init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
     }
@@ -583,6 +636,11 @@ pub struct CuNeighbourhood {
     pub above_available: bool,
     pub left: Option<IntraNeighbour>,
     pub above: Option<IntraNeighbour>,
+    /// `CuSkipFlag[xNbL][yNbL]` — used by §9.3.4.2.2 cu_skip_flag
+    /// context derivation.
+    pub left_cu_skip: bool,
+    /// `CuSkipFlag[xNbA][yNbA]`.
+    pub above_cu_skip: bool,
 }
 
 /// Leaf-CU syntax reader. Stateless w.r.t. the spec (each call to
@@ -617,6 +675,16 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         neigh: &CuNeighbourhood,
     ) -> Result<()> {
         info.pred_mode = CuPredMode::Intra; // I-slice default (§7.4.12.2).
+
+        // ---- Round-21 P/B-slice inter path ------------------------------
+        //
+        // §7.3.11.5 cu_skip_flag is read only outside the
+        // `cbWidth==4 && cbHeight==4` (and IBC corner) cases. In an
+        // inter slice we always read it for the supported sizes; for
+        // 4x4 CUs we infer cu_skip_flag = 0 (no IBC support yet).
+        if self.tools.slice_is_inter {
+            return self.decode_inter(info, residual, neigh);
+        }
 
         // IBC / palette are not currently walked: the flags are
         // grouped here to surface `Error::Unsupported` the moment the
@@ -827,6 +895,146 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         self.decode_transform_unit(info, residual)?;
 
         Ok(())
+    }
+
+    /// Round-21 P/B-slice inter-CU parser. Reads `cu_skip_flag` →
+    /// `general_merge_flag` → `merge_data()` (regular-merge subset
+    /// only) per §7.3.11.5 + §7.3.11.7. Non-merge inter CUs (which
+    /// would carry `mvd_coding()` and friends) surface
+    /// `Error::Unsupported` so callers see exactly which construct is
+    /// pending — the round-21 decoder pipeline only handles the all-
+    /// merge / all-skip case.
+    fn decode_inter(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+        neigh: &CuNeighbourhood,
+    ) -> Result<()> {
+        // §7.3.11.5: cu_skip_flag is signalled when the CU is not
+        // 4x4 (and treeType != DUAL_TREE_CHROMA). For 4x4 it is
+        // implicitly 0 (the IBC corner only applies when sps_ibc_enabled).
+        let cb_is_4x4 = info.cb_width == 4 && info.cb_height == 4;
+        let init_type_offset = (self.ctxs.init_type as usize) * 3;
+        let cu_skip = if !cb_is_4x4 {
+            let inc = ctx_inc_cu_skip_flag(
+                neigh.left_available,
+                neigh.above_available,
+                neigh.left_cu_skip,
+                neigh.above_cu_skip,
+            ) as usize;
+            let n = self.ctxs.cu_skip_flag.len() - 1;
+            let bit = self
+                .dec
+                .decode_decision(&mut self.ctxs.cu_skip_flag[(init_type_offset + inc).min(n)])?;
+            bit == 1
+        } else {
+            false
+        };
+        info.inter.cu_skip_flag = cu_skip;
+
+        // pred_mode_flag is signalled when cu_skip_flag == 0 in P/B for
+        // CUs that are not 4x4 and treeType is single. Round-21 does
+        // not yet support non-merge inter CUs (they need MVD coding).
+        // Force MODE_INTER. When cu_skip_flag == 1 the CU is also
+        // necessarily MODE_INTER (and general_merge_flag is inferred 1).
+        info.pred_mode = CuPredMode::Inter;
+
+        // pred_mode_ibc_flag: not parsed (sps_ibc_enabled_flag = false
+        // in r21 fixtures).
+
+        // §7.3.11.5 inter else-branch: if !cu_skip_flag, read
+        // general_merge_flag. Otherwise infer it to 1.
+        let general_merge_flag = if !cu_skip {
+            let inc = ctx_inc_general_merge_flag() as usize;
+            let n = self.ctxs.general_merge_flag.len() - 1;
+            let ctx_idx = (init_type_offset + inc).min(n);
+            let bit = self
+                .dec
+                .decode_decision(&mut self.ctxs.general_merge_flag[ctx_idx])?;
+            bit == 1
+        } else {
+            true
+        };
+        info.inter.general_merge_flag = general_merge_flag;
+
+        if !general_merge_flag {
+            // Non-merge inter CU — needs mvd_coding() + ref_idx + amvr.
+            // Out of scope for round-21 (covered by r22+).
+            return Err(Error::unsupported(
+                "h266 leaf CU inter: non-merge inter CUs (mvd_coding) not supported in round-21 \
+                 (only cu_skip / regular-merge are wired)",
+            ));
+        }
+
+        // ---- merge_data() (§7.3.11.7) -----------------------------------
+        //
+        // Round-21 covers the regular-merge subset. The spec gating for
+        // regular_merge_flag depends on sps_ciip_enabled_flag /
+        // sps_gpm_enabled_flag (both off in our fixtures), so the gate
+        // collapses and regular_merge_flag is inferred to 1. The
+        // round-21 fixture also clamps cbWidth, cbHeight < 128 always,
+        // so the "subblock_flag" branch is gated only by
+        // MaxNumSubblockMergeCand > 0 — also off in r21.
+        //
+        // We therefore directly parse merge_idx as an unconditional
+        // truncated-rice with cMax = MaxNumMergeCand - 1 (>= 1; the
+        // size==1 case skips the read entirely per spec).
+        info.inter.merge_data.regular_merge_flag = true;
+
+        let max_merge = self.tools.max_num_merge_cand;
+        let merge_idx = if max_merge > 1 {
+            self.read_merge_idx(max_merge)?
+        } else {
+            0
+        };
+        info.inter.merge_data.merge_idx = merge_idx;
+
+        // Round-21 skip-only path: when cu_skip_flag is 1 the CU has no
+        // residual (no cu_coded_flag, no transform_unit reads). Set
+        // CBFs to 0 and return. Non-skip merge would parse cu_coded_flag
+        // + a transform_tree() body — that stays in r22+ scope until
+        // residual decoding for inter is wired.
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = false;
+        info.tu_cr_coded_flag = false;
+        let _ = residual;
+        if !cu_skip {
+            return Err(Error::unsupported(
+                "h266 leaf CU inter: non-skip merge CUs (cu_coded_flag + residual) not supported \
+                 in round-21 (only cu_skip path is wired)",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Decode `merge_idx[x0][y0]` per Table 132 — bin 0 context-coded
+    /// (ctx 0 of MergeIdx table), bins 1..4 bypass-coded. Truncated-
+    /// unary binarisation with `cMax = max_merge - 1`. Returns the
+    /// decoded index (0..=cMax).
+    fn read_merge_idx(&mut self, max_merge: u32) -> Result<u32> {
+        if max_merge < 2 {
+            return Ok(0);
+        }
+        let cmax = max_merge - 1;
+        let init_type_offset = self.ctxs.init_type as usize;
+        let n = self.ctxs.merge_idx.len() - 1;
+        let ctx_idx = init_type_offset.min(n);
+        let bit0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.merge_idx[ctx_idx])?;
+        if bit0 == 0 {
+            return Ok(0);
+        }
+        let mut val = 1u32;
+        while val < cmax {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
     }
 
     /// Read the transform_unit()-level syntax (CBFs, cu_qp_delta,
@@ -1574,6 +1782,8 @@ mod tests {
             chroma_qp_offset_list_len_minus1: 0,
             joint_cbcr_enabled: false,
             ts_residual_coding_disabled: false,
+            slice_is_inter: false,
+            max_num_merge_cand: 6,
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();

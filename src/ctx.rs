@@ -186,6 +186,43 @@ pub fn ctx_inc_intra_subpartitions_split_flag() -> u32 {
     0
 }
 
+/// ctxInc for `cu_skip_flag[x0][y0]` per §9.3.4.2.2 eq. 1551 + Table 133.
+/// Returns 0..2 — `(condL && availableL) + (condA && availableA)` with
+/// `condX = CuSkipFlag[xNbX][yNbX]` and `ctxSetIdx = 0`. The full
+/// per-slice `ctxIdx = init_type * 3 + this_value` mapping happens in
+/// the slice CABAC bundle (see [`crate::tables::CU_SKIP_FLAG_INIT`]).
+pub fn ctx_inc_cu_skip_flag(
+    available_l: bool,
+    available_a: bool,
+    left_skip: bool,
+    above_skip: bool,
+) -> u32 {
+    let cond_l = available_l && left_skip;
+    let cond_a = available_a && above_skip;
+    (cond_l as u32) + (cond_a as u32)
+}
+
+/// ctxInc for `general_merge_flag[x0][y0]` — fixed 0 (Table 132).
+pub fn ctx_inc_general_merge_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `regular_merge_flag[x0][y0]` per Table 132 — yields 0
+/// when `cu_skip_flag` is 1 and 1 otherwise.
+pub fn ctx_inc_regular_merge_flag(cu_skip_flag: bool) -> u32 {
+    if cu_skip_flag {
+        0
+    } else {
+        1
+    }
+}
+
+/// ctxInc for `merge_idx[x0][y0]` — fixed 0 (Table 132). Subsequent
+/// bins are bypass-coded.
+pub fn ctx_inc_merge_idx() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///

@@ -41,6 +41,10 @@
 //!   per initType).
 //! * `sao_type_idx_luma` / `sao_type_idx_chroma` — Table 58 (3 ctxIdx, one
 //!   per initType).
+//! * `cu_skip_flag` — Table 64 (9 ctxIdx, 3 per initType).
+//! * `general_merge_flag` — Table 82 (3 ctxIdx, one per initType).
+//! * `regular_merge_flag` — Table 102 (4 ctxIdx, two per non-I initType).
+//! * `merge_idx` — Table 109 (3 ctxIdx, one per initType).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
@@ -82,6 +86,15 @@ pub enum SyntaxCtx {
     /// Table 58 — `sao_type_idx_luma` and `sao_type_idx_chroma` share the
     /// same 3-entry table (one ctxIdx per initType).
     SaoTypeIdx,
+    /// Table 64 — `cu_skip_flag` (9 ctxIdx, 3 per initType).
+    CuSkipFlag,
+    /// Table 82 — `general_merge_flag` (3 ctxIdx, one per initType).
+    GeneralMergeFlag,
+    /// Table 102 — `regular_merge_flag` (4 ctxIdx, two per initType for the
+    /// last two initTypes; initType 0 is unused → only 4 entries shown).
+    RegularMergeFlag,
+    /// Table 109 — `merge_idx` (3 ctxIdx, one per initType).
+    MergeIdx,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -295,6 +308,32 @@ pub const SAO_MERGE_FLAG_SHIFT: &[u8] = &[0, 0, 0];
 pub const SAO_TYPE_IDX_INIT: &[u8] = &[13, 5, 2];
 pub const SAO_TYPE_IDX_SHIFT: &[u8] = &[4, 4, 4];
 
+/// Table 64 — `cu_skip_flag` (9 ctxIdx, 3 per initType).
+/// `ctxInc = (condL && availableL) + (condA && availableA) + ctxSetIdx*3`
+/// per §9.3.4.2.2 with `condX = CuSkipFlag[xNbX][yNbX]` and
+/// `ctxSetIdx = 0`. Final ctxIdx = `initType * 3 + ctxInc` (P/B paths
+/// only; `cu_skip_flag` is only signalled for non-I slices outside the
+/// IBC corner case).
+pub const CU_SKIP_FLAG_INIT: &[u8] = &[0, 26, 28, 57, 59, 45, 57, 60, 46];
+pub const CU_SKIP_FLAG_SHIFT: &[u8] = &[5, 4, 8, 5, 4, 8, 5, 4, 8];
+
+/// Table 82 — `general_merge_flag` (3 ctxIdx, one per initType).
+/// ctxInc = 0 per Table 132.
+pub const GENERAL_MERGE_FLAG_INIT: &[u8] = &[26, 21, 6];
+pub const GENERAL_MERGE_FLAG_SHIFT: &[u8] = &[4, 4, 4];
+
+/// Table 102 — `regular_merge_flag` (4 ctxIdx). The spec splits across
+/// initType 1 (P, ctxIdx 0..1) and initType 2 (B, ctxIdx 2..3); Table
+/// 132 picks ctxInc ∈ {0, 1} from `cu_skip_flag ? 0 : 1`. Initialised
+/// via `init_type * 2 + ctxInc` for non-I slices.
+pub const REGULAR_MERGE_FLAG_INIT: &[u8] = &[38, 7, 46, 15];
+pub const REGULAR_MERGE_FLAG_SHIFT: &[u8] = &[5, 5, 5, 5];
+
+/// Table 109 — `merge_idx` (3 ctxIdx, one per initType). Bin 0 ctx; bins
+/// 1..4 bypass per Table 132.
+pub const MERGE_IDX_INIT: &[u8] = &[34, 20, 18];
+pub const MERGE_IDX_SHIFT: &[u8] = &[4, 4, 4];
+
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
     // par_level_flag) span multiple PDF rows; we keep the in-tree
@@ -354,6 +393,10 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::ParLevelFlag => (PAR_LEVEL_FLAG_INIT, PAR_LEVEL_FLAG_SHIFT),
         SyntaxCtx::SaoMergeFlag => (SAO_MERGE_FLAG_INIT, SAO_MERGE_FLAG_SHIFT),
         SyntaxCtx::SaoTypeIdx => (SAO_TYPE_IDX_INIT, SAO_TYPE_IDX_SHIFT),
+        SyntaxCtx::CuSkipFlag => (CU_SKIP_FLAG_INIT, CU_SKIP_FLAG_SHIFT),
+        SyntaxCtx::GeneralMergeFlag => (GENERAL_MERGE_FLAG_INIT, GENERAL_MERGE_FLAG_SHIFT),
+        SyntaxCtx::RegularMergeFlag => (REGULAR_MERGE_FLAG_INIT, REGULAR_MERGE_FLAG_SHIFT),
+        SyntaxCtx::MergeIdx => (MERGE_IDX_INIT, MERGE_IDX_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -411,6 +454,10 @@ mod tests {
             SyntaxCtx::ParLevelFlag,
             SyntaxCtx::SaoMergeFlag,
             SyntaxCtx::SaoTypeIdx,
+            SyntaxCtx::CuSkipFlag,
+            SyntaxCtx::GeneralMergeFlag,
+            SyntaxCtx::RegularMergeFlag,
+            SyntaxCtx::MergeIdx,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);
