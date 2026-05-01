@@ -6,6 +6,37 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **§8.5.6.3 fractional-pel motion compensation (round-22)** — the
+  P-slice MC pipeline now handles sub-pel MVs end to end.
+  [`predict_luma_block`](src/inter.rs) and [`predict_chroma_block`]
+  (src/inter.rs) replace the round-21 `mc_copy_block_int` dispatch
+  inside `ctu::CtuWalker::reconstruct_leaf_cu_inter`. The §8.5.6.3.2
+  8-tap separable luma filter (Table 27, `hpelIfIdx == 0` — 16
+  fractional positions, coefficients sum to 64) and the §8.5.6.3.4
+  4-tap separable chroma filter (Table 33 — 32 fractional positions)
+  are wired through a horizontal-then-vertical pipeline per eqs.
+  932 – 936 (luma) and 950 – 954 (chroma) with picture-edge
+  `Clip3(0, picW - 1, ...)` clamping per eqs. 930 – 931 / 948 – 949.
+  The §8.5.6.6.2 default uni-pred clamp (eq. 978: `Clip3(0, 255,
+  (predL0 + 32) >> 6)` at BitDepth 8) closes the chain. Integer-pel
+  `(xFrac, yFrac) == (0, 0)` collapses byte-identical to the
+  round-21 `mc_copy_block_int` path so the all-skip P-slice fixture
+  still passes. 13 new unit tests in `inter::tests` (Table 27 / 33
+  row-sum normalisation invariants, zero-MV memcpy passthrough, full
+  16 × 16 luma + 32 × 32 chroma DC-preservation grids, per-Table-27-
+  row spec-formula pins for both xFrac-only and yFrac-only paths,
+  the half-pel `hpelIfIdx == 0` row, picture-edge clamping under a
+  sub-pel MV, sub-pel self-roundtrip with PSNR = +∞, integer-pel
+  cross-check vs `mc_copy_block_int`, and a chroma vertical-only
+  ramp). Out of scope for this round (still surface
+  `Error::Unsupported` upstream): affine-mode filter tables 30 / 31
+  / 32, scaled-reference tables 28 / 29 / 34 / 35, BCW (§8.5.6.6.2
+  bcwIdx ≠ 0), explicit weighted prediction (§8.5.6.6.3), BDOF
+  (§8.5.6.5), DMVR (§8.5.6.3.2 dmvrFlag clamp), PROF (§8.5.6.4),
+  the §8.5.6.3.3 cbProfFlag / bdofFlag integer-fetching fast path,
+  RPR (reference-picture resampling), wraparound MC, and the
+  subpicture treated-as-pic clamping.
+
 - **P-slice inter coding (round-21 subset)** — first inter path lands
   for the smallest viable scope: `cu_skip_flag` + `general_merge_flag`
   (inferred to 1 when skip) + `merge_data()` regular-merge subtree

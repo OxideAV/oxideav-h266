@@ -74,8 +74,8 @@ use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
-    build_merge_cand_list, derive_spatial_merge_candidates, mc_copy_block_int, MotionField,
-    MvField, ReferencePicture,
+    build_merge_cand_list, derive_spatial_merge_candidates, predict_chroma_block,
+    predict_luma_block, MotionField, MvField, ReferencePicture,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -1296,11 +1296,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ///    zero-MV padding to `MaxNumMergeCand`).
     /// 3. Pick `mergeCandList[merge_idx]`; the resulting
     ///    `(refIdxL0, mvL0)` drives §8.5.6 motion compensation.
-    /// 4. Run integer-pel MC ([`mc_copy_block_int`]) on luma and
-    ///    chroma planes — the round-21 fixture only exercises zero
-    ///    MVs, so MC collapses to a copy from the reference picture's
-    ///    co-located block. Fractional positions and the §8.5.6.3
-    ///    8-tap filter land in r22+ alongside non-merge inter CUs.
+    /// 4. Run §8.5.6 motion compensation. As of round-22, luma uses
+    ///    [`predict_luma_block`] which dispatches to the §8.5.6.3.2
+    ///    8-tap separable filter (Table 27, `hpelIfIdx == 0`) for
+    ///    fractional MVs and falls back to the integer-pel copy for
+    ///    `(xFrac, yFrac) == (0, 0)`; chroma uses
+    ///    [`predict_chroma_block`] (§8.5.6.3.4 4-tap, Table 33).
+    ///    The §8.5.6.6.2 default uni-pred clamp closes the chain.
     /// 5. Broadcast the chosen `MvField` across every 4x4 block in
     ///    the CU so the next CU's merge derivation can read it.
     /// 6. Append a zero-CBF [`DeblockCu`] record (skip CUs are coded
@@ -1341,60 +1343,49 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.ref_pic_list_l0.len()
             )));
         }
-        if !chosen.mv_l0.is_integer_pel() {
-            return Err(Error::unsupported(format!(
-                "h266 inter: fractional-pel MV ({}/16, {}/16) not supported in round-21 \
-                 (8-tap luma filter / bilinear chroma interp not yet wired)",
-                chosen.mv_l0.x, chosen.mv_l0.y
-            )));
-        }
-
         let ref_pic = &self.ref_pic_list_l0[chosen.ref_idx_l0 as usize];
-        let ref_x_l = xcb + chosen.mv_l0.int_x();
-        let ref_y_l = ycb + chosen.mv_l0.int_y();
 
-        // Luma MC.
-        mc_copy_block_int(
+        // Luma MC: round-22 dispatcher. Integer-pel MVs collapse
+        // (inside `predict_luma_block`) to the same byte-identical
+        // copy that round-21 produced via `mc_copy_block_int`;
+        // fractional MVs invoke the §8.5.6.3.2 8-tap separable
+        // filter followed by the §8.5.6.6.2 default uni-pred clamp.
+        predict_luma_block(
             &mut out.luma,
             cu.cu.x,
             cu.cu.y,
             cu.cu.w,
             cu.cu.h,
             &ref_pic.frame.luma,
-            ref_x_l,
-            ref_y_l,
+            chosen.mv_l0,
         )?;
 
-        // Chroma MC for 4:2:0. The MV's chroma components live at half
-        // luma resolution per §8.5.6.3.4 — for the integer-pel path
-        // here we just halve the integer offsets (round towards 0;
-        // round-21 only has zero MVs, so no rounding ambiguity).
+        // Chroma MC for 4:2:0. The 1/16-pel luma MV components map
+        // straight onto 1/32-pel chroma offsets (since chroma is
+        // half-resolution): `predict_chroma_block` does the 4-tap
+        // §8.5.6.3.4 filter against Table 33.
         if self.sps.sps_chroma_format_idc == 1 {
             let cb_w_c = cu.cu.w / 2;
             let cb_h_c = cu.cu.h / 2;
             let cb_x_c = cu.cu.x / 2;
             let cb_y_c = cu.cu.y / 2;
-            let ref_x_c = ref_x_l / 2;
-            let ref_y_c = ref_y_l / 2;
-            mc_copy_block_int(
+            predict_chroma_block(
                 &mut out.cb,
                 cb_x_c,
                 cb_y_c,
                 cb_w_c,
                 cb_h_c,
                 &ref_pic.frame.cb,
-                ref_x_c,
-                ref_y_c,
+                chosen.mv_l0,
             )?;
-            mc_copy_block_int(
+            predict_chroma_block(
                 &mut out.cr,
                 cb_x_c,
                 cb_y_c,
                 cb_w_c,
                 cb_h_c,
                 &ref_pic.frame.cr,
-                ref_x_c,
-                ref_y_c,
+                chosen.mv_l0,
             )?;
         }
 

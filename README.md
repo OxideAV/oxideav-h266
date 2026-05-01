@@ -43,19 +43,24 @@ oxideav-h266 = "0.0"
 ## Decode support
 
 The reconstruction pipeline is being built incrementally and now covers
-the **intra-only single-tile single-slice subset** plus the round-21
-**P-slice all-skip / regular-merge subset**:
+the **intra-only single-tile single-slice subset** plus the round-22
+**P-slice merge / regular-merge subset with §8.5.6.3 fractional-pel
+MC**:
 
 * **Intra**: PLANAR / DC / cardinal angular intra (modes 2, 18, 34, 50,
   66) + MIP (§8.4.5.2.2 — all 30 weight matrices) + CCLM (§8.4.5.2.14)
   + BDPCM + ISP (§8.4.5.1, all 4 split types).
-* **Inter (round-21)**: P-slice `cu_skip_flag` + `general_merge_flag`
+* **Inter (round-22)**: P-slice `cu_skip_flag` + `general_merge_flag`
   inference + `merge_data()` regular-merge subset (`merge_idx`),
   §8.5.2.3 spatial-merge candidate derivation (5-position
   B1/A1/B0/A0/B2 list with redundancy checks), §8.5.2.2 mergeCandList
-  assembly with zero-MV padding, and §8.5.6 integer-pel motion
-  compensation. Single L0 reference, no fractional pel, no MMVD / GPM
-  / CIIP / AMVR / BCW yet.
+  assembly with zero-MV padding, §8.5.6 motion compensation including
+  the round-22 §8.5.6.3 8-tap luma fractional-sample interpolation
+  (Table 27, `hpelIfIdx == 0` family) and §8.5.6.3.4 4-tap chroma
+  interpolation (Table 33), with the §8.5.6.6.2 default uni-pred
+  clamp at 8-bit. Single L0 reference, no MMVD / GPM / CIIP / AMVR /
+  BCW yet; affine + scaled-reference filter tables 28 / 29 / 30 / 31
+  / 32 / 34 / 35, BDOF + DMVR, and PROF land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
