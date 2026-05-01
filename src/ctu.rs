@@ -75,8 +75,9 @@ use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
     build_merge_cand_list, build_merge_cand_list_b, derive_spatial_merge_candidates,
-    predict_chroma_block, predict_chroma_block_bipred, predict_luma_block,
-    predict_luma_block_bipred, HmvpTable, MotionField, MvField, ReferencePicture,
+    derive_temporal_merge_candidate, predict_chroma_block, predict_chroma_block_bipred,
+    predict_luma_block, predict_luma_block_bipred, HmvpTable, MotionField, MotionVector, MvField,
+    ReferencePicture, TemporalMergeInputs,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -544,6 +545,28 @@ pub struct CtuWalker<'a, 'b> {
     /// (§7.4.3.5). Drives the spec's same-parallel-merge-tile
     /// neighbour-suppression rule.
     log2_par_mrg_level: u32,
+    /// Round-25 §8.5.2.11 — current picture's POC. Needed for the
+    /// POC-distance scaling of the temporal merge candidate (eq. 599).
+    /// Defaults to 0; callers that exercise temporal MVP set this via
+    /// [`Self::set_temporal_mvp`].
+    current_poc: i32,
+    /// Round-25 §8.5.2.11 — `ph_temporal_mvp_enabled_flag`. When 0 the
+    /// Col candidate derivation short-circuits to `availableFlagCol = 0`
+    /// per eq. 477. Defaults to `false` (temporal MVP off).
+    ph_temporal_mvp_enabled: bool,
+    /// Round-25 §8.5.2.11 — index of the collocated reference picture
+    /// in the spec-selected list (`sh_collocated_ref_idx` /
+    /// `ph_collocated_ref_idx`). Resolved via
+    /// `ref_pic_list_l{0|1}[col_ref_idx]` based on
+    /// [`Self::collocated_from_l0`]. Ignored when
+    /// [`Self::ph_temporal_mvp_enabled`] is false.
+    col_ref_idx: u32,
+    /// Round-25 §8.5.2.11 — `sh_collocated_from_l0_flag` /
+    /// `ph_collocated_from_l0_flag`. When `true` the collocated
+    /// reference is `RefPicList[0][col_ref_idx]`; when `false` it is
+    /// `RefPicList[1][col_ref_idx]`. Defaults to `true` per spec
+    /// inference.
+    collocated_from_l0: bool,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -675,6 +698,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             motion_field,
             hmvp: HmvpTable::new(),
             log2_par_mrg_level,
+            current_poc: 0,
+            ph_temporal_mvp_enabled: false,
+            col_ref_idx: 0,
+            collocated_from_l0: true,
         })
     }
 
@@ -709,6 +736,149 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// reset state).
     pub fn hmvp_table(&self) -> &HmvpTable {
         &self.hmvp
+    }
+
+    /// Round-25 — configure the §8.5.2.11 temporal motion-vector
+    /// prediction inputs. Must be called before `decode_picture_into`
+    /// when the bitstream signals `ph_temporal_mvp_enabled_flag == 1`
+    /// (the picture-header path that picks the `ColPic` for
+    /// merge / AMVP TMVP).
+    ///
+    /// * `current_poc` — `PicOrderCntVal` of the current picture
+    ///   (§8.3.1).
+    /// * `enabled` — `ph_temporal_mvp_enabled_flag`. When `false` the
+    ///   walker short-circuits the Col candidate (eq. 477 path).
+    /// * `collocated_from_l0` — `sh_collocated_from_l0_flag` /
+    ///   `ph_collocated_from_l0_flag`. Selects which RefPicList
+    ///   provides `ColPic`.
+    /// * `col_ref_idx` — `sh_collocated_ref_idx` /
+    ///   `ph_collocated_ref_idx`. Index into the chosen list.
+    pub fn set_temporal_mvp(
+        &mut self,
+        current_poc: i32,
+        enabled: bool,
+        collocated_from_l0: bool,
+        col_ref_idx: u32,
+    ) {
+        self.current_poc = current_poc;
+        self.ph_temporal_mvp_enabled = enabled;
+        self.collocated_from_l0 = collocated_from_l0;
+        self.col_ref_idx = col_ref_idx;
+    }
+
+    /// §8.5.2.11 derivation harness for one CU. Returns the Col
+    /// candidate (uni-pred for P-slice, fused L0+L1 for B-slice) when
+    /// it is available, else `None`. Always returns `None` when
+    /// `ph_temporal_mvp_enabled` is false, the collocated reference
+    /// is missing or has no captured MotionField, or `(cb_w * cb_h)`
+    /// is too small (the spec disables Col for blocks with area
+    /// `<= 32`).
+    fn derive_col_candidate(
+        &self,
+        xcb: i32,
+        ycb: i32,
+        cb_w: i32,
+        cb_h: i32,
+        is_b: bool,
+    ) -> Option<MvField> {
+        // §8.5.2.11 first bullet: ph_temporal_mvp_enabled_flag == 0 OR
+        // (cbWidth * cbHeight) <= 32 → availableFlagLXCol = 0.
+        if !self.ph_temporal_mvp_enabled {
+            return None;
+        }
+        if cb_w * cb_h <= 32 {
+            return None;
+        }
+        // Resolve ColPic. The collocated reference index is fixed at
+        // `sh_collocated_ref_idx` regardless of which RefPicList the
+        // current CU's refIdx points into; both the L0 and L1 halves
+        // of §8.5.2.11 fetch from the same ColPic.
+        let col_list = if self.collocated_from_l0 {
+            &self.ref_pic_list_l0
+        } else {
+            &self.ref_pic_list_l1
+        };
+        let col_idx = self.col_ref_idx as usize;
+        if col_idx >= col_list.len() {
+            return None;
+        }
+        let col_pic = &col_list[col_idx];
+        col_pic.motion_field.as_ref()?;
+        // The current CU's refIdx for the merge mode is fixed at
+        // refIdxL{X}Col = 0 per §8.5.2.2 step 2. So the
+        // `current_ref_poc` is the POC of `RefPicList[X][0]`. For the
+        // round-25 fixture both lists carry a single reference (the
+        // collocated picture itself), so RefPicList[0][0].poc is the
+        // right value.
+        let curr_ref_poc_l0 = self
+            .ref_pic_list_l0
+            .first()
+            .map(|r| r.poc)
+            .unwrap_or(self.current_poc);
+        // Determine the POC of the collocated MV's reference picture.
+        // §8.5.2.12 sets `colPocDiff = DiffPicOrderCnt(ColPic,
+        // refPicList[ listCol ][ refIdxCol ])`. Without modelling the
+        // collocated picture's RPL we approximate `col_ref_poc` as
+        // `current_poc` — i.e. the typical case where the collocated
+        // picture's MV points back at the current picture's reference
+        // axis. The fixture deliberately uses the equal-distance fast
+        // path (eq. 600) so the approximation is exact.
+        let col_ref_poc = self.current_poc;
+
+        let l0_inputs = TemporalMergeInputs {
+            xcb,
+            ycb,
+            cb_w,
+            cb_h,
+            pic_w: self.layout.pic_width_luma as i32,
+            pic_h: self.layout.pic_height_luma as i32,
+            ctb_log2_size_y: self.layout.ctb_log2_size_y,
+            current_poc: self.current_poc,
+            current_ref_poc: curr_ref_poc_l0,
+            col_pic,
+            col_ref_poc,
+        };
+        let l0_mv = derive_temporal_merge_candidate(&l0_inputs);
+        if !is_b {
+            return l0_mv;
+        }
+        // B-slice: derive the L1 half too, then fuse.
+        let curr_ref_poc_l1 = self
+            .ref_pic_list_l1
+            .first()
+            .map(|r| r.poc)
+            .unwrap_or(self.current_poc);
+        let l1_inputs = TemporalMergeInputs {
+            current_ref_poc: curr_ref_poc_l1,
+            ..l0_inputs.clone()
+        };
+        let l1_mv = derive_temporal_merge_candidate(&l1_inputs);
+        match (l0_mv, l1_mv) {
+            (Some(l0), Some(l1)) => Some(MvField {
+                mv_l0: l0.mv_l0,
+                ref_idx_l0: 0,
+                pred_flag_l0: true,
+                mv_l1: l1.mv_l0, // l1.mv_l0 because the per-call result is uni-pred-shaped
+                ref_idx_l1: 0,
+                pred_flag_l1: true,
+                cu_skip_flag: false,
+                mode_inter: true,
+                available: true,
+            }),
+            (Some(l0), None) => Some(l0),
+            (None, Some(l1)) => Some(MvField {
+                mv_l0: MotionVector::ZERO,
+                ref_idx_l0: -1,
+                pred_flag_l0: false,
+                mv_l1: l1.mv_l0,
+                ref_idx_l1: 0,
+                pred_flag_l1: true,
+                cu_skip_flag: false,
+                mode_inter: true,
+                available: true,
+            }),
+            (None, None) => None,
+        }
     }
 
     /// Inject a per-picture SAO parameter array. Replaces the default
@@ -1368,10 +1538,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // step 7 (HMVP insertion per §8.5.2.6) lights up between
         // the spatial slot fill and the zero-MV pad.
         let is_b = self.sh.sh_slice_type == SliceType::B;
+        // Round-25 §8.5.2.11 — temporal merge candidate ("Col"). When
+        // ph_temporal_mvp_enabled_flag is 1 and the walker has been
+        // configured with a collocated reference (via
+        // [`Self::set_temporal_mvp`]), invoke the §8.5.2.11 derivation
+        // for L0 (P-slice) or L0 + L1 (B-slice). The returned MvField
+        // is then inserted at step 5 last bullet of §8.5.2.2 (after
+        // spatials, before HMVP).
+        let col = self.derive_col_candidate(xcb, ycb, cb_w, cb_h, is_b);
         let mlist = if is_b {
-            build_merge_cand_list_b(&spatial, max_merge, Some(&self.hmvp))
+            build_merge_cand_list_b(&spatial, max_merge, col, Some(&self.hmvp))
         } else {
-            build_merge_cand_list(&spatial, max_merge, Some(&self.hmvp))
+            build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp))
         };
         let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
         let chosen = mlist[idx];

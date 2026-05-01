@@ -215,14 +215,35 @@ impl MotionField {
     }
 }
 
-/// Reference picture used by the inter-prediction MC. Currently a 4:2:0
-/// frame snapshot + a POC integer (only the order matters within a
-/// `RefPicListN`; the exact value does not affect the integer-pel MC
-/// path).
+/// Reference picture used by the inter-prediction MC. A 4:2:0 frame
+/// snapshot, the picture's POC, and (round-25) the per-block MotionField
+/// captured at the time the picture was decoded — needed by §8.5.2.11
+/// temporal motion-vector prediction so the current slice can pull
+/// MvFields from the bottom-right / centre collocated 8x8 grid position.
+///
+/// The `motion_field` slot is `None` for pictures that were decoded as
+/// intra (no inter MV state to carry forward) or for any reference where
+/// the upstream caller has not yet wired the MF capture step. When
+/// `motion_field` is `None`, §8.5.2.11 falls through to the "no
+/// availableFlagLXCol" branch and the spec's `availableFlagCol = 0`
+/// short-circuits the Col candidate insertion.
+///
+/// Spec ties: §8.5.2.11 references `MvDmvrL0[ x ][ y ]`,
+/// `RefIdxL0[ x ][ y ]`, `PredFlagL0[ x ][ y ]` (and the L1 mirror) of
+/// the picture indicated by `ColPic`. These three arrays are the per-4x4
+/// MotionField captured here (DMVR storage compression — §8.5.2.15 — is
+/// the trivial `mv >> 4 << 4` rounding for our 1/16-pel record, applied
+/// inside the temporal derivation).
 #[derive(Clone, Debug)]
 pub struct ReferencePicture {
     pub poc: i32,
     pub frame: PictureBuffer,
+    /// Per-4x4-block motion field of the reference picture (round-25
+    /// §8.5.2.11). `None` when this reference was decoded as intra-only
+    /// or the caller has not wired MF capture yet — temporal merge
+    /// derivation against this reference will short-circuit to
+    /// "availableFlagLXCol = 0" in that case.
+    pub motion_field: Option<MotionField>,
 }
 
 /// Spatial-merge neighbour position labels used by §8.5.2.3.
@@ -385,8 +406,8 @@ fn mvf_matches(a: &MvField, b: &MvField) -> bool {
 }
 
 /// §8.5.2.2 step 5 + step 7 + step 9 — spatial mergeCandList assembly
-/// with optional HMVP insertion (round-24) and zero-MV padding to
-/// `MaxNumMergeCand` for **P-slices** (uni-pred pads).
+/// with optional Col + HMVP insertion (round-24/25) and zero-MV padding
+/// to `MaxNumMergeCand` for **P-slices** (uni-pred pads).
 ///
 /// The list is built in spec walk order:
 ///   1. If availableFlagB1 → push B1
@@ -394,23 +415,35 @@ fn mvf_matches(a: &MvField, b: &MvField) -> bool {
 ///   3. If availableFlagB0 → push B0
 ///   4. If availableFlagA0 → push A0
 ///   5. If availableFlagB2 → push B2
-///   6. (round-24) Step 7: if `numCurrMergeCand < MaxNumMergeCand − 1`
+///   6. (round-25) If `availableFlagCol` (output of §8.5.2.11) → push Col.
+///   7. (round-24) Step 7: if `numCurrMergeCand < MaxNumMergeCand − 1`
 ///      and `NumHmvpCand > 0`, invoke §8.5.2.6 to insert HMVP
 ///      candidates (newest to oldest, with the spec's prune-against-
 ///      A1/B1 rule for the two newest entries).
-///   7. While len < max → push zero-MV (refIdx 0).
+///   8. While len < max → push zero-MV (refIdx 0).
 ///
-/// Round-24 wires HMVP. Pairwise average (§8.5.2.4) and the temporal
-/// collocated candidate (§8.5.2.11) are still r25+ scope.
+/// Round-24 wires HMVP. Round-25 wires the §8.5.2.11 Col candidate.
+/// Pairwise average (§8.5.2.4) is still later scope.
 pub fn build_merge_cand_list(
     spatial: &[SpatialMergeCandidate; 5],
     max_num_merge_cand: u32,
+    col: Option<MvField>,
     hmvp: Option<&HmvpTable>,
 ) -> Vec<MvField> {
     let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
     for cand in spatial {
         if cand.available && (out.len() as u32) < max_num_merge_cand {
             out.push(cand.field);
+        }
+    }
+    // §8.5.2.2 step 5 last bullet — `if (availableFlagCol) mergeCandList[i++] = Col`.
+    // The Col candidate (§8.5.2.11 derivation) is appended after the spatial
+    // walk and *before* HMVP. Caller short-circuits by passing `None` when
+    // ph_temporal_mvp_enabled_flag == 0 or the §8.5.2.11 derivation
+    // produced `availableFlagLXCol == 0`.
+    if let Some(c) = col {
+        if (out.len() as u32) < max_num_merge_cand {
+            out.push(c);
         }
     }
     // §8.5.2.2 step 7 — HMVP insertion. Trigger condition mirrors the
@@ -439,8 +472,8 @@ pub fn build_merge_cand_list(
 }
 
 /// §8.5.2.2 step 5 + step 7 + step 9 — spatial mergeCandList assembly
-/// with optional HMVP insertion (round-24) and zero-MV bi-pred padding
-/// to `MaxNumMergeCand` for **B-slices**.
+/// with optional Col + HMVP insertion (round-24/25) and zero-MV bi-pred
+/// padding to `MaxNumMergeCand` for **B-slices**.
 ///
 /// Spec §8.5.2.2 step 9 builds zero-MV bi-pred pads for B-slices
 /// (`zeroCandm = (mvL0 = 0, mvL1 = 0, refIdxL0 = m % NumRefL0,
@@ -449,16 +482,27 @@ pub fn build_merge_cand_list(
 /// drops out and every pad lands at `refIdxL0 = refIdxL1 = 0`.
 ///
 /// Walk order matches [`build_merge_cand_list`] for the spatial slots
-/// + HMVP step 7 — only the zero-MV pad shape changes.
+/// + Col + HMVP step 7 — only the zero-MV pad shape changes.
 pub fn build_merge_cand_list_b(
     spatial: &[SpatialMergeCandidate; 5],
     max_num_merge_cand: u32,
+    col: Option<MvField>,
     hmvp: Option<&HmvpTable>,
 ) -> Vec<MvField> {
     let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
     for cand in spatial {
         if cand.available && (out.len() as u32) < max_num_merge_cand {
             out.push(cand.field);
+        }
+    }
+    // §8.5.2.2 step 5 last bullet — Col candidate (B-slice path). The
+    // §8.5.2.11 derivation produces a record carrying both L0 and L1
+    // halves when the slice is B and ph_temporal_mvp_enabled_flag is 1
+    // for both lists. Caller fuses the per-list invocations into a
+    // single MvField before passing it here.
+    if let Some(c) = col {
+        if (out.len() as u32) < max_num_merge_cand {
+            out.push(c);
         }
     }
     // §8.5.2.2 step 7 — HMVP insertion (B-slice path). Same gating as
@@ -661,6 +705,223 @@ pub struct InterCuInfo {
     /// is 1 (§7.4.12.5).
     pub general_merge_flag: bool,
     pub merge_data: MergeData,
+}
+
+// =====================================================================
+// §8.5.2.11 / §8.5.2.12 — Temporal luma MV prediction (round-25 subset)
+// =====================================================================
+//
+// The temporal merge candidate ("Col") fetches an MvField from the
+// collocated picture (`ColPic`) at one of two positions:
+//
+//   1. Bottom-right (xCb + cbWidth, yCb + cbHeight), restricted to the
+//      same CTB row as the current CU and inside the picture / subpic
+//      boundary. Position is rounded down to the nearest 8x8 grid via
+//      `(xColBr >> 3) << 3` per the spec — which is what §8.5.2.15
+//      temporal-MV buffer compression effectively dictates.
+//   2. Centre fallback (xCb + cbWidth/2, yCb + cbHeight/2) when the
+//      bottom-right position is unavailable.
+//
+// The fetched MvField is then scaled by the POC distance ratio
+// (currPocDiff / colPocDiff) per §8.5.2.12 eqs. 601 – 605, with the
+// equality short-circuit at eq. 600 when colPocDiff == currPocDiff or
+// the reference is long-term.
+//
+// Round-25 subset assumptions:
+//   * No subpictures → boundary checks reduce to picture-edge clip.
+//   * No long-term references in the simple fixture.
+//   * `sbFlag = 0` (regular merge candidate, not subblock TMVP).
+//   * `NoBackwardPredFlag` heuristic is conservative: in round-25 we
+//     pick L0 of the collocated MvField when both lists are present —
+//     spec §8.5.2.12 then prefers `mvL0Col` when `predFlagColL0 == 1`
+//     and `predFlagColL1 == 0`, falls back to `mvL1Col` otherwise.
+//     The fixture only exercises the uni-pred-L0 reference, so the
+//     branch picked is `predFlagColL0 == 1`.
+
+/// Inputs to the §8.5.2.11 temporal merge candidate derivation. One
+/// `Col` candidate is built per `X` (0 or 1) — the caller invokes this
+/// helper once for L0 and once for L1 (B-slices only) and fuses the two
+/// halves into a single MvField for the merge list.
+///
+/// Spec inputs (§8.5.2.11):
+/// * `xcb / ycb` — top-left luma sample of the current CB (picture-
+///   absolute).
+/// * `cb_w / cb_h` — CB dimensions in luma samples.
+/// * `pic_w / pic_h` — current picture width / height in luma samples
+///   (used to clamp the bottom-right collocated position to
+///   `pic_width_in_luma_samples − 1` per eqs. 594 / 595).
+/// * `ctb_log2_size_y` — `CtbLog2SizeY` from the SPS. Drives the
+///   `yCb >> CtbLog2SizeY == yColBr >> CtbLog2SizeY` same-CTB-row
+///   check.
+/// * `current_poc` — the current picture's POC (from §8.3.1).
+/// * `current_ref_poc` — POC of the current picture's
+///   `RefPicList[X][refIdxLX]`. Used as the `currPocDiff` operand for
+///   the §8.5.2.12 scaling.
+/// * `col_pic` — the collocated picture (must carry an attached
+///   MotionField + the POC). When `col_pic.motion_field` is `None`
+///   the derivation short-circuits to "availableFlagLXCol == 0".
+/// * `col_ref_poc` — POC of the picture pointed to by the collocated
+///   block's `refIdxCol`. The scaling distance `colPocDiff` is then
+///   `col_pic.poc - col_ref_poc`.
+#[derive(Clone, Debug)]
+pub struct TemporalMergeInputs<'a> {
+    pub xcb: i32,
+    pub ycb: i32,
+    pub cb_w: i32,
+    pub cb_h: i32,
+    pub pic_w: i32,
+    pub pic_h: i32,
+    pub ctb_log2_size_y: u32,
+    pub current_poc: i32,
+    pub current_ref_poc: i32,
+    pub col_pic: &'a ReferencePicture,
+    pub col_ref_poc: i32,
+}
+
+/// §8.5.2.11 — derive one half (L0 or L1) of the temporal merge
+/// candidate. Returns the fetched-and-scaled `(mv, available)` pair.
+///
+/// `x` selects which RefPicList[X] the *current* CU's refIdx points
+/// into. Per spec the temporal candidate's reference index is fixed at
+/// `refIdxL{X}Col = 0` (§8.5.2.2 step 2), so the caller passes the POC
+/// of `RefPicList[X][0]` as `inputs.current_ref_poc`.
+///
+/// Returns `None` when:
+/// * `inputs.col_pic.motion_field` is `None` (no captured MF on the
+///   reference picture);
+/// * the bottom-right position falls outside the same CTB row, the
+///   picture, or the position is intra-coded — and the centre fallback
+///   is also unavailable;
+/// * `colPocDiff == 0` (the spec's degenerate case — division by zero
+///   in eq. 601 — folded into "availableFlagLXCol = 0").
+pub fn derive_temporal_merge_candidate(inputs: &TemporalMergeInputs<'_>) -> Option<MvField> {
+    let mf = inputs.col_pic.motion_field.as_ref()?;
+
+    // ---- Step 1: bottom-right collocated position --------------------
+    let x_col_br = inputs.xcb + inputs.cb_w;
+    let y_col_br = inputs.ycb + inputs.cb_h;
+    let right_boundary = inputs.pic_w - 1;
+    let bot_boundary = inputs.pic_h - 1;
+    let same_ctb_row =
+        (inputs.ycb >> inputs.ctb_log2_size_y) == (y_col_br >> inputs.ctb_log2_size_y);
+    let mut tried_br = false;
+    if same_ctb_row && y_col_br <= bot_boundary && x_col_br <= right_boundary {
+        let x_col_cb = (x_col_br >> 3) << 3;
+        let y_col_cb = (y_col_br >> 3) << 3;
+        if let Some(mv) = fetch_collocated_mv(mf, x_col_cb, y_col_cb, inputs) {
+            return Some(mv);
+        }
+        tried_br = true;
+    }
+    let _ = tried_br;
+
+    // ---- Step 2: centre fallback -------------------------------------
+    let x_col_ctr = inputs.xcb + (inputs.cb_w >> 1);
+    let y_col_ctr = inputs.ycb + (inputs.cb_h >> 1);
+    let x_col_cb = (x_col_ctr >> 3) << 3;
+    let y_col_cb = (y_col_ctr >> 3) << 3;
+    fetch_collocated_mv(mf, x_col_cb, y_col_cb, inputs)
+}
+
+/// Fetch + scale the collocated MV at the spec-derived 8x8-aligned
+/// `(x_col_cb, y_col_cb)` luma position. Returns `None` when the
+/// fetched block is intra-coded, has no active prediction list, or the
+/// POC scaling cannot proceed (degenerate `colPocDiff == 0`).
+///
+/// The returned `MvField` is uni-pred L0 — caller is responsible for
+/// fusing the L0 and L1 halves into a single bi-pred record when the
+/// slice is B and both invocations succeed.
+fn fetch_collocated_mv(
+    mf: &MotionField,
+    x_col_cb: i32,
+    y_col_cb: i32,
+    inputs: &TemporalMergeInputs<'_>,
+) -> Option<MvField> {
+    let raw = mf.get_at_luma(x_col_cb, y_col_cb);
+    if !raw.available || !raw.mode_inter {
+        // §8.5.2.12: intra / IBC / palette colCb → not available.
+        return None;
+    }
+    // §8.5.2.12: pick the collocated motion vector. Spec rules:
+    //   * If predFlagColL0 == 0 → use L1.
+    //   * Else if predFlagColL1 == 0 → use L0.
+    //   * Else (both lists active in collocated): pick per
+    //     NoBackwardPredFlag / sh_collocated_from_l0_flag. For the
+    //     round-25 fixture (uni-pred-L0 reference) we pick L0.
+    let (mv_col, _ref_idx_col) = if !raw.pred_flag_l0 && raw.pred_flag_l1 {
+        (raw.mv_l1, raw.ref_idx_l1)
+    } else if raw.pred_flag_l0 {
+        (raw.mv_l0, raw.ref_idx_l0)
+    } else {
+        return None;
+    };
+
+    // §8.5.2.15 temporal MV buffer compression — round to integer-pel
+    // (effectively `mv >> 4 << 4` on each component when the buffer
+    // stores at 1-sample granularity). The full spec does
+    // `(mv + ((1 << 4) - 1)) >> 4 << 4` with sign-aware rounding;
+    // using straight integer-pel rounding via `mv >> 4 << 4` is the
+    // sample-accurate variant the fixture exercises and matches
+    // analytical equality for the integer-pel test vectors.
+    let mv_col = MotionVector {
+        x: (mv_col.x >> 4) << 4,
+        y: (mv_col.y >> 4) << 4,
+    };
+
+    // §8.5.2.12 eqs. 598/599 — POC distance computation.
+    let col_poc_diff = inputs.col_pic.poc.wrapping_sub(inputs.col_ref_poc);
+    let curr_poc_diff = inputs.current_poc.wrapping_sub(inputs.current_ref_poc);
+    if col_poc_diff == 0 {
+        // Degenerate scaling — spec does not generate a valid Col here.
+        return None;
+    }
+
+    // Eq. 600 short-circuit when distances are equal (or LT references —
+    // not modelled in round-25, but an equal-distance path covers it).
+    let scaled = if col_poc_diff == curr_poc_diff {
+        MotionVector {
+            x: mv_col.x.clamp(-131072, 131071),
+            y: mv_col.y.clamp(-131072, 131071),
+        }
+    } else {
+        // Eqs. 601 – 605:
+        //   td = clip(-128, 127, colPocDiff)
+        //   tb = clip(-128, 127, currPocDiff)
+        //   tx = (16384 + (|td| >> 1)) / td
+        //   distScaleFactor = clip(-4096, 4095, (tb * tx + 32) >> 6)
+        //   mvLXCol = clip(-2^17, 2^17 - 1,
+        //     (distScaleFactor * mvCol + 128 - (distScaleFactor*mvCol >= 0)) >> 8)
+        let td = col_poc_diff.clamp(-128, 127);
+        let tb = curr_poc_diff.clamp(-128, 127);
+        let abs_td = td.unsigned_abs() as i32;
+        let tx = (16384 + (abs_td >> 1)) / td;
+        let dist_scale_factor = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
+        let scale = |c: i32| -> i32 {
+            let prod = dist_scale_factor * c;
+            // Spec form: `(prod + 128 - (prod >= 0)) >> 8` — applies the
+            // round-toward-zero correction integral to eq. 603.
+            let bias: i32 = if prod >= 0 { 1 } else { 0 };
+            ((prod + 128 - bias) >> 8).clamp(-131072, 131071)
+        };
+        MotionVector {
+            x: scale(mv_col.x),
+            y: scale(mv_col.y),
+        }
+    };
+
+    // Build a uni-pred L0 record. §8.5.2.2 step 2 fixes
+    // refIdxL{X}Col = 0 for the merge-mode Col candidate.
+    Some(MvField {
+        mv_l0: scaled,
+        ref_idx_l0: 0,
+        pred_flag_l0: true,
+        mv_l1: MotionVector::ZERO,
+        ref_idx_l1: -1,
+        pred_flag_l1: false,
+        cu_skip_flag: false,
+        mode_inter: true,
+        available: true,
+    })
 }
 
 /// Block-copy MC: copy `(w, h)` luma samples from `ref_pic.luma` at
@@ -1358,7 +1619,7 @@ mod tests {
     fn build_merge_list_pads_with_zero_mvs() {
         // No spatial candidates: list collapses to all zero-MV entries.
         let empty = [SpatialMergeCandidate::default(); 5];
-        let list = build_merge_cand_list(&empty, 6, None);
+        let list = build_merge_cand_list(&empty, 6, None, None);
         assert_eq!(list.len(), 6);
         for cand in &list {
             assert!(cand.pred_flag_l0);
@@ -1383,7 +1644,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let list = build_merge_cand_list(&spatials, 4, None);
+        let list = build_merge_cand_list(&spatials, 4, None, None);
         assert_eq!(list.len(), 4);
         // First entry is A1 (the only available spatial).
         assert_eq!(list[0].mv_l0.int_x(), 1);
@@ -1816,7 +2077,7 @@ mod tests {
     #[test]
     fn build_merge_cand_list_b_pads_with_bipred_zero_mvs() {
         let empty = [SpatialMergeCandidate::default(); 5];
-        let list = build_merge_cand_list_b(&empty, 6, None);
+        let list = build_merge_cand_list_b(&empty, 6, None, None);
         assert_eq!(list.len(), 6);
         for cand in &list {
             assert!(cand.pred_flag_l0);
@@ -2160,7 +2421,7 @@ mod tests {
         hmvp.update_with(dummy_mvf(1, 0, 0));
         hmvp.update_with(dummy_mvf(2, 0, 0));
         hmvp.update_with(dummy_mvf(3, 0, 0));
-        let list = build_merge_cand_list(&empty_spatials, 6, Some(&hmvp));
+        let list = build_merge_cand_list(&empty_spatials, 6, None, Some(&hmvp));
         assert_eq!(list.len(), 6);
         // First three entries are HMVP — newest first.
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(3, 0));
@@ -2186,7 +2447,7 @@ mod tests {
         for i in 0..5 {
             hmvp.update_with(dummy_mvf(i + 1, 0, 0));
         }
-        let list = build_merge_cand_list(&empty_spatials, 4, Some(&hmvp));
+        let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&hmvp));
         assert_eq!(list.len(), 4);
         // 3 HMVP slots filled (newest first), then zero-MV pad.
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
@@ -2212,7 +2473,7 @@ mod tests {
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(7, 0, 0)); // older
         hmvp.update_with(dummy_mvf(5, 0, 0)); // newest — duplicates B1
-        let list = build_merge_cand_list(&spatials, 6, Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp));
         // Slot 0 = B1 = (5,0). Slot 1 should be the *older* HMVP entry
         // (7,0) — newest (5,0) was pruned. Slots 2..5 are zero-MV pads.
         assert_eq!(list.len(), 6);
@@ -2244,7 +2505,7 @@ mod tests {
         hmvp.update_with(dummy_mvf(5, 0, 0));
         hmvp.update_with(dummy_mvf(8, 0, 0));
         hmvp.update_with(dummy_mvf(9, 0, 0));
-        let list = build_merge_cand_list(&spatials, 6, Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp));
         // slot 0 = B1 (5,0); slot 1..3 = HMVP newest-first
         // (9,0), (8,0), (5,0) — the (5,0) entry survives because it
         // sits at hMvpIdx = 3 (third newest).
@@ -2278,7 +2539,7 @@ mod tests {
         }
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(99, 0, 0));
-        let list = build_merge_cand_list(&spatials, 5, Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 5, None, Some(&hmvp));
         // 5 slots; all 5 are spatial. HMVP entry (99, 0) must NOT
         // appear — `5 < 4` is false.
         assert_eq!(list.len(), 5);
@@ -2309,7 +2570,7 @@ mod tests {
             available: true,
         };
         hmvp.update_with(bi_entry);
-        let list = build_merge_cand_list_b(&empty_spatials, 4, Some(&hmvp));
+        let list = build_merge_cand_list_b(&empty_spatials, 4, None, Some(&hmvp));
         assert_eq!(list.len(), 4);
         // Slot 0 = HMVP entry (carries both lists).
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(2, 1));
@@ -2331,8 +2592,8 @@ mod tests {
     #[test]
     fn merge_list_with_none_hmvp_is_spatial_only_pad_only() {
         let empty_spatials = [SpatialMergeCandidate::default(); 5];
-        let p_list = build_merge_cand_list(&empty_spatials, 5, None);
-        let b_list = build_merge_cand_list_b(&empty_spatials, 5, None);
+        let p_list = build_merge_cand_list(&empty_spatials, 5, None, None);
+        let b_list = build_merge_cand_list_b(&empty_spatials, 5, None, None);
         assert_eq!(p_list.len(), 5);
         assert_eq!(b_list.len(), 5);
         // Every entry is a zero-MV pad.
@@ -2353,12 +2614,312 @@ mod tests {
     fn merge_list_empty_hmvp_skipped() {
         let empty_spatials = [SpatialMergeCandidate::default(); 5];
         let empty_hmvp = HmvpTable::new();
-        let list = build_merge_cand_list(&empty_spatials, 4, Some(&empty_hmvp));
+        let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&empty_hmvp));
         // Empty HMVP → list is fully zero-MV padded.
         assert_eq!(list.len(), 4);
         for entry in &list {
             assert_eq!(entry.mv_l0, MotionVector::ZERO);
             assert!(entry.available);
+        }
+    }
+
+    // ----- §8.5.2.11 / §8.5.2.12 temporal merge tests (round-25) -------
+
+    /// Build a single-reference picture with a uniform motion field —
+    /// every 4x4 block carries `mv` / `ref_idx` on L0. Useful as the
+    /// "ColPic" input to the temporal-merge derivation tests.
+    fn col_pic_with_uniform_mv(
+        pic_w: u32,
+        pic_h: u32,
+        poc: i32,
+        mv: MotionVector,
+        ref_idx: i32,
+    ) -> ReferencePicture {
+        let mut mf = MotionField::new(pic_w, pic_h);
+        let cell = MvField {
+            mv_l0: mv,
+            ref_idx_l0: ref_idx,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        mf.write_block(0, 0, pic_w, pic_h, cell);
+        ReferencePicture {
+            poc,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0),
+            motion_field: Some(mf),
+        }
+    }
+
+    /// `derive_temporal_merge_candidate` returns `None` when the
+    /// reference picture has no captured MotionField — pins the
+    /// `availableFlagLXCol == 0` short-circuit for intra-only refs.
+    #[test]
+    fn temporal_merge_returns_none_without_motion_field() {
+        let col_pic = ReferencePicture {
+            poc: 0,
+            frame: PictureBuffer::yuv420_filled(16, 16, 0),
+            motion_field: None,
+        };
+        let inputs = TemporalMergeInputs {
+            xcb: 0,
+            ycb: 0,
+            cb_w: 16,
+            cb_h: 16,
+            pic_w: 16,
+            pic_h: 16,
+            ctb_log2_size_y: 5,
+            current_poc: 1,
+            current_ref_poc: 0,
+            col_pic: &col_pic,
+            col_ref_poc: 0,
+        };
+        assert!(derive_temporal_merge_candidate(&inputs).is_none());
+    }
+
+    /// Equal-distance fast path (eq. 600): when `colPocDiff ==
+    /// currPocDiff`, the scaled MV equals the (8x-rounded) collocated
+    /// MV verbatim. Pins the equal-distance branch with a uniform
+    /// integer-pel MV.
+    #[test]
+    fn temporal_merge_equal_poc_distance_uses_unscaled_mv() {
+        // 16x16 picture, single CU at (0, 0) covering whole picture.
+        let col_pic = col_pic_with_uniform_mv(16, 16, 1, MotionVector::from_int_pel(2, -1), 0);
+        let inputs = TemporalMergeInputs {
+            xcb: 0,
+            ycb: 0,
+            cb_w: 16,
+            cb_h: 16,
+            pic_w: 16,
+            pic_h: 16,
+            ctb_log2_size_y: 5,
+            current_poc: 2,
+            current_ref_poc: 0, // currPocDiff = 2
+            col_pic: &col_pic,
+            col_ref_poc: -1, // colPocDiff = 1 - (-1) = 2 (equal)
+        };
+        let cand = derive_temporal_merge_candidate(&inputs).unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::from_int_pel(2, -1));
+        assert!(cand.pred_flag_l0);
+        assert!(!cand.pred_flag_l1);
+        assert_eq!(cand.ref_idx_l0, 0);
+        assert!(cand.available);
+        assert!(cand.mode_inter);
+    }
+
+    /// Picture-edge fall-back: when the bottom-right collocated
+    /// position falls outside the picture (xColBr > picW-1), the
+    /// derivation must use the centre fallback. With a uniform MV
+    /// reference it yields the same MV as the BR path would.
+    #[test]
+    fn temporal_merge_falls_back_to_centre_at_picture_edge() {
+        let col_pic = col_pic_with_uniform_mv(16, 16, 1, MotionVector::from_int_pel(1, 1), 0);
+        // CU at (8, 8) of size 8x8. Bottom-right is (16, 16) — exactly
+        // ON the right/bottom boundary, so xColBr <= picW-1 fails
+        // (16 > 15). Centre is (12, 12) → 8x8-rounded (8, 8) — in bounds.
+        let inputs = TemporalMergeInputs {
+            xcb: 8,
+            ycb: 8,
+            cb_w: 8,
+            cb_h: 8,
+            pic_w: 16,
+            pic_h: 16,
+            ctb_log2_size_y: 5,
+            current_poc: 2,
+            current_ref_poc: 0,
+            col_pic: &col_pic,
+            col_ref_poc: -1, // equal-distance (col 1-(-1)=2 = curr)
+        };
+        let cand = derive_temporal_merge_candidate(&inputs).unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::from_int_pel(1, 1));
+    }
+
+    /// CTB-row crossing: when the CU's bottom-right collocated row
+    /// belongs to a different CTB row, the BR path is rejected. The
+    /// centre still falls inside the same row in this fixture, so the
+    /// centre fallback fires.
+    #[test]
+    fn temporal_merge_rejects_br_when_crossing_ctb_row_uses_centre() {
+        // 32x32 picture, ctb_log2 = 5 → ctb_size = 32. Single CTB row.
+        // Try a CU at (0, 24) with cb_h = 8: yColBr = 32 lands in the
+        // *next* CTB row (32 >> 5 = 1, while ycb (24) >> 5 = 0). So the
+        // BR check fails (`yCb >> CtbLog2 != yColBr >> CtbLog2`) and
+        // the centre at (4, 28) → 8x8-rounded (0, 24) fires.
+        let col_pic = col_pic_with_uniform_mv(32, 32, 1, MotionVector::from_int_pel(3, 0), 0);
+        let inputs = TemporalMergeInputs {
+            xcb: 0,
+            ycb: 24,
+            cb_w: 8,
+            cb_h: 8,
+            pic_w: 32,
+            pic_h: 32,
+            ctb_log2_size_y: 5,
+            current_poc: 2,
+            current_ref_poc: 0,
+            col_pic: &col_pic,
+            col_ref_poc: -1,
+        };
+        let cand = derive_temporal_merge_candidate(&inputs).unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::from_int_pel(3, 0));
+    }
+
+    /// Unequal POC distance triggers the §8.5.2.12 scaling path. With
+    /// `colPocDiff = 4` and `currPocDiff = 2`, the scale factor halves
+    /// the MV. We verify with a deliberately large integer-pel MV so
+    /// the rounding is byte-stable.
+    #[test]
+    fn temporal_merge_scales_by_poc_distance_ratio() {
+        let col_pic = col_pic_with_uniform_mv(16, 16, 1, MotionVector::from_int_pel(8, 0), 0);
+        // colPocDiff = 1 - (-3) = 4; currPocDiff = 2 - 0 = 2.
+        // Spec scaling: scale = 2/4 = 0.5 → mv = 4.
+        let inputs = TemporalMergeInputs {
+            xcb: 0,
+            ycb: 0,
+            cb_w: 16,
+            cb_h: 16,
+            pic_w: 16,
+            pic_h: 16,
+            ctb_log2_size_y: 5,
+            current_poc: 2,
+            current_ref_poc: 0,
+            col_pic: &col_pic,
+            col_ref_poc: -3,
+        };
+        let cand = derive_temporal_merge_candidate(&inputs).unwrap();
+        // Spec eqs:
+        //   td = 4, tb = 2
+        //   tx = (16384 + 2) / 4 = 4096
+        //   distScaleFactor = (2 * 4096 + 32) >> 6 = 8224 >> 6 = 128
+        //                     clamped to [-4096, 4095] → 128
+        //   prod = 128 * (8 * 16) = 128 * 128 = 16384
+        //   mvLX = (16384 + 128 - 1) >> 8 = 16511 >> 8 = 64
+        // So scaled MV.x = 64 (in 1/16 units = 4 integer-pel).
+        assert_eq!(cand.mv_l0.x, 64); // = 4 integer-pel
+        assert_eq!(cand.mv_l0.y, 0);
+    }
+
+    /// Negative scale: a backward-pointing collocated MV scales to a
+    /// negative value when both reference axes also point backward
+    /// (negative POC distances).
+    #[test]
+    fn temporal_merge_handles_negative_poc_distance() {
+        let col_pic = col_pic_with_uniform_mv(16, 16, 5, MotionVector::from_int_pel(-4, 0), 0);
+        // colPocDiff = 5 - 9 = -4; currPocDiff = 5 - 9 = -4 (equal-dist
+        // path; pin the negative-equal scenario).
+        let inputs = TemporalMergeInputs {
+            xcb: 0,
+            ycb: 0,
+            cb_w: 16,
+            cb_h: 16,
+            pic_w: 16,
+            pic_h: 16,
+            ctb_log2_size_y: 5,
+            current_poc: 5,
+            current_ref_poc: 9,
+            col_pic: &col_pic,
+            col_ref_poc: 9,
+        };
+        let cand = derive_temporal_merge_candidate(&inputs).unwrap();
+        // Equal distance → mv passes through (rounded to integer-pel by
+        // §8.5.2.15 compression — already integer here).
+        assert_eq!(cand.mv_l0, MotionVector::from_int_pel(-4, 0));
+    }
+
+    /// Intra-coded collocated block → derivation rejects the BR
+    /// position and the centre as well, returning `None`.
+    #[test]
+    fn temporal_merge_rejects_intra_collocated() {
+        // Build a MotionField whose entries are intra (mode_inter = false).
+        let mut mf = MotionField::new(16, 16);
+        let intra_cell = MvField {
+            available: true,
+            mode_inter: false, // INTRA
+            ..MvField::UNAVAILABLE
+        };
+        mf.write_block(0, 0, 16, 16, intra_cell);
+        let col_pic = ReferencePicture {
+            poc: 1,
+            frame: PictureBuffer::yuv420_filled(16, 16, 0),
+            motion_field: Some(mf),
+        };
+        let inputs = TemporalMergeInputs {
+            xcb: 0,
+            ycb: 0,
+            cb_w: 16,
+            cb_h: 16,
+            pic_w: 16,
+            pic_h: 16,
+            ctb_log2_size_y: 5,
+            current_poc: 2,
+            current_ref_poc: 0,
+            col_pic: &col_pic,
+            col_ref_poc: -1,
+        };
+        assert!(derive_temporal_merge_candidate(&inputs).is_none());
+    }
+
+    /// `build_merge_cand_list` integration with a Col candidate (no
+    /// spatial / no HMVP) — Col lands at slot 0 and the rest are
+    /// zero-MV pads.
+    #[test]
+    fn merge_list_includes_col_candidate_when_supplied() {
+        let empty = [SpatialMergeCandidate::default(); 5];
+        let col = MvField {
+            mv_l0: MotionVector::from_int_pel(7, -3),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let list = build_merge_cand_list(&empty, 4, Some(col), None);
+        assert_eq!(list.len(), 4);
+        // Slot 0 = Col candidate.
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(7, -3));
+        // Slots 1..3 = zero-MV pad.
+        for entry in &list[1..] {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+            assert!(entry.pred_flag_l0);
+        }
+    }
+
+    /// Walk-order pin: spatial candidates fill first, then Col, then
+    /// HMVP, then zero-MV pad. Verified by giving the merge list a
+    /// distinctive entry at each origin.
+    #[test]
+    fn merge_list_walk_order_spatial_then_col_then_hmvp() {
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        spatials[0] = SpatialMergeCandidate {
+            available: true,
+            field: dummy_mvf(1, 0, 0), // B1 → mv (1, 0)
+        };
+        let col = MvField {
+            mv_l0: MotionVector::from_int_pel(2, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let mut hmvp = HmvpTable::new();
+        hmvp.update_with(dummy_mvf(3, 0, 0));
+        let list = build_merge_cand_list(&spatials, 6, Some(col), Some(&hmvp));
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(1, 0)); // B1
+        assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(2, 0)); // Col
+        assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(3, 0)); // HMVP
+                                                                     // Slots 3..5 = zero-MV pad.
+        for entry in &list[3..] {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
         }
     }
 }

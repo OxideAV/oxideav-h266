@@ -6,6 +6,44 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **Temporal merge candidate (round-25, §8.5.2.11 / §8.5.2.12)** — the
+  Col candidate now lands at §8.5.2.2 step 5 between the spatial walk
+  and the §8.5.2.6 HMVP insertion. New
+  [`derive_temporal_merge_candidate`](src/inter.rs) implements the
+  bottom-right + centre-fallback collocated-position derivation of
+  §8.5.2.11 (eqs. 592 – 597, with `(xColBr >> 3) << 3` 8x8 grid
+  rounding and the same-CTB-row gate `yCb >> CtbLog2SizeY == yColBr >>
+  CtbLog2SizeY`); intra / IBC / palette `colCb` short-circuit to
+  `availableFlagLXCol = 0`. The §8.5.2.12 picked-MV scaling
+  (eqs. 598 – 605) lands too: equal-distance / long-term-ref short-
+  circuit at eq. 600 (just `Clip3(-2^17, 2^17 - 1, mvCol)`) and the
+  general `tx = (16384 + |td|>>1)/td` /
+  `distScaleFactor = clip(-4096, 4095, (tb*tx + 32) >> 6)` /
+  `mvLXCol = clip(-2^17, 2^17 - 1, (distScaleFactor*mvCol + 128 -
+  (prod>=0)) >> 8)` chain. The §8.5.2.15 temporal MV buffer compression
+  is folded into the fetch as integer-pel rounding (`(mv >> 4) << 4`).
+  [`build_merge_cand_list`] / [`build_merge_cand_list_b`] gain a
+  leading `Option<MvField>` "Col" parameter that inserts the candidate
+  at the spec-prescribed slot. New [`ReferencePicture`] field
+  `motion_field: Option<MotionField>` carries the per-4x4 MV state of
+  the collocated picture (`None` for intra-only references —
+  derivation falls through to the `availableFlagCol = 0` branch).
+  `CtuWalker` gains [`set_temporal_mvp`](src/ctu.rs) for plumbing
+  `current_poc` / `ph_temporal_mvp_enabled_flag` /
+  `sh_collocated_from_l0_flag` / `sh_collocated_ref_idx`, and a
+  private `derive_col_candidate` that wraps the per-list invocation
+  (uni-pred for P, fused L0+L1 for B) and feeds the result into the
+  merge-list builder. Acceptance fixture
+  [`decode_p_slice_temporal_merge_fires_and_decodes`](tests/reconstruct_pipeline.rs)
+  decodes a 16x16 P-slice whose single CU has no spatial / no HMVP
+  candidates; the chosen `mergeCandList[0]` is the Col MV scaled per
+  POC distance, MC translates the reference picture by the scaled
+  vector, and the test pins the byte-exact translated luma plane.
+  Test count: 481 unit (was 472, +9 covering BR/centre fallback,
+  CTB-row crossing, equal-distance + scaled-distance scaling, intra
+  collocated rejection, no-MF short-circuit, walk-order spatial → Col
+  → HMVP) + 21 integration (was 20, +1 acceptance).
+
 - **HMVP multi-CU acceptance fixture (round-25)** — extends the
   round-24 HMVP wiring with an end-to-end black-box validator that
   drives multiple inter CUs through the merge-mode pull-in path.
