@@ -43,33 +43,39 @@ oxideav-h266 = "0.0"
 ## Decode support
 
 The reconstruction pipeline is being built incrementally and now covers
-the **intra-only single-tile single-slice subset** plus the round-22
-**P-slice merge / regular-merge subset with §8.5.6.3 fractional-pel
-MC**:
+the **intra-only single-tile single-slice subset** plus the round-23
+**P + B-slice merge / regular-merge subset with §8.5.6.3 fractional-pel
+MC and §8.5.6.6.2 default-weighted bi-pred**:
 
 * **Intra**: PLANAR / DC / cardinal angular intra (modes 2, 18, 34, 50,
   66) + MIP (§8.4.5.2.2 — all 30 weight matrices) + CCLM (§8.4.5.2.14)
   + BDPCM + ISP (§8.4.5.1, all 4 split types).
-* **Inter (round-22)**: P-slice `cu_skip_flag` + `general_merge_flag`
-  inference + `merge_data()` regular-merge subset (`merge_idx`),
-  §8.5.2.3 spatial-merge candidate derivation (5-position
-  B1/A1/B0/A0/B2 list with redundancy checks), §8.5.2.2 mergeCandList
-  assembly with zero-MV padding, §8.5.6 motion compensation including
-  the round-22 §8.5.6.3 8-tap luma fractional-sample interpolation
-  (Table 27, `hpelIfIdx == 0` family) and §8.5.6.3.4 4-tap chroma
-  interpolation (Table 33), with the §8.5.6.6.2 default uni-pred
-  clamp at 8-bit. Single L0 reference, no MMVD / GPM / CIIP / AMVR /
-  BCW yet; affine + scaled-reference filter tables 28 / 29 / 30 / 31
-  / 32 / 34 / 35, BDOF + DMVR, and PROF land in later rounds.
+* **Inter (round-23)**: P + B-slice `cu_skip_flag` +
+  `general_merge_flag` inference + `merge_data()` regular-merge
+  subset (`merge_idx`), §8.5.2.3 spatial-merge candidate derivation
+  (5-position B1/A1/B0/A0/B2 list with redundancy checks across both
+  L0 + L1 records), §8.5.2.2 mergeCandList assembly with zero-MV
+  padding (uni-pred for P, bi-pred for B), §8.5.6 motion
+  compensation including the §8.5.6.3 8-tap luma fractional-sample
+  interpolation (Table 27, `hpelIfIdx == 0` family) and §8.5.6.3.4
+  4-tap chroma interpolation (Table 33), with the §8.5.6.6.2 default
+  uni-pred clamp at 8-bit and the §8.5.6.6.2 eq. 980 default-weighted
+  bi-pred composition `(predL0 + predL1 + 1) >> 1` for B-slice
+  bi-pred candidates. Single L0 + L1 reference each. No MMVD / GPM /
+  CIIP / AMVR / BCW yet; affine + scaled-reference filter tables 28
+  / 29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF, HMVP, pairwise-
+  average + temporal merge land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
   / shiftIdx tables for everything currently parsed (cu_skip /
-  general_merge / regular_merge / merge_idx now included).
+  general_merge / regular_merge / merge_idx now included with init_type
+  routing for I / P / B slices).
 * **In-loop filters**: §8.8.3 deblocking, §8.8.4 SAO (Edge + Band
   offset), §8.8.5 ALF including the fixed-filter family + CC-ALF.
-* **B-slices, non-skip merge, mvd_coding (non-merge inter), MMVD, GPM,
-  CIIP, AMVR, BCW**: still surface `Error::Unsupported`.
+* **Non-skip merge, mvd_coding (non-merge inter), HMVP, pairwise/
+  temporal merge, MMVD, GPM, CIIP, AMVR, BCW**: still surface
+  `Error::Unsupported`.
 
 ## Usage
 

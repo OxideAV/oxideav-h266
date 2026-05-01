@@ -74,8 +74,9 @@ use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
-    build_merge_cand_list, derive_spatial_merge_candidates, predict_chroma_block,
-    predict_luma_block, MotionField, MvField, ReferencePicture,
+    build_merge_cand_list, build_merge_cand_list_b, derive_spatial_merge_candidates,
+    predict_chroma_block, predict_chroma_block_bipred, predict_luma_block,
+    predict_luma_block_bipred, MotionField, MvField, ReferencePicture,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -521,6 +522,13 @@ pub struct CtuWalker<'a, 'b> {
     /// [`Self::set_ref_pic_list_l0`] before `decode_picture_into`
     /// for P-slices.
     ref_pic_list_l0: Vec<ReferencePicture>,
+    /// Round-23 reference-picture list 1. Mirrors `ref_pic_list_l0`
+    /// for the bi-pred path: the merge-mode `merge_idx` resolves to
+    /// an `MvField` whose `pred_flag_l1` (when set) indexes
+    /// `ref_idx_l1` into this list. Empty for I/P-slices; populated
+    /// by callers via [`Self::set_ref_pic_list_l1`] before
+    /// `decode_picture_into` for B-slices.
+    ref_pic_list_l1: Vec<ReferencePicture>,
     /// Round-21 per-picture motion field — written by
     /// [`Self::reconstruct_leaf_cu`] for inter CUs and read back during
     /// the §8.5.2.3 spatial-merge derivation of subsequent CUs.
@@ -569,16 +577,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ));
             }
         }
-        // P-slices are now handled by the round-21 inter path (cu_skip
-        // + regular merge). B-slices remain unsupported because the
-        // round-21 merge subset is L0-only — bi-prediction needs the
-        // §8.5.2.2 step-4 second list invocation + the §8.5.6.4
-        // weighted bi-pred path, which land in r22+.
-        if sh.sh_slice_type == SliceType::B {
-            return Err(Error::unsupported(
-                "h266 CTU walker: B-slice not supported (round-21 inter is P / L0 only)",
-            ));
-        }
+        // P-slices land via the round-21 inter path (cu_skip + regular
+        // merge). B-slices land via the round-23 extension (second
+        // §8.5.3.2 invocation against RefPicList[1] + §8.5.6.6.2 eq.
+        // 980 default-weighted bi-pred composition; BCW / weighted-pred
+        // / BDOF / DMVR still surface `Error::Unsupported` further down).
         // Dual-tree luma/chroma separate partitioning is not yet
         // modelled.
         if sps.partition_constraints.qtbtt_dual_tree_intra_flag {
@@ -661,6 +664,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             sao_ctxs,
             alf_picture,
             ref_pic_list_l0: Vec::new(),
+            ref_pic_list_l1: Vec::new(),
             motion_field,
             log2_par_mrg_level,
         })
@@ -673,6 +677,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// walker is one-shot today (`begin_slice` builds a fresh one).
     pub fn set_ref_pic_list_l0(&mut self, list: Vec<ReferencePicture>) {
         self.ref_pic_list_l0 = list;
+    }
+
+    /// Install the per-slice reference-picture list 1. Round-23
+    /// B-slice callers must invoke this before `decode_picture_into`
+    /// when the parsed merge candidate sets `pred_flag_l1` (the
+    /// second §8.5.6 invocation reads from here). Mirrors
+    /// [`Self::set_ref_pic_list_l0`].
+    pub fn set_ref_pic_list_l1(&mut self, list: Vec<ReferencePicture>) {
+        self.ref_pic_list_l1 = list;
     }
 
     /// Read-only view of the round-21 motion field. Useful for tests
@@ -1294,17 +1307,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ///    `(xCb, yCb)` from the live [`MotionField`].
     /// 2. Assemble the §8.5.2.2 mergeCandList (spatial only here +
     ///    zero-MV padding to `MaxNumMergeCand`).
-    /// 3. Pick `mergeCandList[merge_idx]`; the resulting
-    ///    `(refIdxL0, mvL0)` drives §8.5.6 motion compensation.
-    /// 4. Run §8.5.6 motion compensation. As of round-22, luma uses
-    ///    [`predict_luma_block`] which dispatches to the §8.5.6.3.2
-    ///    8-tap separable filter (Table 27, `hpelIfIdx == 0`) for
-    ///    fractional MVs and falls back to the integer-pel copy for
-    ///    `(xFrac, yFrac) == (0, 0)`; chroma uses
+    /// 3. Pick `mergeCandList[merge_idx]`; the resulting per-list
+    ///    `(refIdxLN, mvLN, predFlagLN)` drives §8.5.6 motion
+    ///    compensation per list.
+    /// 4. Run §8.5.6 motion compensation. As of round-22 the per-list
+    ///    luma path is [`predict_luma_block`] (§8.5.6.3.2 8-tap
+    ///    separable, Table 27 `hpelIfIdx == 0`) and chroma is
     ///    [`predict_chroma_block`] (§8.5.6.3.4 4-tap, Table 33).
-    ///    The §8.5.6.6.2 default uni-pred clamp closes the chain.
-    /// 5. Broadcast the chosen `MvField` across every 4x4 block in
-    ///    the CU so the next CU's merge derivation can read it.
+    ///    Round-23 adds bi-prediction (`predFlagL0 == predFlagL1 ==
+    ///    1`) via [`predict_luma_block_bipred`] /
+    ///    [`predict_chroma_block_bipred`], which run the per-list
+    ///    interpolation into scratch planes and compose the result
+    ///    with the §8.5.6.6.2 eq. 980 default-weighted average
+    ///    `(predL0 + predL1 + 1) >> 1` (BCW disabled). The §8.5.6.6.2
+    ///    default uni-pred clamp closes the uni-pred chain.
+    /// 5. Broadcast the chosen `MvField` (full L0 + L1 record) across
+    ///    every 4x4 block in the CU so the next CU's merge derivation
+    ///    can read it.
     /// 6. Append a zero-CBF [`DeblockCu`] record (skip CUs are coded
     ///    without residual) so the deblocker sees the inter boundary.
     fn reconstruct_leaf_cu_inter(
@@ -1326,67 +1345,170 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             &self.motion_field,
             self.log2_par_mrg_level,
         );
-        let mlist = build_merge_cand_list(&spatial, max_merge);
+        // Slice-aware merge list build: B-slice variants pad with
+        // bi-pred zero-MV candidates per §8.5.2.2 step 9; P-slice
+        // variants pad with uni-pred zero-MV candidates.
+        let is_b = self.sh.sh_slice_type == SliceType::B;
+        let mlist = if is_b {
+            build_merge_cand_list_b(&spatial, max_merge)
+        } else {
+            build_merge_cand_list(&spatial, max_merge)
+        };
         let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
         let chosen = mlist[idx];
 
-        if !chosen.pred_flag_l0 {
+        if !chosen.pred_flag_l0 && !chosen.pred_flag_l1 {
             return Err(Error::invalid(
-                "h266 inter: chosen merge candidate has predFlagL0 == 0; \
-                 round-21 P-slice path requires L0 prediction",
+                "h266 inter: chosen merge candidate has both predFlags == 0; \
+                 spec requires at least one active prediction list",
             ));
         }
-        if chosen.ref_idx_l0 < 0 || (chosen.ref_idx_l0 as usize) >= self.ref_pic_list_l0.len() {
-            return Err(Error::invalid(format!(
-                "h266 inter: refIdxL0 {} out of range — RefPicList0 has {} entries",
-                chosen.ref_idx_l0,
-                self.ref_pic_list_l0.len()
-            )));
+        // L0 reference picture lookup (when pred_flag_l0 is set).
+        let ref_pic_l0 = if chosen.pred_flag_l0 {
+            if chosen.ref_idx_l0 < 0 || (chosen.ref_idx_l0 as usize) >= self.ref_pic_list_l0.len() {
+                return Err(Error::invalid(format!(
+                    "h266 inter: refIdxL0 {} out of range — RefPicList0 has {} entries",
+                    chosen.ref_idx_l0,
+                    self.ref_pic_list_l0.len()
+                )));
+            }
+            Some(&self.ref_pic_list_l0[chosen.ref_idx_l0 as usize])
+        } else {
+            None
+        };
+        // L1 reference picture lookup (when pred_flag_l1 is set,
+        // i.e. round-23 B-slice bi-pred path).
+        let ref_pic_l1 = if chosen.pred_flag_l1 {
+            if chosen.ref_idx_l1 < 0 || (chosen.ref_idx_l1 as usize) >= self.ref_pic_list_l1.len() {
+                return Err(Error::invalid(format!(
+                    "h266 inter: refIdxL1 {} out of range — RefPicList1 has {} entries",
+                    chosen.ref_idx_l1,
+                    self.ref_pic_list_l1.len()
+                )));
+            }
+            Some(&self.ref_pic_list_l1[chosen.ref_idx_l1 as usize])
+        } else {
+            None
+        };
+
+        // ---- Luma MC -------------------------------------------------------
+        match (ref_pic_l0, ref_pic_l1) {
+            (Some(rp0), None) => {
+                // Uni-pred L0 (P-slice path, or B-slice candidate with
+                // predFlagL1 == 0).
+                predict_luma_block(
+                    &mut out.luma,
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    &rp0.frame.luma,
+                    chosen.mv_l0,
+                )?;
+            }
+            (None, Some(rp1)) => {
+                // Uni-pred L1 — re-uses the same per-list helper.
+                predict_luma_block(
+                    &mut out.luma,
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    &rp1.frame.luma,
+                    chosen.mv_l1,
+                )?;
+            }
+            (Some(rp0), Some(rp1)) => {
+                // Round-23 bi-pred: §8.5.6.6.2 eq. 980 default-weighted
+                // average of the two list predictions.
+                predict_luma_block_bipred(
+                    &mut out.luma,
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    &rp0.frame.luma,
+                    chosen.mv_l0,
+                    &rp1.frame.luma,
+                    chosen.mv_l1,
+                )?;
+            }
+            (None, None) => unreachable!(), // guarded above
         }
-        let ref_pic = &self.ref_pic_list_l0[chosen.ref_idx_l0 as usize];
 
-        // Luma MC: round-22 dispatcher. Integer-pel MVs collapse
-        // (inside `predict_luma_block`) to the same byte-identical
-        // copy that round-21 produced via `mc_copy_block_int`;
-        // fractional MVs invoke the §8.5.6.3.2 8-tap separable
-        // filter followed by the §8.5.6.6.2 default uni-pred clamp.
-        predict_luma_block(
-            &mut out.luma,
-            cu.cu.x,
-            cu.cu.y,
-            cu.cu.w,
-            cu.cu.h,
-            &ref_pic.frame.luma,
-            chosen.mv_l0,
-        )?;
-
-        // Chroma MC for 4:2:0. The 1/16-pel luma MV components map
-        // straight onto 1/32-pel chroma offsets (since chroma is
-        // half-resolution): `predict_chroma_block` does the 4-tap
-        // §8.5.6.3.4 filter against Table 33.
+        // ---- Chroma MC for 4:2:0 -----------------------------------------
         if self.sps.sps_chroma_format_idc == 1 {
             let cb_w_c = cu.cu.w / 2;
             let cb_h_c = cu.cu.h / 2;
             let cb_x_c = cu.cu.x / 2;
             let cb_y_c = cu.cu.y / 2;
-            predict_chroma_block(
-                &mut out.cb,
-                cb_x_c,
-                cb_y_c,
-                cb_w_c,
-                cb_h_c,
-                &ref_pic.frame.cb,
-                chosen.mv_l0,
-            )?;
-            predict_chroma_block(
-                &mut out.cr,
-                cb_x_c,
-                cb_y_c,
-                cb_w_c,
-                cb_h_c,
-                &ref_pic.frame.cr,
-                chosen.mv_l0,
-            )?;
+            match (ref_pic_l0, ref_pic_l1) {
+                (Some(rp0), None) => {
+                    predict_chroma_block(
+                        &mut out.cb,
+                        cb_x_c,
+                        cb_y_c,
+                        cb_w_c,
+                        cb_h_c,
+                        &rp0.frame.cb,
+                        chosen.mv_l0,
+                    )?;
+                    predict_chroma_block(
+                        &mut out.cr,
+                        cb_x_c,
+                        cb_y_c,
+                        cb_w_c,
+                        cb_h_c,
+                        &rp0.frame.cr,
+                        chosen.mv_l0,
+                    )?;
+                }
+                (None, Some(rp1)) => {
+                    predict_chroma_block(
+                        &mut out.cb,
+                        cb_x_c,
+                        cb_y_c,
+                        cb_w_c,
+                        cb_h_c,
+                        &rp1.frame.cb,
+                        chosen.mv_l1,
+                    )?;
+                    predict_chroma_block(
+                        &mut out.cr,
+                        cb_x_c,
+                        cb_y_c,
+                        cb_w_c,
+                        cb_h_c,
+                        &rp1.frame.cr,
+                        chosen.mv_l1,
+                    )?;
+                }
+                (Some(rp0), Some(rp1)) => {
+                    predict_chroma_block_bipred(
+                        &mut out.cb,
+                        cb_x_c,
+                        cb_y_c,
+                        cb_w_c,
+                        cb_h_c,
+                        &rp0.frame.cb,
+                        chosen.mv_l0,
+                        &rp1.frame.cb,
+                        chosen.mv_l1,
+                    )?;
+                    predict_chroma_block_bipred(
+                        &mut out.cr,
+                        cb_x_c,
+                        cb_y_c,
+                        cb_w_c,
+                        cb_h_c,
+                        &rp0.frame.cr,
+                        chosen.mv_l0,
+                        &rp1.frame.cr,
+                        chosen.mv_l1,
+                    )?;
+                }
+                (None, None) => unreachable!(),
+            }
         }
 
         // Broadcast the chosen MvField across every 4x4 block of the
@@ -1394,8 +1516,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §9.3.4.2.2 cu_skip_flag context picks it up correctly.
         let mvf = MvField {
             mv_l0: chosen.mv_l0,
-            ref_idx_l0: chosen.ref_idx_l0,
-            pred_flag_l0: true,
+            ref_idx_l0: if chosen.pred_flag_l0 {
+                chosen.ref_idx_l0
+            } else {
+                -1
+            },
+            pred_flag_l0: chosen.pred_flag_l0,
+            mv_l1: chosen.mv_l1,
+            ref_idx_l1: if chosen.pred_flag_l1 {
+                chosen.ref_idx_l1
+            } else {
+                -1
+            },
+            pred_flag_l1: chosen.pred_flag_l1,
             cu_skip_flag: info.inter.cu_skip_flag,
             mode_inter: true,
             available: true,
@@ -2200,23 +2333,24 @@ mod tests {
     }
 
     #[test]
-    fn walker_accepts_p_slice_rejects_b_slice() {
-        // Round-21: P-slices are now accepted via the inter path
-        // (cu_skip + regular merge). B-slices remain unsupported until
-        // the bi-pred path lands in r22+.
+    fn walker_accepts_p_and_b_slices() {
+        // Round-21: P-slices accepted via the inter path (cu_skip +
+        // regular merge). Round-23: B-slices accepted with the second
+        // §8.5.3.2 invocation against RefPicList[1] + the §8.5.6.6.2
+        // eq. 980 default-weighted bi-pred composition.
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 8];
         let mut sh_p = intra_slice_header();
         sh_p.sh_slice_type = SliceType::P;
-        // P should construct fine — the inter walker will then drive
-        // cu_skip_flag etc. inside `decode_picture_into`.
         assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh_p, 0, &data).is_ok());
         let mut sh_b = intra_slice_header();
         sh_b.sh_slice_type = SliceType::B;
-        let err = CtuWalker::begin_slice(&layout, &sps, &pps, &sh_b, 0, &data).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+        // B-slices should now construct cleanly; the actual MC requires
+        // RefPicList0 + RefPicList1 to be populated by the caller before
+        // `decode_picture_into`.
+        assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh_b, 0, &data).is_ok());
     }
 
     #[test]

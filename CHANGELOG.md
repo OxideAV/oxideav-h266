@@ -6,6 +6,52 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **B-slice merge / regular-merge subset (round-23)** — first bi-pred
+  path lands. The CTU walker now accepts B-slices via `begin_slice`
+  (the B-slice gate is dropped); a new `set_ref_pic_list_l1` mirror
+  installs `RefPicList[1]` alongside the existing
+  `set_ref_pic_list_l0`; the `MvField` per-4×4-block record carries
+  `mv_l1` / `ref_idx_l1` / `pred_flag_l1` slots in addition to the
+  L0 trio so subsequent CUs read both list halves during their merge
+  derivation. The §8.5.2.2 step-9 zero-MV padding gains a B-slice
+  variant ([`build_merge_cand_list_b`](src/inter.rs)) that emits
+  bi-pred zero-MV candidates (`predFlagL0 == predFlagL1 == 1,
+  refIdxL0 == refIdxL1 == 0`) per spec; the `mvf_matches` redundancy
+  check now compares both list halves so two candidates that share
+  L0 but differ on L1 are correctly *not* collapsed. The §8.5.6.6.2
+  eq. 980 default-weighted bi-pred composition (BCW disabled,
+  weighted-pred disabled) ships as `bi_pred_avg_8bit` —
+  `(predL0 + predL1 + 1) >> 1` over per-list 8-bit prediction
+  scratch planes, with [`predict_luma_block_bipred`] /
+  [`predict_chroma_block_bipred`] driving the per-list §8.5.6.3
+  invocations into matching scratch buffers and compositing into the
+  final destination. `CtuWalker::reconstruct_leaf_cu_inter` now
+  dispatches the L0-only / L1-only / bi-pred trichotomy from the
+  chosen merge candidate's `pred_flag_lN` flags. Verified by 10 new
+  lib unit tests in `inter::tests` (UNAVAILABLE shape, `mvf_matches`
+  L1 distinction, `build_merge_cand_list_b` bi-pred padding,
+  `bi_pred_avg_8bit` DC-preservation across all 256 sample values
+  + spec-formula spot-checks + bounds rejection,
+  `predict_luma_block_bipred` constant-ref invariant + per-list
+  byte-equivalence pin against the trusted single-list helpers,
+  same chroma 4-tap byte-equivalence pin) plus 2 new integration
+  tests in `tests/reconstruct_pipeline.rs`
+  (`decode_b_slice_all_skip_bipred_matches_average` synthesises a
+  B-slice CABAC payload via [`cabac_enc::ArithEncoder`]
+  (split_cu_flag(0) → cu_skip_flag(1) at init_type 2 →
+  merge_idx-bin0(0)) and verifies the decoded picture is byte-exactly
+  the §8.5.6.6.2 average of two distinct deterministic L0 / L1 ramps;
+  `decode_b_slice_writes_bipred_motion_field` verifies the per-CU
+  motion-field write-back propagates `pred_flag_l0 == pred_flag_l1
+  == true` + `ref_idx_l0 == ref_idx_l1 == 0` onto every 4×4 block).
+  Out of scope for this round (still surfaces `Error::Unsupported`
+  upstream): the §8.5.2.6 HMVP table, the §8.5.2.4 pairwise-average
+  candidate, the §8.5.2.11 temporal collocated candidate, MMVD,
+  CIIP, GPM, subblock merge, AMVR, BCW (`bcwIdx != 0`), explicit
+  weighted prediction (§8.5.6.6.3), BDOF (§8.5.6.5), DMVR, PROF
+  (§8.5.6.4), dual-tree luma / chroma split, and the full inter
+  residual decode (`cu_coded_flag` + `transform_tree()`).
+
 - **§8.5.6.3 fractional-pel motion compensation (round-22)** — the
   P-slice MC pipeline now handles sub-pel MVs end to end.
   [`predict_luma_block`](src/inter.rs) and [`predict_chroma_block`]

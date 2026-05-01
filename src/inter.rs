@@ -94,12 +94,28 @@ impl MotionVector {
 
 /// Per-block (4x4 luma) motion field record. Mirrors the spec's per-
 /// position arrays `MvLX[x][y]`, `RefIdxLX[x][y]`, `PredFlagLX[x][y]`
-/// for `X = 0` (round-21 covers L0 only).
+/// for both `X = 0` and `X = 1` — the L1 slot lit up by the round-23
+/// B-slice path. P-slices keep `pred_flag_l1 = false` and zero L1 MV /
+/// `ref_idx_l1 = -1`, which leaves all r21/r22 P-slice tests
+/// byte-identical.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MvField {
     pub mv_l0: MotionVector,
     pub ref_idx_l0: i32,
     pub pred_flag_l0: bool,
+    /// L1 motion vector — only consulted when `pred_flag_l1 == true`
+    /// (round-23 B-slice subset). For P-slices and uni-pred B
+    /// candidates this stays at `MotionVector::ZERO`.
+    pub mv_l1: MotionVector,
+    /// L1 reference index. `-1` when `pred_flag_l1 == false` (round-23
+    /// B-slice convention; mirrors the L0 sentinel).
+    pub ref_idx_l1: i32,
+    /// L1 prediction flag — `true` enables a second §8.5.6 invocation
+    /// against `RefPicList[1]`. Round-23 supports two combinations:
+    /// uni-pred (`predFlagL0 = 1, predFlagL1 = 0` — same as P-slice)
+    /// and bi-pred (`predFlagL0 = predFlagL1 = 1`, default-weighted
+    /// average per §8.5.6.6.2 eq. 980).
+    pub pred_flag_l1: bool,
     /// Marker for the per-CU `CuSkipFlag[x][y]` propagation needed by
     /// the §9.3.4.2.2 cu_skip_flag context derivation. Spec stores
     /// this on the per-CU grid, not the 4x4 grid; we conservatively
@@ -117,11 +133,16 @@ pub struct MvField {
 }
 
 impl MvField {
-    /// "Unavailable" sentinel — all zeros + `available = false`.
+    /// "Unavailable" sentinel — all zeros + `available = false`. Both
+    /// L0 and L1 ref indices land at the spec's `-1` "no reference"
+    /// sentinel.
     pub const UNAVAILABLE: MvField = MvField {
         mv_l0: MotionVector::ZERO,
         ref_idx_l0: -1,
         pred_flag_l0: false,
+        mv_l1: MotionVector::ZERO,
+        ref_idx_l1: -1,
+        pred_flag_l1: false,
         cu_skip_flag: false,
         mode_inter: false,
         available: false,
@@ -339,16 +360,26 @@ pub fn derive_spatial_merge_candidates(
     out
 }
 
-/// True when two MvFields encode the same (refIdx, mv) on L0. The
-/// round-21 redundancy check ignores L1 since P-slices never set
-/// `predFlagL1 = 1`.
+/// True when two MvFields encode the same (refIdx, mv) on **both**
+/// L0 and L1. For P-slice records both have `pred_flag_l1 == false`
+/// + `ref_idx_l1 == -1` + `mv_l1 == ZERO`, so this collapses to the
+/// L0-only check the round-21 path used. For B-slice records the L1
+/// half is non-trivial — the §8.5.2.3 redundancy gate per spec only
+/// suppresses a candidate when it matches the prior one across **all**
+/// active prediction lists.
 fn mvf_matches(a: &MvField, b: &MvField) -> bool {
-    a.pred_flag_l0 == b.pred_flag_l0 && a.ref_idx_l0 == b.ref_idx_l0 && a.mv_l0 == b.mv_l0
+    a.pred_flag_l0 == b.pred_flag_l0
+        && a.ref_idx_l0 == b.ref_idx_l0
+        && a.mv_l0 == b.mv_l0
+        && a.pred_flag_l1 == b.pred_flag_l1
+        && a.ref_idx_l1 == b.ref_idx_l1
+        && a.mv_l1 == b.mv_l1
 }
 
 /// §8.5.2.2 step 5 + step 9 — spatial-only mergeCandList assembly with
-/// zero-MV padding to `MaxNumMergeCand`. Pairwise average and HMVP are
-/// intentionally not yet wired (r22+ scope).
+/// zero-MV padding to `MaxNumMergeCand` for **P-slices** (uni-pred
+/// pads). Pairwise average and HMVP are intentionally not yet wired
+/// (r24+ scope).
 ///
 /// The list is built in spec walk order:
 ///   1. If availableFlagB1 → push B1
@@ -372,6 +403,44 @@ pub fn build_merge_cand_list(
             mv_l0: MotionVector::ZERO,
             ref_idx_l0: 0,
             pred_flag_l0: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// §8.5.2.2 step 5 + step 9 — spatial-only mergeCandList assembly with
+/// zero-MV bi-pred padding to `MaxNumMergeCand` for **B-slices**.
+///
+/// Spec §8.5.2.2 step 9 builds zero-MV bi-pred pads for B-slices
+/// (`zeroCandm = (mvL0 = 0, mvL1 = 0, refIdxL0 = m % NumRefL0,
+/// refIdxL1 = m % NumRefL1, predFlagL0 = predFlagL1 = 1)`). The
+/// round-23 subset only exercises one ref per list so `m % 1 == 0`
+/// drops out and every pad lands at `refIdxL0 = refIdxL1 = 0`.
+///
+/// Walk order matches [`build_merge_cand_list`] for the spatial slots
+/// — only the zero-MV pad shape changes.
+pub fn build_merge_cand_list_b(
+    spatial: &[SpatialMergeCandidate; 5],
+    max_num_merge_cand: u32,
+) -> Vec<MvField> {
+    let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
+    for cand in spatial {
+        if cand.available && (out.len() as u32) < max_num_merge_cand {
+            out.push(cand.field);
+        }
+    }
+    while (out.len() as u32) < max_num_merge_cand {
+        out.push(MvField {
+            mv_l0: MotionVector::ZERO,
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
@@ -839,6 +908,152 @@ pub fn predict_chroma_block(
             dst.samples
                 [(dst_y_c as usize + r as usize) * d_stride + dst_x_c as usize + c as usize] =
                 pb_clip_8bit(v);
+        }
+    }
+    Ok(())
+}
+
+// =====================================================================
+// §8.5.6.6.2 — Default-weighted bi-prediction (round-23 subset)
+// =====================================================================
+//
+// Round-23 wires the BCW-disabled / weighted-pred-disabled bi-pred
+// composition path: given two list-prediction blocks already clamped
+// to 8-bit (the per-list `pbSampleL0` / `pbSampleL1` outputs of
+// `predict_luma_block` / `predict_chroma_block`), combine them with
+// the default-weighted average per eq. 980:
+//
+//     pbSamples[x][y] = (predL0[x][y] + predL1[x][y] + 1) >> 1
+//
+// At BitDepth 8 with no BCW the expression collapses to the rounding-
+// halve a generic codec would write — same byte-exact behaviour as the
+// spec form `Clip1((predL0 + predL1 + offset2) >> shift2)` once we
+// note that both predL0 and predL1 are already in `[0, 255]` (so the
+// final clip is a no-op).
+//
+// BCW (`bcwIdx != 0`), explicit weighted prediction (§8.5.6.6.3),
+// BDOF, DMVR, PROF, and bi-pred at higher BitDepths land in r24+.
+
+/// Default-weighted bi-pred compositing (§8.5.6.6.2 eq. 980) at
+/// BitDepth 8 with BCW / weighted-pred disabled. The two source
+/// planes (`pred_l0` / `pred_l1`) hold pre-clamped 8-bit list
+/// predictions over the same `(w, h)` block; output writes to `dst`
+/// at `(dst_x, dst_y)`.
+///
+/// Both source planes must cover at least the destination block — the
+/// loop reads `(0, 0)..(w, h)` from each, so callers typically pass
+/// scratch [`PicturePlane::filled`] buffers sized exactly `(w, h)`.
+pub fn bi_pred_avg_8bit(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    pred_l0: &PicturePlane,
+    pred_l1: &PicturePlane,
+) -> Result<()> {
+    if dst_x as usize + w as usize > dst.width || dst_y as usize + h as usize > dst.height {
+        return Err(Error::invalid(format!(
+            "h266 bipred avg: destination block ({},{}) {}x{} out of plane bounds {}x{}",
+            dst_x, dst_y, w, h, dst.width, dst.height
+        )));
+    }
+    if pred_l0.width < w as usize
+        || pred_l0.height < h as usize
+        || pred_l1.width < w as usize
+        || pred_l1.height < h as usize
+    {
+        return Err(Error::invalid(format!(
+            "h266 bipred avg: pred_l0 {}x{} / pred_l1 {}x{} smaller than block {}x{}",
+            pred_l0.width, pred_l0.height, pred_l1.width, pred_l1.height, w, h,
+        )));
+    }
+    for r in 0..h as usize {
+        for c in 0..w as usize {
+            let v0 = pred_l0.samples[r * pred_l0.stride + c] as u32;
+            let v1 = pred_l1.samples[r * pred_l1.stride + c] as u32;
+            // (a + b + 1) >> 1 — rounding halve.
+            let avg = ((v0 + v1 + 1) >> 1) as u8;
+            dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
+        }
+    }
+    Ok(())
+}
+
+/// Round-23 bi-pred §8.5.6.3 luma motion-compensated prediction for
+/// one CU. Calls `predict_luma_block` twice into temporary scratch
+/// planes (one per RefPicListN) then composes the result with
+/// [`bi_pred_avg_8bit`] (§8.5.6.6.2 eq. 980) into `dst`. For uni-pred
+/// callers should keep using `predict_luma_block` directly — this
+/// helper is for `predFlagL0 == predFlagL1 == 1` only.
+///
+/// Source-position derivation matches `predict_luma_block` exactly:
+/// the per-list integer reference origin is `(dst_x + mv.x >> 4,
+/// dst_y + mv.y >> 4)`. To keep that arithmetic intact we run the
+/// per-list invocations against scratch planes sized to the *full*
+/// reference origin window — not just the destination block — and
+/// pull samples from `(dst_x, dst_y)` of the scratch when compositing.
+pub fn predict_luma_block_bipred(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src_l0: &PicturePlane,
+    mv_l0: MotionVector,
+    src_l1: &PicturePlane,
+    mv_l1: MotionVector,
+) -> Result<()> {
+    // Scratch planes are sized so the per-list call writes into
+    // (dst_x, dst_y)..(dst_x + w, dst_y + h) — matches the spec's
+    // `(xCb + mvLX[0]>>4, yCb + mvLX[1]>>4)` source-origin formula.
+    let scratch_w = (dst_x + w) as usize;
+    let scratch_h = (dst_y + h) as usize;
+    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    predict_luma_block(&mut tmp_l0, dst_x, dst_y, w, h, src_l0, mv_l0)?;
+    predict_luma_block(&mut tmp_l1, dst_x, dst_y, w, h, src_l1, mv_l1)?;
+    // Bi-pred composition: read from (dst_x, dst_y) of each scratch,
+    // write into (dst_x, dst_y) of the real destination.
+    for r in 0..h as usize {
+        for c in 0..w as usize {
+            let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
+            let v0 = tmp_l0.samples[off_src] as u32;
+            let v1 = tmp_l1.samples[off_src] as u32;
+            let avg = ((v0 + v1 + 1) >> 1) as u8;
+            dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
+        }
+    }
+    Ok(())
+}
+
+/// Round-23 bi-pred §8.5.6.3.4 chroma motion-compensated prediction
+/// for one CU at 4:2:0. Mirrors [`predict_luma_block_bipred`] for the
+/// chroma plane.
+pub fn predict_chroma_block_bipred(
+    dst: &mut PicturePlane,
+    dst_x_c: u32,
+    dst_y_c: u32,
+    w_c: u32,
+    h_c: u32,
+    src_l0: &PicturePlane,
+    mv_l0: MotionVector,
+    src_l1: &PicturePlane,
+    mv_l1: MotionVector,
+) -> Result<()> {
+    let scratch_w = (dst_x_c + w_c) as usize;
+    let scratch_h = (dst_y_c + h_c) as usize;
+    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    predict_chroma_block(&mut tmp_l0, dst_x_c, dst_y_c, w_c, h_c, src_l0, mv_l0)?;
+    predict_chroma_block(&mut tmp_l1, dst_x_c, dst_y_c, w_c, h_c, src_l1, mv_l1)?;
+    for r in 0..h_c as usize {
+        for c in 0..w_c as usize {
+            let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
+            let v0 = tmp_l0.samples[off_src] as u32;
+            let v1 = tmp_l1.samples[off_src] as u32;
+            let avg = ((v0 + v1 + 1) >> 1) as u8;
+            dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
         }
     }
     Ok(())
@@ -1386,5 +1601,241 @@ mod tests {
         predict_luma_block(&mut dst_a, 4, 4, 8, 8, &src, mv).unwrap();
         mc_copy_block_int(&mut dst_b, 4, 4, 8, 8, &src, 4 + mv.int_x(), 4 + mv.int_y()).unwrap();
         assert_eq!(dst_a.samples, dst_b.samples);
+    }
+
+    // ----- §8.5.6.6.2 / §8.5.2.2 B-slice tests (round-23) ---------------
+
+    /// `MvField::UNAVAILABLE` carries `-1` sentinels on both list
+    /// reference indices, both `pred_flag` flags clear, both MVs zero.
+    /// Pins the round-23 default-shape contract for B-slice records.
+    #[test]
+    fn mvfield_unavailable_carries_dual_minus_one() {
+        let u = MvField::UNAVAILABLE;
+        assert!(!u.available);
+        assert!(!u.pred_flag_l0);
+        assert!(!u.pred_flag_l1);
+        assert_eq!(u.ref_idx_l0, -1);
+        assert_eq!(u.ref_idx_l1, -1);
+        assert_eq!(u.mv_l0, MotionVector::ZERO);
+        assert_eq!(u.mv_l1, MotionVector::ZERO);
+    }
+
+    /// `build_merge_cand_list_b` pads with bi-pred zero-MV candidates
+    /// (predFlagL0 == predFlagL1 == 1, both ref indices 0). Mirror of
+    /// `build_merge_list_pads_with_zero_mvs` but for B-slices.
+    #[test]
+    fn build_merge_cand_list_b_pads_with_bipred_zero_mvs() {
+        let empty = [SpatialMergeCandidate::default(); 5];
+        let list = build_merge_cand_list_b(&empty, 6);
+        assert_eq!(list.len(), 6);
+        for cand in &list {
+            assert!(cand.pred_flag_l0);
+            assert!(cand.pred_flag_l1);
+            assert_eq!(cand.ref_idx_l0, 0);
+            assert_eq!(cand.ref_idx_l1, 0);
+            assert_eq!(cand.mv_l0, MotionVector::ZERO);
+            assert_eq!(cand.mv_l1, MotionVector::ZERO);
+            assert!(cand.available);
+            assert!(cand.mode_inter);
+        }
+    }
+
+    /// `bi_pred_avg_8bit`: simple rounding-halve `(a + b + 1) >> 1`.
+    /// Spec invariant: equal inputs round-trip through unchanged
+    /// (DC preserving). Verified across all 256 sample values.
+    #[test]
+    fn bi_pred_avg_dc_preserving_for_equal_inputs() {
+        for v in 0..=255u8 {
+            let p0 = PicturePlane::filled(4, 4, v);
+            let p1 = PicturePlane::filled(4, 4, v);
+            let mut dst = PicturePlane::filled(4, 4, 0);
+            bi_pred_avg_8bit(&mut dst, 0, 0, 4, 4, &p0, &p1).unwrap();
+            for s in &dst.samples {
+                assert_eq!(*s, v, "DC violated at v={v}: got {s}");
+            }
+        }
+    }
+
+    /// `bi_pred_avg_8bit`: rounding behaviour matches the spec's
+    /// `(a + b + 1) >> 1`. Spot-check a handful of (a, b) pairs that
+    /// exercise the rounding tie-break (odd sum) and the no-rounding
+    /// case (even sum).
+    #[test]
+    fn bi_pred_avg_rounding_matches_spec_formula() {
+        let cases: &[(u8, u8, u8)] = &[
+            (0, 0, 0),
+            (255, 255, 255),
+            (10, 20, 15),    // (30+1)/2 = 15 (truncated) — exact
+            (10, 21, 16),    // (31+1)>>1 = 16 — round up
+            (100, 101, 101), // odd sum rounds up
+            (100, 100, 100), // exact
+            (128, 200, 164), // (328+1)>>1 = 164
+            (1, 2, 2),       // (3+1)>>1 = 2 — rounds up
+            (255, 0, 128),   // (255+1)>>1 = 128
+            (0, 255, 128),   // commutativity check
+        ];
+        for &(a, b, expected) in cases {
+            let p0 = PicturePlane::filled(2, 2, a);
+            let p1 = PicturePlane::filled(2, 2, b);
+            let mut dst = PicturePlane::filled(2, 2, 0);
+            bi_pred_avg_8bit(&mut dst, 0, 0, 2, 2, &p0, &p1).unwrap();
+            for s in &dst.samples {
+                assert_eq!(*s, expected, "({a},{b}) → expected {expected}, got {s}");
+            }
+        }
+    }
+
+    /// Bi-pred luma path: with two references that contain the same
+    /// constant value, the bi-pred output is byte-identical to that
+    /// constant — even when the two MVs differ.
+    #[test]
+    fn predict_luma_bipred_constant_refs_are_constant() {
+        let src_l0 = PicturePlane::filled(16, 16, 100);
+        let src_l1 = PicturePlane::filled(16, 16, 100);
+        let mut dst = PicturePlane::filled(16, 16, 0);
+        let mv_l0 = MotionVector { x: 5, y: 7 };
+        let mv_l1 = MotionVector { x: 11, y: 3 };
+        predict_luma_block_bipred(&mut dst, 0, 0, 8, 8, &src_l0, mv_l0, &src_l1, mv_l1).unwrap();
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(dst.samples[r * 16 + c], 100);
+            }
+        }
+    }
+
+    /// Bi-pred luma path: the output equals
+    /// `(predict_luma(L0) + predict_luma(L1) + 1) >> 1` byte-for-byte.
+    /// Pins the spec's eq. 980 default-weighted average against the
+    /// per-list helpers we already trust.
+    #[test]
+    fn predict_luma_bipred_matches_per_list_average() {
+        // Build two distinct reference planes with non-trivial content
+        // so the per-list outputs differ at most positions.
+        let mut src_l0 = PicturePlane::filled(32, 32, 0);
+        let mut src_l1 = PicturePlane::filled(32, 32, 0);
+        for y in 0..32 {
+            for x in 0..32 {
+                src_l0.samples[y * 32 + x] = ((x * 9) ^ (y * 5)) as u8;
+                src_l1.samples[y * 32 + x] = ((x * 3) ^ (y * 11)) as u8;
+            }
+        }
+        let mv_l0 = MotionVector { x: 16, y: 0 }; // integer-pel +1
+        let mv_l1 = MotionVector { x: 0, y: 16 }; // integer-pel +1 in y
+        let mut dst_bipred = PicturePlane::filled(32, 32, 0);
+        let mut dst_l0 = PicturePlane::filled(32, 32, 0);
+        let mut dst_l1 = PicturePlane::filled(32, 32, 0);
+        predict_luma_block_bipred(
+            &mut dst_bipred,
+            8,
+            8,
+            16,
+            16,
+            &src_l0,
+            mv_l0,
+            &src_l1,
+            mv_l1,
+        )
+        .unwrap();
+        predict_luma_block(&mut dst_l0, 8, 8, 16, 16, &src_l0, mv_l0).unwrap();
+        predict_luma_block(&mut dst_l1, 8, 8, 16, 16, &src_l1, mv_l1).unwrap();
+        for r in 0..16 {
+            for c in 0..16 {
+                let off = (8 + r) * 32 + (8 + c);
+                let v0 = dst_l0.samples[off] as u32;
+                let v1 = dst_l1.samples[off] as u32;
+                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                assert_eq!(
+                    dst_bipred.samples[off], avg,
+                    "bipred mismatch at ({r},{c}): l0={v0} l1={v1}",
+                );
+            }
+        }
+    }
+
+    /// Bi-pred chroma path: equivalent of the luma byte-equivalence
+    /// pin above for the chroma 4-tap filter.
+    #[test]
+    fn predict_chroma_bipred_matches_per_list_average() {
+        let mut src_l0 = PicturePlane::filled(16, 16, 0);
+        let mut src_l1 = PicturePlane::filled(16, 16, 0);
+        for y in 0..16 {
+            for x in 0..16 {
+                src_l0.samples[y * 16 + x] = (50 + x + y * 2) as u8;
+                src_l1.samples[y * 16 + x] = (200 - x - y * 2) as u8;
+            }
+        }
+        let mv_l0 = MotionVector { x: 8, y: 0 }; // half-pel chroma x
+        let mv_l1 = MotionVector { x: 0, y: 8 }; // half-pel chroma y
+        let mut dst_bipred = PicturePlane::filled(16, 16, 0);
+        let mut dst_l0 = PicturePlane::filled(16, 16, 0);
+        let mut dst_l1 = PicturePlane::filled(16, 16, 0);
+        predict_chroma_block_bipred(&mut dst_bipred, 2, 2, 8, 8, &src_l0, mv_l0, &src_l1, mv_l1)
+            .unwrap();
+        predict_chroma_block(&mut dst_l0, 2, 2, 8, 8, &src_l0, mv_l0).unwrap();
+        predict_chroma_block(&mut dst_l1, 2, 2, 8, 8, &src_l1, mv_l1).unwrap();
+        for r in 0..8 {
+            for c in 0..8 {
+                let off = (2 + r) * 16 + (2 + c);
+                let v0 = dst_l0.samples[off] as u32;
+                let v1 = dst_l1.samples[off] as u32;
+                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                assert_eq!(dst_bipred.samples[off], avg);
+            }
+        }
+    }
+
+    /// `mvf_matches` redundancy check honours the L1 half — two
+    /// candidates that share the same L0 record but differ on L1 are
+    /// **not** considered duplicates. Pins the round-23 redundancy
+    /// shape against the round-21 L0-only shortcut.
+    #[test]
+    fn mvf_matches_distinguishes_l1_record() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(1, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            available: true,
+            ..Default::default()
+        };
+        // Same L0, but enable L1 with a different MV → must NOT match.
+        let bipred = MvField {
+            mv_l1: MotionVector::from_int_pel(2, 0),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            ..base
+        };
+        assert!(!mvf_matches(&base, &bipred));
+        // Same L0 + L1 → matches.
+        let bipred_clone = bipred;
+        assert!(mvf_matches(&bipred, &bipred_clone));
+    }
+
+    /// `bi_pred_avg_8bit` rejects an out-of-bounds destination block.
+    #[test]
+    fn bi_pred_avg_rejects_out_of_bounds_dst() {
+        let p0 = PicturePlane::filled(4, 4, 0);
+        let p1 = PicturePlane::filled(4, 4, 0);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        let err = bi_pred_avg_8bit(&mut dst, 0, 0, 4, 4, &p0, &p1).unwrap_err();
+        assert!(
+            matches!(err, oxideav_core::Error::InvalidData(_)),
+            "{err:?}"
+        );
+    }
+
+    /// `bi_pred_avg_8bit` rejects source planes smaller than the block.
+    #[test]
+    fn bi_pred_avg_rejects_undersized_source() {
+        let p0 = PicturePlane::filled(2, 2, 0);
+        let p1 = PicturePlane::filled(4, 4, 0);
+        let mut dst = PicturePlane::filled(4, 4, 0);
+        let err = bi_pred_avg_8bit(&mut dst, 0, 0, 4, 4, &p0, &p1).unwrap_err();
+        assert!(
+            matches!(err, oxideav_core::Error::InvalidData(_)),
+            "{err:?}"
+        );
     }
 }

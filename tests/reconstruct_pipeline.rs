@@ -742,6 +742,227 @@ fn decode_p_slice_writes_motion_field() {
     }
 }
 
+/// Round-23: B-slice all-skip + bi-pred zero-MV merge candidate. Two
+/// distinct reference pictures are bound to RefPicList0 and
+/// RefPicList1; the synthesised CABAC payload picks merge index 0
+/// (the spatial-list zero-MV pad, which for B-slices is **bi-pred**
+/// per [`oxideav_h266::inter::build_merge_cand_list_b`]). The
+/// expected output is byte-exactly the §8.5.6.6.2 eq. 980 default-
+/// weighted average `(L0 + L1 + 1) >> 1` of the two reference frames.
+///
+/// Bitstream synthesis matches the round-21 P-slice fixture but
+/// flips `sh_slice_type = B` (init_type = 2 with
+/// `sh_cabac_init_flag = 0`). Verifies:
+///   1. The B-slice gate inside `CtuWalker::begin_slice` is gone.
+///   2. The bi-pred merge candidate is correctly built and selected.
+///   3. The §8.5.6.6.2 eq. 980 composition produces byte-exact output.
+#[test]
+fn decode_b_slice_all_skip_bipred_matches_average() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+
+    // ---- Build two distinct reference pictures (L0 / L1) -----------------
+    // Use deterministic ramps so the bipred output is uniquely determined.
+    let mut ref_l0_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    let mut ref_l1_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            ref_l0_buf.luma.samples[y * 8 + x] = (10 + (y * 8 + x)) as u8;
+            ref_l1_buf.luma.samples[y * 8 + x] = (200 - (y * 8 + x)) as u8;
+        }
+    }
+    for y in 0..(pic_h / 2) as usize {
+        for x in 0..(pic_w / 2) as usize {
+            ref_l0_buf.cb.samples[y * 4 + x] = (90 + y * 4 + x) as u8;
+            ref_l0_buf.cr.samples[y * 4 + x] = (170 + y * 4 + x) as u8;
+            ref_l1_buf.cb.samples[y * 4 + x] = (160 - y * 4 - x) as u8;
+            ref_l1_buf.cr.samples[y * 4 + x] = (200 - y * 4 - x) as u8;
+        }
+    }
+    let ref_l0 = ReferencePicture {
+        poc: 0,
+        frame: ref_l0_buf.clone(),
+    };
+    let ref_l1 = ReferencePicture {
+        poc: 2,
+        frame: ref_l1_buf.clone(),
+    };
+
+    // ---- B-slice CABAC payload synthesis --------------------------------
+    // Slice QP = 26; sh_slice_type = B with sh_cabac_init_flag = 0 →
+    // init_type = 2 per Table 51.
+    let slice_qp = 26;
+    let init_type = 2u8;
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+
+    let mut enc = ArithEncoder::new();
+    // 1. split_cu_flag(0).
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+    // 2. cu_skip_flag(1) at init_type 2 (B-slice).
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+        .unwrap();
+    // 3. general_merge_flag inferred to 1 (skip → no bin emitted).
+    // 4. merge_idx bin 0 = 0 → mergeCandList[0] = bipred zero-MV pad.
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_ctxs.len() - 1);
+    enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+        .unwrap();
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header for a B-slice on an 8x8 picture --------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::B,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+
+    // ---- Decode the B-slice --------------------------------------------
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_l0]);
+    walker.set_ref_pic_list_l1(vec![ref_l1]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+    walker.apply_in_loop_filters(&mut out).unwrap();
+
+    // ---- Build expected output: byte-exact (L0 + L1 + 1) >> 1 -----------
+    let expected_y: Vec<u8> = ref_l0_buf
+        .luma
+        .samples
+        .iter()
+        .zip(&ref_l1_buf.luma.samples)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .collect();
+    let expected_cb: Vec<u8> = ref_l0_buf
+        .cb
+        .samples
+        .iter()
+        .zip(&ref_l1_buf.cb.samples)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .collect();
+    let expected_cr: Vec<u8> = ref_l0_buf
+        .cr
+        .samples
+        .iter()
+        .zip(&ref_l1_buf.cr.samples)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .collect();
+
+    assert_eq!(
+        out.luma.samples, expected_y,
+        "luma plane must equal byte-exact bipred average of L0 + L1"
+    );
+    assert_eq!(out.cb.samples, expected_cb, "Cb plane bipred mismatch");
+    assert_eq!(out.cr.samples, expected_cr, "Cr plane bipred mismatch");
+}
+
+/// Round-23: B-slice motion-field write-back broadcasts the chosen
+/// bi-pred MvField across every 4x4 block of the (only) skip CU.
+/// Verifies that `pred_flag_l0 == pred_flag_l1 == true` and that
+/// `ref_idx_l0 == ref_idx_l1 == 0` (the zero-MV pad slot) propagate
+/// onto the per-block grid for downstream merge derivation.
+#[test]
+fn decode_b_slice_writes_bipred_motion_field() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+    let ref_l0 = ReferencePicture {
+        poc: 0,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+    };
+    let ref_l1 = ReferencePicture {
+        poc: 2,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 192),
+    };
+
+    let slice_qp = 26;
+    let init_type = 2u8;
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut enc = ArithEncoder::new();
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+        .unwrap();
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_ctxs.len() - 1);
+    enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+        .unwrap();
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::B,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_l0]);
+    walker.set_ref_pic_list_l1(vec![ref_l1]);
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // Verify the per-block motion field carries the bi-pred record.
+    let mf = walker.motion_field();
+    for by in 0..mf.blocks_h {
+        for bx in 0..mf.blocks_w {
+            let f = mf.field[(by * mf.blocks_w + bx) as usize];
+            assert!(f.available);
+            assert!(
+                f.pred_flag_l0,
+                "block ({bx},{by}) must carry predFlagL0 == 1"
+            );
+            assert!(
+                f.pred_flag_l1,
+                "block ({bx},{by}) must carry predFlagL1 == 1"
+            );
+            assert_eq!(f.ref_idx_l0, 0);
+            assert_eq!(f.ref_idx_l1, 0);
+            assert_eq!(f.mv_l0.x, 0);
+            assert_eq!(f.mv_l0.y, 0);
+            assert_eq!(f.mv_l1.x, 0);
+            assert_eq!(f.mv_l1.y, 0);
+            assert!(f.cu_skip_flag);
+            assert!(f.mode_inter);
+        }
+    }
+
+    // The per-pixel output should be the rounded average of 64 and 192:
+    // (64 + 192 + 1) >> 1 = 128.
+    for s in &out.luma.samples {
+        assert_eq!(*s, 128, "luma bipred should be (64 + 192 + 1) >> 1 = 128");
+    }
+}
+
 /// Chroma ALF wiring: install a per-CTB Cb-on record + a chroma APS
 /// with all-zero coefficients. On the post-decode (flat) chroma plane
 /// the filter math is identity, but the apply pass should still have
