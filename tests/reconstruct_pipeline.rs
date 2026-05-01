@@ -1097,3 +1097,197 @@ fn ctu_walker_chroma_alf_runs_with_chroma_aps() {
     let after = out.cb.samples[5 * cb_stride + 5];
     assert_ne!(after, 200, "chroma ALF should have moved the spike");
 }
+
+/// Round-24 acceptance fixture: a quad-split P-slice exercises the
+/// HMVP merge-mode pull-in path end-to-end. The CTU is a 16x16 root
+/// that splits into four 8x8 leaf CUs, each cu_skip + merge_idx = 0.
+/// CU2 / CU3 / CU4 invoke [`build_merge_cand_list`] with a non-empty
+/// HMVP table (CU1 already pushed its MvField via `update_with` per
+/// §8.5.2.16), so `insert_hmvp_into_merge_list` runs at least three
+/// times during the slice — proving the §8.5.2.6 walk is wired into
+/// the per-CU reconstruct path, not just the table-update side.
+///
+/// This is the broader counterpart to `decode_p_slice_populates_hmvp_table`
+/// which only pinned table population on a single-CU fixture. The
+/// acceptance criterion is that the multi-CU decode produces the
+/// reference picture byte-exactly (every chosen merge candidate is the
+/// uni-pred zero-MV record — either the spatial neighbour from a prior
+/// CU, the HMVP entry that mirrors it, or the zero-MV pad — they are
+/// all the same MvField after the §8.5.2.16 dedup, which is itself
+/// the round-24 invariant the test exercises).
+#[test]
+fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    // 16x16 picture inside a single 32-CTU. The walker recurses
+    // walk(0,0,16,16): split_cu_flag(1) + split_qt_flag(1) → four 8x8
+    // children at depth 1. Each child reads split_cu_flag(0) (leaf at
+    // 8x8 since 8 > min_cb_log2 = 2 still emits a split-flag bin) and
+    // then the cu_skip + merge_idx pair on the inter path.
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+    };
+    let ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64);
+
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut enc = ArithEncoder::new();
+
+    // 1. Root split_cu_flag(1) at 16x16, depth 0. ctxInc args mirror
+    //    `TreeWalker::recurse` which passes neighbour-availability =
+    //    false today.
+    let split_cu_inc_root =
+        ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_cu_n_minus1 = split_cu_ctxs.len() - 1;
+    enc.encode_decision(
+        &mut split_cu_ctxs[split_cu_inc_root.min(split_cu_n_minus1)],
+        1,
+    )
+    .unwrap();
+
+    // 2. Root split_qt_flag(1) at depth 0.
+    let split_qt_inc_root = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let split_qt_n_minus1 = split_qt_ctxs.len() - 1;
+    enc.encode_decision(
+        &mut split_qt_ctxs[split_qt_inc_root.min(split_qt_n_minus1)],
+        1,
+    )
+    .unwrap();
+
+    // 3. The decoder performs ALL partition decoding (`decode_ctu_partitions`)
+    //    BEFORE reading any leaf-CU syntax (`decode_leaf_cu_syntax`).
+    //    We therefore emit all 4 child split_cu_flag(0) bins first,
+    //    then all 4 (cu_skip + merge_idx) pairs in z-order. Even though
+    //    these bins use different context bundles (tree_ctxs vs
+    //    leaf_ctxs), the arithmetic coder's range/low state is shared,
+    //    so bin order in the stream must match the decoder's read order.
+    //
+    // Note on cu_skip_flag ctxInc: the decoder's
+    // [`CtuWalker::compute_cu_neighbourhood`] samples the motion field
+    // in its parse-time state. The motion-field writes performed by
+    // [`CtuWalker::reconstruct_leaf_cu_inter`] only happen during
+    // [`CtuWalker::decode_picture_into`] — *after* `decode_ctu_full`
+    // has parsed every CU's syntax. So during parse every prior CU's
+    // motion-field slot is still UNAVAILABLE, `left_cu_skip =
+    // above_cu_skip = false` for every CU, ctxInc = 0, and the slot
+    // is `init_type * 3 + 0 = 3` uniformly.
+    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot_8 = split_inc_8.min(split_cu_n_minus1);
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_n_minus1);
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+
+    // a) Four split_cu_flag(0) for the four 8x8 children (TL, TR, BL, BR).
+    for _ in 0..4 {
+        enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+            .unwrap();
+    }
+    // b) Four (cu_skip(1) + merge_idx(0)) pairs in z-order.
+    for _ in 0..4 {
+        enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+            .unwrap();
+        enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+            .unwrap();
+    }
+
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header ---------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    // Slice-start invariant: HMVP table reset to empty per §7.3.11.
+    assert_eq!(
+        walker.hmvp_table().len(),
+        0,
+        "HMVP table must be empty at slice start (§7.3.11 NumHmvpCand = 0 reset)"
+    );
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // Acceptance: the multi-CU decode must reproduce the reference
+    // picture byte-exactly. Every chosen merge candidate resolves to
+    // the same uni-pred zero-MV / refIdx 0 record (HMVP entries from
+    // CU1..CU3 dedup with the spatial zero-MV neighbours and zero-MV
+    // pads), so the reconstructed picture must equal the constant-64
+    // reference frame.
+    assert_eq!(
+        out.luma.samples, ref_buf.luma.samples,
+        "luma plane must equal reference frame after quad-split all-skip P-slice decode"
+    );
+    assert_eq!(
+        out.cb.samples, ref_buf.cb.samples,
+        "Cb plane must equal reference frame"
+    );
+    assert_eq!(
+        out.cr.samples, ref_buf.cr.samples,
+        "Cr plane must equal reference frame"
+    );
+
+    // Post-decode HMVP table invariant: §8.5.2.16 dedup collapses all
+    // four identical inter-CU pushes into a single entry (same MvField
+    // → existing entry is removed and re-appended at the back). Pin
+    // both bounds: at least 1 entry (CU4's push) and at most
+    // `MAX_HMVP_CAND` = 5.
+    let table = walker.hmvp_table();
+    assert!(
+        !table.entries.is_empty(),
+        "HMVP table must have at least one entry after a 4-CU inter slice"
+    );
+    assert!(
+        table.entries.len() <= oxideav_h266::inter::MAX_HMVP_CAND,
+        "HMVP table size must respect §8.5.2.16 cap of {}",
+        oxideav_h266::inter::MAX_HMVP_CAND
+    );
+    // The retained entry must be the CU's chosen MvField (zero-MV,
+    // refIdx 0, predFlagL0 = 1, cu_skip = 1).
+    let last = table.entries.last().unwrap();
+    assert!(last.pred_flag_l0);
+    assert!(!last.pred_flag_l1);
+    assert_eq!(last.ref_idx_l0, 0);
+    assert_eq!(last.mv_l0.x, 0);
+    assert_eq!(last.mv_l0.y, 0);
+    assert!(last.mode_inter);
+    assert!(last.cu_skip_flag);
+
+    // Per-block motion-field invariant: every 4x4 block must carry
+    // the chosen MvField — proves the broadcast in
+    // `reconstruct_leaf_cu_inter` ran for all four CUs.
+    let mf = walker.motion_field();
+    for by in 0..mf.blocks_h {
+        for bx in 0..mf.blocks_w {
+            let f = mf.field[(by * mf.blocks_w + bx) as usize];
+            assert!(f.available);
+            assert!(f.pred_flag_l0);
+            assert_eq!(f.ref_idx_l0, 0);
+            assert_eq!(f.mv_l0.x, 0);
+            assert_eq!(f.mv_l0.y, 0);
+            assert!(f.cu_skip_flag);
+        }
+    }
+}

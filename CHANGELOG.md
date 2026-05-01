@@ -6,6 +6,34 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **HMVP multi-CU acceptance fixture (round-25)** — extends the
+  round-24 HMVP wiring with an end-to-end black-box validator that
+  drives multiple inter CUs through the merge-mode pull-in path.
+  The new
+  [`decode_p_slice_quad_split_exercises_hmvp_merge_pull_in`](tests/reconstruct_pipeline.rs)
+  integration test synthesises a P-slice CABAC payload via
+  [`cabac_enc::ArithEncoder`] for a 16x16 single-CTU picture
+  quad-split into four 8x8 cu_skip + merge_idx = 0 leaf CUs
+  (split_cu(1) → split_qt(1) at root, then four split_cu(0)
+  followed by four (cu_skip(1), merge_idx(0)) pairs in z-order
+  matching the decoder's parse-then-syntax bin sequence). After
+  decode the test pins three round-24 invariants on the multi-CU
+  path: (1) the picture matches the constant-64 reference frame
+  byte-exactly (every chosen merge candidate resolves to the
+  uni-pred zero-MV / refIdx 0 record across all four CUs, with
+  `insert_hmvp_into_merge_list` invoked at least three times during
+  the slice — once per CU2/CU3/CU4); (2)
+  [`CtuWalker::hmvp_table`] post-decode contains 1..=`MAX_HMVP_CAND`
+  entries with the `MvField` carrying `pred_flag_l0 = mode_inter =
+  cu_skip_flag = true` / `pred_flag_l1 = false` / `ref_idx_l0 = 0`
+  / `mv_l0 = ZERO` (the §8.5.2.16 dedup collapses all four
+  identical pushes into a single retained entry); (3) every 4x4
+  block of the per-picture motion field carries the chosen MvField,
+  proving the broadcast in `reconstruct_leaf_cu_inter` ran for all
+  four CUs. Brings the integration test count to 20 (was 19) on
+  zero new lib-unit-test additions — the round-24 lib-unit suite
+  already covered `insert_hmvp_into_merge_list` directly.
+
 - **HMVP merge candidate insertion + table maintenance (round-24)** —
   the §8.5.2.6 history-based merging-candidate derivation and the
   §8.5.2.16 update process now land in `oxideav_h266::inter`. A new
