@@ -1785,3 +1785,176 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
         "CU2 picked Col = (-48, 0)"
     );
 }
+
+/// Round-27: P-slice merge with motion vector difference (MMVD,
+/// §8.5.2.7). Single 8x8 CU; cu_skip = 1 path infers general_merge_flag
+/// + regular_merge_flag to 1, then the MMVD sub-tree fires:
+///
+/// * `mmvd_merge_flag = 1`   (ctx-coded ctx 0 of Table 103)
+/// * `mmvd_cand_flag = 0`    (ctx-coded ctx 0 of Table 104; picks
+///   `mergeCandList[0]` = zero-MV pad as the base)
+/// * `mmvd_distance_idx = 2` (TR cMax=7; Table 17 entry `MmvdDistance =
+///   4`, eq. 188 emits `4 << 2 = 16` 1/16-pel units = `1` integer luma
+///   sample)
+/// * `mmvd_direction_idx = 0` (FL cMax=3; Table 18 entry
+///   `(MmvdSign[0], MmvdSign[1]) = (+1, 0)`)
+///
+/// → `MmvdOffset = (+16, 0)` 1/16-pel = `(+1, 0)` integer-pel. Applied
+/// to the zero-MV base candidate, the final L0 MV is `(+16, 0)` so the
+/// MC fetch translates the reference by one column (`dst[y][x] =
+/// ref[y][x + 1]`, clamped at the right edge per §8.5.6.3).
+///
+/// The fixture verifies:
+///
+/// 1. `sps_mmvd_enabled_flag = 1` survives the SPS round-trip and is
+///    surfaced via [`CtuWalker::cu_tool_flags`].
+/// 2. The leaf CU reader parses the four MMVD syntax elements (Table
+///    103 / 104 / 105 + Table 18 FL bypass bins) correctly off a
+///    synthesised CABAC payload.
+/// 3. The CTU walker calls [`oxideav_h266::inter::derive_mmvd_offset`]
+///    then [`oxideav_h266::inter::apply_mmvd_to_base`] in the right
+///    order so the per-block MotionField records the *MMVD-corrected*
+///    MV (`(+16, 0)` in 1/16-pel units) — not the base MV (`(0, 0)`).
+/// 4. The reconstructed luma plane matches the spec-derived
+///    translated reference (`ref[y][x + 1]` clamped).
+#[test]
+fn decode_p_slice_mmvd_fires_and_decodes() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_split_cu_flag};
+    use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+
+    // Reference: distinctive ramp so the per-pixel translation is
+    // verifiable bit-exactly.
+    let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 5) as u8;
+        }
+    }
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+        motion_field: None,
+    };
+
+    // ---- CABAC payload synthesis -------------------------------------
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
+
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut mmvd_merge_ctxs = init_contexts(SyntaxCtx::MmvdMergeFlag, slice_qp);
+    let mut mmvd_cand_ctxs = init_contexts(SyntaxCtx::MmvdCandFlag, slice_qp);
+    let mut mmvd_dist_ctxs = init_contexts(SyntaxCtx::MmvdDistanceIdx, slice_qp);
+
+    let mut enc = ArithEncoder::new();
+
+    // 1. split_cu_flag(0) — single 8x8 CU at the CTU root.
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+
+    // 2. cu_skip_flag(1) — skip-mode CU. Inference chain: skip=1
+    //    implies general_merge_flag=1 (no bin); CIIP/GPM gates collapse
+    //    so regular_merge_flag also infers to 1 (no bin).
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+        .unwrap();
+
+    // 3. mmvd_merge_flag(1) — Table 103 ctxIdx = init_type - 1 = 0.
+    let mmvd_merge_slot = (init_type as usize) - 1;
+    enc.encode_decision(&mut mmvd_merge_ctxs[mmvd_merge_slot], 1)
+        .unwrap();
+
+    // 4. mmvd_cand_flag(0) — picks mergeCandList[0] = zero-MV pad.
+    let mmvd_cand_slot = (init_type as usize) - 1;
+    enc.encode_decision(&mut mmvd_cand_ctxs[mmvd_cand_slot], 0)
+        .unwrap();
+
+    // 5. mmvd_distance_idx = 2 — TR(cMax=7, cRiceParam=0) encoding:
+    //    bin0 = 1 (ctx), bin1 = 1 (bypass), bin2 = 0 (bypass terminator).
+    let mmvd_dist_slot = (init_type as usize) - 1;
+    enc.encode_decision(&mut mmvd_dist_ctxs[mmvd_dist_slot], 1)
+        .unwrap();
+    enc.encode_bypass(1).unwrap();
+    enc.encode_bypass(0).unwrap();
+
+    // 6. mmvd_direction_idx = 0 — FL(cMax=3) emits 2 bypass bins MSB
+    //    first: `00`.
+    enc.encode_bypass(0).unwrap();
+    enc.encode_bypass(0).unwrap();
+
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header ------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    sps.tool_flags.mmvd_enabled_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+    // Default: ph_mmvd_fullpel_only = false → use Table 17 regular grid.
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // ---- Expected luma: ref translated by (+1, 0) integer-pel.
+    //
+    // MMVD chain:
+    //   mmvd_distance_idx = 2 → MmvdDistance = 4
+    //   eq. 188:    MmvdOffset[0] = (4 << 2) * (+1) = +16 (1/16-pel)
+    //               = +1 integer-pel
+    //   chosen_mv  = base_mv + MmvdOffset = (0,0) + (+16, 0) = (+16, 0)
+    //   §8.5.6.3 fetch: src_x = dst_x + (mv >> 4) = dst_x + 1
+    //
+    // → dst[y][x] = ref[y][min(x + 1, W - 1)].
+    let stride = pic_w as usize;
+    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            let sx = (x + 1).min(pic_w as usize - 1);
+            expected_y[y * stride + x] = ref_buf.luma.samples[y * stride + sx];
+        }
+    }
+    assert_eq!(
+        out.luma.samples, expected_y,
+        "luma must match the MMVD-corrected reference translation \
+         (base zero-MV merge candidate + (+1, 0) MMVD offset = +1 \
+         integer-pel column shift)"
+    );
+
+    // ---- Per-block motion field: MMVD-corrected MV must be broadcast.
+    //
+    // The base candidate is mergeCandList[0] which for a CU with no
+    // available spatial / temporal / HMVP neighbours is the §8.5.2.2
+    // step 9 zero-MV pad. After §8.5.2.7 MMVD application the recorded
+    // MvField must carry mv_l0 = (+16, 0), refIdx 0, predFlagL0 = 1.
+    let mf = walker.motion_field();
+    let centre = mf.get_at_luma(4, 4);
+    assert!(centre.available);
+    assert!(centre.pred_flag_l0);
+    assert!(!centre.pred_flag_l1);
+    assert_eq!(centre.ref_idx_l0, 0);
+    assert_eq!(
+        centre.mv_l0,
+        MotionVector { x: 16, y: 0 },
+        "MotionField must carry the MMVD-corrected MV (+16, 0) \
+         (i.e. base zero-MV + MmvdOffset(+16, 0) per §8.5.2.7), not \
+         the base zero-MV"
+    );
+    assert!(centre.cu_skip_flag);
+    assert!(centre.mode_inter);
+}

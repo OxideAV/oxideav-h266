@@ -6,6 +6,53 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **Merge with Motion Vector Differences — MMVD (round-27, §8.5.2.7)** —
+  the merge-data sub-tree now lights up the MMVD branch when
+  `sps_mmvd_enabled_flag == 1`. New `MergeData` fields
+  `mmvd_merge_flag` / `mmvd_cand_flag` / `mmvd_distance_idx` /
+  `mmvd_direction_idx` carry the parsed syntax. Tables 17 + 18 ship as
+  `MMVD_DISTANCE_TABLE` (`{1, 2, 4, 8, 16, 32, 64, 128}` in pre-`<<2`
+  units → `{1/4, 1/2, 1, 2, 4, 8, 16, 32}` luma after eq. 188),
+  `MMVD_DISTANCE_TABLE_FULLPEL` (`4×` the regular table, gated by the
+  picture-header `ph_mmvd_fullpel_only_flag`), and `MMVD_SIGN_TABLE`
+  (the four cardinal directions `+x / -x / +y / -y` per the spec).
+  [`derive_mmvd_offset`](src/inter.rs) emits `MmvdOffset` as a
+  `MotionVector` in 1/16-pel units (eqs. 188 / 189: `(MmvdDistance <<
+  2) * MmvdSign`), and [`apply_mmvd_to_base`](src/inter.rs) folds the
+  offset into a chosen base candidate's per-list MVs — the uni-pred
+  case (eqs. 581 / 582) and the equal-POC-distance bi-pred shortcut
+  (eqs. 557 – 560) are wired; asymmetric POC bi-pred (eqs. 561 – 580)
+  rides alongside future BCW / DMVR work. Tables 103 / 104 / 105 ship
+  as new `SyntaxCtx` variants `MmvdMergeFlag` / `MmvdCandFlag` /
+  `MmvdDistanceIdx` with the spec initValue / shiftIdx pairs (Table 103
+  `[26, 25] / [4, 4]`, Table 104 `[43, 43] / [10, 10]`, Table 105 `[60,
+  59] / [0, 0]`). The leaf CU reader gains `read_mmvd_distance_idx`
+  (TR `cMax = 7, cRiceParam = 0`: bin0 ctx-coded, bins 1..6 bypass)
+  and `read_mmvd_direction_idx` (FL `cMax = 3`: 2 bypass bins MSB
+  first); both ctxIdx selectors index by `init_type - 1` (P/B only,
+  MMVD is never signalled in I slices). The §7.4.12.7 inference
+  `merge_idx == mmvd_cand_flag` is folded into the parser so the
+  reconstruction pipeline picks `mergeCandList[merge_idx]` uniformly.
+  `CuToolFlags` gains `mmvd_enabled` + `ph_mmvd_fullpel_only`;
+  `CtuWalker` gains [`set_ph_mmvd_fullpel_only`](src/ctu.rs) for
+  plumbing the picture-header switch. The CTU walker invokes
+  `derive_mmvd_offset` + `apply_mmvd_to_base` between merge-list
+  selection and motion compensation when `mmvd_merge_flag == 1`, so
+  the per-block motion field records the MMVD-corrected MV (not the
+  base MV). Acceptance fixture
+  [`decode_p_slice_mmvd_fires_and_decodes`](tests/reconstruct_pipeline.rs)
+  synthesises a P-slice payload with `cu_skip = 1`, `mmvd_merge_flag =
+  1`, `mmvd_cand_flag = 0`, `mmvd_distance_idx = 2` (1-luma offset),
+  `mmvd_direction_idx = 0` (`+x`); the chosen base is the §8.5.2.2
+  step 9 zero-MV pad, MMVD adds `(+16, 0)` 1/16-pel = `(+1, 0)` int-
+  pel, and the test pins the byte-exact `ref[y][x + 1]` translated
+  luma plane plus the broadcast `MotionField` carrying the corrected
+  MV. Test count: 502 unit (was 492, +10 covering Table 17 fractional
+  vs fullpel grids, all four Table 18 directions, eq. 188 `<< 2`
+  scaling, the apply-to-base uni / bi-pred branches, and the
+  `MergeData::default` MMVD-off invariant) + 23 integration (was 22,
+  +1 MMVD acceptance).
+
 - **Pairwise-average merge candidate (round-26, §8.5.2.4)** — the
   §8.5.2.2 step 8 invocation now lands in
   [`build_merge_cand_list`](src/inter.rs) /

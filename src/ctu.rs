@@ -74,10 +74,10 @@ use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
-    build_merge_cand_list, build_merge_cand_list_b, derive_spatial_merge_candidates,
-    derive_temporal_merge_candidate, predict_chroma_block, predict_chroma_block_bipred,
-    predict_luma_block, predict_luma_block_bipred, HmvpTable, MotionField, MotionVector, MvField,
-    ReferencePicture, TemporalMergeInputs,
+    apply_mmvd_to_base, build_merge_cand_list, build_merge_cand_list_b, derive_mmvd_offset,
+    derive_spatial_merge_candidates, derive_temporal_merge_candidate, predict_chroma_block,
+    predict_chroma_block_bipred, predict_luma_block, predict_luma_block_bipred, HmvpTable,
+    MotionField, MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -567,6 +567,14 @@ pub struct CtuWalker<'a, 'b> {
     /// `RefPicList[1][col_ref_idx]`. Defaults to `true` per spec
     /// inference.
     collocated_from_l0: bool,
+    /// Round-27 §8.5.2.7 — `ph_mmvd_fullpel_only_flag`. When `true`
+    /// (and `sps_mmvd_enabled_flag` is also true), the MMVD distance
+    /// table swaps from `MMVD_DISTANCE_TABLE` to
+    /// `MMVD_DISTANCE_TABLE_FULLPEL` so every MMVD-corrected MV stays
+    /// integer-pel. Defaults to `false`. Surfaced into [`CuToolFlags`]
+    /// via [`Self::cu_tool_flags`] so the leaf CU reader can route
+    /// it through to [`crate::inter::derive_mmvd_offset`].
+    ph_mmvd_fullpel_only: bool,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -702,6 +710,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ph_temporal_mvp_enabled: false,
             col_ref_idx: 0,
             collocated_from_l0: true,
+            ph_mmvd_fullpel_only: false,
         })
     }
 
@@ -764,6 +773,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.ph_temporal_mvp_enabled = enabled;
         self.collocated_from_l0 = collocated_from_l0;
         self.col_ref_idx = col_ref_idx;
+    }
+
+    /// Round-27 — install `ph_mmvd_fullpel_only_flag`. When the SPS
+    /// signals `sps_mmvd_fullpel_only_enabled_flag == 1`, the picture
+    /// header may set this to switch the Table 17 distance grid from
+    /// the regular {1/4, 1/2, 1, 2, 4, 8, 16, 32} luma steps to the
+    /// fullpel-only {1, 2, 4, 8, 16, 32, 64, 128} luma steps. Defaults
+    /// to `false`; harmless on bitstreams without MMVD.
+    pub fn set_ph_mmvd_fullpel_only(&mut self, enabled: bool) {
+        self.ph_mmvd_fullpel_only = enabled;
     }
 
     /// §8.5.2.11 derivation harness for one CU. Returns the Col
@@ -1025,6 +1044,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ts_residual_coding_disabled: self.sh.sh_ts_residual_coding_disabled_flag,
             slice_is_inter: self.sh.sh_slice_type != SliceType::I,
             max_num_merge_cand: max_num_merge,
+            mmvd_enabled: tf.mmvd_enabled_flag,
+            ph_mmvd_fullpel_only: self.ph_mmvd_fullpel_only,
         }
     }
 
@@ -1552,7 +1573,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp))
         };
         let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
-        let chosen = mlist[idx];
+        let mut chosen = mlist[idx];
+
+        // Round-27 §8.5.2.7 — Merge with Motion Vector Differences. When
+        // `mmvd_merge_flag == 1`, the parser already inferred
+        // `merge_idx == mmvd_cand_flag` (∈ {0, 1}) so `chosen` holds the
+        // base candidate. Derive `MmvdOffset` from
+        // `(mmvd_distance_idx, mmvd_direction_idx, ph_mmvd_fullpel_only)`
+        // per Tables 17 / 18 + eqs. 188 / 189, then fold it into the
+        // base candidate's per-list MVs via [`apply_mmvd_to_base`]. The
+        // collocated-reference uni-pred fixture (`equal_poc_distance =
+        // false` is irrelevant in that path) is the round-27 acceptance
+        // case; bi-pred symmetric refinement is also wired but the
+        // asymmetric §8.5.2.7 distScaleFactor branches are deferred.
+        if info.inter.merge_data.mmvd_merge_flag {
+            let off = derive_mmvd_offset(
+                info.inter.merge_data.mmvd_distance_idx,
+                info.inter.merge_data.mmvd_direction_idx,
+                self.ph_mmvd_fullpel_only,
+            );
+            chosen = apply_mmvd_to_base(&chosen, off, /*equal_poc_distance*/ true);
+        }
 
         if !chosen.pred_flag_l0 && !chosen.pred_flag_l1 {
             return Err(Error::invalid(

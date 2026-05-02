@@ -138,6 +138,17 @@ pub struct CuToolFlags {
     /// sps_six_minus_max_num_merge_cand`). Only meaningful when
     /// `slice_is_inter == true`.
     pub max_num_merge_cand: u32,
+    /// `sps_mmvd_enabled_flag` — round-27 §8.5.2.7. Gates the
+    /// `mmvd_merge_flag` parse inside `merge_data()` per §7.3.11.7.
+    /// When false, the MMVD branch collapses (matches the round-21..26
+    /// behaviour where MMVD was not yet wired).
+    pub mmvd_enabled: bool,
+    /// `ph_mmvd_fullpel_only_flag` — picture-header switch that swaps
+    /// Table 17 from the regular `MMVD_DISTANCE_TABLE` to the fullpel-
+    /// scaled `MMVD_DISTANCE_TABLE_FULLPEL`. Only meaningful when
+    /// `mmvd_enabled` is true. Round-27 plumbs this through
+    /// [`crate::inter::derive_mmvd_offset`] at reconstruction time.
+    pub ph_mmvd_fullpel_only: bool,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -262,6 +273,10 @@ impl Default for LeafCuInfo {
                 merge_data: MergeData {
                     regular_merge_flag: false,
                     merge_idx: 0,
+                    mmvd_merge_flag: false,
+                    mmvd_cand_flag: 0,
+                    mmvd_distance_idx: 0,
+                    mmvd_direction_idx: 0,
                 },
             },
         }
@@ -354,6 +369,17 @@ pub struct LeafCuCtxs {
     pub regular_merge_flag: Vec<ContextModel>,
     /// `merge_idx` (Table 109) — 3-entry, indexed by `init_type`.
     pub merge_idx: Vec<ContextModel>,
+    /// `mmvd_merge_flag` (Table 103) — 2-entry, one per non-I
+    /// initType. Indexed at parse time as `(init_type - 1)` (init_type
+    /// 1 / 2 only — MMVD is never signalled in I slices).
+    pub mmvd_merge_flag: Vec<ContextModel>,
+    /// `mmvd_cand_flag` (Table 104) — 2-entry, one per non-I initType.
+    /// Indexed as `(init_type - 1)`.
+    pub mmvd_cand_flag: Vec<ContextModel>,
+    /// `mmvd_distance_idx` (Table 105) — 2-entry, one per non-I
+    /// initType. Indexed as `(init_type - 1)`. Only the first bin is
+    /// ctx-coded; remaining TR bins (cMax = 7) are bypass.
+    pub mmvd_distance_idx: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -433,6 +459,9 @@ impl LeafCuCtxs {
             general_merge_flag: init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp_y),
             regular_merge_flag: init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp_y),
             merge_idx: init_contexts(SyntaxCtx::MergeIdx, slice_qp_y),
+            mmvd_merge_flag: init_contexts(SyntaxCtx::MmvdMergeFlag, slice_qp_y),
+            mmvd_cand_flag: init_contexts(SyntaxCtx::MmvdCandFlag, slice_qp_y),
+            mmvd_distance_idx: init_contexts(SyntaxCtx::MmvdDistanceIdx, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -976,18 +1005,66 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // so the "subblock_flag" branch is gated only by
         // MaxNumSubblockMergeCand > 0 — also off in r21.
         //
-        // We therefore directly parse merge_idx as an unconditional
-        // truncated-rice with cMax = MaxNumMergeCand - 1 (>= 1; the
-        // size==1 case skips the read entirely per spec).
+        // Round-27 §8.5.2.7 — MMVD. When `regular_merge_flag == 1` and
+        // `sps_mmvd_enabled_flag == 1`, the spec inserts the MMVD
+        // sub-tree:
+        //
+        //   mmvd_merge_flag                              ← always read
+        //   if (mmvd_merge_flag == 1) {
+        //       if (MaxNumMergeCand > 1)
+        //           mmvd_cand_flag                       ← FL cMax=1
+        //       mmvd_distance_idx                        ← TR cMax=7
+        //       mmvd_direction_idx                       ← FL cMax=3
+        //   } else if (MaxNumMergeCand > 1) {
+        //       merge_idx                                ← regular path
+        //   }
+        //
+        // Per §7.4.12.7, when `mmvd_merge_flag == 1`, `merge_idx` is
+        // **inferred** to `mmvd_cand_flag`; otherwise it's inferred to
+        // 0. We mirror that by stuffing `merge_idx = mmvd_cand_flag`
+        // here so the downstream reconstruction pipeline can pick
+        // `mergeCandList[merge_idx]` uniformly regardless of the MMVD
+        // path.
         info.inter.merge_data.regular_merge_flag = true;
 
         let max_merge = self.tools.max_num_merge_cand;
-        let merge_idx = if max_merge > 1 {
-            self.read_merge_idx(max_merge)?
+        let mmvd_merge_flag = if self.tools.mmvd_enabled {
+            let n = self.ctxs.mmvd_merge_flag.len();
+            // MMVD is only signalled in inter slices; init_type ∈ {1, 2}
+            // → ctx slot 0 / 1. Guard by clamping in case the table
+            // length is short.
+            let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
+            self.dec
+                .decode_decision(&mut self.ctxs.mmvd_merge_flag[slot])?
+                == 1
         } else {
-            0
+            false
         };
-        info.inter.merge_data.merge_idx = merge_idx;
+        info.inter.merge_data.mmvd_merge_flag = mmvd_merge_flag;
+
+        if mmvd_merge_flag {
+            // §8.5.2.7 — MMVD sub-tree.
+            let mmvd_cand_flag = if max_merge > 1 {
+                let n = self.ctxs.mmvd_cand_flag.len();
+                let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
+                self.dec
+                    .decode_decision(&mut self.ctxs.mmvd_cand_flag[slot])?
+            } else {
+                0
+            };
+            info.inter.merge_data.mmvd_cand_flag = mmvd_cand_flag as u32;
+            info.inter.merge_data.mmvd_distance_idx = self.read_mmvd_distance_idx()?;
+            info.inter.merge_data.mmvd_direction_idx = self.read_mmvd_direction_idx()?;
+            // §7.4.12.7 — merge_idx is inferred to mmvd_cand_flag.
+            info.inter.merge_data.merge_idx = mmvd_cand_flag as u32;
+        } else {
+            let merge_idx = if max_merge > 1 {
+                self.read_merge_idx(max_merge)?
+            } else {
+                0
+            };
+            info.inter.merge_data.merge_idx = merge_idx;
+        }
 
         // Round-21 skip-only path: when cu_skip_flag is 1 the CU has no
         // residual (no cu_coded_flag, no transform_unit reads). Set
@@ -1006,6 +1083,48 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         }
 
         Ok(())
+    }
+
+    /// Decode `mmvd_distance_idx[x0][y0]` — TR binarisation with
+    /// `cMax = 7, cRiceParam = 0`. Bin 0 is ctx-coded (ctx 0 of
+    /// `MmvdDistanceIdx` per Table 132); bins 1..6 are bypass-coded.
+    /// Returns the decoded index in `0..=7`.
+    ///
+    /// TR with cRiceParam = 0 behaves like a truncated-unary code over
+    /// `[0, 7]`: emit a `1` to advance, terminate with a `0` until you
+    /// reach `cMax = 7`, where the decoder exits without consuming a
+    /// terminator bin.
+    fn read_mmvd_distance_idx(&mut self) -> Result<u32> {
+        let cmax = 7u32;
+        let n = self.ctxs.mmvd_distance_idx.len();
+        let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
+        let bit0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.mmvd_distance_idx[slot])?;
+        if bit0 == 0 {
+            return Ok(0);
+        }
+        let mut val = 1u32;
+        while val < cmax {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
+    }
+
+    /// Decode `mmvd_direction_idx[x0][y0]` — FL binarisation with
+    /// `cMax = 3` (Table 132 entry: 2 bypass-coded bins, no ctx).
+    /// Returns the decoded index in `0..=3`.
+    ///
+    /// FL(cMax = 3) emits exactly `ceil(log2(4)) = 2` bins, MSB first,
+    /// per §9.3.3.5.
+    fn read_mmvd_direction_idx(&mut self) -> Result<u32> {
+        let b0 = self.dec.decode_bypass()? as u32;
+        let b1 = self.dec.decode_bypass()? as u32;
+        Ok((b0 << 1) | b1)
     }
 
     /// Decode `merge_idx[x0][y0]` per Table 132 — bin 0 context-coded
@@ -1784,6 +1903,8 @@ mod tests {
             ts_residual_coding_disabled: false,
             slice_is_inter: false,
             max_num_merge_cand: 6,
+            mmvd_enabled: false,
+            ph_mmvd_fullpel_only: false,
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();

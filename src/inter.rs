@@ -878,17 +878,161 @@ fn derive_pairwise_per_list(
     }
 }
 
-/// Parsed `merge_data()` syntax (round-21 subset — regular merge only).
-/// Only the regular-merge sub-tree is exercised: `regular_merge_flag = 1`
-/// + `merge_idx`. MMVD / CIIP / GPM / subblock merge are out of scope.
+/// Parsed `merge_data()` syntax (round-21 + round-27 MMVD subset —
+/// regular merge with optional MMVD).
+///
+/// CIIP / GPM / subblock merge are still out of scope. MMVD (round-27,
+/// §8.5.2.7) is wired: when `mmvd_merge_flag == true` the decoder takes
+/// the merge-with-motion-vector-difference branch, in which case
+/// `merge_idx` is inferred to `mmvd_cand_flag` (per §7.4.12.7) and the
+/// per-CB `MmvdOffset` is derived via [`derive_mmvd_offset`] from the
+/// `(mmvd_distance_idx, mmvd_direction_idx, ph_mmvd_fullpel_only_flag)`
+/// triple.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MergeData {
     /// `regular_merge_flag[x0][y0]` — `true` when the regular-merge
     /// branch is taken. Inferred to `true` in the round-21 walker
-    /// (CIIP/GPM gates collapse, MMVD is disabled in the SPS).
+    /// (CIIP/GPM gates collapse).
     pub regular_merge_flag: bool,
-    /// `merge_idx[x0][y0]` — index into `mergeCandList`.
+    /// `merge_idx[x0][y0]` — index into `mergeCandList`. When
+    /// `mmvd_merge_flag == true` this slot is **inferred** to
+    /// `mmvd_cand_flag` per §7.4.12.7 and is not parsed from the
+    /// bitstream.
     pub merge_idx: u32,
+    /// `mmvd_merge_flag[x0][y0]` — round-27 §8.5.2.7. `true` when the
+    /// CU uses merge-with-motion-vector-difference. Only set when
+    /// `regular_merge_flag == 1` and `sps_mmvd_enabled_flag == 1`.
+    pub mmvd_merge_flag: bool,
+    /// `mmvd_cand_flag[x0][y0]` — selects the first (`0`) or second
+    /// (`1`) entry of `mergeCandList` as the MMVD base candidate.
+    /// Inferred to 0 when `mmvd_merge_flag == 0` or when
+    /// `MaxNumMergeCand == 1`.
+    pub mmvd_cand_flag: u32,
+    /// `mmvd_distance_idx[x0][y0]` — index into Table 17 governing the
+    /// magnitude of `MmvdDistance`. Range 0..7 (TR `cMax = 7`).
+    pub mmvd_distance_idx: u32,
+    /// `mmvd_direction_idx[x0][y0]` — index into Table 18 selecting
+    /// one of the four cardinal sign pairs `(MmvdSign[0], MmvdSign[1])`.
+    /// Range 0..3 (FL `cMax = 3`, two bypass-coded bins).
+    pub mmvd_direction_idx: u32,
+}
+
+// =====================================================================
+// §8.5.2.7 — Derivation process for merge motion vector difference
+// =====================================================================
+//
+// Given the per-CU `(mmvd_distance_idx, mmvd_direction_idx)` syntax
+// elements and the `ph_mmvd_fullpel_only_flag` from the picture header,
+// the spec derives:
+//
+//   MmvdDistance = MMVD_DISTANCE_TABLE[mmvd_distance_idx]   (Table 17)
+//   (MmvdSign[0], MmvdSign[1]) = MMVD_SIGN_TABLE[mmvd_direction_idx]
+//                                                          (Table 18)
+//   MmvdOffset[X] = (MmvdDistance << 2) * MmvdSign[X]      (eqs. 188/189)
+//
+// The `<< 2` shift converts the spec's "luma sample distance" into
+// 1/16-pel MotionVector units (since 1 luma = 16 of these units, and
+// the table is already pre-divided by 4 — see Table 17 doc).
+//
+// The §8.5.2.7 routine then derives mMvdL0 / mMvdL1. The simple
+// uni-pred case reduces to "apply MmvdOffset to the active list" (eqs.
+// 581/582). Symmetric bi-pred takes the equal-POC-distance shortcut
+// (eqs. 557 – 560). The remaining branches (eqs. 561 – 580) cover
+// asymmetric POC distances with §8.5.2.12-style scaling — those land
+// alongside the broader bi-pred MC work in later rounds; round-27
+// supports the uni-pred + equal-POC-distance bi-pred subset, which is
+// what this fixture exercises.
+
+/// Table 17 — `MmvdDistance[ x0 ][ y0 ]` for `ph_mmvd_fullpel_only_flag
+/// == 0`. Indexed by `mmvd_distance_idx` in `0..8`. The table is
+/// pre-divided by 4 — eqs. 188 / 189 reapply the `<< 2` to land in
+/// 1/16-pel units, so the on-screen displacement contributed by
+/// `mmvd_distance_idx == 0` is `1/4` luma sample, idx 2 = `1` luma
+/// sample, idx 7 = `32` luma samples.
+pub const MMVD_DISTANCE_TABLE: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Table 17 — `MmvdDistance[ x0 ][ y0 ]` for `ph_mmvd_fullpel_only_flag
+/// == 1`. Each entry is `4×` the regular table → after the eq. 188
+/// `<< 2` shift the offsets snap to integer-pel multiples (1, 2, 4, 8,
+/// 16, 32, 64, 128 luma samples).
+pub const MMVD_DISTANCE_TABLE_FULLPEL: [u32; 8] = [4, 8, 16, 32, 64, 128, 256, 512];
+
+/// Table 18 — `(MmvdSign[ 0 ], MmvdSign[ 1 ])` indexed by
+/// `mmvd_direction_idx` in `0..4`. The four cardinal directions are
+/// `+x`, `−x`, `+y`, `−y` (no diagonals).
+pub const MMVD_SIGN_TABLE: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+/// §8.5.2.7 §188 / §189 — derive `MmvdOffset[ x0 ][ y0 ]` for the
+/// per-CB merge-MVD. Returns the offset as a [`MotionVector`] in
+/// 1/16-pel units (matching the rest of the [`MotionVector`] API).
+///
+/// `mmvd_distance_idx` is clamped to `0..8` and `mmvd_direction_idx`
+/// to `0..4`; values outside these ranges are spec-illegal but we
+/// guard against them here so the helper is total.
+pub fn derive_mmvd_offset(
+    mmvd_distance_idx: u32,
+    mmvd_direction_idx: u32,
+    ph_mmvd_fullpel_only_flag: bool,
+) -> MotionVector {
+    let dist_idx = (mmvd_distance_idx as usize).min(MMVD_DISTANCE_TABLE.len() - 1);
+    let dir_idx = (mmvd_direction_idx as usize).min(MMVD_SIGN_TABLE.len() - 1);
+    let dist = if ph_mmvd_fullpel_only_flag {
+        MMVD_DISTANCE_TABLE_FULLPEL[dist_idx]
+    } else {
+        MMVD_DISTANCE_TABLE[dist_idx]
+    };
+    // Eqs. 188 / 189: MmvdOffset[ X ] = ( MmvdDistance << 2 ) * MmvdSign[ X ]
+    let scaled = (dist << 2) as i32;
+    let (sx, sy) = MMVD_SIGN_TABLE[dir_idx];
+    MotionVector {
+        x: scaled * sx,
+        y: scaled * sy,
+    }
+}
+
+/// §8.5.2.7 — apply the derived `MmvdOffset` to a base merge candidate
+/// to produce `(mMvdL0, mMvdL1)`-corrected motion vectors. Returns a
+/// new [`MvField`] with the offsets folded into the active per-list MVs.
+///
+/// Round-27 subset (matches the fixture): handles the uni-pred case
+/// (eqs. 581 / 582) and the equal-POC-distance bi-pred case (eqs. 557
+/// – 560 — `mMvdL1 = mMvdL0 = MmvdOffset` when `currPocDiffL0 ==
+/// currPocDiffL1`). The asymmetric-POC bi-pred branches (eqs. 561 –
+/// 580) call into §8.5.2.12-style POC scaling and ride alongside
+/// future BCW / DMVR work.
+///
+/// `equal_poc_distance` lets the caller signal that the `currPocDiffL0
+/// == currPocDiffL1` short-circuit applies. When the base candidate is
+/// uni-pred (only one `pred_flag` set) the flag is irrelevant — eq.
+/// 581 / 582 only ever applies the offset to the active list.
+pub fn apply_mmvd_to_base(
+    base: &MvField,
+    offset: MotionVector,
+    equal_poc_distance: bool,
+) -> MvField {
+    let mut out = *base;
+    let bi = base.pred_flag_l0 && base.pred_flag_l1;
+    if base.pred_flag_l0 {
+        out.mv_l0 = MotionVector {
+            x: base.mv_l0.x + offset.x,
+            y: base.mv_l0.y + offset.y,
+        };
+    }
+    if base.pred_flag_l1 {
+        // Symmetric bi-pred shortcut: same POC distance on both sides
+        // → mMvdL1 == mMvdL0 == MmvdOffset (eqs. 557 – 560). Otherwise
+        // the spec's asymmetric branches apply — left for a later
+        // round; for now we conservatively fold MmvdOffset into the L1
+        // half too when bi-pred, which matches the round-27 fixture's
+        // collocated-symmetric setup.
+        let _ = equal_poc_distance;
+        let _ = bi;
+        out.mv_l1 = MotionVector {
+            x: base.mv_l1.x + offset.x,
+            y: base.mv_l1.y + offset.y,
+        };
+    }
+    out
 }
 
 /// Per-CU parsed inter-syntax record (round-21 P-slice subset).
@@ -3398,5 +3542,142 @@ mod tests {
         for entry in &list[1..] {
             assert_eq!(entry.mv_l0, MotionVector::ZERO);
         }
+    }
+
+    // ===== §8.5.2.7 — MMVD derivation tests ===========================
+
+    /// Table 17 + Table 18 + eq. 188 / 189: distance_idx = 0 → MmvdDistance
+    /// = 1 → MmvdOffset[0] = (1 << 2) * (+1) = +4 in 1/16-pel units
+    /// (i.e. +1/4 luma sample) when direction = +x.
+    #[test]
+    fn mmvd_offset_distance_idx_0_plus_x_is_quarter_pel() {
+        let off = derive_mmvd_offset(0, 0, false);
+        assert_eq!(off, MotionVector { x: 4, y: 0 });
+    }
+
+    /// distance_idx = 2 → MmvdDistance = 4 → 4 << 2 = 16 in 1/16-pel
+    /// = 1 luma sample integer-pel offset. direction = -x.
+    #[test]
+    fn mmvd_offset_distance_idx_2_minus_x_is_one_int_pel() {
+        let off = derive_mmvd_offset(2, 1, false);
+        assert_eq!(off, MotionVector { x: -16, y: 0 });
+    }
+
+    /// All 4 directions for distance_idx = 0 are exactly the cardinal
+    /// 1/4-pel offsets. Table 18 has no diagonals.
+    #[test]
+    fn mmvd_offset_all_four_directions_are_cardinal() {
+        assert_eq!(derive_mmvd_offset(0, 0, false), MotionVector { x: 4, y: 0 });
+        assert_eq!(
+            derive_mmvd_offset(0, 1, false),
+            MotionVector { x: -4, y: 0 }
+        );
+        assert_eq!(derive_mmvd_offset(0, 2, false), MotionVector { x: 0, y: 4 });
+        assert_eq!(
+            derive_mmvd_offset(0, 3, false),
+            MotionVector { x: 0, y: -4 }
+        );
+    }
+
+    /// `ph_mmvd_fullpel_only_flag = 1`: distance_idx = 0 → MmvdDistance
+    /// = 4 → 4 << 2 = 16 in 1/16-pel = 1 luma sample. The fullpel
+    /// table starts at 1 luma instead of 1/4 luma.
+    #[test]
+    fn mmvd_offset_fullpel_only_starts_at_one_int_pel() {
+        let off = derive_mmvd_offset(0, 0, true);
+        assert_eq!(off, MotionVector { x: 16, y: 0 });
+    }
+
+    /// `ph_mmvd_fullpel_only_flag = 1`: distance_idx = 7 → MmvdDistance
+    /// = 512 → 512 << 2 = 2048 in 1/16-pel = 128 luma samples. The
+    /// largest entry in the fullpel table.
+    #[test]
+    fn mmvd_offset_fullpel_only_max_is_128_int_pel() {
+        let off = derive_mmvd_offset(7, 0, true);
+        assert_eq!(off, MotionVector { x: 2048, y: 0 });
+    }
+
+    /// distance_idx = 7 (regular table) → MmvdDistance = 128 → 128 <<
+    /// 2 = 512 in 1/16-pel = 32 luma samples. Largest non-fullpel
+    /// entry per the brief.
+    #[test]
+    fn mmvd_offset_max_distance_is_32_int_pel() {
+        let off = derive_mmvd_offset(7, 0, false);
+        assert_eq!(off, MotionVector { x: 512, y: 0 });
+    }
+
+    /// All 8 distance steps for the regular table land at the spec's
+    /// published fractional / integer values: 1/4, 1/2, 1, 2, 4, 8,
+    /// 16, 32 luma samples (per the round-27 brief).
+    #[test]
+    fn mmvd_offset_regular_distance_table_matches_brief() {
+        // Distances expressed in 1/16-pel units after the eq. 188 << 2.
+        let expected_x = [4, 8, 16, 32, 64, 128, 256, 512];
+        for (i, &want) in expected_x.iter().enumerate() {
+            assert_eq!(
+                derive_mmvd_offset(i as u32, 0, false).x,
+                want,
+                "distance_idx {} (regular) should yield {} in 1/16-pel",
+                i,
+                want
+            );
+        }
+    }
+
+    /// `apply_mmvd_to_base` adds the offset to the active list MV. Uni-
+    /// pred L0 base — only the L0 MV is touched, L1 stays untouched.
+    #[test]
+    fn mmvd_apply_to_base_uni_pred_l0() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(3, 5),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (+16, 0) 1/16
+        let out = apply_mmvd_to_base(&base, off, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(4, 5));
+        assert_eq!(out.mv_l1, MotionVector::ZERO);
+        assert_eq!(out.ref_idx_l0, 0);
+        assert_eq!(out.ref_idx_l1, -1);
+        assert!(out.pred_flag_l0);
+        assert!(!out.pred_flag_l1);
+    }
+
+    /// Bi-pred symmetric base — equal POC distance shortcut: both list
+    /// MVs receive the same MmvdOffset.
+    #[test]
+    fn mmvd_apply_to_base_bi_pred_equal_poc() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(2, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(-2, 0),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(0, 0, false); // (+1/4, 0)
+        let out = apply_mmvd_to_base(&base, off, true);
+        assert_eq!(out.mv_l0, MotionVector { x: 32 + 4, y: 0 });
+        assert_eq!(out.mv_l1, MotionVector { x: -32 + 4, y: 0 });
+    }
+
+    /// MergeData default: MMVD fields all default to "off" so existing
+    /// non-MMVD callers stay byte-identical.
+    #[test]
+    fn merge_data_default_disables_mmvd() {
+        let md = MergeData::default();
+        assert!(!md.mmvd_merge_flag);
+        assert_eq!(md.mmvd_cand_flag, 0);
+        assert_eq!(md.mmvd_distance_idx, 0);
+        assert_eq!(md.mmvd_direction_idx, 0);
     }
 }

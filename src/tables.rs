@@ -44,6 +44,9 @@
 //! * `cu_skip_flag` — Table 64 (9 ctxIdx, 3 per initType).
 //! * `general_merge_flag` — Table 82 (3 ctxIdx, one per initType).
 //! * `regular_merge_flag` — Table 102 (4 ctxIdx, two per non-I initType).
+//! * `mmvd_merge_flag` — Table 103 (2 ctxIdx, one per non-I initType).
+//! * `mmvd_cand_flag` — Table 104 (2 ctxIdx, one per non-I initType).
+//! * `mmvd_distance_idx` — Table 105 (2 ctxIdx, one per non-I initType).
 //! * `merge_idx` — Table 109 (3 ctxIdx, one per initType).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
@@ -93,6 +96,15 @@ pub enum SyntaxCtx {
     /// Table 102 — `regular_merge_flag` (4 ctxIdx, two per initType for the
     /// last two initTypes; initType 0 is unused → only 4 entries shown).
     RegularMergeFlag,
+    /// Table 103 — `mmvd_merge_flag` (2 ctxIdx, one per non-I initType).
+    /// Bin 0 ctx-coded with ctxInc = 0 per Table 132; the I-slice slot is
+    /// unused since MMVD is only signalled for inter slices.
+    MmvdMergeFlag,
+    /// Table 104 — `mmvd_cand_flag` (2 ctxIdx, one per non-I initType).
+    MmvdCandFlag,
+    /// Table 105 — `mmvd_distance_idx` (2 ctxIdx, one per non-I initType).
+    /// Bin 0 ctx-coded; bins 1..6 (TR, cMax = 7) bypass-coded.
+    MmvdDistanceIdx,
     /// Table 109 — `merge_idx` (3 ctxIdx, one per initType).
     MergeIdx,
 }
@@ -334,6 +346,34 @@ pub const REGULAR_MERGE_FLAG_SHIFT: &[u8] = &[5, 5, 5, 5];
 pub const MERGE_IDX_INIT: &[u8] = &[34, 20, 18];
 pub const MERGE_IDX_SHIFT: &[u8] = &[4, 4, 4];
 
+/// Table 103 — `mmvd_merge_flag` (2 ctxIdx, one per non-I initType).
+/// Per Table 132 ctxInc = 0; only one ctx-coded bin (FL, cMax = 1).
+/// Spec values:
+///   initType  | 0  | 1 |
+///   initValue | 26 | 25 |
+///   shiftIdx  |  4 | 4 |
+pub const MMVD_MERGE_FLAG_INIT: &[u8] = &[26, 25];
+pub const MMVD_MERGE_FLAG_SHIFT: &[u8] = &[4, 4];
+
+/// Table 104 — `mmvd_cand_flag` (2 ctxIdx, one per non-I initType).
+/// FL cMax = 1 binarisation; bin 0 ctx-coded with ctxInc = 0.
+/// Spec values:
+///   initType  | 0  | 1  |
+///   initValue | 43 | 43 |
+///   shiftIdx  | 10 | 10 |
+pub const MMVD_CAND_FLAG_INIT: &[u8] = &[43, 43];
+pub const MMVD_CAND_FLAG_SHIFT: &[u8] = &[10, 10];
+
+/// Table 105 — `mmvd_distance_idx` (2 ctxIdx, one per non-I initType).
+/// TR binarisation with cMax = 7, cRiceParam = 0; bin 0 ctx-coded with
+/// ctxInc = 0, bins 1..6 bypass-coded per Table 132.
+/// Spec values:
+///   initType  | 0  | 1 |
+///   initValue | 60 | 59 |
+///   shiftIdx  |  0 | 0 |
+pub const MMVD_DISTANCE_IDX_INIT: &[u8] = &[60, 59];
+pub const MMVD_DISTANCE_IDX_SHIFT: &[u8] = &[0, 0];
+
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
     // par_level_flag) span multiple PDF rows; we keep the in-tree
@@ -396,6 +436,9 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::CuSkipFlag => (CU_SKIP_FLAG_INIT, CU_SKIP_FLAG_SHIFT),
         SyntaxCtx::GeneralMergeFlag => (GENERAL_MERGE_FLAG_INIT, GENERAL_MERGE_FLAG_SHIFT),
         SyntaxCtx::RegularMergeFlag => (REGULAR_MERGE_FLAG_INIT, REGULAR_MERGE_FLAG_SHIFT),
+        SyntaxCtx::MmvdMergeFlag => (MMVD_MERGE_FLAG_INIT, MMVD_MERGE_FLAG_SHIFT),
+        SyntaxCtx::MmvdCandFlag => (MMVD_CAND_FLAG_INIT, MMVD_CAND_FLAG_SHIFT),
+        SyntaxCtx::MmvdDistanceIdx => (MMVD_DISTANCE_IDX_INIT, MMVD_DISTANCE_IDX_SHIFT),
         SyntaxCtx::MergeIdx => (MERGE_IDX_INIT, MERGE_IDX_SHIFT),
     };
     let n = init.len().min(shift.len());
@@ -457,6 +500,9 @@ mod tests {
             SyntaxCtx::CuSkipFlag,
             SyntaxCtx::GeneralMergeFlag,
             SyntaxCtx::RegularMergeFlag,
+            SyntaxCtx::MmvdMergeFlag,
+            SyntaxCtx::MmvdCandFlag,
+            SyntaxCtx::MmvdDistanceIdx,
             SyntaxCtx::MergeIdx,
         ] {
             let (i, s) = table_for(kind);

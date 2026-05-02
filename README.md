@@ -43,10 +43,10 @@ oxideav-h266 = "0.0"
 ## Decode support
 
 The reconstruction pipeline is being built incrementally and now covers
-the **intra-only single-tile single-slice subset** plus the round-26
+the **intra-only single-tile single-slice subset** plus the round-27
 **P + B-slice merge / regular-merge subset with HMVP + temporal Col +
-§8.5.2.4 pairwise-average candidate, §8.5.6.3 fractional-pel MC and
-§8.5.6.6.2 default-weighted bi-pred**:
+§8.5.2.4 pairwise-average candidate + §8.5.2.7 MMVD, §8.5.6.3
+fractional-pel MC and §8.5.6.6.2 default-weighted bi-pred**:
 
 * **Intra**: PLANAR / DC / cardinal angular intra (modes 2, 18, 34, 50,
   66) + MIP (§8.4.5.2.2 — all 30 weight matrices) + CCLM (§8.4.5.2.14)
@@ -75,22 +75,35 @@ the **intra-only single-tile single-slice subset** plus the round-26
   4-tap chroma interpolation (Table 33), with the §8.5.6.6.2 default
   uni-pred clamp at 8-bit and the §8.5.6.6.2 eq. 980 default-weighted
   bi-pred composition `(predL0 + predL1 + 1) >> 1` for B-slice bi-
-  pred candidates. Single L0 + L1 reference each. No MMVD / GPM /
-  CIIP / AMVR / BCW yet; affine + scaled-reference filter tables
-  28 / 29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF land in later
-  rounds.
+  pred candidates. Single L0 + L1 reference each. **Round-27 lands
+  §8.5.2.7 MMVD (Merge with Motion Vector Differences):** the leaf CU
+  reader parses `mmvd_merge_flag` (Table 103) / `mmvd_cand_flag`
+  (Table 104) / `mmvd_distance_idx` (Table 105 TR `cMax = 7`) /
+  `mmvd_direction_idx` (FL `cMax = 3`) when `regular_merge_flag == 1
+  && sps_mmvd_enabled_flag == 1`; `derive_mmvd_offset` emits
+  `MmvdOffset` per Tables 17 + 18 + eqs. 188 / 189 (regular `{1/4,
+  1/2, 1, 2, 4, 8, 16, 32}` luma steps or `ph_mmvd_fullpel_only_flag`-
+  scaled `{1, 2, 4, 8, 16, 32, 64, 128}` luma steps) and
+  `apply_mmvd_to_base` folds it into the chosen base candidate's per-
+  list MVs (uni-pred eqs. 581 / 582 + symmetric bi-pred eqs. 557 –
+  560). No GPM / CIIP / AMVR / BCW yet; affine + scaled-reference
+  filter tables 28 / 29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF
+  land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
   / shiftIdx tables for everything currently parsed (cu_skip /
-  general_merge / regular_merge / merge_idx now included with init_type
-  routing for I / P / B slices).
+  general_merge / regular_merge / merge_idx + round-27 mmvd_merge_flag
+  / mmvd_cand_flag / mmvd_distance_idx with init_type routing for
+  I / P / B slices).
 * **In-loop filters**: §8.8.3 deblocking, §8.8.4 SAO (Edge + Band
   offset), §8.8.5 ALF including the fixed-filter family + CC-ALF.
-* **Non-skip merge, mvd_coding (non-merge inter), pairwise merge,
-  MMVD, GPM, CIIP, AMVR, BCW**: still surface `Error::Unsupported`.
+* **Non-skip merge, mvd_coding (non-merge inter), GPM, CIIP, AMVR,
+  BCW**: still surface `Error::Unsupported`.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
-  — §8.5.2.11 + §8.5.2.12 — landed in round-25.)
+  — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
+  merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in
+  round-27.)
 
 ## Usage
 

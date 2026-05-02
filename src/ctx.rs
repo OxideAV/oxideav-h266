@@ -223,6 +223,24 @@ pub fn ctx_inc_merge_idx() -> u32 {
     0
 }
 
+/// ctxInc for `mmvd_merge_flag[x0][y0]` — fixed 0 per Table 132.
+/// `mmvd_merge_flag` is binarised FL with cMax = 1 (one ctx-coded bin).
+pub fn ctx_inc_mmvd_merge_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `mmvd_cand_flag[x0][y0]` — fixed 0 per Table 132.
+/// `mmvd_cand_flag` is binarised FL with cMax = 1 (one ctx-coded bin).
+pub fn ctx_inc_mmvd_cand_flag() -> u32 {
+    0
+}
+
+/// ctxInc for the *first* bin of `mmvd_distance_idx[x0][y0]` per Table
+/// 132 — fixed 0. The remaining bins (TR, cMax = 7) are bypass-coded.
+pub fn ctx_inc_mmvd_distance_idx() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///
