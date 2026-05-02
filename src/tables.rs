@@ -105,8 +105,19 @@ pub enum SyntaxCtx {
     /// Table 105 — `mmvd_distance_idx` (2 ctxIdx, one per non-I initType).
     /// Bin 0 ctx-coded; bins 1..6 (TR, cMax = 7) bypass-coded.
     MmvdDistanceIdx,
+    /// Table 106 — `ciip_flag` (2 ctxIdx, one per non-I initType).
+    /// Single ctx-coded bin (FL `cMax = 1`) per Table 132 with
+    /// `ctxInc = 0`; the I-slice slot is unused since CIIP is only
+    /// signalled for inter slices.
+    CiipFlag,
     /// Table 109 — `merge_idx` (3 ctxIdx, one per initType).
     MergeIdx,
+    /// Table 92 — `cu_coded_flag` (3 ctxIdx, one per initType). Single
+    /// ctx-coded bin (FL `cMax = 1`) with `ctxInc = 0` per Table 132.
+    /// Indexed at parse time as `init_type` (0 / 1 / 2). Used by the
+    /// non-skip merge / non-merge inter paths to gate the
+    /// `transform_tree()` body.
+    CuCodedFlag,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -374,6 +385,24 @@ pub const MMVD_CAND_FLAG_SHIFT: &[u8] = &[10, 10];
 pub const MMVD_DISTANCE_IDX_INIT: &[u8] = &[60, 59];
 pub const MMVD_DISTANCE_IDX_SHIFT: &[u8] = &[0, 0];
 
+/// Table 106 — `ciip_flag` (2 ctxIdx, one per non-I initType). FL
+/// binarisation with `cMax = 1` (a single ctx-coded bin); Table 132
+/// fixes `ctxInc = 0`. Spec values:
+///   initType  | 0  | 1  |
+///   initValue | 57 | 57 |
+///   shiftIdx  |  1 | 1  |
+pub const CIIP_FLAG_INIT: &[u8] = &[57, 57];
+pub const CIIP_FLAG_SHIFT: &[u8] = &[1, 1];
+
+/// Table 92 — `cu_coded_flag` (3 ctxIdx, one per initType). FL
+/// binarisation with `cMax = 1` (a single ctx-coded bin); Table 132
+/// fixes `ctxInc = 0`. Spec values:
+///   initType  | 0 | 1 | 2  |
+///   initValue | 6 | 5 | 12 |
+///   shiftIdx  | 4 | 4 | 4  |
+pub const CU_CODED_FLAG_INIT: &[u8] = &[6, 5, 12];
+pub const CU_CODED_FLAG_SHIFT: &[u8] = &[4, 4, 4];
+
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
     // par_level_flag) span multiple PDF rows; we keep the in-tree
@@ -439,7 +468,9 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::MmvdMergeFlag => (MMVD_MERGE_FLAG_INIT, MMVD_MERGE_FLAG_SHIFT),
         SyntaxCtx::MmvdCandFlag => (MMVD_CAND_FLAG_INIT, MMVD_CAND_FLAG_SHIFT),
         SyntaxCtx::MmvdDistanceIdx => (MMVD_DISTANCE_IDX_INIT, MMVD_DISTANCE_IDX_SHIFT),
+        SyntaxCtx::CiipFlag => (CIIP_FLAG_INIT, CIIP_FLAG_SHIFT),
         SyntaxCtx::MergeIdx => (MERGE_IDX_INIT, MERGE_IDX_SHIFT),
+        SyntaxCtx::CuCodedFlag => (CU_CODED_FLAG_INIT, CU_CODED_FLAG_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -503,7 +534,9 @@ mod tests {
             SyntaxCtx::MmvdMergeFlag,
             SyntaxCtx::MmvdCandFlag,
             SyntaxCtx::MmvdDistanceIdx,
+            SyntaxCtx::CiipFlag,
             SyntaxCtx::MergeIdx,
+            SyntaxCtx::CuCodedFlag,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);

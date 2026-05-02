@@ -43,10 +43,10 @@ oxideav-h266 = "0.0"
 ## Decode support
 
 The reconstruction pipeline is being built incrementally and now covers
-the **intra-only single-tile single-slice subset** plus the round-27
+the **intra-only single-tile single-slice subset** plus the round-28
 **P + B-slice merge / regular-merge subset with HMVP + temporal Col +
-§8.5.2.4 pairwise-average candidate + §8.5.2.7 MMVD, §8.5.6.3
-fractional-pel MC and §8.5.6.6.2 default-weighted bi-pred**:
+§8.5.2.4 pairwise-average candidate + §8.5.2.7 MMVD + §8.5.6.7 CIIP,
+§8.5.6.3 fractional-pel MC and §8.5.6.6.2 default-weighted bi-pred**:
 
 * **Intra**: PLANAR / DC / cardinal angular intra (modes 2, 18, 34, 50,
   66) + MIP (§8.4.5.2.2 — all 30 weight matrices) + CCLM (§8.4.5.2.14)
@@ -86,24 +86,40 @@ fractional-pel MC and §8.5.6.6.2 default-weighted bi-pred**:
   scaled `{1, 2, 4, 8, 16, 32, 64, 128}` luma steps) and
   `apply_mmvd_to_base` folds it into the chosen base candidate's per-
   list MVs (uni-pred eqs. 581 / 582 + symmetric bi-pred eqs. 557 –
-  560). No GPM / CIIP / AMVR / BCW yet; affine + scaled-reference
-  filter tables 28 / 29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF
-  land in later rounds.
+  560). **Round-28 lands §8.5.6.7 CIIP (Combined Inter-Intra
+  Prediction):** when `sps_ciip_enabled_flag = 1` and the §7.3.11.7
+  gates open (`cu_skip_flag == 0`, `cbW * cbH ≥ 64`, `cbW < 128`,
+  `cbH < 128`), the leaf CU reader parses `regular_merge_flag` (Table
+  102) and infers `ciip_flag = 1` per §7.4.12.7 when GPM is off.
+  CIIP CUs combine the regular-merge MC predSamplesInter with a
+  planar predSamplesIntra drawn from the partially-reconstructed
+  picture neighbours via eq. 998
+  `(w * intra + (4 − w) * inter + 2) >> 2` with `w ∈ {1, 2, 3}` from
+  the §8.5.6.7 A / B luma neighbour intra-coded grid (`(both intra,
+  both not intra, one intra) → (3, 1, 2)`). The CTU walker maintains
+  a per-picture 4x4 intra-coded grid (read by CIIP, written by every
+  leaf CU) so neighbour status is exact across raster scan order.
+  Chroma reuses the same `w` and a planar chroma intra prediction
+  per the §8.4.3 PLANAR-luma → PLANAR-chroma mapping. No GPM / AMVR
+  / BCW yet; affine + scaled-reference filter tables 28 / 29 / 30 /
+  31 / 32 / 34 / 35, BDOF + DMVR, PROF land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
   / shiftIdx tables for everything currently parsed (cu_skip /
   general_merge / regular_merge / merge_idx + round-27 mmvd_merge_flag
-  / mmvd_cand_flag / mmvd_distance_idx with init_type routing for
-  I / P / B slices).
+  / mmvd_cand_flag / mmvd_distance_idx + round-28 ciip_flag (Table 106)
+  / cu_coded_flag (Table 92) with init_type routing for I / P / B
+  slices).
 * **In-loop filters**: §8.8.3 deblocking, §8.8.4 SAO (Edge + Band
   offset), §8.8.5 ALF including the fixed-filter family + CC-ALF.
-* **Non-skip merge, mvd_coding (non-merge inter), GPM, CIIP, AMVR,
-  BCW**: still surface `Error::Unsupported`.
+* **Non-skip merge with cu_coded_flag == 1 (residual transform_tree),
+  mvd_coding (non-merge inter), GPM, AMVR, BCW**: still surface
+  `Error::Unsupported`.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in
-  round-27.)
+  round-27; CIIP — §8.5.6.7 — landed in round-28.)
 
 ## Usage
 

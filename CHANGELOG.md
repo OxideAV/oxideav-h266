@@ -6,6 +6,58 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **Combined Inter-Intra Prediction — CIIP (round-28, §8.5.6.7)** —
+  the merge-data sub-tree now lights up the CIIP branch when
+  `sps_ciip_enabled_flag == 1`. New `MergeData::ciip_flag` carries the
+  parsed (or §7.4.12.7-inferred) syntax. `CuToolFlags` gains
+  `ciip_enabled` + `gpm_enabled` so the leaf CU reader sees the SPS
+  gates. The §7.3.11.7 `regular_merge_flag` parse is now wired
+  end-to-end: when CIIP is enabled, `cu_skip_flag == 0`,
+  `cbW * cbH ≥ 64`, and `cbW < 128, cbH < 128`, the bit is read from
+  Table 102 (`(init_type − 1) * 2 + ctxInc` with
+  `ctxInc = !cu_skip_flag` per Table 132); otherwise it stays inferred
+  to 1. When `regular_merge_flag == 0`, the CIIP branch fires per
+  §7.4.12.7 (GPM disambiguation deferred — the parse-gated
+  ciip_flag bin lands in a future round). Round-28 wires Table 92
+  (`cu_coded_flag`) and Table 106 (`ciip_flag`) ctx initialisation
+  arrays as new `SyntaxCtx` variants `CuCodedFlag` / `CiipFlag` (Table
+  92 `[6, 5, 12] / [4, 4, 4]`, Table 106 `[57, 57] / [1, 1]`); the
+  cu_coded_flag read fires for non-skip merge CUs to gate the
+  `transform_tree()` body — round-28 still surfaces Unsupported when
+  the flag comes back 1, so the acceptance fixture pins
+  `cu_coded_flag = 0` (no residual). The §8.5.6.7 weight ladder ships
+  as [`ciip_intra_weight`](src/inter.rs) (`(both intra, both not
+  intra, exactly one intra) → (3, 1, 2)`) and the eq. 998 combiner
+  ships as [`combine_ciip_samples`](src/inter.rs) — both clamp into
+  the bit-depth range. The CTU walker now maintains a per-picture
+  4x4 intra-coded grid alongside the §7.4.4 motion field (every leaf
+  CU writes its `MODE_INTRA / MODE_INTER` bit to the cells it
+  covers); CIIP CUs sample the §8.5.6.7 A / B luma neighbours
+  `(xCb − 1, yCb − 1 + cbHeight)` and `(xCb − 1 + cbWidth, yCb − 1)`
+  off this grid to derive `w`. The reconstruction path computes
+  planar `predSamplesIntra` from the partially-reconstructed picture
+  buffer (out.luma neighbours + §8.4.5.2.8 substitution → mid-grey
+  fallback at picture corners) **before** the regular-merge MC writes
+  predSamplesInter into the CU rectangle, then folds the two via eq.
+  998. Chroma is composed identically — the spec sets
+  `IntraPredModeC = INTRA_PLANAR` for CIIP CUs and reuses the same
+  weight `w` (per the eqs. 995 / 996 SubWidthC / SubHeightC scaling
+  the chroma A / B neighbours land on the same luma-grid 4x4 cells).
+  Acceptance fixture
+  [`decode_p_slice_ciip_fires_and_decodes`](tests/reconstruct_pipeline.rs)
+  synthesises a P-slice payload at the picture corner: 8x8 CU,
+  `cu_skip = 0`, `general_merge = 1`, `regular_merge = 0` (parsed
+  through Table 102), `ciip_flag` inferred to 1, `merge_idx = 0`,
+  `cu_coded = 0`. With both §8.5.6.7 neighbours out-of-picture
+  → `w = 1` → eq. 998 collapses to `(planar128 + 3 * inter + 2) >> 2`;
+  the test pins the byte-exact reconstructed luma plus the
+  unmodified motion-field MV (CIIP doesn't shift the chosen merge
+  candidate). Test count: 511 unit (was 502, +9 covering the
+  weight ladder, eq. 998 spot checks at all three weights, equal-
+  predictor identity, the bit-depth clamp, and the
+  `MergeData::default` CIIP-off invariant) + 24 integration (was 23,
+  +1 CIIP acceptance).
+
 - **Merge with Motion Vector Differences — MMVD (round-27, §8.5.2.7)** —
   the merge-data sub-tree now lights up the MMVD branch when
   `sps_mmvd_enabled_flag == 1`. New `MergeData` fields

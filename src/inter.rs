@@ -878,26 +878,32 @@ fn derive_pairwise_per_list(
     }
 }
 
-/// Parsed `merge_data()` syntax (round-21 + round-27 MMVD subset —
-/// regular merge with optional MMVD).
+/// Parsed `merge_data()` syntax (round-21 + round-27 MMVD + round-28
+/// CIIP subset — regular merge with optional MMVD or CIIP).
 ///
-/// CIIP / GPM / subblock merge are still out of scope. MMVD (round-27,
+/// GPM / subblock merge are still out of scope. MMVD (round-27,
 /// §8.5.2.7) is wired: when `mmvd_merge_flag == true` the decoder takes
 /// the merge-with-motion-vector-difference branch, in which case
 /// `merge_idx` is inferred to `mmvd_cand_flag` (per §7.4.12.7) and the
 /// per-CB `MmvdOffset` is derived via [`derive_mmvd_offset`] from the
 /// `(mmvd_distance_idx, mmvd_direction_idx, ph_mmvd_fullpel_only_flag)`
-/// triple.
+/// triple. CIIP (round-28, §8.5.6.7): when `ciip_flag == true` the
+/// reconstructed prediction is the eq. 998 weighted average of the
+/// regular-merge MC predSamplesInter and a planar predSamplesIntra
+/// drawn from already-reconstructed neighbour samples; the weight `w`
+/// is derived from the intra-coded status of the A / B neighbours per
+/// §8.5.6.7.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MergeData {
     /// `regular_merge_flag[x0][y0]` — `true` when the regular-merge
-    /// branch is taken. Inferred to `true` in the round-21 walker
-    /// (CIIP/GPM gates collapse).
+    /// branch is taken. Inferred per §7.4.12.7 when no CIIP / GPM gate
+    /// is open; explicitly parsed otherwise.
     pub regular_merge_flag: bool,
     /// `merge_idx[x0][y0]` — index into `mergeCandList`. When
     /// `mmvd_merge_flag == true` this slot is **inferred** to
     /// `mmvd_cand_flag` per §7.4.12.7 and is not parsed from the
-    /// bitstream.
+    /// bitstream. Used by both the regular-merge branch and the CIIP
+    /// branch (CIIP also reads `merge_idx` when `MaxNumMergeCand > 1`).
     pub merge_idx: u32,
     /// `mmvd_merge_flag[x0][y0]` — round-27 §8.5.2.7. `true` when the
     /// CU uses merge-with-motion-vector-difference. Only set when
@@ -915,6 +921,16 @@ pub struct MergeData {
     /// one of the four cardinal sign pairs `(MmvdSign[0], MmvdSign[1])`.
     /// Range 0..3 (FL `cMax = 3`, two bypass-coded bins).
     pub mmvd_direction_idx: u32,
+    /// `ciip_flag[x0][y0]` — round-28 §8.5.6.7. `true` when the
+    /// combined inter-intra prediction tool is applied: predSamples =
+    /// `(w * predSamplesIntra + (4 − w) * predSamplesInter + 2) >> 2`
+    /// with `w ∈ {1, 2, 3}` derived from the A / B neighbour intra-
+    /// coded counts. Set only when `regular_merge_flag == 0` and
+    /// (`sps_ciip_enabled_flag == 1`, `cu_skip_flag == 0`,
+    /// `cbW * cbH ≥ 64`, `cbW < 128`, `cbH < 128`); inferred to 1 per
+    /// §7.4.12.7 when CIIP is the only enabled non-regular branch
+    /// (i.e. `sps_gpm_enabled_flag == 0`).
+    pub ciip_flag: bool,
 }
 
 // =====================================================================
@@ -1031,6 +1047,96 @@ pub fn apply_mmvd_to_base(
             x: base.mv_l1.x + offset.x,
             y: base.mv_l1.y + offset.y,
         };
+    }
+    out
+}
+
+// =====================================================================
+// §8.5.6.7 — Combined inter-intra prediction (CIIP)
+// =====================================================================
+//
+// The CIIP weight `w` is derived from the intra-coded status of two
+// neighbouring blocks at fixed offsets relative to the current coding
+// block (cbWidth, cbHeight) — for luma those are
+//
+//   ( xNbA, yNbA ) = ( xCb − 1, yCb − 1 + cbHeight )
+//   ( xNbB, yNbB ) = ( xCb − 1 + cbWidth, yCb − 1 )
+//
+// (the A neighbour sits below the bottom-left corner of the left
+// edge; the B neighbour sits to the right of the top-right corner of
+// the top edge). The §8.5.6.7 ladder maps the count of intra-coded
+// neighbours into `w`:
+//
+//   * both intra → w = 3
+//   * both not intra → w = 1
+//   * exactly one intra → w = 2
+//
+// The output samples are then composed per eq. 998:
+//
+//   predSamplesComb[x][y] = ( w * predSamplesIntra[x][y]
+//                           + (4 − w) * predSamplesInter[x][y]
+//                           + 2 ) >> 2
+//
+// The (intra, inter) weight pair is therefore one of (1, 3), (2, 2),
+// (3, 1). The combiner clips the result back into the bit-depth range
+// — eq. 998 itself does not clip but predSamplesIntra and
+// predSamplesInter are already in-range so their non-negative weighted
+// average is too; we still clamp defensively to handle rounding edge
+// cases.
+
+/// §8.5.6.7 — derive the CIIP intra-prediction weight `w` from the
+/// intra-coded status of the §8.5.6.7 A / B neighbours. The output is
+/// the weight that scales `predSamplesIntra`; the `predSamplesInter`
+/// weight is `4 − w`. Returns `1`, `2`, or `3` per the spec ladder.
+///
+/// Spec mapping (§8.5.6.7):
+///   * (intra_top = T, intra_left = T) → 3
+///   * (intra_top = F, intra_left = F) → 1
+///   * (otherwise — exactly one intra)  → 2
+///
+/// Callers compute `intra_top` / `intra_left` from a per-4x4 grid that
+/// is updated by the leaf-CU walker as each CU finishes. A neighbour
+/// that is unavailable (off-picture, off-slice) is treated as not
+/// intra-coded — matching the spec's `availableX == FALSE →
+/// isIntraCodedNeighbourX = FALSE` branch.
+pub fn ciip_intra_weight(intra_top: bool, intra_left: bool) -> u32 {
+    match (intra_top, intra_left) {
+        (true, true) => 3,
+        (false, false) => 1,
+        _ => 2,
+    }
+}
+
+/// §8.5.6.7 eq. 998 — combine planar intra-predicted samples and
+/// regular-merge inter-predicted samples into the CIIP output. Both
+/// `intra_pred` and `inter_pred` are row-major `cb_w * cb_h` arrays in
+/// reconstructed-sample units (i.e. they are already clipped into
+/// `[0, (1 << bit_depth) - 1]`).
+///
+/// `w` must be in `{1, 2, 3}` — see [`ciip_intra_weight`]. The output
+/// is row-major `cb_w * cb_h` in the same units, with each sample
+/// clamped into `[0, (1 << bit_depth) - 1]`.
+pub fn combine_ciip_samples(
+    intra_pred: &[i16],
+    inter_pred: &[i16],
+    cb_w: usize,
+    cb_h: usize,
+    w: u32,
+    bit_depth: u32,
+) -> Vec<i16> {
+    debug_assert!(matches!(w, 1..=3));
+    debug_assert_eq!(intra_pred.len(), cb_w * cb_h);
+    debug_assert_eq!(inter_pred.len(), cb_w * cb_h);
+    let max = (1i32 << bit_depth) - 1;
+    let mut out = vec![0i16; cb_w * cb_h];
+    let w_i = w as i32;
+    let w_p = 4 - w_i;
+    for y in 0..cb_h {
+        for x in 0..cb_w {
+            let i = y * cb_w + x;
+            let v = (w_i * intra_pred[i] as i32 + w_p * inter_pred[i] as i32 + 2) >> 2;
+            out[i] = v.clamp(0, max) as i16;
+        }
     }
     out
 }
@@ -3679,5 +3785,100 @@ mod tests {
         assert_eq!(md.mmvd_cand_flag, 0);
         assert_eq!(md.mmvd_distance_idx, 0);
         assert_eq!(md.mmvd_direction_idx, 0);
+    }
+
+    /// MergeData default also keeps CIIP off so existing non-CIIP
+    /// callers stay byte-identical (round-28 §8.5.6.7).
+    #[test]
+    fn merge_data_default_disables_ciip() {
+        let md = MergeData::default();
+        assert!(!md.ciip_flag);
+    }
+
+    /// §8.5.6.7 weight ladder — both neighbours intra → w = 3.
+    #[test]
+    fn ciip_weight_both_intra_is_three() {
+        assert_eq!(ciip_intra_weight(true, true), 3);
+    }
+
+    /// §8.5.6.7 weight ladder — both neighbours not intra → w = 1.
+    #[test]
+    fn ciip_weight_neither_intra_is_one() {
+        assert_eq!(ciip_intra_weight(false, false), 1);
+    }
+
+    /// §8.5.6.7 weight ladder — exactly one neighbour intra → w = 2,
+    /// regardless of which side it is.
+    #[test]
+    fn ciip_weight_one_intra_is_two() {
+        assert_eq!(ciip_intra_weight(true, false), 2);
+        assert_eq!(ciip_intra_weight(false, true), 2);
+    }
+
+    /// §8.5.6.7 eq. 998 spot-check — both predictors equal to 100,
+    /// any weight collapses to 100 (since the weighted average of two
+    /// equal values is the value itself).
+    #[test]
+    fn ciip_combine_equal_predictors_is_predictor() {
+        let intra = vec![100i16; 16];
+        let inter = vec![100i16; 16];
+        for w in [1u32, 2, 3] {
+            let out = combine_ciip_samples(&intra, &inter, 4, 4, w, 8);
+            for v in &out {
+                assert_eq!(*v, 100);
+            }
+        }
+    }
+
+    /// §8.5.6.7 eq. 998 spot-check — w = 2 produces the spec-rounded
+    /// midpoint `(intra + inter + 2) >> 2 * 2 = (intra + inter + 1) >> 1`
+    /// when both weights are equal. With `intra = 200, inter = 100`:
+    /// eq. 998 = `(2 * 200 + 2 * 100 + 2) >> 2 = 602 >> 2 = 150`.
+    #[test]
+    fn ciip_combine_w2_is_rounded_midpoint() {
+        let intra = vec![200i16; 4];
+        let inter = vec![100i16; 4];
+        let out = combine_ciip_samples(&intra, &inter, 2, 2, 2, 8);
+        for v in &out {
+            assert_eq!(*v, 150);
+        }
+    }
+
+    /// §8.5.6.7 eq. 998 spot-check — w = 3 leans towards intra.
+    /// `(3 * 240 + 1 * 80 + 2) >> 2 = 802 >> 2 = 200`.
+    #[test]
+    fn ciip_combine_w3_leans_intra() {
+        let intra = vec![240i16; 4];
+        let inter = vec![80i16; 4];
+        let out = combine_ciip_samples(&intra, &inter, 2, 2, 3, 8);
+        for v in &out {
+            assert_eq!(*v, 200);
+        }
+    }
+
+    /// §8.5.6.7 eq. 998 spot-check — w = 1 leans towards inter.
+    /// `(1 * 240 + 3 * 80 + 2) >> 2 = 482 >> 2 = 120`.
+    #[test]
+    fn ciip_combine_w1_leans_inter() {
+        let intra = vec![240i16; 4];
+        let inter = vec![80i16; 4];
+        let out = combine_ciip_samples(&intra, &inter, 2, 2, 1, 8);
+        for v in &out {
+            assert_eq!(*v, 120);
+        }
+    }
+
+    /// CIIP combiner clamps into `[0, (1 << bit_depth) - 1]`. Even
+    /// though eq. 998 is non-expanding for in-range inputs, the helper
+    /// guards against rounding overshoot at extremes (e.g. 1023 / 1023
+    /// at 10-bit returns 1023, not 1024).
+    #[test]
+    fn ciip_combine_clamps_to_bit_depth() {
+        let intra = vec![1023i16; 4];
+        let inter = vec![1023i16; 4];
+        let out = combine_ciip_samples(&intra, &inter, 2, 2, 2, 10);
+        for v in &out {
+            assert_eq!(*v, 1023);
+        }
     }
 }

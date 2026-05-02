@@ -54,6 +54,7 @@ use crate::ctx::{
     ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
+    ctx_inc_regular_merge_flag,
 };
 use crate::inter::{InterCuInfo, MergeData};
 use crate::residual::{
@@ -149,6 +150,18 @@ pub struct CuToolFlags {
     /// `mmvd_enabled` is true. Round-27 plumbs this through
     /// [`crate::inter::derive_mmvd_offset`] at reconstruction time.
     pub ph_mmvd_fullpel_only: bool,
+    /// `sps_ciip_enabled_flag` — round-28 §8.5.6.7. Gates the
+    /// `regular_merge_flag` parse inside `merge_data()` (without
+    /// CIIP / GPM the gate collapses and `regular_merge_flag` is
+    /// inferred to 1) and the §7.4.12.7 `ciip_flag` inference. When
+    /// `false` the merge-data parser ignores CIIP entirely.
+    pub ciip_enabled: bool,
+    /// `sps_gpm_enabled_flag` — geometric partitioning merge. Round-28
+    /// only carries this so the §7.3.11.7 `regular_merge_flag` gate
+    /// can fire correctly when CIIP and / or GPM is enabled. The
+    /// decoder still surfaces `Error::Unsupported` for any CU that
+    /// would actually take the GPM branch.
+    pub gpm_enabled: bool,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -277,6 +290,7 @@ impl Default for LeafCuInfo {
                     mmvd_cand_flag: 0,
                     mmvd_distance_idx: 0,
                     mmvd_direction_idx: 0,
+                    ciip_flag: false,
                 },
             },
         }
@@ -380,6 +394,15 @@ pub struct LeafCuCtxs {
     /// initType. Indexed as `(init_type - 1)`. Only the first bin is
     /// ctx-coded; remaining TR bins (cMax = 7) are bypass.
     pub mmvd_distance_idx: Vec<ContextModel>,
+    /// `ciip_flag` (Table 106) — 2-entry, one per non-I initType.
+    /// Indexed at parse time as `(init_type - 1)`. Single ctx-coded
+    /// bin (FL `cMax = 1`) per Table 132.
+    pub ciip_flag: Vec<ContextModel>,
+    /// `cu_coded_flag` (Table 92) — 3-entry, one per initType. Used
+    /// by non-skip merge / non-merge inter CUs to gate the
+    /// `transform_tree()` body. Single ctx-coded bin (FL `cMax = 1`)
+    /// per Table 132.
+    pub cu_coded_flag: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -462,6 +485,8 @@ impl LeafCuCtxs {
             mmvd_merge_flag: init_contexts(SyntaxCtx::MmvdMergeFlag, slice_qp_y),
             mmvd_cand_flag: init_contexts(SyntaxCtx::MmvdCandFlag, slice_qp_y),
             mmvd_distance_idx: init_contexts(SyntaxCtx::MmvdDistanceIdx, slice_qp_y),
+            ciip_flag: init_contexts(SyntaxCtx::CiipFlag, slice_qp_y),
+            cu_coded_flag: init_contexts(SyntaxCtx::CuCodedFlag, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -997,67 +1022,147 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
 
         // ---- merge_data() (§7.3.11.7) -----------------------------------
         //
-        // Round-21 covers the regular-merge subset. The spec gating for
-        // regular_merge_flag depends on sps_ciip_enabled_flag /
-        // sps_gpm_enabled_flag (both off in our fixtures), so the gate
-        // collapses and regular_merge_flag is inferred to 1. The
-        // round-21 fixture also clamps cbWidth, cbHeight < 128 always,
-        // so the "subblock_flag" branch is gated only by
-        // MaxNumSubblockMergeCand > 0 — also off in r21.
+        // Round-28: §7.3.11.7 `regular_merge_flag` gate now light up
+        // when CIIP and / or GPM is enabled in the SPS. The gate per
+        // §7.3.11.7 reads (paraphrased):
         //
-        // Round-27 §8.5.2.7 — MMVD. When `regular_merge_flag == 1` and
-        // `sps_mmvd_enabled_flag == 1`, the spec inserts the MMVD
-        // sub-tree:
+        //   if cbWidth < 128 && cbHeight < 128 &&
+        //      ((sps_ciip_enabled && cu_skip_flag == 0 && cbW*cbH >= 64) ||
+        //       (sps_gpm_enabled && B-slice && cbW >= 8 && cbH >= 8 &&
+        //         cbW < 8*cbH && cbH < 8*cbW))
+        //     → parse regular_merge_flag
+        //   otherwise → regular_merge_flag inferred to 1
         //
-        //   mmvd_merge_flag                              ← always read
-        //   if (mmvd_merge_flag == 1) {
-        //       if (MaxNumMergeCand > 1)
-        //           mmvd_cand_flag                       ← FL cMax=1
-        //       mmvd_distance_idx                        ← TR cMax=7
-        //       mmvd_direction_idx                       ← FL cMax=3
-        //   } else if (MaxNumMergeCand > 1) {
-        //       merge_idx                                ← regular path
-        //   }
+        // When `regular_merge_flag == 1`, the spec optionally inserts
+        // the round-27 §8.5.2.7 MMVD sub-tree (gated by
+        // `sps_mmvd_enabled_flag`); when `regular_merge_flag == 0`,
+        // round-28 picks the §8.5.6.7 CIIP branch:
+        //
+        //   if sps_ciip && sps_gpm && B-slice && cu_skip_flag == 0
+        //      && cbW >= 8 && cbH >= 8 && cbW < 8*cbH && cbH < 8*cbW
+        //      && cbW < 128 && cbH < 128 → parse ciip_flag
+        //   otherwise → ciip_flag inferred per §7.4.12.7 (= 1 if the
+        //              CIIP gates are met and CIIP is the only enabled
+        //              non-regular branch, else 0).
+        //   if (ciip_flag && MaxNumMergeCand > 1) → parse merge_idx
+        //   if (!ciip_flag) → GPM branch (parse merge_gpm_*) — out of
+        //                     scope; surfaces Error::Unsupported.
         //
         // Per §7.4.12.7, when `mmvd_merge_flag == 1`, `merge_idx` is
-        // **inferred** to `mmvd_cand_flag`; otherwise it's inferred to
-        // 0. We mirror that by stuffing `merge_idx = mmvd_cand_flag`
-        // here so the downstream reconstruction pipeline can pick
-        // `mergeCandList[merge_idx]` uniformly regardless of the MMVD
-        // path.
-        info.inter.merge_data.regular_merge_flag = true;
+        // inferred to `mmvd_cand_flag`; otherwise it's inferred to 0.
+        // The downstream pipeline reads `mergeCandList[merge_idx]`
+        // uniformly regardless of which branch (regular / MMVD / CIIP)
+        // produced the index.
+        let cb_w = info.cb_width;
+        let cb_h = info.cb_height;
+        let cb_under_128 = cb_w < 128 && cb_h < 128;
+        let ciip_size_ok = (cb_w as u64 * cb_h as u64) >= 64;
+        // Pure-CIIP regular_merge_flag gate (P-slice or non-GPM B-slice).
+        let ciip_branch_open = self.tools.ciip_enabled && !cu_skip && ciip_size_ok && cb_under_128;
+        // GPM is gated additionally on B-slice + ratio limits, but the
+        // crate hasn't wired sh_slice_type into the leaf reader yet —
+        // the only consumer that knows is the CTU walker. For now
+        // assume GPM never enables the regular_merge_flag gate for our
+        // own fixtures (the leaf reader surfaces Unsupported when the
+        // CIIP/GPM disambiguation path would actually pick GPM). This
+        // matches the round-28 scope: CIIP + (P-slice or CIIP-only B
+        // slice).
+        let gpm_branch_open = false;
+
+        let regular_merge_flag = if cb_under_128 && (ciip_branch_open || gpm_branch_open) {
+            let inc = ctx_inc_regular_merge_flag(cu_skip) as usize;
+            // Table 102: 4 entries split as initType 1 → slots 0-1,
+            // initType 2 → slots 2-3. Indexed at parse time as
+            // `(init_type - 1) * 2 + ctxInc`.
+            let init_off = (self.ctxs.init_type as usize).saturating_sub(1) * 2;
+            let n = self.ctxs.regular_merge_flag.len() - 1;
+            let slot = (init_off + inc).min(n);
+            let bit = self
+                .dec
+                .decode_decision(&mut self.ctxs.regular_merge_flag[slot])?;
+            bit == 1
+        } else {
+            true
+        };
+        info.inter.merge_data.regular_merge_flag = regular_merge_flag;
 
         let max_merge = self.tools.max_num_merge_cand;
-        let mmvd_merge_flag = if self.tools.mmvd_enabled {
-            let n = self.ctxs.mmvd_merge_flag.len();
-            // MMVD is only signalled in inter slices; init_type ∈ {1, 2}
-            // → ctx slot 0 / 1. Guard by clamping in case the table
-            // length is short.
-            let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
-            self.dec
-                .decode_decision(&mut self.ctxs.mmvd_merge_flag[slot])?
-                == 1
-        } else {
-            false
-        };
-        info.inter.merge_data.mmvd_merge_flag = mmvd_merge_flag;
 
-        if mmvd_merge_flag {
-            // §8.5.2.7 — MMVD sub-tree.
-            let mmvd_cand_flag = if max_merge > 1 {
-                let n = self.ctxs.mmvd_cand_flag.len();
+        if regular_merge_flag {
+            let mmvd_merge_flag = if self.tools.mmvd_enabled {
+                let n = self.ctxs.mmvd_merge_flag.len();
+                // MMVD is only signalled in inter slices; init_type ∈
+                // {1, 2} → ctx slot 0 / 1.
                 let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
                 self.dec
-                    .decode_decision(&mut self.ctxs.mmvd_cand_flag[slot])?
+                    .decode_decision(&mut self.ctxs.mmvd_merge_flag[slot])?
+                    == 1
             } else {
-                0
+                false
             };
-            info.inter.merge_data.mmvd_cand_flag = mmvd_cand_flag as u32;
-            info.inter.merge_data.mmvd_distance_idx = self.read_mmvd_distance_idx()?;
-            info.inter.merge_data.mmvd_direction_idx = self.read_mmvd_direction_idx()?;
-            // §7.4.12.7 — merge_idx is inferred to mmvd_cand_flag.
-            info.inter.merge_data.merge_idx = mmvd_cand_flag as u32;
+            info.inter.merge_data.mmvd_merge_flag = mmvd_merge_flag;
+
+            if mmvd_merge_flag {
+                // §8.5.2.7 — MMVD sub-tree.
+                let mmvd_cand_flag = if max_merge > 1 {
+                    let n = self.ctxs.mmvd_cand_flag.len();
+                    let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
+                    self.dec
+                        .decode_decision(&mut self.ctxs.mmvd_cand_flag[slot])?
+                } else {
+                    0
+                };
+                info.inter.merge_data.mmvd_cand_flag = mmvd_cand_flag as u32;
+                info.inter.merge_data.mmvd_distance_idx = self.read_mmvd_distance_idx()?;
+                info.inter.merge_data.mmvd_direction_idx = self.read_mmvd_direction_idx()?;
+                // §7.4.12.7 — merge_idx is inferred to mmvd_cand_flag.
+                info.inter.merge_data.merge_idx = mmvd_cand_flag as u32;
+            } else {
+                let merge_idx = if max_merge > 1 {
+                    self.read_merge_idx(max_merge)?
+                } else {
+                    0
+                };
+                info.inter.merge_data.merge_idx = merge_idx;
+            }
         } else {
+            // §7.3.11.7 — `regular_merge_flag == 0` branch. Either CIIP
+            // or GPM fires. The leaf reader handles the CIIP-only path
+            // (round-28); GPM is surfaced as Unsupported. The CIIP
+            // gate per §7.3.11.7 only opens when both CIIP **and** GPM
+            // are enabled; outside that gate the spec §7.4.12.7
+            // inference picks ciip_flag = 1 unconditionally when the
+            // CIIP size-and-skip conditions are met (which they must
+            // be — otherwise the regular_merge_flag gate would not
+            // have opened). For our round-28 scope GPM is gated off,
+            // so ciip_flag is always inferred to 1 here.
+            let ciip_parse_gate = false;
+            let ciip_flag = if ciip_parse_gate {
+                // Reserved for the future B-slice CIIP-vs-GPM
+                // disambiguation. The branch is unreachable today
+                // (gpm_branch_open = false) but the bin would be:
+                // let inc = ctx_inc_ciip_flag() as usize;
+                // let slot = (init_type - 1) + inc;
+                // self.dec.decode_decision(&mut self.ctxs.ciip_flag[slot])?
+                false
+            } else {
+                // §7.4.12.7 inference: with CIIP enabled, regular_merge
+                // == 0, !cu_skip, cb_under_128, cbW*cbH >= 64 →
+                // ciip_flag = 1.
+                self.tools.ciip_enabled && !cu_skip && cb_under_128 && ciip_size_ok
+            };
+            info.inter.merge_data.ciip_flag = ciip_flag;
+
+            if !ciip_flag {
+                // GPM branch (or any other non-CIIP non-regular merge
+                // path) is out of scope.
+                return Err(Error::unsupported(
+                    "h266 leaf CU inter: non-CIIP non-regular merge (GPM / subblock) not yet \
+                     supported (round-28 only handles regular merge + CIIP)",
+                ));
+            }
+
+            // CIIP branch — read merge_idx if MaxNumMergeCand > 1.
             let merge_idx = if max_merge > 1 {
                 self.read_merge_idx(max_merge)?
             } else {
@@ -1066,20 +1171,34 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.inter.merge_data.merge_idx = merge_idx;
         }
 
-        // Round-21 skip-only path: when cu_skip_flag is 1 the CU has no
-        // residual (no cu_coded_flag, no transform_unit reads). Set
-        // CBFs to 0 and return. Non-skip merge would parse cu_coded_flag
-        // + a transform_tree() body — that stays in r22+ scope until
-        // residual decoding for inter is wired.
+        // Skip CUs (cu_skip_flag == 1) carry no residual. Non-skip
+        // merge / CIIP CUs read `cu_coded_flag` to gate the
+        // `transform_tree()` body. Round-28 wires that read but does
+        // not yet decode an actual `transform_tree()` body — when the
+        // flag comes back 1 the reader surfaces Unsupported. The CIIP
+        // acceptance fixture pins the cu_coded_flag = 0 path, which
+        // matches the spec's eq. 998 application to the
+        // (intra+inter)-only prediction.
         info.tu_y_coded_flag = false;
         info.tu_cb_coded_flag = false;
         info.tu_cr_coded_flag = false;
         let _ = residual;
         if !cu_skip {
-            return Err(Error::unsupported(
-                "h266 leaf CU inter: non-skip merge CUs (cu_coded_flag + residual) not supported \
-                 in round-21 (only cu_skip path is wired)",
-            ));
+            // §7.3.11.5 — for a merge CU with cu_skip_flag == 0 the
+            // next syntax element is `cu_coded_flag` (Table 92, single
+            // ctx bin, ctxInc = 0 per Table 132).
+            let n = self.ctxs.cu_coded_flag.len() - 1;
+            let slot = (self.ctxs.init_type as usize).min(n);
+            let cu_coded = self
+                .dec
+                .decode_decision(&mut self.ctxs.cu_coded_flag[slot])?
+                == 1;
+            if cu_coded {
+                return Err(Error::unsupported(
+                    "h266 leaf CU inter: non-skip merge CUs with cu_coded_flag == 1 (residual \
+                     transform_tree) not yet supported (round-28 only handles cu_coded_flag == 0)",
+                ));
+            }
         }
 
         Ok(())
@@ -1905,6 +2024,8 @@ mod tests {
             max_num_merge_cand: 6,
             mmvd_enabled: false,
             ph_mmvd_fullpel_only: false,
+            ciip_enabled: false,
+            gpm_enabled: false,
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();

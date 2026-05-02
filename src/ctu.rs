@@ -74,10 +74,11 @@ use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
-    apply_mmvd_to_base, build_merge_cand_list, build_merge_cand_list_b, derive_mmvd_offset,
-    derive_spatial_merge_candidates, derive_temporal_merge_candidate, predict_chroma_block,
-    predict_chroma_block_bipred, predict_luma_block, predict_luma_block_bipred, HmvpTable,
-    MotionField, MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
+    apply_mmvd_to_base, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
+    derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
+    predict_chroma_block, predict_chroma_block_bipred, predict_luma_block,
+    predict_luma_block_bipred, HmvpTable, MotionField, MotionVector, MvField, ReferencePicture,
+    TemporalMergeInputs,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -147,6 +148,47 @@ pub(crate) fn chroma_pred_mode_for_predict(mode_c: u32) -> u32 {
 /// where `top` is empty when the top side is unavailable and `left` is
 /// empty when the left side is unavailable.
 ///
+/// Round-28 §8.5.6.7 — apply the eq. 998 weighted average between the
+/// freshly-MC'd `predSamplesInter` (already living inside the CU
+/// rectangle of `plane`) and the supplied `pred_intra` planar
+/// prediction array. Writes the combined result back into the same
+/// plane rectangle, clipping into the bit-depth range. The `w`
+/// argument is the §8.5.6.7 intra-prediction weight in `{1, 2, 3}`
+/// — see [`crate::inter::ciip_intra_weight`].
+fn apply_ciip_combine_to_plane(
+    plane: &mut crate::reconstruct::PicturePlane,
+    x0: usize,
+    y0: usize,
+    n_w: usize,
+    n_h: usize,
+    pred_intra: &[i16],
+    w: u32,
+    bit_depth: u32,
+) {
+    debug_assert_eq!(pred_intra.len(), n_w * n_h);
+    debug_assert!(matches!(w, 1..=3));
+    let stride = plane.stride;
+    // Snapshot the current rectangle as predSamplesInter, then
+    // combine + write back. We could combine in-place row-by-row but
+    // staging through `Vec<i16>` keeps the helper symmetric with
+    // [`crate::inter::combine_ciip_samples`].
+    let mut inter_pred = vec![0i16; n_w * n_h];
+    for y in 0..n_h {
+        let plane_row = (y0 + y) * stride;
+        for x in 0..n_w {
+            inter_pred[y * n_w + x] = plane.samples[plane_row + x0 + x] as i16;
+        }
+    }
+    let combined =
+        crate::inter::combine_ciip_samples(pred_intra, &inter_pred, n_w, n_h, w, bit_depth);
+    for y in 0..n_h {
+        let plane_row = (y0 + y) * stride;
+        for x in 0..n_w {
+            plane.samples[plane_row + x0 + x] = combined[y * n_w + x] as u8;
+        }
+    }
+}
+
 /// The lengths follow §8.4.5.2.14 numSampN derivation:
 ///
 /// * `INTRA_LT_CCLM` — `top` has `n_tb_w` samples, `left` has `n_tb_h`.
@@ -575,6 +617,26 @@ pub struct CtuWalker<'a, 'b> {
     /// via [`Self::cu_tool_flags`] so the leaf CU reader can route
     /// it through to [`crate::inter::derive_mmvd_offset`].
     ph_mmvd_fullpel_only: bool,
+    /// Round-28 §8.5.6.7 — per-picture intra-coded grid sampled at 4x4
+    /// luma granularity. The §8.5.6.7 weight ladder reads
+    /// `CuPredMode[0][xNbX][yNbX]` for X being the A / B neighbour
+    /// positions; this grid is the cheapest way to track the
+    /// MODE_INTRA / MODE_INTER decision per 4x4 block without rerunning
+    /// the partition walker. Each entry is initialised to `false`
+    /// (treat-as-unavailable / inter); intra leaf CUs flip their
+    /// covered cells to `true` and inter leaf CUs flip them back to
+    /// `false`. The CTU walker reads the (xCb − 1, yCb − 1 + cbHeight)
+    /// and (xCb − 1 + cbWidth, yCb − 1) cells when the leaf CU's
+    /// `info.inter.merge_data.ciip_flag == true` to derive the §8.5.6.7
+    /// weight `w`.
+    intra_grid: Vec<bool>,
+    /// Round-28 — width of [`Self::intra_grid`] in 4x4 blocks. Mirrors
+    /// `motion_field.blocks_w` but is kept as a separate field so the
+    /// CIIP path doesn't have to indirect through `motion_field` for a
+    /// pure picture-geometry constant.
+    intra_grid_w: u32,
+    /// Round-28 — height of [`Self::intra_grid`] in 4x4 blocks.
+    intra_grid_h: u32,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -684,6 +746,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let alf_picture =
             AlfPicture::empty(layout.pic_width_in_ctbs_y, layout.pic_height_in_ctbs_y);
         let motion_field = MotionField::new(layout.pic_width_luma, layout.pic_height_luma);
+        // Round-28 — 4x4 intra-coded grid. Initialised to `false`
+        // (== unavailable / inter), gets updated by every leaf CU
+        // reconstruction path to track the §8.5.6.7 neighbour status.
+        let intra_grid_w = layout.pic_width_luma.div_ceil(4);
+        let intra_grid_h = layout.pic_height_luma.div_ceil(4);
+        let intra_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         // §7.4.3.5 — Log2ParMrgLevel = pps_log2_parallel_merge_level_minus2
         // + 2. Our PPS parser does not yet surface that field, so we
         // default to the spec minimum (2 → ParMrgLevel = 4) which is
@@ -711,6 +779,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             col_ref_idx: 0,
             collocated_from_l0: true,
             ph_mmvd_fullpel_only: false,
+            intra_grid,
+            intra_grid_w,
+            intra_grid_h,
         })
     }
 
@@ -737,6 +808,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// emits.
     pub fn motion_field(&self) -> &MotionField {
         &self.motion_field
+    }
+
+    /// Round-28 §8.5.6.7 — sample the picture-wide 4x4 intra-coded
+    /// grid at picture-absolute luma `(x, y)`. Returns `false` when the
+    /// position is out of bounds (matching the spec's
+    /// `availableX == FALSE` → `isIntraCodedNeighbourX = FALSE`
+    /// branch) and otherwise the cell's stored mode flag.
+    fn sample_intra_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.intra_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// Round-28 §8.5.6.7 — broadcast `is_intra` across every 4x4 cell
+    /// touched by the rectangle `[x, x+w) x [y, y+h)`. Used by the
+    /// per-CU reconstruction paths to update [`Self::intra_grid`] so
+    /// later CIIP CUs see the correct neighbour status.
+    fn write_intra_block(&mut self, x: u32, y: u32, w: u32, h: u32, is_intra: bool) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
+        let by1 = (y + h).div_ceil(4).min(self.intra_grid_h);
+        for by in by0..by1 {
+            let row_off = (by * self.intra_grid_w) as usize;
+            for bx in bx0..bx1 {
+                self.intra_grid[row_off + bx as usize] = is_intra;
+            }
+        }
     }
 
     /// Read-only view of the round-24 HMVP table. Useful for tests that
@@ -1046,6 +1151,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             max_num_merge_cand: max_num_merge,
             mmvd_enabled: tf.mmvd_enabled_flag,
             ph_mmvd_fullpel_only: self.ph_mmvd_fullpel_only,
+            ciip_enabled: tf.ciip_enabled_flag,
+            gpm_enabled: tf.gpm_enabled_flag,
         }
     }
 
@@ -1312,6 +1419,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 bdpcm_luma: info.intra_bdpcm_luma,
                 bdpcm_chroma: false,
             });
+            self.write_intra_block(
+                cu.cu.x,
+                cu.cu.y,
+                cu.cu.w,
+                cu.cu.h,
+                matches!(info.pred_mode, CuPredMode::Intra),
+            );
             return Ok(());
         }
 
@@ -1503,6 +1617,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm_luma: info.intra_bdpcm_luma,
             bdpcm_chroma: false,
         });
+        // Round-28 §8.5.6.7 — record this CU's prediction mode in the
+        // 4x4 intra-coded grid so subsequent CIIP CUs see the correct
+        // neighbour status.
+        self.write_intra_block(
+            cu.cu.x,
+            cu.cu.y,
+            cu.cu.w,
+            cu.cu.h,
+            matches!(info.pred_mode, CuPredMode::Intra),
+        );
         Ok(())
     }
 
@@ -1629,6 +1753,66 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             None
         };
 
+        // ---- CIIP setup ----------------------------------------------------
+        //
+        // Round-28 §8.5.6.7. Build the planar intra prediction from the
+        // *partially-reconstructed* output plane neighbours **before**
+        // running motion compensation — MC only writes inside the CU
+        // rectangle, but reading neighbour samples after-the-fact would
+        // still be safe because the neighbour rows / columns are
+        // outside the CU. Doing it up-front mirrors the spec's
+        // pre-computed `predSamplesIntra` vs `predSamplesInter`
+        // separation in eq. 998. The §8.5.6.7 weight `w` is also
+        // captured here from the `(xCb − 1, yCb − 1 + cbHeight)` /
+        // `(xCb − 1 + cbWidth, yCb − 1)` neighbour intra-coded grid.
+        let ciip_active = info.inter.merge_data.ciip_flag;
+        let ciip_w_luma = if ciip_active {
+            let xcb_i = cu.cu.x as i32;
+            let ycb_i = cu.cu.y as i32;
+            let cbw_i = cu.cu.w as i32;
+            let cbh_i = cu.cu.h as i32;
+            // §8.5.6.7 — the "A" neighbour sits at (xCb − 1, yCb − 1
+            // + cbHeight) and the "B" neighbour at (xCb − 1 + cbWidth,
+            // yCb − 1). Out-of-picture neighbours register as
+            // not-intra (matching the spec's `availableX == FALSE`
+            // → `isIntraCodedNeighbourX = FALSE` branch).
+            let intra_a = self.sample_intra_at_luma(xcb_i - 1, ycb_i - 1 + cbh_i);
+            let intra_b = self.sample_intra_at_luma(xcb_i - 1 + cbw_i, ycb_i - 1);
+            ciip_intra_weight(intra_b, intra_a)
+        } else {
+            0
+        };
+        let bit_depth_ciip = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let ciip_pred_intra_luma: Vec<i16> = if ciip_active {
+            let n_w = cu.cu.w as usize;
+            let n_h = cu.cu.h as usize;
+            let above_avail = cu.cu.y > 0;
+            let left_avail = cu.cu.x > 0;
+            let refs = OwnedIntraRefs::from_plane(
+                &out.luma,
+                cu.cu.x as usize,
+                cu.cu.y as usize,
+                n_w,
+                n_h,
+                above_avail,
+                left_avail,
+                bit_depth_ciip,
+            );
+            let refs_view = IntraRefs {
+                above: &refs.above,
+                left: &refs.left,
+                top_left: refs.top_left,
+            };
+            // §7.4.5.2 — when ciip_flag == 1 the spec sets
+            // IntraPredModeY[x][y] = INTRA_PLANAR for every sample of
+            // the CB. The chroma intra mode is derived from luma per
+            // §8.4.3 / Table 20 → also INTRA_PLANAR for our 4:2:0
+            // single-tree case.
+            predict_planar(n_w, n_h, &refs_view)?
+        } else {
+            Vec::new()
+        };
+
         // ---- Luma MC -------------------------------------------------------
         match (ref_pic_l0, ref_pic_l1) {
             (Some(rp0), None) => {
@@ -1674,12 +1858,75 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             (None, None) => unreachable!(), // guarded above
         }
 
+        // ---- CIIP luma combine (§8.5.6.7 eq. 998) --------------------------
+        if ciip_active {
+            apply_ciip_combine_to_plane(
+                &mut out.luma,
+                cu.cu.x as usize,
+                cu.cu.y as usize,
+                cu.cu.w as usize,
+                cu.cu.h as usize,
+                &ciip_pred_intra_luma,
+                ciip_w_luma,
+                bit_depth_ciip,
+            );
+        }
+
         // ---- Chroma MC for 4:2:0 -----------------------------------------
         if self.sps.sps_chroma_format_idc == 1 {
             let cb_w_c = cu.cu.w / 2;
             let cb_h_c = cu.cu.h / 2;
             let cb_x_c = cu.cu.x / 2;
             let cb_y_c = cu.cu.y / 2;
+            // Round-28 §8.5.6.7 — capture the planar chroma intra
+            // prediction *before* the chroma MC overwrites the CU
+            // rectangle. The §8.4.5.2.11 planar predictor is the same
+            // for chroma as for luma; for CIIP the spec forces
+            // IntraPredModeC to PLANAR (luma is also forced to PLANAR
+            // by §7.4.5.2 and the §8.4.3 chroma derivation table maps
+            // PLANAR luma → PLANAR chroma).
+            let (ciip_pred_intra_cb, ciip_pred_intra_cr) = if ciip_active {
+                let n_w_c = cb_w_c as usize;
+                let n_h_c = cb_h_c as usize;
+                let above_avail_c = cb_y_c > 0;
+                let left_avail_c = cb_x_c > 0;
+                let refs_cb = OwnedIntraRefs::from_plane(
+                    &out.cb,
+                    cb_x_c as usize,
+                    cb_y_c as usize,
+                    n_w_c,
+                    n_h_c,
+                    above_avail_c,
+                    left_avail_c,
+                    bit_depth_ciip,
+                );
+                let refs_cr = OwnedIntraRefs::from_plane(
+                    &out.cr,
+                    cb_x_c as usize,
+                    cb_y_c as usize,
+                    n_w_c,
+                    n_h_c,
+                    above_avail_c,
+                    left_avail_c,
+                    bit_depth_ciip,
+                );
+                let view_cb = IntraRefs {
+                    above: &refs_cb.above,
+                    left: &refs_cb.left,
+                    top_left: refs_cb.top_left,
+                };
+                let view_cr = IntraRefs {
+                    above: &refs_cr.above,
+                    left: &refs_cr.left,
+                    top_left: refs_cr.top_left,
+                };
+                (
+                    predict_planar(n_w_c, n_h_c, &view_cb)?,
+                    predict_planar(n_w_c, n_h_c, &view_cr)?,
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
             match (ref_pic_l0, ref_pic_l1) {
                 (Some(rp0), None) => {
                     predict_chroma_block(
@@ -1747,6 +1994,37 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 }
                 (None, None) => unreachable!(),
             }
+            // ---- CIIP chroma combine (§8.5.6.7 eq. 998) -------------------
+            //
+            // Per §8.5.6.7 the chroma weight is derived from the same
+            // §8.5.6.7 A / B luma neighbours as the luma weight (the
+            // spec scales the neighbour position by SubWidthC /
+            // SubHeightC in eqs. 995 / 996, which for 4:2:0 means the
+            // chroma neighbours sit at *the same* luma-grid 4x4 cells
+            // as the luma neighbours; the intra-grid sample picked
+            // earlier therefore applies here too).
+            if ciip_active {
+                apply_ciip_combine_to_plane(
+                    &mut out.cb,
+                    cb_x_c as usize,
+                    cb_y_c as usize,
+                    cb_w_c as usize,
+                    cb_h_c as usize,
+                    &ciip_pred_intra_cb,
+                    ciip_w_luma,
+                    bit_depth_ciip,
+                );
+                apply_ciip_combine_to_plane(
+                    &mut out.cr,
+                    cb_x_c as usize,
+                    cb_y_c as usize,
+                    cb_w_c as usize,
+                    cb_h_c as usize,
+                    &ciip_pred_intra_cr,
+                    ciip_w_luma,
+                    bit_depth_ciip,
+                );
+            }
         }
 
         // Broadcast the chosen MvField across every 4x4 block of the
@@ -1799,6 +2077,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm_luma: false,
             bdpcm_chroma: false,
         });
+        // Round-28 §8.5.6.7 — inter CUs (regular-merge or CIIP) record
+        // MODE_INTER in the intra-coded grid so subsequent CIIP CUs
+        // see this CU as a non-intra neighbour. Even CIIP CUs are
+        // MODE_INTER per §7.4.12.7 — the spec uses the intra-flag of
+        // the *neighbour* CU's pred mode, not the predictor mix.
+        self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         Ok(())
     }
 

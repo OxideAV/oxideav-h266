@@ -1958,3 +1958,202 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     assert!(centre.cu_skip_flag);
     assert!(centre.mode_inter);
 }
+
+/// Round-28: P-slice combined inter-intra prediction (CIIP, §8.5.6.7).
+/// Single 8x8 CU at the top-left of an 8x8 picture; the CU sits at
+/// the picture corner so neither §8.5.6.7 neighbour (A at
+/// `(xCb − 1, yCb − 1 + cbHeight) = (−1, 7)`, B at
+/// `(xCb − 1 + cbWidth, yCb − 1) = (7, −1)`) is in-picture, so both
+/// register as not-intra → §8.5.6.7 weight `w = 1` → eq. 998 collapses
+/// to `(1 * predIntra + 3 * predInter + 2) >> 2`.
+///
+/// CABAC sequence (from `decode_inter` in `leaf_cu.rs`):
+///
+/// * `split_cu_flag = 0`           — single 8x8 CU at the CTU root.
+/// * `cu_skip_flag = 0`            — non-skip merge (CIIP requires this).
+/// * `general_merge_flag = 1`      — merge data follows.
+/// * `regular_merge_flag = 0`      — gate is open because
+///   `sps_ciip_enabled_flag = 1`, `cu_skip_flag = 0`, `cbW * cbH = 64`,
+///   `cbW < 128`, `cbH < 128`. The `0` selects the CIIP branch.
+/// * `ciip_flag = 1` (inferred per §7.4.12.7 — `gpm_enabled = 0` means
+///   no parse, the inference rules pick 1 since CIIP is the only
+///   non-regular branch open). No CABAC bin consumed.
+/// * `merge_idx = 0`               — TR(cMax = 5), bin 0 ctx-coded = 0.
+/// * `cu_coded_flag = 0`           — no transform_tree() body.
+///
+/// Reference picture: a per-pixel ramp with each sample distinct so the
+/// CIIP combination is observable. Zero MV pad → predSamplesInter =
+/// the reference sample at the same position. Above / left neighbours
+/// of the CU are all out-of-picture → planar refs default to mid-grey
+/// (128 at 8-bit) → predSamplesIntra = 128 (planar of all-128 refs).
+///
+/// Expected reconstructed luma sample at `(x, y)`:
+///   `(1 * 128 + 3 * ref[y][x] + 2) >> 2`
+///
+/// The fixture verifies:
+///
+/// 1. `sps_ciip_enabled_flag = 1` flows through `CtuWalker::cu_tool_flags`
+///    so the leaf CU reader hits the CIIP gate.
+/// 2. The `regular_merge_flag = 0` parse is taken (not the round-21 +
+///    round-27 inferred-to-1 collapse).
+/// 3. `MergeData::ciip_flag` is set to `true` per the §7.4.12.7
+///    inference and propagated to the CTU walker.
+/// 4. The reconstructed luma plane matches the spec eq. 998 weighted
+///    average sample-by-sample.
+/// 5. The motion field still records the regular-merge MC vector
+///    (zero-MV pad, ref index 0, predFlagL0 = 1) — CIIP doesn't
+///    change the per-block MV state.
+#[test]
+fn decode_p_slice_ciip_fires_and_decodes() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_regular_merge_flag,
+        ctx_inc_split_cu_flag,
+    };
+    use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 8u32;
+    let pic_h = 8u32;
+
+    // Reference: per-pixel ramp; the high range exercises the eq. 998
+    // weighted-average rounding path.
+    let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            ref_buf.luma.samples[y * pic_w as usize + x] = (40 + (x * 7) + (y * 11)) as u8;
+        }
+    }
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+        motion_field: None,
+    };
+
+    // ---- CABAC payload synthesis -------------------------------------
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
+
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
+    let mut regular_merge_ctxs = init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut cu_coded_ctxs = init_contexts(SyntaxCtx::CuCodedFlag, slice_qp);
+
+    let mut enc = ArithEncoder::new();
+
+    // 1. split_cu_flag(0) — single 8x8 CU at the CTU root.
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+
+    // 2. cu_skip_flag(0) — non-skip merge.
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 0)
+        .unwrap();
+
+    // 3. general_merge_flag(1) — merge_data() follows. The leaf
+    //    reader picks the ctx slot via `(init_type * 3 + ctxInc).min(n)`
+    //    against the 3-entry Table 82 array; encode-side mirrors the
+    //    same formula so we land on the identical context.
+    let gm_inc = ctx_inc_general_merge_flag() as usize;
+    let gm_n = general_merge_ctxs.len() - 1;
+    let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+    enc.encode_decision(&mut general_merge_ctxs[gm_slot], 1)
+        .unwrap();
+
+    // 4. regular_merge_flag(0) — selects the CIIP/GPM branch. Table
+    //    102 has 4 entries; the leaf reader indexes
+    //    `((init_type - 1) * 2 + ctxInc).min(n)` where
+    //    `ctxInc = (cu_skip_flag ? 0 : 1)` per Table 132.
+    let rm_inc = ctx_inc_regular_merge_flag(false) as usize; // cu_skip = 0 → ctxInc = 1
+    let rm_n = regular_merge_ctxs.len() - 1;
+    let rm_slot = ((init_type as usize - 1) * 2 + rm_inc).min(rm_n);
+    enc.encode_decision(&mut regular_merge_ctxs[rm_slot], 0)
+        .unwrap();
+
+    // 5. ciip_flag inferred to 1 per §7.4.12.7 (no GPM → no parse).
+    //    No CABAC bin consumed.
+
+    // 6. merge_idx = 0 — TR(cMax = MaxNumMergeCand - 1 = 5), bin 0
+    //    ctx-coded with ctxInc = 0. Encode the single 0 bin.
+    let mi_slot = (init_type as usize).min(merge_idx_ctxs.len() - 1);
+    enc.encode_decision(&mut merge_idx_ctxs[mi_slot], 0)
+        .unwrap();
+
+    // 7. cu_coded_flag = 0 — no transform_tree(). Single ctx bin,
+    //    ctxInc = 0 per Table 132; ctxIdx = init_type per Table 92.
+    let cc_slot = (init_type as usize).min(cu_coded_ctxs.len() - 1);
+    enc.encode_decision(&mut cu_coded_ctxs[cc_slot], 0).unwrap();
+
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header ------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    sps.tool_flags.ciip_enabled_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // ---- Expected luma per §8.5.6.7 eq. 998 --------------------------
+    //
+    // Both §8.5.6.7 neighbours sit outside the picture → both register
+    // as not-intra → w = 1. predSamplesIntra = planar(neighbours all
+    // 128, 4:2:0 padded mid-grey) = 128 everywhere. predSamplesInter
+    // = ref_buf.luma at (x, y) (zero MV).
+    //
+    //   predSamplesComb[x][y] = (1 * 128 + 3 * ref[y][x] + 2) >> 2.
+    let stride = pic_w as usize;
+    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            let inter = ref_buf.luma.samples[y * stride + x] as i32;
+            let intra = 128i32;
+            expected_y[y * stride + x] = ((intra + 3 * inter + 2) >> 2) as u8;
+        }
+    }
+    assert_eq!(
+        out.luma.samples, expected_y,
+        "luma must match the §8.5.6.7 eq. 998 weighted average \
+         (1 * planar128 + 3 * inter + 2) >> 2 at corner CU with \
+         w = 1 (both neighbours unavailable / not-intra)"
+    );
+
+    // ---- Per-block motion field: regular-merge MV unchanged by CIIP.
+    //
+    // The CIIP branch does not modify the chosen merge candidate; the
+    // motion field still records the zero-MV pad (mergeCandList[0] for
+    // a CU with no spatial / temporal / HMVP neighbours).
+    let mf = walker.motion_field();
+    let centre = mf.get_at_luma(4, 4);
+    assert!(centre.available);
+    assert!(centre.pred_flag_l0);
+    assert!(!centre.pred_flag_l1);
+    assert_eq!(centre.ref_idx_l0, 0);
+    assert_eq!(
+        centre.mv_l0,
+        MotionVector { x: 0, y: 0 },
+        "CIIP path must not modify the regular-merge MV — the \
+         motion field still records the zero-MV pad chosen as the \
+         base merge candidate"
+    );
+    // CIIP CUs are non-skip merge per §7.3.11.7 (the ciip_size_ok
+    // branch requires cu_skip_flag == 0); the per-block flag must
+    // mirror that.
+    assert!(!centre.cu_skip_flag);
+    assert!(centre.mode_inter);
+}

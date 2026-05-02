@@ -241,6 +241,20 @@ pub fn ctx_inc_mmvd_distance_idx() -> u32 {
     0
 }
 
+/// ctxInc for `ciip_flag[x0][y0]` per Table 132 — fixed 0.
+/// `ciip_flag` is binarised FL with `cMax = 1` (a single ctx-coded
+/// bin); §8.5.6.7 governs its semantic meaning.
+pub fn ctx_inc_ciip_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `cu_coded_flag` per Table 132 — fixed 0. Single
+/// ctx-coded bin (FL `cMax = 1`); gates the `transform_tree()` body
+/// per §7.3.11.5.
+pub fn ctx_inc_cu_coded_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///
