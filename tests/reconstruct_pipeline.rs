@@ -1475,3 +1475,313 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
     assert_eq!(centre.mv_l0.y, 0);
     assert_eq!(centre.ref_idx_l0, 0);
 }
+
+/// Round-26 acceptance fixture: pairwise-average merge candidate
+/// (§8.5.2.4) is the chosen merge index for the BR CU of a quad-split
+/// P-slice and decodes byte-exactly via the §8.5.2.2 step 8 invocation
+/// path.
+///
+/// Setup geometry:
+///   * 16x16 picture, single 32x32 CTU (one CTU covers everything).
+///   * Quad-split into four 8x8 leaf CUs in z-order
+///     (TL=(0,0), TR=(8,0), BL=(0,8), BR=(8,8)).
+///   * `MaxNumMergeCand = 6`, P-slice, single L0 reference picture.
+///   * `ph_temporal_mvp_enabled_flag = 1` → §8.5.2.11 Col candidate
+///     fires for every CU (8x8 area = 64 > 32, the spec's `cbWidth *
+///     cbHeight <= 32` skip threshold).
+///
+/// Reference picture has a non-uniform L0 MotionField split into the
+/// same four 8x8 quadrants. Only the TR/BL/BR regions are exercised by
+/// the §8.5.2.11 fetches:
+///   * TR region (8..16, 0..8):  ref MV = (1, 0) integer-pel
+///   * BL region (0..8, 8..16):  ref MV = (3, 0)
+///   * BR region (8..16, 8..16): ref MV = (4, 0)
+///   * TL region: ref MV = (0, 0) — never sampled (no CU's Col fetch
+///     lands here once the spec's 8x8 round + BR-fallback / centre
+///     position resolve to TR/BL/BR).
+///
+/// Per-CU §8.5.2.11 Col MV resolution (ref_pic.poc=0, current_poc=1,
+/// `col_ref_poc = current_poc = 1` per the walker heuristic, so
+/// `colPocDiff = 0 - 1 = -1` and `currPocDiff = 1 - 0 = 1`. §8.5.2.12
+/// eqs. 601 – 603 then scale by `distScaleFactor = -256` (sign flips):
+/// for `mvCol = (a, 0)` integer-pel, `scaled.x = ((-256 * a*16) + 128)
+/// >> 8 = (-4096a + 128) >> 8`):
+///   * a=1 → scaled = (-16, 0) = (-1, 0) integer-pel
+///   * a=3 → scaled = (-48, 0) = (-3, 0) integer-pel
+///   * a=4 → scaled = (-64, 0) = (-4, 0) integer-pel
+///
+/// **CU0 (TL @(0,0,8x8))**: BR fetch position (8,8) → BR region → mvCol
+/// (4,0) → scaled (-64, 0). Spatial neighbours all unavailable; HMVP
+/// empty; merge_idx=0 picks Col. CU0 chosen MV = (-64, 0).
+///
+/// **CU1 (TR @(8,0,8x8))**: BR fetch position (16,8) outside picture →
+/// centre fallback (12,4) rounded to (8,0) → TR region → mvCol (1,0) →
+/// scaled (-16, 0). Spatial walk: B1 at (15,-1) unavail, A1 at (7,7) =
+/// TL's MV (-64, 0). B0/A0/B2 all unavail. HMVP = [(-64, 0)] from CU0;
+/// newest entry duplicates A1 → §8.5.2.6 prune. Merge list =
+/// [A1=(-64, 0), Col=(-16, 0)]. Pairwise = avg → (-40, 0). merge_idx=1
+/// picks Col. CU1 chosen MV = (-16, 0).
+///
+/// **CU2 (BL @(0,8,8x8))**: BR fetch position (8,16) outside picture →
+/// centre fallback (4,12) rounded to (0,8) → BL region → mvCol (3,0) →
+/// scaled (-48, 0). Spatial walk: B1 at (7,7) = TL's MV (-64, 0); A1
+/// at (-1,15) unavail; **B0 at (8,7) = TR's MV (-16, 0)** (distinct
+/// from B1 → not pruned); A0 unavail; B2 unavail. Merge list spatial
+/// portion = [B1=(-64, 0), B0=(-16, 0)]. Col adds (-48, 0). HMVP =
+/// [(-64, 0), (-16, 0)]; newest (-16, 0) doesn't match B1 (A1 unavail
+/// in the spatial slot pair) → inserted; older (-64, 0) duplicates B1
+/// → pruned. Merge list before pairwise =
+/// [(-64, 0), (-16, 0), (-48, 0), (-16, 0)]. Pairwise = avg of slots 0
+/// + 1 = (-40, 0). merge_idx=2 picks Col. CU2 chosen MV = (-48, 0).
+///
+/// **CU3 (BR @(8,8,8x8))**: BR fetch position (16,16) outside picture
+/// → centre fallback (12,12) rounded to (8,8) → BR region → mvCol (4,
+/// 0) → scaled (-64, 0). Spatial walk: B1 at (15,7) = TR's MV (-16,
+/// 0); A1 at (7,15) = BL's MV (-48, 0) (distinct from B1 → not
+/// pruned); B0 at (16,7) unavail; A0 at (7,16) unavail; B2 at (7,7) =
+/// TL's MV (-64, 0) (distinct from B1 + A1 + the not-all-4-prior
+/// guard → kept). Spatial list portion = [B1=(-16, 0), A1=(-48, 0),
+/// B2=(-64, 0)]. Col adds another (-64, 0). HMVP =
+/// [(-64, 0), (-16, 0), (-48, 0)] (CU0/CU1/CU2 pushes, all distinct).
+/// Walk newest first: (-48, 0) matches A1 → pruned; (-16, 0) matches
+/// B1 → pruned; (-64, 0) at hMvpIdx=3 (no prune) → inserted. Merge
+/// list before §8.5.2.4 step 8 = [B1=(-16, 0), A1=(-48, 0),
+/// B2=(-64, 0), Col=(-64, 0), HMVP=(-64, 0)] (length 5). §8.5.2.4
+/// pairwise of slots 0+1 = avg((-16, 0), (-48, 0)) =
+/// round_pairwise(-64, 0) = (-32, 0) — the test's signature MV.
+/// **merge_idx=5 picks the §8.5.2.4 pairwise-average candidate.** CU3
+/// chosen MV = (-32, 0) — exactly (-2, 0) integer-pel (zero
+/// fractional component, so the §8.5.6.3 fractional-pel filter
+/// collapses to the integer-pel passthrough and we get a clean
+/// `mc_copy_block_int` translation).
+///
+/// Acceptance: each 8x8 quadrant of the reconstructed luma plane
+/// matches `mc_copy_block_int(ref, src_x = mv.x >> 4, src_y = 0)` with
+/// picture-edge clamping. The pairwise quadrant (BR) reads the
+/// reference at integer-pel offset (-2, 0) — i.e. `dst[8+y][8+x] =
+/// ref[8+y][6+x]` (no clamping needed; 6 + 0 ≥ 0 and 6 + 7 = 13 < 16).
+#[test]
+fn decode_p_slice_pairwise_average_fires_and_decodes() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
+    };
+    use oxideav_h266::inter::{MotionField, MotionVector, MvField};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+
+    // ---- Reference picture: distinctive luma ramp + non-uniform MF ---
+    let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            // Distinctive per-pixel pattern so the per-quadrant MC
+            // translation can be verified bit-exactly.
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 3) as u8;
+        }
+    }
+
+    // Non-uniform L0 motion field per the four 8x8 quadrants.
+    let mut mf = MotionField::new(pic_w, pic_h);
+    let cell = |dx: i32| -> MvField {
+        MvField {
+            mv_l0: MotionVector::from_int_pel(dx, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        }
+    };
+    // TL (0..8, 0..8): mv (0, 0) — unused by any CU's Col fetch.
+    mf.write_block(0, 0, 8, 8, cell(0));
+    // TR (8..16, 0..8): mv (1, 0) — sampled by CU1.
+    mf.write_block(8, 0, 8, 8, cell(1));
+    // BL (0..8, 8..16): mv (3, 0) — sampled by CU2.
+    mf.write_block(0, 8, 8, 8, cell(3));
+    // BR (8..16, 8..16): mv (4, 0) — sampled by CU0 + CU3.
+    mf.write_block(8, 8, 8, 8, cell(4));
+
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+        motion_field: Some(mf),
+    };
+
+    // ---- P-slice CABAC payload synthesis -----------------------------
+    // Tree structure: split_cu_flag(1) + split_qt_flag(1) at the 16x16
+    // root → four 8x8 children. Per-leaf split_cu_flag(0) at 8x8, then
+    // (cu_skip(1), merge_idx) per leaf in z-order. merge_idx values:
+    // CU0=0, CU1=1, CU2=1, CU3=4.
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut enc = ArithEncoder::new();
+
+    // Root split_cu_flag(1) + split_qt_flag(1).
+    let split_cu_inc_root =
+        ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_cu_n_minus1 = split_cu_ctxs.len() - 1;
+    enc.encode_decision(
+        &mut split_cu_ctxs[split_cu_inc_root.min(split_cu_n_minus1)],
+        1,
+    )
+    .unwrap();
+    let split_qt_inc_root = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let split_qt_n_minus1 = split_qt_ctxs.len() - 1;
+    enc.encode_decision(
+        &mut split_qt_ctxs[split_qt_inc_root.min(split_qt_n_minus1)],
+        1,
+    )
+    .unwrap();
+
+    // Per-leaf bin slots.
+    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_slot_8 = split_inc_8.min(split_cu_n_minus1);
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_idx_n_minus1);
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+
+    // Four split_cu_flag(0) for the four 8x8 children.
+    for _ in 0..4 {
+        enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+            .unwrap();
+    }
+
+    // Per-CU (cu_skip(1), merge_idx) pairs in z-order. The merge_idx
+    // truncated-unary encoding (cMax = MaxNumMergeCand - 1 = 5):
+    //   * value 0 → bin0=0 (1 ctx-coded bin)
+    //   * value 1 → bin0=1 ctx, bin1=0 bypass
+    //   * value 2 → bin0=1 ctx, bin1=1 bypass, bin2=0 bypass
+    //   * value 5 (== cMax) → bin0=1 ctx, bins1..4 = 1 bypass each;
+    //     loop exits at val == cMax with NO terminator bypass bit
+    //     (`while val < cmax` falls through).
+    let max_merge_minus1: u32 = 5;
+    let merge_idx_values: [u32; 4] = [0, 1, 2, 5];
+    for &mi in &merge_idx_values {
+        // cu_skip_flag(1).
+        enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+            .unwrap();
+        // merge_idx truncated-unary encode.
+        if mi == 0 {
+            enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+                .unwrap();
+        } else {
+            enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 1)
+                .unwrap();
+            // Emit (mi - 1) bypass=1 bits to advance val to mi.
+            for _ in 1..mi {
+                enc.encode_bypass(1).unwrap();
+            }
+            // Terminator bypass=0 — UNLESS val == cMax, in which case
+            // the decoder's `while val < cmax` loop exits without
+            // reading a terminator bin. Mirror that here.
+            if mi < max_merge_minus1 {
+                enc.encode_bypass(0).unwrap();
+            }
+        }
+    }
+
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header ------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    sps.tool_flags.temporal_mvp_enabled_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+    // Enable §8.5.2.11 with the same (current_poc=1, ref.poc=0,
+    // collocated_from_l0=true, col_ref_idx=0) configuration as the
+    // round-25 fixture. The walker's heuristic
+    // `col_ref_poc = current_poc` produces colPocDiff = -1 vs.
+    // currPocDiff = +1 → eqs. 601 – 603 sign-flip the Col MV (the
+    // distScaleFactor = -256 chain analysed above).
+    walker.set_temporal_mvp(/*current_poc*/ 1, true, true, 0);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // ---- Build the expected luma plane: per-quadrant translated copy
+    // of the reference frame.
+    //   CU0 (TL) MV = (-4, 0) int-pel: dst[y][x] = ref[y][clamp(x-4)]
+    //   CU1 (TR) MV = (-1, 0):       dst[y][8+x] = ref[y][7+x]
+    //   CU2 (BL) MV = (-3, 0):       dst[8+y][x] = ref[8+y][clamp(x-3)]
+    //   CU3 (BR) MV = (-2, 0) (PAIRWISE!): dst[8+y][8+x] = ref[8+y][6+x]
+    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    let stride = pic_w as usize;
+    let read_clamped = |src_x: i32, src_y: i32| -> u8 {
+        let sx = src_x.clamp(0, pic_w as i32 - 1) as usize;
+        let sy = src_y.clamp(0, pic_h as i32 - 1) as usize;
+        ref_buf.luma.samples[sy * stride + sx]
+    };
+    let translate_quad = |expected: &mut [u8], qx: usize, qy: usize, mv_int_x: i32| {
+        for y in 0..8 {
+            for x in 0..8 {
+                expected[(qy + y) * stride + (qx + x)] =
+                    read_clamped(qx as i32 + x as i32 + mv_int_x, qy as i32 + y as i32);
+            }
+        }
+    };
+    translate_quad(&mut expected_y, 0, 0, -4); // CU0 MV = (-4, 0)
+    translate_quad(&mut expected_y, 8, 0, -1); // CU1 MV = (-1, 0)
+    translate_quad(&mut expected_y, 0, 8, -3); // CU2 MV = (-3, 0)
+    translate_quad(&mut expected_y, 8, 8, -2); // CU3 MV = (-2, 0) ← PAIRWISE-AVERAGE
+
+    assert_eq!(
+        out.luma.samples, expected_y,
+        "luma must match per-quadrant translated reference; the BR \
+         quadrant's translation = (-2, 0) integer-pel proves the \
+         §8.5.2.4 pairwise-average candidate fired and was selected"
+    );
+
+    // Per-block motion-field invariant: the BR CU's MvField must carry
+    // the pairwise-average MV (-32, 0) in 1/16-pel units. This is the
+    // load-bearing assertion — it pins that the chosen merge candidate
+    // for CU3 was indeed the §8.5.2.4 avgCand and not the Col / HMVP
+    // entries (which would have surfaced as (-64, 0)).
+    let mf_out = walker.motion_field();
+    let cu3_centre = mf_out.get_at_luma(12, 12);
+    assert!(cu3_centre.available);
+    assert!(cu3_centre.pred_flag_l0);
+    assert_eq!(
+        cu3_centre.mv_l0,
+        MotionVector { x: -32, y: 0 },
+        "CU3's broadcast MvField must carry the §8.5.2.4 pairwise- \
+         average MV ((-16) + (-48)) >> 1 = -32 in 1/16-pel units"
+    );
+    assert_eq!(cu3_centre.ref_idx_l0, 0);
+    // Sanity-check the per-CU MVs the analysis predicted:
+    assert_eq!(
+        mf_out.get_at_luma(2, 2).mv_l0,
+        MotionVector { x: -64, y: 0 },
+        "CU0 picked Col = (-64, 0)"
+    );
+    assert_eq!(
+        mf_out.get_at_luma(10, 2).mv_l0,
+        MotionVector { x: -16, y: 0 },
+        "CU1 picked Col = (-16, 0)"
+    );
+    assert_eq!(
+        mf_out.get_at_luma(2, 10).mv_l0,
+        MotionVector { x: -48, y: 0 },
+        "CU2 picked Col = (-48, 0)"
+    );
+}

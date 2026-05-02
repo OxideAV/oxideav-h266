@@ -43,14 +43,15 @@ oxideav-h266 = "0.0"
 ## Decode support
 
 The reconstruction pipeline is being built incrementally and now covers
-the **intra-only single-tile single-slice subset** plus the round-25
-**P + B-slice merge / regular-merge subset with HMVP + temporal Col,
-§8.5.6.3 fractional-pel MC and §8.5.6.6.2 default-weighted bi-pred**:
+the **intra-only single-tile single-slice subset** plus the round-26
+**P + B-slice merge / regular-merge subset with HMVP + temporal Col +
+§8.5.2.4 pairwise-average candidate, §8.5.6.3 fractional-pel MC and
+§8.5.6.6.2 default-weighted bi-pred**:
 
 * **Intra**: PLANAR / DC / cardinal angular intra (modes 2, 18, 34, 50,
   66) + MIP (§8.4.5.2.2 — all 30 weight matrices) + CCLM (§8.4.5.2.14)
   + BDPCM + ISP (§8.4.5.1, all 4 split types).
-* **Inter (round-25)**: P + B-slice `cu_skip_flag` +
+* **Inter (round-26)**: P + B-slice `cu_skip_flag` +
   `general_merge_flag` inference + `merge_data()` regular-merge
   subset (`merge_idx`), §8.5.2.3 spatial-merge candidate derivation
   (5-position B1/A1/B0/A0/B2 list with redundancy checks across both
@@ -62,17 +63,22 @@ the **intra-only single-tile single-slice subset** plus the round-25
   HMVP insertion (round-24, per-slice 5-entry table reset at slice
   start per §7.3.11; merge derivation reads newest-to-oldest with the
   spec's two-newest-entry prune against A1/B1; §8.5.2.16 update fires
-  after every inter CU) and zero-MV padding (uni-pred for P, bi-pred
-  for B), §8.5.6 motion compensation including the §8.5.6.3 8-tap
-  luma fractional-sample interpolation (Table 27, `hpelIfIdx == 0`
-  family) and §8.5.6.3.4 4-tap chroma interpolation (Table 33), with
-  the §8.5.6.6.2 default uni-pred clamp at 8-bit and the §8.5.6.6.2
-  eq. 980 default-weighted bi-pred composition `(predL0 + predL1 +
-  1) >> 1` for B-slice bi-pred candidates. Single L0 + L1 reference
-  each. No MMVD / GPM / CIIP / AMVR / BCW yet; affine + scaled-
-  reference filter tables 28 / 29 / 30 / 31 / 32 / 34 / 35, BDOF +
-  DMVR, PROF, pairwise-average merge candidate (§8.5.2.4) land in
-  later rounds.
+  after every inter CU), §8.5.2.4 pairwise-average synthetic
+  candidate (round-26, derived from `mergeCandList[0]` and
+  `mergeCandList[1]` with the §8.5.2.14 `rightShift = 1, leftShift = 0`
+  signed-magnitude rounding; per-list switch covering both-active /
+  only-p0-active / only-p1-active / neither-active branches; L1 half
+  suppressed for P-slices via the `numRefLists == 1` clause), and
+  zero-MV padding (uni-pred for P, bi-pred for B), §8.5.6 motion
+  compensation including the §8.5.6.3 8-tap luma fractional-sample
+  interpolation (Table 27, `hpelIfIdx == 0` family) and §8.5.6.3.4
+  4-tap chroma interpolation (Table 33), with the §8.5.6.6.2 default
+  uni-pred clamp at 8-bit and the §8.5.6.6.2 eq. 980 default-weighted
+  bi-pred composition `(predL0 + predL1 + 1) >> 1` for B-slice bi-
+  pred candidates. Single L0 + L1 reference each. No MMVD / GPM /
+  CIIP / AMVR / BCW yet; affine + scaled-reference filter tables
+  28 / 29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF land in later
+  rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue

@@ -16,9 +16,9 @@
 //!   condition `xCb >> Log2ParMrgLevel == xNbX >> Log2ParMrgLevel &&
 //!   yCb >> Log2ParMrgLevel == yNbX >> Log2ParMrgLevel`.
 //! * [`build_merge_cand_list`] — §8.5.2.2 step 5 spatial assembly +
-//!   step 7 HMVP insertion (round-24, §8.5.2.6) + step 9 zero-MV
-//!   padding. The §8.5.2.4 pairwise average and §8.5.2.11 temporal
-//!   collocated candidate are still r25+ scope.
+//!   step 7 HMVP insertion (round-24, §8.5.2.6) + step 5 last bullet
+//!   Col candidate (round-25, §8.5.2.11) + step 8 pairwise-average
+//!   candidate (round-26, §8.5.2.4) + step 9 zero-MV padding.
 //! * [`HmvpTable`] — round-24 §8.5.2.6 / §8.5.2.16 history-based
 //!   motion vector predictor table. Per-slice circular buffer of up
 //!   to [`MAX_HMVP_CAND`] = 5 MvField records, reset to empty at
@@ -405,9 +405,10 @@ fn mvf_matches(a: &MvField, b: &MvField) -> bool {
         && a.mv_l1 == b.mv_l1
 }
 
-/// §8.5.2.2 step 5 + step 7 + step 9 — spatial mergeCandList assembly
-/// with optional Col + HMVP insertion (round-24/25) and zero-MV padding
-/// to `MaxNumMergeCand` for **P-slices** (uni-pred pads).
+/// §8.5.2.2 step 5 + step 7 + step 8 + step 9 — spatial mergeCandList
+/// assembly with optional Col + HMVP insertion + pairwise-average
+/// candidate, padded with zero-MV to `MaxNumMergeCand` for **P-slices**
+/// (uni-pred pads).
 ///
 /// The list is built in spec walk order:
 ///   1. If availableFlagB1 → push B1
@@ -420,10 +421,11 @@ fn mvf_matches(a: &MvField, b: &MvField) -> bool {
 ///      and `NumHmvpCand > 0`, invoke §8.5.2.6 to insert HMVP
 ///      candidates (newest to oldest, with the spec's prune-against-
 ///      A1/B1 rule for the two newest entries).
-///   8. While len < max → push zero-MV (refIdx 0).
-///
-/// Round-24 wires HMVP. Round-25 wires the §8.5.2.11 Col candidate.
-/// Pairwise average (§8.5.2.4) is still later scope.
+///   8. (round-26, this round) Step 8: if `numCurrMergeCand > 1` and
+///      `numCurrMergeCand < MaxNumMergeCand`, invoke §8.5.2.4 to derive
+///      the pairwise-average candidate from `mergeCandList[0]` and
+///      `mergeCandList[1]` and append it.
+///   9. While len < max → push zero-MV (refIdx 0).
 pub fn build_merge_cand_list(
     spatial: &[SpatialMergeCandidate; 5],
     max_num_merge_cand: u32,
@@ -451,12 +453,19 @@ pub fn build_merge_cand_list(
     // The §8.5.2.6 walk inserts entries from newest to oldest, prunes
     // duplicates against A1/B1 (only for the two newest entries), and
     // halts as soon as `numCurrMergeCand == MaxNumMergeCand − 1`. The
-    // last slot is reserved for the zero-MV pad below.
+    // last slot is reserved for the pairwise-average candidate / zero-MV
+    // pad below.
     if let Some(table) = hmvp {
         if (out.len() as u32) < max_num_merge_cand.saturating_sub(1) && !table.entries.is_empty() {
             insert_hmvp_into_merge_list(&mut out, spatial, table, max_num_merge_cand);
         }
     }
+    // §8.5.2.2 step 8 — pairwise-average candidate (§8.5.2.4). Gates
+    // mirror the spec: `numCurrMergeCand > 1 && numCurrMergeCand <
+    // MaxNumMergeCand`. P-slice variant → is_b_slice = false suppresses
+    // the L1 half (the spec's `numRefLists == 1` clause forces
+    // refIdxL1avg = -1 / predFlagL1avg = 0).
+    derive_pairwise_average_candidate(&mut out, max_num_merge_cand, /*is_b_slice*/ false);
     while (out.len() as u32) < max_num_merge_cand {
         out.push(MvField {
             mv_l0: MotionVector::ZERO,
@@ -513,6 +522,10 @@ pub fn build_merge_cand_list_b(
             insert_hmvp_into_merge_list(&mut out, spatial, table, max_num_merge_cand);
         }
     }
+    // §8.5.2.2 step 8 — pairwise-average candidate (§8.5.2.4). B-slice
+    // variant → is_b_slice = true so both L0 and L1 halves of avgCand
+    // are derived (numRefLists == 2 in the spec walk).
+    derive_pairwise_average_candidate(&mut out, max_num_merge_cand, /*is_b_slice*/ true);
     while (out.len() as u32) < max_num_merge_cand {
         out.push(MvField {
             mv_l0: MotionVector::ZERO,
@@ -628,8 +641,8 @@ impl HmvpTable {
 /// §8.5.2.6 — insert HMVP candidates into the merge list in newest-to-
 /// oldest order, with the spec's two-newest-entry prune against A1/B1.
 /// Halts as soon as `numCurrMergeCand == MaxNumMergeCand − 1` (i.e. one
-/// slot is reserved for the eventual zero-MV pad / pairwise average /
-/// temporal candidate) or the HMVP table is exhausted.
+/// slot is reserved for the eventual pairwise-average / zero-MV pad
+/// candidate) or the HMVP table is exhausted.
 ///
 /// Spec text (§8.5.2.6 — reproduced for reviewer convenience):
 /// > For each candidate in `HmvpCandList[NumHmvpCand − hMvpIdx]` with
@@ -679,6 +692,188 @@ fn insert_hmvp_into_merge_list(
         }
         if !same_motion {
             merge_list.push(entry);
+        }
+    }
+}
+
+// =====================================================================
+// §8.5.2.4 — Derivation process for pairwise average merging candidate
+// =====================================================================
+//
+// Spec walk (§8.5.2.4):
+//
+//   p0Cand = mergeCandList[0]
+//   p1Cand = mergeCandList[1]
+//   numRefLists = (sh_slice_type == B) ? 2 : 1
+//
+//   For each X in 0..(numRefLists - 1):
+//     If predFlagLX of both p0 and p1 is 1:
+//       refIdxLXavg     = refIdxLXp0
+//       predFlagLXavg   = 1
+//       mvLXavg         = round( mvLXp0 + mvLXp1, rightShift=1, leftShift=0 )
+//                         per §8.5.2.14 eqs. 608 – 610 (signed-magnitude
+//                         shift toward zero, offset = 0 because
+//                         rightShift == 1 ⇒ offset = (1 << 0) − 1 = 0).
+//     Elif only p0 active on LX: copy from p0.
+//     Elif only p1 active on LX: copy from p1.
+//     Else: refIdxLXavg = -1, predFlagLXavg = 0, mvLXavg = (0, 0).
+//
+//   When numRefLists == 1 (P-slice): force refIdxL1avg = -1 and
+//   predFlagL1avg = 0 — the L1 half is suppressed even if p0/p1 happen
+//   to carry stale L1 state.
+//
+// Insertion is governed by §8.5.2.2 step 8: pairwise fires only when
+// `numCurrMergeCand > 1 && numCurrMergeCand < MaxNumMergeCand` (i.e.
+// the list has at least the two source candidates and there's room for
+// the synthetic average). The new entry is appended at position
+// `numCurrMergeCand` and the count is incremented by 1; the spec then
+// hands off to step 9 (zero-MV pad).
+
+/// §8.5.2.14 motion-vector rounding helper for the pairwise-average
+/// case (`rightShift = 1`, `leftShift = 0`).
+///
+/// Reproduces eqs. 608 – 610:
+///
+/// ```text
+/// offset = (rightShift == 0) ? 0 : ((1 << (rightShift - 1)) - 1)
+/// mvX[i] = Sign(mvX[i]) * ((Abs(mvX[i]) + offset) >> rightShift) << leftShift
+/// ```
+///
+/// For `rightShift = 1` the offset collapses to 0, so this is a
+/// signed-magnitude divide-by-2 toward zero (`(-1, -1)` rounds to `0`,
+/// not `-1`). This matches the spec exactly — note that this is **not**
+/// the same as Rust's arithmetic right shift for negative values
+/// (`-1 >> 1 == -1`, but `Sign(-1) * (Abs(-1) >> 1) == 0`).
+#[inline]
+fn round_mv_pairwise(sum: i32) -> i32 {
+    let s = sum.signum();
+    let abs = sum.unsigned_abs();
+    s * ((abs >> 1) as i32)
+}
+
+/// §8.5.2.4 — derive the pairwise-average synthetic merging candidate
+/// from the first two entries of `merge_list`.
+///
+/// Returns `None` (and leaves `merge_list` untouched) when:
+///
+///   * `merge_list.len() < 2` — there is no `p1Cand` to average against
+///     (the §8.5.2.2 step 8 `numCurrMergeCand > 1` gate).
+///   * `(merge_list.len() as u32) >= max_num_merge_cand` — the list is
+///     already at capacity, so step 8 short-circuits before invoking
+///     §8.5.2.4 (the `numCurrMergeCand < MaxNumMergeCand` gate).
+///
+/// Otherwise computes the per-list average per the spec walk above
+/// (rounded with [`round_mv_pairwise`] for the both-active case),
+/// suppresses L1 for P-slices, and pushes the new candidate at the end
+/// of the list. Returns `Some(avgCand)` for inspection by tests.
+fn derive_pairwise_average_candidate(
+    merge_list: &mut Vec<MvField>,
+    max_num_merge_cand: u32,
+    is_b_slice: bool,
+) -> Option<MvField> {
+    if merge_list.len() < 2 {
+        return None;
+    }
+    if (merge_list.len() as u32) >= max_num_merge_cand {
+        return None;
+    }
+    let p0 = merge_list[0];
+    let p1 = merge_list[1];
+    let num_ref_lists: u32 = if is_b_slice { 2 } else { 1 };
+    let mut avg = MvField {
+        // Default everything to the "inactive" shape; the per-list walk
+        // below overwrites the active half(ves).
+        mv_l0: MotionVector::ZERO,
+        ref_idx_l0: -1,
+        pred_flag_l0: false,
+        mv_l1: MotionVector::ZERO,
+        ref_idx_l1: -1,
+        pred_flag_l1: false,
+        cu_skip_flag: false,
+        // The synthetic candidate inherits MODE_INTER (it is added to
+        // the merge list of an inter CU; the leaf-CU walker only cares
+        // that pred_flag_l{0,1} are set correctly for MC). Setting
+        // mode_inter true keeps the broadcast MvField self-consistent
+        // for downstream §9.3.4.2.2 pred_mode context derivation when a
+        // later CU samples this CU's slot.
+        mode_inter: true,
+        available: true,
+    };
+    // L0 half — always derived (numRefLists >= 1).
+    derive_pairwise_per_list(
+        p0.pred_flag_l0,
+        p1.pred_flag_l0,
+        p0.mv_l0,
+        p1.mv_l0,
+        p0.ref_idx_l0,
+        p1.ref_idx_l0,
+        &mut avg.mv_l0,
+        &mut avg.ref_idx_l0,
+        &mut avg.pred_flag_l0,
+    );
+    // L1 half — only derived for B-slices (numRefLists == 2). For
+    // P-slices the spec forces refIdxL1avg = -1 / predFlagL1avg = 0,
+    // which is exactly the default `avg` shape, so we leave the L1 half
+    // alone.
+    if num_ref_lists == 2 {
+        derive_pairwise_per_list(
+            p0.pred_flag_l1,
+            p1.pred_flag_l1,
+            p0.mv_l1,
+            p1.mv_l1,
+            p0.ref_idx_l1,
+            p1.ref_idx_l1,
+            &mut avg.mv_l1,
+            &mut avg.ref_idx_l1,
+            &mut avg.pred_flag_l1,
+        );
+    }
+    merge_list.push(avg);
+    Some(avg)
+}
+
+/// Per-list inner of §8.5.2.4 — applies the four-way switch on
+/// (predFlagLXp0, predFlagLXp1) and writes the resulting refIdx /
+/// predFlag / MV into the output slots.
+#[allow(clippy::too_many_arguments)]
+fn derive_pairwise_per_list(
+    p0_flag: bool,
+    p1_flag: bool,
+    p0_mv: MotionVector,
+    p1_mv: MotionVector,
+    p0_ref: i32,
+    p1_ref: i32,
+    out_mv: &mut MotionVector,
+    out_ref: &mut i32,
+    out_flag: &mut bool,
+) {
+    match (p0_flag, p1_flag) {
+        (true, true) => {
+            // Eqs. 520 – 521 + the §8.5.2.14 round on (mvL0p0 + mvL0p1).
+            *out_ref = p0_ref;
+            *out_flag = true;
+            *out_mv = MotionVector {
+                x: round_mv_pairwise(p0_mv.x + p1_mv.x),
+                y: round_mv_pairwise(p0_mv.y + p1_mv.y),
+            };
+        }
+        (true, false) => {
+            // Eqs. 522 – 525 — copy p0.
+            *out_ref = p0_ref;
+            *out_flag = true;
+            *out_mv = p0_mv;
+        }
+        (false, true) => {
+            // Eqs. 526 – 529 — copy p1.
+            *out_ref = p1_ref;
+            *out_flag = true;
+            *out_mv = p1_mv;
+        }
+        (false, false) => {
+            // Eqs. 530 – 533 — inactive on this list.
+            *out_ref = -1;
+            *out_flag = false;
+            *out_mv = MotionVector::ZERO;
         }
     }
 }
@@ -2411,8 +2606,8 @@ mod tests {
 
     /// §8.5.2.6 — when no spatial candidates are available, all HMVP
     /// entries should be inserted (no pruning needed) up to
-    /// `MaxNumMergeCand − 1`. The last slot is filled by the zero-MV
-    /// pad.
+    /// `MaxNumMergeCand − 1`. The remaining slots get the §8.5.2.4
+    /// pairwise-average candidate (round-26) followed by zero-MV pads.
     #[test]
     fn merge_list_inserts_hmvp_no_pruning_when_no_spatials() {
         let empty_spatials = [SpatialMergeCandidate::default(); 5];
@@ -2427,19 +2622,25 @@ mod tests {
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(3, 0));
         assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(2, 0));
         assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(1, 0));
-        // Slots 3..6 are zero-MV pads (HMVP halts at MaxNumMergeCand−1
-        // = 5 — but we already filled 3 < 5, so slot 5 becomes the
-        // zero-MV pad alongside the rest).
-        for entry in &list[3..] {
+        // Slot 3 = §8.5.2.4 pairwise-average of slots 0 and 1:
+        // sum = (3*16 + 2*16, 0) = (80, 0), rounded by §8.5.2.14
+        // (rightShift=1, leftShift=0, offset=0) → (40, 0). The
+        // signed-magnitude shift collapses to a plain (sum >> 1) for
+        // positive sums.
+        assert_eq!(list[3].mv_l0, MotionVector { x: 40, y: 0 });
+        assert!(list[3].pred_flag_l0);
+        // Slots 4..6 are zero-MV pads.
+        for entry in &list[4..] {
             assert_eq!(entry.mv_l0, MotionVector::ZERO);
             assert!(entry.pred_flag_l0);
         }
     }
 
     /// §8.5.2.6 — HMVP insertion halts at `MaxNumMergeCand − 1` (last
-    /// slot reserved for the zero-MV pad / pairwise / temporal). With
-    /// 5 HMVP entries and `MaxNumMergeCand == 4`, only 3 HMVP entries
-    /// land in the merge list (slots 0..2) — slot 3 is zero-MV pad.
+    /// slot reserved for the §8.5.2.4 pairwise-average candidate /
+    /// zero-MV pad). With 5 HMVP entries and `MaxNumMergeCand == 4`,
+    /// only 3 HMVP entries land in the merge list (slots 0..2) — and
+    /// slot 3 is the pairwise-average of slots 0 and 1.
     #[test]
     fn merge_list_hmvp_halts_one_short_of_max() {
         let empty_spatials = [SpatialMergeCandidate::default(); 5];
@@ -2449,11 +2650,13 @@ mod tests {
         }
         let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&hmvp));
         assert_eq!(list.len(), 4);
-        // 3 HMVP slots filled (newest first), then zero-MV pad.
+        // 3 HMVP slots filled (newest first).
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
         assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(4, 0));
         assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(3, 0));
-        assert_eq!(list[3].mv_l0, MotionVector::ZERO);
+        // Slot 3 = pairwise-average of slots 0 + 1 = (80+64, 0) >> 1 =
+        // (72, 0) in 1/16 units (4.5 int-pel).
+        assert_eq!(list[3].mv_l0, MotionVector { x: 72, y: 0 });
     }
 
     /// §8.5.2.6 — `sameMotion` pruning rule: when the **newest** HMVP
@@ -2474,8 +2677,10 @@ mod tests {
         hmvp.update_with(dummy_mvf(7, 0, 0)); // older
         hmvp.update_with(dummy_mvf(5, 0, 0)); // newest — duplicates B1
         let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp));
-        // Slot 0 = B1 = (5,0). Slot 1 should be the *older* HMVP entry
-        // (7,0) — newest (5,0) was pruned. Slots 2..5 are zero-MV pads.
+        // Slot 0 = B1 = (5,0). Slot 1 = older HMVP (7,0) — newest (5,0)
+        // was pruned. Slot 2 = §8.5.2.4 pairwise-average of (5,0)+(7,0)
+        // = (192, 0) >> 1 = (96, 0) in 1/16-pel units. Slots 3..5 are
+        // zero-MV pads.
         assert_eq!(list.len(), 6);
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
         assert_eq!(
@@ -2483,7 +2688,8 @@ mod tests {
             MotionVector::from_int_pel(7, 0),
             "newest HMVP must have been pruned (matches B1)"
         );
-        for entry in &list[2..] {
+        assert_eq!(list[2].mv_l0, MotionVector { x: 96, y: 0 });
+        for entry in &list[3..] {
             assert_eq!(entry.mv_l0, MotionVector::ZERO);
         }
     }
@@ -2891,8 +3097,8 @@ mod tests {
     }
 
     /// Walk-order pin: spatial candidates fill first, then Col, then
-    /// HMVP, then zero-MV pad. Verified by giving the merge list a
-    /// distinctive entry at each origin.
+    /// HMVP, then pairwise-average, then zero-MV pad. Verified by
+    /// giving the merge list a distinctive entry at each origin.
     #[test]
     fn merge_list_walk_order_spatial_then_col_then_hmvp() {
         let mut spatials = [SpatialMergeCandidate::default(); 5];
@@ -2917,8 +3123,279 @@ mod tests {
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(1, 0)); // B1
         assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(2, 0)); // Col
         assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(3, 0)); // HMVP
-                                                                     // Slots 3..5 = zero-MV pad.
+                                                                     // Slot 3 = §8.5.2.4 pairwise-average of B1 + Col = (1+2, 0)
+                                                                     // int-pel sum = (48, 0) in 1/16-pel units, rounded by §8.5.2.14
+                                                                     // (rightShift=1) → (24, 0). Slots 4..5 = zero-MV pad.
+        assert_eq!(list[3].mv_l0, MotionVector { x: 24, y: 0 });
+        for entry in &list[4..] {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+        }
+    }
+
+    // ----- §8.5.2.4 pairwise-average tests (round-26) ------------------
+
+    /// §8.5.2.14 round (`rightShift = 1`, `leftShift = 0`) — pin the
+    /// signed-magnitude divide-by-2-toward-zero behavior. This is the
+    /// edge case that distinguishes the spec rounding from a plain
+    /// arithmetic shift: `(-1) >> 1 == -1` in Rust, but the spec
+    /// `Sign(-1) * (Abs(-1) >> 1) == 0`.
+    #[test]
+    fn round_mv_pairwise_signed_magnitude_toward_zero() {
+        // Positive sums: plain (sum >> 1).
+        assert_eq!(round_mv_pairwise(0), 0);
+        assert_eq!(round_mv_pairwise(1), 0);
+        assert_eq!(round_mv_pairwise(2), 1);
+        assert_eq!(round_mv_pairwise(3), 1);
+        assert_eq!(round_mv_pairwise(4), 2);
+        // Negative sums: rounds toward zero (NOT floor like Rust >>).
+        assert_eq!(round_mv_pairwise(-1), 0);
+        assert_eq!(round_mv_pairwise(-2), -1);
+        assert_eq!(round_mv_pairwise(-3), -1);
+        assert_eq!(round_mv_pairwise(-4), -2);
+        // Sanity check vs Rust arithmetic shift (the trap).
+        assert_ne!(-1i32 >> 1, round_mv_pairwise(-1));
+    }
+
+    /// §8.5.2.4 — both source candidates active on L0; the synthetic
+    /// avgCand inherits p0's refIdx and carries the rounded per-axis
+    /// average MV. P-slice variant (numRefLists == 1) suppresses L1.
+    #[test]
+    fn pairwise_average_both_active_l0_p_slice() {
+        let mut list = vec![
+            dummy_mvf(4, 2, 0), // p0: mv (4*16, 2*16) = (64, 32)
+            dummy_mvf(2, 4, 0), // p1: mv (32, 64)
+        ];
+        let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ false).unwrap();
+        // Sum = (96, 96), rounded by (sum >> 1) → (48, 48) in 1/16-pel
+        // units (i.e. 3 int-pel on each axis).
+        assert_eq!(avg.mv_l0, MotionVector { x: 48, y: 48 });
+        assert_eq!(avg.ref_idx_l0, 0);
+        assert!(avg.pred_flag_l0);
+        // P-slice → L1 half forced inactive even though dummy_mvf
+        // happens to leave it at the unavailable shape.
+        assert!(!avg.pred_flag_l1);
+        assert_eq!(avg.ref_idx_l1, -1);
+        assert_eq!(avg.mv_l1, MotionVector::ZERO);
+        // The new candidate landed at the end.
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[2], avg);
+    }
+
+    /// §8.5.2.4 — only p0 active on L0; avgCand copies p0 verbatim
+    /// (eqs. 522 – 525). No averaging on this list.
+    #[test]
+    fn pairwise_average_only_p0_active_copies_p0() {
+        let p0 = dummy_mvf(7, -3, 1);
+        let p1 = MvField {
+            mv_l0: MotionVector::from_int_pel(99, 99), // ignored
+            ref_idx_l0: -1,
+            pred_flag_l0: false, // p1 inactive on L0
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let mut list = vec![p0, p1];
+        let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ false).unwrap();
+        // L0 copied from p0.
+        assert_eq!(avg.mv_l0, p0.mv_l0);
+        assert_eq!(avg.ref_idx_l0, 1);
+        assert!(avg.pred_flag_l0);
+    }
+
+    /// §8.5.2.4 — only p1 active on L0; avgCand copies p1 verbatim
+    /// (eqs. 526 – 529).
+    #[test]
+    fn pairwise_average_only_p1_active_copies_p1() {
+        let p0 = MvField {
+            mv_l0: MotionVector::from_int_pel(99, 99), // ignored
+            ref_idx_l0: -1,
+            pred_flag_l0: false, // p0 inactive on L0
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let p1 = dummy_mvf(-5, 6, 2);
+        let mut list = vec![p0, p1];
+        let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ false).unwrap();
+        assert_eq!(avg.mv_l0, p1.mv_l0);
+        assert_eq!(avg.ref_idx_l0, 2);
+        assert!(avg.pred_flag_l0);
+    }
+
+    /// §8.5.2.4 — neither p0 nor p1 active on L0; avgCand reports
+    /// inactive on this list (eqs. 530 – 533: refIdxLXavg = -1,
+    /// predFlagLXavg = 0, mvLXavg = (0, 0)).
+    #[test]
+    fn pairwise_average_neither_active_l0_inactive() {
+        let inactive = MvField {
+            mv_l0: MotionVector::from_int_pel(99, 99),
+            ref_idx_l0: -1,
+            pred_flag_l0: false,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let mut list = vec![inactive, inactive];
+        // is_b=true so the L1 walk also runs (and mirrors the L0 result).
+        let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ true).unwrap();
+        assert_eq!(avg.mv_l0, MotionVector::ZERO);
+        assert_eq!(avg.ref_idx_l0, -1);
+        assert!(!avg.pred_flag_l0);
+        assert_eq!(avg.mv_l1, MotionVector::ZERO);
+        assert_eq!(avg.ref_idx_l1, -1);
+        assert!(!avg.pred_flag_l1);
+    }
+
+    /// §8.5.2.4 — B-slice path: both halves derived. Mixed activity per
+    /// list (L0 both active, L1 only p0 active) exercises the per-list
+    /// switch independently.
+    #[test]
+    fn pairwise_average_mixed_per_list_b_slice() {
+        let p0 = MvField {
+            mv_l0: MotionVector::from_int_pel(2, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(-3, 1),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let p1 = MvField {
+            mv_l0: MotionVector::from_int_pel(4, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            // p1 inactive on L1 — copy p0's L1.
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let mut list = vec![p0, p1];
+        let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ true).unwrap();
+        // L0: both active → avg = ((32 + 64) >> 1, 0) = (48, 0).
+        assert_eq!(avg.mv_l0, MotionVector { x: 48, y: 0 });
+        assert_eq!(avg.ref_idx_l0, 0);
+        assert!(avg.pred_flag_l0);
+        // L1: only p0 → copy p0.
+        assert_eq!(avg.mv_l1, p0.mv_l1);
+        assert_eq!(avg.ref_idx_l1, 0);
+        assert!(avg.pred_flag_l1);
+    }
+
+    /// §8.5.2.2 step 8 gate — pairwise does not fire when the merge
+    /// list has fewer than 2 entries (`numCurrMergeCand > 1`).
+    #[test]
+    fn pairwise_average_skipped_when_list_has_fewer_than_two_entries() {
+        let mut list = vec![dummy_mvf(1, 0, 0)];
+        let result = derive_pairwise_average_candidate(&mut list, 6, false);
+        assert!(result.is_none());
+        assert_eq!(list.len(), 1, "list must be unchanged when gate fails");
+    }
+
+    /// §8.5.2.2 step 8 gate — pairwise does not fire when the merge
+    /// list is already at `MaxNumMergeCand` (`numCurrMergeCand <
+    /// MaxNumMergeCand`).
+    #[test]
+    fn pairwise_average_skipped_when_list_at_capacity() {
+        let mut list = vec![dummy_mvf(1, 0, 0), dummy_mvf(2, 0, 0)];
+        // max = 2 → list is already full.
+        let result = derive_pairwise_average_candidate(&mut list, 2, false);
+        assert!(result.is_none());
+        assert_eq!(list.len(), 2);
+    }
+
+    /// §8.5.2.2 step 8 — when only spatial B1 + A1 are available the
+    /// pairwise candidate is derived from those two entries. Pin the
+    /// integration with `build_merge_cand_list` (P-slice variant).
+    #[test]
+    fn merge_list_pairwise_from_two_spatial_p_slice() {
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        spatials[0] = SpatialMergeCandidate {
+            available: true,
+            field: dummy_mvf(2, 0, 0), // B1 = (32, 0)
+        };
+        spatials[1] = SpatialMergeCandidate {
+            available: true,
+            field: dummy_mvf(6, 0, 0), // A1 = (96, 0)
+        };
+        let list = build_merge_cand_list(&spatials, 6, None, None);
+        assert_eq!(list.len(), 6);
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(2, 0));
+        assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(6, 0));
+        // Slot 2 = pairwise-average = ((32 + 96) >> 1, 0) = (64, 0)
+        // = 4 int-pel on the x axis.
+        assert_eq!(list[2].mv_l0, MotionVector { x: 64, y: 0 });
+        assert!(list[2].pred_flag_l0);
+        assert!(!list[2].pred_flag_l1, "P-slice: L1 must be inactive");
+        // Slots 3..5 = zero-MV pads.
         for entry in &list[3..] {
+            assert_eq!(entry.mv_l0, MotionVector::ZERO);
+        }
+    }
+
+    /// §8.5.2.2 step 8 — B-slice variant integration. Two spatial
+    /// candidates with full bi-pred motion → pairwise carries averaged
+    /// L0 + L1 halves.
+    #[test]
+    fn merge_list_pairwise_b_slice_carries_both_halves() {
+        let bipred = |dx0, dy0, dx1, dy1| MvField {
+            mv_l0: MotionVector::from_int_pel(dx0, dy0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(dx1, dy1),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        spatials[0] = SpatialMergeCandidate {
+            available: true,
+            field: bipred(2, 0, -2, 0),
+        };
+        spatials[1] = SpatialMergeCandidate {
+            available: true,
+            field: bipred(4, 0, -4, 0),
+        };
+        let list = build_merge_cand_list_b(&spatials, 6, None, None);
+        assert_eq!(list.len(), 6);
+        // Slot 2 = pairwise: L0 = ((32+64)>>1, 0) = (48, 0);
+        //                    L1 = ((-32 + -64) >> 1, 0) = (-48, 0).
+        assert_eq!(list[2].mv_l0, MotionVector { x: 48, y: 0 });
+        assert_eq!(list[2].mv_l1, MotionVector { x: -48, y: 0 });
+        assert!(list[2].pred_flag_l0);
+        assert!(list[2].pred_flag_l1);
+    }
+
+    /// §8.5.2.2 step 8 — does not fire on a single-spatial list
+    /// (numCurrMergeCand == 1 fails the `> 1` gate). Pin that the
+    /// integration respects the gate.
+    #[test]
+    fn merge_list_pairwise_skipped_on_single_spatial() {
+        let mut spatials = [SpatialMergeCandidate::default(); 5];
+        spatials[0] = SpatialMergeCandidate {
+            available: true,
+            field: dummy_mvf(3, 0, 0),
+        };
+        let list = build_merge_cand_list(&spatials, 6, None, None);
+        // Slot 0 = B1, slots 1..5 = zero-MV pads (no pairwise — only
+        // one source candidate available).
+        assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(3, 0));
+        for entry in &list[1..] {
             assert_eq!(entry.mv_l0, MotionVector::ZERO);
         }
     }

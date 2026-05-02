@@ -6,6 +6,41 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **Pairwise-average merge candidate (round-26, §8.5.2.4)** — the
+  §8.5.2.2 step 8 invocation now lands in
+  [`build_merge_cand_list`](src/inter.rs) /
+  [`build_merge_cand_list_b`](src/inter.rs) between the §8.5.2.6 HMVP
+  step and the §8.5.2.5 zero-MV pad. New
+  `derive_pairwise_average_candidate` synthesises the avgCand from
+  `mergeCandList[0]` and `mergeCandList[1]` per the spec's per-list
+  four-way switch (both-active → average, only-p0 → copy p0, only-p1 →
+  copy p1, neither → inactive on this list), with the §8.5.2.14
+  `rightShift = 1, leftShift = 0` rounding implemented as a signed-
+  magnitude divide-by-2-toward-zero in `round_mv_pairwise` (the spec
+  rounding is **not** the same as Rust's arithmetic `>> 1` for
+  negative sums: `(-1) >> 1 == -1` but `Sign(-1) * (Abs(-1) >> 1) ==
+  0`). Trigger gates mirror §8.5.2.2 step 8 exactly:
+  `numCurrMergeCand > 1 && numCurrMergeCand < MaxNumMergeCand` (the
+  source-pair availability + room-left checks). For P-slices the
+  spec's `numRefLists == 1` clause forces `refIdxL1avg = -1` and
+  `predFlagL1avg = 0`, which the implementation enforces by skipping
+  the L1 derivation. Acceptance fixture
+  [`decode_p_slice_pairwise_average_fires_and_decodes`](tests/reconstruct_pipeline.rs)
+  exercises a quad-split 16x16 P-slice where four 8x8 cu_skip CUs
+  read the §8.5.2.11 Col candidate from a non-uniform reference
+  motion field; CU3 (BR @(8,8)) builds a merge list whose pairwise-
+  average lands at slot 5 with chosen MV `(-32, 0)` in 1/16-pel units
+  (`(B1=(-16,0) + A1=(-48,0)) >> 1`), giving an integer-pel `(-2, 0)`
+  translation that the test pins via byte-exact reconstruction of
+  the BR quadrant against `mc_copy_block_int` (and via the post-
+  decode motion-field assertion that CU3's broadcast MvField carries
+  the avgCand MV — distinguishable from the Col / HMVP entries which
+  would have surfaced as `(-64, 0)`). Test count: 492 unit (was 481,
+  +11 covering the §8.5.2.14 signed-magnitude rounding edge cases,
+  the four per-list switch arms, the `>1` and `<Max` gates, and the
+  walk-order integration with both `build_merge_cand_list` /
+  `build_merge_cand_list_b`) + 22 integration (was 21, +1 acceptance).
+
 - **Temporal merge candidate (round-25, §8.5.2.11 / §8.5.2.12)** — the
   Col candidate now lands at §8.5.2.2 step 5 between the spatial walk
   and the §8.5.2.6 HMVP insertion. New
