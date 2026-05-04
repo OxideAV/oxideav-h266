@@ -107,9 +107,22 @@ the **intra-only single-tile single-slice subset** plus the round-28
   a per-picture 4x4 intra-coded grid (read by CIIP, written by every
   leaf CU) so neighbour status is exact across raster scan order.
   Chroma reuses the same `w` and a planar chroma intra prediction
-  per the §8.4.3 PLANAR-luma → PLANAR-chroma mapping. No GPM / AMVR
-  / BCW yet; affine + scaled-reference filter tables 28 / 29 / 30 /
-  31 / 32 / 34 / 35, BDOF + DMVR, PROF land in later rounds.
+  per the §8.4.3 PLANAR-luma → PLANAR-chroma mapping. **Round-29 lands §8.5.6.6.2 BCW (Bi-prediction with CU-level
+  Weights):** the bi-pred composition path now applies eq. 981
+  weighted blending when the chosen merge candidate carries
+  `bcw_idx > 0` and `ciip_flag == 0`. New `MvField::bcw_idx`
+  field carries the per-block `BcwIdx[x][y]` (sampled at 4x4 luma
+  granularity, inherited automatically by spatial merge
+  candidates per eqs. 496 / 501 / 506). Temporal merge / pairwise
+  average / zero-MV pad pin `bcw_idx = 0` per the spec footnotes.
+  The `bcwWLut[k] = {4, 5, 3, 10, -2}` table maps `bcw_idx ∈ 1..=4`
+  to `w1 ∈ {5, 3, 10, -2}` (and `w0 = 8 - w1 ∈ {3, 5, -2, 10}`);
+  `bcw_idx == 0` short-circuits to the eq. 980 default average,
+  matching the spec's "If bcwIdx is equal to 0 OR ciip_flag == 1"
+  gate.
+  No GPM / AMVR yet; affine + scaled-reference filter tables 28 /
+  29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF land in later
+  rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue

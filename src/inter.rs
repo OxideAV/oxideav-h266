@@ -138,6 +138,16 @@ pub struct MvField {
     /// written into it. Default `false` so picture-edge / pre-decode
     /// neighbours register as unavailable.
     pub available: bool,
+    /// `BcwIdx[x][y]` per §8.5.6.6.2 — the bi-prediction with
+    /// CU-level weights index. Range `0..=4`; `0` means "default
+    /// equal-weight bi-pred per eq. 980" and is the spec value for
+    /// every candidate spawned by the temporal merge (§8.5.2.11),
+    /// the pairwise-average path (eq. 483 footnote), and the zero-MV
+    /// pad (§8.5.2.5). Spatial-merge candidates inherit the per-block
+    /// `BcwIdx[xNbN][yNbN]` of the neighbour. The HMVP table also
+    /// carries the index. CTU-level apply selects between eq. 980 and
+    /// eq. 981 based on this slot.
+    pub bcw_idx: u8,
 }
 
 impl MvField {
@@ -154,6 +164,7 @@ impl MvField {
         cu_skip_flag: false,
         mode_inter: false,
         available: false,
+        bcw_idx: 0,
     };
 }
 
@@ -537,6 +548,7 @@ pub fn build_merge_cand_list_b(
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         });
     }
     out
@@ -798,6 +810,7 @@ fn derive_pairwise_average_candidate(
         // later CU samples this CU's slot.
         mode_inter: true,
         available: true,
+        bcw_idx: 0,
     };
     // L0 half — always derived (numRefLists >= 1).
     derive_pairwise_per_list(
@@ -1137,7 +1150,11 @@ pub fn apply_mmvd_to_base_with_poc(
 /// Returns `MotionVector::ZERO` for the degenerate `td == 0` input
 /// (the caller is expected to short-circuit equal-POC cases before
 /// invoking this helper, but the guard keeps the function total).
-fn mmvd_scale_offset(offset: MotionVector, curr_poc_diff_l0: i32, curr_poc_diff_l1: i32) -> MotionVector {
+fn mmvd_scale_offset(
+    offset: MotionVector,
+    curr_poc_diff_l0: i32,
+    curr_poc_diff_l1: i32,
+) -> MotionVector {
     let td = curr_poc_diff_l0.clamp(-128, 127);
     let tb = curr_poc_diff_l1.clamp(-128, 127);
     if td == 0 {
@@ -1472,6 +1489,7 @@ fn fetch_collocated_mv(
         cu_skip_flag: false,
         mode_inter: true,
         available: true,
+        bcw_idx: 0,
     })
 }
 
@@ -2056,6 +2074,203 @@ pub fn predict_chroma_block_bipred(
             let v1 = tmp_l1.samples[off_src] as u32;
             let avg = ((v0 + v1 + 1) >> 1) as u8;
             dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
+        }
+    }
+    Ok(())
+}
+
+// =====================================================================
+// §8.5.6.6.2 — BCW (Bi-prediction with CU-level Weights) eq. 981
+// =====================================================================
+//
+// When a bi-pred CU carries `bcw_idx > 0` and CIIP is off, the spec's
+// eq. 981 replaces the eq. 980 default-weighted average with an
+// explicit weighted blend:
+//
+//   w1 = bcwWLut[bcw_idx]   with bcwWLut = { 4, 5, 3, 10, -2 }
+//   w0 = 8 - w1
+//   pbSamples = Clip1((w0*predL0 + w1*predL1 + offset3) >> (shift1 + 3))
+//
+// At BitDepth 8 the spec sets shift1 = max(2, 14-8) = 6 and
+// offset3 = 1 << (shift1 + 2) = 1 << 8 = 256. The two source predL0 /
+// predL1 we hold are already pre-clamped 8-bit values (the round-22
+// uni-pred clamp at eq. 978 / 979); the BCW path then does
+//
+//   ((4 - sign(w1)*…) * v0 * 64 + w1 * v1 * 64 + 256) >> 9
+//
+// once we factor in the implicit `<< 6` to lift each clamped sample
+// back into the spec's 14-bit precision domain. That is equivalent
+// (and byte-exact) to the simpler form
+//
+//   pbSamples = Clip1((w0 * v0 + w1 * v1 + 4) >> 3)
+//
+// which is what we implement here — the two forms differ only by the
+// constant factor 64 cancelling between numerator and denominator.
+
+/// Spec table — `bcwWLut[k]` for `k ∈ 0..=4`. The default index 0 is
+/// equivalent to the eq. 980 shortcut and is never read through this
+/// table at the call site (the BCW dispatch in
+/// [`bi_pred_avg_8bit_bcw`] short-circuits to the simple average when
+/// `bcw_idx == 0`); it is included here for completeness.
+pub const BCW_W_LUT: [i32; 5] = [4, 5, 3, 10, -2];
+
+/// Default-weighted bi-pred composite at BitDepth 8 with optional BCW
+/// (§8.5.6.6.2). `bcw_idx == 0` falls through to eq. 980 (rounding
+/// average); `bcw_idx ∈ 1..=4` applies eq. 981 with weights from
+/// [`BCW_W_LUT`]. CIIP CUs MUST pass `bcw_idx == 0` per the spec
+/// "If bcwIdx is equal to 0 OR ciip_flag == 1" gate.
+pub fn bi_pred_avg_8bit_bcw(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    pred_l0: &PicturePlane,
+    pred_l1: &PicturePlane,
+    bcw_idx: u8,
+) -> Result<()> {
+    if bcw_idx == 0 {
+        return bi_pred_avg_8bit(dst, dst_x, dst_y, w, h, pred_l0, pred_l1);
+    }
+    let idx = bcw_idx as usize;
+    if idx >= BCW_W_LUT.len() {
+        return Err(Error::invalid(format!(
+            "h266 bipred BCW: bcw_idx {idx} out of range (0..=4)"
+        )));
+    }
+    if dst_x as usize + w as usize > dst.width || dst_y as usize + h as usize > dst.height {
+        return Err(Error::invalid(format!(
+            "h266 bipred BCW: destination block ({dst_x},{dst_y}) {w}x{h} out of plane bounds {}x{}",
+            dst.width, dst.height
+        )));
+    }
+    if pred_l0.width < w as usize
+        || pred_l0.height < h as usize
+        || pred_l1.width < w as usize
+        || pred_l1.height < h as usize
+    {
+        return Err(Error::invalid(format!(
+            "h266 bipred BCW: pred_l0 {}x{} / pred_l1 {}x{} smaller than block {w}x{h}",
+            pred_l0.width, pred_l0.height, pred_l1.width, pred_l1.height,
+        )));
+    }
+    let w1 = BCW_W_LUT[idx];
+    let w0 = 8 - w1;
+    for r in 0..h as usize {
+        for c in 0..w as usize {
+            let v0 = pred_l0.samples[r * pred_l0.stride + c] as i32;
+            let v1 = pred_l1.samples[r * pred_l1.stride + c] as i32;
+            // pbSamples = Clip1((w0*v0 + w1*v1 + 4) >> 3)
+            let blended = (w0 * v0 + w1 * v1 + 4) >> 3;
+            let clamped = blended.clamp(0, 255) as u8;
+            dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = clamped;
+        }
+    }
+    Ok(())
+}
+
+/// BCW-aware luma bi-pred MC. Drop-in replacement for
+/// [`predict_luma_block_bipred`] that selects between eq. 980 (when
+/// `bcw_idx == 0`) and eq. 981 weighted blending (when `bcw_idx > 0`).
+pub fn predict_luma_block_bipred_bcw(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src_l0: &PicturePlane,
+    mv_l0: MotionVector,
+    src_l1: &PicturePlane,
+    mv_l1: MotionVector,
+    bcw_idx: u8,
+) -> Result<()> {
+    let scratch_w = (dst_x + w) as usize;
+    let scratch_h = (dst_y + h) as usize;
+    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    predict_luma_block(&mut tmp_l0, dst_x, dst_y, w, h, src_l0, mv_l0)?;
+    predict_luma_block(&mut tmp_l1, dst_x, dst_y, w, h, src_l1, mv_l1)?;
+    if bcw_idx == 0 {
+        // Fast eq. 980 path matches predict_luma_block_bipred byte-for-
+        // byte; preserved separately to avoid the extra inner clamp.
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
+                let v0 = tmp_l0.samples[off_src] as u32;
+                let v1 = tmp_l1.samples[off_src] as u32;
+                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
+            }
+        }
+        return Ok(());
+    }
+    let idx = bcw_idx as usize;
+    if idx >= BCW_W_LUT.len() {
+        return Err(Error::invalid(format!(
+            "h266 luma bipred BCW: bcw_idx {idx} out of range (0..=4)"
+        )));
+    }
+    let w1 = BCW_W_LUT[idx];
+    let w0 = 8 - w1;
+    for r in 0..h as usize {
+        for c in 0..w as usize {
+            let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
+            let v0 = tmp_l0.samples[off_src] as i32;
+            let v1 = tmp_l1.samples[off_src] as i32;
+            let blended = ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, 255) as u8;
+            dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = blended;
+        }
+    }
+    Ok(())
+}
+
+/// BCW-aware chroma bi-pred MC. Mirrors
+/// [`predict_luma_block_bipred_bcw`] for the chroma plane at 4:2:0.
+pub fn predict_chroma_block_bipred_bcw(
+    dst: &mut PicturePlane,
+    dst_x_c: u32,
+    dst_y_c: u32,
+    w_c: u32,
+    h_c: u32,
+    src_l0: &PicturePlane,
+    mv_l0: MotionVector,
+    src_l1: &PicturePlane,
+    mv_l1: MotionVector,
+    bcw_idx: u8,
+) -> Result<()> {
+    let scratch_w = (dst_x_c + w_c) as usize;
+    let scratch_h = (dst_y_c + h_c) as usize;
+    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
+    predict_chroma_block(&mut tmp_l0, dst_x_c, dst_y_c, w_c, h_c, src_l0, mv_l0)?;
+    predict_chroma_block(&mut tmp_l1, dst_x_c, dst_y_c, w_c, h_c, src_l1, mv_l1)?;
+    if bcw_idx == 0 {
+        for r in 0..h_c as usize {
+            for c in 0..w_c as usize {
+                let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
+                let v0 = tmp_l0.samples[off_src] as u32;
+                let v1 = tmp_l1.samples[off_src] as u32;
+                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
+            }
+        }
+        return Ok(());
+    }
+    let idx = bcw_idx as usize;
+    if idx >= BCW_W_LUT.len() {
+        return Err(Error::invalid(format!(
+            "h266 chroma bipred BCW: bcw_idx {idx} out of range (0..=4)"
+        )));
+    }
+    let w1 = BCW_W_LUT[idx];
+    let w0 = 8 - w1;
+    for r in 0..h_c as usize {
+        for c in 0..w_c as usize {
+            let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
+            let v0 = tmp_l0.samples[off_src] as i32;
+            let v1 = tmp_l1.samples[off_src] as i32;
+            let blended = ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, 255) as u8;
+            dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = blended;
         }
     }
     Ok(())
@@ -2857,6 +3072,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         }
     }
 
@@ -3130,6 +3346,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         hmvp.update_with(bi_entry);
         let list = build_merge_cand_list_b(&empty_spatials, 4, None, Some(&hmvp));
@@ -3208,6 +3425,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         mf.write_block(0, 0, pic_w, pic_h, cell);
         ReferencePicture {
@@ -3440,6 +3658,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let list = build_merge_cand_list(&empty, 4, Some(col), None);
         assert_eq!(list.len(), 4);
@@ -3472,6 +3691,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(3, 0, 0));
@@ -3552,6 +3772,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let mut list = vec![p0, p1];
         let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ false).unwrap();
@@ -3575,6 +3796,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let p1 = dummy_mvf(-5, 6, 2);
         let mut list = vec![p0, p1];
@@ -3599,6 +3821,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let mut list = vec![inactive, inactive];
         // is_b=true so the L1 walk also runs (and mirrors the L0 result).
@@ -3626,6 +3849,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let p1 = MvField {
             mv_l0: MotionVector::from_int_pel(4, 0),
@@ -3638,6 +3862,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let mut list = vec![p0, p1];
         let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ true).unwrap();
@@ -3717,6 +3942,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let mut spatials = [SpatialMergeCandidate::default(); 5];
         spatials[0] = SpatialMergeCandidate {
@@ -3850,6 +4076,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (+16, 0) 1/16
         let out = apply_mmvd_to_base(&base, off, false);
@@ -3875,6 +4102,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(0, 0, false); // (+1/4, 0)
         let out = apply_mmvd_to_base(&base, off, true);
@@ -3911,10 +4139,11 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
-        // currPocDiffL0 = +1, currPocDiffL1 = +1 — equal distance
-        // (eqs. 557 – 560).
+                                                   // currPocDiffL0 = +1, currPocDiffL1 = +1 — equal distance
+                                                   // (eqs. 557 – 560).
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 1, false, false);
         assert_eq!(out.mv_l0, MotionVector::from_int_pel(3, 0));
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(-1, 0));
@@ -3935,10 +4164,11 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
-        // currPocDiffL0 = +1 (L0 ref earlier), currPocDiffL1 = -1 (L1
-        // ref later) → opposite-sign branch.
+                                                   // currPocDiffL0 = +1 (L0 ref earlier), currPocDiffL1 = -1 (L1
+                                                   // ref later) → opposite-sign branch.
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, -1, false, false);
         assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(-1, 0));
@@ -3966,6 +4196,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (16, 0)
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, false, false);
@@ -3988,10 +4219,11 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
-        // Distances that would normally scale (1 vs 2), but `lt_l0 =
-        // true` flips us back to the LT shortcut.
+                                                   // Distances that would normally scale (1 vs 2), but `lt_l0 =
+                                                   // true` flips us back to the LT shortcut.
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, true, false);
         assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(1, 0));
@@ -4011,6 +4243,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false);
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 0, false, false);
@@ -4033,6 +4266,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0)
         let out = apply_mmvd_to_base_with_poc(&base, off, 0, 1, false, false);
@@ -4058,6 +4292,7 @@ mod tests {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false);
         // currPocDiffL0 = 0, currPocDiffL1 = 1 — hits equal-POC short
@@ -4076,6 +4311,168 @@ mod tests {
     fn merge_data_default_disables_ciip() {
         let md = MergeData::default();
         assert!(!md.ciip_flag);
+    }
+
+    // ---- §8.5.6.6.2 BCW (eq. 981) ------------------------------------
+
+    /// `MvField::default()` has bcw_idx == 0, so existing non-BCW
+    /// callers stay byte-identical (eq. 980 default-weighted average).
+    #[test]
+    fn mvfield_default_has_bcw_idx_zero() {
+        let f = MvField::default();
+        assert_eq!(f.bcw_idx, 0);
+    }
+
+    /// BCW table value sanity — `bcwWLut[k] = {4, 5, 3, 10, -2}` per
+    /// the spec (the round-29 brief).
+    #[test]
+    fn bcw_w_lut_matches_spec() {
+        assert_eq!(BCW_W_LUT, [4, 5, 3, 10, -2]);
+    }
+
+    /// `bi_pred_avg_8bit_bcw` with `bcw_idx == 0` reduces to eq. 980 —
+    /// byte-identical to `bi_pred_avg_8bit` over a constant pair.
+    #[test]
+    fn bcw_idx_zero_falls_through_to_eq_980() {
+        let p0 = PicturePlane::filled(4, 4, 100);
+        let p1 = PicturePlane::filled(4, 4, 200);
+        let mut dst_a = PicturePlane::filled(4, 4, 0);
+        let mut dst_b = PicturePlane::filled(4, 4, 0);
+        bi_pred_avg_8bit(&mut dst_a, 0, 0, 4, 4, &p0, &p1).unwrap();
+        bi_pred_avg_8bit_bcw(&mut dst_b, 0, 0, 4, 4, &p0, &p1, 0).unwrap();
+        assert_eq!(dst_a.samples, dst_b.samples);
+        // Sanity: (100 + 200 + 1) >> 1 = 150
+        assert!(dst_a.samples.iter().all(|&v| v == 150));
+    }
+
+    /// BCW eq. 981 spot-check — bcw_idx = 1 (w1 = 5, w0 = 3) over
+    /// (v0, v1) = (100, 200): (3*100 + 5*200 + 4) >> 3 = 1304 >> 3 = 163.
+    #[test]
+    fn bcw_idx_1_blends_with_w1_5_w0_3() {
+        let p0 = PicturePlane::filled(2, 2, 100);
+        let p1 = PicturePlane::filled(2, 2, 200);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 1).unwrap();
+        assert!(
+            dst.samples.iter().all(|&v| v == 163),
+            "got {:?}",
+            dst.samples
+        );
+    }
+
+    /// BCW eq. 981 spot-check — bcw_idx = 2 (w1 = 3, w0 = 5) over
+    /// (v0, v1) = (100, 200): (5*100 + 3*200 + 4) >> 3 = 1104 >> 3 = 138.
+    #[test]
+    fn bcw_idx_2_blends_with_w1_3_w0_5() {
+        let p0 = PicturePlane::filled(2, 2, 100);
+        let p1 = PicturePlane::filled(2, 2, 200);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 2).unwrap();
+        assert!(
+            dst.samples.iter().all(|&v| v == 138),
+            "got {:?}",
+            dst.samples
+        );
+    }
+
+    /// BCW eq. 981 spot-check — bcw_idx = 3 (w1 = 10, w0 = -2) over
+    /// (v0, v1) = (100, 200): (-2*100 + 10*200 + 4) >> 3 = 1804 >> 3 = 225.
+    /// Exercises the negative-weight branch.
+    #[test]
+    fn bcw_idx_3_blends_with_w1_10_w0_neg2() {
+        let p0 = PicturePlane::filled(2, 2, 100);
+        let p1 = PicturePlane::filled(2, 2, 200);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 3).unwrap();
+        assert!(
+            dst.samples.iter().all(|&v| v == 225),
+            "got {:?}",
+            dst.samples
+        );
+    }
+
+    /// BCW eq. 981 spot-check — bcw_idx = 4 (w1 = -2, w0 = 10) over
+    /// (v0, v1) = (100, 200): (10*100 + -2*200 + 4) >> 3 = 604 >> 3 = 75.
+    /// The other negative-weight branch.
+    #[test]
+    fn bcw_idx_4_blends_with_w1_neg2_w0_10() {
+        let p0 = PicturePlane::filled(2, 2, 100);
+        let p1 = PicturePlane::filled(2, 2, 200);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 4).unwrap();
+        assert!(
+            dst.samples.iter().all(|&v| v == 75),
+            "got {:?}",
+            dst.samples
+        );
+    }
+
+    /// BCW eq. 981 must Clip1 — at the extreme `(255, 255)` with
+    /// `bcw_idx = 3` (w0 = -2, w1 = 10): (-2*255 + 10*255 + 4) >> 3 =
+    /// 2044 >> 3 = 255. Verifies that the upper boundary stays in range.
+    #[test]
+    fn bcw_clamps_to_255_at_extreme() {
+        let p0 = PicturePlane::filled(2, 2, 255);
+        let p1 = PicturePlane::filled(2, 2, 255);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 3).unwrap();
+        assert!(dst.samples.iter().all(|&v| v == 255));
+    }
+
+    /// BCW eq. 981 must Clip1 — at `(255, 0)` with `bcw_idx = 4`
+    /// (w0 = 10, w1 = -2): (10*255 + -2*0 + 4) >> 3 = 2554 >> 3 = 319,
+    /// which clamps down to 255.
+    #[test]
+    fn bcw_clamps_to_255_when_blend_overshoots() {
+        let p0 = PicturePlane::filled(2, 2, 255);
+        let p1 = PicturePlane::filled(2, 2, 0);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 4).unwrap();
+        assert!(dst.samples.iter().all(|&v| v == 255));
+    }
+
+    /// BCW eq. 981 must Clip1 to 0 — at `(0, 255)` with `bcw_idx = 4`
+    /// (w0 = 10, w1 = -2): (10*0 + -2*255 + 4) >> 3 = -506 >> 3 = -64
+    /// (Rust arith shift), which clamps up to 0.
+    #[test]
+    fn bcw_clamps_to_zero_when_blend_undershoots() {
+        let p0 = PicturePlane::filled(2, 2, 0);
+        let p1 = PicturePlane::filled(2, 2, 255);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 4).unwrap();
+        assert!(dst.samples.iter().all(|&v| v == 0));
+    }
+
+    /// `bi_pred_avg_8bit_bcw` rejects out-of-range `bcw_idx`.
+    #[test]
+    fn bcw_rejects_out_of_range_idx() {
+        let p0 = PicturePlane::filled(2, 2, 100);
+        let p1 = PicturePlane::filled(2, 2, 200);
+        let mut dst = PicturePlane::filled(2, 2, 0);
+        let err = bi_pred_avg_8bit_bcw(&mut dst, 0, 0, 2, 2, &p0, &p1, 5).unwrap_err();
+        assert!(format!("{err:?}").contains("bcw_idx"));
+    }
+
+    /// BCW with bcw_idx = 0 over distinct planes via the luma MC
+    /// helper produces byte-identical output to `predict_luma_block_bipred`.
+    #[test]
+    fn bcw_idx_zero_luma_path_matches_legacy_bipred() {
+        let mut src_l0 = PicturePlane::filled(16, 16, 0);
+        let mut src_l1 = PicturePlane::filled(16, 16, 0);
+        for r in 0..16usize {
+            for c in 0..16usize {
+                src_l0.samples[r * 16 + c] = ((r * 17 + c) & 0xff) as u8;
+                src_l1.samples[r * 16 + c] = (255u8).wrapping_sub((r * 7 + c) as u8);
+            }
+        }
+        let mv_l0 = MotionVector::from_int_pel(0, 0);
+        let mv_l1 = MotionVector::from_int_pel(0, 0);
+        let mut dst_a = PicturePlane::filled(8, 8, 0);
+        let mut dst_b = PicturePlane::filled(8, 8, 0);
+        predict_luma_block_bipred(&mut dst_a, 0, 0, 8, 8, &src_l0, mv_l0, &src_l1, mv_l1).unwrap();
+        predict_luma_block_bipred_bcw(&mut dst_b, 0, 0, 8, 8, &src_l0, mv_l0, &src_l1, mv_l1, 0)
+            .unwrap();
+        assert_eq!(dst_a.samples, dst_b.samples);
     }
 
     /// §8.5.6.7 weight ladder — both neighbours intra → w = 3.

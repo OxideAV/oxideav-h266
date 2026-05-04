@@ -6,6 +6,37 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **BCW — Bi-prediction with CU-level Weights (§8.5.6.6.2 eq. 981)** —
+  the bi-pred MC path now applies explicit weighted blending when the
+  chosen merge candidate carries `bcw_idx > 0` and CIIP is off. New
+  [`MvField::bcw_idx`](src/inter.rs) field carries the per-block
+  `BcwIdx[x][y]` (the spec's `BcwIdx[xCb][yCb]` array, sampled at
+  4x4 luma granularity), inherited automatically by spatial merge
+  candidates via the existing motion-field broadcast (eqs. 496 / 501
+  / 506). The temporal merge / pairwise-average / zero-MV pad / Col
+  candidates pin `bcw_idx = 0` per the spec footnotes (eq. 478, eq.
+  483 footnote, §8.5.2.5). New
+  [`BCW_W_LUT`](src/inter.rs) ships the spec's
+  `bcwWLut[k] = {4, 5, 3, 10, -2}` table; new
+  [`bi_pred_avg_8bit_bcw`](src/inter.rs) /
+  [`predict_luma_block_bipred_bcw`](src/inter.rs) /
+  [`predict_chroma_block_bipred_bcw`](src/inter.rs) implement the
+  `pbSamples = Clip1((w0*v0 + w1*v1 + 4) >> 3)` form of eq. 981 (the
+  factor-of-64 cancellation of the spec's `(w0*v0*64 + w1*v1*64 +
+  256) >> 9` is byte-exact for already-clamped 8-bit predL0 / predL1
+  inputs). The CTU walker bi-pred apply path now selects between
+  eq. 980 (`bcw_idx == 0` OR `ciip_flag == 1`) and eq. 981 per spec
+  gating. The legacy `predict_luma_block_bipred` /
+  `predict_chroma_block_bipred` are retained as the `bcw_idx == 0`
+  fast-path inside the new BCW helpers. Test count: 530 unit (was
+  518, +12 covering the bcw_idx ladder spot-checks at indices 0..=4
+  with eq. 981 spec values, the negative-weight `(w0 = -2, w1 = 10)`
+  and `(w0 = 10, w1 = -2)` branches, the `Clip1` upper-bound clamp at
+  255, the lower-bound clamp at 0 on the negative-blend branch, the
+  out-of-range bcw_idx error, the byte-equivalence pin against
+  `predict_luma_block_bipred` for the `bcw_idx == 0` path, the
+  default-MvField bcw_idx invariant, and the `BCW_W_LUT` value pin).
+
 - **MMVD asymmetric POC bi-pred (§8.5.2.7 eqs. 561 – 580)** — extends
   the round-27 MMVD apply pass with the full §8.5.2.7 bi-pred branch
   ladder. Round-27 only handled the equal-POC-distance shortcut

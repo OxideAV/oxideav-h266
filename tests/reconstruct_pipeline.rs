@@ -1365,6 +1365,7 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
         cu_skip_flag: true,
         mode_inter: true,
         available: true,
+        bcw_idx: 0,
     };
     mf.write_block(0, 0, pic_w, pic_h, cell);
 
@@ -1595,6 +1596,7 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
+            bcw_idx: 0,
         }
     };
     // TL (0..8, 0..8): mv (0, 0) — unused by any CU's Col fetch.

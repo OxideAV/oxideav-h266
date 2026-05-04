@@ -76,8 +76,8 @@ use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
     apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
-    predict_chroma_block, predict_chroma_block_bipred, predict_luma_block,
-    predict_luma_block_bipred, HmvpTable, MotionField, MotionVector, MvField, ReferencePicture,
+    predict_chroma_block, predict_chroma_block_bipred_bcw, predict_luma_block,
+    predict_luma_block_bipred_bcw, HmvpTable, MotionField, MotionVector, MvField, ReferencePicture,
     TemporalMergeInputs,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
@@ -988,6 +988,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cu_skip_flag: false,
                 mode_inter: true,
                 available: true,
+                // §8.5.2.2 step 2 — bcwIdxCol = 0 for the merge-mode
+                // temporal candidate, regardless of the L0 / L1 fuse.
+                bcw_idx: 0,
             }),
             (Some(l0), None) => Some(l0),
             (None, Some(l1)) => Some(MvField {
@@ -1000,6 +1003,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cu_skip_flag: false,
                 mode_inter: true,
                 available: true,
+                bcw_idx: 0,
             }),
             (None, None) => None,
         }
@@ -1870,9 +1874,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 )?;
             }
             (Some(rp0), Some(rp1)) => {
-                // Round-23 bi-pred: §8.5.6.6.2 eq. 980 default-weighted
-                // average of the two list predictions.
-                predict_luma_block_bipred(
+                // Bi-pred: §8.5.6.6.2 — default-weighted (eq. 980)
+                // when bcw_idx == 0 OR ciip_flag == 1; explicit BCW
+                // (eq. 981) with weights from BCW_W_LUT otherwise.
+                let bcw_for_blend = if ciip_active { 0 } else { chosen.bcw_idx };
+                predict_luma_block_bipred_bcw(
                     &mut out.luma,
                     cu.cu.x,
                     cu.cu.y,
@@ -1882,6 +1888,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     chosen.mv_l0,
                     &rp1.frame.luma,
                     chosen.mv_l1,
+                    bcw_for_blend,
                 )?;
             }
             (None, None) => unreachable!(), // guarded above
@@ -1998,7 +2005,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     )?;
                 }
                 (Some(rp0), Some(rp1)) => {
-                    predict_chroma_block_bipred(
+                    // BCW chroma — same gating as luma above.
+                    let bcw_for_blend = if ciip_active { 0 } else { chosen.bcw_idx };
+                    predict_chroma_block_bipred_bcw(
                         &mut out.cb,
                         cb_x_c,
                         cb_y_c,
@@ -2008,8 +2017,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         chosen.mv_l0,
                         &rp1.frame.cb,
                         chosen.mv_l1,
+                        bcw_for_blend,
                     )?;
-                    predict_chroma_block_bipred(
+                    predict_chroma_block_bipred_bcw(
                         &mut out.cr,
                         cb_x_c,
                         cb_y_c,
@@ -2019,6 +2029,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         chosen.mv_l0,
                         &rp1.frame.cr,
                         chosen.mv_l1,
+                        bcw_for_blend,
                     )?;
                 }
                 (None, None) => unreachable!(),
@@ -2077,6 +2088,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu_skip_flag: info.inter.cu_skip_flag,
             mode_inter: true,
             available: true,
+            // §8.5.6.6.2 — propagate the chosen candidate's BcwIdx
+            // onto every covered 4x4 block so subsequent spatial
+            // neighbours inherit it per eqs. 496 / 501 / 506 / etc.
+            bcw_idx: chosen.bcw_idx,
         };
         self.motion_field
             .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, mvf);
