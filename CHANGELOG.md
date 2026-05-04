@@ -6,6 +6,38 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **§8.5.6.3 high-precision intermediate surfaced for BDOF — round 32.**
+  New [`crate::inter::predict_luma_block_high_precision`] is a
+  drop-in parallel of [`crate::inter::predict_luma_block`] that
+  returns the spec's `BitDepth + 6` precision i32 intermediate per
+  the §8.5.6.3.2 separable filter (the value the §8.5.6.6.x
+  composition stages take as input, *before* the per-list clip and
+  right-shift). Output buffer is row-major `w × h` `Vec<i32>`. The
+  `bit_depth` parameter selects the right shift1 — `Min(4, BD - 8)`
+  — so the function works at every supported bit depth (the
+  existing 8-bit path was hard-coded to BD = 8). Companion
+  [`crate::bdof::build_extended_pred_high_precision`] lifts the
+  intermediate into the spec's `(nCbW + 2) × (nCbH + 2)` extended
+  layout via pure 1-sample edge replication (no scaling — the input
+  already lives in BD + 6 precision). The BDOF dispatch site in
+  `reconstruct_leaf_cu_inter` now flows the per-list MC through the
+  HP pipeline, making §8.5.6.5 spec-byte-identical at every bit
+  depth: BD = 8 keeps a 14-bit gradient pipeline, BD = 10 a 16-bit
+  pipeline, BD = 12 an 18-bit pipeline. The round-30 8-bit lifter
+  (`build_extended_pred_8bit`) is now `#[deprecated]` and retained
+  only for back-compat with pre-round-32 callers; new code should
+  use the HP path. New tests exercise (a) integer-pel HP / 8-bit-
+  lifter parity (the integer lift `<< (14 - BD)` coincides with the
+  8-bit `<< SHIFT1`, so both extended buffers are bit-identical),
+  (b) subpel HP / 8-bit-lifter agreement within ≤ 1 LSB at BD = 8
+  (the 8-bit lifter discards the sub-LSB precision the HP path
+  keeps), (c) precision scaling for BD = 8 / 10 / 12 (`<< 6` /
+  `<< 4` / `<< 2` integer-pel lift), (d) HP-path identical-
+  predictors no-op (round-30 invariant preserved through the new
+  pipeline), and (e) HP buffer length validation. The existing
+  integration test
+  `decode_b_slice_bdof_refinement_differs_from_bipred_average`
+  continues to pass on the HP pipeline.
 - **BDOF wiring into leaf-CU bipred dispatch — §8.5.5.1 / §8.5.6.5
   (round 31)** — the round-30 [`bdof`](src/bdof.rs) module is now
   reachable from [`crate::ctu::CtuWalker`]. The leaf-CU bipred branch

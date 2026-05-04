@@ -35,15 +35,18 @@
 //!    whether BDOF runs for the current CU. The picture-header /
 //!    SPS-flag inputs are forwarded by the leaf-CU walker; this
 //!    helper mirrors the spec bullet list one-to-one.
-//! 3. [`build_extended_pred_8bit`] — convenience helper that lifts a
-//!    pre-clamped 8-bit per-list prediction (the existing
-//!    [`crate::inter::predict_luma_block`] output sized `nCbW × nCbH`)
-//!    into the spec's `(nCbW + 2) × (nCbH + 2)` extended layout by
-//!    1-sample edge replication and shift-1-equivalent left-shift to
-//!    the high-precision domain. This lets callers exercise BDOF on
-//!    the 8-bit pipeline today; once the §8.5.6.3 separable filter is
-//!    refactored to surface its high-precision intermediate, the
-//!    helper becomes optional.
+//! 3. [`build_extended_pred_high_precision`] — round-32 helper that
+//!    takes the §8.5.6.3 high-precision intermediate produced by
+//!    [`crate::inter::predict_luma_block_high_precision`] and lifts
+//!    it into the spec's `(nCbW + 2) × (nCbH + 2)` extended layout via
+//!    pure 1-sample edge replication. This is the spec-byte-identical
+//!    BDOF input pipeline at every supported bit depth.
+//! 4. [`build_extended_pred_8bit`] — *deprecated* round-30 best-effort
+//!    bridge that lifts an 8-bit per-list prediction by `<< 6`. Loses
+//!    the spec's `BitDepth + 6` precision (gradients are computed at
+//!    8-bit instead of 14-bit at BD = 8) and is retained only for
+//!    pre-round-32 callers; new code should use the high-precision
+//!    path.
 //!
 //! ## Spec reference
 //!
@@ -153,9 +156,11 @@ pub fn bdof_used_flag(
 /// `s ∈ [0, 255]` maps to `s << 6 ∈ [0, 16320]`. With this scaling
 /// `shift1 = 6` (eqs. 962–965) recovers the original sample, so
 /// gradients/diff are computed at 8-bit precision instead of the
-/// spec's 14-bit precision. This is a best-effort 8-bit bridge until
-/// the separable filter is refactored to surface its high-precision
-/// intermediates (round-31 work — left as a doc gap).
+/// spec's 14-bit precision. This is a best-effort 8-bit bridge — for
+/// spec-byte-identical BDOF prefer the round-32
+/// [`crate::inter::predict_luma_block_high_precision`] +
+/// [`build_extended_pred_high_precision`] pair, which keeps the full
+/// `BitDepth + 6` precision intermediate produced by §8.5.6.3.
 ///
 /// One-sample border replication uses edge clamping
 /// (`Clip3(0, w-1, x)`, `Clip3(0, h-1, y)`); this matches the spec's
@@ -164,6 +169,15 @@ pub fn bdof_used_flag(
 /// `0..=nCbH+1`.
 ///
 /// The returned vector is row-major of length `(nCbW + 2) * (nCbH + 2)`.
+#[deprecated(
+    since = "0.1.0",
+    note = "Round-32 surfaced the §8.5.6.3 BD+6 intermediate via \
+            `predict_luma_block_high_precision` — pair it with \
+            `build_extended_pred_high_precision` for spec-byte-identical \
+            BDOF at all bit depths. The 8-bit lifter loses 6 bits of \
+            precision and is only retained for back-compat with \
+            pre-round-32 callers."
+)]
 pub fn build_extended_pred_8bit(pred: &PicturePlane, n_cb_w: u32, n_cb_h: u32) -> Result<Vec<i32>> {
     if pred.width < n_cb_w as usize || pred.height < n_cb_h as usize {
         return Err(Error::invalid(format!(
@@ -179,6 +193,51 @@ pub fn build_extended_pred_8bit(pred: &PicturePlane, n_cb_w: u32, n_cb_h: u32) -
         for x in 0..ext_w {
             let src_x = (x as i32 - 1).clamp(0, n_cb_w as i32 - 1) as usize;
             out[y * ext_w + x] = (pred.samples[src_y * pred.stride + src_x] as i32) << SHIFT1;
+        }
+    }
+    Ok(out)
+}
+
+/// Lift a §8.5.6.3 high-precision per-list prediction (the
+/// `BitDepth + 6` precision i32 intermediate produced by
+/// [`crate::inter::predict_luma_block_high_precision`]) into the
+/// spec's `(nCbW + 2) × (nCbH + 2)` extended-prediction layout via
+/// 1-sample edge replication.
+///
+/// Unlike [`build_extended_pred_8bit`] this performs *no* scaling —
+/// the input `pred` already lives in the BD + 6 precision domain
+/// §8.5.6.5 expects, so its values pass through unchanged. The
+/// resulting buffer makes [`bdof_refine_into`] spec-byte-identical to
+/// the §8.5.6.5 pseudocode at every supported bit depth.
+///
+/// `pred` is row-major `nCbW × nCbH` (stride = nCbW). Edge replication
+/// matches the spec's `hx = Clip3(1, nCbW, x)` / `vy = Clip3(1, nCbH,
+/// y)` clip applied to the extended array indexed `0..=nCbW+1` /
+/// `0..=nCbH+1`.
+pub fn build_extended_pred_high_precision(
+    pred: &[i32],
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Result<Vec<i32>> {
+    let n_cb_w_us = n_cb_w as usize;
+    let n_cb_h_us = n_cb_h as usize;
+    if pred.len() != n_cb_w_us * n_cb_h_us {
+        return Err(Error::invalid(format!(
+            "bdof: HP pred buffer length {} != nCbW×nCbH = {}×{} = {}",
+            pred.len(),
+            n_cb_w,
+            n_cb_h,
+            n_cb_w_us * n_cb_h_us,
+        )));
+    }
+    let ext_w = n_cb_w_us + 2;
+    let ext_h = n_cb_h_us + 2;
+    let mut out = vec![0i32; ext_w * ext_h];
+    for y in 0..ext_h {
+        let src_y = (y as i32 - 1).clamp(0, n_cb_h as i32 - 1) as usize;
+        for x in 0..ext_w {
+            let src_x = (x as i32 - 1).clamp(0, n_cb_w as i32 - 1) as usize;
+            out[y * ext_w + x] = pred[src_y * n_cb_w_us + src_x];
         }
     }
     Ok(out)
@@ -395,6 +454,7 @@ pub fn bdof_refine_into(
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests intentionally exercise both lifters
 mod tests {
     use super::*;
 
@@ -635,5 +695,269 @@ mod tests {
         assert_eq!(ext[1 * 6 + 1], 10 << SHIFT1);
         // Right edge replication — extended[(5, 2)] = src(3, 1) << 6.
         assert_eq!(ext[2 * 6 + 5], (10 + 3 + 4) << SHIFT1);
+    }
+
+    /// `build_extended_pred_high_precision` replicates edges without
+    /// any scaling — the input is already in `BitDepth + 6` precision.
+    #[test]
+    fn build_extended_high_precision_replicates_edges_no_scale() {
+        // Values lifted by `<< 6` to live in BD = 8 high-precision
+        // domain, matching what `predict_luma_block_high_precision`
+        // would emit on a constant-input integer-pel MC.
+        let mut pred = vec![0i32; 4 * 4];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                pred[y * 4 + x] = ((10 + x + y * 4) as i32) << 6;
+            }
+        }
+        let ext = build_extended_pred_high_precision(&pred, 4, 4).unwrap();
+        assert_eq!(ext.len(), 6 * 6);
+        // Top-left corner = pred(0, 0).
+        assert_eq!(ext[0], 10 << 6);
+        // Top-right corner = pred(3, 0).
+        assert_eq!(ext[5], 13 << 6);
+        // Bottom-left corner = pred(0, 3).
+        assert_eq!(ext[5 * 6], (10 + 12) << 6);
+        // Bottom-right corner = pred(3, 3).
+        assert_eq!(ext[5 * 6 + 5], (10 + 3 + 12) << 6);
+        // Centre — extended[(1, 1)] = pred(0, 0).
+        assert_eq!(ext[1 * 6 + 1], 10 << 6);
+        // Right edge replication — extended[(5, 2)] = pred(3, 1).
+        assert_eq!(ext[2 * 6 + 5], (10 + 3 + 4) << 6);
+    }
+
+    /// `build_extended_pred_high_precision` rejects mismatched buffer
+    /// lengths — a `(nCbW × nCbH)` input is required.
+    #[test]
+    fn build_extended_high_precision_rejects_bad_size() {
+        let bad = vec![0i32; 4 * 4];
+        assert!(build_extended_pred_high_precision(&bad, 8, 8).is_err());
+    }
+
+    /// **Round-32 spec parity check** — feed the same per-list MC
+    /// outputs through both extended-prediction lifters and confirm:
+    ///   (a) at the BD = 8 14-bit precision intermediate, the HP and
+    ///       8-bit-lifter paths produce values that differ only by
+    ///       the H+V filter rounding (the 8-bit path discards the
+    ///       sub-LSB precision the spec keeps);
+    ///   (b) the BDOF refinement output is within 1 LSB of equal at
+    ///       BitDepth 8 (rounding noise from the sub-LSB precision
+    ///       loss).
+    #[test]
+    fn hp_path_matches_8bit_lifter_within_1_lsb_at_8bit() {
+        use crate::inter::{predict_luma_block, predict_luma_block_high_precision, MotionVector};
+        let n_cb_w: u32 = 8;
+        let n_cb_h: u32 = 16;
+        // Build a 32×32 reference plane with a smooth gradient so MC
+        // exercises subpel-interpolation + per-list differs.
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut ref_l0 = PicturePlane::filled(ref_w, ref_h, 0);
+        let mut ref_l1 = PicturePlane::filled(ref_w, ref_h, 0);
+        for y in 0..ref_h {
+            for x in 0..ref_w {
+                ref_l0.samples[y * ref_w + x] = (40 + x * 3 + y * 2).min(255) as u8;
+                // L1 is slightly different so BDOF refinement is non-zero.
+                ref_l1.samples[y * ref_w + x] = (38 + x * 3 + y * 2).min(255) as u8;
+            }
+        }
+        // Use the same source-origin for both paths: dst_x=0, dst_y=0,
+        // mv=0 reads ref(0,0)..(w,h) for both `predict_luma_block` and
+        // `predict_luma_block_high_precision` so the comparison
+        // isolates the precision difference, not the source-origin
+        // arithmetic.
+        let mv_l0 = MotionVector { x: 0, y: 0 };
+        let mv_l1 = MotionVector { x: 0, y: 0 };
+        let dst_x: u32 = 0;
+        let dst_y: u32 = 0;
+
+        // High-precision path.
+        let hp_l0 =
+            predict_luma_block_high_precision(dst_x, dst_y, n_cb_w, n_cb_h, &ref_l0, mv_l0, 8)
+                .unwrap();
+        let hp_l1 =
+            predict_luma_block_high_precision(dst_x, dst_y, n_cb_w, n_cb_h, &ref_l1, mv_l1, 8)
+                .unwrap();
+        let ext_hp_l0 = build_extended_pred_high_precision(&hp_l0, n_cb_w, n_cb_h).unwrap();
+        let ext_hp_l1 = build_extended_pred_high_precision(&hp_l1, n_cb_w, n_cb_h).unwrap();
+        let mut dst_hp = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        bdof_refine_into(
+            &mut dst_hp,
+            dst_x,
+            dst_y,
+            n_cb_w,
+            n_cb_h,
+            &ext_hp_l0,
+            &ext_hp_l1,
+            8,
+        )
+        .unwrap();
+
+        // 8-bit-lifter path.
+        let mut scratch_l0 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        let mut scratch_l1 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        predict_luma_block(&mut scratch_l0, 0, 0, n_cb_w, n_cb_h, &ref_l0, mv_l0).unwrap();
+        predict_luma_block(&mut scratch_l1, 0, 0, n_cb_w, n_cb_h, &ref_l1, mv_l1).unwrap();
+        let ext_8b_l0 = build_extended_pred_8bit(&scratch_l0, n_cb_w, n_cb_h).unwrap();
+        let ext_8b_l1 = build_extended_pred_8bit(&scratch_l1, n_cb_w, n_cb_h).unwrap();
+        let mut dst_8b = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        bdof_refine_into(
+            &mut dst_8b,
+            dst_x,
+            dst_y,
+            n_cb_w,
+            n_cb_h,
+            &ext_8b_l0,
+            &ext_8b_l1,
+            8,
+        )
+        .unwrap();
+
+        // For zero-MV integer-pel both paths read the ref directly:
+        // HP returns `sample << 6` and `build_extended_pred_8bit`
+        // computes `sample << 6` after `predict_luma_block`'s
+        // `mc_copy_block_int`. The two extended buffers must therefore
+        // be bit-identical, and so must the refined BDOF output.
+        for (i, (a, b)) in ext_hp_l0.iter().zip(ext_8b_l0.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "integer-pel L0 ext buffers must be bit-identical (idx={i})",
+            );
+        }
+        for y in 0..n_cb_h as usize {
+            for x in 0..n_cb_w as usize {
+                let off = y * dst_hp.stride + x;
+                let a = dst_hp.samples[off] as i32;
+                let b = dst_8b.samples[off] as i32;
+                assert_eq!(
+                    a, b,
+                    "BDOF HP vs 8-bit lifter (integer-pel) must match exactly at ({x},{y})",
+                );
+            }
+        }
+
+        // For integer-pel zero-MV the §8.5.6.3 H+V fast path collapses
+        // to the integer lift `<< (14 - BD) = << 6`. The HP intermediate
+        // for L0 should therefore match `sample << 6` bit-for-bit (the
+        // integer lift coincides with what the 8-bit `<< SHIFT1` does
+        // for the integer-pel case).
+        for y in 0..n_cb_h as usize {
+            for x in 0..n_cb_w as usize {
+                let hp_v = hp_l0[y * n_cb_w as usize + x];
+                let want = (ref_l0.samples[y * ref_w + x] as i32) << 6;
+                assert_eq!(
+                    hp_v, want,
+                    "integer-pel HP at ({x},{y}) must equal sample << 6",
+                );
+            }
+        }
+    }
+
+    /// Subpel MC: HP path keeps the BD + 6 sub-LSB precision the
+    /// §8.5.6.3 separable filter computes, while the 8-bit lifter path
+    /// rounds to 8 bits per the per-list clip + `<< SHIFT1` re-lift.
+    /// At BitDepth 8 the round-trip difference is bounded by ½ LSB
+    /// per sub-pixel, and the BDOF-refined output blocks must agree
+    /// within ≤ 1 LSB.
+    #[test]
+    fn hp_subpel_path_matches_8bit_within_1_lsb() {
+        use crate::inter::{predict_luma_block, predict_luma_block_high_precision, MotionVector};
+        let n_cb_w: u32 = 8;
+        let n_cb_h: u32 = 16;
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut ref_l0 = PicturePlane::filled(ref_w, ref_h, 0);
+        let mut ref_l1 = PicturePlane::filled(ref_w, ref_h, 0);
+        for y in 0..ref_h {
+            for x in 0..ref_w {
+                ref_l0.samples[y * ref_w + x] = (40 + x * 3 + y * 2).min(255) as u8;
+                ref_l1.samples[y * ref_w + x] = (38 + x * 3 + y * 2).min(255) as u8;
+            }
+        }
+        // ½-pel horizontal + integer vertical (xFrac = 8, yFrac = 0)
+        // — exercises `luma_h_8tap` for both paths so the precision
+        // delta surfaces.
+        let mv = MotionVector { x: 8, y: 0 };
+        let hp_l0 =
+            predict_luma_block_high_precision(0, 0, n_cb_w, n_cb_h, &ref_l0, mv, 8).unwrap();
+        let hp_l1 =
+            predict_luma_block_high_precision(0, 0, n_cb_w, n_cb_h, &ref_l1, mv, 8).unwrap();
+        let ext_hp_l0 = build_extended_pred_high_precision(&hp_l0, n_cb_w, n_cb_h).unwrap();
+        let ext_hp_l1 = build_extended_pred_high_precision(&hp_l1, n_cb_w, n_cb_h).unwrap();
+        let mut dst_hp = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        bdof_refine_into(&mut dst_hp, 0, 0, n_cb_w, n_cb_h, &ext_hp_l0, &ext_hp_l1, 8).unwrap();
+
+        let mut scratch_l0 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        let mut scratch_l1 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        predict_luma_block(&mut scratch_l0, 0, 0, n_cb_w, n_cb_h, &ref_l0, mv).unwrap();
+        predict_luma_block(&mut scratch_l1, 0, 0, n_cb_w, n_cb_h, &ref_l1, mv).unwrap();
+        let ext_8b_l0 = build_extended_pred_8bit(&scratch_l0, n_cb_w, n_cb_h).unwrap();
+        let ext_8b_l1 = build_extended_pred_8bit(&scratch_l1, n_cb_w, n_cb_h).unwrap();
+        let mut dst_8b = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        bdof_refine_into(&mut dst_8b, 0, 0, n_cb_w, n_cb_h, &ext_8b_l0, &ext_8b_l1, 8).unwrap();
+
+        for y in 0..n_cb_h as usize {
+            for x in 0..n_cb_w as usize {
+                let off = y * dst_hp.stride + x;
+                let a = dst_hp.samples[off] as i32;
+                let b = dst_8b.samples[off] as i32;
+                assert!(
+                    (a - b).abs() <= 1,
+                    "subpel BDOF HP vs 8-bit lifter must match within 1 LSB at ({x},{y}): hp={a} 8bit={b}",
+                );
+            }
+        }
+    }
+
+    /// At BD = 10 the HP intermediate must lie in BitDepth + 6 = 16
+    /// bit precision (range roughly [0, 2^16)) — i.e. the integer-pel
+    /// lift becomes `<< (14 - 10) = << 4` so a 10-bit sample of value
+    /// `s` lands at `s << 4`. This locks in the per-bit-depth
+    /// precision contract the BDOF gradient pipeline relies on.
+    #[test]
+    fn hp_path_precision_scales_with_bit_depth() {
+        use crate::inter::{predict_luma_block_high_precision, MotionVector};
+        // Build a tiny "10-bit" reference: PicturePlane stores u8 so
+        // values are capped at 255, but the lift is `<< 4` for BD=10
+        // so 255 lands at `255 * 16 = 4080`, still in 16-bit range.
+        let ref_p = PicturePlane::filled(16, 16, 200);
+        let mv = MotionVector { x: 0, y: 0 };
+        let hp = predict_luma_block_high_precision(0, 0, 8, 8, &ref_p, mv, 10).unwrap();
+        for &v in &hp {
+            assert_eq!(v, 200 << 4, "BD=10 integer-pel: sample << 4");
+        }
+        // BD=12: lift is `<< 2`.
+        let hp12 = predict_luma_block_high_precision(0, 0, 8, 8, &ref_p, mv, 12).unwrap();
+        for &v in &hp12 {
+            assert_eq!(v, 200 << 2, "BD=12 integer-pel: sample << 2");
+        }
+        // BD=8: lift is `<< 6` (the 14-bit BD+6 default).
+        let hp8 = predict_luma_block_high_precision(0, 0, 8, 8, &ref_p, mv, 8).unwrap();
+        for &v in &hp8 {
+            assert_eq!(v, 200 << 6, "BD=8 integer-pel: sample << 6");
+        }
+    }
+
+    /// HP lifter + BDOF on identical L0 = L1 inputs is a no-op: every
+    /// output sample equals the input constant. Mirror of the
+    /// existing `identical_predictors_pass_through_constant` test but
+    /// going through the round-32 HP pipeline rather than the 8-bit
+    /// lifter.
+    #[test]
+    fn hp_path_identical_predictors_pass_through_constant() {
+        use crate::inter::{predict_luma_block_high_precision, MotionVector};
+        let n_cb_w: u32 = 8;
+        let n_cb_h: u32 = 16;
+        let ref_p = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 130);
+        let mv = MotionVector { x: 0, y: 0 };
+        let hp_l0 = predict_luma_block_high_precision(0, 0, n_cb_w, n_cb_h, &ref_p, mv, 8).unwrap();
+        let hp_l1 = hp_l0.clone();
+        let ext_l0 = build_extended_pred_high_precision(&hp_l0, n_cb_w, n_cb_h).unwrap();
+        let ext_l1 = build_extended_pred_high_precision(&hp_l1, n_cb_w, n_cb_h).unwrap();
+        let mut dst = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        bdof_refine_into(&mut dst, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).unwrap();
+        for &s in &dst.samples {
+            assert_eq!(s, 130, "HP path: identical predictors round-trip exactly");
+        }
     }
 }

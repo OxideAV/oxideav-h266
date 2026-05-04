@@ -128,9 +128,23 @@ the **intra-only single-tile single-slice subset** plus the round-28
   `bcw_idx == 0` short-circuits to the eq. 980 default average,
   matching the spec's "If bcwIdx is equal to 0 OR ciip_flag == 1"
   gate.
+  **Round-30 lands §8.5.6.5 BDOF (Bi-Directional Optical Flow)** as
+  a per-pixel refinement on top of the bi-pred composition; round-31
+  wires the §8.5.5.1 `bdofUsedFlag` derivation into the leaf-CU
+  bipred dispatch (gated on `sps_bdof_enabled_flag`,
+  `ph_bdof_disabled_flag`, both `predFlagL{0,1}`, symmetric POC
+  distance, STRP refs, `MotionModelIdc == 0`, no sub-block /
+  sym-MVD / CIIP / BCW / weighted-pred, `cbW * cbH >= 128`,
+  `cIdx == 0`); when the gate is open the §8.5.6.5 refinement
+  runs in place of the eq. 980 average. **Round-32 surfaces the
+  §8.5.6.3 `BitDepth + 6` precision intermediate** via
+  `predict_luma_block_high_precision` (paired with
+  `build_extended_pred_high_precision`) so BDOF gradients now
+  operate at the spec's full 14-bit precision (8-bit input),
+  16-bit (10-bit input), 18-bit (12-bit input) — the round-30
+  8-bit lifter (`build_extended_pred_8bit`) is now deprecated.
   No GPM / AMVR yet; affine + scaled-reference filter tables 28 /
-  29 / 30 / 31 / 32 / 34 / 35, BDOF + DMVR, PROF land in later
-  rounds.
+  29 / 30 / 31 / 32 / 34 / 35, DMVR, PROF land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue

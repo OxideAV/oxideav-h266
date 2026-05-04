@@ -1688,6 +1688,16 @@ fn pb_clip_8bit(intermediate: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+/// §8.5.6.3 horizontal-pass shift1 = `Min(4, BitDepth - 8)`. The H
+/// pass divides its `coeffs(sum 64) × sample` accumulator by `1 <<
+/// shift1` so the result lands in `BitDepth + 6 - shift2` precision
+/// when followed by the V pass (shift2 = 6). At BitDepth 8 this is
+/// `Min(4, 0) = 0` — the existing 8-bit code path.
+#[inline]
+fn shift1_for_bd(bit_depth: u32) -> i32 {
+    std::cmp::min(4, bit_depth as i32 - 8).max(0)
+}
+
 /// Round-22 §8.5.6.3 luma motion-compensated prediction for one CU.
 ///
 /// Inputs:
@@ -1790,6 +1800,120 @@ pub fn predict_luma_block(
         }
     }
     Ok(())
+}
+
+/// Round-32 §8.5.6.3 luma motion-compensated prediction surfacing the
+/// `BitDepth + 6` precision intermediate.
+///
+/// Equivalent to [`predict_luma_block`] except no final per-list clip
+/// + right-shift is applied; the returned `Vec<i32>` of length `w * h`
+/// (row-major) carries the spec's high-precision predSamplesLN values
+/// per the §8.5.6.3.2 separable filter. This is the array §8.5.6.5
+/// (BDOF), §8.5.6.5b (PROF), and the §8.5.6.6.x bi-pred composition
+/// stages consume.
+///
+/// At `BitDepth = 8` the values lie in roughly `[-2^14, 2^14)` (=
+/// 14-bit signed); at `BitDepth = 10` the range expands to 16-bit;
+/// at `BitDepth = 12` it expands to 18-bit. Recovering an 8-bit
+/// sample from the BD = 8 intermediate is `(v + 32) >> 6` clipped
+/// to `[0, 255]` — i.e. the existing [`pb_clip_8bit`] helper —
+/// which makes a high-precision → 8-bit conversion bit-identical
+/// to [`predict_luma_block`].
+///
+/// Source-position derivation matches [`predict_luma_block`]: integer
+/// origin is `(dst_x + mv.x >> 4, dst_y + mv.y >> 4)` and fractional
+/// position is `(mv.x & 15, mv.y & 15)`. `dst_x` / `dst_y` are the CU
+/// origin in the *current* picture (used purely for the integer
+/// reference origin); the returned buffer is CU-origin-aligned with
+/// no padding.
+pub fn predict_luma_block_high_precision(
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane,
+    mv: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "h266 luma MC HP: bit_depth {bit_depth} out of supported range 8..=16",
+        )));
+    }
+    let x_int_base = dst_x as i32 + (mv.x >> 4);
+    let y_int_base = dst_y as i32 + (mv.y >> 4);
+    let x_frac = (mv.x & 15) as usize;
+    let y_frac = (mv.y & 15) as usize;
+
+    let pic_w = src.width as i32;
+    let pic_h = src.height as i32;
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let mut out = vec![0i32; w_us * h_us];
+    let shift1 = shift1_for_bd(bit_depth);
+    let lift = 14 - bit_depth as i32; // integer-pel `<< (14 - BD)` — eq. 932
+
+    // ---- Fast path: integer-pel — eq. 932 lifts each sample by
+    // `<< (14 - BitDepth)` to land in BD + 6 precision.
+    if x_frac == 0 && y_frac == 0 {
+        for r in 0..h as i32 {
+            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            for c in 0..w as i32 {
+                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+                out[r as usize * w_us + c as usize] =
+                    (src.samples[yi * src.stride + xi] as i32) << lift;
+            }
+        }
+        return Ok(out);
+    }
+
+    if y_frac == 0 {
+        // Horizontal-only filter (eq. 933). Output is in BD + 6
+        // precision after `>> shift1`.
+        for r in 0..h as i32 {
+            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            for c in 0..w as i32 {
+                let acc = luma_h_8tap(src, x_int_base + c, yi, x_frac);
+                out[r as usize * w_us + c as usize] = acc >> shift1;
+            }
+        }
+        return Ok(out);
+    }
+
+    if x_frac == 0 {
+        // Vertical-only filter (eq. 934).
+        for c in 0..w as i32 {
+            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            for r in 0..h as i32 {
+                let acc = luma_v_only_8tap(src, xi, y_int_base + r, y_frac);
+                out[r as usize * w_us + c as usize] = acc >> shift1;
+            }
+        }
+        return Ok(out);
+    }
+
+    // Two-dimensional case (eqs. 935 + 936). The H pass produces an
+    // `(h + 7) × w` intermediate at `>> shift1` precision, the V pass
+    // shifts by `shift2 = 6` to land in BD + 6 precision overall.
+    let inter_h = h_us + 7;
+    let mut intermediate = vec![0i32; inter_h * w_us];
+    for r in 0..inter_h as i32 {
+        let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
+        for c in 0..w as i32 {
+            intermediate[r as usize * w_us + c as usize] =
+                luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
+        }
+    }
+    let mut col = [0i32; 8];
+    for r in 0..h as i32 {
+        for c in 0..w as i32 {
+            for i in 0..8 {
+                col[i] = intermediate[(r as usize + i) * w_us + c as usize];
+            }
+            out[r as usize * w_us + c as usize] = luma_v_8tap(&col, y_frac);
+        }
+    }
+    Ok(out)
 }
 
 /// Chroma 4-tap horizontal filter (eq. 953). `x_int` is the chroma

@@ -68,7 +68,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
-use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_8bit};
+use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_high_precision};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
@@ -78,8 +78,8 @@ use crate::inter::{
     apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
     predict_chroma_block, predict_chroma_block_bipred_bcw, predict_luma_block,
-    predict_luma_block_bipred_bcw, HmvpTable, MotionField, MotionVector, MvField, ReferencePicture,
-    TemporalMergeInputs,
+    predict_luma_block_bipred_bcw, predict_luma_block_high_precision, HmvpTable, MotionField,
+    MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
@@ -1943,47 +1943,41 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     );
 
                 if bdof_runs {
-                    // §8.5.6.5 — render each per-list MC into a block-
-                    // sized scratch plane, lift through the
-                    // `(nCbW + 2) × (nCbH + 2)` extended-prediction
-                    // bridge, then run the BDOF refinement straight
-                    // into the output plane. The 8-bit lifter is the
-                    // round-30 best-effort bridge until the §8.5.6.3
-                    // separable filter surfaces its `BitDepth + 6`
-                    // intermediate (tracked as the round-31 followup).
+                    // §8.5.6.5 — round-32 wires the spec-byte-identical
+                    // path: each per-list §8.5.6.3 MC surfaces its
+                    // `BitDepth + 6` precision intermediate (the value
+                    // before the §8.5.6.6.2 per-list clip / right-
+                    // shift), and that intermediate is lifted into the
+                    // spec's `(nCbW + 2) × (nCbH + 2)` extended layout
+                    // by 1-sample edge replication only — no re-scale.
+                    // BDOF gradients then operate on the spec's full
+                    // 14-bit precision (8-bit input), 16-bit (10-bit
+                    // input), 18-bit (12-bit input). The round-30
+                    // 8-bit lifter (`build_extended_pred_8bit`) is now
+                    // deprecated.
                     let n_cb_w = cu.cu.w;
                     let n_cb_h = cu.cu.h;
-                    let mut scratch_l0 = crate::reconstruct::PicturePlane::filled(
-                        n_cb_w as usize,
-                        n_cb_h as usize,
-                        0,
-                    );
-                    let mut scratch_l1 = crate::reconstruct::PicturePlane::filled(
-                        n_cb_w as usize,
-                        n_cb_h as usize,
-                        0,
-                    );
-                    predict_luma_block(
-                        &mut scratch_l0,
-                        0,
-                        0,
+                    let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+                    let pred_l0 = predict_luma_block_high_precision(
+                        cu.cu.x,
+                        cu.cu.y,
                         n_cb_w,
                         n_cb_h,
                         &rp0.frame.luma,
                         chosen.mv_l0,
+                        bit_depth,
                     )?;
-                    predict_luma_block(
-                        &mut scratch_l1,
-                        0,
-                        0,
+                    let pred_l1 = predict_luma_block_high_precision(
+                        cu.cu.x,
+                        cu.cu.y,
                         n_cb_w,
                         n_cb_h,
                         &rp1.frame.luma,
                         chosen.mv_l1,
+                        bit_depth,
                     )?;
-                    let ext_l0 = build_extended_pred_8bit(&scratch_l0, n_cb_w, n_cb_h)?;
-                    let ext_l1 = build_extended_pred_8bit(&scratch_l1, n_cb_w, n_cb_h)?;
-                    let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+                    let ext_l0 = build_extended_pred_high_precision(&pred_l0, n_cb_w, n_cb_h)?;
+                    let ext_l1 = build_extended_pred_high_precision(&pred_l1, n_cb_w, n_cb_h)?;
                     bdof_refine_into(
                         &mut out.luma,
                         cu.cu.x,
