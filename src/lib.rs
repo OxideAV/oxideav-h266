@@ -145,6 +145,7 @@
 pub mod alf;
 pub mod alf_fixed;
 pub mod aps;
+pub mod bdof;
 pub mod bitreader;
 pub mod cabac;
 pub mod cabac_enc;

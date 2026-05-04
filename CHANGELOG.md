@@ -6,6 +6,41 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **Bi-Directional Optical Flow (BDOF) — §8.5.6.5 (round 30)** — new
+  [`bdof`](src/bdof.rs) module implements the per-pixel optical-flow
+  refinement layered on top of bi-pred motion compensation.
+  [`bdof_refine_into`] is the bit-accurate algorithm: for each `4x4`
+  sub-block it computes horizontal/vertical gradients on the two
+  list predictors over a `6x6` window (eqs. 962–965), accumulates
+  the five correlation sums `sGx2`/`sGy2`/`sGxGy`/`sGxdI`/`sGydI`
+  (eqs. 969–973), solves the closed-form `(vx, vy)` refinement
+  clipped to `±(2/16)` pel via `mvRefineThres = 1 << 4` (eqs. 974/
+  975), and writes the eq. 977 `pbSamples = Clip3(0, (1 << BitDepth)
+  − 1, (predL0 + offset4 + predL1 + bdofOffset) >> shift4)` output.
+  Inputs are the spec's `(nCbW + 2) × (nCbH + 2)` extended high-
+  precision per-list arrays; output writes `nCbW × nCbH` `u8`
+  samples into a destination [`reconstruct::PicturePlane`] at
+  `(dst_x, dst_y)`. [`bdof_used_flag`] mirrors the §8.5.5.1 bullet
+  list one-to-one (`ph_bdof_disabled_flag`, both `predFlagL{0,1}`,
+  symmetric POC distance, both refs are STRP, `MotionModelIdc == 0`,
+  no `merge_subblock_flag`/`sym_mvd_flag`/`ciip_flag`, `bcwIdx == 0`,
+  no luma/chroma weights, `cbWidth >= 8 && cbHeight >= 8 &&
+  cbW * cbH >= 128`, no RPR-active flags, `cIdx == 0`).
+  [`build_extended_pred_8bit`] convenience helper lifts an existing
+  pre-clamped 8-bit per-list prediction into the extended-prediction
+  layout (1-sample edge replication + `<< SHIFT1` precision lift) so
+  the new module can be exercised against the round-22 fractional-pel
+  MC output today; once the §8.5.6.3 separable filter is refactored
+  to surface its `BitDepth + 6` precision intermediates, the helper
+  becomes optional. 12 new unit tests cover the gating helper, the
+  `floor_log2`/`sign` primitives, identical-input no-op behaviour
+  (constant + horizontal ramp), non-trivial refinement on a 1-sample-
+  shifted L0/L1 pair, edge-replication scaling in the 8-bit lifter,
+  and malformed-input rejection. The wiring into the leaf-CU walker
+  (replacing the existing default-bipred-average call when
+  `bdofUsedFlag` is true) is a follow-up — for now [`bdof_refine_into`]
+  is reachable through the public module API.
+
 - **`pred_weight_table()` parsing — §7.3.8** — the picture header
   parser now walks the explicit weighted prediction table when
   `(pps_weighted_pred_flag || pps_weighted_bipred_flag) &&
