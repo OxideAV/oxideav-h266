@@ -4,6 +4,45 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-h266/compare/v0.0.4...v0.0.5) - 2026-05-04
+
+### Other
+
+- dedup BDOF u8 / u16 paths through shared kernel
+- HBD picture-plane storage + Main10 / Main12 MC + reconstruction
+- surface §8.5.6.3 BD+6 precision intermediate for BDOF
+- wire BDOF refinement into leaf-CU bipred dispatch — §8.5.5.1 / §8.5.6.5
+- BDOF (Bi-Directional Optical Flow) — §8.5.6.5
+- pred_weight_table parser — §7.3.8 (PH-carried path)
+- BCW (Bi-prediction with CU-level Weights) — §8.5.6.6.2 eq. 981
+- MMVD asymmetric POC bi-pred — §8.5.2.7 eqs. 561 – 580
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- combined inter-intra prediction (CIIP) — §8.5.6.7 + Tables 92 / 102 / 106
+- MMVD merge candidate — §8.5.2.7 (Tables 17 / 18 + 103 / 104 / 105)
+- pairwise-average merge candidate — §8.5.2.4 + §8.5.2.2 step 8
+- temporal merge candidate (Col) — §8.5.2.11 + §8.5.2.12
+- HMVP multi-CU acceptance fixture — §8.5.2.6 + §8.5.2.16
+- HMVP merge candidate insertion + table maintenance — §8.5.2.6 + §8.5.2.16
+- B-slice merge + bi-pred MC — §8.5.2.2 step 9 + §8.5.6.6.2 eq. 980
+- §8.5.6.3 fractional-pel MC — 8-tap luma + 4-tap chroma
+- P-slice inter — cu_skip + regular merge + integer-pel MC
+- ISP — Intra Sub-Partitions (§8.4.5.1)
+- CCLM intra prediction (§8.4.5.2.14)
+- round 19 — MIP intra mode (matrix-based intra prediction)
+- round 18 — BDPCM intra mode (luma + chroma)
+- round 17 — ALF fixed-filter family + CC-ALF apply
+- adopt slim VideoFrame shape
+- forward-side CABAC engine + forward DCT-II / flat quant
+- implement §8.8.5.3 luma classification (filtIdx + transposeIdx)
+- implement §8.8.5 adaptive loop filter (luma + chroma apply, ALF APS parser)
+- long luma 5/7-tap, chroma strong, §7.3.11.3 SAO CABAC parser
+- implement §8.8.4 sample adaptive offset (EO + BO) + size-2 DCT-II
+- implement §8.8.3 in-loop deblocking filter (short-tap)
+- wire chroma reconstruction (Cb / Cr) + DCT-II 64 (§8.7.4.2)
+- implement reconstruct_leaf_cu — intra prediction + inverse transform pipeline (§8.4 / §8.7)
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **HBD picture-plane storage + Main10 / Main12 MC + reconstruction —
