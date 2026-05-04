@@ -60,7 +60,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::reconstruct::{PictureBuffer, PicturePlane};
+use crate::reconstruct::{PictureBuffer, PicturePlane, PicturePlane16};
 
 /// 1/16-pel motion vector (§8.5.2 fractional-sample accuracy).
 ///
@@ -1902,6 +1902,137 @@ pub fn predict_luma_block_high_precision(
         for c in 0..w as i32 {
             intermediate[r as usize * w_us + c as usize] =
                 luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
+        }
+    }
+    let mut col = [0i32; 8];
+    for r in 0..h as i32 {
+        for c in 0..w as i32 {
+            for i in 0..8 {
+                col[i] = intermediate[(r as usize + i) * w_us + c as usize];
+            }
+            out[r as usize * w_us + c as usize] = luma_v_8tap(&col, y_frac);
+        }
+    }
+    Ok(out)
+}
+
+/// HBD twin of [`luma_h_8tap`] reading u16 samples (Main10 / Main12).
+fn luma_h_8tap_u16(plane: &PicturePlane16, x_int: i32, y_clamped: usize, x_frac: usize) -> i32 {
+    let coeffs = &LUMA_FILTER_HPEL0[x_frac];
+    let pic_w = plane.width as i32;
+    let mut acc = 0i32;
+    let row_base = y_clamped * plane.stride;
+    for (i, c) in coeffs.iter().enumerate() {
+        let xi = (x_int + (i as i32) - 3).clamp(0, pic_w - 1) as usize;
+        acc += c * (plane.samples[row_base + xi] as i32);
+    }
+    acc
+}
+
+/// HBD twin of [`luma_v_only_8tap`] reading u16 samples.
+fn luma_v_only_8tap_u16(
+    plane: &PicturePlane16,
+    x_clamped: usize,
+    y_int: i32,
+    y_frac: usize,
+) -> i32 {
+    let coeffs = &LUMA_FILTER_HPEL0[y_frac];
+    let pic_h = plane.height as i32;
+    let mut acc = 0i32;
+    for i in 0..8 {
+        let yi = (y_int + (i as i32) - 3).clamp(0, pic_h - 1) as usize;
+        acc += coeffs[i] * (plane.samples[yi * plane.stride + x_clamped] as i32);
+    }
+    acc
+}
+
+/// HBD twin of [`predict_luma_block_high_precision`] — reads `u16`
+/// reference samples from a [`PicturePlane16`] so the §8.5.6.3
+/// separable 8-tap filter sees the full Main10 / Main12 dynamic range
+/// rather than the 8-bit-truncated value the legacy `u8` plane would
+/// expose. Output layout, output precision, and the per-bit-depth
+/// `shift1 / shift2` tracking are byte-identical to the existing 8-bit
+/// HP helper at `bit_depth == 8`; tests cover the parity.
+///
+/// The returned `Vec<i32>` of length `w * h` (row-major) carries the
+/// spec's `BitDepth + 6` precision intermediate values, ready to feed
+/// into the round-32 BDOF / PROF / bi-pred composition stages without
+/// the per-list clip + right-shift the §8.5.6.6.2 closing stage
+/// applies.
+pub fn predict_luma_block_high_precision_u16(
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane16,
+    mv: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "h266 luma MC HP u16: bit_depth {bit_depth} out of supported range 8..=16",
+        )));
+    }
+    if src.bit_depth != bit_depth {
+        return Err(Error::invalid(format!(
+            "h266 luma MC HP u16: ref plane bit_depth {} != requested {}",
+            src.bit_depth, bit_depth
+        )));
+    }
+    let x_int_base = dst_x as i32 + (mv.x >> 4);
+    let y_int_base = dst_y as i32 + (mv.y >> 4);
+    let x_frac = (mv.x & 15) as usize;
+    let y_frac = (mv.y & 15) as usize;
+
+    let pic_w = src.width as i32;
+    let pic_h = src.height as i32;
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let mut out = vec![0i32; w_us * h_us];
+    let shift1 = shift1_for_bd(bit_depth);
+    let lift = 14 - bit_depth as i32;
+
+    if x_frac == 0 && y_frac == 0 {
+        for r in 0..h as i32 {
+            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            for c in 0..w as i32 {
+                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+                out[r as usize * w_us + c as usize] =
+                    (src.samples[yi * src.stride + xi] as i32) << lift;
+            }
+        }
+        return Ok(out);
+    }
+
+    if y_frac == 0 {
+        for r in 0..h as i32 {
+            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            for c in 0..w as i32 {
+                let acc = luma_h_8tap_u16(src, x_int_base + c, yi, x_frac);
+                out[r as usize * w_us + c as usize] = acc >> shift1;
+            }
+        }
+        return Ok(out);
+    }
+
+    if x_frac == 0 {
+        for c in 0..w as i32 {
+            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            for r in 0..h as i32 {
+                let acc = luma_v_only_8tap_u16(src, xi, y_int_base + r, y_frac);
+                out[r as usize * w_us + c as usize] = acc >> shift1;
+            }
+        }
+        return Ok(out);
+    }
+
+    let inter_h = h_us + 7;
+    let mut intermediate = vec![0i32; inter_h * w_us];
+    for r in 0..inter_h as i32 {
+        let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
+        for c in 0..w as i32 {
+            intermediate[r as usize * w_us + c as usize] =
+                luma_h_8tap_u16(src, x_int_base + c, yi, x_frac) >> shift1;
         }
     }
     let mut col = [0i32; 8];
@@ -4684,5 +4815,83 @@ mod tests {
         for v in &out {
             assert_eq!(*v, 1023);
         }
+    }
+
+    /// At `bit_depth == 8`, the HBD u16 MC HP path produces a
+    /// bit-identical intermediate to the legacy u8 HP path for the
+    /// same sample values lifted into a `PicturePlane16`.
+    #[test]
+    fn predict_luma_hp_u16_bit8_matches_u8() {
+        // Build a non-trivial 16x16 reference and clone it into a
+        // bit_depth=8 u16 plane.
+        let mut src8 = PicturePlane::filled(16, 16, 0);
+        let mut src16 = PicturePlane16::filled(16, 16, 0, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = (((x * 13 + y * 7) ^ 0x55) & 0xff) as u8;
+                src8.samples[y * 16 + x] = v;
+                src16.samples[y * 16 + x] = v as u16;
+            }
+        }
+        // Sweep a few sub-pel positions covering every fast-path
+        // branch in `predict_luma_block_high_precision`.
+        for &(mx, my) in &[(0, 0), (5, 0), (0, 7), (3, 9), (8, 8)] {
+            let mv = MotionVector { x: mx, y: my };
+            let want = predict_luma_block_high_precision(2, 2, 8, 8, &src8, mv, 8).unwrap();
+            let got = predict_luma_block_high_precision_u16(2, 2, 8, 8, &src16, mv, 8).unwrap();
+            assert_eq!(
+                got, want,
+                "u16 / u8 HP MC must match at BD=8 for mv=({mx},{my})",
+            );
+        }
+    }
+
+    /// Main10 MC sees the full 10-bit dynamic range of the reference
+    /// plane: a 1023-valued constant plane at BD=10 round-trips
+    /// through the HP filter to `1023 << (14 - 10) = 16368`, well
+    /// above the 8-bit-truncated `255 << 6 = 16320` the legacy path
+    /// would produce. This pins the "HBD MC actually uses HBD samples"
+    /// invariant.
+    #[test]
+    fn predict_luma_hp_u16_main10_uses_full_range() {
+        let src = PicturePlane16::filled(16, 16, 1023, 10);
+        let mv = MotionVector::ZERO;
+        let out = predict_luma_block_high_precision_u16(2, 2, 8, 8, &src, mv, 10).unwrap();
+        // Integer-pel HP lift = src << (14 - bit_depth) = 1023 << 4
+        // = 16368.
+        for &v in &out {
+            assert_eq!(
+                v, 16368,
+                "Main10 HP integer-pel must lift 1023 to 16368 (got {v})",
+            );
+        }
+        // The legacy 8-bit path would have truncated 1023 → 255 before
+        // the lift, producing `255 << 6 = 16320`; the HBD path must
+        // exceed that by exactly the truncation gap.
+        assert!(out[0] > 16320);
+    }
+
+    /// Round-trip Main12: integer-pel HP lift = src << (14 - 12) = 4.
+    /// This makes the "lift-by-(14-BD)" formula traceable across all
+    /// supported bit depths.
+    #[test]
+    fn predict_luma_hp_u16_main12_lift() {
+        let src = PicturePlane16::filled(16, 16, 4095, 12);
+        let mv = MotionVector::ZERO;
+        let out = predict_luma_block_high_precision_u16(2, 2, 8, 8, &src, mv, 12).unwrap();
+        // 4095 << 2 = 16380.
+        for &v in &out {
+            assert_eq!(v, 16380);
+        }
+    }
+
+    /// HBD MC rejects a bit-depth mismatch between the reference plane
+    /// and the requested precision.
+    #[test]
+    fn predict_luma_hp_u16_bit_depth_mismatch_errors() {
+        let src = PicturePlane16::filled(16, 16, 0, 10);
+        assert!(
+            predict_luma_block_high_precision_u16(0, 0, 8, 8, &src, MotionVector::ZERO, 8).is_err()
+        );
     }
 }

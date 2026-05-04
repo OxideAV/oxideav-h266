@@ -143,6 +143,19 @@ the **intra-only single-tile single-slice subset** plus the round-28
   operate at the spec's full 14-bit precision (8-bit input),
   16-bit (10-bit input), 18-bit (12-bit input) — the round-30
   8-bit lifter (`build_extended_pred_8bit`) is now deprecated.
+  **Round-33 introduces HBD picture-plane storage** —
+  `PicturePlane16` / `PictureBuffer16` (parallel to the legacy
+  `u8` `PicturePlane` / `PictureBuffer`) carry samples in `u16`
+  cells with an explicit `bit_depth` (8..=16) and per-write
+  range-clipping. New `_u16` twins of the HP MC
+  (`predict_luma_block_high_precision_u16`), the BDOF refinement
+  (`bdof_refine_into_u16`), and the per-TB reconstruction
+  (`reconstruct_tb_into_u16`) read / write at full Main10 / Main12
+  precision instead of 8-bit-truncating reference samples — the
+  legacy `u8` paths stay byte-identical and the HBD twins are
+  cross-pinned against them at `bit_depth == 8`. The cascade is
+  contained to the new HBD entry points; consumer code opts in by
+  switching the buffer type + the corresponding `_u16` calls.
   No GPM / AMVR yet; affine + scaled-reference filter tables 28 /
   29 / 30 / 31 / 32 / 34 / 35, DMVR, PROF land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;

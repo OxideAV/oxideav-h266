@@ -88,6 +88,128 @@ impl PictureBuffer {
     }
 }
 
+/// HBD twin of [`PicturePlane`] — Main10 / Main12 reconstruction needs
+/// `u16` sample storage so MC and reconstruction can read / write the
+/// full bit-depth value (the legacy 8-bit plane truncates Main10 by 2
+/// bits). Layout mirrors [`PicturePlane`] one-to-one (row-major, an
+/// over-allocated `stride >= width` allowed). Range is `[0,
+/// (1 << bit_depth) - 1]`; `bit_depth` is carried at the buffer level
+/// to make the clip range explicit and to let MC lift integer-pel
+/// samples by the spec's `<< (14 - BitDepth)`.
+#[derive(Clone, Debug)]
+pub struct PicturePlane16 {
+    /// Row-major sample storage, length = `stride * height`.
+    pub samples: Vec<u16>,
+    /// Number of samples per row (>= width).
+    pub stride: usize,
+    /// Visible width in samples.
+    pub width: usize,
+    /// Visible height in samples.
+    pub height: usize,
+    /// Bit depth of the stored samples (8..=16). `samples[i]` is
+    /// guaranteed to lie in `[0, (1 << bit_depth) - 1]` for any
+    /// value written through this module's helpers.
+    pub bit_depth: u32,
+}
+
+impl PicturePlane16 {
+    /// Allocate an HBD plane of `width × height` samples seeded to
+    /// `seed`. Panics if `bit_depth` is outside `8..=16` or if the
+    /// seed exceeds the bit-depth range.
+    pub fn filled(width: usize, height: usize, seed: u16, bit_depth: u32) -> Self {
+        assert!(
+            (8..=16).contains(&bit_depth),
+            "PicturePlane16: bit_depth {bit_depth} must be in 8..=16",
+        );
+        let max = (1u32 << bit_depth) - 1;
+        assert!(
+            seed as u32 <= max,
+            "PicturePlane16: seed {seed} exceeds bit_depth-{bit_depth} max {max}",
+        );
+        Self {
+            samples: vec![seed; width * height],
+            stride: width,
+            width,
+            height,
+            bit_depth,
+        }
+    }
+
+    /// Read the sample at `(x, y)`. Returns `None` when out of bounds.
+    pub fn get(&self, x: usize, y: usize) -> Option<u16> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        Some(self.samples[y * self.stride + x])
+    }
+
+    /// Write `v` at `(x, y)`. Returns `Err` when out of bounds or
+    /// when `v` exceeds the bit-depth range.
+    pub fn set(&mut self, x: usize, y: usize, v: u16) -> Result<()> {
+        if x >= self.width || y >= self.height {
+            return Err(Error::invalid(format!(
+                "PicturePlane16: ({x},{y}) out of bounds {}x{}",
+                self.width, self.height
+            )));
+        }
+        let max = (1u32 << self.bit_depth) - 1;
+        if v as u32 > max {
+            return Err(Error::invalid(format!(
+                "PicturePlane16: value {v} exceeds bit_depth-{} max {max}",
+                self.bit_depth,
+            )));
+        }
+        self.samples[y * self.stride + x] = v;
+        Ok(())
+    }
+
+    /// Lossy projection to an 8-bit [`PicturePlane`] via right-shift by
+    /// `bit_depth - 8` (the canonical narrowing used by the legacy
+    /// 8-bit pipeline). When `bit_depth == 8` this is a copy.
+    pub fn to_picture_plane_u8(&self) -> PicturePlane {
+        let shift = self.bit_depth - 8;
+        let mut out = vec![0u8; self.width * self.height];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                out[y * self.width + x] =
+                    (self.samples[y * self.stride + x] >> shift).min(255) as u8;
+            }
+        }
+        PicturePlane {
+            samples: out,
+            stride: self.width,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+/// HBD twin of [`PictureBuffer`] — 4:2:0 frame at any spec-supported
+/// bit depth (8..=16). At `bit_depth == 8` this is functionally
+/// identical to [`PictureBuffer`] but stored in `u16` cells; for
+/// Main10 / Main12 it preserves the full luma dynamic range that the
+/// legacy 8-bit buffer would truncate.
+#[derive(Clone, Debug)]
+pub struct PictureBuffer16 {
+    pub luma: PicturePlane16,
+    pub cb: PicturePlane16,
+    pub cr: PicturePlane16,
+}
+
+impl PictureBuffer16 {
+    /// Allocate a 4:2:0 frame at the given `bit_depth`. Chroma planes
+    /// are seeded to mid-grey (`1 << (bit_depth - 1)`); the luma seed
+    /// is supplied by the caller.
+    pub fn yuv420_filled(luma_w: usize, luma_h: usize, seed: u16, bit_depth: u32) -> Self {
+        let mid = 1u16 << (bit_depth - 1);
+        Self {
+            luma: PicturePlane16::filled(luma_w, luma_h, seed, bit_depth),
+            cb: PicturePlane16::filled(luma_w / 2, luma_h / 2, mid, bit_depth),
+            cr: PicturePlane16::filled(luma_w / 2, luma_h / 2, mid, bit_depth),
+        }
+    }
+}
+
 /// Owned reference-sample bundle ready to feed into the intra
 /// predictors of [`crate::intra`].
 ///
@@ -272,6 +394,51 @@ pub fn reconstruct_tb_into(
     Ok(())
 }
 
+/// HBD twin of [`reconstruct_tb_into`] — writes the eq. 1426
+/// `Clip1(pred + res)` into a `u16` destination plane at the supplied
+/// `bit_depth` (no narrowing). Used by the Main10 / Main12
+/// reconstruction path; for the legacy 8-bit pipeline keep using the
+/// `u8` overload (it is byte-identical at `bit_depth == 8`).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_tb_into_u16(
+    dst: &mut [u16],
+    dst_stride: usize,
+    dst_height: usize,
+    x: usize,
+    y: usize,
+    pred: &[i16],
+    residual: &[i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    bit_depth: u32,
+) -> Result<()> {
+    if pred.len() != n_tb_w * n_tb_h || residual.len() != n_tb_w * n_tb_h {
+        return Err(Error::invalid(
+            "h266 reconstruct u16: pred / residual size mismatch",
+        ));
+    }
+    if x + n_tb_w > dst_stride || y + n_tb_h > dst_height {
+        return Err(Error::invalid(
+            "h266 reconstruct u16: TB does not fit in destination",
+        ));
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "h266 reconstruct u16: bit_depth {bit_depth} out of supported range 8..=16",
+        )));
+    }
+    let max = (1i32 << bit_depth) - 1;
+    for row in 0..n_tb_h {
+        for col in 0..n_tb_w {
+            let p = pred[row * n_tb_w + col] as i32;
+            let r = residual[row * n_tb_w + col];
+            let v = (p + r).clamp(0, max) as u16;
+            dst[(y + row) * dst_stride + (x + col)] = v;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +563,152 @@ mod tests {
         for &v in &plane {
             assert_eq!(v, first);
         }
+    }
+
+    /// `PicturePlane16::filled` round-trips a Main10 mid-grey seed
+    /// (= 512) and rejects out-of-range seeds.
+    #[test]
+    fn picture_plane16_filled_main10() {
+        let p = PicturePlane16::filled(8, 8, 512, 10);
+        assert_eq!(p.bit_depth, 10);
+        assert_eq!(p.width, 8);
+        assert_eq!(p.samples.len(), 64);
+        for &v in &p.samples {
+            assert_eq!(v, 512);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds bit_depth")]
+    fn picture_plane16_filled_rejects_oversized_seed() {
+        // seed = 2000 > (1 << 10) - 1 = 1023
+        let _ = PicturePlane16::filled(4, 4, 2000, 10);
+    }
+
+    /// `PicturePlane16::set` enforces the bit-depth range.
+    #[test]
+    fn picture_plane16_set_clip_range() {
+        let mut p = PicturePlane16::filled(4, 4, 0, 10);
+        p.set(2, 2, 1023).unwrap();
+        assert_eq!(p.get(2, 2), Some(1023));
+        // 1024 exceeds the 10-bit range.
+        assert!(p.set(0, 0, 1024).is_err());
+        // out-of-bounds is also an error.
+        assert!(p.set(4, 0, 0).is_err());
+    }
+
+    /// At `bit_depth == 8`, `reconstruct_tb_into_u16` is byte-identical
+    /// to the legacy `reconstruct_tb_into` for the same pred/res inputs
+    /// (samples just live in `u16` cells now).
+    #[test]
+    fn reconstruct_u16_bit8_matches_u8() {
+        let mut u8_dst = vec![0u8; 16];
+        let mut u16_dst = vec![0u16; 16];
+        let pred: Vec<i16> = (0..16).map(|i| 100 + i as i16).collect();
+        let res: Vec<i32> = (0..16).map(|i| if i % 3 == 0 { 5 } else { -3 }).collect();
+        reconstruct_tb_into(&mut u8_dst, 4, 4, 0, 0, &pred, &res, 4, 4, 8).unwrap();
+        reconstruct_tb_into_u16(&mut u16_dst, 4, 4, 0, 0, &pred, &res, 4, 4, 8).unwrap();
+        for i in 0..16 {
+            assert_eq!(u8_dst[i] as u16, u16_dst[i]);
+        }
+    }
+
+    /// Main10 reconstruction preserves the full sub-1024 dynamic range
+    /// — pred = 1000 + res = 20 = 1020 stays at 1020 (the legacy 8-bit
+    /// path would right-shift this to 255).
+    #[test]
+    fn reconstruct_u16_main10_preserves_range() {
+        let mut dst = vec![0u16; 16];
+        let pred = vec![1000i16; 16];
+        let res = vec![20i32; 16];
+        reconstruct_tb_into_u16(&mut dst, 4, 4, 0, 0, &pred, &res, 4, 4, 10).unwrap();
+        for &v in &dst {
+            assert_eq!(v, 1020);
+        }
+    }
+
+    /// Main10 reconstruction clips at `(1 << 10) - 1 = 1023`.
+    #[test]
+    fn reconstruct_u16_main10_clips_overflow() {
+        let mut dst = vec![0u16; 4];
+        let pred = vec![1020i16; 4];
+        let res = vec![20i32; 4];
+        reconstruct_tb_into_u16(&mut dst, 2, 2, 0, 0, &pred, &res, 2, 2, 10).unwrap();
+        for &v in &dst {
+            assert_eq!(v, 1023);
+        }
+    }
+
+    /// `to_picture_plane_u8` is the canonical narrowing — Main10 1020
+    /// becomes 8-bit 255.
+    #[test]
+    fn picture_plane16_narrow_to_u8() {
+        let mut p = PicturePlane16::filled(4, 4, 0, 10);
+        for y in 0..4 {
+            for x in 0..4 {
+                p.set(x, y, 1020).unwrap();
+            }
+        }
+        let p8 = p.to_picture_plane_u8();
+        for &v in &p8.samples {
+            assert_eq!(v, 255);
+        }
+    }
+
+    /// End-to-end Main10 reconstruction: DC-predicted 4x4 TB at a
+    /// 10-bit mid-grey neighbour (512) + a 10-bit residual lands in a
+    /// `u16` plane without any narrowing.
+    #[test]
+    fn mini_end_to_end_main10_dc_impulse() {
+        use crate::intra::{predict_dc, IntraRefs};
+        use crate::transform::{inverse_transform_2d, TrType};
+
+        // Main10 mid-grey neighbours → DC prediction 512.
+        let above = vec![512i16; 5];
+        let left = vec![512i16; 5];
+        let refs = IntraRefs {
+            above: &above,
+            left: &left,
+            top_left: 512,
+        };
+        let pred = predict_dc(4, 4, &refs).unwrap();
+        assert_eq!(pred, vec![512; 16]);
+
+        let mut c = vec![0i32; 16];
+        c[0] = 200;
+        let d = dequantise_block(&c, 4, 4, 30, 10).unwrap();
+        let res =
+            inverse_transform_2d(4, 4, 1, 1, TrType::DctII, TrType::DctII, &d, 10, 17).unwrap();
+
+        let mut buf = PictureBuffer16::yuv420_filled(4, 4, 512, 10);
+        reconstruct_tb_into_u16(
+            &mut buf.luma.samples,
+            buf.luma.stride,
+            buf.luma.height,
+            0,
+            0,
+            &pred,
+            &res,
+            4,
+            4,
+            10,
+        )
+        .unwrap();
+        // Every sample must remain in the Main10 range.
+        for &v in &buf.luma.samples {
+            assert!(v <= 1023, "Main10 sample {v} out of range [0, 1023]");
+        }
+        // DC-only input + constant prediction → spatially uniform.
+        let first = buf.luma.samples[0];
+        for &v in &buf.luma.samples {
+            assert_eq!(v, first);
+        }
+        // The DC residual at QP=30, BD=10 lifts the prediction by a
+        // small positive number — the result must exceed the legacy
+        // 8-bit max-value 255 (i.e. genuinely benefits from u16).
+        assert!(
+            first > 255,
+            "Main10 reconstruction must escape the 8-bit ceiling, got {first}",
+        );
     }
 }

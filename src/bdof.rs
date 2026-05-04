@@ -56,7 +56,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::reconstruct::PicturePlane;
+use crate::reconstruct::{PicturePlane, PicturePlane16};
 
 /// `mvRefineThres = 1 << 4` (spec, top of §8.5.6.5). Caps the per-sub-
 /// block refinement at `±(2/16)` luma pel.
@@ -440,6 +440,172 @@ pub fn bdof_refine_into(
                     // ranges 0..=nCbW-1 across all sub-blocks). The pbSamples array
                     // is CU-origin-aligned, so the destination index is (x, y) directly
                     // — no extra adjustment.
+                    debug_assert!((0..n_cb_w_i).contains(&x));
+                    debug_assert!((0..n_cb_h_i).contains(&y));
+                    let dst_off =
+                        (dst_y as usize + y as usize) * dst.stride + (dst_x as usize + x as usize);
+                    dst.samples[dst_off] = clamped;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// HBD twin of [`bdof_refine_into`] — writes the eq. 977 `pbSamples`
+/// values into a [`PicturePlane16`] at `bit_depth` precision instead
+/// of narrowing to 8 bits. Algorithmics are byte-identical to the u8
+/// path; only the destination type and clip range differ. The
+/// `dst.bit_depth` must equal `bit_depth`.
+#[allow(clippy::too_many_arguments)]
+pub fn bdof_refine_into_u16(
+    dst: &mut PicturePlane16,
+    dst_x: u32,
+    dst_y: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    bit_depth: u32,
+) -> Result<()> {
+    if n_cb_w == 0 || n_cb_h == 0 || (n_cb_w & 3) != 0 || (n_cb_h & 3) != 0 {
+        return Err(Error::invalid(format!(
+            "bdof u16: nCbW × nCbH = {n_cb_w}x{n_cb_h} must be non-zero multiples of 4",
+        )));
+    }
+    let ext_w = n_cb_w as usize + 2;
+    let ext_h = n_cb_h as usize + 2;
+    if pred_l0.len() != ext_w * ext_h || pred_l1.len() != ext_w * ext_h {
+        return Err(Error::invalid(format!(
+            "bdof u16: extended prediction arrays must be ({}+2)x({}+2) = {} samples (got L0={}, L1={})",
+            n_cb_w,
+            n_cb_h,
+            ext_w * ext_h,
+            pred_l0.len(),
+            pred_l1.len(),
+        )));
+    }
+    if dst_x as usize + n_cb_w as usize > dst.width || dst_y as usize + n_cb_h as usize > dst.height
+    {
+        return Err(Error::invalid(format!(
+            "bdof u16: destination block ({dst_x},{dst_y}) {n_cb_w}x{n_cb_h} out of plane bounds {}x{}",
+            dst.width, dst.height,
+        )));
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "bdof u16: bit_depth {bit_depth} out of supported range 8..=16",
+        )));
+    }
+    if dst.bit_depth != bit_depth {
+        return Err(Error::invalid(format!(
+            "bdof u16: dst.bit_depth {} != requested {}",
+            dst.bit_depth, bit_depth,
+        )));
+    }
+
+    let shift4 = std::cmp::max(3, 15 - bit_depth as i32);
+    let offset4: i32 = 1 << (shift4 - 1);
+    let max_sample: i32 = (1i32 << bit_depth) - 1;
+
+    let n_cb_w_i = n_cb_w as i32;
+    let n_cb_h_i = n_cb_h as i32;
+
+    let read_l0 = |hx: i32, vy: i32| -> i32 { pred_l0[vy as usize * ext_w + hx as usize] };
+    let read_l1 = |hx: i32, vy: i32| -> i32 { pred_l1[vy as usize * ext_w + hx as usize] };
+
+    type Win = [[i32; 6]; 6];
+
+    let num_sb_x = n_cb_w as usize / 4;
+    let num_sb_y = n_cb_h as usize / 4;
+
+    for sy in 0..num_sb_y {
+        let y_sb = (sy << 2) as i32 + 1;
+        for sx in 0..num_sb_x {
+            let x_sb = (sx << 2) as i32 + 1;
+
+            let mut gh0: Win = [[0; 6]; 6];
+            let mut gv0: Win = [[0; 6]; 6];
+            let mut gh1: Win = [[0; 6]; 6];
+            let mut gv1: Win = [[0; 6]; 6];
+            let mut diff: Win = [[0; 6]; 6];
+
+            for j in -1i32..=4 {
+                for i in -1i32..=4 {
+                    let x = x_sb + i;
+                    let y = y_sb + j;
+                    let hx = x.clamp(1, n_cb_w_i);
+                    let vy = y.clamp(1, n_cb_h_i);
+                    let gh0v = (read_l0(hx + 1, vy) >> SHIFT1) - (read_l0(hx - 1, vy) >> SHIFT1);
+                    let gv0v = (read_l0(hx, vy + 1) >> SHIFT1) - (read_l0(hx, vy - 1) >> SHIFT1);
+                    let gh1v = (read_l1(hx + 1, vy) >> SHIFT1) - (read_l1(hx - 1, vy) >> SHIFT1);
+                    let gv1v = (read_l1(hx, vy + 1) >> SHIFT1) - (read_l1(hx, vy - 1) >> SHIFT1);
+                    let dv = (read_l0(hx, vy) >> SHIFT2) - (read_l1(hx, vy) >> SHIFT2);
+
+                    let ii = (i + 1) as usize;
+                    let jj = (j + 1) as usize;
+                    gh0[jj][ii] = gh0v;
+                    gv0[jj][ii] = gv0v;
+                    gh1[jj][ii] = gh1v;
+                    gv1[jj][ii] = gv1v;
+                    diff[jj][ii] = dv;
+                }
+            }
+
+            let mut temp_h: Win = [[0; 6]; 6];
+            let mut temp_v: Win = [[0; 6]; 6];
+            for jj in 0..6 {
+                for ii in 0..6 {
+                    temp_h[jj][ii] = (gh0[jj][ii] + gh1[jj][ii]) >> SHIFT3;
+                    temp_v[jj][ii] = (gv0[jj][ii] + gv1[jj][ii]) >> SHIFT3;
+                }
+            }
+
+            let mut s_gx2: i32 = 0;
+            let mut s_gy2: i32 = 0;
+            let mut s_gx_gy: i32 = 0;
+            let mut s_gx_di: i32 = 0;
+            let mut s_gy_di: i32 = 0;
+            for jj in 0..6 {
+                for ii in 0..6 {
+                    let th = temp_h[jj][ii];
+                    let tv = temp_v[jj][ii];
+                    let d = diff[jj][ii];
+                    s_gx2 += th.abs();
+                    s_gy2 += tv.abs();
+                    s_gx_gy += sign(tv) * th;
+                    s_gx_di += -sign(th) * d;
+                    s_gy_di += -sign(tv) * d;
+                }
+            }
+
+            let vx = if s_gx2 > 0 {
+                let raw = (s_gx_di << 2) >> floor_log2(s_gx2);
+                raw.clamp(-MV_REFINE_THRES + 1, MV_REFINE_THRES - 1)
+            } else {
+                0
+            };
+            let vy = if s_gy2 > 0 {
+                let inner = (s_gy_di << 2) - ((vx * s_gx_gy) >> 1);
+                let raw = inner >> floor_log2(s_gy2);
+                raw.clamp(-MV_REFINE_THRES + 1, MV_REFINE_THRES - 1)
+            } else {
+                0
+            };
+
+            for j in -1i32..=2 {
+                for i in -1i32..=2 {
+                    let x = x_sb + i;
+                    let y = y_sb + j;
+                    let g_idx_j = (j + 2) as usize;
+                    let g_idx_i = (i + 2) as usize;
+                    let bdof_offset = vx * (gh0[g_idx_j][g_idx_i] - gh1[g_idx_j][g_idx_i])
+                        + vy * (gv0[g_idx_j][g_idx_i] - gv1[g_idx_j][g_idx_i]);
+                    let p0 = pred_l0[(y + 1) as usize * ext_w + (x + 1) as usize];
+                    let p1 = pred_l1[(y + 1) as usize * ext_w + (x + 1) as usize];
+                    let blended = (p0 + offset4 + p1 + bdof_offset) >> shift4;
+                    let clamped = blended.clamp(0, max_sample) as u16;
                     debug_assert!((0..n_cb_w_i).contains(&x));
                     debug_assert!((0..n_cb_h_i).contains(&y));
                     let dst_off =
@@ -959,5 +1125,73 @@ mod tests {
         for &s in &dst.samples {
             assert_eq!(s, 130, "HP path: identical predictors round-trip exactly");
         }
+    }
+
+    /// At `bit_depth == 8`, `bdof_refine_into_u16` produces a
+    /// bit-identical result to the legacy u8 path for the same
+    /// extended predictors (samples just live in u16 cells).
+    #[test]
+    fn bdof_u16_bit8_matches_u8() {
+        let n_cb_w: u32 = 8;
+        let n_cb_h: u32 = 16;
+        // Use a non-trivial extended pair so the refinement does
+        // measurable work.
+        let mut p0 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        let mut p1 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        for y in 0..n_cb_h as usize {
+            for x in 0..n_cb_w as usize {
+                p0.samples[y * p0.stride + x] = (10 + x * 8 + y * 2) as u8;
+                let xp = x.saturating_sub(1);
+                p1.samples[y * p1.stride + x] = (10 + xp * 8 + y * 2) as u8;
+            }
+        }
+        let ext_l0 = build_extended_pred_8bit(&p0, n_cb_w, n_cb_h).unwrap();
+        let ext_l1 = build_extended_pred_8bit(&p1, n_cb_w, n_cb_h).unwrap();
+        let mut dst_u8 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
+        let mut dst_u16 = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 0, 8);
+        bdof_refine_into(&mut dst_u8, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).unwrap();
+        bdof_refine_into_u16(&mut dst_u16, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).unwrap();
+        for i in 0..dst_u8.samples.len() {
+            assert_eq!(dst_u8.samples[i] as u16, dst_u16.samples[i]);
+        }
+    }
+
+    /// Main10 BDOF preserves the full 10-bit clip range. With
+    /// constant-equal HP predictors lifted to BD+6 = 16-bit precision
+    /// (`v = sample << 6`), the eq. 977 path collapses to the input
+    /// sample value, which can sit anywhere in `[0, 1023]`.
+    #[test]
+    fn bdof_u16_main10_preserves_range() {
+        use crate::inter::{predict_luma_block_high_precision_u16, MotionVector};
+        let n_cb_w: u32 = 8;
+        let n_cb_h: u32 = 16;
+        let ref_p = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 900, 10);
+        let mv = MotionVector::ZERO;
+        let hp_l0 =
+            predict_luma_block_high_precision_u16(0, 0, n_cb_w, n_cb_h, &ref_p, mv, 10).unwrap();
+        let hp_l1 = hp_l0.clone();
+        let ext_l0 = build_extended_pred_high_precision(&hp_l0, n_cb_w, n_cb_h).unwrap();
+        let ext_l1 = build_extended_pred_high_precision(&hp_l1, n_cb_w, n_cb_h).unwrap();
+        let mut dst = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 0, 10);
+        bdof_refine_into_u16(&mut dst, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 10).unwrap();
+        for &s in &dst.samples {
+            assert_eq!(
+                s, 900,
+                "Main10 BDOF identical-predictors must round-trip exactly",
+            );
+        }
+    }
+
+    /// Bit-depth mismatch between `dst.bit_depth` and the requested
+    /// `bit_depth` is rejected.
+    #[test]
+    fn bdof_u16_bit_depth_mismatch_errors() {
+        let n_cb_w: u32 = 8;
+        let n_cb_h: u32 = 16;
+        let ext_w = (n_cb_w as usize + 2) * (n_cb_h as usize + 2);
+        let ext_l0 = vec![0i32; ext_w];
+        let ext_l1 = vec![0i32; ext_w];
+        let mut dst = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 0, 10);
+        assert!(bdof_refine_into_u16(&mut dst, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).is_err());
     }
 }

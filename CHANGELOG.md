@@ -6,6 +6,49 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **HBD picture-plane storage + Main10 / Main12 MC + reconstruction —
+  round 33.** New [`crate::reconstruct::PicturePlane16`] /
+  [`crate::reconstruct::PictureBuffer16`] mirror the legacy `u8`
+  [`crate::reconstruct::PicturePlane`] / [`crate::reconstruct::PictureBuffer`]
+  but store samples as `u16` and carry an explicit `bit_depth` field
+  (8..=16). `PicturePlane16::filled` panics on out-of-range seeds,
+  `set` returns `Err` on out-of-bounds writes or values exceeding the
+  bit-depth max, and `to_picture_plane_u8` provides the canonical
+  `>> (bit_depth - 8)` narrowing for downstream YUV420P sinks. New
+  [`crate::reconstruct::reconstruct_tb_into_u16`] is the HBD twin of
+  [`crate::reconstruct::reconstruct_tb_into`] — writes the eq. 1426
+  `Clip1(pred + res)` value into a `u16` destination plane at the
+  supplied `bit_depth` with no narrowing (the legacy `u8` overload
+  truncates Main10 / Main12 by 2 / 4 bits). New
+  [`crate::inter::predict_luma_block_high_precision_u16`] is the HBD
+  twin of [`crate::inter::predict_luma_block_high_precision`]; it
+  reads `u16` reference samples via two new HBD filter primitives
+  (`luma_h_8tap_u16` / `luma_v_only_8tap_u16`) so the §8.5.6.3
+  separable 8-tap luma filter sees the full Main10 / Main12 dynamic
+  range rather than the 8-bit-truncated value the existing `&PicturePlane`
+  reader exposes. New [`crate::bdof::bdof_refine_into_u16`] mirrors
+  [`crate::bdof::bdof_refine_into`] for the HBD output path: same
+  §8.5.6.5 algorithmics, but the eq. 977 `pbSamples` clamp lands in a
+  `u16` plane at the requested `bit_depth`. The existing 8-bit code
+  paths are byte-identical (no signature changes, no behaviour
+  changes); the HBD variants are additive and tests cross-pin u8/u16
+  parity at `bit_depth == 8`. New tests cover (a) `PicturePlane16`
+  filled / set / get / clip-range invariants, (b) Main10 reconstruct
+  preserving values > 255, (c) Main10 reconstruct clipping at 1023,
+  (d) `to_picture_plane_u8` narrowing 1020 → 255, (e) end-to-end
+  Main10 DC-impulse reconstruction (DC-predicted intra TB +
+  dequantise + inverse DCT-II + reconstruct landing in a `u16` plane
+  with values escaping the 8-bit ceiling), (f) HBD MC u8/u16 parity
+  at BD = 8 across 5 sub-pel positions, (g) Main10 integer-pel HP
+  lift = `1023 << 4 = 16368` (vs. the legacy 8-bit-truncated `255 <<
+  6 = 16320`), (h) Main12 integer-pel HP lift = `4095 << 2 = 16380`,
+  (i) BDOF u8/u16 parity at BD = 8 with a non-trivial motion-offset
+  predictor pair, (j) Main10 BDOF identical-predictor round-trip
+  preserving sample value 900, and (k) bit-depth-mismatch error
+  surfacing for both HBD MC and HBD BDOF. The cascade is contained
+  to the new HBD entry points; consumer code can opt into HBD by
+  switching `PictureBuffer` → `PictureBuffer16` and the corresponding
+  `_u16` MC / reconstruct calls without any 8-bit churn.
 - **§8.5.6.3 high-precision intermediate surfaced for BDOF — round 32.**
   New [`crate::inter::predict_luma_block_high_precision`] is a
   drop-in parallel of [`crate::inter::predict_luma_block`] that
