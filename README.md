@@ -39,6 +39,14 @@ oxideav-h266 = "0.0"
 * **Picture / slice header** (§7.3.2.7-8) — coarse walk through
   syntax, enough to keep the bit position aligned across NAL
   boundaries during decoder bring-up.
+* **Weighted prediction parameters** (§7.3.8) — `pred_weight_table()`
+  walked when carried in the PH (round-29; `pps_wp_info_in_ph_flag
+  == 1` path); produces `PredWeightTable` with per-record
+  `(delta_luma_weight, luma_offset)` plus paired Cb/Cr chroma deltas
+  for both L0 and L1. `derive_luma_weight` / `derive_luma_offset`
+  implement the §7.4.7 inferences. The reconstruction pipeline does
+  not yet apply the parsed weights — the §8.5.6.6.3 explicit
+  weighted sample prediction process is a future round.
 
 ## Decode support
 

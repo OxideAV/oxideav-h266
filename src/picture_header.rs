@@ -65,6 +65,96 @@ pub struct PhDeblockingParams {
     pub cr_tc_offset_div2: i32,
 }
 
+/// Per-list weighted-prediction parameters within
+/// [`PredWeightTable`]. Mirrors the §7.3.8 syntax for one direction
+/// (L0 or L1).
+///
+/// `luma_weight_lN_flag` / `chroma_weight_lN_flag` are stored as
+/// `Vec<bool>` of length `NumWeightsLN` (§7.4.7). When the flag is
+/// `true`, the corresponding `delta_luma_weight_lN[i]` /
+/// `luma_offset_lN[i]` (or chroma equivalents) are also captured.
+/// Per spec §7.4.7: when `luma_weight_lN_flag[i] == 0`,
+/// `LumaWeightLN[i]` is inferred to `2^luma_log2_weight_denom` and
+/// `luma_offset_lN[i]` is inferred to 0.
+#[derive(Clone, Debug, Default)]
+pub struct PredWeightTableList {
+    /// `num_lN_weights` (the field is parsed when
+    /// `pps_wp_info_in_ph_flag == 1`; otherwise `NumWeightsLN` is
+    /// inferred to `NumRefIdxActive[N]` per §7.4.7 and this slot is
+    /// left at 0). Round-29: in the PH-carried path
+    /// (pps_wp_info_in_ph_flag == 1) we pin this to the parsed value.
+    pub num_weights: u32,
+    /// `luma_weight_lN_flag[i]`, length `NumWeightsLN`.
+    pub luma_weight_flag: Vec<bool>,
+    /// `chroma_weight_lN_flag[i]`, length `NumWeightsLN` (skipped
+    /// entirely when chroma is absent).
+    pub chroma_weight_flag: Vec<bool>,
+    /// `delta_luma_weight_lN[i]` for each `i` where
+    /// `luma_weight_flag[i] == 1`; collected sparsely as
+    /// `(i, delta_luma_weight, luma_offset)` triples.
+    pub luma: Vec<LumaWeight>,
+    /// `delta_chroma_weight_lN[i][j]` / `delta_chroma_offset_lN[i][j]`
+    /// for each `i` where `chroma_weight_flag[i] == 1`. `j ∈ {0, 1}`
+    /// for `(Cb, Cr)`.
+    pub chroma: Vec<ChromaWeight>,
+}
+
+/// One luma weighting record in `pred_weight_table()`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LumaWeight {
+    /// Index `i` into `RefPicList[N]` this record applies to.
+    pub ref_idx: u32,
+    /// `delta_luma_weight_lN[i]`. Spec range: -128..=127.
+    pub delta_luma_weight: i32,
+    /// `luma_offset_lN[i]`. Spec range: -128..=127.
+    pub luma_offset: i32,
+}
+
+/// One chroma weighting record in `pred_weight_table()`. Carries both
+/// the Cb and Cr deltas because §7.3.8 emits them paired under one
+/// `chroma_weight_lN_flag[i]` gate.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChromaWeight {
+    /// Index `i` into `RefPicList[N]` this record applies to.
+    pub ref_idx: u32,
+    /// `delta_chroma_weight_lN[i][0]` (Cb).
+    pub delta_chroma_weight_cb: i32,
+    /// `delta_chroma_offset_lN[i][0]` (Cb).
+    pub delta_chroma_offset_cb: i32,
+    /// `delta_chroma_weight_lN[i][1]` (Cr).
+    pub delta_chroma_weight_cr: i32,
+    /// `delta_chroma_offset_lN[i][1]` (Cr).
+    pub delta_chroma_offset_cr: i32,
+}
+
+/// `pred_weight_table()` per §7.3.8 — explicit weighted prediction
+/// parameters carried in the PH (when `pps_wp_info_in_ph_flag == 1`)
+/// or in the slice header. Round-29 wires the PH-carried path.
+///
+/// Per §7.4.7, `LumaWeightLN[i] = (1 << luma_log2_weight_denom) +
+/// delta_luma_weight_lN[i]` (when `luma_weight_lN_flag[i] == 1`) or
+/// `2^luma_log2_weight_denom` (when the flag is 0). `ChromaLog2WeightDenom
+/// = luma_log2_weight_denom + delta_chroma_log2_weight_denom`. The
+/// `ChromaOffsetLN[i][j]` reconstruction uses eq. 144:
+///   ChromaOffsetLN[i][j] = Clip3(-128, 127,
+///     128 + delta_chroma_offset_lN[i][j] -
+///     ((128 * ChromaWeightLN[i][j]) >> ChromaLog2WeightDenom))
+#[derive(Clone, Debug, Default)]
+pub struct PredWeightTable {
+    /// `luma_log2_weight_denom`. Spec range 0..=7.
+    pub luma_log2_weight_denom: u32,
+    /// `delta_chroma_log2_weight_denom`. Only signalled when
+    /// `sps_chroma_format_idc != 0`. Spec range -7..=7 with the sum
+    /// `luma_log2_weight_denom + delta_chroma_log2_weight_denom` in
+    /// `0..=7`.
+    pub delta_chroma_log2_weight_denom: i32,
+    /// L0 weighting block.
+    pub l0: PredWeightTableList,
+    /// L1 weighting block. Empty when `pps_weighted_bipred_flag == 0`
+    /// or when `num_ref_entries[1][RplsIdx[1]] == 0` (P-slice path).
+    pub l1: PredWeightTableList,
+}
+
 /// Full picture-header structure (§7.3.2.8) after a stateful parse.
 ///
 /// Fields that the spec infers when absent are populated with their
@@ -143,10 +233,15 @@ pub struct PictureHeader {
     pub ph_prof_disabled_flag: bool,
 
     /// Raw bytes of the `pred_weight_table()` block when it appears in
-    /// the PH — captured opaque because the weighted-prediction table
-    /// grammar (§7.3.8) is not walked yet.
+    /// the PH — kept for round-tripping the bitstream verbatim.
     pub pred_weight_table_bytes: Vec<u8>,
     pub pred_weight_table_bit_len: u32,
+    /// Parsed `pred_weight_table()` per §7.3.8 (round-29). Populated
+    /// when the table actually appears in the PH; left at the empty
+    /// default otherwise. The walker advances bit-position by the
+    /// table's own structural fields rather than relying on
+    /// `pred_weight_table_bit_len`.
+    pub pred_weight_table: PredWeightTable,
 
     pub ph_qp_delta: i32,
     pub ph_joint_cbcr_sign_flag: bool,
@@ -511,13 +606,22 @@ pub fn parse_picture_header_stateful(
         if (pps.pps_weighted_pred_flag || pps.pps_weighted_bipred_flag)
             && pps.pps_wp_info_in_ph_flag
         {
-            // pred_weight_table() — grammar §7.3.8 is not walked here;
-            // we refuse rather than silently advance, because the
-            // table's bit length can't be pre-computed without parsing
-            // it. Caller that wants this needs a later increment.
-            return Err(Error::unsupported(
-                "h266 PH: pred_weight_table() in-header is not yet parsed",
-            ));
+            // pred_weight_table() — round-29 walks §7.3.8 in the PH
+            // path. The number of L1 entries used to gate the L1 part
+            // comes from `num_ref_entries[1][RplsIdx[1]]` per spec —
+            // which we read off the parsed PH-level RPL.
+            let num_ref_entries_l1 = ph
+                .ref_pic_lists
+                .as_ref()
+                .map(|r| r[1].rpls.entries.len() as u32)
+                .unwrap_or(0);
+            ph.pred_weight_table = parse_pred_weight_table(
+                &mut br,
+                sps.sps_chroma_format_idc != 0,
+                pps.pps_weighted_bipred_flag,
+                pps.pps_wp_info_in_ph_flag,
+                num_ref_entries_l1,
+            )?;
         }
     }
 
@@ -588,6 +692,205 @@ pub fn parse_picture_header_stateful(
     ph.payload_tail_bit_offset = bit_off;
     ph.consumed_bits = bit_pos;
     Ok(ph)
+}
+
+/// Parse `pred_weight_table()` per §7.3.8 starting at the reader's
+/// current bit position.
+///
+/// Inputs:
+/// * `chroma_present` — `sps_chroma_format_idc != 0`. When false the
+///   chroma fields are skipped entirely (not even the
+///   `delta_chroma_log2_weight_denom` `se(v)` is consumed).
+/// * `pps_weighted_bipred_flag` — gates the L1 walk's
+///   `num_l1_weights` parse along with the next two predicates.
+/// * `pps_wp_info_in_ph_flag` — `true` when this table lives in the
+///   PH (round-29 path; `num_l0_weights` / `num_l1_weights` are
+///   parsed). When `false`, `NumWeightsLN` is the SPS-derived
+///   `NumRefIdxActive[N]`, which the caller threads in via
+///   `num_ref_entries_l1` when relevant.
+/// * `num_ref_entries_l1` — `num_ref_entries[1][RplsIdx[1]]` from
+///   the §7.3.10 RPL struct. Only consulted when
+///   `pps_weighted_bipred_flag && pps_wp_info_in_ph_flag` to gate
+///   the L1 weighting block (§7.3.8 final `if`).
+///
+/// Returns the populated [`PredWeightTable`].
+pub fn parse_pred_weight_table(
+    br: &mut BitReader<'_>,
+    chroma_present: bool,
+    pps_weighted_bipred_flag: bool,
+    pps_wp_info_in_ph_flag: bool,
+    num_ref_entries_l1: u32,
+) -> Result<PredWeightTable> {
+    let mut pwt = PredWeightTable::default();
+    pwt.luma_log2_weight_denom = br.ue()?;
+    if pwt.luma_log2_weight_denom > 7 {
+        return Err(Error::invalid(format!(
+            "h266 pred_weight_table: luma_log2_weight_denom {} exceeds spec max 7",
+            pwt.luma_log2_weight_denom
+        )));
+    }
+    if chroma_present {
+        pwt.delta_chroma_log2_weight_denom = br.se()?;
+        let chroma_denom = pwt.luma_log2_weight_denom as i32 + pwt.delta_chroma_log2_weight_denom;
+        if !(0..=7).contains(&chroma_denom) {
+            return Err(Error::invalid(format!(
+                "h266 pred_weight_table: ChromaLog2WeightDenom {chroma_denom} \
+                 out of spec range 0..=7",
+            )));
+        }
+    }
+    // L0 walk -----------------------------------------------------------
+    if pps_wp_info_in_ph_flag {
+        pwt.l0.num_weights = br.ue()?;
+        if pwt.l0.num_weights == 0 || pwt.l0.num_weights > 15 {
+            return Err(Error::invalid(format!(
+                "h266 pred_weight_table: num_l0_weights {} out of spec range 1..=15",
+                pwt.l0.num_weights
+            )));
+        }
+    } else {
+        // Caller must have populated NumRefIdxActive[0] elsewhere; we
+        // expect the slice-header path to call this with
+        // pps_wp_info_in_ph_flag == false and the count threaded
+        // separately. Round-29 only wires the PH path, where
+        // num_l0_weights is parsed; the slice-header path is left as a
+        // no-op here.
+        pwt.l0.num_weights = 0;
+    }
+    let n_l0 = pwt.l0.num_weights as usize;
+    pwt.l0.luma_weight_flag.resize(n_l0, false);
+    for slot in pwt.l0.luma_weight_flag.iter_mut().take(n_l0) {
+        *slot = br.u1()? == 1;
+    }
+    if chroma_present {
+        pwt.l0.chroma_weight_flag.resize(n_l0, false);
+        for slot in pwt.l0.chroma_weight_flag.iter_mut().take(n_l0) {
+            *slot = br.u1()? == 1;
+        }
+    }
+    for i in 0..n_l0 {
+        if pwt.l0.luma_weight_flag[i] {
+            let dlw = br.se()?;
+            let lo = br.se()?;
+            if !(-128..=127).contains(&dlw) || !(-128..=127).contains(&lo) {
+                return Err(Error::invalid(format!(
+                    "h266 pred_weight_table: L0 luma weight ({dlw}, {lo}) at i={i} \
+                     out of spec range -128..=127",
+                )));
+            }
+            pwt.l0.luma.push(LumaWeight {
+                ref_idx: i as u32,
+                delta_luma_weight: dlw,
+                luma_offset: lo,
+            });
+        }
+        if chroma_present && pwt.l0.chroma_weight_flag.get(i).copied().unwrap_or(false) {
+            let cb_dw = br.se()?;
+            let cb_do = br.se()?;
+            let cr_dw = br.se()?;
+            let cr_do = br.se()?;
+            for v in [cb_dw, cb_do, cr_dw, cr_do] {
+                if !(-128..=127).contains(&v) {
+                    return Err(Error::invalid(format!(
+                        "h266 pred_weight_table: L0 chroma value {v} at i={i} \
+                         out of spec range -128..=127",
+                    )));
+                }
+            }
+            pwt.l0.chroma.push(ChromaWeight {
+                ref_idx: i as u32,
+                delta_chroma_weight_cb: cb_dw,
+                delta_chroma_offset_cb: cb_do,
+                delta_chroma_weight_cr: cr_dw,
+                delta_chroma_offset_cr: cr_do,
+            });
+        }
+    }
+    // L1 walk -----------------------------------------------------------
+    let l1_gate = pps_weighted_bipred_flag && pps_wp_info_in_ph_flag && num_ref_entries_l1 > 0;
+    if l1_gate {
+        pwt.l1.num_weights = br.ue()?;
+        if pwt.l1.num_weights == 0 || pwt.l1.num_weights > 15 {
+            return Err(Error::invalid(format!(
+                "h266 pred_weight_table: num_l1_weights {} out of spec range 1..=15",
+                pwt.l1.num_weights
+            )));
+        }
+        let n_l1 = pwt.l1.num_weights as usize;
+        pwt.l1.luma_weight_flag.resize(n_l1, false);
+        for slot in pwt.l1.luma_weight_flag.iter_mut().take(n_l1) {
+            *slot = br.u1()? == 1;
+        }
+        if chroma_present {
+            pwt.l1.chroma_weight_flag.resize(n_l1, false);
+            for slot in pwt.l1.chroma_weight_flag.iter_mut().take(n_l1) {
+                *slot = br.u1()? == 1;
+            }
+        }
+        for i in 0..n_l1 {
+            if pwt.l1.luma_weight_flag[i] {
+                let dlw = br.se()?;
+                let lo = br.se()?;
+                if !(-128..=127).contains(&dlw) || !(-128..=127).contains(&lo) {
+                    return Err(Error::invalid(format!(
+                        "h266 pred_weight_table: L1 luma weight ({dlw}, {lo}) at i={i} \
+                         out of spec range -128..=127",
+                    )));
+                }
+                pwt.l1.luma.push(LumaWeight {
+                    ref_idx: i as u32,
+                    delta_luma_weight: dlw,
+                    luma_offset: lo,
+                });
+            }
+            if chroma_present && pwt.l1.chroma_weight_flag.get(i).copied().unwrap_or(false) {
+                let cb_dw = br.se()?;
+                let cb_do = br.se()?;
+                let cr_dw = br.se()?;
+                let cr_do = br.se()?;
+                for v in [cb_dw, cb_do, cr_dw, cr_do] {
+                    if !(-128..=127).contains(&v) {
+                        return Err(Error::invalid(format!(
+                            "h266 pred_weight_table: L1 chroma value {v} at i={i} \
+                             out of spec range -128..=127",
+                        )));
+                    }
+                }
+                pwt.l1.chroma.push(ChromaWeight {
+                    ref_idx: i as u32,
+                    delta_chroma_weight_cb: cb_dw,
+                    delta_chroma_offset_cb: cb_do,
+                    delta_chroma_weight_cr: cr_dw,
+                    delta_chroma_offset_cr: cr_do,
+                });
+            }
+        }
+    }
+    Ok(pwt)
+}
+
+/// §7.4.7 — derive `LumaWeightLN[i]` for record `i`. When the per-i
+/// `luma_weight_lN_flag == 1`, returns `(1 << luma_log2_weight_denom) +
+/// delta_luma_weight_lN[i]`; otherwise the spec-inferred
+/// `2^luma_log2_weight_denom`.
+pub fn derive_luma_weight(table: &PredWeightTableList, log2_weight_denom: u32, i: u32) -> i32 {
+    let base = 1i32 << log2_weight_denom;
+    if let Some(rec) = table.luma.iter().find(|l| l.ref_idx == i) {
+        base + rec.delta_luma_weight
+    } else {
+        base
+    }
+}
+
+/// §7.4.7 — derive `LumaOffsetLN[i]` for record `i`. Returns
+/// `luma_offset_lN[i]` when present, else 0 (the spec-inferred value).
+pub fn derive_luma_offset(table: &PredWeightTableList, i: u32) -> i32 {
+    table
+        .luma
+        .iter()
+        .find(|l| l.ref_idx == i)
+        .map(|l| l.luma_offset)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -821,5 +1124,189 @@ mod tests {
         let ph = parse_picture_header_stateful(&bytes, &sps, &pps).unwrap();
         assert!(ph.ph_sao_luma_enabled_flag);
         assert!(!ph.ph_sao_chroma_enabled_flag);
+    }
+
+    // ---- §7.3.8 pred_weight_table parser tests -----------------------
+
+    fn push_se(bits: &mut Vec<u8>, value: i32) {
+        let code = if value <= 0 {
+            (-(value as i64) * 2) as u32
+        } else {
+            (value as i64 * 2 - 1) as u32
+        };
+        push_ue(bits, code);
+    }
+
+    /// Minimal PH-carried table: `luma_log2_weight_denom = 6`,
+    /// `delta_chroma_log2_weight_denom = 0`, `num_l0_weights = 1`,
+    /// `luma_weight_l0_flag[0] = 0`, `chroma_weight_l0_flag[0] = 0`,
+    /// `pps_weighted_bipred_flag = false` so L1 is skipped. Verify the
+    /// inferred `LumaWeightL0[0] = 64` (= 1 << 6).
+    #[test]
+    fn pred_weight_table_minimal_l0_only() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 6); // luma_log2_weight_denom = 6
+        push_se(&mut bits, 0); // delta_chroma_log2_weight_denom = 0
+        push_ue(&mut bits, 1); // num_l0_weights = 1
+        push_u(&mut bits, 0, 1); // luma_weight_l0_flag[0] = 0
+        push_u(&mut bits, 0, 1); // chroma_weight_l0_flag[0] = 0
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let pwt = parse_pred_weight_table(&mut br, true, false, true, 0).unwrap();
+        assert_eq!(pwt.luma_log2_weight_denom, 6);
+        assert_eq!(pwt.delta_chroma_log2_weight_denom, 0);
+        assert_eq!(pwt.l0.num_weights, 1);
+        assert_eq!(pwt.l0.luma_weight_flag, vec![false]);
+        assert_eq!(pwt.l0.chroma_weight_flag, vec![false]);
+        assert!(pwt.l0.luma.is_empty());
+        assert!(pwt.l0.chroma.is_empty());
+        // Inferred LumaWeightL0[0] = 1 << 6 = 64.
+        assert_eq!(
+            derive_luma_weight(&pwt.l0, pwt.luma_log2_weight_denom, 0),
+            64
+        );
+        assert_eq!(derive_luma_offset(&pwt.l0, 0), 0);
+        // L1 is skipped (pps_weighted_bipred_flag = false).
+        assert_eq!(pwt.l1.num_weights, 0);
+    }
+
+    /// L0 record with explicit luma weight: delta_luma = -8, offset = 16.
+    /// Result: LumaWeightL0[0] = 64 + (-8) = 56.
+    #[test]
+    fn pred_weight_table_explicit_luma_weight() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 6); // luma_log2_weight_denom = 6
+        push_se(&mut bits, 0); // delta_chroma_log2_weight_denom
+        push_ue(&mut bits, 1); // num_l0_weights = 1
+        push_u(&mut bits, 1, 1); // luma_weight_l0_flag[0] = 1
+        push_u(&mut bits, 0, 1); // chroma_weight_l0_flag[0] = 0
+        push_se(&mut bits, -8); // delta_luma_weight_l0[0]
+        push_se(&mut bits, 16); // luma_offset_l0[0]
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let pwt = parse_pred_weight_table(&mut br, true, false, true, 0).unwrap();
+        assert_eq!(pwt.l0.luma.len(), 1);
+        let rec = pwt.l0.luma[0];
+        assert_eq!(rec.ref_idx, 0);
+        assert_eq!(rec.delta_luma_weight, -8);
+        assert_eq!(rec.luma_offset, 16);
+        // Eq. derived: LumaWeightL0[0] = 64 + (-8) = 56.
+        assert_eq!(
+            derive_luma_weight(&pwt.l0, pwt.luma_log2_weight_denom, 0),
+            56
+        );
+        assert_eq!(derive_luma_offset(&pwt.l0, 0), 16);
+    }
+
+    /// L1 walk fires when pps_weighted_bipred_flag = true and
+    /// num_ref_entries_l1 > 0. Verify two-record L0 + one-record L1.
+    #[test]
+    fn pred_weight_table_l0_and_l1_walks() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 5); // luma_log2_weight_denom = 5
+        push_se(&mut bits, 1); // delta_chroma_log2 = 1 → ChromaLog2 = 6
+                               // L0
+        push_ue(&mut bits, 2); // num_l0_weights = 2
+        push_u(&mut bits, 1, 1); // luma_weight_l0_flag[0] = 1
+        push_u(&mut bits, 0, 1); // luma_weight_l0_flag[1] = 0
+        push_u(&mut bits, 0, 1); // chroma_weight_l0_flag[0] = 0
+        push_u(&mut bits, 0, 1); // chroma_weight_l0_flag[1] = 0
+        push_se(&mut bits, 4); // delta_luma_weight_l0[0]
+        push_se(&mut bits, -2); // luma_offset_l0[0]
+                                // L1
+        push_ue(&mut bits, 1); // num_l1_weights = 1
+        push_u(&mut bits, 0, 1); // luma_weight_l1_flag[0] = 0
+        push_u(&mut bits, 0, 1); // chroma_weight_l1_flag[0] = 0
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let pwt = parse_pred_weight_table(&mut br, true, true, true, 1).unwrap();
+        assert_eq!(pwt.l0.num_weights, 2);
+        assert_eq!(pwt.l0.luma.len(), 1);
+        assert_eq!(pwt.l0.luma[0].delta_luma_weight, 4);
+        assert_eq!(pwt.l0.luma[0].luma_offset, -2);
+        assert_eq!(pwt.l1.num_weights, 1);
+        assert!(pwt.l1.luma.is_empty()); // luma_weight_l1_flag[0] == 0
+                                         // Inferred values: LumaWeightL0[1] = 32 (1 << 5), L1[0] = 32.
+        assert_eq!(
+            derive_luma_weight(&pwt.l0, pwt.luma_log2_weight_denom, 1),
+            32
+        );
+        assert_eq!(
+            derive_luma_weight(&pwt.l1, pwt.luma_log2_weight_denom, 0),
+            32
+        );
+    }
+
+    /// L1 block is suppressed when `num_ref_entries_l1 == 0` even
+    /// with `pps_weighted_bipred_flag = true` (P-slice in disguise).
+    #[test]
+    fn pred_weight_table_l1_suppressed_when_no_l1_refs() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 4); // luma_log2_weight_denom
+        push_se(&mut bits, 0);
+        push_ue(&mut bits, 1); // num_l0_weights = 1
+        push_u(&mut bits, 0, 1);
+        push_u(&mut bits, 0, 1);
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        // num_ref_entries_l1 = 0 — L1 walk skipped.
+        let pwt = parse_pred_weight_table(&mut br, true, true, true, 0).unwrap();
+        assert_eq!(pwt.l1.num_weights, 0);
+    }
+
+    /// Out-of-spec `luma_log2_weight_denom > 7` is rejected.
+    #[test]
+    fn pred_weight_table_rejects_out_of_range_luma_denom() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 8); // > 7 — invalid
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let err = parse_pred_weight_table(&mut br, false, false, true, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("luma_log2_weight_denom"));
+    }
+
+    /// Chroma is skipped entirely when `chroma_present == false` —
+    /// `delta_chroma_log2_weight_denom` is NOT consumed.
+    #[test]
+    fn pred_weight_table_skips_chroma_when_not_present() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 3); // luma_log2_weight_denom
+                               // chroma fields skipped.
+        push_ue(&mut bits, 1); // num_l0_weights = 1
+        push_u(&mut bits, 0, 1); // luma_weight_l0_flag[0] = 0
+                                 // No chroma_weight_l0_flag emitted because chroma_present = false.
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let pwt = parse_pred_weight_table(&mut br, false, false, true, 0).unwrap();
+        assert_eq!(pwt.luma_log2_weight_denom, 3);
+        assert_eq!(pwt.delta_chroma_log2_weight_denom, 0); // default
+        assert_eq!(pwt.l0.num_weights, 1);
+        assert!(pwt.l0.chroma_weight_flag.is_empty());
+    }
+
+    /// `num_l0_weights` must be in 1..=15. Reject `num_l0_weights = 0`.
+    #[test]
+    fn pred_weight_table_rejects_zero_num_l0_weights() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 6);
+        push_se(&mut bits, 0);
+        push_ue(&mut bits, 0); // num_l0_weights = 0 — invalid
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let err = parse_pred_weight_table(&mut br, true, false, true, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("num_l0_weights"));
+    }
+
+    /// `num_l0_weights` upper bound: rejects 16.
+    #[test]
+    fn pred_weight_table_rejects_too_large_num_l0_weights() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_ue(&mut bits, 6);
+        push_se(&mut bits, 0);
+        push_ue(&mut bits, 16); // num_l0_weights = 16 — invalid
+        let bytes = pack(&bits);
+        let mut br = BitReader::new(&bytes);
+        let err = parse_pred_weight_table(&mut br, true, false, true, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("num_l0_weights"));
     }
 }

@@ -6,6 +6,50 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **`pred_weight_table()` parsing — §7.3.8** — the picture header
+  parser now walks the explicit weighted prediction table when
+  `(pps_weighted_pred_flag || pps_weighted_bipred_flag) &&
+  pps_wp_info_in_ph_flag` (the in-PH path); the round-28 baseline
+  surfaced `Error::Unsupported` here. New top-level
+  [`parse_pred_weight_table`](src/picture_header.rs) reads
+  `luma_log2_weight_denom` (range-checked to 0..=7), the optional
+  `delta_chroma_log2_weight_denom` (range-checked so
+  `ChromaLog2WeightDenom ∈ 0..=7`), `num_l0_weights` (1..=15),
+  per-i `luma_weight_l0_flag` / `chroma_weight_l0_flag` (skipped when
+  `chroma_present == false`), the per-record
+  `(delta_luma_weight_l0[i], luma_offset_l0[i])` (each in -128..=127),
+  and the chroma quad
+  `(delta_chroma_weight_l0[i][j], delta_chroma_offset_l0[i][j])`
+  for `j ∈ {Cb, Cr}`. The L1 walk fires when
+  `pps_weighted_bipred_flag && pps_wp_info_in_ph_flag &&
+  num_ref_entries[1][RplsIdx[1]] > 0`; `num_ref_entries_l1` is
+  threaded in from the PH-level RPL. New types
+  [`PredWeightTable`](src/picture_header.rs) /
+  [`PredWeightTableList`](src/picture_header.rs) /
+  [`LumaWeight`](src/picture_header.rs) /
+  [`ChromaWeight`](src/picture_header.rs) hold the parsed structure;
+  [`derive_luma_weight`](src/picture_header.rs) /
+  [`derive_luma_offset`](src/picture_header.rs) implement the §7.4.7
+  inferences (`LumaWeightLN[i] = (1 << luma_log2_weight_denom) +
+  delta_luma_weight_lN[i]` when the per-i flag is 1, else
+  `2^luma_log2_weight_denom`; offset defaults to 0). The
+  reconstruction pipeline does not yet apply the parsed weights
+  (the §8.5.6.6.3 explicit weighted sample prediction process is a
+  future round); this commit covers the parser-side gap so the PH
+  now walks end-to-end on bitstreams that signal weighted prediction
+  in the PH. The slice-header path (when
+  `pps_wp_info_in_ph_flag == 0`) is left as a future increment —
+  `parse_pred_weight_table` accepts the flag and pins
+  `num_weights = 0` in that mode (slice-header callers will need to
+  thread `NumRefIdxActive[N]` separately).
+  Test count: 538 unit (was 530, +8 covering the minimal-L0 path,
+  explicit luma weight derivation, two-record L0 + one-record L1,
+  the L1-suppression-when-no-L1-refs gate, the chroma-skip path
+  when `chroma_present == false`, the out-of-range
+  `luma_log2_weight_denom > 7` rejection, the
+  `num_l0_weights == 0` rejection, and the `num_l0_weights > 15`
+  rejection).
+
 - **BCW — Bi-prediction with CU-level Weights (§8.5.6.6.2 eq. 981)** —
   the bi-pred MC path now applies explicit weighted blending when the
   chosen merge candidate carries `bcw_idx > 0` and CIIP is off. New
