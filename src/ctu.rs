@@ -74,7 +74,7 @@ use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::inter::{
-    apply_mmvd_to_base, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
+    apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
     predict_chroma_block, predict_chroma_block_bipred, predict_luma_block,
     predict_luma_block_bipred, HmvpTable, MotionField, MotionVector, MvField, ReferencePicture,
@@ -1699,24 +1699,53 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
         let mut chosen = mlist[idx];
 
-        // Round-27 §8.5.2.7 — Merge with Motion Vector Differences. When
+        // §8.5.2.7 — Merge with Motion Vector Differences. When
         // `mmvd_merge_flag == 1`, the parser already inferred
         // `merge_idx == mmvd_cand_flag` (∈ {0, 1}) so `chosen` holds the
         // base candidate. Derive `MmvdOffset` from
         // `(mmvd_distance_idx, mmvd_direction_idx, ph_mmvd_fullpel_only)`
         // per Tables 17 / 18 + eqs. 188 / 189, then fold it into the
-        // base candidate's per-list MVs via [`apply_mmvd_to_base`]. The
-        // collocated-reference uni-pred fixture (`equal_poc_distance =
-        // false` is irrelevant in that path) is the round-27 acceptance
-        // case; bi-pred symmetric refinement is also wired but the
-        // asymmetric §8.5.2.7 distScaleFactor branches are deferred.
+        // base candidate's per-list MVs via
+        // [`apply_mmvd_to_base_with_poc`]. POC distances are pulled
+        // from the chosen candidate's `(refIdxLN, RefPicListN)`
+        // pointers; this dispatches into the equal-POC shortcut
+        // (eqs. 557 – 560), the opposite-sign branch (eqs. 564 / 565),
+        // or the §8.5.2.12 distScaleFactor scaling (eqs. 561 – 580 /
+        // 601 – 605) automatically based on the POC layout. LT refs
+        // are not modelled yet — passed through as `false` to keep the
+        // short-term branch active.
         if info.inter.merge_data.mmvd_merge_flag {
             let off = derive_mmvd_offset(
                 info.inter.merge_data.mmvd_distance_idx,
                 info.inter.merge_data.mmvd_direction_idx,
                 self.ph_mmvd_fullpel_only,
             );
-            chosen = apply_mmvd_to_base(&chosen, off, /*equal_poc_distance*/ true);
+            let poc_l0 = if chosen.pred_flag_l0 && chosen.ref_idx_l0 >= 0 {
+                self.ref_pic_list_l0
+                    .get(chosen.ref_idx_l0 as usize)
+                    .map(|r| r.poc)
+                    .unwrap_or(self.current_poc)
+            } else {
+                self.current_poc
+            };
+            let poc_l1 = if chosen.pred_flag_l1 && chosen.ref_idx_l1 >= 0 {
+                self.ref_pic_list_l1
+                    .get(chosen.ref_idx_l1 as usize)
+                    .map(|r| r.poc)
+                    .unwrap_or(self.current_poc)
+            } else {
+                self.current_poc
+            };
+            let curr_poc_diff_l0 = self.current_poc.wrapping_sub(poc_l0);
+            let curr_poc_diff_l1 = self.current_poc.wrapping_sub(poc_l1);
+            chosen = apply_mmvd_to_base_with_poc(
+                &chosen,
+                off,
+                curr_poc_diff_l0,
+                curr_poc_diff_l1,
+                /*lt_l0*/ false,
+                /*lt_l1*/ false,
+            );
         }
 
         if !chosen.pred_flag_l0 && !chosen.pred_flag_l1 {

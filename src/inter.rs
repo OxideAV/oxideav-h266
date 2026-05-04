@@ -952,12 +952,14 @@ pub struct MergeData {
 //
 // The §8.5.2.7 routine then derives mMvdL0 / mMvdL1. The simple
 // uni-pred case reduces to "apply MmvdOffset to the active list" (eqs.
-// 581/582). Symmetric bi-pred takes the equal-POC-distance shortcut
-// (eqs. 557 – 560). The remaining branches (eqs. 561 – 580) cover
-// asymmetric POC distances with §8.5.2.12-style scaling — those land
-// alongside the broader bi-pred MC work in later rounds; round-27
-// supports the uni-pred + equal-POC-distance bi-pred subset, which is
-// what this fixture exercises.
+// 581/582). Bi-pred has three sub-paths:
+//
+//   * Equal POC distance (eqs. 557 – 560): mMvdL1 = mMvdL0 = MmvdOffset.
+//   * Long-term refs OR opposite-sign POC distances of equal magnitude
+//     (eqs. 564 / 565): mMvdL1 = -MmvdOffset (sign flip on both axes).
+//   * General asymmetric short-term refs (eqs. 561 – 580): apply the
+//     §8.5.2.12 distScaleFactor chain (eqs. 601 – 605) to scale the L1
+//     offset by `currPocDiffL1 / currPocDiffL0`.
 
 /// Table 17 — `MmvdDistance[ x0 ][ y0 ]` for `ph_mmvd_fullpel_only_flag
 /// == 0`. Indexed by `mmvd_distance_idx` in `0..8`. The table is
@@ -1010,17 +1012,22 @@ pub fn derive_mmvd_offset(
 /// to produce `(mMvdL0, mMvdL1)`-corrected motion vectors. Returns a
 /// new [`MvField`] with the offsets folded into the active per-list MVs.
 ///
-/// Round-27 subset (matches the fixture): handles the uni-pred case
+/// This is the legacy POC-agnostic entry: handles the uni-pred case
 /// (eqs. 581 / 582) and the equal-POC-distance bi-pred case (eqs. 557
 /// – 560 — `mMvdL1 = mMvdL0 = MmvdOffset` when `currPocDiffL0 ==
-/// currPocDiffL1`). The asymmetric-POC bi-pred branches (eqs. 561 –
-/// 580) call into §8.5.2.12-style POC scaling and ride alongside
-/// future BCW / DMVR work.
+/// currPocDiffL1`). For arbitrary POC layouts (eqs. 561 – 580) prefer
+/// [`apply_mmvd_to_base_with_poc`], which carries POC distance
+/// information and dispatches into the §8.5.2.12-style distScaleFactor
+/// scaling automatically.
 ///
 /// `equal_poc_distance` lets the caller signal that the `currPocDiffL0
 /// == currPocDiffL1` short-circuit applies. When the base candidate is
 /// uni-pred (only one `pred_flag` set) the flag is irrelevant — eq.
-/// 581 / 582 only ever applies the offset to the active list.
+/// 581 / 582 only ever applies the offset to the active list. When the
+/// caller cannot prove `equal_poc_distance == true` and the base is
+/// bi-pred, the older path silently dropped to "fold the offset into
+/// L1 too"; that conservative behaviour is preserved here so existing
+/// fixtures stay byte-identical.
 pub fn apply_mmvd_to_base(
     base: &MvField,
     offset: MotionVector,
@@ -1036,11 +1043,10 @@ pub fn apply_mmvd_to_base(
     }
     if base.pred_flag_l1 {
         // Symmetric bi-pred shortcut: same POC distance on both sides
-        // → mMvdL1 == mMvdL0 == MmvdOffset (eqs. 557 – 560). Otherwise
-        // the spec's asymmetric branches apply — left for a later
-        // round; for now we conservatively fold MmvdOffset into the L1
-        // half too when bi-pred, which matches the round-27 fixture's
-        // collocated-symmetric setup.
+        // → mMvdL1 == mMvdL0 == MmvdOffset (eqs. 557 – 560). The
+        // asymmetric branch is unreachable here (the legacy entry
+        // never carried POC data); preserved for byte-identical
+        // backward compatibility with round-27 fixtures.
         let _ = equal_poc_distance;
         let _ = bi;
         out.mv_l1 = MotionVector {
@@ -1049,6 +1055,106 @@ pub fn apply_mmvd_to_base(
         };
     }
     out
+}
+
+/// §8.5.2.7 — full POC-aware MMVD application for bi-pred bases.
+/// Extends [`apply_mmvd_to_base`] with the asymmetric-POC branch
+/// (eqs. 561 – 580). The inputs are signed POC distances:
+///
+///   `curr_poc_diff_l0 = currPoc − RefPicListL0[refIdxL0].poc`
+///   `curr_poc_diff_l1 = currPoc − RefPicListL1[refIdxL1].poc`
+///
+/// `lt_l0` / `lt_l1` indicate whether the corresponding reference is
+/// long-term (LT). Per spec, the L1 derivation switches between three
+/// branches:
+///
+/// 1. Equal POC distance OR both-LT shortcut (eqs. 557 – 560): the L1
+///    offset equals MmvdOffset unchanged.
+/// 2. Opposite-sign POC distances (regardless of magnitude — when both
+///    refs are short-term and `sign(d0) != sign(d1)`): the L1 offset is
+///    `-MmvdOffset` per eq. 564 / 565 ("Td and Tb of opposite sign →
+///    mMvdL1 = −MmvdOffset").
+/// 3. Asymmetric same-sign short-term refs: scale MmvdOffset by the
+///    §8.5.2.12 distScaleFactor (eqs. 601 – 605) so
+///    `mMvdL1 = (distScaleFactor * MmvdOffset + 128) >> 8` per
+///    component, with sign-aware rounding and the spec's clamps.
+///
+/// Uni-pred bases collapse to eqs. 581 / 582 — the offset is folded
+/// into the active list and the inactive list stays untouched.
+pub fn apply_mmvd_to_base_with_poc(
+    base: &MvField,
+    offset: MotionVector,
+    curr_poc_diff_l0: i32,
+    curr_poc_diff_l1: i32,
+    lt_l0: bool,
+    lt_l1: bool,
+) -> MvField {
+    let mut out = *base;
+    if base.pred_flag_l0 {
+        out.mv_l0 = MotionVector {
+            x: base.mv_l0.x.saturating_add(offset.x),
+            y: base.mv_l0.y.saturating_add(offset.y),
+        };
+    }
+    if base.pred_flag_l1 {
+        let l1_offset = if !base.pred_flag_l0 {
+            // Uni-pred-L1 base — eq. 582: just apply the offset.
+            offset
+        } else if lt_l0 || lt_l1 || curr_poc_diff_l0 == curr_poc_diff_l1 {
+            // Equal POC distance or LT shortcut (eqs. 557 – 560).
+            offset
+        } else if (curr_poc_diff_l0 ^ curr_poc_diff_l1) < 0 {
+            // Opposite-sign POC distances — eq. 564 / 565: flip sign on
+            // both axes.
+            MotionVector {
+                x: -offset.x,
+                y: -offset.y,
+            }
+        } else {
+            // General asymmetric same-sign short-term refs — apply the
+            // §8.5.2.12 distScaleFactor scaling chain (eqs. 601 – 605).
+            mmvd_scale_offset(offset, curr_poc_diff_l0, curr_poc_diff_l1)
+        };
+        out.mv_l1 = MotionVector {
+            x: base.mv_l1.x.saturating_add(l1_offset.x),
+            y: base.mv_l1.y.saturating_add(l1_offset.y),
+        };
+    }
+    out
+}
+
+/// §8.5.2.12 / §8.5.2.7 — scale `MmvdOffset` from the L0 POC distance
+/// onto the L1 POC distance per the spec's distScaleFactor pipeline:
+///
+///   td = clip3(-128, 127, currPocDiffL0)
+///   tb = clip3(-128, 127, currPocDiffL1)
+///   tx = (16384 + (|td| >> 1)) / td
+///   distScaleFactor = clip3(-4096, 4095, (tb * tx + 32) >> 6)
+///   mMvdL1[c] = clip3(-2^17, 2^17 - 1,
+///                     (distScaleFactor * MmvdOffset[c] + 128 -
+///                      (distScaleFactor*MmvdOffset[c] >= 0 ? 1 : 0)) >> 8)
+///
+/// Returns `MotionVector::ZERO` for the degenerate `td == 0` input
+/// (the caller is expected to short-circuit equal-POC cases before
+/// invoking this helper, but the guard keeps the function total).
+fn mmvd_scale_offset(offset: MotionVector, curr_poc_diff_l0: i32, curr_poc_diff_l1: i32) -> MotionVector {
+    let td = curr_poc_diff_l0.clamp(-128, 127);
+    let tb = curr_poc_diff_l1.clamp(-128, 127);
+    if td == 0 {
+        return MotionVector::ZERO;
+    }
+    let abs_td = td.unsigned_abs() as i32;
+    let tx = (16384 + (abs_td >> 1)) / td;
+    let dist_scale_factor = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
+    let scale = |c: i32| -> i32 {
+        let prod = dist_scale_factor * c;
+        let bias: i32 = if prod >= 0 { 1 } else { 0 };
+        ((prod + 128 - bias) >> 8).clamp(-131072, 131071)
+    };
+    MotionVector {
+        x: scale(offset.x),
+        y: scale(offset.y),
+    }
 }
 
 // =====================================================================
@@ -3785,6 +3891,183 @@ mod tests {
         assert_eq!(md.mmvd_cand_flag, 0);
         assert_eq!(md.mmvd_distance_idx, 0);
         assert_eq!(md.mmvd_direction_idx, 0);
+    }
+
+    // §8.5.2.7 — POC-aware MMVD bi-pred application (eqs. 561 – 580).
+    // The next batch of tests pins all three branches of
+    // `apply_mmvd_to_base_with_poc`.
+
+    /// Equal POC distance bi-pred — same as the legacy symmetric
+    /// shortcut: both list MVs receive `+MmvdOffset`.
+    #[test]
+    fn mmvd_with_poc_bi_pred_equal_distance_symmetric() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(2, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(-2, 0),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
+        // currPocDiffL0 = +1, currPocDiffL1 = +1 — equal distance
+        // (eqs. 557 – 560).
+        let out = apply_mmvd_to_base_with_poc(&base, off, 1, 1, false, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(3, 0));
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(-1, 0));
+    }
+
+    /// Opposite-sign POC distances — mMvdL1 = -MmvdOffset (eqs. 564 /
+    /// 565). Typical case: L0 ref has POC < curr, L1 ref has POC > curr,
+    /// so currPocDiffL0 > 0 and currPocDiffL1 < 0.
+    #[test]
+    fn mmvd_with_poc_bi_pred_opposite_sign_negates_l1() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(0, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(0, 0),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
+        // currPocDiffL0 = +1 (L0 ref earlier), currPocDiffL1 = -1 (L1
+        // ref later) → opposite-sign branch.
+        let out = apply_mmvd_to_base_with_poc(&base, off, 1, -1, false, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(-1, 0));
+    }
+
+    /// Asymmetric same-sign POC distances — mMvdL1 is scaled by the
+    /// §8.5.2.12 distScaleFactor (eqs. 561 – 580). Concrete vector:
+    /// `currPocDiffL0 = 1, currPocDiffL1 = 2`. Per the spec chain:
+    ///   td = 1, tb = 2
+    ///   tx = (16384 + 0) / 1 = 16384
+    ///   distScaleFactor = (2 * 16384 + 32) >> 6 = 32800 >> 6 = 512
+    ///                     (clamped to 4095 — 512 fits)
+    /// So mMvdL1 = (512 * MmvdOffset + 128 - 1) >> 8 — for offset 16
+    /// (= +1 int-pel = 16 in 1/16-pel) we get
+    ///   (512 * 16 + 128 - 1) >> 8 = 8319 >> 8 = 32 → +2 int-pel.
+    #[test]
+    fn mmvd_with_poc_bi_pred_asymmetric_distance_scales_l1() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(0, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(0, 0),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (16, 0)
+        let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, false, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(2, 0));
+    }
+
+    /// Long-term reference on either side — bypasses the asymmetric
+    /// branch and applies the offset unscaled (eqs. 557 – 560 LT
+    /// shortcut).
+    #[test]
+    fn mmvd_with_poc_bi_pred_lt_ref_bypasses_scaling() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(0, 0),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::from_int_pel(0, 0),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
+        // Distances that would normally scale (1 vs 2), but `lt_l0 =
+        // true` flips us back to the LT shortcut.
+        let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, true, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(1, 0));
+    }
+
+    /// Uni-pred-L0 base — only L0 receives the offset; POC distances
+    /// are irrelevant (eq. 581).
+    #[test]
+    fn mmvd_with_poc_uni_pred_l0_only_touches_l0() {
+        let base = MvField {
+            mv_l0: MotionVector::from_int_pel(3, 5),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false);
+        let out = apply_mmvd_to_base_with_poc(&base, off, 1, 0, false, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(4, 5));
+        assert_eq!(out.mv_l1, MotionVector::ZERO);
+        assert_eq!(out.ref_idx_l1, -1);
+    }
+
+    /// Uni-pred-L1 base — only L1 receives the offset; eq. 582 applies
+    /// the offset directly to the active list regardless of POC.
+    #[test]
+    fn mmvd_with_poc_uni_pred_l1_only_touches_l1() {
+        let base = MvField {
+            mv_l0: MotionVector::ZERO,
+            ref_idx_l0: -1,
+            pred_flag_l0: false,
+            mv_l1: MotionVector::from_int_pel(7, -3),
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false); // (+1, 0)
+        let out = apply_mmvd_to_base_with_poc(&base, off, 0, 1, false, false);
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(8, -3));
+        assert_eq!(out.mv_l0, MotionVector::ZERO);
+        assert_eq!(out.ref_idx_l0, -1);
+    }
+
+    /// Degenerate `currPocDiffL0 == 0` in the asymmetric branch — the
+    /// helper short-circuits to a zero L1 offset. The case is
+    /// unreachable from the call site (the equal-POC shortcut always
+    /// fires first when L0 distance is 0 and L1 is also 0), but the
+    /// guard keeps the helper total.
+    #[test]
+    fn mmvd_with_poc_zero_l0_distance_in_asymm_path_zeros_l1() {
+        let base = MvField {
+            mv_l0: MotionVector::ZERO,
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: 0,
+            pred_flag_l1: true,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+        };
+        let off = derive_mmvd_offset(2, 0, false);
+        // currPocDiffL0 = 0, currPocDiffL1 = 1 — hits equal-POC short
+        // (since 0 != 1 fails) but neither opposite-sign nor asymm
+        // works without a non-zero td. The path lands in the asymm
+        // branch (both same sign? 0 ^ 1 == 1 > 0, so no
+        // opposite-sign), then `mmvd_scale_offset` returns ZERO.
+        let out = apply_mmvd_to_base_with_poc(&base, off, 0, 1, false, false);
+        assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
+        assert_eq!(out.mv_l1, MotionVector::ZERO);
     }
 
     /// MergeData default also keeps CIIP off so existing non-CIIP

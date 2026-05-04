@@ -84,9 +84,16 @@ the **intra-only single-tile single-slice subset** plus the round-28
   `MmvdOffset` per Tables 17 + 18 + eqs. 188 / 189 (regular `{1/4,
   1/2, 1, 2, 4, 8, 16, 32}` luma steps or `ph_mmvd_fullpel_only_flag`-
   scaled `{1, 2, 4, 8, 16, 32, 64, 128}` luma steps) and
-  `apply_mmvd_to_base` folds it into the chosen base candidate's per-
-  list MVs (uni-pred eqs. 581 / 582 + symmetric bi-pred eqs. 557 –
-  560). **Round-28 lands §8.5.6.7 CIIP (Combined Inter-Intra
+  `apply_mmvd_to_base_with_poc` folds it into the chosen base
+  candidate's per-list MVs across all four §8.5.2.7 branches: uni-pred
+  (eqs. 581 / 582), symmetric bi-pred / equal-POC / LT shortcut
+  (eqs. 557 – 560), opposite-sign POC bi-pred (eqs. 564 / 565 — `mMvdL1
+  = -MmvdOffset`), and asymmetric same-sign short-term ref bi-pred
+  (eqs. 561 – 580 with the §8.5.2.12 `distScaleFactor` chain — `td =
+  clip(-128, 127, currPocDiffL0)`, `tx = (16384 + |td|>>1)/td`,
+  `distScaleFactor = clip(-4096, 4095, (tb*tx + 32) >> 6)`, then
+  `mMvdL1 = clip(-2^17, 2^17-1, (distScaleFactor*MmvdOffset + 128 -
+  (prod>=0)) >> 8)`). **Round-28 lands §8.5.6.7 CIIP (Combined Inter-Intra
   Prediction):** when `sps_ciip_enabled_flag = 1` and the §7.3.11.7
   gates open (`cu_skip_flag == 0`, `cbW * cbH ≥ 64`, `cbW < 128`,
   `cbH < 128`), the leaf CU reader parses `regular_merge_flag` (Table

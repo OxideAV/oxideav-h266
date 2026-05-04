@@ -6,6 +6,37 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **MMVD asymmetric POC bi-pred (§8.5.2.7 eqs. 561 – 580)** — extends
+  the round-27 MMVD apply pass with the full §8.5.2.7 bi-pred branch
+  ladder. Round-27 only handled the equal-POC-distance shortcut
+  (eqs. 557 – 560) and conservatively folded `MmvdOffset` into the L1
+  half regardless of POC layout; that lost bit-accuracy on any
+  bi-pred MMVD CU with asymmetric short-term references. The new
+  [`apply_mmvd_to_base_with_poc`](src/inter.rs) takes
+  `(currPocDiffL0, currPocDiffL1, lt_l0, lt_l1)` and dispatches into
+  three paths per spec: (1) equal POC distance OR LT-ref shortcut →
+  `mMvdL1 = MmvdOffset` (eqs. 557 – 560), (2) opposite-sign POC
+  distances → `mMvdL1 = -MmvdOffset` (eqs. 564 / 565), (3) asymmetric
+  same-sign short-term refs → scale `MmvdOffset` by the §8.5.2.12
+  `distScaleFactor` chain (eqs. 561 – 580 reusing eqs. 601 – 605:
+  `td = clip(-128, 127, currPocDiffL0)`, `tx = (16384 + |td|>>1)/td`,
+  `distScaleFactor = clip(-4096, 4095, (tb*tx + 32) >> 6)`,
+  `mMvdL1[c] = clip(-2^17, 2^17 - 1, (distScaleFactor*MmvdOffset[c] +
+  128 - (prod>=0)) >> 8)`). Uni-pred bases collapse to eqs. 581 / 582
+  unchanged. The CTU walker MMVD apply site at
+  [`reconstruct_leaf_cu_inter`](src/ctu.rs) now pulls per-list POCs
+  from `RefPicListN[refIdxLN].poc` against `current_poc` and feeds
+  them into the new helper; LT refs are conservatively passed as
+  `false` (the LT-ref short-term distinction is not yet plumbed into
+  the [`ReferencePicture`] type — the asymmetric branch fires only
+  when both refs are short-term, which matches the round-27 fixture's
+  layout exactly so that test stays byte-identical). The legacy
+  POC-agnostic [`apply_mmvd_to_base`] is retained for the
+  unit-test surface but is no longer wired into the pipeline. Test
+  count: 518 unit (was 511, +7 covering equal-POC bi, opposite-sign
+  bi, asymmetric scaled bi, LT-ref bypass, uni-pred-L0, uni-pred-L1,
+  and the degenerate `currPocDiffL0 == 0` guard).
+
 - **Combined Inter-Intra Prediction — CIIP (round-28, §8.5.6.7)** —
   the merge-data sub-tree now lights up the CIIP branch when
   `sps_ciip_enabled_flag == 1`. New `MergeData::ciip_flag` carries the
