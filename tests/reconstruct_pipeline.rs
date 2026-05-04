@@ -2159,3 +2159,165 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     assert!(!centre.cu_skip_flag);
     assert!(centre.mode_inter);
 }
+
+/// Round-31 §8.5.6.5 — BDOF wiring acceptance test.
+///
+/// Builds a 16x8 single-CU B-slice picture with two short-term
+/// references at symmetric POC distance (`current_poc = 1`,
+/// `pocL0 = 0`, `pocL1 = 2` → `currPocDiff_L0 = 1` matches
+/// `pocL1 - currPoc = 1`). The merge candidate selected is the
+/// bipred zero-MV pad (`bcw_idx == 0`, both `pred_flag` set,
+/// `MotionModelIdc == 0`, no sub-block / sym-MVD / CIIP /
+/// weighted-pred), so every §8.5.5.1 bullet is satisfied. With
+/// `sps_bdof_enabled_flag = 1` and `ph_bdof_disabled_flag = 0`
+/// the §8.5.6.5 refinement runs in place of the eq. 980 average.
+///
+/// Both reference luma planes carry **distinct** horizontal ramps
+/// — L0 is `value = x` and L1 is `value = 32 + x` — so the §8.5.6.5
+/// gradient sums in eqs. 962–965 are non-zero and the per-sub-block
+/// `(vx, vy)` solver picks a non-zero refinement. The eq. 977
+/// `pbSamples` therefore differ from the plain `(predL0 + predL1
+/// + 1) >> 1` average in at least some pixels of the CU rectangle.
+///
+/// To build the eq. 980 reference we re-run the whole pipeline with
+/// `ph_bdof_disabled_flag = 1` (everything else identical, including
+/// the CABAC payload) and compare luma planes. The chroma planes
+/// must remain byte-identical between the two runs because BDOF
+/// only refines the luma plane (`cIdx == 0` bullet of §8.5.5.1).
+#[test]
+fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 8u32;
+
+    // ---- Build two distinct reference pictures (L0 / L1) ------------
+    // Mirror the bdof unit-test pattern in `src/bdof.rs`: L0 carries
+    // a 2-D ramp `(10 + x*8 + y*2)` and L1 is the same ramp with a
+    // 1-sample horizontal shift. With that pattern the §8.5.6.5
+    // gradient sums are *asymmetric* between the two lists (gh0 != gh1
+    // along the shifted axis), which drives a non-zero `vx`
+    // refinement and an observable per-pixel `bdofOffset`.
+    let mut ref_l0_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    let mut ref_l1_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            let v0 = (10 + x * 8 + y * 2) as u8;
+            ref_l0_buf.luma.samples[y * pic_w as usize + x] = v0;
+            let xp = x.saturating_sub(1);
+            ref_l1_buf.luma.samples[y * pic_w as usize + x] = (10 + xp * 8 + y * 2) as u8;
+        }
+    }
+    // Chroma planes left at the mid-grey fill — BDOF must not touch
+    // them, so a flat field exposes any accidental write.
+    let make_l0 = || ReferencePicture {
+        poc: 0,
+        frame: ref_l0_buf.clone(),
+        motion_field: None,
+    };
+    let make_l1 = || ReferencePicture {
+        poc: 2,
+        frame: ref_l1_buf.clone(),
+        motion_field: None,
+    };
+
+    // ---- B-slice CABAC payload synthesis ----------------------------
+    // Single 16x8 leaf CU (split_cu_flag = 0 at the top level), then
+    // cu_skip_flag = 1 + merge_idx = 0 → mergeCandList[0] = bipred
+    // zero-MV pad.
+    let slice_qp = 26;
+    let init_type = 2u8;
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+
+    let payload = {
+        let mut enc = ArithEncoder::new();
+        let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 8, 1, 1, 1, 1, 1) as usize;
+        let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+        enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+            .unwrap();
+        let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        let skip_slot = (init_type as usize) * 3 + skip_inc;
+        enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
+            .unwrap();
+        // general_merge_flag inferred to 1 (skip CU); merge_idx bin 0.
+        let merge_inc = ctx_inc_merge_idx() as usize;
+        let merge_slot = (init_type as usize + merge_inc).min(merge_idx_ctxs.len() - 1);
+        enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        enc.finish()
+    };
+
+    // ---- SPS / PPS / SH for a B-slice on a 16x8 picture with BDOF ----
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    sps.tool_flags.bdof_enabled_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::B,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+
+    // ---- Run 1: BDOF ON (ph_bdof_disabled_flag = 0) -----------------
+    let mut walker_on = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker_on.set_ref_pic_list_l0(vec![make_l0()]);
+    walker_on.set_ref_pic_list_l1(vec![make_l1()]);
+    // current_poc = 1 → symmetric distance to L0 (poc=0) and L1 (poc=2).
+    walker_on.set_temporal_mvp(/*current_poc*/ 1, false, true, 0);
+    walker_on.set_ph_bdof_disabled(false);
+    let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker_on.decode_picture_into(&mut out_on).unwrap();
+
+    // ---- Run 2: BDOF OFF (ph_bdof_disabled_flag = 1, gating fails) --
+    let mut walker_off = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker_off.set_ref_pic_list_l0(vec![make_l0()]);
+    walker_off.set_ref_pic_list_l1(vec![make_l1()]);
+    walker_off.set_temporal_mvp(/*current_poc*/ 1, false, true, 0);
+    // Default for ph_bdof_disabled is `true`; spell it out for clarity.
+    walker_off.set_ph_bdof_disabled(true);
+    let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker_off.decode_picture_into(&mut out_off).unwrap();
+
+    // ---- Compare ----------------------------------------------------
+    // The eq. 980 reference is the byte-exact average across the
+    // whole CU rectangle.
+    let expected_avg: Vec<u8> = ref_l0_buf
+        .luma
+        .samples
+        .iter()
+        .zip(&ref_l1_buf.luma.samples)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .collect();
+    assert_eq!(
+        out_off.luma.samples, expected_avg,
+        "BDOF-off run must match the byte-exact eq. 980 average"
+    );
+
+    // BDOF-on output must differ from the plain average in at least
+    // one luma sample — that is the wiring's only observable side
+    // effect at fixture level.
+    assert_ne!(
+        out_on.luma.samples, out_off.luma.samples,
+        "BDOF-on output must differ from BDOF-off (the §8.5.6.5 \
+         refinement is supposed to add a non-zero per-sample offset \
+         on a fixture with non-trivial gradients)"
+    );
+
+    // §8.5.5.1 last bullet: BDOF only refines the luma plane
+    // (`cIdx == 0`). The chroma planes therefore must be byte-
+    // identical between the two runs.
+    assert_eq!(
+        out_on.cb.samples, out_off.cb.samples,
+        "BDOF must not touch the Cb plane"
+    );
+    assert_eq!(
+        out_on.cr.samples, out_off.cr.samples,
+        "BDOF must not touch the Cr plane"
+    );
+}

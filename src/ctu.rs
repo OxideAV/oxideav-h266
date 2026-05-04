@@ -68,6 +68,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
+use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_8bit};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
@@ -617,6 +618,16 @@ pub struct CtuWalker<'a, 'b> {
     /// via [`Self::cu_tool_flags`] so the leaf CU reader can route
     /// it through to [`crate::inter::derive_mmvd_offset`].
     ph_mmvd_fullpel_only: bool,
+    /// Round-31 §8.5.5.1 / §8.5.6.5 — `ph_bdof_disabled_flag`. The
+    /// BDOF picture-level disable that, together with
+    /// `sps_bdof_enabled_flag` (read directly from
+    /// [`Self::sps`]`.tool_flags.bdof_enabled_flag`), drives the
+    /// `bdofUsedFlag` derivation in [`crate::bdof::bdof_used_flag`].
+    /// Defaults to `true` — i.e. BDOF off — so callers that have not
+    /// wired the picture-header bit yet keep the round-23 plain
+    /// `bi_pred_avg_8bit` byte-for-byte. Set via
+    /// [`Self::set_ph_bdof_disabled`].
+    ph_bdof_disabled: bool,
     /// Round-28 §8.5.6.7 — per-picture intra-coded grid sampled at 4x4
     /// luma granularity. The §8.5.6.7 weight ladder reads
     /// `CuPredMode[0][xNbX][yNbX]` for X being the A / B neighbour
@@ -779,6 +790,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             col_ref_idx: 0,
             collocated_from_l0: true,
             ph_mmvd_fullpel_only: false,
+            ph_bdof_disabled: true,
             intra_grid,
             intra_grid_w,
             intra_grid_h,
@@ -888,6 +900,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// to `false`; harmless on bitstreams without MMVD.
     pub fn set_ph_mmvd_fullpel_only(&mut self, enabled: bool) {
         self.ph_mmvd_fullpel_only = enabled;
+    }
+
+    /// Round-31 §8.5.5.1 / §8.5.6.5 — install the picture-header
+    /// `ph_bdof_disabled_flag`. Takes effect for subsequent leaf-CU
+    /// inter dispatches: when this flag is `false` AND the SPS-level
+    /// `sps_bdof_enabled_flag` (read from [`Self::sps`]) is `true` AND
+    /// every other §8.5.5.1 condition holds (symmetric POC distance,
+    /// both refs short-term, no sub-block / sym-MVD / CIIP / BCW /
+    /// weighted-pred / RPR, `cbW * cbH >= 128`), the bipred dispatch
+    /// runs [`crate::bdof::bdof_refine_into`] in place of the eq. 980
+    /// average. Defaults to `true` (BDOF off) so callers that have
+    /// not wired the bit keep the round-23 byte-for-byte pipeline.
+    pub fn set_ph_bdof_disabled(&mut self, disabled: bool) {
+        self.ph_bdof_disabled = disabled;
     }
 
     /// §8.5.2.11 derivation harness for one CU. Returns the Col
@@ -1878,18 +1904,110 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // when bcw_idx == 0 OR ciip_flag == 1; explicit BCW
                 // (eq. 981) with weights from BCW_W_LUT otherwise.
                 let bcw_for_blend = if ciip_active { 0 } else { chosen.bcw_idx };
-                predict_luma_block_bipred_bcw(
-                    &mut out.luma,
-                    cu.cu.x,
-                    cu.cu.y,
-                    cu.cu.w,
-                    cu.cu.h,
-                    &rp0.frame.luma,
-                    chosen.mv_l0,
-                    &rp1.frame.luma,
-                    chosen.mv_l1,
-                    bcw_for_blend,
-                )?;
+
+                // §8.5.5.1 bdofUsedFlag derivation (round-31). The
+                // §8.5.6.5 refinement runs in place of the eq. 980
+                // default-weighted average when every gating bullet
+                // holds. Long-term reference classification is not
+                // modelled by the round-23 [`ReferencePicture`]
+                // record; we conservatively treat both refs as STRP
+                // (matching every existing bipred fixture). Symmetric
+                // POC distance is computed from the per-list
+                // reference POCs against `current_poc`. RPR resampling
+                // is not active in the scaffold.
+                let curr_poc = self.current_poc;
+                let same_diff_poc =
+                    curr_poc.wrapping_sub(rp0.poc) == rp1.poc.wrapping_sub(curr_poc);
+                let bdof_runs = self.sps.tool_flags.bdof_enabled_flag
+                    && bdof_used_flag(
+                        self.ph_bdof_disabled,
+                        chosen.pred_flag_l0,
+                        chosen.pred_flag_l1,
+                        same_diff_poc,
+                        /*is_strp_l0*/ true,
+                        /*is_strp_l1*/ true,
+                        /*motion_model_idc*/ 0,
+                        /*merge_subblock_flag*/ false,
+                        /*sym_mvd_flag*/ false,
+                        ciip_active,
+                        chosen.bcw_idx,
+                        /*luma_weight_l0_flag*/ false,
+                        /*luma_weight_l1_flag*/ false,
+                        /*chroma_weight_l0_flag*/ false,
+                        /*chroma_weight_l1_flag*/ false,
+                        cu.cu.w,
+                        cu.cu.h,
+                        /*rpr_constraints_active_l0*/ false,
+                        /*rpr_constraints_active_l1*/ false,
+                        /*c_idx*/ 0,
+                    );
+
+                if bdof_runs {
+                    // §8.5.6.5 — render each per-list MC into a block-
+                    // sized scratch plane, lift through the
+                    // `(nCbW + 2) × (nCbH + 2)` extended-prediction
+                    // bridge, then run the BDOF refinement straight
+                    // into the output plane. The 8-bit lifter is the
+                    // round-30 best-effort bridge until the §8.5.6.3
+                    // separable filter surfaces its `BitDepth + 6`
+                    // intermediate (tracked as the round-31 followup).
+                    let n_cb_w = cu.cu.w;
+                    let n_cb_h = cu.cu.h;
+                    let mut scratch_l0 = crate::reconstruct::PicturePlane::filled(
+                        n_cb_w as usize,
+                        n_cb_h as usize,
+                        0,
+                    );
+                    let mut scratch_l1 = crate::reconstruct::PicturePlane::filled(
+                        n_cb_w as usize,
+                        n_cb_h as usize,
+                        0,
+                    );
+                    predict_luma_block(
+                        &mut scratch_l0,
+                        0,
+                        0,
+                        n_cb_w,
+                        n_cb_h,
+                        &rp0.frame.luma,
+                        chosen.mv_l0,
+                    )?;
+                    predict_luma_block(
+                        &mut scratch_l1,
+                        0,
+                        0,
+                        n_cb_w,
+                        n_cb_h,
+                        &rp1.frame.luma,
+                        chosen.mv_l1,
+                    )?;
+                    let ext_l0 = build_extended_pred_8bit(&scratch_l0, n_cb_w, n_cb_h)?;
+                    let ext_l1 = build_extended_pred_8bit(&scratch_l1, n_cb_w, n_cb_h)?;
+                    let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+                    bdof_refine_into(
+                        &mut out.luma,
+                        cu.cu.x,
+                        cu.cu.y,
+                        n_cb_w,
+                        n_cb_h,
+                        &ext_l0,
+                        &ext_l1,
+                        bit_depth,
+                    )?;
+                } else {
+                    predict_luma_block_bipred_bcw(
+                        &mut out.luma,
+                        cu.cu.x,
+                        cu.cu.y,
+                        cu.cu.w,
+                        cu.cu.h,
+                        &rp0.frame.luma,
+                        chosen.mv_l0,
+                        &rp1.frame.luma,
+                        chosen.mv_l1,
+                        bcw_for_blend,
+                    )?;
+                }
             }
             (None, None) => unreachable!(), // guarded above
         }

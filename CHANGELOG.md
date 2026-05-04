@@ -6,6 +6,38 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- **BDOF wiring into leaf-CU bipred dispatch — §8.5.5.1 / §8.5.6.5
+  (round 31)** — the round-30 [`bdof`](src/bdof.rs) module is now
+  reachable from [`crate::ctu::CtuWalker`]. The leaf-CU bipred branch
+  in `reconstruct_leaf_cu_inter` derives `bdofUsedFlag` per the
+  §8.5.5.1 bullet list (`ph_bdof_disabled_flag`,
+  `sps_bdof_enabled_flag`, both `predFlagL{0,1}`, symmetric POC
+  distance computed from `current_poc - poc(L0)` vs `poc(L1) - current_poc`,
+  STRP classification of both refs, `MotionModelIdc == 0`, no
+  sub-block / sym-MVD / CIIP / BCW / weighted-pred / RPR,
+  `cbW * cbH >= 128`, `cIdx == 0`); when the gate is open the bipred
+  composition runs the §8.5.6.5 refinement
+  ([`bdof_refine_into`]) instead of the eq. 980 default-weighted
+  average. The 8-bit per-list MC outputs are lifted into the spec's
+  `(nCbW + 2) × (nCbH + 2)` extended layout via the round-30
+  [`build_extended_pred_8bit`] bridge — surfacing the §8.5.6.3
+  separable filter's `BitDepth + 6` precision intermediate is left
+  as a follow-up that would make BDOF spec-byte-identical at all
+  bit depths. New picture-header switch [`CtuWalker::set_ph_bdof_disabled`]
+  exposes `ph_bdof_disabled_flag` to the slice driver; defaults to
+  `true` (BDOF off) so existing tests keep their byte-for-byte
+  baselines. New integration test
+  `decode_b_slice_bdof_refinement_differs_from_bipred_average`
+  builds a 16x8 single-CU B-slice with two short-term references at
+  symmetric POC distance (poc 0 / current 1 / poc 2) and asymmetric
+  per-list ramps (L1 = L0 with a 1-sample horizontal shift), then
+  decodes the same payload twice (BDOF on vs BDOF off) and asserts
+  (a) the BDOF-off luma plane equals the byte-exact eq. 980 average
+  of the two ramps, (b) the BDOF-on luma plane differs from the
+  BDOF-off luma plane (the §8.5.6.5 refinement is observable), and
+  (c) the chroma planes are byte-identical between the two runs
+  (BDOF only refines `cIdx == 0`).
+
 - **Bi-Directional Optical Flow (BDOF) — §8.5.6.5 (round 30)** — new
   [`bdof`](src/bdof.rs) module implements the per-pixel optical-flow
   refinement layered on top of bi-pred motion compensation.
