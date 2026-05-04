@@ -243,38 +243,27 @@ pub fn build_extended_pred_high_precision(
     Ok(out)
 }
 
-/// Apply BDOF refinement (§8.5.6.5 eqs. 958–977) to one CU.
-///
-/// `pred_l0` / `pred_l1` are the spec's `(nCbW + 2) × (nCbH + 2)`
-/// extended high-precision per-list predictions, row-major. `n_cb_w`
-/// and `n_cb_h` must both be multiples of 4 and `>= 8` (the algorithm
-/// works in `4 × 4` sub-blocks; `bdof_used_flag` already enforces the
-/// outer `>= 8` and area `>= 128` bullets).
-///
-/// Output overwrites `dst.samples[(dst_y..dst_y+n_cb_h)]
-/// [(dst_x..dst_x+n_cb_w)]` with the eq. 977 `pbSamples` values
-/// `Clip3(0, (1 << bit_depth) - 1, …)`.
-#[allow(clippy::too_many_arguments)]
-pub fn bdof_refine_into(
-    dst: &mut PicturePlane,
-    dst_x: u32,
-    dst_y: u32,
+/// Validate the geometry / extended-pred-buffer / bit-depth inputs
+/// shared by `bdof_refine_into` and `bdof_refine_into_u16`. Returns
+/// `(ext_w, ext_h)`.
+fn bdof_validate(
     n_cb_w: u32,
     n_cb_h: u32,
     pred_l0: &[i32],
     pred_l1: &[i32],
     bit_depth: u32,
-) -> Result<()> {
+    label: &str,
+) -> Result<(usize, usize)> {
     if n_cb_w == 0 || n_cb_h == 0 || (n_cb_w & 3) != 0 || (n_cb_h & 3) != 0 {
         return Err(Error::invalid(format!(
-            "bdof: nCbW × nCbH = {n_cb_w}x{n_cb_h} must be non-zero multiples of 4",
+            "{label}: nCbW × nCbH = {n_cb_w}x{n_cb_h} must be non-zero multiples of 4",
         )));
     }
     let ext_w = n_cb_w as usize + 2;
     let ext_h = n_cb_h as usize + 2;
     if pred_l0.len() != ext_w * ext_h || pred_l1.len() != ext_w * ext_h {
         return Err(Error::invalid(format!(
-            "bdof: extended prediction arrays must be ({}+2)x({}+2) = {} samples (got L0={}, L1={})",
+            "{label}: extended prediction arrays must be ({}+2)x({}+2) = {} samples (got L0={}, L1={})",
             n_cb_w,
             n_cb_h,
             ext_w * ext_h,
@@ -282,19 +271,31 @@ pub fn bdof_refine_into(
             pred_l1.len(),
         )));
     }
-    if dst_x as usize + n_cb_w as usize > dst.width || dst_y as usize + n_cb_h as usize > dst.height
-    {
-        return Err(Error::invalid(format!(
-            "bdof: destination block ({dst_x},{dst_y}) {n_cb_w}x{n_cb_h} out of plane bounds {}x{}",
-            dst.width, dst.height,
-        )));
-    }
     if !(8..=16).contains(&bit_depth) {
         return Err(Error::invalid(format!(
-            "bdof: bit_depth {bit_depth} out of supported range 8..=16",
+            "{label}: bit_depth {bit_depth} out of supported range 8..=16",
         )));
     }
+    Ok((ext_w, ext_h))
+}
 
+/// Core §8.5.6.5 algorithm — runs the gradient / correlation /
+/// refinement / per-pixel pbSamples pipeline (eqs. 958–977) and
+/// dispatches every clamped output through `write(x, y, value)` where
+/// `(x, y)` are CU-origin-aligned in `0..n_cb_w / 0..n_cb_h` and
+/// `value` is the eq. 977 `Clip3(0, (1 << bit_depth) - 1, …)` result
+/// stored as `i32`. Inputs are pre-validated by [`bdof_validate`].
+fn bdof_apply_kernel<F>(
+    n_cb_w: u32,
+    n_cb_h: u32,
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    bit_depth: u32,
+    ext_w: usize,
+    mut write: F,
+) where
+    F: FnMut(i32, i32, i32),
+{
     // shift4 / offset4 per the spec's "derived as follows" preamble.
     // shift4 = max(3, 15 - BitDepth). offset4 = 1 << (shift4 - 1).
     let shift4 = std::cmp::max(3, 15 - bit_depth as i32);
@@ -425,39 +426,76 @@ pub fn bdof_refine_into(
                     let g_idx_i = (i + 2) as usize;
                     let bdof_offset = vx * (gh0[g_idx_j][g_idx_i] - gh1[g_idx_j][g_idx_i])
                         + vy * (gv0[g_idx_j][g_idx_i] - gv1[g_idx_j][g_idx_i]);
-                    // predSamplesLN[x+1][y+1] in spec terms — x and y
-                    // here are the spec's loop variables (1..=nCbW),
-                    // so the read is at (x+1, y+1) of the extended
-                    // array which also indexes 0..=nCbW+1. The spec
-                    // never clamps these reads — the +1 keeps them
-                    // inside (1..=nCbW+1) when (x, y) ∈ (0..=nCbW).
+                    // predSamplesLN[x+1][y+1] in spec terms — the +1
+                    // keeps reads inside (1..=nCbW+1) when (x, y) ∈
+                    // (0..=nCbW).
                     let p0 = pred_l0[(y + 1) as usize * ext_w + (x + 1) as usize];
                     let p1 = pred_l1[(y + 1) as usize * ext_w + (x + 1) as usize];
                     let blended = (p0 + offset4 + p1 + bdof_offset) >> shift4;
-                    let clamped = blended.clamp(0, max_sample) as u8;
-                    // x, y here are spec loop variables in 0..=nCbW-1 / 0..=nCbH-1
-                    // (xSb-1+i for i in -1..=2, with xSb = (xIdx<<2)+1, so x = xIdx*4 + i + 1
-                    // ranges 0..=nCbW-1 across all sub-blocks). The pbSamples array
-                    // is CU-origin-aligned, so the destination index is (x, y) directly
-                    // — no extra adjustment.
+                    let clamped = blended.clamp(0, max_sample);
                     debug_assert!((0..n_cb_w_i).contains(&x));
                     debug_assert!((0..n_cb_h_i).contains(&y));
-                    let dst_off =
-                        (dst_y as usize + y as usize) * dst.stride + (dst_x as usize + x as usize);
-                    dst.samples[dst_off] = clamped;
+                    write(x, y, clamped);
                 }
             }
         }
     }
+}
 
+/// Apply BDOF refinement (§8.5.6.5 eqs. 958–977) to one CU.
+///
+/// `pred_l0` / `pred_l1` are the spec's `(nCbW + 2) × (nCbH + 2)`
+/// extended high-precision per-list predictions, row-major. `n_cb_w`
+/// and `n_cb_h` must both be multiples of 4 and `>= 8` (the algorithm
+/// works in `4 × 4` sub-blocks; `bdof_used_flag` already enforces the
+/// outer `>= 8` and area `>= 128` bullets).
+///
+/// Output overwrites `dst.samples[(dst_y..dst_y+n_cb_h)]
+/// [(dst_x..dst_x+n_cb_w)]` with the eq. 977 `pbSamples` values
+/// `Clip3(0, (1 << bit_depth) - 1, …)`.
+#[allow(clippy::too_many_arguments)]
+pub fn bdof_refine_into(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    bit_depth: u32,
+) -> Result<()> {
+    let (ext_w, _) = bdof_validate(n_cb_w, n_cb_h, pred_l0, pred_l1, bit_depth, "bdof")?;
+    if dst_x as usize + n_cb_w as usize > dst.width || dst_y as usize + n_cb_h as usize > dst.height
+    {
+        return Err(Error::invalid(format!(
+            "bdof: destination block ({dst_x},{dst_y}) {n_cb_w}x{n_cb_h} out of plane bounds {}x{}",
+            dst.width, dst.height,
+        )));
+    }
+    let dst_stride = dst.stride;
+    let dst_x_us = dst_x as usize;
+    let dst_y_us = dst_y as usize;
+    bdof_apply_kernel(
+        n_cb_w,
+        n_cb_h,
+        pred_l0,
+        pred_l1,
+        bit_depth,
+        ext_w,
+        |x, y, clamped| {
+            let dst_off = (dst_y_us + y as usize) * dst_stride + (dst_x_us + x as usize);
+            dst.samples[dst_off] = clamped as u8;
+        },
+    );
     Ok(())
 }
 
 /// HBD twin of [`bdof_refine_into`] — writes the eq. 977 `pbSamples`
 /// values into a [`PicturePlane16`] at `bit_depth` precision instead
 /// of narrowing to 8 bits. Algorithmics are byte-identical to the u8
-/// path; only the destination type and clip range differ. The
-/// `dst.bit_depth` must equal `bit_depth`.
+/// path (both delegate to the shared `bdof_apply_kernel`); only the
+/// destination type and clip range differ. The `dst.bit_depth` must
+/// equal `bit_depth`.
 #[allow(clippy::too_many_arguments)]
 pub fn bdof_refine_into_u16(
     dst: &mut PicturePlane16,
@@ -469,33 +507,12 @@ pub fn bdof_refine_into_u16(
     pred_l1: &[i32],
     bit_depth: u32,
 ) -> Result<()> {
-    if n_cb_w == 0 || n_cb_h == 0 || (n_cb_w & 3) != 0 || (n_cb_h & 3) != 0 {
-        return Err(Error::invalid(format!(
-            "bdof u16: nCbW × nCbH = {n_cb_w}x{n_cb_h} must be non-zero multiples of 4",
-        )));
-    }
-    let ext_w = n_cb_w as usize + 2;
-    let ext_h = n_cb_h as usize + 2;
-    if pred_l0.len() != ext_w * ext_h || pred_l1.len() != ext_w * ext_h {
-        return Err(Error::invalid(format!(
-            "bdof u16: extended prediction arrays must be ({}+2)x({}+2) = {} samples (got L0={}, L1={})",
-            n_cb_w,
-            n_cb_h,
-            ext_w * ext_h,
-            pred_l0.len(),
-            pred_l1.len(),
-        )));
-    }
+    let (ext_w, _) = bdof_validate(n_cb_w, n_cb_h, pred_l0, pred_l1, bit_depth, "bdof u16")?;
     if dst_x as usize + n_cb_w as usize > dst.width || dst_y as usize + n_cb_h as usize > dst.height
     {
         return Err(Error::invalid(format!(
             "bdof u16: destination block ({dst_x},{dst_y}) {n_cb_w}x{n_cb_h} out of plane bounds {}x{}",
             dst.width, dst.height,
-        )));
-    }
-    if !(8..=16).contains(&bit_depth) {
-        return Err(Error::invalid(format!(
-            "bdof u16: bit_depth {bit_depth} out of supported range 8..=16",
         )));
     }
     if dst.bit_depth != bit_depth {
@@ -504,118 +521,21 @@ pub fn bdof_refine_into_u16(
             dst.bit_depth, bit_depth,
         )));
     }
-
-    let shift4 = std::cmp::max(3, 15 - bit_depth as i32);
-    let offset4: i32 = 1 << (shift4 - 1);
-    let max_sample: i32 = (1i32 << bit_depth) - 1;
-
-    let n_cb_w_i = n_cb_w as i32;
-    let n_cb_h_i = n_cb_h as i32;
-
-    let read_l0 = |hx: i32, vy: i32| -> i32 { pred_l0[vy as usize * ext_w + hx as usize] };
-    let read_l1 = |hx: i32, vy: i32| -> i32 { pred_l1[vy as usize * ext_w + hx as usize] };
-
-    type Win = [[i32; 6]; 6];
-
-    let num_sb_x = n_cb_w as usize / 4;
-    let num_sb_y = n_cb_h as usize / 4;
-
-    for sy in 0..num_sb_y {
-        let y_sb = (sy << 2) as i32 + 1;
-        for sx in 0..num_sb_x {
-            let x_sb = (sx << 2) as i32 + 1;
-
-            let mut gh0: Win = [[0; 6]; 6];
-            let mut gv0: Win = [[0; 6]; 6];
-            let mut gh1: Win = [[0; 6]; 6];
-            let mut gv1: Win = [[0; 6]; 6];
-            let mut diff: Win = [[0; 6]; 6];
-
-            for j in -1i32..=4 {
-                for i in -1i32..=4 {
-                    let x = x_sb + i;
-                    let y = y_sb + j;
-                    let hx = x.clamp(1, n_cb_w_i);
-                    let vy = y.clamp(1, n_cb_h_i);
-                    let gh0v = (read_l0(hx + 1, vy) >> SHIFT1) - (read_l0(hx - 1, vy) >> SHIFT1);
-                    let gv0v = (read_l0(hx, vy + 1) >> SHIFT1) - (read_l0(hx, vy - 1) >> SHIFT1);
-                    let gh1v = (read_l1(hx + 1, vy) >> SHIFT1) - (read_l1(hx - 1, vy) >> SHIFT1);
-                    let gv1v = (read_l1(hx, vy + 1) >> SHIFT1) - (read_l1(hx, vy - 1) >> SHIFT1);
-                    let dv = (read_l0(hx, vy) >> SHIFT2) - (read_l1(hx, vy) >> SHIFT2);
-
-                    let ii = (i + 1) as usize;
-                    let jj = (j + 1) as usize;
-                    gh0[jj][ii] = gh0v;
-                    gv0[jj][ii] = gv0v;
-                    gh1[jj][ii] = gh1v;
-                    gv1[jj][ii] = gv1v;
-                    diff[jj][ii] = dv;
-                }
-            }
-
-            let mut temp_h: Win = [[0; 6]; 6];
-            let mut temp_v: Win = [[0; 6]; 6];
-            for jj in 0..6 {
-                for ii in 0..6 {
-                    temp_h[jj][ii] = (gh0[jj][ii] + gh1[jj][ii]) >> SHIFT3;
-                    temp_v[jj][ii] = (gv0[jj][ii] + gv1[jj][ii]) >> SHIFT3;
-                }
-            }
-
-            let mut s_gx2: i32 = 0;
-            let mut s_gy2: i32 = 0;
-            let mut s_gx_gy: i32 = 0;
-            let mut s_gx_di: i32 = 0;
-            let mut s_gy_di: i32 = 0;
-            for jj in 0..6 {
-                for ii in 0..6 {
-                    let th = temp_h[jj][ii];
-                    let tv = temp_v[jj][ii];
-                    let d = diff[jj][ii];
-                    s_gx2 += th.abs();
-                    s_gy2 += tv.abs();
-                    s_gx_gy += sign(tv) * th;
-                    s_gx_di += -sign(th) * d;
-                    s_gy_di += -sign(tv) * d;
-                }
-            }
-
-            let vx = if s_gx2 > 0 {
-                let raw = (s_gx_di << 2) >> floor_log2(s_gx2);
-                raw.clamp(-MV_REFINE_THRES + 1, MV_REFINE_THRES - 1)
-            } else {
-                0
-            };
-            let vy = if s_gy2 > 0 {
-                let inner = (s_gy_di << 2) - ((vx * s_gx_gy) >> 1);
-                let raw = inner >> floor_log2(s_gy2);
-                raw.clamp(-MV_REFINE_THRES + 1, MV_REFINE_THRES - 1)
-            } else {
-                0
-            };
-
-            for j in -1i32..=2 {
-                for i in -1i32..=2 {
-                    let x = x_sb + i;
-                    let y = y_sb + j;
-                    let g_idx_j = (j + 2) as usize;
-                    let g_idx_i = (i + 2) as usize;
-                    let bdof_offset = vx * (gh0[g_idx_j][g_idx_i] - gh1[g_idx_j][g_idx_i])
-                        + vy * (gv0[g_idx_j][g_idx_i] - gv1[g_idx_j][g_idx_i]);
-                    let p0 = pred_l0[(y + 1) as usize * ext_w + (x + 1) as usize];
-                    let p1 = pred_l1[(y + 1) as usize * ext_w + (x + 1) as usize];
-                    let blended = (p0 + offset4 + p1 + bdof_offset) >> shift4;
-                    let clamped = blended.clamp(0, max_sample) as u16;
-                    debug_assert!((0..n_cb_w_i).contains(&x));
-                    debug_assert!((0..n_cb_h_i).contains(&y));
-                    let dst_off =
-                        (dst_y as usize + y as usize) * dst.stride + (dst_x as usize + x as usize);
-                    dst.samples[dst_off] = clamped;
-                }
-            }
-        }
-    }
-
+    let dst_stride = dst.stride;
+    let dst_x_us = dst_x as usize;
+    let dst_y_us = dst_y as usize;
+    bdof_apply_kernel(
+        n_cb_w,
+        n_cb_h,
+        pred_l0,
+        pred_l1,
+        bit_depth,
+        ext_w,
+        |x, y, clamped| {
+            let dst_off = (dst_y_us + y as usize) * dst_stride + (dst_x_us + x as usize);
+            dst.samples[dst_off] = clamped as u16;
+        },
+    );
     Ok(())
 }
 
