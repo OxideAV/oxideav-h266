@@ -131,23 +131,52 @@ pub fn forward_dct_ii_2d(
             out[y * n_tb_w + x] = c[y];
         }
     }
-    // Step D — final bdShift dual to inverse's `5 + log2_transform_range
-    // - bit_depth = 5 + 15 - 8 = 12` for 8-bit. For the forward
-    // direction we apply the *inverse* shift: scale the coefficients
-    // up by the bit_depth-related factor so the dequant + inverse
-    // transform brings them back.
+    // Step D — final normalisation shift to put coefficients into the
+    // dequant output domain (`d[]` fed to the inverse transform), so that
+    // `quantize_tb_flat(forward_dct_ii_2d(r))` is the proper encoder-side
+    // inverse of `dequantize_tb_flat → inverse_transform_2d`.
     //
-    // Per the round-16 minimum, we use `bd_shift_final = 6 + bit_depth -
-    // log2_transform_range = 6 + 8 - 15 = -1` (i.e. multiply by 2). For
-    // simplicity and because the test fixtures use 8-bit, we encode
-    // this as a single small left-shift.
+    // Derivation (8-bit, log2TrRange=15, square N×N block):
     //
-    // NOTE: the spec's inverse path does `(20 - BitDepth)` total
-    // (split as 7 mid-shift + (13 - BitDepth) final shift). For the
-    // forward direction we'd need to scale up by the same total to
-    // make the round-trip identity. To keep this simple and avoid
-    // overflow we leave the final scaling to the quantiser, which
-    // applies the matching `levelScale[]` factor.
+    //   FDCT_2D with 7-bit mid-shift:
+    //     DC_out = 32 · N² · r   (for flat residual r)
+    //
+    //   Target `d` value so that IDCT_2D(d) = r (all square sizes, 8-bit):
+    //     IDCT_col:  64·d  →  >>7  →  d/2  →  IDCT_row:  64·d/2 = 32·d
+    //     >>bdShift_IDCT(=5+15-8=12):  32·d >> 12 = r  →  d = r·128
+    //     (d_correct = 128·r, independent of N)
+    //
+    //   Ratio = DC_out / d_correct = 32·N²·r / (128·r) = N²/4
+    //   Right-shift = log2(N²/4) = 2·log2(N) − 2
+    //
+    // For a W×H block: generalise to (log2W + log2H) − 2 using integer
+    // floor (this equals 2·log2N − 2 for square blocks).
+    //
+    // The shift is applied with round-to-nearest (add 2^(shift−1)) to
+    // avoid systematic down-bias for AC coefficients.
+    let log2_w = n_tb_w.trailing_zeros();
+    let log2_h = n_tb_h.trailing_zeros();
+    let total_log2 = log2_w + log2_h; // ≥ 4 for min 2×2
+    if total_log2 < 2 {
+        // Tiny (2×1 or 1×2 — degenerate, should not occur in practice).
+        return Ok(out);
+    }
+    let bd_shift_final = (total_log2 - 2) as usize;
+    if bd_shift_final == 0 {
+        // No shift needed (2×2 block: log2W+log2H=2, shift=0).
+        return Ok(out);
+    }
+    let round_final = 1i64 << (bd_shift_final - 1);
+    for v in out.iter_mut() {
+        // Symmetric rounding: round away from zero for exact half-points.
+        let vv = *v as i64;
+        let shifted = if vv >= 0 {
+            (vv + round_final) >> bd_shift_final
+        } else {
+            -((-vv + round_final) >> bd_shift_final)
+        };
+        *v = shifted as i32;
+    }
     Ok(out)
 }
 

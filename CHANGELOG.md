@@ -4,6 +4,13 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Residual CABAC encoder** (`residual_enc`): forward three-pass `encode_tb_coefficients` (sig/gt1/par/gt3/abs_remainder/sign flags per §7.3.10.11), exp-Golomb-k helper, `encode_last_sig_coeff_pos`; round-trips against `decode_tb_coefficients` for levels 1–5, negative levels, scattered positions, and chroma.
+- **SAO encoder** (`sao_enc`): per-CTU mode selection (BO vs EO, all four EO directions) with distortion-only RDO; `sao_decide_picture` integrates into the IDR pipeline.
+- **Encoder pipeline** (`encoder_pipeline`): `encode_idr_with_residuals` (DC intra + forward DCT-II + flat quant + CABAC emit + dequant + IDCT + deblock + SAO); `psnr_y` measurement helper.
+- **Fixed forward DCT-II scaling**: corrected `forward_dct_ii_2d` final normalisation shift from the wrong `7+log2N` formula to the correct `2·log2N−2`, putting FDCT output in the same domain as `dequantize_tb_flat`; PSNR_Y ≥ 30 dB at QP=26 and ≥ 40 dB at QP=0 on a smooth-gradient 64×64 fixture.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-h266/compare/v0.0.4...v0.0.5) - 2026-05-04
 
 ### Other
