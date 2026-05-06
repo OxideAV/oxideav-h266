@@ -290,7 +290,7 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     apply_deblocking(&mut rec, &all_deblock_cus, &dbp, 1);
 
     // SAO decision + apply (luma only for this round).
-    let sao_pic = sao_decide_picture(&src, &rec, 7, 8, true, false);
+    let sao_pic = sao_decide_picture(src, &rec, 7, 8, true, false);
     let sao_cfg = SaoConfig {
         luma_used: true,
         chroma_used: false,
