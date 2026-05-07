@@ -156,8 +156,23 @@ the **intra-only single-tile single-slice subset** plus the round-28
   cross-pinned against them at `bit_depth == 8`. The cascade is
   contained to the new HBD entry points; consumer code opts in by
   switching the buffer type + the corresponding `_u16` calls.
-  No GPM / AMVR yet; affine + scaled-reference filter tables 28 /
-  29 / 30 / 31 / 32 / 34 / 35, DMVR, PROF land in later rounds.
+  **Round-40 lands §8.5.4 + §8.5.7 GPM (Geometric Partitioning Mode)** —
+  the new `gpm` module transcribes Tables 36 + 37, derives
+  `(angleIdx, distanceIdx)` from `merge_gpm_partition_idx`, runs the
+  §8.5.4.2 `(m, n)` / `predListFlagN` derivation (eqs. 646 – 655),
+  and applies the §8.5.7.2 per-pixel weighted blend (eqs. 999 – 1016)
+  on luma + 4:2:0 chroma. The leaf-CU parser reads
+  `merge_gpm_partition_idx` (FL `cMax = 63`), `merge_gpm_idx0` (TR
+  `cMax = MaxNumGpmMergeCand − 1`), `merge_gpm_idx1` (TR `cMax =
+  MaxNumGpmMergeCand − 2`) on B-slices when the §7.3.11.7 GPM gate
+  opens; the CTU walker runs two §8.5.6.3 MC passes followed by
+  the §8.5.7.2 blend. **Round-40 also lands §7.4.11.6 AMVR
+  (Adaptive Motion Vector Resolution) helpers** — Table 16
+  `AmvrShift` for regular / affine / IBC rows, `apply_amvr_shift`
+  (eqs. 161 – 176), `ctx_inc_amvr_*` and Tables 89 / 90 init
+  transcriptions, ready for the upcoming `mvd_coding()` parser.
+  Affine + scaled-reference filter tables 28 / 29 / 30 / 31 / 32
+  / 34 / 35, DMVR, PROF land in later rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
@@ -169,12 +184,14 @@ the **intra-only single-tile single-slice subset** plus the round-28
 * **In-loop filters**: §8.8.3 deblocking, §8.8.4 SAO (Edge + Band
   offset), §8.8.5 ALF including the fixed-filter family + CC-ALF.
 * **Non-skip merge with cu_coded_flag == 1 (residual transform_tree),
-  mvd_coding (non-merge inter), GPM, AMVR, BCW**: still surface
+  mvd_coding (non-merge inter)**: still surface
   `Error::Unsupported`.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in
-  round-27; CIIP — §8.5.6.7 — landed in round-28.)
+  round-27; CIIP — §8.5.6.7 — landed in round-28; GPM — §8.5.4 +
+  §8.5.7 — landed in round-40; AMVR helpers — §7.4.11.6 — landed in
+  round-40.)
 
 ## Usage
 

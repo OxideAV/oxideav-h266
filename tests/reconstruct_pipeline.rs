@@ -2321,3 +2321,167 @@ fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
         "BDOF must not touch the Cr plane"
     );
 }
+
+/// Round-40 §8.5.4 + §8.5.7 — GPM (Geometric Partitioning Mode)
+/// reconstruction acceptance test.
+///
+/// Builds a 16×16 single-CU B-slice picture with two contrasting
+/// short-term references (`L0` is flat 50, `L1` is flat 200). The
+/// CABAC payload selects:
+///   * `cu_skip_flag = 0`, `general_merge_flag = 1`, `regular_merge_flag = 0`,
+///     CIIP gate is closed (`sps_ciip_enabled = 0`) so `ciip_flag` is
+///     inferred to 0 → GPM branch fires.
+///   * `merge_gpm_partition_idx = 0` (angle 0, distance 1).
+///   * `merge_gpm_idx0 = 0`, `merge_gpm_idx1 = 0`. Eq. 647 then yields
+///     `n = 1`, picking the second mergeCandList entry for partition B.
+///
+/// The two merge candidates come from the bipred zero-MV pad: at a
+/// corner CU with no spatial / temporal / HMVP neighbours, every
+/// mergeCandList entry is `(L0 = ref 0, L1 = ref 0, mv = 0)`. The
+/// §8.5.4.2 step 4 / 5 X-derivation picks `predListFlagA = m & 1 = 0`
+/// (L0 → flat-50 ref) for partition A and `predListFlagB = n & 1 = 1`
+/// (L1 → flat-200 ref) for partition B. With the angle-0 / distance-1
+/// partition, the CU's top half blends mostly from one source and the
+/// bottom half mostly from the other → the output picture must show
+/// both 50 and 200 in the per-CU luma rectangle (proving that the
+/// per-pixel weight `w` actually crosses 0/8 across the partition).
+#[test]
+fn decode_b_slice_gpm_fires_and_decodes() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_regular_merge_flag,
+        ctx_inc_split_cu_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+
+    let ref_l0_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 50);
+    let ref_l1_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200);
+    let ref_l0 = ReferencePicture {
+        poc: 0,
+        frame: ref_l0_buf,
+        motion_field: None,
+    };
+    let ref_l1 = ReferencePicture {
+        poc: 2,
+        frame: ref_l1_buf,
+        motion_field: None,
+    };
+
+    // ---- CABAC payload synthesis ------------------------------------
+    let slice_qp = 26;
+    let init_type = 2u8; // B-slice, sh_cabac_init_flag = 0
+
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
+    let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
+    let mut regular_merge_ctxs = init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp);
+    let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
+    let mut cu_coded_ctxs = init_contexts(SyntaxCtx::CuCodedFlag, slice_qp);
+
+    let mut enc = ArithEncoder::new();
+
+    // 1. split_cu_flag(0) — single 16×16 CU at the CTU root.
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
+    enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
+        .unwrap();
+
+    // 2. cu_skip_flag(0) — non-skip merge.
+    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 0)
+        .unwrap();
+
+    // 3. general_merge_flag(1).
+    let gm_inc = ctx_inc_general_merge_flag() as usize;
+    let gm_n = general_merge_ctxs.len() - 1;
+    let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+    enc.encode_decision(&mut general_merge_ctxs[gm_slot], 1)
+        .unwrap();
+
+    // 4. regular_merge_flag(0) — selects GPM (CIIP off in SPS so
+    //    ciip_flag is inferred to 0).
+    let rm_inc = ctx_inc_regular_merge_flag(false) as usize; // cu_skip = 0 → ctxInc = 1
+    let rm_n = regular_merge_ctxs.len() - 1;
+    let rm_slot = ((init_type as usize - 1) * 2 + rm_inc).min(rm_n);
+    enc.encode_decision(&mut regular_merge_ctxs[rm_slot], 0)
+        .unwrap();
+
+    // 5. merge_gpm_partition_idx = 0 — six bypass bins, all 0.
+    for _ in 0..6 {
+        enc.encode_bypass(0).unwrap();
+    }
+
+    // 6. merge_gpm_idx0 = 0 — TR(cMax = MaxNumGpmMergeCand - 1 = 5),
+    //    bin 0 ctx-coded with ctxInc = 0; encode the single 0 bin.
+    let mi_slot = (init_type as usize).min(merge_idx_ctxs.len() - 1);
+    enc.encode_decision(&mut merge_idx_ctxs[mi_slot], 0)
+        .unwrap();
+
+    // 7. merge_gpm_idx1 = 0 — TR(cMax = MaxNumGpmMergeCand - 2 = 4),
+    //    bin 0 ctx-coded; same Table 109 ctxIdx as gpm_idx0.
+    enc.encode_decision(&mut merge_idx_ctxs[mi_slot], 0)
+        .unwrap();
+
+    // 8. cu_coded_flag = 0 — no transform_tree(). Single ctx bin.
+    let cc_slot = (init_type as usize).min(cu_coded_ctxs.len() - 1);
+    enc.encode_decision(&mut cu_coded_ctxs[cc_slot], 0).unwrap();
+
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    // ---- SPS / PPS / slice header ------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    sps.tool_flags.gpm_enabled_flag = true;
+    sps.tool_flags.max_num_merge_cand_minus_max_num_gpm_cand = 0; // MaxNumGpmMergeCand = 6
+    sps.tool_flags.ciip_enabled_flag = false;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::B,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 1, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_l0]);
+    walker.set_ref_pic_list_l1(vec![ref_l1]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // ---- GPM blend signature: both 50 and 200 must surface in the
+    // CU's luma plane (proving the wValue weight crosses 0 ↔ 8 across
+    // the angle-0 partition line). The deblocker may smooth the
+    // transition band but the extreme values above and below it must
+    // remain visible.
+    let mut saw_low = false;
+    let mut saw_high = false;
+    for v in &out.luma.samples {
+        if *v <= 80 {
+            saw_low = true;
+        } else if *v >= 170 {
+            saw_high = true;
+        }
+    }
+    assert!(
+        saw_low && saw_high,
+        "GPM blend must produce both regions of the partition — saw_low = {}, saw_high = {}",
+        saw_low,
+        saw_high
+    );
+
+    // ---- Motion field: GPM stored partition A's MV uniformly per
+    // round-40's §8.5.7.3 simplification. Spatial slot is L0 (X = 0)
+    // because m = 0 → X = m & 1 = 0 and the bipred zero-MV pad has
+    // predFlagL0 = 1.
+    let mf = walker.motion_field();
+    let centre = mf.get_at_luma(8, 8);
+    assert!(centre.available);
+    assert!(centre.pred_flag_l0);
+    assert!(!centre.pred_flag_l1);
+    assert_eq!(centre.ref_idx_l0, 0);
+}

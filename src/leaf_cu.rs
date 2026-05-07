@@ -156,12 +156,24 @@ pub struct CuToolFlags {
     /// inferred to 1) and the §7.4.12.7 `ciip_flag` inference. When
     /// `false` the merge-data parser ignores CIIP entirely.
     pub ciip_enabled: bool,
-    /// `sps_gpm_enabled_flag` — geometric partitioning merge. Round-28
-    /// only carries this so the §7.3.11.7 `regular_merge_flag` gate
-    /// can fire correctly when CIIP and / or GPM is enabled. The
-    /// decoder still surfaces `Error::Unsupported` for any CU that
-    /// would actually take the GPM branch.
+    /// `sps_gpm_enabled_flag` — geometric partitioning merge. Round-40
+    /// (this round) wires the §7.3.11.7 GPM branch end-to-end: the
+    /// `merge_gpm_partition_idx`, `merge_gpm_idx0`, `merge_gpm_idx1`
+    /// syntax elements are parsed and the §8.5.4 / §8.5.7 reconstruction
+    /// path runs through [`crate::gpm`]. Pre-round-40 callers can still
+    /// leave this `false` to fall back to the round-28 CIIP-only
+    /// behaviour.
     pub gpm_enabled: bool,
+    /// `MaxNumGpmMergeCand` — derived per §7.4.3.4 eq. 60 from
+    /// `sps_max_num_merge_cand_minus_max_num_gpm_cand`. Caps the GPM
+    /// merge-cand list size and drives the TR binarisation of
+    /// `merge_gpm_idx0` (`cMax = MaxNumGpmMergeCand − 1`) and
+    /// `merge_gpm_idx1` (`cMax = MaxNumGpmMergeCand − 2`).
+    pub max_num_gpm_merge_cand: u32,
+    /// True for B-slices. The §7.3.11.7 GPM branch is gated on this
+    /// (P-slices never enter GPM); the round-21..30 paths only ever
+    /// consulted `slice_is_inter`.
+    pub slice_is_b: bool,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -291,6 +303,10 @@ impl Default for LeafCuInfo {
                     mmvd_distance_idx: 0,
                     mmvd_direction_idx: 0,
                     ciip_flag: false,
+                    gpm_flag: false,
+                    gpm_partition_idx: 0,
+                    gpm_idx0: 0,
+                    gpm_idx1: 0,
                 },
             },
         }
@@ -1059,15 +1075,19 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         let ciip_size_ok = (cb_w as u64 * cb_h as u64) >= 64;
         // Pure-CIIP regular_merge_flag gate (P-slice or non-GPM B-slice).
         let ciip_branch_open = self.tools.ciip_enabled && !cu_skip && ciip_size_ok && cb_under_128;
-        // GPM is gated additionally on B-slice + ratio limits, but the
-        // crate hasn't wired sh_slice_type into the leaf reader yet —
-        // the only consumer that knows is the CTU walker. For now
-        // assume GPM never enables the regular_merge_flag gate for our
-        // own fixtures (the leaf reader surfaces Unsupported when the
-        // CIIP/GPM disambiguation path would actually pick GPM). This
-        // matches the round-28 scope: CIIP + (P-slice or CIIP-only B
-        // slice).
-        let gpm_branch_open = false;
+        // §7.3.11.7 GPM gate (round-40): B-slice only, square-ish CU
+        // (8 ≤ side < 8 × other_side), under 128, !cu_skip, GPM enabled in
+        // SPS with at least 2 GPM merge candidates.
+        let gpm_size_ok = cb_w >= 8
+            && cb_h >= 8
+            && (cb_w as u64) < 8u64 * cb_h as u64
+            && (cb_h as u64) < 8u64 * cb_w as u64;
+        let gpm_branch_open = self.tools.gpm_enabled
+            && self.tools.slice_is_b
+            && self.tools.max_num_gpm_merge_cand >= 2
+            && !cu_skip
+            && cb_under_128
+            && gpm_size_ok;
 
         let regular_merge_flag = if cb_under_128 && (ciip_branch_open || gpm_branch_open) {
             let inc = ctx_inc_regular_merge_flag(cu_skip) as usize;
@@ -1127,48 +1147,59 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             }
         } else {
             // §7.3.11.7 — `regular_merge_flag == 0` branch. Either CIIP
-            // or GPM fires. The leaf reader handles the CIIP-only path
-            // (round-28); GPM is surfaced as Unsupported. The CIIP
-            // gate per §7.3.11.7 only opens when both CIIP **and** GPM
-            // are enabled; outside that gate the spec §7.4.12.7
-            // inference picks ciip_flag = 1 unconditionally when the
-            // CIIP size-and-skip conditions are met (which they must
-            // be — otherwise the regular_merge_flag gate would not
-            // have opened). For our round-28 scope GPM is gated off,
-            // so ciip_flag is always inferred to 1 here.
-            let ciip_parse_gate = false;
+            // or GPM fires. Round-40 lights up the GPM path; CIIP stays
+            // wired from round-28. The §7.3.11.7 ciip_flag bin is parsed
+            // **only** when both CIIP and GPM gates are open
+            // simultaneously (forcing the decoder to disambiguate); when
+            // only one of the two is open, §7.4.12.7 infers ciip_flag
+            // (= 1 for CIIP-only, = 0 for GPM-only).
+            let ciip_parse_gate = ciip_branch_open && gpm_branch_open;
             let ciip_flag = if ciip_parse_gate {
-                // Reserved for the future B-slice CIIP-vs-GPM
-                // disambiguation. The branch is unreachable today
-                // (gpm_branch_open = false) but the bin would be:
-                // let inc = ctx_inc_ciip_flag() as usize;
-                // let slot = (init_type - 1) + inc;
-                // self.dec.decode_decision(&mut self.ctxs.ciip_flag[slot])?
-                false
+                let n = self.ctxs.ciip_flag.len();
+                let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
+                self.dec.decode_decision(&mut self.ctxs.ciip_flag[slot])? == 1
             } else {
-                // §7.4.12.7 inference: with CIIP enabled, regular_merge
-                // == 0, !cu_skip, cb_under_128, cbW*cbH >= 64 →
-                // ciip_flag = 1.
-                self.tools.ciip_enabled && !cu_skip && cb_under_128 && ciip_size_ok
+                // §7.4.12.7 inference: when only the CIIP gate is open
+                // → ciip_flag = 1; when only the GPM gate is open
+                // → ciip_flag = 0; if neither is open, the
+                // regular_merge_flag inference (above) already selected
+                // regular_merge = 1 so this branch is unreachable.
+                ciip_branch_open && !gpm_branch_open
             };
             info.inter.merge_data.ciip_flag = ciip_flag;
 
-            if !ciip_flag {
-                // GPM branch (or any other non-CIIP non-regular merge
-                // path) is out of scope.
-                return Err(Error::unsupported(
-                    "h266 leaf CU inter: non-CIIP non-regular merge (GPM / subblock) not yet \
-                     supported (round-28 only handles regular merge + CIIP)",
+            if ciip_flag {
+                // CIIP branch — read merge_idx if MaxNumMergeCand > 1.
+                let merge_idx = if max_merge > 1 {
+                    self.read_merge_idx(max_merge)?
+                } else {
+                    0
+                };
+                info.inter.merge_data.merge_idx = merge_idx;
+            } else if gpm_branch_open {
+                // §7.3.11.7 GPM branch — read merge_gpm_partition_idx,
+                // merge_gpm_idx0, merge_gpm_idx1.
+                info.inter.merge_data.gpm_flag = true;
+                info.inter.merge_data.gpm_partition_idx = self.read_merge_gpm_partition_idx()?;
+                let max_gpm = self.tools.max_num_gpm_merge_cand;
+                info.inter.merge_data.gpm_idx0 = self.read_merge_gpm_idx0(max_gpm)?;
+                info.inter.merge_data.gpm_idx1 = if max_gpm >= 3 {
+                    self.read_merge_gpm_idx1(max_gpm)?
+                } else {
+                    0
+                };
+                // §7.4.12.7 — merge_idx is unused in the GPM branch,
+                // mergeCandList[m] / [n] are looked up directly.
+                info.inter.merge_data.merge_idx = 0;
+            } else {
+                // Truly neither branch open and regular_merge_flag was
+                // explicitly parsed as 0 — spec-illegal in any well-
+                // formed VVC stream, but bail cleanly.
+                return Err(Error::invalid(
+                    "h266 leaf CU inter: regular_merge_flag = 0 with neither CIIP nor GPM \
+                     branches open (spec §7.3.11.7 violation)",
                 ));
             }
-
-            // CIIP branch — read merge_idx if MaxNumMergeCand > 1.
-            let merge_idx = if max_merge > 1 {
-                self.read_merge_idx(max_merge)?
-            } else {
-                0
-            };
-            info.inter.merge_data.merge_idx = merge_idx;
         }
 
         // Skip CUs (cu_skip_flag == 1) carry no residual. Non-skip
@@ -1255,6 +1286,79 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             return Ok(0);
         }
         let cmax = max_merge - 1;
+        let init_type_offset = self.ctxs.init_type as usize;
+        let n = self.ctxs.merge_idx.len() - 1;
+        let ctx_idx = init_type_offset.min(n);
+        let bit0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.merge_idx[ctx_idx])?;
+        if bit0 == 0 {
+            return Ok(0);
+        }
+        let mut val = 1u32;
+        while val < cmax {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
+    }
+
+    /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
+    /// binarisation with `cMax = 63` (six bypass-coded bins, MSB first).
+    /// Returns the decoded value in `0..=63`.
+    fn read_merge_gpm_partition_idx(&mut self) -> Result<u32> {
+        let mut val = 0u32;
+        for _ in 0..6 {
+            let bit = self.dec.decode_bypass()? as u32;
+            val = (val << 1) | bit;
+        }
+        Ok(val)
+    }
+
+    /// Decode `merge_gpm_idx0[x0][y0]` per Table 132 — TR binarisation
+    /// with `cMax = MaxNumGpmMergeCand − 1` and `cRiceParam = 0`. Bin 0
+    /// is ctx-coded against the Table 109 `merge_idx` slot (initType-
+    /// indexed); subsequent bins are bypass-coded. Returns the decoded
+    /// index in `0..=cMax`.
+    fn read_merge_gpm_idx0(&mut self, max_gpm: u32) -> Result<u32> {
+        if max_gpm < 2 {
+            return Ok(0);
+        }
+        let cmax = max_gpm - 1;
+        let init_type_offset = self.ctxs.init_type as usize;
+        let n = self.ctxs.merge_idx.len() - 1;
+        let ctx_idx = init_type_offset.min(n);
+        let bit0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.merge_idx[ctx_idx])?;
+        if bit0 == 0 {
+            return Ok(0);
+        }
+        let mut val = 1u32;
+        while val < cmax {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
+    }
+
+    /// Decode `merge_gpm_idx1[x0][y0]` per Table 132 — TR binarisation
+    /// with `cMax = MaxNumGpmMergeCand − 2` and `cRiceParam = 0`. Bin 0
+    /// is ctx-coded against the same Table 109 slot as
+    /// `merge_gpm_idx0`; subsequent bins are bypass-coded. Returns the
+    /// decoded index in `0..=cMax`. The §8.5.4.2 eq. 647 increment past
+    /// `merge_gpm_idx0` is applied later by [`crate::gpm::derive_gpm_mn`].
+    fn read_merge_gpm_idx1(&mut self, max_gpm: u32) -> Result<u32> {
+        if max_gpm < 3 {
+            return Ok(0);
+        }
+        let cmax = max_gpm - 2;
         let init_type_offset = self.ctxs.init_type as usize;
         let n = self.ctxs.merge_idx.len() - 1;
         let ctx_idx = init_type_offset.min(n);
@@ -2026,6 +2130,8 @@ mod tests {
             ph_mmvd_fullpel_only: false,
             ciip_enabled: false,
             gpm_enabled: false,
+            max_num_gpm_merge_cand: 0,
+            slice_is_b: false,
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();

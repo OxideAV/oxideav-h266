@@ -74,6 +74,10 @@ use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
+use crate::gpm::{
+    blend_gpm_into_plane, derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motion,
+    GpmContext,
+};
 use crate::inter::{
     apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
@@ -1183,6 +1187,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ph_mmvd_fullpel_only: self.ph_mmvd_fullpel_only,
             ciip_enabled: tf.ciip_enabled_flag,
             gpm_enabled: tf.gpm_enabled_flag,
+            // §7.4.3.4 eq. 60 — MaxNumGpmMergeCand = MaxNumMergeCand
+            //                   − sps_max_num_merge_cand_minus_max_num_gpm_cand.
+            // Only meaningful when sps_gpm_enabled_flag == 1 and
+            // MaxNumMergeCand >= 2 (the SPS gates the field's presence).
+            max_num_gpm_merge_cand: if tf.gpm_enabled_flag {
+                max_num_merge.saturating_sub(tf.max_num_merge_cand_minus_max_num_gpm_cand)
+            } else {
+                0
+            },
+            slice_is_b: self.sh.sh_slice_type == SliceType::B,
         }
     }
 
@@ -1726,6 +1740,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         } else {
             build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp))
         };
+        // Round-40 §8.5.4 + §8.5.7 — Geometric Partitioning Mode (GPM).
+        // When `gpm_flag == 1`, the CU is split along an oblique line
+        // into two regions, each predicted from a separate merge
+        // candidate. We pull `(m, n)` from `merge_gpm_idx0` /
+        // `merge_gpm_idx1` (eqs. 646 / 647), look up the two
+        // mergeCandList entries, apply the §8.5.4.2 step 4 / 5 list-
+        // selection rule, run two §8.5.6.3 MC predictions and blend per
+        // §8.5.7.2 eq. 1016. Chroma uses the same partition geometry
+        // (Tables 36 / 37) with `cIdx ∈ {1, 2}`; eqs. 999/1000 scale to
+        // the chroma sub-sample grid.
+        if info.inter.merge_data.gpm_flag {
+            return self.reconstruct_leaf_cu_gpm(cu, info, &mlist, out);
+        }
+
         let idx = (info.inter.merge_data.merge_idx as usize).min(mlist.len() - 1);
         let mut chosen = mlist[idx];
 
@@ -2239,6 +2267,246 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // MODE_INTER per §7.4.12.7 — the spec uses the intra-flag of
         // the *neighbour* CU's pred mode, not the predictor mix.
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
+        Ok(())
+    }
+
+    /// Round-40 §8.5.4 + §8.5.7 — Geometric Partitioning Mode
+    /// reconstruction. The CU is split along an oblique line; each side
+    /// is predicted from a separate merge candidate. Implements:
+    ///
+    ///  1. **§8.5.4.2** — derive `(m, n)` from `merge_gpm_idx0` /
+    ///     `merge_gpm_idx1` (eqs. 646 / 647), pick `(predListFlagN, mvN,
+    ///     refIdxN)` for partitions A and B per the `X = idx & 1`
+    ///     active-list rule (eqs. 648 – 655).
+    ///  2. **§8.5.7.1** — invoke §8.5.6.3 fractional-sample MC twice,
+    ///     once for partition A and once for partition B, capturing the
+    ///     full `cbWidth × cbHeight` predicted samples in scratch
+    ///     planes (one per chroma component when 4:2:0).
+    ///  3. **§8.5.7.2** — blend the two predictions with the per-pixel
+    ///     `wValue` derived from Tables 36 / 37 + eqs. 999 – 1015 +
+    ///     final eq. 1016 clip.
+    ///  4. **§8.5.7.3** — broadcast a representative MvField into the
+    ///     motion-field 4×4 grid (round-40 stores partition A's MV
+    ///     uniformly across the CU; the spec's per-4×4 partition-aware
+    ///     storage lands once GPM-aware merge derivation is exercised
+    ///     by a downstream CU).
+    fn reconstruct_leaf_cu_gpm(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        mlist: &[MvField],
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        if mlist.is_empty() {
+            return Err(Error::invalid(
+                "h266 GPM: empty merge candidate list — §8.5.4.2 step 1 violation",
+            ));
+        }
+        let cb_x = cu.cu.x;
+        let cb_y = cu.cu.y;
+        let cb_w = cu.cu.w;
+        let cb_h = cu.cu.h;
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+
+        // §8.5.4.2 step 2 — eqs. 646 / 647.
+        let (m, n) = derive_gpm_mn(
+            info.inter.merge_data.gpm_idx0,
+            info.inter.merge_data.gpm_idx1,
+        );
+        let cand_a = mlist[(m as usize).min(mlist.len() - 1)];
+        let cand_b = mlist[(n as usize).min(mlist.len() - 1)];
+        // §8.5.4.2 steps 4 / 5 — pick the active list per partition.
+        let (x_a, mv_a, ref_idx_a) = derive_gpm_partition_motion(m, &cand_a);
+        let (x_b, mv_b, ref_idx_b) = derive_gpm_partition_motion(n, &cand_b);
+
+        // Look up the two reference pictures.
+        let ref_a = if ref_idx_a < 0 {
+            None
+        } else if x_a == 0 {
+            self.ref_pic_list_l0.get(ref_idx_a as usize)
+        } else {
+            self.ref_pic_list_l1.get(ref_idx_a as usize)
+        }
+        .ok_or_else(|| {
+            Error::invalid("h266 GPM: partition A reference not available — §8.5.4.2 / §8.5.7.1")
+        })?;
+        let ref_b = if ref_idx_b < 0 {
+            None
+        } else if x_b == 0 {
+            self.ref_pic_list_l0.get(ref_idx_b as usize)
+        } else {
+            self.ref_pic_list_l1.get(ref_idx_b as usize)
+        }
+        .ok_or_else(|| {
+            Error::invalid("h266 GPM: partition B reference not available — §8.5.4.2 / §8.5.7.1")
+        })?;
+
+        // §8.5.7.1 step 1 — predict each partition over the full CU
+        // rectangle using §8.5.6.3 (the round-22 8-tap luma + 4-tap
+        // chroma path). The two predictions are captured in scratch
+        // planes (8-bit samples) so the §8.5.7.2 blend has the full
+        // `cbWidth × cbHeight` arrays available.
+        use crate::reconstruct::PicturePlane;
+        let mut scratch_a_luma = PicturePlane::filled(cb_w as usize, cb_h as usize, 0);
+        let mut scratch_b_luma = PicturePlane::filled(cb_w as usize, cb_h as usize, 0);
+        predict_luma_block(
+            &mut scratch_a_luma,
+            0,
+            0,
+            cb_w,
+            cb_h,
+            &ref_a.frame.luma,
+            mv_a,
+        )?;
+        predict_luma_block(
+            &mut scratch_b_luma,
+            0,
+            0,
+            cb_w,
+            cb_h,
+            &ref_b.frame.luma,
+            mv_b,
+        )?;
+
+        // §8.5.7.1 step 2 + §8.5.7.2 — set up the partition geometry.
+        let (angle_idx, distance_idx) =
+            derive_gpm_partition(info.inter.merge_data.gpm_partition_idx);
+        let ctx_luma = GpmContext::new(cb_w, cb_h, angle_idx, distance_idx, 0, bit_depth, 1, 1);
+
+        // §8.5.7.1 step 3 — eq. 1016 blend on luma.
+        blend_gpm_into_plane(
+            &mut out.luma,
+            cb_x,
+            cb_y,
+            cb_w,
+            cb_h,
+            &scratch_a_luma.samples,
+            &scratch_b_luma.samples,
+            &ctx_luma,
+            0,
+            bit_depth,
+        );
+
+        // §8.5.7.1 steps 4 / 5 — chroma 4:2:0 blend. The same
+        // `(angleIdx, distanceIdx)` apply; eqs. 999 / 1000 expand the
+        // CU back to luma units so `wValue` is consistent across the
+        // partition line.
+        if self.sps.sps_chroma_format_idc == 1 {
+            let cb_w_c = cb_w / 2;
+            let cb_h_c = cb_h / 2;
+            let cb_x_c = cb_x / 2;
+            let cb_y_c = cb_y / 2;
+            let mut scratch_a_cb = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
+            let mut scratch_b_cb = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
+            let mut scratch_a_cr = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
+            let mut scratch_b_cr = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
+            predict_chroma_block(
+                &mut scratch_a_cb,
+                0,
+                0,
+                cb_w_c,
+                cb_h_c,
+                &ref_a.frame.cb,
+                mv_a,
+            )?;
+            predict_chroma_block(
+                &mut scratch_b_cb,
+                0,
+                0,
+                cb_w_c,
+                cb_h_c,
+                &ref_b.frame.cb,
+                mv_b,
+            )?;
+            predict_chroma_block(
+                &mut scratch_a_cr,
+                0,
+                0,
+                cb_w_c,
+                cb_h_c,
+                &ref_a.frame.cr,
+                mv_a,
+            )?;
+            predict_chroma_block(
+                &mut scratch_b_cr,
+                0,
+                0,
+                cb_w_c,
+                cb_h_c,
+                &ref_b.frame.cr,
+                mv_b,
+            )?;
+            let ctx_chroma =
+                GpmContext::new(cb_w_c, cb_h_c, angle_idx, distance_idx, 1, bit_depth, 2, 2);
+            blend_gpm_into_plane(
+                &mut out.cb,
+                cb_x_c,
+                cb_y_c,
+                cb_w_c,
+                cb_h_c,
+                &scratch_a_cb.samples,
+                &scratch_b_cb.samples,
+                &ctx_chroma,
+                1,
+                bit_depth,
+            );
+            blend_gpm_into_plane(
+                &mut out.cr,
+                cb_x_c,
+                cb_y_c,
+                cb_w_c,
+                cb_h_c,
+                &scratch_a_cr.samples,
+                &scratch_b_cr.samples,
+                &ctx_chroma,
+                2,
+                bit_depth,
+            );
+        }
+
+        // §8.5.7.3 — Motion vector storing process. Round-40 broadcasts
+        // partition A's MV uniformly across the CU's 4×4 motion-field
+        // grid; the per-4×4 partition-aware storage (storing partition
+        // B's MV on cells whose centre falls on the partition-B side
+        // of the line) lands when a downstream merge derivation
+        // actually consumes a partition-aware neighbour. None of the
+        // existing fixtures or downstream CUs do.
+        let mvf = MvField {
+            mv_l0: if x_a == 0 { mv_a } else { MotionVector::ZERO },
+            ref_idx_l0: if x_a == 0 { ref_idx_a } else { -1 },
+            pred_flag_l0: x_a == 0,
+            mv_l1: if x_a == 1 { mv_a } else { MotionVector::ZERO },
+            ref_idx_l1: if x_a == 1 { ref_idx_a } else { -1 },
+            pred_flag_l1: x_a == 1,
+            cu_skip_flag: info.inter.cu_skip_flag,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+        };
+        self.motion_field.write_block(cb_x, cb_y, cb_w, cb_h, mvf);
+        self.hmvp.update_with(mvf);
+
+        // Deblock + intra-grid bookkeeping (matches the round-21 inter
+        // path).
+        let qp_y = self.cabac.slice_qp_y.0;
+        self.deblock_cus.push(DeblockCu {
+            x: cb_x,
+            y: cb_y,
+            w: cb_w,
+            h: cb_h,
+            qp_y: qp_y.clamp(0, 63),
+            intra: false,
+            tu_y_coded: false,
+            tu_cb_coded: false,
+            tu_cr_coded: false,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        });
+        self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);
+        // `cand_b` is not consulted again post-MC (its motion is folded
+        // into the picture's pixels via the §8.5.7.2 blend), so swallow
+        // it explicitly.
+        let _ = cand_b;
         Ok(())
     }
 

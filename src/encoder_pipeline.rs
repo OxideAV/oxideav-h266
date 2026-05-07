@@ -300,6 +300,14 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     };
     crate::sao::apply_sao(&mut rec, &sao_pic, &sao_cfg);
 
+    // Round-40 — ALF on/off RDO with §7.4.3.18 fixed filter set 0
+    // (no APS dependency). The RDO chooses, per CTB, the lower-SSE_Y
+    // option between (a) leaving the post-SAO samples in place and
+    // (b) running the §8.8.5.2 luma diamond filter on top of them.
+    // Chroma ALF stays off in this round; the per-CTB on/off picture
+    // is captured for the future bitstream-emit round.
+    let _alf_pic = crate::alf_enc::alf_decide_and_apply(src, &mut rec, 7, 8, 1);
+
     // Build the IDR slice NAL: header bytes + CABAC bytes + trailing bits.
     let mut slice_rbsp = slice_header_bytes;
     slice_rbsp.extend_from_slice(&cabac_bytes);

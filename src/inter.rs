@@ -944,6 +944,25 @@ pub struct MergeData {
     /// §7.4.12.7 when CIIP is the only enabled non-regular branch
     /// (i.e. `sps_gpm_enabled_flag == 0`).
     pub ciip_flag: bool,
+    /// `MergeGpmFlag[x0][y0]` — round-40 §8.5.4 / §8.5.7. `true` when
+    /// the CU uses geometric partitioning. Set when `regular_merge_flag
+    /// == 0`, `ciip_flag == 0`, the §7.3.11.7 GPM gates are met
+    /// (`sps_gpm_enabled_flag == 1`, B-slice, `8 ≤ cbW < 8*cbH`,
+    /// `8 ≤ cbH < 8*cbW`, `cbW < 128`, `cbH < 128`,
+    /// `cu_skip_flag == 0`).
+    pub gpm_flag: bool,
+    /// `merge_gpm_partition_idx[x0][y0]` — FL `cMax = 63` partition shape
+    /// selector (Table 36). Six bypass-coded bins. Inferred to 0 when
+    /// not present.
+    pub gpm_partition_idx: u32,
+    /// `merge_gpm_idx0[x0][y0]` — TR `cMax = MaxNumGpmMergeCand − 1`
+    /// merge-cand index for partition A. Bin 0 ctx-coded (Table 109,
+    /// shared with `merge_idx`); subsequent bins bypass-coded.
+    pub gpm_idx0: u32,
+    /// `merge_gpm_idx1[x0][y0]` — TR `cMax = MaxNumGpmMergeCand − 2`
+    /// merge-cand index for partition B (the spec's eq. 647 increments
+    /// past `m` automatically).
+    pub gpm_idx1: u32,
 }
 
 // =====================================================================

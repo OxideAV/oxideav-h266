@@ -118,6 +118,14 @@ pub enum SyntaxCtx {
     /// non-skip merge / non-merge inter paths to gate the
     /// `transform_tree()` body.
     CuCodedFlag,
+    /// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6. The four
+    /// slots map to `(initType, ctxInc) ∈ ({0,1,2}, {0,1,2})` per
+    /// Tables 51 / 132 — regular AMVR / affine-AMVR / IBC-AMVR rows.
+    AmvrFlag,
+    /// Table 90 — `amvr_precision_idx` (9 ctxIdx). Round-40
+    /// §7.4.11.6. Three rows of three slots (regular / affine / IBC),
+    /// indexed at parse time by the same `(initType, ctxInc)` pair.
+    AmvrPrecisionIdx,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -403,6 +411,21 @@ pub const CIIP_FLAG_SHIFT: &[u8] = &[1, 1];
 pub const CU_CODED_FLAG_INIT: &[u8] = &[6, 5, 12];
 pub const CU_CODED_FLAG_SHIFT: &[u8] = &[4, 4, 4];
 
+/// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6 transcription:
+///   ctxIdx     | 0  | 1  | 2  | 3  |
+///   initValue  | 59 | 58 | 59 | 50 |
+///   shiftIdx   |  0 |  0 |  0 |  0 |
+pub const AMVR_FLAG_INIT: &[u8] = &[59, 58, 59, 50];
+pub const AMVR_FLAG_SHIFT: &[u8] = &[0, 0, 0, 0];
+
+/// Table 90 — `amvr_precision_idx` (9 ctxIdx). Round-40 §7.4.11.6
+/// transcription:
+///   ctxIdx     | 0  | 1  | 2  | 3  | 4  | 5  | 6  | 7  | 8  |
+///   initValue  | 35 | 34 | 35 | 60 | 48 | 60 | 38 | 26 | 60 |
+///   shiftIdx   |  4 |  5 |  0 |  4 |  5 |  0 |  4 |  5 |  0 |
+pub const AMVR_PRECISION_IDX_INIT: &[u8] = &[35, 34, 35, 60, 48, 60, 38, 26, 60];
+pub const AMVR_PRECISION_IDX_SHIFT: &[u8] = &[4, 5, 0, 4, 5, 0, 4, 5, 0];
+
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
     // par_level_flag) span multiple PDF rows; we keep the in-tree
@@ -471,6 +494,8 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::CiipFlag => (CIIP_FLAG_INIT, CIIP_FLAG_SHIFT),
         SyntaxCtx::MergeIdx => (MERGE_IDX_INIT, MERGE_IDX_SHIFT),
         SyntaxCtx::CuCodedFlag => (CU_CODED_FLAG_INIT, CU_CODED_FLAG_SHIFT),
+        SyntaxCtx::AmvrFlag => (AMVR_FLAG_INIT, AMVR_FLAG_SHIFT),
+        SyntaxCtx::AmvrPrecisionIdx => (AMVR_PRECISION_IDX_INIT, AMVR_PRECISION_IDX_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])

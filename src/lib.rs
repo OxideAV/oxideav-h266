@@ -143,7 +143,9 @@
 #![allow(clippy::same_item_push)]
 
 pub mod alf;
+pub mod alf_enc;
 pub mod alf_fixed;
+pub mod amvr;
 pub mod aps;
 pub mod bdof;
 pub mod bitreader;
@@ -159,6 +161,7 @@ pub mod decoder;
 pub mod dequant;
 pub mod encoder;
 pub mod encoder_pipeline;
+pub mod gpm;
 pub mod hrd;
 pub mod inter;
 pub mod intra;
