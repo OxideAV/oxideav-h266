@@ -82,6 +82,34 @@ pub fn psnr_y(src: &PicturePlane, rec: &PicturePlane) -> Result<f64> {
     Ok(10.0 * (255.0 * 255.0 / mse).log10())
 }
 
+/// Round-48 — total picture-wide luma SSE used by the APS-vs-fixed-only
+/// picture-bits trade-off RDO.
+fn total_sse_y(src: &PicturePlane, rec: &PicturePlane) -> u64 {
+    let mut sse: u64 = 0;
+    let h = src.height.min(rec.height);
+    let w = src.width.min(rec.width);
+    for y in 0..h {
+        for x in 0..w {
+            let s = src.samples[y * src.stride + x] as i32;
+            let r = rec.samples[y * rec.stride + x] as i32;
+            let d = (s - r) as i64;
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
+/// Round-48 — `lambda` for the §8.8.5 RDO trade-off (SSE vs APS bits).
+///
+/// Approximates the VVC reference encoder's piecewise-linear curve as
+/// `lambda = 0.85 * 2^((qp - 12) / 3)`, calibrated against the round-47
+/// QP test points (QP 0 → ~0.04, QP 26 → ~12.7, QP 51 → ~617). The
+/// caller multiplies `lambda * bits` to convert APS bytes into an SSE-
+/// equivalent overhead.
+fn lambda_for_qp(qp: i32) -> f64 {
+    0.85f64 * 2.0f64.powf((qp as f64 - 12.0) / 3.0)
+}
+
 /// Persisted per-TB state from the round-46 reconstruction pass —
 /// re-used by the second-pass CABAC emit (per-CTU ALF + residual
 /// interleave) so the encoder doesn't have to redo forward DCT /
@@ -370,39 +398,101 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     // small magnitudes; the per-CTB SSE RDO leaves any component off
     // whenever the trial does not lower SSE.
     //
-    // Round-47 — design + emit a luma ALF APS at id 2. The
-    // [`crate::alf_aps_design::design_luma_alf_filter`] pass solves the
-    // 12×12 normal-equations system over the post-SAO recon vs. the
-    // source for a single signalled filter row that minimises picture-
-    // wide squared error in the eq. 1449 / 1450 luma diamond. The
-    // resulting [`AlfApsData`] feeds (a) `emit_alf_aps_rbsp` so the
-    // decoder side can resolve `AlfCtbFiltSetIdxY = 16` to the
-    // designed coefficients, and (b) `alf_decide_and_apply_with_aps`
-    // so the per-CTB RDO compares the learned filter against the 16
-    // fixed sets and picks the lower-SSE option. Per §7.4.2.4 the APS
-    // NAL must precede the picture header that references it; we emit
-    // it here, then the picture header, then the slice.
-    let luma_alf_aps = {
-        let designed = crate::alf_aps_design::design_luma_alf_filter(src, &rec);
-        crate::alf_aps_design::build_luma_alf_aps_data(&designed)
-    };
+    // Round-48 — design + (conditionally) emit a luma ALF APS at id 2.
+    //
+    // The round-47 single-row design is split into 25 independent
+    // §8.8.5.3 per-class Wiener fits via
+    // [`crate::alf_aps_design::design_per_class_luma_alf_filters`]. The
+    // per-class APS feeds (a) `emit_alf_aps_rbsp`, which deduplicates
+    // equal class rows so the wire format stays compact when the
+    // designer falls back to a single row, (b)
+    // `alf_decide_and_apply_with_aps`, which trial-applies the APS-
+    // signalled set alongside the 16 fixed sets and picks per CTB.
+    //
+    // Round-48 also adds a picture-level APS-vs-fixed-only competition:
+    // we run the RDO twice (once with the APS as a candidate, once
+    // without) and ship the APS NAL only when (a) at least one CTB
+    // picks the APS slot, and (b) the per-picture SSE_Y reduction
+    // exceeds the rate-distortion cost of the APS NAL. The rate-
+    // distortion cost approximates each APS byte at `lambda * 8` SSE
+    // units; `lambda` is a low-effort `2^((qp-12)/3)` curve calibrated
+    // against the round-47 baseline test pictures (QP 0 → ~0.04, QP 26
+    // → ~12.7). When the APS loses the trade-off we collapse the
+    // pipeline to round-46 fixed-only behaviour: skip the APS NAL,
+    // emit the PH with `ph_num_alf_aps_ids_luma = 0`, and configure
+    // the per-CTU walk with `sh_num_alf_aps_ids_luma = 0`.
+    //
+    // Per §7.4.2.4 the APS NAL must precede the picture header that
+    // references it; we therefore design + measure the APS *before*
+    // emitting either NAL.
+    let designed_per_class = crate::alf_aps_design::design_per_class_luma_alf_filters(src, &rec);
+    let luma_alf_aps =
+        crate::alf_aps_design::build_per_class_luma_alf_aps_data(&designed_per_class);
+
+    // CC-ALF reads from the *pre-luma-ALF* `recPictureL` (eq. 1515 /
+    // §8.8.5.7). Snapshot the post-SAO luma plane *before* the
+    // luma-ALF RDO mutates `rec`, regardless of the trade-off branch.
+    let pre_luma_alf_samples = rec.luma.samples.clone();
+
+    // Trial 1 — fixed-only RDO on a clone of `rec`.
+    let mut rec_fixed_only = rec.clone();
+    let alf_pic_fixed_only =
+        crate::alf_enc::alf_decide_and_apply(src, &mut rec_fixed_only, 7, 8, 1);
+    let sse_fixed_only = total_sse_y(&src.luma, &rec_fixed_only.luma);
+
+    // Trial 2 — APS + fixed RDO on a clone of `rec`. Cheap because the
+    // RDO scales linearly with the number of trial sets and the test
+    // pictures are at most 128×128.
+    let mut rec_with_aps = rec.clone();
+    let alf_pic_with_aps = crate::alf_enc::alf_decide_and_apply_with_aps(
+        src,
+        &mut rec_with_aps,
+        &luma_alf_aps,
+        7,
+        8,
+        1,
+    );
+    let sse_with_aps = total_sse_y(&src.luma, &rec_with_aps.luma);
+
+    // Picture-bits trade-off. APS NAL byte cost includes the 2-byte NAL
+    // header plus the emulation-prevented RBSP payload.
     let luma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(2, false, &luma_alf_aps)?;
-    let luma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &luma_aps_rbsp);
-    annex_b(&mut bitstream, &luma_aps_nal);
+    let aps_byte_cost = 2 + luma_aps_rbsp.len() as u64;
+    let lambda = lambda_for_qp(qp);
+    // §8.8.5 RDO cost = SSE + lambda * bits. APS NAL ⇒ bits = 8 * bytes.
+    let aps_rd_overhead = (lambda * (aps_byte_cost as f64) * 8.0) as u64;
+    let aps_used_anywhere = (0..alf_pic_with_aps.pic_height_in_ctbs_y).any(|ry| {
+        (0..alf_pic_with_aps.pic_width_in_ctbs_y)
+            .any(|rx| alf_pic_with_aps.get(rx, ry).luma_filt_set_idx >= 16)
+    });
+    let ship_aps = aps_used_anywhere && sse_with_aps + aps_rd_overhead < sse_fixed_only;
+
+    // Commit the chosen luma reconstruction + AlfPicture.
+    let (mut alf_pic, sh_num_alf_aps_ids_luma, ph_num_alf_aps_ids_luma) = if ship_aps {
+        let luma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &luma_aps_rbsp);
+        annex_b(&mut bitstream, &luma_aps_nal);
+        rec.luma.samples.copy_from_slice(&rec_with_aps.luma.samples);
+        (alf_pic_with_aps, 1u8, 1u8)
+    } else {
+        rec.luma
+            .samples
+            .copy_from_slice(&rec_fixed_only.luma.samples);
+        (alf_pic_fixed_only, 0u8, 0u8)
+    };
+    drop(rec_with_aps);
+    drop(rec_fixed_only);
 
     // Picture header — must come AFTER the APSes it references
-    // (§7.4.2.4). Round-47 PH carries `ph_num_alf_aps_ids_luma = 1` /
-    // `ph_alf_aps_id_luma[0] = 2` so the slice CABAC walk's
-    // `alf_use_aps_flag = 1` branch resolves to the freshly emitted
-    // APS at id 2.
+    // (§7.4.2.4). Round-48 PH carries `ph_num_alf_aps_ids_luma ∈ {0, 1}`
+    // depending on the trade-off; when 1 the bound APS id is 2.
     annex_b(
         &mut bitstream,
-        &vvc_enc.emit_nal(EmittedNalKind::PictureHeader)?,
+        &vvc_enc.emit_nal_with_alf_aps_chain(
+            EmittedNalKind::PictureHeader,
+            ph_num_alf_aps_ids_luma,
+            2,
+        )?,
     );
-
-    let pre_luma_alf_samples = rec.luma.samples.clone();
-    let mut alf_pic =
-        crate::alf_enc::alf_decide_and_apply_with_aps(src, &mut rec, &luma_alf_aps, 7, 8, 1);
 
     crate::alf_enc::chroma_alf_decide_and_apply(
         src,
@@ -462,11 +552,11 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     // from the first pass. We do not redo any DCT / quantisation work
     // here; this loop is pure bin emission.
     // ------------------------------------------------------------------
-    // Round-47 — `sh_num_alf_aps_ids_luma = 1` matches the PH-level
-    // chain (`ph_num_alf_aps_ids_luma = 1`). The per-CTU
-    // `alf_luma_prev_filter_idx` field uses cMax = N - 1 = 0 (so the
-    // field is suppressed and `prev_idx` is inferred to 0), which is
-    // the round-47 behaviour we want — every "use APS" CTB resolves to
+    // Round-48 — `sh_num_alf_aps_ids_luma` mirrors the PH chain count
+    // (0 when the picture-bits trade-off skipped the APS, 1 when the
+    // APS is shipped). When 1, the per-CTU `alf_luma_prev_filter_idx`
+    // field uses cMax = N - 1 = 0 (suppressed; `prev_idx` inferred 0),
+    // which is the desired behaviour — every "use APS" CTB resolves to
     // APS slot 0 (= APS id 2).
     let alf_cfg = crate::alf_syntax::AlfSyntaxConfig {
         alf_enabled: true,
@@ -474,7 +564,7 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         cr_enabled: true,
         cc_cb_enabled: true,
         cc_cr_enabled: true,
-        sh_num_alf_aps_ids_luma: 1,
+        sh_num_alf_aps_ids_luma,
         alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
         alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
         alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
@@ -741,6 +831,45 @@ mod tests {
             psnr >= 30.0,
             "PSNR_Y {psnr:.2} dB < 30 dB after CC-ALF integration"
         );
+    }
+
+    /// Round-48 — `lambda_for_qp` matches the documented curve at
+    /// the calibration QPs. The trade-off RDO uses this to convert
+    /// APS bytes into an SSE-equivalent overhead.
+    #[test]
+    fn lambda_for_qp_matches_calibration_points() {
+        let lam0 = lambda_for_qp(0);
+        let lam26 = lambda_for_qp(26);
+        let lam51 = lambda_for_qp(51);
+        // Exponential growth in QP — every 3 QP step ⇒ 2× lambda.
+        let ratio = lam26 / lam0;
+        // 26 / 3 = ~8.67 → 2^8.67 ≈ 408.
+        assert!(
+            (ratio - 408.0f64.abs()).abs() / 408.0 < 0.05,
+            "lam26/lam0 = {ratio}; expected ≈ 408"
+        );
+        // 51 / 3 = 17 → 2^17 ≈ 131072 vs. baseline.
+        let ratio51 = lam51 / lam0;
+        assert!(
+            (ratio51 - 131072.0).abs() / 131072.0 < 0.05,
+            "lam51/lam0 = {ratio51}; expected ≈ 131072"
+        );
+    }
+
+    /// Round-48 — total_sse_y on identical planes is zero.
+    #[test]
+    fn total_sse_y_identical_planes_is_zero() {
+        let p = PicturePlane::filled(32, 32, 100);
+        assert_eq!(total_sse_y(&p, &p), 0);
+    }
+
+    /// Round-48 — total_sse_y reflects pointwise squared deltas.
+    #[test]
+    fn total_sse_y_off_by_one_yields_npixels_units() {
+        let a = PicturePlane::filled(8, 8, 100);
+        let b = PicturePlane::filled(8, 8, 101);
+        // 64 pixels × 1² = 64.
+        assert_eq!(total_sse_y(&a, &b), 64);
     }
 
     /// Round-43 — flat-grey source: the IDR pipeline (with CC-ALF

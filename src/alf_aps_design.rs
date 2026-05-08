@@ -39,6 +39,25 @@
 //! design 25 separate rows; the APS encoder + decoder framework
 //! introduced here scales to that without changes.
 //!
+//! ## Round 48 — per-class Wiener design
+//!
+//! [`design_per_class_luma_alf_filters`] splits the round-47 single-row
+//! Wiener pass into 25 independent regressions, one per §8.8.5.3
+//! `filtIdx`. Each pixel is assigned to a class via
+//! [`crate::alf::derive_luma_classification`] (the same routine the
+//! decoder side uses), and its tap features are reordered through the
+//! `transposeIdx` permutation into a "canonical" 12-coefficient slot
+//! (so the decoder's `f[idx[k]]` lookup at apply time recovers the
+//! pixel's original tap weighting). The 25 per-class normal-equations
+//! systems are solved independently; classes with too few samples to
+//! fit a full-rank 12×12 system fall back to the picture-wide design
+//! row from [`design_luma_alf_filter`] so the per-class APS is always
+//! well-defined. The aps_enc emitter [`crate::aps_enc::emit_alf_aps_rbsp`]
+//! deduplicates equal rows automatically — when the per-class designs
+//! produce only one or two unique rows the wire format collapses to
+//! `alf_luma_num_filters_signalled_minus1 ∈ {0, 1}` with the
+//! corresponding `alf_luma_coeff_delta_idx[]`.
+//!
 //! ## Lattice quantisation
 //!
 //! The §7.3.2.18 wire format encodes each tap as `alf_luma_coeff_abs`
@@ -61,6 +80,22 @@
 
 use crate::aps::{AlfApsData, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
+
+/// Mirror of [`crate::alf::transpose_idx_table`] — kept private to this
+/// crate but redeclared here to avoid widening the apply module's
+/// public surface. The four permutations realise the §8.8.5.3 geometric
+/// transforms (eqs. 1442 – 1445); the table is an involution so the
+/// design-side "canonical" reordering uses the same permutation as the
+/// apply-side `f[idx[k]]` lookup.
+#[inline]
+fn design_transpose_idx_table(transpose_idx: u8) -> [usize; ALF_LUMA_NUM_COEFF] {
+    match transpose_idx {
+        1 => [9, 4, 10, 8, 1, 5, 11, 7, 3, 0, 2, 6],
+        2 => [0, 3, 2, 1, 8, 7, 6, 5, 4, 9, 10, 11],
+        3 => [9, 8, 10, 4, 3, 7, 11, 5, 1, 0, 2, 6],
+        _ => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    }
+}
 
 /// Coefficient precision in fractional bits — eq. 1450 right-shifts by
 /// `alfShiftY = 7` for the body of the CTB.
@@ -297,6 +332,218 @@ pub fn build_luma_alf_aps_data(designed: &DesignedLumaAlf) -> AlfApsData {
     aps
 }
 
+/// Round 48 — outcome of [`design_per_class_luma_alf_filters`].
+///
+/// `coeff[c]` carries the 12 quantised coefficients for §8.8.5.3 class
+/// `c ∈ 0..25`. `n_samples_per_class[c]` reports how many design pixels
+/// fell into that class (a class with too few samples falls back to the
+/// picture-wide design row carried in `fallback_coeff`).
+#[derive(Clone, Debug, Default)]
+pub struct DesignedLumaAlfPerClass {
+    /// 25 rows of 12 quantised coefficients each.
+    pub coeff: [[i32; ALF_LUMA_NUM_COEFF]; NUM_ALF_FILTERS],
+    /// Number of design pixels per class.
+    pub n_samples_per_class: [usize; NUM_ALF_FILTERS],
+    /// Picture-wide fallback design (the round-47 single-row Wiener).
+    /// Used to populate classes whose own normal-equations system was
+    /// singular or under-sampled.
+    pub fallback_coeff: [i32; ALF_LUMA_NUM_COEFF],
+    /// `true` if at least one class produced a non-zero quantised
+    /// filter (after the per-class solve **or** the fallback substitution).
+    pub is_meaningful: bool,
+}
+
+/// Round 48 — minimum design pixels a class must accumulate before its
+/// own 12×12 normal-equations system is trusted. Classes below this
+/// threshold fall back to the picture-wide single-row design from
+/// [`design_luma_alf_filter`].
+///
+/// Set to `12 * 4 = 48` so that, on average, every coefficient sees four
+/// uncorrelated samples — well below the "rule of thumb" of `n × 10` but
+/// safe for our diamond geometry (the 12 taps are nearly orthogonal on
+/// natural content and the per-class solver uses partial-pivot Gauss-
+/// Jordan, not a regularised LASSO).
+const PER_CLASS_MIN_SAMPLES: usize = 48;
+
+/// Round 48 — design 25 independent 12-tap luma ALF filters using
+/// §8.8.5.3 per-class statistics.
+///
+/// For every interior pixel of the post-SAO recon, this routine:
+///
+/// 1. Derives the pixel's `(filtIdx, transposeIdx)` via the same §8.8.5.3
+///    classification the decoder runs at apply time (per-4×4-sub-block,
+///    grouped by CTB so the spec's line-buffer carve-outs fire on the
+///    same rows as the decoder).
+/// 2. Computes the 12 raw tap features `(neighbour_+ + neighbour_- -
+///    2·curr) / 2^7` for the 7×7 luma diamond (eq. 1449), then permutes
+///    them through the pixel's `transposeIdx` permutation so the
+///    accumulated normal-equations use the **canonical** coefficient
+///    slots (`f[m]` in the eq. 1450 sense after eqs. 1442 – 1445).
+/// 3. Accumulates the 12×12 outer-product matrix `R[c]` and the 12-vector
+///    `r[c]` into the bin for the pixel's class `c = filtIdx`.
+///
+/// After the picture sweep each class with `≥ PER_CLASS_MIN_SAMPLES`
+/// design pixels gets its own Gauss-Jordan solve; under-sampled classes
+/// inherit the picture-wide fallback design from
+/// [`design_luma_alf_filter`].
+pub fn design_per_class_luma_alf_filters(
+    src: &PictureBuffer,
+    rec: &PictureBuffer,
+) -> DesignedLumaAlfPerClass {
+    let pw = rec.luma.width as i32;
+    let ph = rec.luma.height as i32;
+    let mut out = DesignedLumaAlfPerClass::default();
+
+    // Picture-wide fallback (single-row design) — also used as the seed
+    // for classes whose own R[c] is under-sampled or singular.
+    let fallback = design_luma_alf_filter(src, rec);
+    out.fallback_coeff = fallback.coeff;
+    if pw < 7 || ph < 7 {
+        // Picture too small for any interior pixel; populate every class
+        // with the (zero) fallback and bail.
+        for c in 0..NUM_ALF_FILTERS {
+            out.coeff[c] = out.fallback_coeff;
+        }
+        out.is_meaningful = fallback.is_meaningful;
+        return out;
+    }
+
+    let n = ALF_LUMA_NUM_COEFF;
+    // Per-class normal-equations buffers. `n × n` row-major matrix +
+    // n-vector per class (25 classes).
+    let mut r_mats: Vec<Vec<f64>> = (0..NUM_ALF_FILTERS).map(|_| vec![0.0f64; n * n]).collect();
+    let mut r_vecs: Vec<Vec<f64>> = (0..NUM_ALF_FILTERS).map(|_| vec![0.0f64; n]).collect();
+    let mut counts = [0usize; NUM_ALF_FILTERS];
+
+    // §8.8.5.3 classifies on a per-4×4-sub-block basis grouped by CTB so
+    // the line-buffer carve-outs fire on the right rows. We mirror the
+    // decoder's CTB-by-CTB classification by walking the picture in
+    // 128-pixel CTB tiles (matches the encoder pipeline's
+    // `ctb_log2_size_y = 7`). Pixels inside the 5-pixel margin against
+    // the picture edge are skipped (the 7×7 diamond reaches ±3 samples).
+    let ctb_size_y: u32 = 128;
+    let ctb = ctb_size_y as i32;
+    let pic_w_in_ctbs = (pw as u32).div_ceil(ctb_size_y);
+    let pic_h_in_ctbs = (ph as u32).div_ceil(ctb_size_y);
+    let margin = 3i32;
+
+    for ry in 0..pic_h_in_ctbs {
+        for rx in 0..pic_w_in_ctbs {
+            // Per-4×4-sub-block classification for this CTB. Read from
+            // the *recon* (matches §8.8.5.1: classification reads from
+            // the pre-ALF buffer, which is exactly `rec.luma` here).
+            let cls = crate::alf::derive_luma_classification(
+                &rec.luma.samples,
+                rec.luma.stride,
+                pw,
+                ph,
+                rx,
+                ry,
+                ctb_size_y,
+                8,
+            );
+
+            let x_ctb = (rx * ctb_size_y) as i32;
+            let y_ctb = (ry * ctb_size_y) as i32;
+            let x_end = (x_ctb + ctb).min(pw);
+            let y_end = (y_ctb + ctb).min(ph);
+
+            for y in y_ctb.max(margin)..y_end.min(ph - margin) {
+                for x in x_ctb.max(margin)..x_end.min(pw - margin) {
+                    // Map (y, x) to the CTB-local 4×4 sub-block.
+                    let sy = ((y - y_ctb) >> 2) as usize;
+                    let sx = ((x - x_ctb) >> 2) as usize;
+                    if sx >= cls.sub_size() || sy >= cls.sub_size() {
+                        continue;
+                    }
+                    let (filt_idx, transpose_idx) = cls.get(sx, sy);
+                    debug_assert!(filt_idx < NUM_ALF_FILTERS);
+                    let idx_perm = design_transpose_idx_table(transpose_idx);
+
+                    // Raw tap features for this pixel.
+                    let raw = tap_features(&rec.luma, x, y);
+                    // Reorder through the transposeIdx permutation so the
+                    // accumulator targets the spec's canonical
+                    // coefficient slots (apply-time `f[idx[k]]` lookup).
+                    let mut canon = [0.0f64; ALF_LUMA_NUM_COEFF];
+                    for m in 0..n {
+                        canon[m] = raw[idx_perm[m]];
+                    }
+                    let target = (sample_in(&src.luma, x, y) - sample_in(&rec.luma, x, y)) as f64;
+
+                    let r_mat = &mut r_mats[filt_idx];
+                    let r_vec = &mut r_vecs[filt_idx];
+                    for i in 0..n {
+                        r_vec[i] += canon[i] * target;
+                        for j in 0..n {
+                            r_mat[i * n + j] += canon[i] * canon[j];
+                        }
+                    }
+                    counts[filt_idx] += 1;
+                }
+            }
+        }
+    }
+
+    // Per-class solve with picture-wide fallback when the class is
+    // under-sampled or its R[c] turns out singular.
+    let mut any_nonzero = fallback.is_meaningful;
+    for c in 0..NUM_ALF_FILTERS {
+        out.n_samples_per_class[c] = counts[c];
+        let solved = if counts[c] >= PER_CLASS_MIN_SAMPLES {
+            solve_linear_system(&mut r_mats[c], &mut r_vecs[c], n)
+        } else {
+            None
+        };
+        match solved {
+            Some(real_coeff) => {
+                let mut row = [0i32; ALF_LUMA_NUM_COEFF];
+                let mut row_nonzero = false;
+                for k in 0..n {
+                    row[k] = quantise_coeff(real_coeff[k]);
+                    if row[k] != 0 {
+                        row_nonzero = true;
+                    }
+                }
+                out.coeff[c] = row;
+                if row_nonzero {
+                    any_nonzero = true;
+                }
+            }
+            None => {
+                // Fallback — adopt the picture-wide row.
+                out.coeff[c] = out.fallback_coeff;
+            }
+        }
+    }
+    out.is_meaningful = any_nonzero;
+    out
+}
+
+/// Round 48 — pack the per-class designed coefficients into an
+/// [`AlfApsData`].
+///
+/// The 25 rows are dropped straight into `luma_coeff[ filtIdx ]`. The
+/// emitter [`crate::aps_enc::emit_alf_aps_rbsp`] deduplicates equal rows
+/// when packing the wire format, so when the per-class design produces
+/// only `K` unique rows the bitstream carries
+/// `alf_luma_num_filters_signalled_minus1 = K - 1` plus an
+/// `alf_luma_coeff_delta_idx[ filtIdx ]` map. In particular when the
+/// per-class designer falls back to the same picture-wide row for every
+/// class the wire format degrades to the round-47 single-row encoding.
+pub fn build_per_class_luma_alf_aps_data(designed: &DesignedLumaAlfPerClass) -> AlfApsData {
+    let mut aps = AlfApsData::default();
+    aps.alf_luma_filter_signal_flag = true;
+    aps.alf_luma_clip_flag = false;
+    let mut rows: Vec<[i32; ALF_LUMA_NUM_COEFF]> = Vec::with_capacity(NUM_ALF_FILTERS);
+    for c in 0..NUM_ALF_FILTERS {
+        rows.push(designed.coeff[c]);
+    }
+    aps.luma_coeff = rows;
+    aps.luma_clip_idx = vec![[0u8; ALF_LUMA_NUM_COEFF]; NUM_ALF_FILTERS];
+    aps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +640,82 @@ mod tests {
         assert_eq!(pp.luma_coeff.len(), NUM_ALF_FILTERS);
         for row in &pp.luma_coeff {
             assert_eq!(row, &designed.coeff);
+        }
+    }
+
+    /// Round-48 — `design_per_class_luma_alf_filters` populates every
+    /// one of the 25 class rows even when the per-class statistics are
+    /// under-sampled (those rows inherit the picture-wide fallback).
+    #[test]
+    fn design_per_class_populates_all_25_rows_via_fallback() {
+        // Source is a smooth horizontal gradient; recon adds a small
+        // global offset so the picture-wide fallback design is
+        // non-trivial. Most pixels will land in just a handful of
+        // §8.8.5.3 classes, so the others must inherit the fallback.
+        let w = 64usize;
+        let h = 64usize;
+        let mut src = PictureBuffer::yuv420_filled(w, h, 128);
+        let mut rec = src.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let v = (32 + (x as u32 * 192 / w as u32)) as u8;
+                src.luma.samples[y * src.luma.stride + x] = v;
+                rec.luma.samples[y * rec.luma.stride + x] = v.saturating_add(2);
+            }
+        }
+        let designed = design_per_class_luma_alf_filters(&src, &rec);
+        // 25 rows must be populated; classes below the fallback
+        // threshold copy `fallback_coeff`. The picture-wide design
+        // itself may or may not be meaningful (the gradient + constant
+        // offset does sit on a near-singular R), but the per-class
+        // routine must always produce 25 rows.
+        for c in 0..NUM_ALF_FILTERS {
+            // Every class row is either the fallback or a row solved
+            // from this class's R — we don't pin specific values, just
+            // that the row exists and is in spec range.
+            for k in 0..ALF_LUMA_NUM_COEFF {
+                assert!(designed.coeff[c][k].abs() <= ALF_LUMA_SPEC_COEFF_MAX_ABS);
+            }
+        }
+    }
+
+    /// Round-48 — `build_per_class_luma_alf_aps_data` packs the 25 rows
+    /// into the `AlfApsData` shape the §7.3.2.18 emitter expects.
+    #[test]
+    fn build_per_class_luma_alf_aps_data_packs_25_rows() {
+        let mut designed = DesignedLumaAlfPerClass::default();
+        for c in 0..NUM_ALF_FILTERS {
+            designed.coeff[c][0] = c as i32;
+        }
+        let aps = build_per_class_luma_alf_aps_data(&designed);
+        assert!(aps.alf_luma_filter_signal_flag);
+        assert!(!aps.alf_luma_clip_flag);
+        assert_eq!(aps.luma_coeff.len(), NUM_ALF_FILTERS);
+        for c in 0..NUM_ALF_FILTERS {
+            assert_eq!(aps.luma_coeff[c][0], c as i32);
+        }
+    }
+
+    /// Round-48 — designed per-class APS round-trips through the
+    /// emitter + parser, with the parser-expanded `luma_coeff` matching
+    /// the designer's class rows after the eq. 89 indirection.
+    #[test]
+    fn designed_per_class_luma_aps_round_trips() {
+        let mut designed = DesignedLumaAlfPerClass::default();
+        // Hand-pick distinct rows for a few classes so `compress_luma`
+        // sees multiple unique signalled filters.
+        designed.coeff[0][1] = 5;
+        designed.coeff[1][2] = -3;
+        designed.coeff[12][6] = 7;
+        designed.coeff[24][11] = -4;
+        let aps = build_per_class_luma_alf_aps_data(&designed);
+        let bytes = crate::aps_enc::emit_alf_aps_rbsp(2, false, &aps).unwrap();
+        let parsed = parse_aps(&bytes).unwrap();
+        let pp = parsed.alf_data.as_ref().unwrap();
+        assert!(pp.alf_luma_filter_signal_flag);
+        assert_eq!(pp.luma_coeff.len(), NUM_ALF_FILTERS);
+        for c in 0..NUM_ALF_FILTERS {
+            assert_eq!(pp.luma_coeff[c], designed.coeff[c]);
         }
     }
 

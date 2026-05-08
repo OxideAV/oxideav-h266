@@ -317,7 +317,7 @@ impl VvcEncoder {
         annex_b_wrap(&sps, &mut bitstream);
         let pps = self.emit_pps()?;
         annex_b_wrap(&pps, &mut bitstream);
-        let ph = self.emit_picture_header_nal()?;
+        let ph = self.emit_picture_header_nal_with_alf_chain(1, 2)?;
         annex_b_wrap(&ph, &mut bitstream);
         let slice = self.emit_idr_slice()?;
         annex_b_wrap(&slice, &mut bitstream);
@@ -331,8 +331,36 @@ impl VvcEncoder {
             EmittedNalKind::Vps => self.emit_vps(),
             EmittedNalKind::Sps => self.emit_sps(),
             EmittedNalKind::Pps => self.emit_pps(),
-            EmittedNalKind::PictureHeader => self.emit_picture_header_nal(),
+            EmittedNalKind::PictureHeader => {
+                // Default behaviour preserves the round-47 PH layout
+                // (one luma APS bound at id 2). Round-48 callers that
+                // want a different `ph_num_alf_aps_ids_luma` must use
+                // `emit_nal_with_alf_aps_chain` instead.
+                self.emit_picture_header_nal_with_alf_chain(1, 2)
+            }
             EmittedNalKind::IdrSlice => self.emit_idr_slice(),
+        }
+    }
+
+    /// Round-48 — emit a NAL with a parameterised §7.3.2.8 luma ALF APS
+    /// chain. When `num_alf_aps_ids_luma == 0` the encoder pipeline is
+    /// expected to also skip the APS NAL emission (the
+    /// picture-bits trade-off chose fixed-only); when 1 the bound
+    /// `ph_alf_aps_id_luma[0]` is `first_aps_id`.
+    ///
+    /// Currently only `EmittedNalKind::PictureHeader` reads these
+    /// parameters; other NAL kinds delegate to [`emit_nal`].
+    pub fn emit_nal_with_alf_aps_chain(
+        &self,
+        kind: EmittedNalKind,
+        num_alf_aps_ids_luma: u8,
+        first_aps_id: u8,
+    ) -> Result<Vec<u8>> {
+        match kind {
+            EmittedNalKind::PictureHeader => {
+                self.emit_picture_header_nal_with_alf_chain(num_alf_aps_ids_luma, first_aps_id)
+            }
+            _ => self.emit_nal(kind),
         }
     }
 
@@ -541,16 +569,30 @@ impl VvcEncoder {
     // Picture Header NAL (§7.3.2.7) + IDR slice (§7.3.7)
     // ------------------------------------------------------------------
 
-    fn emit_picture_header_nal(&self) -> Result<Vec<u8>> {
+    fn emit_picture_header_nal_with_alf_chain(
+        &self,
+        num_alf_aps_ids_luma: u8,
+        first_aps_id: u8,
+    ) -> Result<Vec<u8>> {
         let mut bw = BitWriter::new();
-        self.emit_picture_header_body(&mut bw);
+        self.emit_picture_header_body(&mut bw, num_alf_aps_ids_luma, first_aps_id);
         bw.rbsp_trailing_bits();
         let rbsp = bw.into_bytes();
         Ok(Self::wrap_nal(NalUnitType::PhNut, 0, 1, &rbsp))
     }
 
     /// Emit the §7.3.2.8 `picture_header_structure()` body into `bw`.
-    fn emit_picture_header_body(&self, bw: &mut BitWriter) {
+    ///
+    /// `num_alf_aps_ids_luma` is the §7.4.3.8 `ph_num_alf_aps_ids_luma`;
+    /// when `> 0`, `first_aps_id` is repeated as
+    /// `ph_alf_aps_id_luma[i]` for every `i` (round-48 ships at most one
+    /// luma APS, so the trade-off cap is 1).
+    fn emit_picture_header_body(
+        &self,
+        bw: &mut BitWriter,
+        num_alf_aps_ids_luma: u8,
+        first_aps_id: u8,
+    ) {
         // IRAP IDR intra-only picture.
         bw.write_bit(1); // ph_gdr_or_irap_pic_flag = 1
         bw.write_bit(0); // ph_non_ref_pic_flag = 0
@@ -567,13 +609,15 @@ impl VvcEncoder {
         // ALF to APS id 0 (the one the encoder ships first) and CC-ALF
         // Cb / Cr to APS id 1 (the second APS).
         bw.write_bit(1); // ph_alf_enabled_flag
-                         // Round-47 — bind one luma APS at id 2 so the per-CTU walk's
-                         // `alf_use_aps_flag = 1` branch resolves to the encoder-
-                         // designed Wiener filter (round-46 always landed in the
-                         // fixed-filter branch).
-        bw.write_bits(1, 3); // ph_num_alf_aps_ids_luma = 1
-        bw.write_bits(2, 3); // ph_alf_aps_id_luma[0] = 2
-                             // chroma_format_idc != 0 → emit per-component chroma flags.
+                         // Round-48 — luma APS chain count is parameterised: the
+                         // picture-bits trade-off in `encode_idr_with_residuals` may
+                         // skip the luma APS NAL entirely (`num = 0`) when the SSE
+                         // gain is smaller than the APS byte cost.
+        bw.write_bits(num_alf_aps_ids_luma as u32, 3);
+        for _ in 0..num_alf_aps_ids_luma {
+            bw.write_bits(first_aps_id as u32, 3); // ph_alf_aps_id_luma[i]
+        }
+        // chroma_format_idc != 0 → emit per-component chroma flags.
         bw.write_bit(1); // ph_alf_cb_enabled_flag
         bw.write_bit(1); // ph_alf_cr_enabled_flag
                          // At least one of cb/cr is on → APS id for primary chroma.

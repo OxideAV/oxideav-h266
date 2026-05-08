@@ -235,21 +235,22 @@ fn alf_aps_nal_round_trip() {
     assert_eq!(p.cc_cr_coeff[0], row_cc_cr);
 }
 
-/// Round-45 / Round-47 — the full encoder pipeline must include three
-/// ALF APS NALs (chroma + CC-ALF emitted up-front, plus the round-47
-/// post-SAO-derived luma APS) that parse cleanly through `parse_aps`.
+/// Round-48 — the pipeline always emits the chroma + CC-ALF APSes, and
+/// emits a third luma APS if and only if the picture-bits trade-off
+/// finds the per-class Wiener design beats fixed-only RDO by more than
+/// the APS byte cost. Either way every APS NAL must round-trip cleanly
+/// through `parse_aps`.
 #[test]
 fn encoder_pipeline_emits_alf_aps_nals() {
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::reconstruct::PictureBuffer;
 
+    // Default flat-grey source — the trade-off is expected to skip the
+    // luma APS here (no SSE win), so we observe 2 APS NALs.
     let src = PictureBuffer::yuv420_filled(64, 64, 128);
     let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
 
-    // Walk all NALs, count APS NALs and confirm each parses as an ALF
-    // APS with the round-45 / round-47 wire layout.
     let mut alf_aps_count = 0u32;
-    let mut seen_luma_signal = false;
     let mut seen_chroma_signal = false;
     let mut seen_cc_signal = false;
     let mut seen_aps_ids: Vec<u8> = Vec::new();
@@ -263,9 +264,6 @@ fn encoder_pipeline_emits_alf_aps_nals() {
         assert_eq!(aps.aps_params_type, ApsParamsType::Alf);
         seen_aps_ids.push(aps.aps_adaptation_parameter_set_id);
         let p = aps.alf_data.as_ref().expect("ALF APS payload");
-        if p.alf_luma_filter_signal_flag {
-            seen_luma_signal = true;
-        }
         if p.alf_chroma_filter_signal_flag {
             seen_chroma_signal = true;
         }
@@ -273,14 +271,108 @@ fn encoder_pipeline_emits_alf_aps_nals() {
             seen_cc_signal = true;
         }
     }
-    assert_eq!(alf_aps_count, 3, "pipeline must emit 3 ALF APS NALs");
+    // Chroma + CC-ALF APSes are unconditional (round-44 / round-43);
+    // the luma APS is gated by the round-48 trade-off.
+    assert!(
+        (2..=3).contains(&alf_aps_count),
+        "pipeline must emit 2 or 3 APS NALs, got {alf_aps_count}"
+    );
     assert!(seen_chroma_signal, "one APS must carry primary chroma ALF");
     assert!(seen_cc_signal, "one APS must carry CC-ALF");
-    assert!(seen_luma_signal, "round-47: one APS must carry luma ALF");
-    // Round-47 — APS ids 0 (chroma), 1 (CC-ALF), 2 (luma) are all
-    // present.
     seen_aps_ids.sort();
-    assert_eq!(seen_aps_ids, vec![0u8, 1, 2]);
+    assert!(
+        seen_aps_ids.starts_with(&[0u8, 1]),
+        "APS ids 0 (chroma) + 1 (CC-ALF) must always be present"
+    );
+}
+
+/// Round-48 — the per-class luma APS, when shipped, must round-trip
+/// cleanly through the §7.3.2.18 parser **and** include at least one
+/// non-zero coefficient. The test feeds the encoder a high-contrast
+/// source so the post-recon error is large enough that the per-class
+/// Wiener design produces a non-trivial filter; the trade-off then
+/// ships the APS because the SSE win exceeds the byte cost. We
+/// indirectly verify the design path by construction: if the trade-off
+/// skips the APS we just observe `2 APS NALs`, which is also a valid
+/// round-48 outcome — the test deliberately tolerates both branches so
+/// it remains stable under future encoder changes.
+#[test]
+fn encoder_pipeline_per_class_luma_aps_round_trips_when_shipped() {
+    use oxideav_h266::aps::{ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS};
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::reconstruct::PictureBuffer;
+
+    // High-contrast checkerboard of 16×16 tiles — the post-recon
+    // error is dominated by tile boundaries and the per-class design
+    // can fit the boundary patterns differently per class.
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+    for y in 0..128 {
+        for x in 0..128 {
+            let tile_x = (x / 16) & 1;
+            let tile_y = (y / 16) & 1;
+            let v = if tile_x ^ tile_y == 1 { 200u8 } else { 60u8 };
+            src.luma.samples[y * src.luma.stride + x] = v;
+        }
+    }
+    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+
+    for nal in iter_annex_b(&bs) {
+        if nal.header.nal_unit_type != NalUnitType::PrefixApsNut {
+            continue;
+        }
+        let rbsp = extract_rbsp(nal.payload());
+        let aps = parse_aps(&rbsp).expect("APS NAL must parse");
+        let p = aps.alf_data.as_ref().expect("ALF APS payload");
+        if !p.alf_luma_filter_signal_flag {
+            continue;
+        }
+        // Luma APS shipped — verify the parser-expanded `luma_coeff`
+        // carries `NUM_ALF_FILTERS` rows of `ALF_LUMA_NUM_COEFF` taps.
+        assert_eq!(p.luma_coeff.len(), NUM_ALF_FILTERS);
+        for row in &p.luma_coeff {
+            assert_eq!(row.len(), ALF_LUMA_NUM_COEFF);
+        }
+        // At least one tap across all 25 rows must be non-zero (a
+        // shipped APS never carries the all-zero filter — the trade-
+        // off would have skipped it).
+        let any_nonzero = p.luma_coeff.iter().any(|row| row.iter().any(|&c| c != 0));
+        assert!(any_nonzero, "shipped luma APS must have a non-zero tap");
+    }
+}
+
+/// Round-48 — flat-grey input lets the picture-bits trade-off drop the
+/// luma APS. The pipeline emits 2 APS NALs (chroma + CC-ALF) and the PH
+/// carries `ph_num_alf_aps_ids_luma = 0`.
+#[test]
+fn encoder_pipeline_skips_luma_aps_on_flat_source() {
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::reconstruct::PictureBuffer;
+
+    let src = PictureBuffer::yuv420_filled(64, 64, 128);
+    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+
+    let mut alf_aps_count = 0u32;
+    let mut seen_luma_signal = false;
+    for nal in iter_annex_b(&bs) {
+        if nal.header.nal_unit_type != NalUnitType::PrefixApsNut {
+            continue;
+        }
+        alf_aps_count += 1;
+        let rbsp = extract_rbsp(nal.payload());
+        let aps = parse_aps(&rbsp).expect("APS NAL must parse");
+        let p = aps.alf_data.as_ref().expect("ALF APS payload");
+        if p.alf_luma_filter_signal_flag {
+            seen_luma_signal = true;
+        }
+    }
+    assert_eq!(
+        alf_aps_count, 2,
+        "flat source: trade-off must skip luma APS"
+    );
+    assert!(
+        !seen_luma_signal,
+        "flat source: no luma-signalling APS should ship"
+    );
 }
 
 /// Round-46 — the encoder pipeline now flips `sps_alf_enabled_flag` +
@@ -332,9 +424,12 @@ fn encoder_pipeline_ph_alf_chain_round_trip() {
     let ph = parse_picture_header_stateful(&extract_rbsp(ph_nal.payload()), &sps, &pps)
         .expect("PH parse");
     assert!(ph.ph_alf_enabled_flag, "ph_alf_enabled_flag must be 1");
-    // Round-47 — luma APS chain bound to APS id 2.
-    assert_eq!(ph.ph_num_alf_aps_ids_luma, 1);
-    assert_eq!(ph.ph_alf_aps_id_luma, vec![2]);
+    // Round-48 — the picture-bits trade-off skipped the luma APS for
+    // this 128×128 single-grey-tone source (no SSE win).
+    assert_eq!(
+        ph.ph_num_alf_aps_ids_luma, 0,
+        "round-48 trade-off must skip luma APS on flat source"
+    );
     assert!(ph.ph_alf_cb_enabled_flag);
     assert!(ph.ph_alf_cr_enabled_flag);
     assert_eq!(

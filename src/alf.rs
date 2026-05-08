@@ -716,16 +716,16 @@ impl LumaClassification {
     /// Return `(filtIdx as usize, transposeIdx as u8)` for the 4×4
     /// sub-block at `(sx, sy)`.
     #[inline]
-    fn get(&self, sx: usize, sy: usize) -> (usize, u8) {
+    pub(crate) fn get(&self, sx: usize, sy: usize) -> (usize, u8) {
         let (f, t) = self.cells[self.idx(sx, sy)];
         (f as usize, t)
     }
 
-    /// Number of 4×4 sub-blocks per CTB row/column. Used by the test
+    /// Number of 4×4 sub-blocks per CTB row/column. Used by the per-
+    /// class design walker in [`crate::alf_aps_design`] and by the test
     /// suite to walk the classification grid.
-    #[cfg(test)]
     #[inline]
-    fn sub_size(&self) -> usize {
+    pub(crate) fn sub_size(&self) -> usize {
         self.sub_size
     }
 }
@@ -757,7 +757,7 @@ impl LumaClassification {
 /// height ≤ CtbSizeY - 4 past `yCtb`) yields the default
 /// `minY=-2, maxY=5, ac=2` row everywhere.
 #[allow(clippy::too_many_arguments)]
-fn derive_luma_classification(
+pub(crate) fn derive_luma_classification(
     pre: &[u8],
     stride: usize,
     pw: i32,
