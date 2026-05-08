@@ -9,17 +9,27 @@
 //! * [`encode_idr_with_residuals`] — stateless function-level entry point.
 //! * [`psnr_y`] — compute PSNR_Y between two luma planes.
 //!
-//! ## Pipeline for one CTU
+//! ## Pipeline for one IDR
 //!
-//! 1. **Intra prediction** — DC (flat mid-grey) for the whole CTU.
-//! 2. **Residual** — `src - pred` → `forward_dct_ii_2d` → `quantize_tb_flat`.
-//! 3. **Residual CABAC emit** — [`crate::residual_enc::encode_tb_coefficients`].
-//! 4. **Dequant + inverse transform** — reconstruct the decoded residual.
-//! 5. **Reconstruction** — `pred + dequant_residual`, clipped to `[0, 255]`.
-//! 6. **Deblocking** — applied per CTU after reconstruction (simplified:
-//!    one CTU per IDR with `pps_no_pic_partition = 1`, so border only).
-//! 7. **SAO** — decided via [`crate::sao_enc`] and applied via
-//!    [`crate::sao::apply_sao`].
+//! Round 46 onward, the pipeline runs in two passes so the per-CTU ALF
+//! CABAC bins emitted by `crate::alf_syntax::encode_alf_ctu` end up in
+//! the same single CABAC stream as the residual bins (§7.3.11.2):
+//!
+//! 1. **First pass — reconstruction (no CABAC):** for every TB, DC intra
+//!    pred → residual → `forward_dct_ii_2d` → `quantize_tb_flat` →
+//!    `dequantize_tb_flat` → inverse transform → write `(pred +
+//!    dequant_residual).clamp(0, 255)` into `rec`. Per-TB quantised
+//!    levels are persisted as [`PreparedLumaTb`] for the second pass.
+//! 2. **In-loop filters:** deblock (§8.8.3) → SAO RDO + apply (§8.8.2)
+//!    → luma ALF RDO (§7.4.3.18 fixed-filter sets) → chroma ALF RDO
+//!    (§8.8.5.4) → CC-ALF RDO (§8.8.5.7), each pass mutating `rec` and
+//!    recording per-CTB decisions into `alf_pic`.
+//! 3. **Second pass — CABAC interleave:** for every CTU emit
+//!    `encode_alf_ctu` (`alf_ctb_flag[]` / `alf_use_aps_flag` /
+//!    `alf_luma_*_idx` / `alf_ctb_filter_alt_idx[]` /
+//!    `alf_ctb_cc_*_idc[]`) followed by `emit_luma_tb_residual` for
+//!    every TB followed by `encode_terminate(0)` (or `(1)` on the last
+//!    CTU). Both syntax families share one [`crate::cabac_enc::ArithEncoder`].
 //!
 //! ## Scope restrictions
 //!
@@ -72,20 +82,28 @@ pub fn psnr_y(src: &PicturePlane, rec: &PicturePlane) -> Result<f64> {
     Ok(10.0 * (255.0 * 255.0 / mse).log10())
 }
 
-/// Encode one luma TB (n_tb × n_tb block at position `(x, y)` in the
-/// source plane). Updates `rec_plane` in-place with the decoded reconstruction.
-///
-/// Returns the quantised level array for the deblocking step.
-fn encode_luma_tb(
+/// Persisted per-TB state from the round-46 reconstruction pass —
+/// re-used by the second-pass CABAC emit (per-CTU ALF + residual
+/// interleave) so the encoder doesn't have to redo forward DCT /
+/// quantisation work.
+struct PreparedLumaTb {
+    /// Square TB side length in luma samples.
+    n_tb: usize,
+    /// Quantised level array (length = `n_tb * n_tb`).
+    levels: Vec<i32>,
+}
+
+/// Compute residual + reconstruction for one luma TB without touching
+/// any CABAC stream. Returns the quantised levels for the later
+/// per-CTU CABAC emit pass.
+fn prepare_luma_tb(
     src: &PicturePlane,
     rec_plane: &mut PicturePlane,
     x: usize,
     y: usize,
     n_tb: usize,
     qp: i32,
-    enc: &mut crate::cabac_enc::ArithEncoder,
-    ctxs: &mut ResidualCtxs,
-) -> Result<()> {
+) -> Result<Vec<i32>> {
     // DC intra prediction: flat fill with mid-grey (128).
     let pred_val = 128u8;
 
@@ -105,13 +123,6 @@ fn encode_luma_tb(
 
     // Quantise.
     let levels = quantize_tb_flat(&coeffs, n_tb as u32, n_tb as u32, qp, 8, 15)?;
-
-    // CABAC-emit residual.
-    // Check if there are any non-zero levels (CBF).
-    let has_nonzero = levels.iter().any(|&l| l != 0);
-    if has_nonzero {
-        encode_tb_coefficients(enc, ctxs, n_tb, n_tb, 0, &levels)?;
-    }
 
     // Dequant + IDCT to get decoded residual.
     let params = DequantParams::luma_8bit(n_tb as u32, n_tb as u32, qp);
@@ -138,6 +149,22 @@ fn encode_luma_tb(
                 rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, 255) as u8;
             }
         }
+    }
+    Ok(levels)
+}
+
+/// Round-46 — emit the residual CABAC bins for one prepared luma TB.
+/// CBF is implicit (only emit coefficients when a non-zero level
+/// exists); the spec's `tu_y_coded_flag` is gated outside of this helper
+/// in the foundation IDR pipeline.
+fn emit_luma_tb_residual(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    ctxs: &mut ResidualCtxs,
+    tb: &PreparedLumaTb,
+) -> Result<()> {
+    let has_nonzero = tb.levels.iter().any(|&l| l != 0);
+    if has_nonzero {
+        encode_tb_coefficients(enc, ctxs, tb.n_tb, tb.n_tb, 0, &tb.levels)?;
     }
     Ok(())
 }
@@ -211,12 +238,20 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     let mut rec = PictureBuffer::yuv420_filled(w as usize, h as usize, 128);
     let mut all_deblock_cus: Vec<DeblockCu> = Vec::new();
 
-    let mut cabac_enc = ArithEncoder::new();
-    let mut ctxs = ResidualCtxs::init(26); // slice_qp_y = 26
-
     // TB size: use the full CTB for simplicity.  For large pictures this
     // is fine since DCT-II is defined up to 64×64; cap TB at 64×64.
     let tb_size = 64usize;
+
+    // ------------------------------------------------------------------
+    // First pass — compute per-TB residuals + reconstruct without
+    // touching any CABAC stream. We persist the quantised levels so the
+    // round-46 second pass (per-CTU ALF + residual CABAC interleave) can
+    // emit them after the in-loop-filter / ALF RDO has chosen the
+    // per-CTB ALF flags.
+    // ------------------------------------------------------------------
+    let mut prepared_per_ctu: Vec<Vec<Vec<PreparedLumaTb>>> = (0..pic_h_ctbs)
+        .map(|_| (0..pic_w_ctbs).map(|_| Vec::new()).collect())
+        .collect();
 
     for ry in 0..pic_h_ctbs {
         for rx in 0..pic_w_ctbs {
@@ -241,16 +276,12 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                     // Only square TBs for simplicity.
                     let n_tb_sq = if n_tb_pow2 >= 4 { n_tb_pow2 } else { 4 };
 
-                    encode_luma_tb(
-                        &src.luma,
-                        &mut rec.luma,
-                        tb_x,
-                        tb_y,
-                        n_tb_sq,
-                        qp,
-                        &mut cabac_enc,
-                        &mut ctxs,
-                    )?;
+                    let levels =
+                        prepare_luma_tb(&src.luma, &mut rec.luma, tb_x, tb_y, n_tb_sq, qp)?;
+                    prepared_per_ctu[ry][rx].push(PreparedLumaTb {
+                        n_tb: n_tb_sq,
+                        levels,
+                    });
 
                     // Chroma: flat fill (mid-grey, no residual for now).
                     let chr_x = tb_x / 2;
@@ -286,16 +317,8 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                     });
                 }
             }
-
-            // CABAC end_of_slice_segment_flag for CTU termination:
-            // encode_terminate(0) for all but the last CTU,
-            // encode_terminate(1) for the last.
-            let is_last_ctu = ry == pic_h_ctbs - 1 && rx == pic_w_ctbs - 1;
-            cabac_enc.encode_terminate(if is_last_ctu { 1 } else { 0 })?;
         }
     }
-
-    let cabac_bytes = cabac_enc.finish();
 
     // Apply deblocking. `bit_depth = 8` matches the round-35 8-bit
     // pipeline scope; without this the strong-filter `scale_*_for_
@@ -388,52 +411,78 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         8,
         1,
     );
-    // Round-45 — emit the per-CTU ALF CABAC syntax for the recorded
-    // `alf_pic` decisions. This produces a self-contained CABAC byte
-    // stream the decoder can replay through
-    // [`crate::alf_syntax::decode_alf_picture`] to recover the same
-    // [`crate::alf::AlfPicture`]. The scaffold IDR slice keeps the ALF
-    // bins in a logical sub-block ahead of the residual bytes; full
-    // per-CTU interleave (ALF → SAO → coding_tree() → terminate as a
-    // single CABAC stream per Table 132) is round-46 scope.
-    let alf_cabac_bytes = {
-        let mut alf_enc = ArithEncoder::new();
-        let mut alf_ctxs = crate::alf_syntax::AlfCtxs::init(26);
-        let alf_cfg = crate::alf_syntax::AlfSyntaxConfig {
-            alf_enabled: true,
-            cb_enabled: true,
-            cr_enabled: true,
-            cc_cb_enabled: true,
-            cc_cr_enabled: true,
-            sh_num_alf_aps_ids_luma: 0,
-            alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1
-                as u8,
-            alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1)
-                as u8,
-            alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1)
-                as u8,
-            chroma_format_idc: 1,
-            slice_type: crate::slice_header::SliceType::I,
-            sh_cabac_init_flag: false,
-        };
-        crate::alf_syntax::encode_alf_picture(&mut alf_enc, &mut alf_ctxs, &alf_cfg, &alf_pic)?;
-        // Terminate the ALF CABAC sub-block with `encode_terminate(1)`
-        // so the decoder knows when to stop walking ALF bins. This is
-        // the scaffold separator; the real spec walks the same bins
-        // inside the per-CTU loop.
-        alf_enc.encode_terminate(1)?;
-        alf_enc.finish()
+
+    // ------------------------------------------------------------------
+    // Round-46 — second CABAC pass: walk every CTU emitting the ALF
+    // bins (`alf_ctb_flag[]`, `alf_use_aps_flag`, `alf_luma_*_idx`,
+    // `alf_ctb_filter_alt_idx[]`, `alf_ctb_cc_*_idc`) immediately
+    // followed by the luma-residual CABAC bins for that CTU's TBs and
+    // a per-CTU `encode_terminate()`. Both syntax families share one
+    // ArithEncoder so the produced bitstream matches the §7.3.11.2
+    // single-stream layout of `coding_tree_unit()`.
+    //
+    // The per-CTB ALF decisions persisted in `alf_pic` came from the
+    // round-41/43/44 RDO passes above, and the residual levels came
+    // from the first pass. We do not redo any DCT / quantisation work
+    // here; this loop is pure bin emission.
+    // ------------------------------------------------------------------
+    let alf_cfg = crate::alf_syntax::AlfSyntaxConfig {
+        alf_enabled: true,
+        cb_enabled: true,
+        cr_enabled: true,
+        cc_cb_enabled: true,
+        cc_cr_enabled: true,
+        sh_num_alf_aps_ids_luma: 0,
+        alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
+        alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
+        alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
+        chroma_format_idc: 1,
+        slice_type: crate::slice_header::SliceType::I,
+        sh_cabac_init_flag: false,
     };
+
+    let mut cabac_enc = ArithEncoder::new();
+    let mut alf_ctxs = crate::alf_syntax::AlfCtxs::init(26);
+    let mut residual_ctxs = ResidualCtxs::init(26);
+
+    for ry in 0..pic_h_ctbs {
+        for rx in 0..pic_w_ctbs {
+            // ALF CABAC bins for this CTU (§7.3.11.2 prefix). Neighbours
+            // are picture-edge derived because we run with a single
+            // slice + single tile.
+            let nbrs = crate::alf_syntax::AlfNeighbours {
+                left_avail: rx > 0,
+                up_avail: ry > 0,
+            };
+            crate::alf_syntax::encode_alf_ctu(
+                &mut cabac_enc,
+                &mut alf_ctxs,
+                &alf_cfg,
+                &alf_pic,
+                rx as u32,
+                ry as u32,
+                nbrs,
+            )?;
+
+            // Residual CABAC bins for every TB inside this CTU.
+            for tb in &prepared_per_ctu[ry][rx] {
+                emit_luma_tb_residual(&mut cabac_enc, &mut residual_ctxs, tb)?;
+            }
+
+            // CABAC end_of_slice_segment_flag for CTU termination.
+            let is_last_ctu = ry == pic_h_ctbs - 1 && rx == pic_w_ctbs - 1;
+            cabac_enc.encode_terminate(if is_last_ctu { 1 } else { 0 })?;
+        }
+    }
+    let cabac_bytes = cabac_enc.finish();
     let _ = alf_pic;
 
-    // Build the IDR slice NAL: header bytes + ALF CABAC + residual
-    // CABAC + trailing bits.
+    // Build the IDR slice NAL: header bytes + interleaved CABAC bytes.
+    // The single-stream invariant lives in `cabac_bytes`: ALF and
+    // residual bins are no longer two separate sub-blocks but a single
+    // §7.3.11.2 walk.
     let mut slice_rbsp = slice_header_bytes;
-    slice_rbsp.extend_from_slice(&alf_cabac_bytes);
     slice_rbsp.extend_from_slice(&cabac_bytes);
-    // rbsp_trailing_bits: the CABAC finish() already byte-aligns; append
-    // a stop bit if needed for strict conformance.
-    // For our scaffold, the CABAC bytes are byte-aligned by finish().
     let slice_nal = build_nal(NalUnitType::IdrNLp, 0, 1, &slice_rbsp);
     annex_b(&mut bitstream, &slice_nal);
 

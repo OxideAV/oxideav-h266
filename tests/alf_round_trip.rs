@@ -270,3 +270,179 @@ fn encoder_pipeline_emits_alf_aps_nals() {
     assert!(seen_chroma_signal, "one APS must carry primary chroma ALF");
     assert!(seen_cc_signal, "one APS must carry CC-ALF");
 }
+
+/// Round-46 — the encoder pipeline now flips `sps_alf_enabled_flag` +
+/// `sps_ccalf_enabled_flag` on, and emits the §7.3.2.8 PH-level ALF
+/// chain with primary chroma bound to APS id 0 and CC-ALF bound to
+/// APS id 1. Parsing the bitstream must surface every flag.
+#[test]
+fn encoder_pipeline_ph_alf_chain_round_trip() {
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::picture_header::parse_picture_header_stateful;
+    use oxideav_h266::pps::parse_pps;
+    use oxideav_h266::reconstruct::PictureBuffer;
+    use oxideav_h266::sps::parse_sps;
+
+    let src = PictureBuffer::yuv420_filled(128, 128, 100);
+    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+
+    let nals: Vec<_> = iter_annex_b(&bs).collect();
+    // Identify SPS / PPS / PH for the stateful parsers.
+    let sps_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+        .expect("SPS");
+    let pps_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+        .expect("PPS");
+    let ph_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+        .expect("PH");
+
+    let sps = parse_sps(&extract_rbsp(sps_nal.payload())).expect("SPS parse");
+    assert!(
+        sps.tool_flags.alf_enabled_flag,
+        "sps_alf_enabled_flag must be 1"
+    );
+    assert!(
+        sps.tool_flags.ccalf_enabled_flag,
+        "sps_ccalf_enabled_flag must be 1"
+    );
+
+    let pps = parse_pps(&extract_rbsp(pps_nal.payload())).expect("PPS parse");
+    assert!(
+        pps.pps_alf_info_in_ph_flag,
+        "pps_no_pic_partition_flag = 1 → pps_alf_info_in_ph_flag = 1 (inferred)"
+    );
+
+    let ph = parse_picture_header_stateful(&extract_rbsp(ph_nal.payload()), &sps, &pps)
+        .expect("PH parse");
+    assert!(ph.ph_alf_enabled_flag, "ph_alf_enabled_flag must be 1");
+    assert_eq!(ph.ph_num_alf_aps_ids_luma, 0);
+    assert!(ph.ph_alf_cb_enabled_flag);
+    assert!(ph.ph_alf_cr_enabled_flag);
+    assert_eq!(
+        ph.ph_alf_aps_id_chroma, 0,
+        "primary chroma ALF must bind to APS id 0"
+    );
+    assert!(ph.ph_alf_cc_cb_enabled_flag);
+    assert_eq!(ph.ph_alf_cc_cb_aps_id, 1, "CC-ALF Cb must bind to APS id 1");
+    assert!(ph.ph_alf_cc_cr_enabled_flag);
+    assert_eq!(ph.ph_alf_cc_cr_aps_id, 1, "CC-ALF Cr must bind to APS id 1");
+}
+
+/// Round-46 — slice-header parse: with `pps_alf_info_in_ph_flag = 1`
+/// (inferred from `pps_no_pic_partition_flag = 1`), the slice-header
+/// ALF block is suppressed but the PH-level ALF state propagates to
+/// the slice-header `PhState`. The IDR slice RBSP's CABAC tail must
+/// then decode through `decode_alf_picture` followed by the per-CTU
+/// `encode_terminate(1)` exit condition without choking on the ALF
+/// bins inlined ahead of the residual bins.
+#[test]
+fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
+    use oxideav_h266::alf::AlfPicture;
+    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::picture_header::parse_picture_header_stateful;
+    use oxideav_h266::pps::parse_pps;
+    use oxideav_h266::reconstruct::PictureBuffer;
+    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::sps::parse_sps;
+
+    // 128×128 IDR — 1×1 CTU grid (CTB = 128).
+    let src = PictureBuffer::yuv420_filled(128, 128, 128);
+    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+
+    let nals: Vec<_> = iter_annex_b(&bs).collect();
+    let sps_rbsp = extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .unwrap()
+            .payload(),
+    );
+    let sps = parse_sps(&sps_rbsp).unwrap();
+    let pps_rbsp = extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .unwrap()
+            .payload(),
+    );
+    let pps = parse_pps(&pps_rbsp).unwrap();
+    let ph_rbsp = extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+            .unwrap()
+            .payload(),
+    );
+    let ph = parse_picture_header_stateful(&ph_rbsp, &sps, &pps).unwrap();
+
+    // PH ALF state propagates into the slice-header parser via PhState.
+    let ph_state = PhState {
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+        ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+        ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+        ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        num_extra_sh_bits: 0,
+        nal_unit_type: NalUnitType::IdrNLp,
+    };
+    assert!(ph_state.ph_alf_enabled_flag);
+
+    let slice_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .expect("IDR slice");
+    let slice_rbsp = extract_rbsp(slice_nal.payload());
+    let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).expect("slice header");
+
+    // pps_alf_info_in_ph_flag = 1 → no SH-level ALF block; SH default.
+    assert!(
+        !sh.sh_alf_enabled_flag,
+        "PH-carried ALF must suppress SH ALF block"
+    );
+
+    // The CABAC payload starts after the byte-aligned SH; the first
+    // CABAC bin is the §7.3.11.2 alf_ctb_flag[0] for CTU(0,0).
+    let cabac_bytes = sh.trailing_bits.clone();
+    assert!(!cabac_bytes.is_empty(), "slice RBSP must carry CABAC bytes");
+
+    // Decode the inlined ALF bins for the 1×1 CTU grid.
+    let cfg = AlfSyntaxConfig {
+        alf_enabled: true,
+        cb_enabled: ph.ph_alf_cb_enabled_flag,
+        cr_enabled: ph.ph_alf_cr_enabled_flag,
+        cc_cb_enabled: ph.ph_alf_cc_cb_enabled_flag,
+        cc_cr_enabled: ph.ph_alf_cc_cr_enabled_flag,
+        sh_num_alf_aps_ids_luma: ph.ph_num_alf_aps_ids_luma,
+        // The chroma APS the encoder ships carries one alt filter
+        // (`alf_chroma_num_alt_filters_minus1 = 0`) so the per-CTB
+        // alt-idx fields are not transmitted; same for CC-ALF
+        // (`alf_cc_*_filters_signalled_minus1 = 0` → cMax = 1).
+        alf_chroma_num_alt_filters_minus1: 0,
+        alf_cc_cb_filters_signalled_minus1: 0,
+        alf_cc_cr_filters_signalled_minus1: 0,
+        chroma_format_idc: sps.sps_chroma_format_idc as u32,
+        slice_type: SliceType::I,
+        sh_cabac_init_flag: false,
+    };
+    let padded = pad(cabac_bytes);
+    let mut dec = ArithDecoder::new(&padded).unwrap();
+    let mut ctxs = AlfCtxs::init(26);
+    let mut alf_pic = AlfPicture::empty(1, 1);
+    decode_alf_picture(&mut dec, &mut ctxs, &cfg, &mut alf_pic)
+        .expect("ALF CABAC inlined in CTU walk must decode through decode_alf_picture");
+
+    // Flat-grey input → ALF RDO leaves every per-CTB flag off (no
+    // SSE wins are possible on a constant plane). The decoded
+    // alf_pic must therefore mirror the encoder's all-off decision.
+    let ctb = alf_pic.get(0, 0);
+    assert!(!ctb.luma_on, "luma ALF off on flat source");
+    assert!(!ctb.cb_on, "Cb ALF off on flat source");
+    assert!(!ctb.cr_on, "Cr ALF off on flat source");
+    assert_eq!(ctb.cc_cb_idc, 0, "CC-ALF Cb idc 0 on flat source");
+    assert_eq!(ctb.cc_cr_idc, 0, "CC-ALF Cr idc 0 on flat source");
+}

@@ -443,7 +443,14 @@ impl VvcEncoder {
         bw.write_ue(0); // delta_qp_in_val_minus1[0][0]
         bw.write_ue(0); // delta_qp_diff_val[0][0]
         bw.write_bit(0); // sao_enabled
-        bw.write_bit(0); // alf_enabled
+                         // Round-46 — flip `sps_alf_enabled_flag` on so the
+                         // PH-level ALF chain (`ph_alf_*`) becomes the
+                         // decoder-visible gate for the per-CTU ALF CABAC
+                         // emit. With `sps_chroma_format_idc != 0`,
+                         // §7.3.2.4 also emits `sps_ccalf_enabled_flag`;
+                         // we set both to 1.
+        bw.write_bit(1); // alf_enabled
+        bw.write_bit(1); // ccalf_enabled (gated by alf_enabled && chroma_format_idc != 0)
         bw.write_bit(0); // lmcs_enabled
         bw.write_bit(0); // weighted_pred
         bw.write_bit(0); // weighted_bipred
@@ -552,10 +559,32 @@ impl VvcEncoder {
         bw.write_ue(0); // ph_pic_parameter_set_id = 0
                         // ph_pic_order_cnt_lsb — 8 bits.
         bw.write_bits(0, 8);
-        // pps_rpl_info_in_ph_flag inferred = 1 → parse_ref_pic_lists()
-        // is called. With num_ref_pic_lists[0/1] = 0 each list falls
-        // into the inline branch which emits `num_ref_entries = 0`
-        // (one ue(0) per list).
+        // Round-46 — picture-header ALF chain (§7.3.2.8). Gated by
+        // `sps.alf_enabled_flag && pps.pps_alf_info_in_ph_flag` per
+        // §7.4.3.8. `pps_no_pic_partition_flag = 1` infers
+        // `pps_alf_info_in_ph_flag = 1` (§7.4.3.5), so the chain lives
+        // here rather than in the slice header. We bind primary chroma
+        // ALF to APS id 0 (the one the encoder ships first) and CC-ALF
+        // Cb / Cr to APS id 1 (the second APS).
+        bw.write_bit(1); // ph_alf_enabled_flag
+        bw.write_bits(0, 3); // ph_num_alf_aps_ids_luma = 0 → no luma APS
+                             // (round-46 deferred); the per-CTU walk
+                             // therefore drops into the fixed-filter
+                             // branch (`alf_use_aps_flag = 0`).
+                             // chroma_format_idc != 0 → emit per-component chroma flags.
+        bw.write_bit(1); // ph_alf_cb_enabled_flag
+        bw.write_bit(1); // ph_alf_cr_enabled_flag
+                         // At least one of cb/cr is on → APS id for primary chroma.
+        bw.write_bits(0, 3); // ph_alf_aps_id_chroma = 0
+                             // ccalf_enabled_flag = 1 → CC-ALF chain.
+        bw.write_bit(1); // ph_alf_cc_cb_enabled_flag
+        bw.write_bits(1, 3); // ph_alf_cc_cb_aps_id = 1
+        bw.write_bit(1); // ph_alf_cc_cr_enabled_flag
+        bw.write_bits(1, 3); // ph_alf_cc_cr_aps_id = 1
+                             // pps_rpl_info_in_ph_flag inferred = 1 → parse_ref_pic_lists()
+                             // is called. With num_ref_pic_lists[0/1] = 0 each list falls
+                             // into the inline branch which emits `num_ref_entries = 0`
+                             // (one ue(0) per list).
         bw.write_ue(0); // list 0: num_ref_entries = 0
         bw.write_ue(0); // list 1: num_ref_entries = 0
                         // pps_qp_delta_info_in_ph_flag inferred = 1 → emit ph_qp_delta.
@@ -757,7 +786,11 @@ mod tests {
         assert_eq!(sps.bit_depth_y(), 8);
         assert_eq!(sps.ctb_size(), 128);
         assert!(!sps.tool_flags.sao_enabled_flag);
-        assert!(!sps.tool_flags.alf_enabled_flag);
+        // Round-46 — `alf_enabled_flag` + `ccalf_enabled_flag` are now
+        // emitted as 1 by the SPS so the PH-level ALF chain (and per-CTU
+        // ALF CABAC) becomes part of the decoder-visible bitstream.
+        assert!(sps.tool_flags.alf_enabled_flag);
+        assert!(sps.tool_flags.ccalf_enabled_flag);
         assert!(!sps.tool_flags.lmcs_enabled_flag);
         assert!(!sps.tool_flags.transform_skip_enabled_flag);
         assert!(!sps.tool_flags.mts_enabled_flag);
@@ -802,7 +835,17 @@ mod tests {
         assert_eq!(ph.ph_pic_parameter_set_id, 0);
         assert_eq!(ph.ph_pic_order_cnt_lsb, 0);
         assert_eq!(ph.ph_qp_delta, 0);
-        assert!(!ph.ph_alf_enabled_flag);
+        // Round-46 — ALF on; PH carries `ph_alf_enabled_flag = 1` plus
+        // the chroma + CC-ALF chain bound to APS id 0 / id 1.
+        assert!(ph.ph_alf_enabled_flag);
+        assert_eq!(ph.ph_num_alf_aps_ids_luma, 0);
+        assert!(ph.ph_alf_cb_enabled_flag);
+        assert!(ph.ph_alf_cr_enabled_flag);
+        assert_eq!(ph.ph_alf_aps_id_chroma, 0);
+        assert!(ph.ph_alf_cc_cb_enabled_flag);
+        assert_eq!(ph.ph_alf_cc_cb_aps_id, 1);
+        assert!(ph.ph_alf_cc_cr_enabled_flag);
+        assert_eq!(ph.ph_alf_cc_cr_aps_id, 1);
         assert!(!ph.ph_lmcs_enabled_flag);
     }
 
