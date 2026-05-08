@@ -143,6 +143,7 @@
 #![allow(clippy::same_item_push)]
 
 pub mod alf;
+pub mod alf_aps_design;
 pub mod alf_enc;
 pub mod alf_fixed;
 pub mod alf_syntax;

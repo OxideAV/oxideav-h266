@@ -567,10 +567,12 @@ impl VvcEncoder {
         // ALF to APS id 0 (the one the encoder ships first) and CC-ALF
         // Cb / Cr to APS id 1 (the second APS).
         bw.write_bit(1); // ph_alf_enabled_flag
-        bw.write_bits(0, 3); // ph_num_alf_aps_ids_luma = 0 → no luma APS
-                             // (round-46 deferred); the per-CTU walk
-                             // therefore drops into the fixed-filter
-                             // branch (`alf_use_aps_flag = 0`).
+                         // Round-47 — bind one luma APS at id 2 so the per-CTU walk's
+                         // `alf_use_aps_flag = 1` branch resolves to the encoder-
+                         // designed Wiener filter (round-46 always landed in the
+                         // fixed-filter branch).
+        bw.write_bits(1, 3); // ph_num_alf_aps_ids_luma = 1
+        bw.write_bits(2, 3); // ph_alf_aps_id_luma[0] = 2
                              // chroma_format_idc != 0 → emit per-component chroma flags.
         bw.write_bit(1); // ph_alf_cb_enabled_flag
         bw.write_bit(1); // ph_alf_cr_enabled_flag
@@ -835,10 +837,12 @@ mod tests {
         assert_eq!(ph.ph_pic_parameter_set_id, 0);
         assert_eq!(ph.ph_pic_order_cnt_lsb, 0);
         assert_eq!(ph.ph_qp_delta, 0);
-        // Round-46 — ALF on; PH carries `ph_alf_enabled_flag = 1` plus
-        // the chroma + CC-ALF chain bound to APS id 0 / id 1.
+        // Round-47 — ALF on; PH carries `ph_alf_enabled_flag = 1` plus
+        // the luma APS chain bound to APS id 2 and the chroma + CC-ALF
+        // chain bound to APS id 0 / id 1.
         assert!(ph.ph_alf_enabled_flag);
-        assert_eq!(ph.ph_num_alf_aps_ids_luma, 0);
+        assert_eq!(ph.ph_num_alf_aps_ids_luma, 1);
+        assert_eq!(ph.ph_alf_aps_id_luma, vec![2]);
         assert!(ph.ph_alf_cb_enabled_flag);
         assert!(ph.ph_alf_cr_enabled_flag);
         assert_eq!(ph.ph_alf_aps_id_chroma, 0);
@@ -865,6 +869,10 @@ mod tests {
         let frame = dummy_frame(320, 240);
         let bs = enc.encode_idr_frame(&frame).unwrap();
 
+        // `VvcEncoder::encode_idr_frame` is the round-35 minimal path —
+        // it does NOT walk through `encode_idr_with_residuals` and so
+        // does not emit the round-45 chroma+CC-ALF APSes or the
+        // round-47 luma APS. Only VPS/SPS/PPS/PH/slice land here.
         let nals: Vec<_> = iter_annex_b(&bs).collect();
         assert_eq!(nals.len(), 5);
         assert_eq!(nals[0].header.nal_unit_type, NalUnitType::VpsNut);

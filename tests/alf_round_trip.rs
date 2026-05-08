@@ -235,8 +235,9 @@ fn alf_aps_nal_round_trip() {
     assert_eq!(p.cc_cr_coeff[0], row_cc_cr);
 }
 
-/// Round-45 — the full encoder pipeline must include two ALF APS NALs
-/// (chroma + CC-ALF) that parse cleanly through `parse_aps`.
+/// Round-45 / Round-47 — the full encoder pipeline must include three
+/// ALF APS NALs (chroma + CC-ALF emitted up-front, plus the round-47
+/// post-SAO-derived luma APS) that parse cleanly through `parse_aps`.
 #[test]
 fn encoder_pipeline_emits_alf_aps_nals() {
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
@@ -246,10 +247,12 @@ fn encoder_pipeline_emits_alf_aps_nals() {
     let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
 
     // Walk all NALs, count APS NALs and confirm each parses as an ALF
-    // APS with the round-45 wire layout.
+    // APS with the round-45 / round-47 wire layout.
     let mut alf_aps_count = 0u32;
+    let mut seen_luma_signal = false;
     let mut seen_chroma_signal = false;
     let mut seen_cc_signal = false;
+    let mut seen_aps_ids: Vec<u8> = Vec::new();
     for nal in iter_annex_b(&bs) {
         if nal.header.nal_unit_type != NalUnitType::PrefixApsNut {
             continue;
@@ -258,7 +261,11 @@ fn encoder_pipeline_emits_alf_aps_nals() {
         let rbsp = extract_rbsp(nal.payload());
         let aps = parse_aps(&rbsp).expect("APS NAL must parse");
         assert_eq!(aps.aps_params_type, ApsParamsType::Alf);
+        seen_aps_ids.push(aps.aps_adaptation_parameter_set_id);
         let p = aps.alf_data.as_ref().expect("ALF APS payload");
+        if p.alf_luma_filter_signal_flag {
+            seen_luma_signal = true;
+        }
         if p.alf_chroma_filter_signal_flag {
             seen_chroma_signal = true;
         }
@@ -266,9 +273,14 @@ fn encoder_pipeline_emits_alf_aps_nals() {
             seen_cc_signal = true;
         }
     }
-    assert_eq!(alf_aps_count, 2, "pipeline must emit 2 ALF APS NALs");
+    assert_eq!(alf_aps_count, 3, "pipeline must emit 3 ALF APS NALs");
     assert!(seen_chroma_signal, "one APS must carry primary chroma ALF");
     assert!(seen_cc_signal, "one APS must carry CC-ALF");
+    assert!(seen_luma_signal, "round-47: one APS must carry luma ALF");
+    // Round-47 — APS ids 0 (chroma), 1 (CC-ALF), 2 (luma) are all
+    // present.
+    seen_aps_ids.sort();
+    assert_eq!(seen_aps_ids, vec![0u8, 1, 2]);
 }
 
 /// Round-46 — the encoder pipeline now flips `sps_alf_enabled_flag` +
@@ -320,7 +332,9 @@ fn encoder_pipeline_ph_alf_chain_round_trip() {
     let ph = parse_picture_header_stateful(&extract_rbsp(ph_nal.payload()), &sps, &pps)
         .expect("PH parse");
     assert!(ph.ph_alf_enabled_flag, "ph_alf_enabled_flag must be 1");
-    assert_eq!(ph.ph_num_alf_aps_ids_luma, 0);
+    // Round-47 — luma APS chain bound to APS id 2.
+    assert_eq!(ph.ph_num_alf_aps_ids_luma, 1);
+    assert_eq!(ph.ph_alf_aps_id_luma, vec![2]);
     assert!(ph.ph_alf_cb_enabled_flag);
     assert!(ph.ph_alf_cr_enabled_flag);
     assert_eq!(

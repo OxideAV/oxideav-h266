@@ -205,6 +205,15 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     // / sh_alf_cc_*_aps_id at slice-parse time. APS NUTs use type 17
     // (prefix); both APSes share the chroma payload via
     // `aps_chroma_present_flag = 1`.
+    //
+    // Round-47 — the luma APS at id 2 (referenced by
+    // `ph_alf_aps_id_luma[0] = 2`) is designed AFTER the post-SAO
+    // reconstruction so the §8.8.5.2 design pass sees the same pixels
+    // the apply pass will read. We therefore defer all NAL emission
+    // until after the in-loop-filter chain has run; the order on the
+    // wire will still be `VPS, SPS, PPS, APS(0), APS(1), APS(2), PH,
+    // slice` per §7.4.2.4 (and the round-47 PH carries
+    // `ph_num_alf_aps_ids_luma = 1` referencing APS id 2).
     let chroma_alf_aps = build_chroma_alf_aps();
     let cc_alf_aps = build_cc_alf_aps();
     let chroma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(0, true, &chroma_alf_aps)?;
@@ -213,11 +222,6 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     let cc_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &cc_aps_rbsp);
     annex_b(&mut bitstream, &chroma_aps_nal);
     annex_b(&mut bitstream, &cc_aps_nal);
-
-    annex_b(
-        &mut bitstream,
-        &vvc_enc.emit_nal(EmittedNalKind::PictureHeader)?,
-    );
 
     // --- Build the slice RBSP ---
     let mut bw = BitWriter::new();
@@ -365,8 +369,40 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     // Both chroma APSes are synthesised in-memory with deliberately
     // small magnitudes; the per-CTB SSE RDO leaves any component off
     // whenever the trial does not lower SSE.
+    //
+    // Round-47 — design + emit a luma ALF APS at id 2. The
+    // [`crate::alf_aps_design::design_luma_alf_filter`] pass solves the
+    // 12×12 normal-equations system over the post-SAO recon vs. the
+    // source for a single signalled filter row that minimises picture-
+    // wide squared error in the eq. 1449 / 1450 luma diamond. The
+    // resulting [`AlfApsData`] feeds (a) `emit_alf_aps_rbsp` so the
+    // decoder side can resolve `AlfCtbFiltSetIdxY = 16` to the
+    // designed coefficients, and (b) `alf_decide_and_apply_with_aps`
+    // so the per-CTB RDO compares the learned filter against the 16
+    // fixed sets and picks the lower-SSE option. Per §7.4.2.4 the APS
+    // NAL must precede the picture header that references it; we emit
+    // it here, then the picture header, then the slice.
+    let luma_alf_aps = {
+        let designed = crate::alf_aps_design::design_luma_alf_filter(src, &rec);
+        crate::alf_aps_design::build_luma_alf_aps_data(&designed)
+    };
+    let luma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(2, false, &luma_alf_aps)?;
+    let luma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &luma_aps_rbsp);
+    annex_b(&mut bitstream, &luma_aps_nal);
+
+    // Picture header — must come AFTER the APSes it references
+    // (§7.4.2.4). Round-47 PH carries `ph_num_alf_aps_ids_luma = 1` /
+    // `ph_alf_aps_id_luma[0] = 2` so the slice CABAC walk's
+    // `alf_use_aps_flag = 1` branch resolves to the freshly emitted
+    // APS at id 2.
+    annex_b(
+        &mut bitstream,
+        &vvc_enc.emit_nal(EmittedNalKind::PictureHeader)?,
+    );
+
     let pre_luma_alf_samples = rec.luma.samples.clone();
-    let mut alf_pic = crate::alf_enc::alf_decide_and_apply(src, &mut rec, 7, 8, 1);
+    let mut alf_pic =
+        crate::alf_enc::alf_decide_and_apply_with_aps(src, &mut rec, &luma_alf_aps, 7, 8, 1);
 
     crate::alf_enc::chroma_alf_decide_and_apply(
         src,
@@ -426,13 +462,19 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     // from the first pass. We do not redo any DCT / quantisation work
     // here; this loop is pure bin emission.
     // ------------------------------------------------------------------
+    // Round-47 — `sh_num_alf_aps_ids_luma = 1` matches the PH-level
+    // chain (`ph_num_alf_aps_ids_luma = 1`). The per-CTU
+    // `alf_luma_prev_filter_idx` field uses cMax = N - 1 = 0 (so the
+    // field is suppressed and `prev_idx` is inferred to 0), which is
+    // the round-47 behaviour we want — every "use APS" CTB resolves to
+    // APS slot 0 (= APS id 2).
     let alf_cfg = crate::alf_syntax::AlfSyntaxConfig {
         alf_enabled: true,
         cb_enabled: true,
         cr_enabled: true,
         cc_cb_enabled: true,
         cc_cr_enabled: true,
-        sh_num_alf_aps_ids_luma: 0,
+        sh_num_alf_aps_ids_luma: 1,
         alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
         alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
         alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
