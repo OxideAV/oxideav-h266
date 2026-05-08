@@ -1,14 +1,17 @@
-//! Encoder-side ALF RDO — rounds 40 + 41.
+//! Encoder-side ALF RDO — rounds 40 + 41 + 42.
 //!
 //! This module wraps the decode-side [`crate::alf::apply_alf`] pipeline
 //! in a per-CTB filter-set RDO loop. The encoder picks the lower-SSE_Y
 //! option among (a) ALF off and (b) one of the 16 §7.4.3.18 fixed
 //! filter sets (`AlfCtbFiltSetIdxY ∈ 0..16`), independently per CTB.
-//! Chroma ALF + CC-ALF are not exercised by this round — both
-//! `cb_enabled` and `cr_enabled` stay false, and the per-CTB chroma
-//! slots / CC-IDC arrays are zero.
+//! Chroma ALF (Cb / Cr alternative-filter selection) is still gated
+//! off — that needs an APS-signalled `AlfCoeffC` set, which is a
+//! later-round encoder project. CC-ALF, in contrast, only needs an
+//! APS-signalled `CcAlfApsCoeff{Cb,Cr}` set bound in the slice
+//! header; given such an APS, [`cc_alf_decide_and_apply`] mirrors the
+//! per-CTB SSE selection over the available `idc ∈ {0, 1..=N}` slots.
 //!
-//! ## Why fixed filter sets only
+//! ## Why fixed filter sets only (luma)
 //!
 //! VVC's full-fat ALF requires APS signalling — the encoder side has
 //! to derive 25 per-class 12-tap filters from the picture statistics,
@@ -39,8 +42,25 @@
 //! §9.3.4.2). Compute scales linearly: 16× the round-40 ALF apply
 //! cost. Test wall-time impact is negligible because the test
 //! pictures are 64×64 / 128×128.
+//!
+//! ## Round-42 — CC-ALF per-CTB filter selection (`cc_alf_decide_and_apply`)
+//!
+//! CC-ALF (§8.8.5.7) is a cross-component refinement: a 7-tap luma
+//! kernel (eq. 1515 / 1516 / 1517) computed against the **pre-luma-ALF**
+//! `recPictureL` produces a small additive offset that lifts the
+//! chroma plane closer to the source. The decoder side already lands
+//! [`crate::alf::apply_alf`]'s second pass; round-42 mirrors it on the
+//! encoder by picking, per CTB, the lower-SSE option among
+//! `{off, idc=1, idc=2, …, idc=N}` where `N = aps.cc_{cb,cr}_coeff.len()`.
+//! Trial reconstructions reuse [`apply_alf`] with `luma_on = false`
+//! everywhere so only the CC-ALF second pass fires; the snapshot
+//! semantics of [`apply_alf`] (`luma_pre = out.luma.samples.clone()`)
+//! mean the caller must hand `cc_alf_decide_and_apply` the
+//! pre-luma-ALF luma plane separately so each trial's `recPictureL`
+//! reads come from the correct §8.8.5.7 source.
 
 use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfCtb, AlfPicture};
+use crate::aps::AlfApsData;
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 
 /// Per-CTB SSE summed over the luma rectangle covering this CTB. Used
@@ -258,6 +278,312 @@ pub fn alf_decide_and_apply(
         }
     }
     final_pic
+}
+
+/// Which CC-ALF chroma component is currently being decided. CC-ALF is
+/// signalled independently per component (`alf_ctb_cc_cb_idc[]` and
+/// `alf_ctb_cc_cr_idc[]` are separate per-CTB arrays) so the encoder
+/// runs the per-component RDO twice — once for Cb and once for Cr —
+/// against potentially different APSes (`sh_alf_cc_cb_aps_id` /
+/// `sh_alf_cc_cr_aps_id` may resolve to different APS slots).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CcAlfComponent {
+    /// Decide `alf_ctb_cc_cb_idc[]` per CTB.
+    Cb,
+    /// Decide `alf_ctb_cc_cr_idc[]` per CTB.
+    Cr,
+}
+
+/// Per-CTB SSE summed over the chroma rectangle covering this CTB. The
+/// rectangle's `(x0, y0, w, h)` are already pre-scaled to the chroma
+/// plane's dimensions (i.e. the caller divides the luma CTB size by
+/// `SubWidthC` / `SubHeightC` before invoking this helper).
+fn ctb_sse_chroma(
+    src: &PicturePlane,
+    rec: &PicturePlane,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    let mut sse: u64 = 0;
+    for y in 0..h {
+        let yi = y0 + y;
+        if yi >= src.height || yi >= rec.height {
+            break;
+        }
+        for x in 0..w {
+            let xi = x0 + x;
+            if xi >= src.width || xi >= rec.width {
+                break;
+            }
+            let s = src.samples[yi * src.stride + xi] as i32;
+            let r = rec.samples[yi * rec.stride + xi] as i32;
+            let d = (s - r) as i64;
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
+/// Build a fully-on `AlfPicture` whose luma slots stay off and whose
+/// CC-ALF idc for the chosen component is `idc` at every CTB. Used by
+/// [`cc_alf_decide_and_apply`] as the trial candidate against which
+/// per-CTB SSE deltas are measured for every signalled CC filter.
+fn cc_alf_picture_all_on(
+    component: CcAlfComponent,
+    idc: u8,
+    pic_w_in_ctbs: u32,
+    pic_h_in_ctbs: u32,
+) -> AlfPicture {
+    debug_assert!(idc != 0, "cc_alf trial picture needs a non-zero idc");
+    let mut pic = AlfPicture::empty(pic_w_in_ctbs, pic_h_in_ctbs);
+    for ry in 0..pic_h_in_ctbs {
+        for rx in 0..pic_w_in_ctbs {
+            let mut p = AlfCtb::default();
+            match component {
+                CcAlfComponent::Cb => p.cc_cb_idc = idc,
+                CcAlfComponent::Cr => p.cc_cr_idc = idc,
+            }
+            pic.set(rx, ry, p);
+        }
+    }
+    pic
+}
+
+/// Encoder CC-ALF per-CTB filter-selection RDO + apply.
+///
+/// `pre_luma_alf_samples` is the luma plane *before* the luma-ALF pass
+/// ran. This is the §8.8.5.7 `recPictureL` source: CC-ALF reads from
+/// the pre-luma-ALF buffer, NOT the post-luma-ALF buffer the encoder
+/// has currently committed into `rec.luma.samples`. The RDO itself
+/// does not touch luma; only the chroma plane corresponding to
+/// `component` is mutated.
+///
+/// `aps` is the bound CC-ALF APS for `component` — `aps.cc_cb_coeff`
+/// (or `aps.cc_cr_coeff`) carries the signalled filter rows. Trial
+/// `idc` values run from `1..=N` where `N = aps.cc_{cb,cr}_coeff.len()`
+/// (`idc = 0` is the "off" baseline).
+///
+/// `apply_pic` is mutated in place: the chosen `cc_cb_idc` /
+/// `cc_cr_idc` per CTB is written there alongside the existing
+/// luma-RDO records. This lets the caller chain
+/// `alf_decide_and_apply` (round-41 luma) → `cc_alf_decide_and_apply`
+/// (round-42 Cb) → `cc_alf_decide_and_apply` (round-42 Cr) and end
+/// with a single `AlfPicture` that captures the full encoder
+/// decision for the future bitstream-emit round.
+///
+/// Per CTB the function picks the lower-SSE option among:
+/// * `idc = 0` — keep the pre-CC-ALF chroma samples (CC-ALF off).
+/// * `idc = k+1` — apply CC-ALF using the `k`-th signalled filter row
+///   for every `k ∈ 0..N`.
+///
+/// Compute scales linearly with `N`. CC-ALF only needs at most 4
+/// signalled filters per APS (§7.4.3.18 caps
+/// `alf_cc_{cb,cr}_filters_signalled_minus1` at 3) so the loop count
+/// is small; trial cost dominates over the per-CTB SSE measurement.
+pub fn cc_alf_decide_and_apply(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    pre_luma_alf_samples: &[u8],
+    apply_pic: &mut AlfPicture,
+    aps: &AlfApsData,
+    component: CcAlfComponent,
+    ctb_log2_size_y: u32,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+) {
+    if chroma_format_idc == 0 {
+        return; // Monochrome: no chroma plane to refine.
+    }
+    let n_filters = match component {
+        CcAlfComponent::Cb => aps.cc_cb_coeff.len(),
+        CcAlfComponent::Cr => aps.cc_cr_coeff.len(),
+    };
+    if n_filters == 0 {
+        return; // APS does not signal any CC filter for this component.
+    }
+    debug_assert_eq!(
+        apply_pic.pic_width_in_ctbs_y,
+        (rec.luma.width as u32).div_ceil(1u32 << ctb_log2_size_y)
+    );
+    debug_assert_eq!(
+        apply_pic.pic_height_in_ctbs_y,
+        (rec.luma.height as u32).div_ceil(1u32 << ctb_log2_size_y)
+    );
+
+    let ctb_size_y = 1u32 << ctb_log2_size_y;
+    let pic_w_in_ctbs = apply_pic.pic_width_in_ctbs_y;
+    let pic_h_in_ctbs = apply_pic.pic_height_in_ctbs_y;
+    let n_ctbs = (pic_w_in_ctbs as usize) * (pic_h_in_ctbs as usize);
+
+    // Chroma subsampling — matches `AlfConfig::chroma_subsampling` /
+    // §7.4.3.3 SubWidthC / SubHeightC.
+    let (sub_w, sub_h): (u32, u32) = match chroma_format_idc {
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => (1, 1),
+    };
+    let ctb_size_c = (ctb_size_y / sub_w, ctb_size_y / sub_h);
+
+    // Stage 1: collect per-CTB SSE on the *current* chroma plane
+    // (pre-CC-ALF baseline = "idc = 0"). We pull from `rec` (post-
+    // primary-chroma-ALF, pre-CC-ALF, in this round both stages are
+    // off so this is just post-SAO chroma).
+    let pre_cc_sse = {
+        let mut tab = vec![0u64; n_ctbs];
+        let chroma_src = match component {
+            CcAlfComponent::Cb => &src.cb,
+            CcAlfComponent::Cr => &src.cr,
+        };
+        let chroma_rec = match component {
+            CcAlfComponent::Cb => &rec.cb,
+            CcAlfComponent::Cr => &rec.cr,
+        };
+        for ry in 0..pic_h_in_ctbs {
+            for rx in 0..pic_w_in_ctbs {
+                let x0 = ((rx * ctb_size_y) / sub_w) as usize;
+                let y0 = ((ry * ctb_size_y) / sub_h) as usize;
+                tab[(ry * pic_w_in_ctbs + rx) as usize] = ctb_sse_chroma(
+                    chroma_src,
+                    chroma_rec,
+                    x0,
+                    y0,
+                    ctb_size_c.0 as usize,
+                    ctb_size_c.1 as usize,
+                );
+            }
+        }
+        tab
+    };
+
+    // Build the AlfApsBinding that points the CC-ALF apply pass at
+    // this APS for the chosen component, leaving the other component
+    // and primary chroma off.
+    let (cc_cb_aps, cc_cr_aps) = match component {
+        CcAlfComponent::Cb => (Some(aps), None),
+        CcAlfComponent::Cr => (None, Some(aps)),
+    };
+    let binding = AlfApsBinding {
+        luma_apses: &[],
+        chroma_aps: None,
+        cc_cb_aps,
+        cc_cr_aps,
+    };
+    let cfg = AlfConfig {
+        alf_enabled: true,
+        cb_enabled: matches!(component, CcAlfComponent::Cb),
+        cr_enabled: matches!(component, CcAlfComponent::Cr),
+        bit_depth,
+        ctb_log2_size_y,
+        chroma_format_idc,
+    };
+
+    // Stage 2: per-filter trial reconstruction. For each signalled
+    // filter `k ∈ 0..N` build a fully-on AlfPicture (with all CTBs
+    // requesting `idc = k+1`), splice the pre-luma-ALF luma plane into
+    // a working clone so apply_alf's `luma_pre = out.luma.samples.clone()`
+    // snapshot picks up the §8.8.5.7 source, then run apply_alf and
+    // measure per-CTB chroma SSE. We stash the post-CC-ALF chroma
+    // plane so the chosen-CTB commit step can copy from it without a
+    // redundant re-run.
+    let mut per_filter_sse = vec![vec![0u64; n_filters]; n_ctbs];
+    let mut per_filter_chroma: Vec<Vec<u8>> = Vec::with_capacity(n_filters);
+    for k in 0..n_filters {
+        let mut trial = rec.clone();
+        // Restore the pre-luma-ALF luma plane so apply_alf's internal
+        // snapshot is the §8.8.5.7 `recPictureL`. Chroma stays as
+        // committed in `rec` (post-SAO, post any future primary
+        // chroma ALF — currently a no-op in the encoder pipeline).
+        trial.luma.samples.copy_from_slice(pre_luma_alf_samples);
+        let trial_pic =
+            cc_alf_picture_all_on(component, (k + 1) as u8, pic_w_in_ctbs, pic_h_in_ctbs);
+        apply_alf(&mut trial, &trial_pic, &cfg, &binding);
+
+        let chroma_src = match component {
+            CcAlfComponent::Cb => &src.cb,
+            CcAlfComponent::Cr => &src.cr,
+        };
+        let chroma_trial = match component {
+            CcAlfComponent::Cb => &trial.cb,
+            CcAlfComponent::Cr => &trial.cr,
+        };
+        for ry in 0..pic_h_in_ctbs {
+            for rx in 0..pic_w_in_ctbs {
+                let x0 = ((rx * ctb_size_y) / sub_w) as usize;
+                let y0 = ((ry * ctb_size_y) / sub_h) as usize;
+                let post = ctb_sse_chroma(
+                    chroma_src,
+                    chroma_trial,
+                    x0,
+                    y0,
+                    ctb_size_c.0 as usize,
+                    ctb_size_c.1 as usize,
+                );
+                per_filter_sse[(ry * pic_w_in_ctbs + rx) as usize][k] = post;
+            }
+        }
+        let chroma_samples = match component {
+            CcAlfComponent::Cb => trial.cb.samples,
+            CcAlfComponent::Cr => trial.cr.samples,
+        };
+        per_filter_chroma.push(chroma_samples);
+    }
+
+    // Stage 3: per-CTB pick the lower-SSE option among {off,
+    // filter 0, …, filter N-1}. Commit chosen chroma samples back
+    // into `rec`; record `idc` into `apply_pic`.
+    let chroma_w = match component {
+        CcAlfComponent::Cb => rec.cb.width,
+        CcAlfComponent::Cr => rec.cr.width,
+    };
+    let chroma_h = match component {
+        CcAlfComponent::Cb => rec.cb.height,
+        CcAlfComponent::Cr => rec.cr.height,
+    };
+    let chroma_stride = match component {
+        CcAlfComponent::Cb => rec.cb.stride,
+        CcAlfComponent::Cr => rec.cr.stride,
+    };
+    for ry in 0..pic_h_in_ctbs {
+        for rx in 0..pic_w_in_ctbs {
+            let idx = (ry * pic_w_in_ctbs + rx) as usize;
+            let pre = pre_cc_sse[idx];
+            let mut best_sse = pre;
+            let mut best_k: Option<usize> = None;
+            for (k, sse_row) in per_filter_sse[idx].iter().enumerate() {
+                if *sse_row < best_sse {
+                    best_sse = *sse_row;
+                    best_k = Some(k);
+                }
+            }
+            if let Some(k) = best_k {
+                let x0 = ((rx * ctb_size_y) / sub_w) as usize;
+                let y0 = ((ry * ctb_size_y) / sub_h) as usize;
+                let w = (ctb_size_c.0 as usize).min(chroma_w.saturating_sub(x0));
+                let h = (ctb_size_c.1 as usize).min(chroma_h.saturating_sub(y0));
+                let chosen = &per_filter_chroma[k];
+                let dst_plane = match component {
+                    CcAlfComponent::Cb => &mut rec.cb,
+                    CcAlfComponent::Cr => &mut rec.cr,
+                };
+                for y in 0..h {
+                    let yi = y0 + y;
+                    let dst = &mut dst_plane.samples
+                        [yi * chroma_stride + x0..yi * chroma_stride + x0 + w];
+                    let src_cc = &chosen[yi * chroma_stride + x0..yi * chroma_stride + x0 + w];
+                    dst.copy_from_slice(src_cc);
+                }
+                let mut existing = apply_pic.get(rx, ry);
+                match component {
+                    CcAlfComponent::Cb => existing.cc_cb_idc = (k + 1) as u8,
+                    CcAlfComponent::Cr => existing.cc_cr_idc = (k + 1) as u8,
+                }
+                apply_pic.set(rx, ry, existing);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +823,367 @@ mod tests {
                 (d * d) as u64
             })
             .sum()
+    }
+
+    fn total_sse_cb(src: &PictureBuffer, rec: &PictureBuffer) -> u64 {
+        src.cb
+            .samples
+            .iter()
+            .zip(rec.cb.samples.iter())
+            .map(|(s, r)| {
+                let d = *s as i64 - *r as i64;
+                (d * d) as u64
+            })
+            .sum()
+    }
+
+    fn total_sse_cr(src: &PictureBuffer, rec: &PictureBuffer) -> u64 {
+        src.cr
+            .samples
+            .iter()
+            .zip(rec.cr.samples.iter())
+            .map(|(s, r)| {
+                let d = *s as i64 - *r as i64;
+                (d * d) as u64
+            })
+            .sum()
+    }
+
+    /// Build an APS with two CC-Cb filters: the first is all-zero
+    /// (identity, no-op refinement), the second has non-zero taps
+    /// designed to nudge chroma in the direction of a luma edge.
+    fn cc_aps_two_cb_filters() -> AlfApsData {
+        use crate::aps::ALF_CC_NUM_COEFF;
+        let mut aps = AlfApsData::default();
+        let identity = [0i32; ALF_CC_NUM_COEFF];
+        let mut tweak = [0i32; ALF_CC_NUM_COEFF];
+        // Tap 1 = left luma neighbour, tap 2 = right luma neighbour.
+        // A vertical luma edge will surface a non-zero scaledSum that
+        // shifts chroma toward / away from the edge centre.
+        tweak[1] = 8;
+        tweak[2] = -8;
+        aps.cc_cb_coeff = vec![identity, tweak];
+        aps
+    }
+
+    /// Round-42 — flat-luma source: every CC filter computes a zero
+    /// `sum` (eq. 1515) regardless of taps because every luma neighbour
+    /// equals every other luma neighbour. The RDO must therefore find
+    /// every filter is a no-op and leave the chroma plane unchanged.
+    /// Per-CTB SSE for `idc != 0` ties `idc = 0`, and the loop's
+    /// strict-less-than comparison preserves "off".
+    #[test]
+    fn cc_alf_rdo_flat_luma_keeps_chroma_unchanged() {
+        let src = PictureBuffer::yuv420_filled(64, 64, 100);
+        // Distort chroma so the SSE measurement has a non-trivial baseline.
+        let mut rec = src.clone();
+        rec.cb.samples[0] ^= 0x20;
+        rec.cb.samples[10] ^= 0x10;
+        let pre_luma = rec.luma.samples.clone();
+        let aps = cc_aps_two_cb_filters();
+        let mut apply_pic = AlfPicture::empty(1, 1);
+        let baseline_cb = rec.cb.samples.clone();
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps,
+            CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+        );
+        // Flat luma → CC-ALF refinement is identically zero → RDO
+        // refuses to enable any filter (off ties idc=k).
+        assert_eq!(rec.cb.samples, baseline_cb);
+        assert_eq!(apply_pic.get(0, 0).cc_cb_idc, 0);
+    }
+
+    /// Round-42 — RDO is monotone-improving. With a non-flat luma
+    /// edge in the picture and a chroma plane that already has some
+    /// distortion, total Cb SSE after the RDO must be `<=` the
+    /// pre-RDO baseline (any CTB whose post-CC-ALF SSE >= baseline
+    /// stays off).
+    #[test]
+    fn cc_alf_rdo_never_increases_chroma_sse() {
+        let mut src = PictureBuffer::yuv420_filled(64, 64, 100);
+        // Inject a vertical luma edge in the source.
+        for y in 0..64 {
+            for x in 32..64 {
+                src.luma.samples[y * src.luma.stride + x] = 200;
+            }
+        }
+        let mut rec = src.clone();
+        // Distort chroma so the RDO can either pick a winning filter
+        // or leave it off.
+        for y in 0..32 {
+            for x in 0..32 {
+                rec.cb.samples[y * rec.cb.stride + x] =
+                    rec.cb.samples[y * rec.cb.stride + x].wrapping_add(7);
+            }
+        }
+        let pre_luma = rec.luma.samples.clone();
+        let aps = cc_aps_two_cb_filters();
+        let mut apply_pic = AlfPicture::empty(1, 1);
+        let pre_sse = total_sse_cb(&src, &rec);
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps,
+            CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+        );
+        let post_sse = total_sse_cb(&src, &rec);
+        assert!(
+            post_sse <= pre_sse,
+            "CC-ALF RDO must not increase Cb SSE: pre={pre_sse} post={post_sse}"
+        );
+    }
+
+    /// Round-42 — when the recorded `apply_pic` says `cc_cb_idc != 0`
+    /// for some CTB, replaying the picture through the decoder
+    /// `apply_alf` (with the pre-luma-ALF luma plane in place) must
+    /// reproduce the RDO's committed chroma samples byte-for-byte.
+    #[test]
+    fn cc_alf_rdo_recorded_decision_replays_to_same_chroma() {
+        let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+        // Pictures with a sharp horizontal-step luma plus a chroma
+        // misalignment give CC-ALF a real win.
+        for y in 0..128 {
+            for x in 64..128 {
+                src.luma.samples[y * src.luma.stride + x] = 220;
+            }
+        }
+        let mut rec = src.clone();
+        // Misalign the right-half chroma so a CC tap that pulls
+        // toward the luma edge can lower SSE.
+        for y in 0..64 {
+            for x in 32..64 {
+                rec.cb.samples[y * rec.cb.stride + x] =
+                    rec.cb.samples[y * rec.cb.stride + x].wrapping_add(15);
+            }
+        }
+        let pre_luma = rec.luma.samples.clone();
+        let aps = cc_aps_two_cb_filters();
+        let mut apply_pic = AlfPicture::empty(1, 1);
+        let pre_chroma_state = rec.cb.samples.clone();
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps,
+            CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+        );
+
+        // Replay: starting from the pre-CC-ALF chroma state + the
+        // pre-luma-ALF luma plane, run apply_alf with the exact
+        // recorded picture and binding.
+        let mut replay = rec.clone();
+        replay.cb.samples = pre_chroma_state;
+        replay.luma.samples = pre_luma.clone();
+        let aps_local = cc_aps_two_cb_filters();
+        let binding = AlfApsBinding {
+            luma_apses: &[],
+            chroma_aps: None,
+            cc_cb_aps: Some(&aps_local),
+            cc_cr_aps: None,
+        };
+        let cfg = AlfConfig {
+            alf_enabled: true,
+            cb_enabled: true,
+            cr_enabled: false,
+            bit_depth: 8,
+            ctb_log2_size_y: 7,
+            chroma_format_idc: 1,
+        };
+        apply_alf(&mut replay, &apply_pic, &cfg, &binding);
+
+        // The two paths must produce byte-identical Cb planes.
+        assert_eq!(rec.cb.samples, replay.cb.samples);
+    }
+
+    /// Round-42 — the per-component path on `Cr` must mutate `Cr`,
+    /// not `Cb`, when given a non-trivial CC-Cr APS.
+    #[test]
+    fn cc_alf_rdo_cr_only_touches_cr() {
+        use crate::aps::ALF_CC_NUM_COEFF;
+        let mut src = PictureBuffer::yuv420_filled(64, 64, 100);
+        for y in 0..64 {
+            for x in 32..64 {
+                src.luma.samples[y * src.luma.stride + x] = 200;
+            }
+        }
+        let mut rec = src.clone();
+        for y in 0..32 {
+            for x in 16..32 {
+                rec.cr.samples[y * rec.cr.stride + x] =
+                    rec.cr.samples[y * rec.cr.stride + x].wrapping_add(20);
+            }
+        }
+        let pre_luma = rec.luma.samples.clone();
+        let baseline_cb = rec.cb.samples.clone();
+        let mut aps = AlfApsData::default();
+        let mut tweak = [0i32; ALF_CC_NUM_COEFF];
+        tweak[1] = 16;
+        tweak[2] = -16;
+        aps.cc_cr_coeff = vec![tweak];
+        let mut apply_pic = AlfPicture::empty(1, 1);
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps,
+            CcAlfComponent::Cr,
+            7,
+            8,
+            1,
+        );
+        // Cb is untouched by the CC-Cr decision pass.
+        assert_eq!(rec.cb.samples, baseline_cb);
+        // The recorded picture writes only `cc_cr_idc`.
+        assert_eq!(apply_pic.get(0, 0).cc_cb_idc, 0);
+    }
+
+    /// Round-42 — RDO must early-out cleanly when the bound APS
+    /// signals no CC filters for the requested component.
+    #[test]
+    fn cc_alf_rdo_empty_aps_is_no_op() {
+        let src = PictureBuffer::yuv420_filled(64, 64, 100);
+        let mut rec = src.clone();
+        rec.cb.samples[0] = 7;
+        let pre_luma = rec.luma.samples.clone();
+        let baseline_cb = rec.cb.samples.clone();
+        let aps = AlfApsData::default(); // both cc_cb_coeff and cc_cr_coeff empty
+        let mut apply_pic = AlfPicture::empty(1, 1);
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps,
+            CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+        );
+        assert_eq!(rec.cb.samples, baseline_cb);
+        assert_eq!(apply_pic.get(0, 0).cc_cb_idc, 0);
+    }
+
+    /// Round-42 — monochrome (`chroma_format_idc = 0`) is a no-op.
+    #[test]
+    fn cc_alf_rdo_monochrome_is_no_op() {
+        let mut src = PictureBuffer::yuv420_filled(64, 64, 100);
+        // Drop the chroma planes by making them zero-sized — no
+        // chroma walk should reach them.
+        src.cb.samples.clear();
+        src.cb.width = 0;
+        src.cb.height = 0;
+        src.cr.samples.clear();
+        src.cr.width = 0;
+        src.cr.height = 0;
+        let mut rec = src.clone();
+        let pre_luma = rec.luma.samples.clone();
+        let aps = cc_aps_two_cb_filters();
+        let mut apply_pic = AlfPicture::empty(1, 1);
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps,
+            CcAlfComponent::Cb,
+            7,
+            8,
+            0, // monochrome
+        );
+        assert_eq!(apply_pic.get(0, 0).cc_cb_idc, 0);
+    }
+
+    /// Round-42 — multi-CTB picture with mixed Cb / Cr distortion.
+    /// Running the per-component RDO twice (Cb then Cr) on the same
+    /// `apply_pic` should land independent records — picking
+    /// `cc_cb_idc` on the Cb pass must not clobber `cc_cr_idc` and
+    /// vice versa.
+    #[test]
+    fn cc_alf_rdo_cb_and_cr_passes_compose() {
+        use crate::aps::ALF_CC_NUM_COEFF;
+        let mut src = PictureBuffer::yuv420_filled(256, 128, 100);
+        for y in 0..128 {
+            for x in 64..192 {
+                src.luma.samples[y * src.luma.stride + x] = 210;
+            }
+        }
+        let mut rec = src.clone();
+        // Distort both chroma components.
+        for v in rec.cb.samples.iter_mut().take(50) {
+            *v = v.wrapping_add(15);
+        }
+        for v in rec.cr.samples.iter_mut().take(50) {
+            *v = v.wrapping_add(20);
+        }
+        let pre_luma = rec.luma.samples.clone();
+
+        let mut aps_cb = AlfApsData::default();
+        let mut row = [0i32; ALF_CC_NUM_COEFF];
+        row[1] = 12;
+        row[2] = -12;
+        aps_cb.cc_cb_coeff = vec![row];
+        let mut aps_cr = AlfApsData::default();
+        let mut row2 = [0i32; ALF_CC_NUM_COEFF];
+        row2[1] = -12;
+        row2[2] = 12;
+        aps_cr.cc_cr_coeff = vec![row2];
+
+        let mut apply_pic = AlfPicture::empty(2, 1);
+        let pre_cb_sse = total_sse_cb(&src, &rec);
+        let pre_cr_sse = total_sse_cr(&src, &rec);
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps_cb,
+            CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+        );
+        // After Cb pass: Cb SSE may have dropped, Cr is untouched.
+        let mid_cb_sse = total_sse_cb(&src, &rec);
+        let mid_cr_sse = total_sse_cr(&src, &rec);
+        assert!(mid_cb_sse <= pre_cb_sse, "Cb pass increased Cb SSE");
+        assert_eq!(mid_cr_sse, pre_cr_sse, "Cb pass mutated Cr plane");
+
+        cc_alf_decide_and_apply(
+            &src,
+            &mut rec,
+            &pre_luma,
+            &mut apply_pic,
+            &aps_cr,
+            CcAlfComponent::Cr,
+            7,
+            8,
+            1,
+        );
+        let post_cr_sse = total_sse_cr(&src, &rec);
+        assert!(post_cr_sse <= pre_cr_sse, "Cr pass increased Cr SSE");
+
+        // Each chosen idc must lie in `0..=N` for its component.
+        for rx in 0..2 {
+            let p = apply_pic.get(rx, 0);
+            assert!(p.cc_cb_idc <= 1, "cb idc out of APS range");
+            assert!(p.cc_cr_idc <= 1, "cr idc out of APS range");
+        }
     }
 }

@@ -180,8 +180,18 @@ the **intra-only single-tile single-slice subset** plus the round-28
   set 15}` and records the choice into the returned `AlfPicture`
   for the future bitstream-emit round. Compute scales linearly
   (16× the round-40 ALF apply cost). APS-signalled luma filter
-  sets (`AlfCtbFiltSetIdxY ≥ 16`) and CC-ALF encoder RDO remain
-  follow-up rounds.
+  sets (`AlfCtbFiltSetIdxY ≥ 16`) remain a follow-up round.
+  **Round-42 lands the encoder CC-ALF per-CTB filter-selection
+  RDO** — `alf_enc::cc_alf_decide_and_apply` mirrors the round-41
+  per-CTB SSE selection on §8.8.5.7. Given a bound CC-ALF APS
+  (`cc_cb_coeff` / `cc_cr_coeff`, up to 4 filters per component
+  per §7.4.3.18) plus the pre-luma-ALF `recPictureL` snapshot, the
+  helper picks for each CTB the lower-SSE option among
+  `{idc = 0, 1, …, N}` and records the chosen `cc_cb_idc` /
+  `cc_cr_idc` into a caller-provided `AlfPicture`. Per-component
+  (`CcAlfComponent::{Cb, Cr}`) so the encoder can chain a luma RDO
+  → Cb CC-RDO → Cr CC-RDO on the same picture-level decision
+  record.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
