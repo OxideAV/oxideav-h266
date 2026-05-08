@@ -173,6 +173,15 @@ the **intra-only single-tile single-slice subset** plus the round-28
   transcriptions, ready for the upcoming `mvd_coding()` parser.
   Affine + scaled-reference filter tables 28 / 29 / 30 / 31 / 32
   / 34 / 35, DMVR, PROF land in later rounds.
+  **Round-41 lands the encoder ALF filter-set RDO** — the per-CTB
+  trial search now spans all 16 §7.4.3.18 fixed filter sets
+  (`AlfCtbFiltSetIdxY ∈ 0..16`) instead of just set 0. For each CTB
+  the encoder picks the lower-SSE_Y option among `{off, set 0, …,
+  set 15}` and records the choice into the returned `AlfPicture`
+  for the future bitstream-emit round. Compute scales linearly
+  (16× the round-40 ALF apply cost). APS-signalled luma filter
+  sets (`AlfCtbFiltSetIdxY ≥ 16`) and CC-ALF encoder RDO remain
+  follow-up rounds.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
