@@ -172,6 +172,21 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     annex_b(&mut bitstream, &vvc_enc.emit_nal(EmittedNalKind::Vps)?);
     annex_b(&mut bitstream, &vvc_enc.emit_nal(EmittedNalKind::Sps)?);
     annex_b(&mut bitstream, &vvc_enc.emit_nal(EmittedNalKind::Pps)?);
+
+    // Round-45 — emit the synthesised chroma + CC-ALF APSes ahead of
+    // the picture header so the decoder can resolve sh_alf_aps_id_chroma
+    // / sh_alf_cc_*_aps_id at slice-parse time. APS NUTs use type 17
+    // (prefix); both APSes share the chroma payload via
+    // `aps_chroma_present_flag = 1`.
+    let chroma_alf_aps = build_chroma_alf_aps();
+    let cc_alf_aps = build_cc_alf_aps();
+    let chroma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(0, true, &chroma_alf_aps)?;
+    let cc_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(1, true, &cc_alf_aps)?;
+    let chroma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &chroma_aps_rbsp);
+    let cc_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &cc_aps_rbsp);
+    annex_b(&mut bitstream, &chroma_aps_nal);
+    annex_b(&mut bitstream, &cc_aps_nal);
+
     annex_b(
         &mut bitstream,
         &vvc_enc.emit_nal(EmittedNalKind::PictureHeader)?,
@@ -330,7 +345,6 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     let pre_luma_alf_samples = rec.luma.samples.clone();
     let mut alf_pic = crate::alf_enc::alf_decide_and_apply(src, &mut rec, 7, 8, 1);
 
-    let chroma_alf_aps = build_chroma_alf_aps();
     crate::alf_enc::chroma_alf_decide_and_apply(
         src,
         &mut rec,
@@ -352,7 +366,6 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         1,
     );
 
-    let cc_alf_aps = build_cc_alf_aps();
     crate::alf_enc::cc_alf_decide_and_apply(
         src,
         &mut rec,
@@ -375,13 +388,48 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         8,
         1,
     );
-    // `alf_pic` now records the full (luma_filt_set_idx, cb_on/alt,
-    // cr_on/alt, cc_cb_idc, cc_cr_idc) per-CTB decision for the future
-    // bitstream-emit round.
+    // Round-45 — emit the per-CTU ALF CABAC syntax for the recorded
+    // `alf_pic` decisions. This produces a self-contained CABAC byte
+    // stream the decoder can replay through
+    // [`crate::alf_syntax::decode_alf_picture`] to recover the same
+    // [`crate::alf::AlfPicture`]. The scaffold IDR slice keeps the ALF
+    // bins in a logical sub-block ahead of the residual bytes; full
+    // per-CTU interleave (ALF → SAO → coding_tree() → terminate as a
+    // single CABAC stream per Table 132) is round-46 scope.
+    let alf_cabac_bytes = {
+        let mut alf_enc = ArithEncoder::new();
+        let mut alf_ctxs = crate::alf_syntax::AlfCtxs::init(26);
+        let alf_cfg = crate::alf_syntax::AlfSyntaxConfig {
+            alf_enabled: true,
+            cb_enabled: true,
+            cr_enabled: true,
+            cc_cb_enabled: true,
+            cc_cr_enabled: true,
+            sh_num_alf_aps_ids_luma: 0,
+            alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1
+                as u8,
+            alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1)
+                as u8,
+            alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1)
+                as u8,
+            chroma_format_idc: 1,
+            slice_type: crate::slice_header::SliceType::I,
+            sh_cabac_init_flag: false,
+        };
+        crate::alf_syntax::encode_alf_picture(&mut alf_enc, &mut alf_ctxs, &alf_cfg, &alf_pic)?;
+        // Terminate the ALF CABAC sub-block with `encode_terminate(1)`
+        // so the decoder knows when to stop walking ALF bins. This is
+        // the scaffold separator; the real spec walks the same bins
+        // inside the per-CTU loop.
+        alf_enc.encode_terminate(1)?;
+        alf_enc.finish()
+    };
     let _ = alf_pic;
 
-    // Build the IDR slice NAL: header bytes + CABAC bytes + trailing bits.
+    // Build the IDR slice NAL: header bytes + ALF CABAC + residual
+    // CABAC + trailing bits.
     let mut slice_rbsp = slice_header_bytes;
+    slice_rbsp.extend_from_slice(&alf_cabac_bytes);
     slice_rbsp.extend_from_slice(&cabac_bytes);
     // rbsp_trailing_bits: the CABAC finish() already byte-aligns; append
     // a stop bit if needed for strict conformance.

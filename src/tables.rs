@@ -48,6 +48,11 @@
 //! * `mmvd_cand_flag` — Table 104 (2 ctxIdx, one per non-I initType).
 //! * `mmvd_distance_idx` — Table 105 (2 ctxIdx, one per non-I initType).
 //! * `merge_idx` — Table 109 (3 ctxIdx, one per initType).
+//! * `alf_ctb_flag` — Table 52 (27 ctxIdx, 9 per initType).
+//! * `alf_use_aps_flag` — Table 53 (3 ctxIdx, one per initType).
+//! * `alf_ctb_cc_cb_idc` — Table 54 (9 ctxIdx, 3 per initType).
+//! * `alf_ctb_cc_cr_idc` — Table 55 (9 ctxIdx, 3 per initType).
+//! * `alf_ctb_filter_alt_idx` — Table 56 (6 ctxIdx, 2 per initType).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
@@ -126,6 +131,29 @@ pub enum SyntaxCtx {
     /// §7.4.11.6. Three rows of three slots (regular / affine / IBC),
     /// indexed at parse time by the same `(initType, ctxInc)` pair.
     AmvrPrecisionIdx,
+    /// Table 52 — `alf_ctb_flag` (27 ctxIdx; 9 per initType, 3 ctxInc per
+    /// component cIdx). Per Table 51 the cIdx-major slicing is
+    /// `(initType, cIdx) → (initType * 9 + cIdx * 3)..+3`. Round-45
+    /// §7.4.3.13 / §9.3.4.2.2 with Table 133 condL/condA giving
+    /// `ctxInc = (condL && availL) + (condA && availA) + cIdx * 3`.
+    AlfCtbFlag,
+    /// Table 53 — `alf_use_aps_flag` (3 ctxIdx, one per initType).
+    /// Single ctx-coded bin (FL `cMax = 1`), Table 132 fixes
+    /// `ctxInc = 0`; the per-initType row follows Table 51.
+    AlfUseApsFlag,
+    /// Table 54 — `alf_ctb_cc_cb_idc` (9 ctxIdx, 3 per initType). Bin 0
+    /// is ctx-coded with `ctxInc = (condL && availL) + (condA && availA)`
+    /// per §9.3.4.2.2 / Table 133 (`ctxSetIdx = 0`). Bins 1.. are
+    /// bypass-coded per Table 132 (TR with `cMax =
+    /// alf_cc_cb_filters_signalled_minus1 + 1`).
+    AlfCtbCcCbIdc,
+    /// Table 55 — `alf_ctb_cc_cr_idc` (9 ctxIdx, 3 per initType). Same
+    /// shape as `AlfCtbCcCbIdc`.
+    AlfCtbCcCrIdc,
+    /// Table 56 — `alf_ctb_filter_alt_idx` (6 ctxIdx, 2 per initType).
+    /// Per Table 132 every TR bin uses the same ctxInc derived from
+    /// chromaIdx (0 → ctx 0 of the row, 1 → ctx 1 of the row).
+    AlfCtbFilterAltIdx,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -426,6 +454,51 @@ pub const AMVR_FLAG_SHIFT: &[u8] = &[0, 0, 0, 0];
 pub const AMVR_PRECISION_IDX_INIT: &[u8] = &[35, 34, 35, 60, 48, 60, 38, 26, 60];
 pub const AMVR_PRECISION_IDX_SHIFT: &[u8] = &[4, 5, 0, 4, 5, 0, 4, 5, 0];
 
+/// Table 52 — `alf_ctb_flag` (27 ctxIdx). Round-45 §9.3.4.2.2 / Table 51
+/// transcription. ctxIdx layout: 27 entries split as 3 initType blocks
+/// of 9 ctxIdx (3 ctxInc rows × 3 cIdx rows = 9). Per Table 51:
+///   * initType 0 → ctxIdx 0..8
+///   * initType 1 → ctxIdx 9..17
+///   * initType 2 → ctxIdx 18..26
+/// The `ctxInc` derivation in §9.3.4.2.2 produces values
+/// `(condL && availL) + (condA && availA) + cIdx * 3` ∈ {0..8}.
+pub const ALF_CTB_FLAG_INIT: &[u8] = &[
+    62, 39, 39, 54, 39, 39, 31, 39, 39, 13, 23, 46, 4, 61, 54, 19, 46, 54, 33, 52, 46, 25, 61, 54,
+    25, 61, 54,
+];
+pub const ALF_CTB_FLAG_SHIFT: &[u8] = &[
+    0, 0, 0, 4, 0, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 1, 0, 0,
+];
+
+/// Table 53 — `alf_use_aps_flag` (3 ctxIdx, one per initType). Round-45
+/// §9.3.4.2 / Table 132 `ctxInc = 0` per bin. Per Table 51 each initType
+/// uses ctxIdx 0 / 1 / 2 respectively.
+pub const ALF_USE_APS_FLAG_INIT: &[u8] = &[46, 46, 46];
+pub const ALF_USE_APS_FLAG_SHIFT: &[u8] = &[0, 0, 0];
+
+/// Table 54 — `alf_ctb_cc_cb_idc` (9 ctxIdx, 3 per initType). Round-45
+/// §9.3.4.2.2 / Table 51. The 3 ctxInc values per initType cover the
+/// {0, 1, 2} = `(condL && availL) + (condA && availA)` range of bin 0
+/// (bin 1+ is bypass per Table 132).
+pub const ALF_CTB_CC_CB_IDC_INIT: &[u8] = &[18, 30, 31, 18, 21, 38, 25, 35, 38];
+pub const ALF_CTB_CC_CB_IDC_SHIFT: &[u8] = &[4, 1, 4, 4, 1, 4, 4, 1, 4];
+
+/// Table 55 — `alf_ctb_cc_cr_idc` (9 ctxIdx, 3 per initType). Same
+/// shape as Table 54.
+pub const ALF_CTB_CC_CR_IDC_INIT: &[u8] = &[18, 30, 31, 18, 21, 38, 25, 28, 38];
+pub const ALF_CTB_CC_CR_IDC_SHIFT: &[u8] = &[4, 1, 4, 4, 1, 4, 4, 1, 4];
+
+/// Table 56 — `alf_ctb_filter_alt_idx` (6 ctxIdx, 2 per initType).
+/// Round-45 §9.3.4.2 / Table 132. Per Table 51:
+///   * initType 0 → ctxIdx 0..1   (Cb / Cr)
+///   * initType 1 → ctxIdx 2..3
+///   * initType 2 → ctxIdx 4..5
+/// Bin 0 (and the rest of the TR sequence) all share `ctxInc = 0` for
+/// chroma component 0 and `ctxInc = 1` for chroma component 1
+/// (Table 132).
+pub const ALF_CTB_FILTER_ALT_IDX_INIT: &[u8] = &[11, 11, 20, 12, 11, 26];
+pub const ALF_CTB_FILTER_ALT_IDX_SHIFT: &[u8] = &[0, 0, 0, 0, 0, 0];
+
 fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     // Some of the longer spec tables (sig_coeff_flag, abs_level_gtx_flag,
     // par_level_flag) span multiple PDF rows; we keep the in-tree
@@ -496,6 +569,13 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::CuCodedFlag => (CU_CODED_FLAG_INIT, CU_CODED_FLAG_SHIFT),
         SyntaxCtx::AmvrFlag => (AMVR_FLAG_INIT, AMVR_FLAG_SHIFT),
         SyntaxCtx::AmvrPrecisionIdx => (AMVR_PRECISION_IDX_INIT, AMVR_PRECISION_IDX_SHIFT),
+        SyntaxCtx::AlfCtbFlag => (ALF_CTB_FLAG_INIT, ALF_CTB_FLAG_SHIFT),
+        SyntaxCtx::AlfUseApsFlag => (ALF_USE_APS_FLAG_INIT, ALF_USE_APS_FLAG_SHIFT),
+        SyntaxCtx::AlfCtbCcCbIdc => (ALF_CTB_CC_CB_IDC_INIT, ALF_CTB_CC_CB_IDC_SHIFT),
+        SyntaxCtx::AlfCtbCcCrIdc => (ALF_CTB_CC_CR_IDC_INIT, ALF_CTB_CC_CR_IDC_SHIFT),
+        SyntaxCtx::AlfCtbFilterAltIdx => {
+            (ALF_CTB_FILTER_ALT_IDX_INIT, ALF_CTB_FILTER_ALT_IDX_SHIFT)
+        }
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -562,11 +642,29 @@ mod tests {
             SyntaxCtx::CiipFlag,
             SyntaxCtx::MergeIdx,
             SyntaxCtx::CuCodedFlag,
+            SyntaxCtx::AmvrFlag,
+            SyntaxCtx::AmvrPrecisionIdx,
+            SyntaxCtx::AlfCtbFlag,
+            SyntaxCtx::AlfUseApsFlag,
+            SyntaxCtx::AlfCtbCcCbIdc,
+            SyntaxCtx::AlfCtbCcCrIdc,
+            SyntaxCtx::AlfCtbFilterAltIdx,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);
             assert_eq!(i.len(), ctx_count(kind));
         }
+    }
+
+    /// Round-45 — Tables 52-56 transcription length sanity. Table 51
+    /// pins the per-ALF context counts (27 / 3 / 9 / 9 / 6).
+    #[test]
+    fn alf_context_table_lengths() {
+        assert_eq!(ctx_count(SyntaxCtx::AlfCtbFlag), 27);
+        assert_eq!(ctx_count(SyntaxCtx::AlfUseApsFlag), 3);
+        assert_eq!(ctx_count(SyntaxCtx::AlfCtbCcCbIdc), 9);
+        assert_eq!(ctx_count(SyntaxCtx::AlfCtbCcCrIdc), 9);
+        assert_eq!(ctx_count(SyntaxCtx::AlfCtbFilterAltIdx), 6);
     }
 
     #[test]

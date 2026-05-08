@@ -145,8 +145,10 @@
 pub mod alf;
 pub mod alf_enc;
 pub mod alf_fixed;
+pub mod alf_syntax;
 pub mod amvr;
 pub mod aps;
+pub mod aps_enc;
 pub mod bdof;
 pub mod bitreader;
 pub mod cabac;
