@@ -192,6 +192,16 @@ the **intra-only single-tile single-slice subset** plus the round-28
   (`CcAlfComponent::{Cb, Cr}`) so the encoder can chain a luma RDO
   → Cb CC-RDO → Cr CC-RDO on the same picture-level decision
   record.
+  **Round-43 wires CC-ALF into the IDR encoder pipeline** —
+  `encode_idr_with_residuals` now snapshots the pre-luma-ALF
+  `recPictureL`, runs the round-41 luma filter-set RDO, then
+  chains `cc_alf_decide_and_apply` for Cb and Cr against an
+  in-memory CC-ALF APS (one signalled vertical-edge filter per
+  component). The §8.8.5.7 RDO is monotone-improving so the
+  pipeline never increases chroma SSE; flat / aligned content is
+  a strict no-op. The combined `(luma_filt_set_idx, cc_cb_idc,
+  cc_cr_idc)` per-CTB record is now captured for the future
+  bitstream-emit round.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
   DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue

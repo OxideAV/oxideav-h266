@@ -282,9 +282,14 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
 
     let cabac_bytes = cabac_enc.finish();
 
-    // Apply deblocking.
+    // Apply deblocking. `bit_depth = 8` matches the round-35 8-bit
+    // pipeline scope; without this the strong-filter `scale_*_for_
+    // bit_depth` shifts overflow on any picture that triggers a
+    // strong-edge deblocking decision (eq. 1276 / 1345 do `<< (BitDepth
+    // − 8)`, and `BitDepth = 0` would shift by −8).
     let dbp = DeblockParams {
         disabled: false,
+        bit_depth: 8,
         ..Default::default()
     };
     apply_deblocking(&mut rec, &all_deblock_cus, &dbp, 1);
@@ -300,13 +305,48 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     };
     crate::sao::apply_sao(&mut rec, &sao_pic, &sao_cfg);
 
-    // Round-40 — ALF on/off RDO with §7.4.3.18 fixed filter set 0
-    // (no APS dependency). The RDO chooses, per CTB, the lower-SSE_Y
-    // option between (a) leaving the post-SAO samples in place and
-    // (b) running the §8.8.5.2 luma diamond filter on top of them.
-    // Chroma ALF stays off in this round; the per-CTB on/off picture
-    // is captured for the future bitstream-emit round.
-    let _alf_pic = crate::alf_enc::alf_decide_and_apply(src, &mut rec, 7, 8, 1);
+    // Round-41 — luma ALF filter-set RDO over all 16 fixed filter
+    // sets. The RDO chooses, per CTB, the lower-SSE_Y option among
+    // `{off, set 0, …, set 15}`.
+    //
+    // Round-43 — CC-ALF (§8.8.5.7) RDO is chained on top of the luma
+    // pass. CC-ALF reads from the *pre-luma-ALF* `recPictureL`, so we
+    // snapshot the luma plane before the luma RDO mutates it. We then
+    // synthesise an in-memory CC-ALF APS carrying a single non-trivial
+    // filter row per chroma component (vertical-edge sensitive taps —
+    // small enough not to over-correct when CC-ALF would not help, big
+    // enough that real Cb / Cr misalignment near a luma edge gets
+    // refined). The per-CTB RDO leaves CC-ALF off whenever the trial
+    // increases SSE; for flat or aligned content the helper is a no-op.
+    let pre_luma_alf_samples = rec.luma.samples.clone();
+    let mut alf_pic = crate::alf_enc::alf_decide_and_apply(src, &mut rec, 7, 8, 1);
+
+    let cc_alf_aps = build_cc_alf_aps();
+    crate::alf_enc::cc_alf_decide_and_apply(
+        src,
+        &mut rec,
+        &pre_luma_alf_samples,
+        &mut alf_pic,
+        &cc_alf_aps,
+        crate::alf_enc::CcAlfComponent::Cb,
+        7,
+        8,
+        1,
+    );
+    crate::alf_enc::cc_alf_decide_and_apply(
+        src,
+        &mut rec,
+        &pre_luma_alf_samples,
+        &mut alf_pic,
+        &cc_alf_aps,
+        crate::alf_enc::CcAlfComponent::Cr,
+        7,
+        8,
+        1,
+    );
+    // `alf_pic` now records (luma_filt_set_idx, cc_cb_idc, cc_cr_idc)
+    // per CTB for the future bitstream-emit round.
+    let _ = alf_pic;
 
     // Build the IDR slice NAL: header bytes + CABAC bytes + trailing bits.
     let mut slice_rbsp = slice_header_bytes;
@@ -318,6 +358,32 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     annex_b(&mut bitstream, &slice_nal);
 
     Ok((bitstream, rec))
+}
+
+/// Synthesise an in-memory CC-ALF APS for the round-43 encoder pipeline.
+///
+/// Carries one signalled filter per chroma component; the 7-tap row
+/// targets vertical-edge luma → chroma corrections (taps 1 and 2 are
+/// the left / right luma neighbours per §8.8.5.7 / Fig. 53). Magnitudes
+/// are deliberately small (`|coeff| <= 8`) so the helper is a near-no-op
+/// on flat / aligned content; the per-CTB SSE RDO inside
+/// [`crate::alf_enc::cc_alf_decide_and_apply`] strictly leaves CTBs off
+/// whenever the trial does not lower SSE.
+fn build_cc_alf_aps() -> crate::aps::AlfApsData {
+    use crate::aps::{AlfApsData, ALF_CC_NUM_COEFF};
+    let mut row_cb = [0i32; ALF_CC_NUM_COEFF];
+    row_cb[1] = 4;
+    row_cb[2] = -4;
+    let mut row_cr = [0i32; ALF_CC_NUM_COEFF];
+    row_cr[1] = 4;
+    row_cr[2] = -4;
+    AlfApsData {
+        alf_cc_cb_filter_signal_flag: true,
+        alf_cc_cr_filter_signal_flag: true,
+        cc_cb_coeff: vec![row_cb],
+        cc_cr_coeff: vec![row_cr],
+        ..AlfApsData::default()
+    }
 }
 
 /// Build a NAL unit from raw RBSP bytes (add header + emulation prevention).
@@ -424,5 +490,67 @@ mod tests {
         assert!(!bs.is_empty(), "bitstream must be non-empty");
         // Check Annex-B start code.
         assert_eq!(&bs[..4], &[0x00, 0x00, 0x00, 0x01]);
+    }
+
+    /// Round-43 — `build_cc_alf_aps` returns an APS with one signalled
+    /// filter per chroma component, matching the §7.4.3.18 invariants
+    /// (`alf_cc_*_filter_signal_flag = 1`, `cc_*_coeff` non-empty,
+    /// each row exactly `ALF_CC_NUM_COEFF` taps long).
+    #[test]
+    fn cc_alf_aps_signals_one_filter_per_component() {
+        use crate::aps::ALF_CC_NUM_COEFF;
+        let aps = build_cc_alf_aps();
+        assert!(aps.alf_cc_cb_filter_signal_flag);
+        assert!(aps.alf_cc_cr_filter_signal_flag);
+        assert_eq!(aps.cc_cb_coeff.len(), 1);
+        assert_eq!(aps.cc_cr_coeff.len(), 1);
+        assert_eq!(aps.cc_cb_coeff[0].len(), ALF_CC_NUM_COEFF);
+        assert_eq!(aps.cc_cr_coeff[0].len(), ALF_CC_NUM_COEFF);
+    }
+
+    /// Round-43 — sharp-luma-edge IDR encode runs to completion with
+    /// CC-ALF integrated. Smoke-test for the chained luma RDO → Cb
+    /// CC-RDO → Cr CC-RDO sequence on content that exercises the
+    /// §8.8.5.7 cross-component apply path (taps 1 / 2 = ±4 hit the
+    /// vertical-edge luma neighbours). The per-CTB monotonicity
+    /// invariant is covered by `alf_enc::tests::
+    /// cc_alf_rdo_never_increases_chroma_sse`; this test exists to
+    /// ensure the pipeline plumbing (pre-luma-ALF snapshot, in-memory
+    /// APS, both Cb and Cr passes) stays correctly wired.
+    #[test]
+    fn encode_idr_with_cc_alf_runs_on_sharp_edge_picture() {
+        let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+        for y in 0..128 {
+            for x in 64..128 {
+                src.luma.samples[y * src.luma.stride + x] = 220;
+            }
+        }
+        let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+        assert!(!bs.is_empty(), "bitstream must be non-empty");
+        // PSNR_Y on a sharp-edge frame at QP=26 should still clear
+        // 30 dB — the round-43 ALF chain must not regress luma quality.
+        let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+        assert!(
+            psnr >= 30.0,
+            "PSNR_Y {psnr:.2} dB < 30 dB after CC-ALF integration"
+        );
+    }
+
+    /// Round-43 — flat-grey source: the IDR pipeline (with CC-ALF
+    /// integrated) must still reconstruct exactly.
+    #[test]
+    fn encode_idr_flat_grey_with_cc_alf_reconstructs_exactly() {
+        let src = PictureBuffer::yuv420_filled(64, 64, 128);
+        let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+        let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+        assert!(
+            psnr >= 60.0,
+            "flat grey + CC-ALF: PSNR_Y {psnr:.2} dB should be very high"
+        );
+        // CC-ALF on flat luma is identically zero (eq. 1515 sums to
+        // zero because every neighbour equals every other), so chroma
+        // must be byte-identical to the source.
+        assert_eq!(rec.cb.samples, src.cb.samples);
+        assert_eq!(rec.cr.samples, src.cr.samples);
     }
 }
