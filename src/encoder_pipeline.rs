@@ -311,15 +311,46 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     //
     // Round-43 — CC-ALF (§8.8.5.7) RDO is chained on top of the luma
     // pass. CC-ALF reads from the *pre-luma-ALF* `recPictureL`, so we
-    // snapshot the luma plane before the luma RDO mutates it. We then
-    // synthesise an in-memory CC-ALF APS carrying a single non-trivial
-    // filter row per chroma component (vertical-edge sensitive taps —
-    // small enough not to over-correct when CC-ALF would not help, big
-    // enough that real Cb / Cr misalignment near a luma edge gets
-    // refined). The per-CTB RDO leaves CC-ALF off whenever the trial
-    // increases SSE; for flat or aligned content the helper is a no-op.
+    // snapshot the luma plane before the luma RDO mutates it.
+    //
+    // Round-44 — primary chroma ALF (§8.8.5.4) RDO closes the on/off
+    // loop on Cb / Cr. Per §8.8.5.1 the primary chroma pass runs with
+    // luma in the same CTB walk and *before* CC-ALF (which adds onto
+    // the post-primary-chroma plane). Encoder-side we therefore order
+    // the passes:
+    //   1. snapshot pre-luma-ALF luma (CC-ALF reference);
+    //   2. luma RDO (mutates rec.luma);
+    //   3. primary chroma RDO for Cb (mutates rec.cb);
+    //   4. primary chroma RDO for Cr (mutates rec.cr);
+    //   5. CC-ALF RDO for Cb (reads pre-luma-ALF luma, mutates rec.cb);
+    //   6. CC-ALF RDO for Cr (reads pre-luma-ALF luma, mutates rec.cr).
+    // Both chroma APSes are synthesised in-memory with deliberately
+    // small magnitudes; the per-CTB SSE RDO leaves any component off
+    // whenever the trial does not lower SSE.
     let pre_luma_alf_samples = rec.luma.samples.clone();
     let mut alf_pic = crate::alf_enc::alf_decide_and_apply(src, &mut rec, 7, 8, 1);
+
+    let chroma_alf_aps = build_chroma_alf_aps();
+    crate::alf_enc::chroma_alf_decide_and_apply(
+        src,
+        &mut rec,
+        &mut alf_pic,
+        &chroma_alf_aps,
+        crate::alf_enc::CcAlfComponent::Cb,
+        7,
+        8,
+        1,
+    );
+    crate::alf_enc::chroma_alf_decide_and_apply(
+        src,
+        &mut rec,
+        &mut alf_pic,
+        &chroma_alf_aps,
+        crate::alf_enc::CcAlfComponent::Cr,
+        7,
+        8,
+        1,
+    );
 
     let cc_alf_aps = build_cc_alf_aps();
     crate::alf_enc::cc_alf_decide_and_apply(
@@ -344,8 +375,9 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         8,
         1,
     );
-    // `alf_pic` now records (luma_filt_set_idx, cc_cb_idc, cc_cr_idc)
-    // per CTB for the future bitstream-emit round.
+    // `alf_pic` now records the full (luma_filt_set_idx, cb_on/alt,
+    // cr_on/alt, cc_cb_idc, cc_cr_idc) per-CTB decision for the future
+    // bitstream-emit round.
     let _ = alf_pic;
 
     // Build the IDR slice NAL: header bytes + CABAC bytes + trailing bits.
@@ -358,6 +390,42 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     annex_b(&mut bitstream, &slice_nal);
 
     Ok((bitstream, rec))
+}
+
+/// Synthesise an in-memory primary chroma ALF APS for the round-44
+/// encoder pipeline.
+///
+/// Signals `alf_chroma_filter_signal_flag = 1` and one alt-filter row
+/// (`alf_chroma_num_alt_filters_minus1 = 0`). The 6-tap row uses a
+/// gentle smoothing pattern (centre-heavy, small symmetric taps) that
+/// is unlikely to over-correct on aligned content but can shave off
+/// chroma noise that survives SAO. Per §7.4.3.18 the alt count caps at
+/// 8; one row is enough to drive the round-44 RDO loop (`{off, alt 0}`).
+/// Per-CTB the RDO inside
+/// [`crate::alf_enc::chroma_alf_decide_and_apply`] strictly leaves CTBs
+/// off when the trial does not lower SSE, so this helper degrades to a
+/// no-op on flat / well-reconstructed chroma.
+fn build_chroma_alf_aps() -> crate::aps::AlfApsData {
+    use crate::aps::{AlfApsData, ALF_CHROMA_NUM_COEFF};
+    // 6 signalled taps; clip indices stay at 0 (= max-clip per Table 8,
+    // i.e. effectively no clipping for an 8-bit pipeline).
+    let mut row = [0i32; ALF_CHROMA_NUM_COEFF];
+    // Eq. 1490 sums `f[k] * (clip(+) + clip(-))` so the contribution is
+    // 2·f[k]·delta. To stay well below the §8.8.5.4 clipping band we
+    // pick small magnitudes that act as a 5-point neighbour smoother.
+    row[0] = 1; // (0, ±2)
+    row[1] = 1; // (±1, ±1)
+    row[2] = 2; // (0, ±1)
+    row[3] = 1; // (∓1, ±1)
+    row[4] = 1; // (±2, 0)
+    row[5] = 2; // (±1, 0)
+    AlfApsData {
+        alf_chroma_filter_signal_flag: true,
+        alf_chroma_num_alt_filters_minus1: 0,
+        chroma_coeff: vec![row],
+        chroma_clip_idx: vec![[0u8; ALF_CHROMA_NUM_COEFF]],
+        ..AlfApsData::default()
+    }
 }
 
 /// Synthesise an in-memory CC-ALF APS for the round-43 encoder pipeline.
@@ -548,9 +616,55 @@ mod tests {
             "flat grey + CC-ALF: PSNR_Y {psnr:.2} dB should be very high"
         );
         // CC-ALF on flat luma is identically zero (eq. 1515 sums to
-        // zero because every neighbour equals every other), so chroma
-        // must be byte-identical to the source.
+        // zero because every neighbour equals every other), and primary
+        // chroma ALF on flat chroma is also identically zero (eq. 1490
+        // sums neighbour-deltas to zero), so chroma must be byte-
+        // identical to the source.
         assert_eq!(rec.cb.samples, src.cb.samples);
         assert_eq!(rec.cr.samples, src.cr.samples);
+    }
+
+    /// Round-44 — `build_chroma_alf_aps` returns an APS with one alt
+    /// filter per the §7.4.3.18 invariants
+    /// (`alf_chroma_filter_signal_flag = 1`,
+    /// `alf_chroma_num_alt_filters_minus1 = 0`, `chroma_coeff` non-empty
+    /// with each row exactly `ALF_CHROMA_NUM_COEFF` taps long).
+    #[test]
+    fn chroma_alf_aps_signals_one_alt_filter() {
+        use crate::aps::ALF_CHROMA_NUM_COEFF;
+        let aps = build_chroma_alf_aps();
+        assert!(aps.alf_chroma_filter_signal_flag);
+        assert_eq!(aps.alf_chroma_num_alt_filters_minus1, 0);
+        assert_eq!(aps.chroma_coeff.len(), 1);
+        assert_eq!(aps.chroma_clip_idx.len(), 1);
+        assert_eq!(aps.chroma_coeff[0].len(), ALF_CHROMA_NUM_COEFF);
+    }
+
+    /// Round-44 — sharp chroma-edge IDR encode runs to completion with
+    /// primary chroma ALF + CC-ALF chained. The pipeline must not
+    /// regress luma PSNR_Y vs. the round-43 baseline.
+    #[test]
+    fn encode_idr_with_chroma_alf_runs_on_chroma_noise_picture() {
+        // Source with a structured chroma pattern so the primary
+        // chroma RDO has work to do.
+        let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+        for y in 0..64 {
+            for x in 0..64 {
+                src.cb.samples[y * src.cb.stride + x] = 140;
+            }
+        }
+        for y in 0..64 {
+            for x in 0..64 {
+                src.cr.samples[y * src.cr.stride + x] = 110;
+            }
+        }
+        let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+        assert!(!bs.is_empty(), "bitstream must be non-empty");
+        // Luma PSNR must clear 30 dB (chroma ALF must not hurt luma).
+        let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+        assert!(
+            psnr >= 30.0,
+            "PSNR_Y {psnr:.2} dB < 30 dB after chroma ALF integration"
+        );
     }
 }
