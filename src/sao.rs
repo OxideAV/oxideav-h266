@@ -255,6 +255,74 @@ impl SaoPicture {
     }
 }
 
+/// Round-53 — per-CTB merge decision recorded by
+/// [`crate::sao_enc::apply_chroma_sao_merge`].
+///
+/// Values map directly to the §7.3.11.3 syntax bits the SAO emitter
+/// would write per CTB:
+///
+/// * `Independent` — `sao_merge_left_flag = 0`, `sao_merge_up_flag = 0`.
+///   Per-component `sao_type_idx_*` etc. are emitted in full.
+/// * `MergeLeft` — `sao_merge_left_flag = 1`. Per-component params are
+///   inherited from the CTB to the left and not re-emitted.
+/// * `MergeAbove` — `sao_merge_left_flag = 0`,
+///   `sao_merge_up_flag = 1`. Params inherited from the CTB above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SaoMergeChoice {
+    #[default]
+    Independent,
+    MergeLeft,
+    MergeAbove,
+}
+
+/// Round-53 — per-picture array of [`SaoMergeChoice`] decisions, one
+/// entry per CTB in raster order. Companion to [`SaoPicture`]: a future
+/// SAO bit-emit pass would consult this map alongside the params to
+/// decide whether to emit `sao_merge_*_flag = 1` (skip the per-component
+/// re-emit) or fall back to the full block.
+#[derive(Clone, Debug)]
+pub struct SaoMergeMap {
+    pub pic_width_in_ctbs_y: u32,
+    pub pic_height_in_ctbs_y: u32,
+    choices: Vec<SaoMergeChoice>,
+}
+
+impl SaoMergeMap {
+    /// Allocate with every CTB defaulting to [`SaoMergeChoice::Independent`].
+    pub fn empty(pic_width_in_ctbs_y: u32, pic_height_in_ctbs_y: u32) -> Self {
+        let n = (pic_width_in_ctbs_y as usize) * (pic_height_in_ctbs_y as usize);
+        Self {
+            pic_width_in_ctbs_y,
+            pic_height_in_ctbs_y,
+            choices: vec![SaoMergeChoice::Independent; n],
+        }
+    }
+
+    fn idx(&self, rx: u32, ry: u32) -> usize {
+        (ry as usize) * (self.pic_width_in_ctbs_y as usize) + (rx as usize)
+    }
+
+    pub fn set(&mut self, rx: u32, ry: u32, choice: SaoMergeChoice) {
+        let i = self.idx(rx, ry);
+        self.choices[i] = choice;
+    }
+
+    pub fn get(&self, rx: u32, ry: u32) -> SaoMergeChoice {
+        let i = self.idx(rx, ry);
+        self.choices[i]
+    }
+
+    /// Count CTBs where merge fired (left or above). Useful for
+    /// instrumenting the round-53 RDO test that asserts merge fires on
+    /// flat-region pictures.
+    pub fn merge_count(&self) -> usize {
+        self.choices
+            .iter()
+            .filter(|c| !matches!(c, SaoMergeChoice::Independent))
+            .count()
+    }
+}
+
 /// Picture-level configuration the SAO driver needs.
 #[derive(Clone, Copy, Debug)]
 pub struct SaoConfig {
