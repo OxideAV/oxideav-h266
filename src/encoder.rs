@@ -235,6 +235,29 @@ pub fn annex_b_wrap(nal_payload: &[u8], out: &mut Vec<u8>) {
 
 /// Encoder configuration. The fields are deliberately spartan — only
 /// the bits the bitstream layout branches on are exposed.
+///
+/// Round-54 — adds two opt-in encoder-pipeline knobs:
+///
+/// * [`Self::enable_alf_clip_rdo`] — when `true`, the per-class luma
+///   ALF design pass is followed by [`crate::alf_aps_design::
+///   design_clip_rdo_for_luma_aps`], which performs a greedy per-tap
+///   descent over `alf_luma_clip_idx[ filtIdx ][ j ]`. The resulting
+///   per-tap clip indices flow into `AlfApsData` via
+///   [`crate::alf_aps_design::build_per_class_luma_alf_aps_data_with_clip`]
+///   and the wire APS carries `alf_luma_clip_flag = 1` plus the per-tap
+///   block. Default `false` until validated on a broader corpus.
+///
+/// * [`Self::enable_chroma_sao_merge`] — when `true`, the per-CTB chroma
+///   SAO RDO is followed by [`crate::sao_enc::apply_chroma_sao_merge`],
+///   which considers `sao_merge_left_flag` / `sao_merge_up_flag` for
+///   every chroma CTB and rewrites the `SaoPicture` chroma slots to
+///   inherit from the chosen neighbour when that lowers the §8.8.4.1
+///   rate-distortion cost. The matching merge bits are emitted in the
+///   second CABAC pass via [`crate::sao_syntax::encode_sao_ctb`] (round-54
+///   added the encoder-side mirror of [`crate::sao_syntax::decode_sao_ctb`]).
+///   Default `false`. When `true`, the encoder also flips on
+///   `sps_sao_enabled_flag` + the matching `ph_sao_*_enabled_flag` bits
+///   so the SAO bins land on the wire instead of being internal-only.
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -245,6 +268,17 @@ pub struct EncoderConfig {
     /// Chroma subsampling. Only 4:2:0 (`chroma_format_idc = 1`) is
     /// supported by this scaffold.
     pub chroma_format_idc: u8,
+    /// Round-54 — opt-in: run the per-tap luma ALF clip-index RDO after
+    /// the per-class coefficient design. Default `false`.
+    pub enable_alf_clip_rdo: bool,
+    /// Round-54 — opt-in: run [`crate::sao_enc::apply_chroma_sao_merge`]
+    /// after the per-CTB chroma SAO RDO and emit `sao_merge_*_flag`
+    /// CABAC bins on the wire. When `true`, `sps_sao_enabled_flag` is
+    /// signalled 1 + the picture header carries `ph_sao_chroma_enabled_flag
+    /// = 1` (luma SAO stays per the round-50 internal-only path; the
+    /// merge map's `Independent`/`MergeLeft`/`MergeAbove` choices apply
+    /// only to the chroma slots). Default `false`.
+    pub enable_chroma_sao_merge: bool,
 }
 
 impl EncoderConfig {
@@ -254,6 +288,8 @@ impl EncoderConfig {
             height,
             bit_depth: 8,
             chroma_format_idc: 1,
+            enable_alf_clip_rdo: false,
+            enable_chroma_sao_merge: false,
         }
     }
 
@@ -470,13 +506,19 @@ impl VvcEncoder {
         bw.write_ue(0); // num_points_minus1 = 0
         bw.write_ue(0); // delta_qp_in_val_minus1[0][0]
         bw.write_ue(0); // delta_qp_diff_val[0][0]
-        bw.write_bit(0); // sao_enabled
-                         // Round-46 — flip `sps_alf_enabled_flag` on so the
-                         // PH-level ALF chain (`ph_alf_*`) becomes the
-                         // decoder-visible gate for the per-CTU ALF CABAC
-                         // emit. With `sps_chroma_format_idc != 0`,
-                         // §7.3.2.4 also emits `sps_ccalf_enabled_flag`;
-                         // we set both to 1.
+                        // Round-54 — `sps_sao_enabled_flag` is gated by the encoder
+                        // config knob `enable_chroma_sao_merge`. Off → wire matches
+                        // round-53 (SAO is internal-only on the encoder reconstruction).
+                        // On → the per-CTB SAO syntax (and round-54's
+                        // `sao_merge_*_flag`) is emitted by the second-pass CABAC walk
+                        // and the PH carries `ph_sao_chroma_enabled_flag = 1`.
+        bw.write_bit(self.config.enable_chroma_sao_merge as u8); // sao_enabled
+                                                                 // Round-46 — flip `sps_alf_enabled_flag` on so the
+                                                                 // PH-level ALF chain (`ph_alf_*`) becomes the
+                                                                 // decoder-visible gate for the per-CTU ALF CABAC
+                                                                 // emit. With `sps_chroma_format_idc != 0`,
+                                                                 // §7.3.2.4 also emits `sps_ccalf_enabled_flag`;
+                                                                 // we set both to 1.
         bw.write_bit(1); // alf_enabled
         bw.write_bit(1); // ccalf_enabled (gated by alf_enabled && chroma_format_idc != 0)
         bw.write_bit(0); // lmcs_enabled
@@ -590,6 +632,8 @@ impl VvcEncoder {
             ph_alf_cc_cb_aps_id: 1,
             ph_alf_cc_cr_enabled_flag: true,
             ph_alf_cc_cr_aps_id: 1,
+            ph_sao_luma_enabled_flag: false,
+            ph_sao_chroma_enabled_flag: false,
         })
     }
 
@@ -684,7 +728,22 @@ impl VvcEncoder {
         bw.write_ue(0); // ph_cu_qp_delta_subdiv_intra_slice = 0
                         // pps_qp_delta_info_in_ph_flag inferred = 1 → emit ph_qp_delta.
         bw.write_se(0); // ph_qp_delta = 0
-                        // pps_dbf_info_in_ph_flag inferred = 1 → emit gate.
+                        // Round-54 — `ph_sao_*_enabled_flag` lives between
+                        // `ph_qp_delta` and `ph_deblocking_params_present_flag`
+                        // in §7.3.2.8 / §7.4.3.7 — it is gated by
+                        // `sps_sao_enabled_flag && pps_sao_info_in_ph_flag`.
+                        // The round-35 PPS infers `pps_sao_info_in_ph_flag = 1`
+                        // (`pps_no_pic_partition_flag = 1`), so the only gate
+                        // here is the SPS bit, which we tie to the
+                        // round-54 EncoderConfig knob.
+        if self.config.enable_chroma_sao_merge {
+            bw.write_bit(chain.ph_sao_luma_enabled_flag as u8);
+            // chroma_format_idc != 0 → emit chroma flag.
+            if self.config.chroma_format_idc != 0 {
+                bw.write_bit(chain.ph_sao_chroma_enabled_flag as u8);
+            }
+        }
+        // pps_dbf_info_in_ph_flag inferred = 1 → emit gate.
         bw.write_bit(0); // ph_deblocking_params_present_flag = 0
     }
 
@@ -760,6 +819,17 @@ pub struct AlfPhChain {
     /// `ph_alf_cc_cr_aps_id` — pipeline binds CC-ALF Cr to APS id 1 when
     /// shipped.
     pub ph_alf_cc_cr_aps_id: u8,
+    /// Round-54 — `ph_sao_luma_enabled_flag`. Only emitted when
+    /// `sps_sao_enabled_flag = 1` (round-54 ties this to
+    /// `EncoderConfig::enable_chroma_sao_merge`). Present in the PH per
+    /// §7.4.3.7 because `pps_sao_info_in_ph_flag = 1` is inferred from
+    /// the round-35 PPS's `pps_no_pic_partition_flag = 1`.
+    pub ph_sao_luma_enabled_flag: bool,
+    /// Round-54 — `ph_sao_chroma_enabled_flag`. Same gate as luma; the
+    /// round-54 chroma SAO merge path always sets this `true` so the
+    /// per-CTB `sao_type_idx_chroma` + the new `sao_merge_*_flag` bins
+    /// flow through the wire stream.
+    pub ph_sao_chroma_enabled_flag: bool,
 }
 
 #[cfg(test)]
@@ -862,17 +932,13 @@ mod tests {
         assert!(VvcEncoder::new(EncoderConfig::new(0, 240)).is_err());
         assert!(VvcEncoder::new(EncoderConfig::new(320, 0)).is_err());
         assert!(VvcEncoder::new(EncoderConfig {
-            width: 320,
-            height: 240,
             bit_depth: 10,
-            chroma_format_idc: 1,
+            ..EncoderConfig::new(320, 240)
         })
         .is_err());
         assert!(VvcEncoder::new(EncoderConfig {
-            width: 320,
-            height: 240,
-            bit_depth: 8,
             chroma_format_idc: 3,
+            ..EncoderConfig::new(320, 240)
         })
         .is_err());
     }
@@ -1035,6 +1101,8 @@ mod tests {
             ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
             ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
             ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+            ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+            ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
             num_extra_sh_bits: 0,
             nal_unit_type: NalUnitType::IdrNLp,
         };

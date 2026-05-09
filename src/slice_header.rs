@@ -58,6 +58,13 @@ pub struct PhState {
     pub ph_lmcs_enabled_flag: bool,
     pub ph_explicit_scaling_list_enabled_flag: bool,
     pub ph_temporal_mvp_enabled_flag: bool,
+    /// Round-54 — `ph_sao_luma_enabled_flag` (§7.4.3.7). Used by
+    /// [`parse_slice_header_stateful`] to infer `sh_sao_luma_used_flag`
+    /// when `pps_sao_info_in_ph_flag == 1` (the SH does not transmit the
+    /// flag in that branch — it inherits from the PH).
+    pub ph_sao_luma_enabled_flag: bool,
+    /// Round-54 — `ph_sao_chroma_enabled_flag` (§7.4.3.7).
+    pub ph_sao_chroma_enabled_flag: bool,
     /// `NumExtraShBits` — the count of `sps_extra_sh_bit_present_flag[i]`
     /// entries that are equal to 1 (§7.4.3.4). Zero if
     /// `sps_num_extra_sh_bytes == 0`. Our SPS parser does not keep the
@@ -78,6 +85,8 @@ impl Default for PhState {
             ph_lmcs_enabled_flag: false,
             ph_explicit_scaling_list_enabled_flag: false,
             ph_temporal_mvp_enabled_flag: false,
+            ph_sao_luma_enabled_flag: false,
+            ph_sao_chroma_enabled_flag: false,
             num_extra_sh_bits: 0,
             nal_unit_type: NalUnitType::TrailNut,
         }
@@ -417,6 +426,12 @@ pub fn parse_slice_header_stateful(
         if sps.sps_chroma_format_idc != 0 {
             out.sh_sao_chroma_used_flag = br.u1()? == 1;
         }
+    } else if sps.tool_flags.sao_enabled_flag && pps.pps_sao_info_in_ph_flag {
+        // Round-54 — §7.4.8 inference: when `pps_sao_info_in_ph_flag == 1`
+        // the slice header does not transmit `sh_sao_*_used_flag`; both
+        // values are inferred to equal the PH's `ph_sao_*_enabled_flag`.
+        out.sh_sao_luma_used_flag = ph_state.ph_sao_luma_enabled_flag;
+        out.sh_sao_chroma_used_flag = ph_state.ph_sao_chroma_enabled_flag;
     }
 
     if pps.pps_deblocking_filter_override_enabled_flag && !pps.pps_dbf_info_in_ph_flag {

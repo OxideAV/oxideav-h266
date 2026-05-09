@@ -514,6 +514,8 @@ fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
         ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
         ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
         ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
@@ -634,6 +636,8 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
         ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
         ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
         ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
@@ -764,6 +768,8 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
         ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
         ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
         ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
@@ -1043,6 +1049,8 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
         ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
         ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
         ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
@@ -1206,6 +1214,8 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
         ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
         ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
         ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
@@ -1282,5 +1292,107 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     assert_eq!(
         max_abs_delta, 0,
         "constant-QP path must produce zero per-CU QP delta (got {max_abs_delta})"
+    );
+}
+
+/// Round-54 — when `EncoderConfig::enable_chroma_sao_merge` is on, the
+/// SPS carries `sao_enabled_flag = 1`, the PPS carries
+/// `pps_sao_info_in_ph_flag = 1` (inferred), the PH carries
+/// `ph_sao_chroma_enabled_flag = 1`, and the slice-header parser infers
+/// `sh_sao_chroma_used_flag = 1` from the PH per §7.4.8. Verify the full
+/// header chain round-trips.
+#[test]
+fn round54_chroma_sao_merge_header_chain_round_trips() {
+    use oxideav_h266::encoder::EncoderConfig;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals_cfg;
+    use oxideav_h266::picture_header::parse_picture_header_stateful;
+    use oxideav_h266::pps::parse_pps;
+    use oxideav_h266::reconstruct::PictureBuffer;
+    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::sps::parse_sps;
+
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+    for y in 0..64 {
+        for x in 0..64 {
+            src.cb.samples[y * src.cb.stride + x] = 96 + x as u8;
+            src.cr.samples[y * src.cr.stride + x] = 160 - y as u8;
+        }
+    }
+    let mut cfg = EncoderConfig::new(128, 128);
+    cfg.enable_chroma_sao_merge = true;
+    let (bs, _) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+
+    let nals: Vec<_> = iter_annex_b(&bs).collect();
+    let sps = parse_sps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    assert!(
+        sps.tool_flags.sao_enabled_flag,
+        "round-54 chroma SAO merge → sps_sao_enabled_flag = 1"
+    );
+
+    let pps = parse_pps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    assert!(
+        pps.pps_sao_info_in_ph_flag,
+        "pps_no_pic_partition_flag = 1 → pps_sao_info_in_ph_flag = 1 (inferred)"
+    );
+
+    let ph = parse_picture_header_stateful(
+        &extract_rbsp(
+            nals.iter()
+                .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+                .unwrap()
+                .payload(),
+        ),
+        &sps,
+        &pps,
+    )
+    .unwrap();
+    assert!(
+        !ph.ph_sao_luma_enabled_flag,
+        "round-54 luma SAO stays internal-only on this path"
+    );
+    assert!(
+        ph.ph_sao_chroma_enabled_flag,
+        "round-54 chroma SAO merge → ph_sao_chroma_enabled_flag = 1"
+    );
+
+    // SH inference: with pps_sao_info_in_ph_flag = 1, the SH does not
+    // emit sao_*_used flags; both inferred from the PH per §7.4.8.
+    let ph_state = PhState {
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+        ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+        ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+        ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
+        num_extra_sh_bits: 0,
+        nal_unit_type: NalUnitType::IdrNLp,
+    };
+    let slice_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .expect("IDR slice");
+    let slice_rbsp = extract_rbsp(slice_nal.payload());
+    let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).unwrap();
+    assert!(
+        !sh.sh_sao_luma_used_flag,
+        "luma SAO inferred off from ph_sao_luma_enabled_flag = 0"
+    );
+    assert!(
+        sh.sh_sao_chroma_used_flag,
+        "chroma SAO inferred on from ph_sao_chroma_enabled_flag = 1"
     );
 }
