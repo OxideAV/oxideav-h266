@@ -71,7 +71,7 @@ use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
 use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_high_precision};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
-use crate::coding_tree::{Cu, TreeCtxs, TreeWalker};
+use crate::coding_tree::{Cu, CuNeighbourMap, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::gpm::{
@@ -652,6 +652,14 @@ pub struct CtuWalker<'a, 'b> {
     intra_grid_w: u32,
     /// Round-28 — height of [`Self::intra_grid`] in 4x4 blocks.
     intra_grid_h: u32,
+    /// Round-56 — picture-wide CU neighbour map used by the
+    /// [`TreeWalker`] to derive the §9.3.4.2 ctxInc. Populated as each
+    /// CTU's leaf CUs commit; `decode_ctu_partitions` hands a `&mut`
+    /// borrow to the per-CTU walker via
+    /// [`TreeWalker::with_neighbour_map`]. Replaces the round-55 hard-
+    /// coded picture-edge default so multi-row CTBs see real left /
+    /// above neighbour descriptors.
+    nbr_map: CuNeighbourMap,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -798,6 +806,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             intra_grid,
             intra_grid_w,
             intra_grid_h,
+            nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
         })
     }
 
@@ -1337,17 +1346,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if ctu.width_luma == 0 || ctu.height_luma == 0 {
             return Ok(Vec::new());
         }
-        // NB: the low-level TreeWalker ignores neighbour availability
-        // today; this is fine for the root of each CTU but biases the
-        // ctxInc derivation for internal splits. That precision is
-        // tracked in the TreeWalker module.
+        // Round-56 — the TreeWalker now consumes a picture-wide
+        // [`CuNeighbourMap`] (§9.3.4.2 ctxInc derivation). The walker
+        // operates in CTU-local coordinates so we hand it the full
+        // picture map rebased onto the CTU origin: leaves it inserts
+        // are picture-absolute via the rebase below.
         let _avail = Self::neighbour_avail(ctu);
-        let local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs).walk(
-            0,
-            0,
-            ctu.width_luma,
-            ctu.height_luma,
-        )?;
+        let local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
+            .with_neighbour_map_rebased(&mut self.nbr_map, ctu.x0, ctu.y0)
+            .walk(0, 0, ctu.width_luma, ctu.height_luma)?;
         Ok(local
             .into_iter()
             .map(|c| CtuCu {

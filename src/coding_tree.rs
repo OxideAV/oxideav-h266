@@ -81,16 +81,118 @@ impl TreeCtxs {
     }
 }
 
+/// Round-56 — picture-wide neighbour-map for the §9.3.4.2 ctxInc
+/// derivations.
+///
+/// The map is keyed by `(x / 4, y / 4)` cells (min-CB granularity) and
+/// holds, for every emitted CU, the descriptor consumed by
+/// [`ctx_inc_split_cu_flag`] / [`ctx_inc_split_qt_flag`] /
+/// [`ctx_inc_mtt_split_cu_vertical_flag`]. The decoder side mirrors
+/// the encoder map shape so the wire bins match: encoder + decoder
+/// both populate the map as each CU is committed and look up the
+/// `(x - 1, y)` / `(x, y - 1)` neighbour to derive ctxInc.
+///
+/// The map is the spec-exact replacement for the round-55 hard-coded
+/// `nbrs.left/above_avail = false`. With per-CU neighbour state plumbed
+/// the encoder + decoder agree on `condL` / `condA` for split flags and
+/// produce wire-compatible CABAC streams across multi-row CTBs.
+#[derive(Debug, Default, Clone)]
+pub struct CuNeighbourMap {
+    width_mcb: usize,
+    height_mcb: usize,
+    cells: Vec<Option<NeighbourDescriptor>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NeighbourDescriptor {
+    cb_w: u32,
+    cb_h: u32,
+    cqt_depth: u32,
+}
+
+impl CuNeighbourMap {
+    /// Build a fresh map for a picture of `(w, h)` luma samples. Every
+    /// cell is initially unpopulated.
+    pub fn new(w: u32, h: u32) -> Self {
+        let width_mcb = (w as usize + 3) / 4;
+        let height_mcb = (h as usize + 3) / 4;
+        Self {
+            width_mcb,
+            height_mcb,
+            cells: vec![None; width_mcb * height_mcb],
+        }
+    }
+
+    /// Insert one CU rectangle into the map.
+    pub fn insert(&mut self, x: u32, y: u32, cb_w: u32, cb_h: u32, cqt_depth: u32) {
+        let desc = NeighbourDescriptor {
+            cb_w,
+            cb_h,
+            cqt_depth,
+        };
+        let mcb_x0 = (x as usize) / 4;
+        let mcb_y0 = (y as usize) / 4;
+        let mcb_x1 = ((x + cb_w) as usize).div_ceil(4);
+        let mcb_y1 = ((y + cb_h) as usize).div_ceil(4);
+        for my in mcb_y0..mcb_y1.min(self.height_mcb) {
+            for mx in mcb_x0..mcb_x1.min(self.width_mcb) {
+                self.cells[my * self.width_mcb + mx] = Some(desc);
+            }
+        }
+    }
+
+    fn get(&self, x: i64, y: i64) -> Option<NeighbourDescriptor> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let mx = (x as usize) / 4;
+        let my = (y as usize) / 4;
+        if mx >= self.width_mcb || my >= self.height_mcb {
+            return None;
+        }
+        self.cells[my * self.width_mcb + mx]
+    }
+
+    /// Pack the map's entries at `(x - 1, y)` / `(x, y - 1)` into the
+    /// six fields that the §9.3.4.2 ctxInc derivations consume.
+    /// Returns `(left_avail, above_avail, cb_height_left, cb_width_above,
+    /// cqt_depth_left, cqt_depth_above)`.
+    pub fn neighbour_state(&self, x: u32, y: u32) -> (bool, bool, u32, u32, u32, u32) {
+        let left = self.get(x as i64 - 1, y as i64);
+        let above = self.get(x as i64, y as i64 - 1);
+        (
+            left.is_some(),
+            above.is_some(),
+            left.map(|d| d.cb_h).unwrap_or(0),
+            above.map(|d| d.cb_w).unwrap_or(0),
+            left.map(|d| d.cqt_depth).unwrap_or(0),
+            above.map(|d| d.cqt_depth).unwrap_or(0),
+        )
+    }
+}
+
 /// Walker state: the output CU list plus scratch neighbour info for
-/// ctxInc derivation. Initial implementation ignores neighbour state
-/// and passes `false` availability flags — that's a valid simplification
-/// for the root of the first CTU but biases the ctxInc derivation for
-/// subsequent CUs. Will be refined when a full picture walker lands.
+/// ctxInc derivation. Round 56 lit up the optional `nbr_map` hook
+/// which threads a picture-wide [`CuNeighbourMap`] through the
+/// recursion so left / above CU descriptors feed
+/// [`ctx_inc_split_cu_flag`] / [`ctx_inc_split_qt_flag`] /
+/// [`ctx_inc_mtt_split_cu_vertical_flag`]. With `nbr_map = None` the
+/// walker preserves the round-55 picture-edge default
+/// (`nbrs.left/above_avail = false`).
 pub struct TreeWalker<'a, 'b> {
     dec: &'a mut ArithDecoder<'b>,
     ctxs: &'a mut TreeCtxs,
     min_cb_log2: u32,
     out: Vec<Cu>,
+    nbr_map: Option<&'a mut CuNeighbourMap>,
+    /// Round-56 — picture-absolute origin of the walked region. Added
+    /// to every CU's local `(x, y)` before the [`CuNeighbourMap`]
+    /// look-up / insert. The walker emits CTU-local rectangles to its
+    /// caller (`out`); the map operates in picture-absolute
+    /// coordinates because neighbour CUs of the *first* CU in a CTU
+    /// live in the *previous* CTU.
+    base_x: u32,
+    base_y: u32,
 }
 
 impl<'a, 'b> TreeWalker<'a, 'b> {
@@ -100,7 +202,38 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             ctxs,
             min_cb_log2: 2, // 4x4 minimum for luma (MinCbLog2SizeY default)
             out: Vec::new(),
+            nbr_map: None,
+            base_x: 0,
+            base_y: 0,
         }
+    }
+
+    /// Round-56 — attach a picture-wide [`CuNeighbourMap`] to the
+    /// walker so the §9.3.4.2 ctxInc derivations see real neighbour
+    /// descriptors. The map is populated as each leaf CU is committed
+    /// (post-`split_cu_flag` decision) so look-ups inside the same CTU
+    /// can see siblings emitted earlier in the walk.
+    pub fn with_neighbour_map(mut self, map: &'a mut CuNeighbourMap) -> Self {
+        self.nbr_map = Some(map);
+        self
+    }
+
+    /// Round-56 — variant of [`Self::with_neighbour_map`] used by per-
+    /// CTU walkers that emit rectangles in CTU-local coordinates while
+    /// the neighbour map operates in picture-absolute coordinates. The
+    /// `(base_x, base_y)` offset is added to every local `(x, y)` for
+    /// look-ups + inserts so the map sees consistent coordinates
+    /// across CTU boundaries.
+    pub fn with_neighbour_map_rebased(
+        mut self,
+        map: &'a mut CuNeighbourMap,
+        base_x: u32,
+        base_y: u32,
+    ) -> Self {
+        self.nbr_map = Some(map);
+        self.base_x = base_x;
+        self.base_y = base_y;
+        self
     }
 
     /// Walk a coding_tree() rooted at `(x, y)` of size `w × h`.
@@ -108,6 +241,21 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
     pub fn walk(mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<Cu>> {
         self.recurse(x, y, w, h, 0, 0)?;
         Ok(self.out)
+    }
+
+    fn neighbour_state(&self, x: u32, y: u32) -> (bool, bool, u32, u32, u32, u32) {
+        match &self.nbr_map {
+            Some(map) => map.neighbour_state(self.base_x + x, self.base_y + y),
+            None => (false, false, 0, 0, 0, 0),
+        }
+    }
+
+    fn record_cu(&mut self, x: u32, y: u32, w: u32, h: u32, cqt_depth: u32) {
+        let bx = self.base_x;
+        let by = self.base_y;
+        if let Some(map) = self.nbr_map.as_deref_mut() {
+            map.insert(bx + x, by + y, w, h, cqt_depth);
+        }
     }
 
     fn recurse(
@@ -131,12 +279,33 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
                 cqt_depth,
                 mtt_depth,
             });
+            self.record_cu(x, y, w, h, cqt_depth);
             return Ok(());
         }
-        // split_cu_flag — ctxInc uses availability of L/A neighbours
-        // (treated as unavailable at the root here) and partition
-        // allowance flags (all allowed at the root of a large CU).
-        let split_cu_inc = ctx_inc_split_cu_flag(false, false, 0, 0, w, h, 1, 1, 1, 1, 1) as usize;
+        // split_cu_flag — round-56 ctxInc uses real neighbour
+        // availability when the walker has been attached to a
+        // [`CuNeighbourMap`] (otherwise picture-edge defaults).
+        let (
+            left_avail,
+            above_avail,
+            cb_height_left,
+            cb_width_above,
+            cqt_depth_left,
+            cqt_depth_above,
+        ) = self.neighbour_state(x, y);
+        let split_cu_inc = ctx_inc_split_cu_flag(
+            left_avail,
+            above_avail,
+            cb_height_left,
+            cb_width_above,
+            w,
+            h,
+            1,
+            1,
+            1,
+            1,
+            1,
+        ) as usize;
         let split_cu_ctx_n = self.ctxs.split_cu.len() - 1;
         let split_cu = self
             .dec
@@ -150,12 +319,19 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
                 cqt_depth,
                 mtt_depth,
             });
+            self.record_cu(x, y, w, h, cqt_depth);
             return Ok(());
         }
         // split_qt_flag — only readable while we're in the quad-tree
         // phase (mtt_depth == 0). Outside that we force BT/TT.
         let split_qt = if mtt_depth == 0 {
-            let inc = ctx_inc_split_qt_flag(false, false, 0, 0, cqt_depth) as usize;
+            let inc = ctx_inc_split_qt_flag(
+                left_avail,
+                above_avail,
+                cqt_depth_left,
+                cqt_depth_above,
+                cqt_depth,
+            ) as usize;
             let n = self.ctxs.split_qt.len() - 1;
             self.dec
                 .decode_decision(&mut self.ctxs.split_qt[inc.min(n)])?
@@ -171,14 +347,21 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             self.recurse(x + hw, y + hh, hw, hh, cqt_depth + 1, mtt_depth)?;
             return Ok(());
         }
-        // Round-55 — multi-type-tree split: read vertical + binary bins
-        // through their proper §9.3.4.2.3 / Table 132 contexts. The
-        // walker hasn't yet wired full neighbour tracking so we feed
-        // unavailable neighbours; under symmetric BT/TT allowance this
-        // collapses ctxInc to 0 (vertical) per the dA == dL or
-        // unavailable-neighbour branch of §9.3.4.2.3.
-        let mtt_v_inc =
-            ctx_inc_mtt_split_cu_vertical_flag(false, false, 0, 0, w, h, 1, 1, 1, 1) as usize;
+        // Round-55 — multi-type-tree split. Round-56 — feed the same
+        // neighbour state into the §9.3.4.2.3 derivation so multi-row
+        // pictures see the proper aspect-ratio branch.
+        let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
+            left_avail,
+            above_avail,
+            cb_height_left,
+            cb_width_above,
+            w,
+            h,
+            1,
+            1,
+            1,
+            1,
+        ) as usize;
         let mtt_v_n = self.ctxs.mtt_split_vertical.len() - 1;
         let mtt_vertical = self
             .dec
@@ -277,6 +460,72 @@ mod tests {
                 cqt_depth: 0,
                 mtt_depth: 0
             }]
+        );
+    }
+
+    /// Round-56 — `CuNeighbourMap` insert + neighbour_state round-
+    /// trips a CU descriptor. With both left + above CUs populated the
+    /// returned tuple matches the §9.3.4.2 inputs.
+    #[test]
+    fn cu_neighbour_map_round_trips_descriptor() {
+        let mut map = CuNeighbourMap::new(128, 128);
+        // Picture-edge default → all unavailable.
+        let (l, a, _, _, _, _) = map.neighbour_state(0, 0);
+        assert!(!l);
+        assert!(!a);
+        // Look up at (64, 64): the left neighbour cell is at (63, 64)
+        // and the above neighbour cell is at (64, 63). Insert two CUs
+        // covering those cells: a 64×64 left neighbour at (0, 64) and
+        // a 64×64 above neighbour at (64, 0).
+        map.insert(0, 64, 64, 64, 0);
+        map.insert(64, 0, 64, 64, 0);
+        let (l, a, hl, wa, dl, da) = map.neighbour_state(64, 64);
+        assert!(l);
+        assert!(a);
+        assert_eq!(hl, 64);
+        assert_eq!(wa, 64);
+        assert_eq!(dl, 0);
+        assert_eq!(da, 0);
+    }
+
+    /// Round-56 — `TreeWalker::with_neighbour_map` populates the map
+    /// for every leaf the walker emits. After walking a 4×4 leaf the
+    /// map should contain that one CU.
+    #[test]
+    fn tree_walker_populates_neighbour_map_on_leaf() {
+        let data = [0u8; 32];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = TreeCtxs::init(16);
+        let mut map = CuNeighbourMap::new(64, 64);
+        let walker = TreeWalker::new(&mut dec, &mut ctxs).with_neighbour_map(&mut map);
+        let _cus = walker.walk(0, 0, 4, 4).unwrap();
+        // Map should contain the 4×4 leaf at (0, 0).
+        let d = map.get(0, 0).expect("4×4 leaf must be inserted");
+        assert_eq!(d.cb_w, 4);
+        assert_eq!(d.cb_h, 4);
+    }
+
+    /// Round-56 — `TreeWalker::with_neighbour_map_rebased` adds the
+    /// `(base_x, base_y)` offset to every map insert, so per-CTU
+    /// walkers operating in CTU-local coords still populate the
+    /// picture-absolute map correctly.
+    #[test]
+    fn tree_walker_rebased_inserts_picture_absolute() {
+        let data = [0u8; 32];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = TreeCtxs::init(16);
+        let mut map = CuNeighbourMap::new(128, 128);
+        let walker =
+            TreeWalker::new(&mut dec, &mut ctxs).with_neighbour_map_rebased(&mut map, 64, 64);
+        let _cus = walker.walk(0, 0, 4, 4).unwrap();
+        // Map inserts at picture-absolute (64, 64) not local (0, 0).
+        assert!(
+            map.get(0, 0).is_none(),
+            "local origin must not be populated"
+        );
+        assert!(
+            map.get(64, 64).is_some(),
+            "rebased origin (64, 64) must be populated"
         );
     }
 }

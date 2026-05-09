@@ -279,6 +279,17 @@ pub struct EncoderConfig {
     /// merge map's `Independent`/`MergeLeft`/`MergeAbove` choices apply
     /// only to the chroma slots). Default `false`.
     pub enable_chroma_sao_merge: bool,
+    /// Round-56 — opt-in: enable the multi-type-tree binary-split (MTT
+    /// BT) picker in the encoder pipeline. For each leaf CU candidate
+    /// the picker also evaluates `BT_VERT` (split into two stacked
+    /// half-width CUs) and `BT_HORZ` (split into two stacked half-height
+    /// CUs) and picks the lowest-cost option per `cost = SSE + λ·bits`
+    /// (rate-distortion). Default `false` preserves the round-55 leaf-or-
+    /// QT-only behaviour. The picker uses
+    /// [`crate::syntax_enc::encode_coding_tree_bt_split`] for the syntax
+    /// emit; the recursive sub-CU bodies follow the same
+    /// `transform_tree()` / `cu_qp_delta` path as leaf CUs.
+    pub enable_mtt_bt_picker: bool,
 }
 
 impl EncoderConfig {
@@ -290,6 +301,7 @@ impl EncoderConfig {
             chroma_format_idc: 1,
             enable_alf_clip_rdo: false,
             enable_chroma_sao_merge: false,
+            enable_mtt_bt_picker: false,
         }
     }
 
