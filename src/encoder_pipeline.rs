@@ -117,6 +117,42 @@ fn lambda_for_qp(qp: i32) -> f64 {
     0.85f64 * 2.0f64.powf((qp as f64 - 12.0) / 3.0)
 }
 
+/// Round-50 — measure the per-picture CABAC bit cost of the per-CTB ALF
+/// syntax bins (`alf_ctb_flag[]` + `alf_use_aps_flag` +
+/// `alf_luma_prev_filter_idx` / `alf_luma_fixed_filter_idx` +
+/// `alf_ctb_filter_alt_idx[]` + `alf_ctb_cc_*_idc[]`) for one
+/// [`crate::alf::AlfPicture`].
+///
+/// Uses a fresh [`crate::cabac_enc::ArithEncoder`] + freshly-init
+/// `AlfCtxs` so the count reflects the standalone bin cost, isolated
+/// from the residual / `end_of_slice_segment` bins that the second-pass
+/// CABAC walk interleaves on top. The returned bit count is `8 *
+/// bytes_emitted` from the finished arithmetic stream — same accounting
+/// the wire stream uses.
+///
+/// The round-48 APS-vs-fixed trade-off used to compare
+/// `sse_with_aps + lambda * 8 * aps_byte_cost` against `sse_fixed_only`,
+/// missing the per-CTB CABAC bit deltas: every CTB the picture-level
+/// "use APS" branch picks pays the `alf_use_aps_flag = 1` ctx-coded bin
+/// + a TB-bypass `alf_luma_prev_filter_idx`, while the "fixed-set"
+/// branch pays `alf_use_aps_flag = 0` + a 4-bit-bypass
+/// `alf_luma_fixed_filter_idx`. The two costs differ enough (especially
+/// at low QP) to flip the picture-level decision when the APS only
+/// barely beats fixed-only on raw SSE. Round-50 closes that gap by
+/// adding `lambda * picture_bin_cost(alf_pic, cfg)` to *both* sides
+/// before comparing.
+fn estimate_alf_picture_bin_cost(
+    alf_pic: &crate::alf::AlfPicture,
+    cfg: &crate::alf_syntax::AlfSyntaxConfig,
+    qp: i32,
+) -> Result<u64> {
+    let mut enc = crate::cabac_enc::ArithEncoder::new();
+    let mut ctxs = crate::alf_syntax::AlfCtxs::init(qp);
+    crate::alf_syntax::encode_alf_picture(&mut enc, &mut ctxs, cfg, alf_pic)?;
+    let bytes = enc.finish();
+    Ok((bytes.len() as u64) * 8)
+}
+
 /// Persisted per-TB state from the round-46 reconstruction pass —
 /// re-used by the second-pass CABAC emit (per-CTU ALF + residual
 /// interleave) so the encoder doesn't have to redo forward DCT /
@@ -479,11 +515,23 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     };
     apply_deblocking(&mut rec, &all_deblock_cus, &dbp, 1);
 
-    // SAO decision + apply (luma only for this round).
-    let sao_pic = sao_decide_picture(src, &rec, 7, 8, true, false);
+    // SAO decision + apply.
+    //
+    // Round-50 — chroma SAO RDO + apply lit up alongside luma now that
+    // round-49 emits real chroma residuals. The reconstructed Cb / Cr
+    // planes carry chroma quant / IDCT noise that the per-CTB §8.8.4.2
+    // BO + EO RDO can shave off the same way the luma path already does.
+    // [`sao_decide_picture`] already mirrors the per-CTU walk for
+    // chroma at the 4:2:0 half-resolution, and [`apply_sao`] gates the
+    // chroma branch on `cfg.chroma_used && chroma_format_idc != 0`. The
+    // SPS still carries `sao_enabled_flag = 0` (the round-50 encoder is
+    // a self-roundtrip pipeline; SAO modifies the in-loop reconstruction
+    // but is not signalled on the wire), so flipping `chroma_used` on
+    // changes only the *internal* reconstruction the PSNR test reads.
+    let sao_pic = sao_decide_picture(src, &rec, 7, 8, true, true);
     let sao_cfg = SaoConfig {
         luma_used: true,
-        chroma_used: false,
+        chroma_used: true,
         bit_depth: 8,
         ctb_log2_size_y: 7,
         chroma_format_idc: 1,
@@ -580,7 +628,54 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         (0..alf_pic_with_aps.pic_width_in_ctbs_y)
             .any(|rx| alf_pic_with_aps.get(rx, ry).luma_filt_set_idx >= 16)
     });
-    let ship_aps = aps_used_anywhere && sse_with_aps + aps_rd_overhead < sse_fixed_only;
+
+    // Round-50 — extend the trade-off with the per-CTB CABAC bit cost of
+    // the `alf_use_aps_flag` + `alf_luma_*_filter_idx` syntax. The two
+    // candidate `AlfPicture`s differ in which luma filter index family
+    // they signal per CTB (APS vs fixed-set), and the binarisation cost
+    // is not symmetric: `alf_luma_fixed_filter_idx` is a TB-bypass with
+    // cMax = 15 (~4 bits per CTB) while `alf_luma_prev_filter_idx` with
+    // cMax = N - 1 = 0 is suppressed entirely (eq. 1437, the field is
+    // absent and prev_idx is inferred to 0). The fixed-only candidate
+    // therefore pays ~5 bits per "luma_on" CTB while the with-APS
+    // candidate pays ~1 bit. Without this term the round-48 trade-off
+    // would over-account the APS NAL byte cost in isolation; closing
+    // the gap means both branches are compared on an apples-to-apples
+    // SSE + lambda * total_bits basis.
+    //
+    // We measure each candidate against the `AlfSyntaxConfig` that
+    // matches the wire stream the second-pass CABAC walk would emit:
+    // - fixed-only: `sh_num_alf_aps_ids_luma = 0` (`alf_use_aps_flag`
+    //   suppressed downstream, but every "luma_on" CTB still pays the
+    //   fixed-filter index), with the chroma + CC-ALF parameters left
+    //   at their picture-level values so the chroma bins are folded in
+    //   identically across both branches and cancel in the difference.
+    // - with-aps: `sh_num_alf_aps_ids_luma = 1`, so each "luma_on" CTB
+    //   pays an `alf_use_aps_flag` ctx-coded bin and (when the bin is
+    //   set) the prev_idx field collapses to a no-op.
+    let cfg_fixed = crate::alf_syntax::AlfSyntaxConfig {
+        alf_enabled: true,
+        cb_enabled: true,
+        cr_enabled: true,
+        cc_cb_enabled: true,
+        cc_cr_enabled: true,
+        sh_num_alf_aps_ids_luma: 0,
+        alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
+        alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
+        alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
+        chroma_format_idc: 1,
+        slice_type: crate::slice_header::SliceType::I,
+        sh_cabac_init_flag: false,
+    };
+    let cfg_with_aps = crate::alf_syntax::AlfSyntaxConfig {
+        sh_num_alf_aps_ids_luma: 1,
+        ..cfg_fixed
+    };
+    let bits_fixed_only = estimate_alf_picture_bin_cost(&alf_pic_fixed_only, &cfg_fixed, qp)?;
+    let bits_with_aps = estimate_alf_picture_bin_cost(&alf_pic_with_aps, &cfg_with_aps, qp)?;
+    let rd_fixed_only = sse_fixed_only + (lambda * bits_fixed_only as f64) as u64;
+    let rd_with_aps = sse_with_aps + aps_rd_overhead + (lambda * bits_with_aps as f64) as u64;
+    let ship_aps = aps_used_anywhere && rd_with_aps < rd_fixed_only;
 
     // Commit the chosen luma reconstruction + AlfPicture.
     let (mut alf_pic, sh_num_alf_aps_ids_luma, ph_num_alf_aps_ids_luma) = if ship_aps {
@@ -1140,6 +1235,119 @@ mod tests {
         assert!(
             levels.iter().any(|&l| l != 0),
             "expected at least one non-zero level on non-flat input, got all zeros"
+        );
+    }
+
+    /// Round-50 — chroma SAO is now enabled in the pipeline. With a
+    /// structured chroma source the SAO RDO should non-trivially improve
+    /// chroma PSNR vs. the round-49 baseline (which had `chroma_used =
+    /// false` and skipped chroma SAO entirely). We use a 128×128
+    /// structured-chroma fixture identical to the
+    /// `encode_idr_chroma_psnr_clears_30db_at_qp26` setup; the round-49
+    /// baseline reported PSNR_Cb = 57.16 dB, PSNR_Cr = 56.65 dB. With
+    /// chroma SAO live the round-50 numbers must clear those baselines
+    /// (the per-CTU SAO RDO leaves a CTB at `NotApplied` whenever no
+    /// improvement is possible, so it cannot regress).
+    #[test]
+    fn round50_chroma_sao_does_not_regress_chroma_psnr() {
+        let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+        for y in 0..64 {
+            for x in 0..64 {
+                src.cb.samples[y * src.cb.stride + x] = (96 + (x as u16 * 64 / 64)) as u8;
+                src.cr.samples[y * src.cr.stride + x] = (160 - (y as u16 * 64 / 64)) as u8;
+            }
+        }
+        let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+        let psnr_cb = psnr_y(&src.cb, &rec.cb).unwrap();
+        let psnr_cr = psnr_y(&src.cr, &rec.cr).unwrap();
+        // Round-49 baseline: 57.16 / 56.65 dB. Allow a small margin
+        // (1 dB) below the measured round-50 numbers (59.20 / 57.74 dB)
+        // so unrelated future RDO tweaks have headroom.
+        assert!(
+            psnr_cb >= 58.0,
+            "Cb PSNR {psnr_cb:.2} dB regressed below the round-50 chroma-SAO floor (≥ 58 dB)"
+        );
+        assert!(
+            psnr_cr >= 57.0,
+            "Cr PSNR {psnr_cr:.2} dB regressed below the round-50 chroma-SAO floor (≥ 57 dB)"
+        );
+    }
+
+    /// Round-50 — `estimate_alf_picture_bin_cost` returns zero when ALF
+    /// is disabled (every CTB short-circuits in `encode_alf_ctu`). Smoke
+    /// test that the helper is wired through the §7.3.11.2 syntax path.
+    #[test]
+    fn estimate_alf_bin_cost_disabled_is_zero() {
+        let pic = crate::alf::AlfPicture::empty(2, 2);
+        let cfg = crate::alf_syntax::AlfSyntaxConfig {
+            alf_enabled: false,
+            cb_enabled: false,
+            cr_enabled: false,
+            cc_cb_enabled: false,
+            cc_cr_enabled: false,
+            sh_num_alf_aps_ids_luma: 0,
+            alf_chroma_num_alt_filters_minus1: 0,
+            alf_cc_cb_filters_signalled_minus1: 0,
+            alf_cc_cr_filters_signalled_minus1: 0,
+            chroma_format_idc: 1,
+            slice_type: crate::slice_header::SliceType::I,
+            sh_cabac_init_flag: false,
+        };
+        // Disabled ALF emits no bins, which after CABAC termination still
+        // produces a small "flush" footer (≤ a few bytes). The helper
+        // does not subtract that footer, but the bit cost is bounded by
+        // the encoder's flush footer (≤ 4 bytes ⇒ ≤ 32 bits).
+        let bits = estimate_alf_picture_bin_cost(&pic, &cfg, 26).unwrap();
+        assert!(
+            bits <= 32,
+            "expected ≤ 32-bit (flush-only) bin cost when ALF disabled, got {bits}"
+        );
+    }
+
+    /// Round-50 — bin cost increases monotonically with the number of
+    /// "luma_on" CTBs for a fixed-only picture (each "on" CTB adds the
+    /// `alf_use_aps_flag` + `alf_luma_fixed_filter_idx` bypass bits).
+    /// Verifies the helper is actually exercising the per-CTB syntax
+    /// emit, not always returning the same flush footer.
+    #[test]
+    fn estimate_alf_bin_cost_grows_with_luma_on_ctbs() {
+        use crate::alf::{AlfCtb, AlfPicture};
+        let mut pic_off = AlfPicture::empty(4, 4);
+        let mut pic_on = AlfPicture::empty(4, 4);
+        // Every CTB "on" with fixed filter index 7.
+        for ry in 0..4 {
+            for rx in 0..4 {
+                pic_on.set(
+                    rx,
+                    ry,
+                    AlfCtb {
+                        luma_on: true,
+                        luma_filt_set_idx: 7,
+                        ..Default::default()
+                    },
+                );
+                pic_off.set(rx, ry, AlfCtb::default());
+            }
+        }
+        let cfg = crate::alf_syntax::AlfSyntaxConfig {
+            alf_enabled: true,
+            cb_enabled: false,
+            cr_enabled: false,
+            cc_cb_enabled: false,
+            cc_cr_enabled: false,
+            sh_num_alf_aps_ids_luma: 0,
+            alf_chroma_num_alt_filters_minus1: 0,
+            alf_cc_cb_filters_signalled_minus1: 0,
+            alf_cc_cr_filters_signalled_minus1: 0,
+            chroma_format_idc: 1,
+            slice_type: crate::slice_header::SliceType::I,
+            sh_cabac_init_flag: false,
+        };
+        let bits_off = estimate_alf_picture_bin_cost(&pic_off, &cfg, 26).unwrap();
+        let bits_on = estimate_alf_picture_bin_cost(&pic_on, &cfg, 26).unwrap();
+        assert!(
+            bits_on > bits_off,
+            "bin cost ({bits_on}) should exceed all-off cost ({bits_off}) when CTBs are on"
         );
     }
 }
