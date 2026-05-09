@@ -20,6 +20,9 @@
 //!    `dequantize_tb_flat` → inverse transform → write `(pred +
 //!    dequant_residual).clamp(0, 255)` into `rec`. Per-TB quantised
 //!    levels are persisted as [`PreparedLumaTb`] for the second pass.
+//!    Round-49 — the same DCT / quant / dequant / IDCT loop runs for
+//!    Cb + Cr at half luma resolution (4:2:0); chroma quantised levels
+//!    are stored alongside the luma levels in the same `PreparedLumaTb`.
 //! 2. **In-loop filters:** deblock (§8.8.3) → SAO RDO + apply (§8.8.2)
 //!    → luma ALF RDO (§7.4.3.18 fixed-filter sets) → chroma ALF RDO
 //!    (§8.8.5.4) → CC-ALF RDO (§8.8.5.7), each pass mutating `rec` and
@@ -27,9 +30,10 @@
 //! 3. **Second pass — CABAC interleave:** for every CTU emit
 //!    `encode_alf_ctu` (`alf_ctb_flag[]` / `alf_use_aps_flag` /
 //!    `alf_luma_*_idx` / `alf_ctb_filter_alt_idx[]` /
-//!    `alf_ctb_cc_*_idc[]`) followed by `emit_luma_tb_residual` for
-//!    every TB followed by `encode_terminate(0)` (or `(1)` on the last
-//!    CTU). Both syntax families share one [`crate::cabac_enc::ArithEncoder`].
+//!    `alf_ctb_cc_*_idc[]`) followed by `emit_luma_tb_residual` then
+//!    `emit_chroma_tb_residuals` (Cb then Cr per §7.3.10) for every TB
+//!    followed by `encode_terminate(0)` (or `(1)` on the last CTU).
+//!    Both syntax families share one [`crate::cabac_enc::ArithEncoder`].
 //!
 //! ## Scope restrictions
 //!
@@ -39,7 +43,10 @@
 //!   used (they would require more complex reference-sample management in
 //!   the encoder path).
 //! * No transform-skip, no MTS, no dep-quant, no SAO on chroma (to keep
-//!   the first encoder round lean).
+//!   the first encoder round lean). Round-49 added forward DCT + flat
+//!   quant + CABAC for chroma residual (Cb / Cr); chroma SAO decision
+//!   is still off (the first-pass reconstruction goes through deblock
+//!   only on the chroma planes).
 //! * Deblocking uses the existing [`crate::deblock`] primitives wired to
 //!   a constant `QP = 26`.
 
@@ -114,11 +121,26 @@ fn lambda_for_qp(qp: i32) -> f64 {
 /// re-used by the second-pass CABAC emit (per-CTU ALF + residual
 /// interleave) so the encoder doesn't have to redo forward DCT /
 /// quantisation work.
+///
+/// Round-49 — chroma TB levels (Cb + Cr) are persisted alongside luma so
+/// the second-pass CABAC walk can emit them in the §7.3.10 / §8.7
+/// per-component order (luma → Cb → Cr). The chroma TB lives at half
+/// luma resolution per the 4:2:0 scope (`n_tb_chroma = n_tb / 2`); when
+/// the luma TB is 4×4 the chroma side collapses to 2×2 (smallest spec-
+/// supported) which we round up to a 4×4 level array per the §8.7.4
+/// `nTbS ∈ {4, …, 64}` floor.
 struct PreparedLumaTb {
     /// Square TB side length in luma samples.
     n_tb: usize,
     /// Quantised level array (length = `n_tb * n_tb`).
     levels: Vec<i32>,
+    /// Round-49 — chroma TB side length (Cb + Cr share the same n).
+    /// In 4:2:0 this is `max(4, n_tb / 2)`.
+    n_tb_chroma: usize,
+    /// Round-49 — Cb quantised levels (length `n_tb_chroma^2`).
+    cb_levels: Vec<i32>,
+    /// Round-49 — Cr quantised levels (length `n_tb_chroma^2`).
+    cr_levels: Vec<i32>,
 }
 
 /// Compute residual + reconstruction for one luma TB without touching
@@ -195,6 +217,94 @@ fn emit_luma_tb_residual(
         encode_tb_coefficients(enc, ctxs, tb.n_tb, tb.n_tb, 0, &tb.levels)?;
     }
     Ok(())
+}
+
+/// Round-49 — emit the residual CABAC bins for the Cb + Cr TBs that
+/// pair with one prepared luma TB. The chroma planes follow the same
+/// implicit-CBF convention as luma: only blocks with at least one
+/// non-zero level are emitted. `c_idx = 1` for Cb, `2` for Cr per the
+/// §7.3.11.11 `cIdx`-keyed context table.
+fn emit_chroma_tb_residuals(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    ctxs: &mut ResidualCtxs,
+    tb: &PreparedLumaTb,
+) -> Result<()> {
+    let has_nonzero_cb = tb.cb_levels.iter().any(|&l| l != 0);
+    if has_nonzero_cb {
+        encode_tb_coefficients(enc, ctxs, tb.n_tb_chroma, tb.n_tb_chroma, 1, &tb.cb_levels)?;
+    }
+    let has_nonzero_cr = tb.cr_levels.iter().any(|&l| l != 0);
+    if has_nonzero_cr {
+        encode_tb_coefficients(enc, ctxs, tb.n_tb_chroma, tb.n_tb_chroma, 2, &tb.cr_levels)?;
+    }
+    Ok(())
+}
+
+/// Round-49 — forward-DCT + quantise + reconstruct one chroma TB.
+///
+/// `chroma_src` / `chroma_rec` are one component (Cb or Cr) at half luma
+/// resolution (4:2:0 scope). `cx` / `cy` are the chroma-coordinate top-
+/// left of the TB; `n_tb_c` is the chroma TB side length (= `max(4, luma
+/// n_tb / 2)`). `qp_c` is the §8.7.1 derived chroma QP — for the
+/// foundation IDR pipeline we use `chroma_qp_identity(qp_y, 0)` since
+/// the SPS / PPS / slice / CU chroma offsets are all zero.
+///
+/// The DC-flat-128 prediction matches the luma path: this is the
+/// encoder analogue of the decoder using the §8.7.5 `(pred + dequant
+/// residual).clamp(0, 255)` reconstruction. The quantised levels are
+/// returned for the second-pass CABAC emit.
+fn prepare_chroma_tb(
+    chroma_src: &PicturePlane,
+    chroma_rec: &mut PicturePlane,
+    cx: usize,
+    cy: usize,
+    n_tb_c: usize,
+    qp_c: i32,
+) -> Result<Vec<i32>> {
+    let pred_val = 128u8;
+
+    // Extract source block → residual.
+    let mut residual = vec![0i32; n_tb_c * n_tb_c];
+    for ty in 0..n_tb_c {
+        for tx in 0..n_tb_c {
+            let sx = cx + tx;
+            let sy = cy + ty;
+            let src_s = chroma_src.get(sx, sy).unwrap_or(pred_val) as i32;
+            residual[ty * n_tb_c + tx] = src_s - pred_val as i32;
+        }
+    }
+
+    // Forward DCT-II + flat quantisation (same ladder as luma; bit_depth
+    // = 8 for 4:2:0 8-bit).
+    let coeffs = forward_dct_ii_2d(n_tb_c, n_tb_c, &residual, 8)?;
+    let levels = quantize_tb_flat(&coeffs, n_tb_c as u32, n_tb_c as u32, qp_c, 8, 15)?;
+
+    // Dequant → IDCT → reconstruct.
+    let params = DequantParams::chroma_8bit(n_tb_c as u32, n_tb_c as u32, qp_c);
+    let dq = dequantize_tb_flat(&levels, &params)?;
+    let rec_res = inverse_transform_2d(
+        n_tb_c,
+        n_tb_c,
+        n_tb_c,
+        n_tb_c,
+        TrType::DctII,
+        TrType::DctII,
+        &dq,
+        8,
+        15,
+    )?;
+
+    for ty in 0..n_tb_c {
+        for tx in 0..n_tb_c {
+            let rx = cx + tx;
+            let ry = cy + ty;
+            if rx < chroma_rec.width && ry < chroma_rec.height {
+                let s = pred_val as i32 + rec_res[ty * n_tb_c + tx];
+                chroma_rec.samples[ry * chroma_rec.stride + rx] = s.clamp(0, 255) as u8;
+            }
+        }
+    }
+    Ok(levels)
 }
 
 /// Encode a complete IDR frame from `src` with residual coding.
@@ -310,28 +420,33 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
 
                     let levels =
                         prepare_luma_tb(&src.luma, &mut rec.luma, tb_x, tb_y, n_tb_sq, qp)?;
+
+                    // Round-49 — chroma residual emit. The 4:2:0 chroma
+                    // TB is at half luma resolution (`n_tb / 2`), with
+                    // a §8.7.4-mandated `nTbS >= 4` floor: when the luma
+                    // TB collapses to 4×4 (smallest power-of-two TB) the
+                    // chroma TB stays at 4×4 covering the same chroma
+                    // span as two luma 4×4s. The QP is the §8.7.1
+                    // identity-table chroma QP with all offsets at
+                    // zero; this matches the round-46 deblock chroma
+                    // path that already plumbs `pps_cb_qp_offset = 0`.
+                    let chr_x = tb_x / 2;
+                    let chr_y = tb_y / 2;
+                    let n_tb_chroma = (n_tb_sq / 2).max(4);
+                    let qp_c = crate::ctu::chroma_qp_identity(qp, 0);
+                    let cb_levels =
+                        prepare_chroma_tb(&src.cb, &mut rec.cb, chr_x, chr_y, n_tb_chroma, qp_c)?;
+                    let cr_levels =
+                        prepare_chroma_tb(&src.cr, &mut rec.cr, chr_x, chr_y, n_tb_chroma, qp_c)?;
+                    let tu_cb_coded_flag = cb_levels.iter().any(|&l| l != 0);
+                    let tu_cr_coded_flag = cr_levels.iter().any(|&l| l != 0);
                     prepared_per_ctu[ry][rx].push(PreparedLumaTb {
                         n_tb: n_tb_sq,
                         levels,
+                        n_tb_chroma,
+                        cb_levels,
+                        cr_levels,
                     });
-
-                    // Chroma: flat fill (mid-grey, no residual for now).
-                    let chr_x = tb_x / 2;
-                    let chr_y = tb_y / 2;
-                    let chr_n = n_tb_sq / 2;
-                    for py in 0..chr_n {
-                        for px in 0..chr_n {
-                            if chr_x + px < rec.cb.width && chr_y + py < rec.cb.height {
-                                // Predict chroma from source.
-                                if let Some(s) = src.cb.get(chr_x + px, chr_y + py) {
-                                    rec.cb.samples[(chr_y + py) * rec.cb.stride + chr_x + px] = s;
-                                }
-                                if let Some(s) = src.cr.get(chr_x + px, chr_y + py) {
-                                    rec.cr.samples[(chr_y + py) * rec.cr.stride + chr_x + px] = s;
-                                }
-                            }
-                        }
-                    }
 
                     // Accumulate deblock CU info.
                     all_deblock_cus.push(DeblockCu {
@@ -342,8 +457,8 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                         qp_y: qp,
                         intra: true,
                         tu_y_coded: true,
-                        tu_cb_coded: false,
-                        tu_cr_coded: false,
+                        tu_cb_coded: tu_cb_coded_flag,
+                        tu_cr_coded: tu_cr_coded_flag,
                         bdpcm_luma: false,
                         bdpcm_chroma: false,
                     });
@@ -597,8 +712,12 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
             )?;
 
             // Residual CABAC bins for every TB inside this CTU.
+            // Per §7.3.10 / §8.7 the components emit in the order
+            // luma → Cb → Cr; the round-49 chroma residual path mirrors
+            // that ordering with `c_idx = 1` for Cb, `2` for Cr.
             for tb in &prepared_per_ctu[ry][rx] {
                 emit_luma_tb_residual(&mut cabac_enc, &mut residual_ctxs, tb)?;
+                emit_chroma_tb_residuals(&mut cabac_enc, &mut residual_ctxs, tb)?;
             }
 
             // CABAC end_of_slice_segment_flag for CTU termination.
@@ -933,6 +1052,94 @@ mod tests {
         assert!(
             psnr >= 30.0,
             "PSNR_Y {psnr:.2} dB < 30 dB after chroma ALF integration"
+        );
+    }
+
+    /// Round-49 — chroma PSNR (Cb / Cr) over a structured chroma source
+    /// at QP=26 should clear 30 dB. Direct-copy from source would have
+    /// reported infinite PSNR; the new forward DCT + flat quant +
+    /// dequant + IDCT path introduces a finite (but small) reconstruction
+    /// error that must still satisfy the 30 dB intra-IDR floor.
+    #[test]
+    fn encode_idr_chroma_psnr_clears_30db_at_qp26() {
+        let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+        // Smooth chroma gradient so the AC coefficients carry energy
+        // (otherwise the chroma residual is nearly identically zero and
+        // the new path is indistinguishable from the round-48 direct-
+        // copy version).
+        for y in 0..64 {
+            for x in 0..64 {
+                src.cb.samples[y * src.cb.stride + x] = (96 + (x as u16 * 64 / 64)) as u8;
+                src.cr.samples[y * src.cr.stride + x] = (160 - (y as u16 * 64 / 64)) as u8;
+            }
+        }
+        let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+        let psnr_cb = psnr_y(&src.cb, &rec.cb).unwrap();
+        let psnr_cr = psnr_y(&src.cr, &rec.cr).unwrap();
+        assert!(
+            psnr_cb >= 30.0,
+            "Cb PSNR {psnr_cb:.2} dB < 30 dB at QP=26 with chroma residual"
+        );
+        assert!(
+            psnr_cr >= 30.0,
+            "Cr PSNR {psnr_cr:.2} dB < 30 dB at QP=26 with chroma residual"
+        );
+    }
+
+    /// Round-49 — flat-grey (chroma at 128) round-trips through the
+    /// forward chroma DCT + quant + dequant + IDCT path with zero error
+    /// (residual is identically zero, every level quantises to 0,
+    /// dequant returns 0, IDCT returns 0, reconstruction = pred = 128).
+    #[test]
+    fn encode_idr_chroma_flat_grey_reconstructs_exactly() {
+        let src = PictureBuffer::yuv420_filled(64, 64, 128);
+        let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+        // Both chroma planes must be byte-identical to the 128 input
+        // because zero residual + DC pred = 128 reconstructs exactly,
+        // and both chroma ALF and CC-ALF on flat chroma is identically
+        // zero (eqs. 1490 / 1515 sum neighbour-deltas to zero).
+        assert_eq!(rec.cb.samples, src.cb.samples);
+        assert_eq!(rec.cr.samples, src.cr.samples);
+    }
+
+    /// Round-49 — `prepare_chroma_tb` on a flat block returns all-zero
+    /// quantised levels (the residual is identically zero so every
+    /// coefficient quantises to zero).
+    #[test]
+    fn prepare_chroma_tb_flat_block_yields_zero_levels() {
+        let src = PicturePlane::filled(8, 8, 128);
+        let mut rec = PicturePlane::filled(8, 8, 0);
+        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 26).unwrap();
+        assert!(
+            levels.iter().all(|&l| l == 0),
+            "got non-zero level: {levels:?}"
+        );
+        // Reconstruction inside the TB must equal the prediction (128)
+        // since the residual dequantises to zero.
+        for ty in 0..4 {
+            for tx in 0..4 {
+                assert_eq!(rec.samples[ty * rec.stride + tx], 128);
+            }
+        }
+    }
+
+    /// Round-49 — `prepare_chroma_tb` on a non-flat block produces at
+    /// least one non-zero quantised level. The source value at (0,0)
+    /// is 200 vs. pred 128 so the DC residual is 72; even after the
+    /// flat-quant ladder this must round to a non-zero level at QP ≤ 26.
+    #[test]
+    fn prepare_chroma_tb_non_flat_block_yields_nonzero_level() {
+        let mut src = PicturePlane::filled(8, 8, 128);
+        for y in 0..4 {
+            for x in 0..4 {
+                src.samples[y * src.stride + x] = 200;
+            }
+        }
+        let mut rec = PicturePlane::filled(8, 8, 0);
+        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 26).unwrap();
+        assert!(
+            levels.iter().any(|&l| l != 0),
+            "expected at least one non-zero level on non-flat input, got all zeros"
         );
     }
 }

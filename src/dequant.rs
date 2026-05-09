@@ -195,6 +195,28 @@ impl DequantParams {
             bdpcm_dir: false,
         }
     }
+
+    /// Helper: construct a flat-scaling-list parameter bundle for a chroma
+    /// component (Cb or Cr) at 8-bit depth.
+    ///
+    /// The §8.7.1 derivation of `Qp′Cb` / `Qp′Cr` happens in the caller
+    /// — this helper just plumbs the already-derived chroma `qp` (the
+    /// identity-table result of [`crate::ctu::chroma_qp_identity`]) into
+    /// the same flat-scaling-list dequant ladder used for luma. Same
+    /// 4:2:0 / non-TS / non-BDPCM scope as [`Self::luma_8bit`].
+    pub fn chroma_8bit(n_tb_w: u32, n_tb_h: u32, qp: i32) -> Self {
+        Self {
+            bit_depth: 8,
+            log2_transform_range: 15,
+            n_tb_w,
+            n_tb_h,
+            qp,
+            dep_quant: false,
+            transform_skip: false,
+            bdpcm: false,
+            bdpcm_dir: false,
+        }
+    }
 }
 
 /// `CoeffMin` / `CoeffMax` per §7.4.11.11: the symmetric
