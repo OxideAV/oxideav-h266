@@ -59,10 +59,12 @@ use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::ResidualCtxs;
 use crate::residual_enc::{
-    encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
+    encode_tb_coefficients, write_cu_qp_delta, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+    write_tu_y_coded_flag,
 };
 use crate::sao::SaoConfig;
 use crate::sao_enc::sao_decide_picture;
+use crate::syntax_enc::{encode_coding_tree_leaf_iframe, TreeNeighbours};
 use crate::transform::{inverse_transform_2d, TrType};
 use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_flat};
 
@@ -181,6 +183,11 @@ struct PreparedLumaTb {
     cb_levels: Vec<i32>,
     /// Round-49 — Cr quantised levels (length `n_tb_chroma^2`).
     cr_levels: Vec<i32>,
+    /// Round-52 — local CU QP (luma). Emitted as
+    /// `cu_qp_delta = cu_qp_local - prev_qp_in_qg` when CBFs non-zero
+    /// and `pps_cu_qp_delta_enabled_flag = 1`. The dequant on the
+    /// decoder side will recover the same QP via §8.7.1.
+    cu_qp_local: i32,
 }
 
 /// Compute residual + reconstruction for one luma TB without touching
@@ -263,6 +270,7 @@ fn emit_tu_with_cbf(
     enc: &mut crate::cabac_enc::ArithEncoder,
     ctxs: &mut ResidualCtxs,
     tb: &PreparedLumaTb,
+    qp_state: &mut QpDeltaState,
 ) -> Result<()> {
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
@@ -276,6 +284,27 @@ fn emit_tu_with_cbf(
     // `prev_tu_cbf_y = false` (single TU, non-ISP path).
     write_tu_y_coded_flag(enc, ctxs, cbf_y, false, false, false)?;
 
+    // Round-52 — `cu_qp_delta_abs` + `cu_qp_delta_sign_flag` per
+    // §7.3.13 / §9.3.3.10. The spec gate (§7.3.11.10):
+    //   IsCuQpDeltaCoded == 0
+    //   && pps_cu_qp_delta_enabled_flag
+    //   && (CuCbWidth > 64 || CuCbHeight > 64
+    //       || tu_y_coded_flag || tu_cb_coded_flag || tu_cr_coded_flag)
+    // The "first CU of a quantization group" gate (`IsCuQpDeltaCoded`)
+    // collapses here to "first CU per CTB with any CBF" because the
+    // round-52 pipeline runs at QG = CTB granularity (no PH-signalled
+    // sub-CTB QG depth). On the decoder side
+    // `LeafCuReader::decode_transform_unit` reads the same delta when
+    // it sees `pps_cu_qp_delta_enabled_flag` + any CBF set, so the
+    // round-trip stays in lockstep.
+    let any_cbf = cbf_y || cbf_cb || cbf_cr;
+    if qp_state.enabled && qp_state.pending && any_cbf {
+        let delta = tb.cu_qp_local - qp_state.prev_qp_in_qg;
+        write_cu_qp_delta(enc, ctxs, delta)?;
+        qp_state.prev_qp_in_qg = tb.cu_qp_local;
+        qp_state.pending = false;
+    }
+
     // Residual blocks per component — only emitted when the
     // corresponding CBF is set (§7.3.11.10's spec gate).
     if cbf_y {
@@ -288,6 +317,39 @@ fn emit_tu_with_cbf(
         encode_tb_coefficients(enc, ctxs, tb.n_tb_chroma, tb.n_tb_chroma, 2, &tb.cr_levels)?;
     }
     Ok(())
+}
+
+/// Round-52 — per-quantisation-group state for the `cu_qp_delta`
+/// emit path. `prev_qp_in_qg` carries the §8.7.1 `QpY` value of the
+/// most-recent CU that signalled a delta (or the slice QP for the
+/// first QG). `pending` is true at the start of every CU until the
+/// shell either emits a `cu_qp_delta` (CBF non-zero path) or the CU
+/// completes with all-zero CBFs (the spec's `IsCuQpDeltaCoded` stays
+/// 0 for the next CU in the same QG).
+#[derive(Debug)]
+struct QpDeltaState {
+    enabled: bool,
+    pending: bool,
+    prev_qp_in_qg: i32,
+}
+
+impl QpDeltaState {
+    fn new(enabled: bool, slice_qp_y: i32) -> Self {
+        Self {
+            enabled,
+            pending: enabled,
+            prev_qp_in_qg: slice_qp_y,
+        }
+    }
+
+    /// Reset to "pending again" at the start of a new CU. Round-52
+    /// scope treats every CU as the first of its own QG (CTB-level
+    /// QG granularity), so every CU may signal a delta.
+    fn begin_cu(&mut self) {
+        if self.enabled {
+            self.pending = true;
+        }
+    }
 }
 
 /// Round-49 — forward-DCT + quantise + reconstruct one chroma TB.
@@ -362,8 +424,30 @@ fn prepare_chroma_tb(
 /// Returns `(bitstream, reconstructed_frame)`. The caller can compute
 /// PSNR_Y via [`psnr_y`].
 ///
-/// `qp` — luma quantisation parameter (0..=51).
+/// `qp` — luma quantisation parameter (0..=51). Constant across all CUs.
+/// For per-CU QP control (round-52 `cu_qp_delta` testbed) see
+/// [`encode_idr_with_qp_picker`].
 pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8>, PictureBuffer)> {
+    encode_idr_with_qp_picker(src, qp, |_, _, _, _| qp)
+}
+
+/// Round-52 — encode an IDR with a caller-provided per-CU QP picker.
+///
+/// `slice_qp_y` is the slice-level QP (signalled in `sh_qp_delta`); the
+/// per-CU QP returned by `qp_picker(rx, ry, tx, ty)` becomes the
+/// `CuQpDeltaVal` source — when `qp_picker(...) != prev_qp_in_qg` and
+/// the CU has any non-zero CBF, the encoder emits
+/// `cu_qp_delta_abs` + `cu_qp_delta_sign_flag` per §7.3.13 / §9.3.3.10.
+/// The decoder side recovers the same `qp_y` via §8.7.1 from the
+/// previous QG's QP + the signalled delta, so dequantisation matches.
+///
+/// `(rx, ry)` are the CTU coordinates and `(tx, ty)` are the per-CTU TB
+/// coordinates (each TB block is one CU in the round-52 scope).
+pub fn encode_idr_with_qp_picker(
+    src: &PictureBuffer,
+    slice_qp_y: i32,
+    qp_picker: impl Fn(usize, usize, usize, usize) -> i32,
+) -> Result<(Vec<u8>, PictureBuffer)> {
     use crate::cabac_enc::ArithEncoder;
     use crate::encoder::{BitWriter, EncoderConfig, VvcEncoder};
     use crate::nal::NalUnitType;
@@ -459,8 +543,16 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                     // Only square TBs for simplicity.
                     let n_tb_sq = if n_tb_pow2 >= 4 { n_tb_pow2 } else { 4 };
 
+                    // Round-52 — per-CU QP picked from the caller-supplied
+                    // closure. The slice-level QP (`slice_qp_y`) acts as
+                    // the QP-baseline; `cu_qp` is the actual QP applied
+                    // to forward DCT + quant + dequant + IDCT for this
+                    // CU. The encoder will signal `cu_qp_delta = cu_qp -
+                    // prev_qp_in_qg` on the wire when CBFs are non-zero
+                    // (round-52 `pps_cu_qp_delta_enabled_flag = 1`).
+                    let cu_qp = qp_picker(rx, ry, tx, ty).clamp(0, 63);
                     let levels =
-                        prepare_luma_tb(&src.luma, &mut rec.luma, tb_x, tb_y, n_tb_sq, qp)?;
+                        prepare_luma_tb(&src.luma, &mut rec.luma, tb_x, tb_y, n_tb_sq, cu_qp)?;
 
                     // Round-49 — chroma residual emit. The 4:2:0 chroma
                     // TB is at half luma resolution (`n_tb / 2`), with
@@ -474,7 +566,7 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                     let chr_x = tb_x / 2;
                     let chr_y = tb_y / 2;
                     let n_tb_chroma = (n_tb_sq / 2).max(4);
-                    let qp_c = crate::ctu::chroma_qp_identity(qp, 0);
+                    let qp_c = crate::ctu::chroma_qp_identity(cu_qp, 0);
                     let cb_levels =
                         prepare_chroma_tb(&src.cb, &mut rec.cb, chr_x, chr_y, n_tb_chroma, qp_c)?;
                     let cr_levels =
@@ -487,6 +579,7 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                         n_tb_chroma,
                         cb_levels,
                         cr_levels,
+                        cu_qp_local: cu_qp,
                     });
 
                     // Accumulate deblock CU info.
@@ -495,7 +588,7 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                         y: tb_y as u32,
                         w: n_tb_sq as u32,
                         h: n_tb_sq as u32,
-                        qp_y: qp,
+                        qp_y: cu_qp,
                         intra: true,
                         tu_y_coded: true,
                         tu_cb_coded: tu_cb_coded_flag,
@@ -626,7 +719,7 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     // header plus the emulation-prevented RBSP payload.
     let luma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(2, false, &luma_alf_aps)?;
     let aps_byte_cost = 2 + luma_aps_rbsp.len() as u64;
-    let lambda = lambda_for_qp(qp);
+    let lambda = lambda_for_qp(slice_qp_y);
     // §8.8.5 RDO cost = SSE + lambda * bits. APS NAL ⇒ bits = 8 * bytes.
     let aps_rd_overhead = (lambda * (aps_byte_cost as f64) * 8.0) as u64;
     let aps_used_anywhere = (0..alf_pic_with_aps.pic_height_in_ctbs_y).any(|ry| {
@@ -676,8 +769,10 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         sh_num_alf_aps_ids_luma: 1,
         ..cfg_fixed
     };
-    let bits_fixed_only = estimate_alf_picture_bin_cost(&alf_pic_fixed_only, &cfg_fixed, qp)?;
-    let bits_with_aps = estimate_alf_picture_bin_cost(&alf_pic_with_aps, &cfg_with_aps, qp)?;
+    let bits_fixed_only =
+        estimate_alf_picture_bin_cost(&alf_pic_fixed_only, &cfg_fixed, slice_qp_y)?;
+    let bits_with_aps =
+        estimate_alf_picture_bin_cost(&alf_pic_with_aps, &cfg_with_aps, slice_qp_y)?;
     let rd_fixed_only = sse_fixed_only + (lambda * bits_fixed_only as f64) as u64;
     let rd_with_aps = sse_with_aps + aps_rd_overhead + (lambda * bits_with_aps as f64) as u64;
     let ship_aps = aps_used_anywhere && rd_with_aps < rd_fixed_only;
@@ -770,9 +865,9 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         cr_enabled: true,
         ..cfg_chroma_off
     };
-    let bins_chroma_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_chroma_off, qp)?;
+    let bins_chroma_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_chroma_off, slice_qp_y)?;
     let bins_chroma_on =
-        estimate_alf_picture_bin_cost(&alf_pic_with_chroma_aps, &cfg_chroma_on, qp)?;
+        estimate_alf_picture_bin_cost(&alf_pic_with_chroma_aps, &cfg_chroma_on, slice_qp_y)?;
     let rd_chroma_off = sse_chroma_off + (lambda * bins_chroma_off as f64) as u64;
     let rd_chroma_on = sse_chroma_on
         + (lambda * (chroma_aps_byte_cost as f64) * 8.0) as u64
@@ -885,9 +980,9 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
         cr_enabled: ship_chroma_aps,
         ..cfg_chroma_off
     };
-    let bins_cc_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_cc_off, qp)?;
-    let bins_cc_cb_on = estimate_alf_picture_bin_cost(&alf_pic_cc_cb, &cfg_cc_cb_on, qp)?;
-    let bins_cc_cr_on = estimate_alf_picture_bin_cost(&alf_pic_cc_cr, &cfg_cc_cr_on, qp)?;
+    let bins_cc_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_cc_off, slice_qp_y)?;
+    let bins_cc_cb_on = estimate_alf_picture_bin_cost(&alf_pic_cc_cb, &cfg_cc_cb_on, slice_qp_y)?;
+    let bins_cc_cr_on = estimate_alf_picture_bin_cost(&alf_pic_cc_cr, &cfg_cc_cr_on, slice_qp_y)?;
 
     // Per-component RDO comparison (no APS-byte share yet).
     let rd_cb_off_no_aps = sse_cb_off + (lambda * bins_cc_off as f64) as u64;
@@ -1019,8 +1114,20 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
     };
 
     let mut cabac_enc = ArithEncoder::new();
-    let mut alf_ctxs = crate::alf_syntax::AlfCtxs::init(26);
-    let mut residual_ctxs = ResidualCtxs::init(26);
+    // §9.3.4.2 ctx init draws on the slice QP (eq. 1571 SliceQpY, eq. 1573
+    // m,n derivation). Round-52 ties every CABAC context family to the
+    // single slice QP — round-51 hardcoded QP=26, but the round-52
+    // per-CU QP picker may run at a different baseline.
+    let mut alf_ctxs = crate::alf_syntax::AlfCtxs::init(slice_qp_y);
+    let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
+    // Round-52 — coding_tree() shell ctxs (`split_cu_flag` + `split_qt_flag`
+    // + `pred_mode_flag` + `intra_luma_mpm_flag`) initialised at the slice
+    // QP. Used by `encode_coding_tree_leaf_iframe`.
+    let mut tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
+    // Round-52 — `cu_qp_delta` per-quantisation-group state. The pipeline
+    // runs with QG = CTB granularity (no PH-signalled `cu_qp_delta_subdiv`
+    // or `cu_chroma_qp_offset_subdiv`), so the QG resets at every new CTB.
+    let mut qp_state = QpDeltaState::new(/*enabled=*/ true, slice_qp_y);
 
     for ry in 0..pic_h_ctbs {
         for rx in 0..pic_w_ctbs {
@@ -1041,14 +1148,43 @@ pub fn encode_idr_with_residuals(src: &PictureBuffer, qp: i32) -> Result<(Vec<u8
                 nbrs,
             )?;
 
-            // §7.3.10 transform_unit() per TB: real `tu_*_coded_flag`
-            // CABAC bins (round-51 closed the implicit-CBF gap) followed
-            // by the per-component residual blocks for every component
-            // whose CBF is set. Residual blocks emit in the order luma →
-            // Cb → Cr per §7.3.11.
+            // Round-52 — every TB in this CTB is one CU in the round-52
+            // single-CU-per-CTB scope. Wrap each CU body in
+            // `encode_coding_tree_leaf_iframe` so the §7.3.11.4
+            // `split_cu_flag = 0` bin is on the wire ahead of the
+            // `transform_tree()` content.
+            //
+            // QG reset: §7.4.13.2 specifies the QG starts at the first CU
+            // of the CTB when `cu_qp_delta_subdiv` is 0 (the round-52
+            // default). `qp_state.begin_cu()` is called per TB so the
+            // first CU with any non-zero CBF emits its delta and the
+            // remainder of the CTB inherits.
             for tb in &prepared_per_ctu[ry][rx] {
-                emit_tu_with_cbf(&mut cabac_enc, &mut residual_ctxs, tb)?;
+                qp_state.begin_cu();
+                let tree_nbrs = TreeNeighbours::default();
+                encode_coding_tree_leaf_iframe(
+                    &mut cabac_enc,
+                    &mut tree_ctxs,
+                    tb.n_tb as u32,
+                    tb.n_tb as u32,
+                    tree_nbrs,
+                    |enc| {
+                        // §7.3.10 transform_unit() per TB: real
+                        // `tu_*_coded_flag` CABAC bins (round-51 closed
+                        // the implicit-CBF gap) + `cu_qp_delta` (round-52)
+                        // followed by the per-component residual blocks
+                        // for every component whose CBF is set. Residual
+                        // blocks emit in the order luma → Cb → Cr per
+                        // §7.3.11.
+                        emit_tu_with_cbf(enc, &mut residual_ctxs, tb, &mut qp_state)
+                    },
+                )?;
             }
+            // QG resets at the end of every CTB (§7.4.13.2 with
+            // `cu_qp_delta_subdiv = 0`): the first CU of the next CTB
+            // signals its delta against the slice-baseline carried in
+            // `prev_qp_in_qg`.
+            qp_state.pending = qp_state.enabled;
 
             // CABAC end_of_slice_segment_flag for CTU termination.
             let is_last_ctu = ry == pic_h_ctbs - 1 && rx == pic_w_ctbs - 1;

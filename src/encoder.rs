@@ -552,7 +552,13 @@ impl VvcEncoder {
         bw.write_bit(0); // pps_weighted_bipred_flag
         bw.write_bit(0); // pps_ref_wraparound_enabled_flag
         bw.write_se(0); // pps_init_qp_minus26 → QP 26
-        bw.write_bit(0); // pps_cu_qp_delta_enabled_flag
+                        // Round-52 — enable per-CU QP delta signalling so the encoder
+                        // pipeline can emit `cu_qp_delta_abs` + `cu_qp_delta_sign_flag`
+                        // on CUs whose CBFs are non-zero (§7.3.13 + §8.7.1). The
+                        // decoder already respects `cu_qp_delta_val` in
+                        // `CtuWalker::reconstruct_leaf_cu` (luma dequant) and the
+                        // §8.8.3 deblocker.
+        bw.write_bit(1); // pps_cu_qp_delta_enabled_flag
         bw.write_bit(0); // pps_chroma_tool_offsets_present_flag
         bw.write_bit(0); // pps_deblocking_filter_control_present_flag
         bw.write_bit(0); // pps_picture_header_extension_present_flag
@@ -668,6 +674,14 @@ impl VvcEncoder {
         // (one ue(0) per list).
         bw.write_ue(0); // list 0: num_ref_entries = 0
         bw.write_ue(0); // list 1: num_ref_entries = 0
+                        // Round-52 — `pps_cu_qp_delta_enabled_flag = 1` (per
+                        // round-52 PPS) gates the §7.3.2.8 emit of
+                        // `ph_cu_qp_delta_subdiv_intra_slice`. The pipeline
+                        // runs with QG = CTB granularity (no sub-CTB QG split)
+                        // → emit `ue(0)`. The matching `ph_cu_qp_delta_subdiv_inter_slice`
+                        // gate is suppressed because `ph_inter_slice_allowed_flag = 0`
+                        // (intra-only IDR).
+        bw.write_ue(0); // ph_cu_qp_delta_subdiv_intra_slice = 0
                         // pps_qp_delta_info_in_ph_flag inferred = 1 → emit ph_qp_delta.
         bw.write_se(0); // ph_qp_delta = 0
                         // pps_dbf_info_in_ph_flag inferred = 1 → emit gate.

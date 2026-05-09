@@ -187,6 +187,7 @@ pub mod sao_syntax;
 pub mod scan;
 pub mod slice_header;
 pub mod sps;
+pub mod syntax_enc;
 pub mod tables;
 pub mod transform;
 pub mod transform_fwd;

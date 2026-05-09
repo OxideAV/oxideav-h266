@@ -586,6 +586,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     use oxideav_h266::alf::AlfPicture;
     use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
     use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::TreeCtxs;
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
@@ -595,6 +596,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     let src = PictureBuffer::yuv420_filled(128, 128, 128);
     let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
@@ -663,10 +665,24 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     let mut alf_pic = AlfPicture::empty(1, 1);
     decode_alf_picture(&mut dec, &mut alf_ctxs, &alf_cfg, &mut alf_pic).unwrap();
 
-    // Now decode the four 64×64 TB CBF triplets that follow the ALF
-    // bins. §7.3.10 ordering: Cb CBF, Cr CBF, luma CBF per TU.
+    // Round-52 — every CU is wrapped in a `coding_tree() → split_cu_flag = 0`
+    // shell that precedes the §7.3.10 transform_unit() emit. Read the
+    // shell bin first, then the CBF triplet (Cb, Cr, luma per §7.3.10).
     let mut residual_ctxs = ResidualCtxs::init(26);
+    let mut tree_ctxs = TreeCtxs::init(26);
     for _tb_idx in 0..4 {
+        let split = decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut tree_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            split, 0,
+            "round-52 single-CU-per-CTB scope: split_cu_flag must decode as 0"
+        );
         let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
         let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
         let cbf_y =
@@ -687,6 +703,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     use oxideav_h266::alf::AlfPicture;
     use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
     use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::TreeCtxs;
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
@@ -696,6 +713,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     // High-contrast luma + chroma noise → the encoder's flat quant
     // ladder leaves non-trivial residuals on every plane.
@@ -776,12 +794,24 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     let mut alf_pic = AlfPicture::empty(1, 1);
     decode_alf_picture(&mut dec, &mut alf_ctxs, &alf_cfg, &mut alf_pic).unwrap();
 
+    // Round-52 — `coding_tree()` shell wraps every CU; read the
+    // `split_cu_flag = 0` bin per TB before the CBF triplet.
     let mut residual_ctxs = ResidualCtxs::init(26);
+    let mut tree_ctxs = TreeCtxs::init(26);
     let mut any_nonzero_cbf = false;
     // Track whether we hit any non-zero CBF in the first TU; we stop
     // there because decoding the residual bins after a non-zero CBF
     // requires the full §7.3.11.11 reader (not exercised here).
     for _tb_idx in 0..4 {
+        let split = decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut tree_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(split, 0, "round-52 split_cu_flag must decode as 0");
         let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
         let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
         let cbf_y =
@@ -914,5 +944,343 @@ fn round51_chroma_aps_rdo_skips_aps_on_flat_source() {
     assert!(
         !ph.ph_alf_cc_cr_enabled_flag,
         "flat source: ph_alf_cc_cr_enabled_flag must mirror the CC-ALF Cr RDO skip"
+    );
+}
+
+/// Round-52 — per-CU `cu_qp_delta` round-trip. The encoder pipeline runs
+/// `encode_idr_with_qp_picker` with two CUs at different QPs (CU(0,0) at
+/// QP=22 — finer quant; CU(1,0) at QP=30 — coarser quant). With
+/// `pps_cu_qp_delta_enabled_flag = 1` the encoder must emit a non-zero
+/// `cu_qp_delta` on at least one of the two CUs (the second one, since
+/// the first CU's QP matches the slice baseline).
+///
+/// Decoder side: parse VPS / SPS / PPS / PH / SH, then walk the per-CU
+/// CABAC bins (`split_cu_flag = 0` → CBF triplet → `cu_qp_delta` if any
+/// CBF is set). For the fixture used here the second CU has at least
+/// one non-zero CBF (the textured 64×64 quadrant), so its delta MUST
+/// decode as `30 - 22 = 8`. The non-textured first CU (flat 128 quad)
+/// quantises to all-zero CBFs at QP=22, so the encoder defers emitting
+/// the delta to the next CU per the §7.3.13 `IsCuQpDeltaCoded` gate.
+#[test]
+fn round52_cu_qp_delta_round_trips_per_cu() {
+    use oxideav_h266::alf::AlfPicture;
+    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::TreeCtxs;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_qp_picker;
+    use oxideav_h266::picture_header::parse_picture_header_stateful;
+    use oxideav_h266::pps::parse_pps;
+    use oxideav_h266::reconstruct::PictureBuffer;
+    use oxideav_h266::residual::{
+        read_cu_qp_delta, read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag,
+        ResidualCtxs,
+    };
+    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::sps::parse_sps;
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+
+    // 128×64 source: two stacked 64×64 CUs in row 0 of a 128×128 CTB
+    // grid. CU(0,0) is the left half (flat 128 → all-zero residuals at
+    // any QP), CU(1,0) is the right half (textured 200/60 step → forces
+    // non-zero CBF + non-zero levels at QP=30).
+    //
+    // 128×128 frame ensures both CUs are first / second in the CTB walk
+    // order so the per-CTB QG state is exercised.
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 128);
+    for y in 0..128 {
+        for x in 64..128 {
+            src.luma.samples[y * src.luma.stride + x] = if (x + y) & 7 < 4 { 200 } else { 60 };
+        }
+    }
+    // QP picker: CU index by tx (0 → 22, 1 → 30); rows + ry irrelevant
+    // for this single-CTB fixture.
+    let qp_for = |_rx: usize, _ry: usize, tx: usize, _ty: usize| -> i32 {
+        if tx == 0 {
+            22
+        } else {
+            30
+        }
+    };
+    let slice_qp_y = 22;
+    let (bs, _) = encode_idr_with_qp_picker(&src, slice_qp_y, qp_for).unwrap();
+
+    // Parse VPS / SPS / PPS / PH / SH.
+    let nals: Vec<_> = iter_annex_b(&bs).collect();
+    let sps = parse_sps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    let pps = parse_pps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    assert!(
+        pps.pps_cu_qp_delta_enabled_flag,
+        "round-52 PPS must signal pps_cu_qp_delta_enabled_flag = 1"
+    );
+
+    let ph = parse_picture_header_stateful(
+        &extract_rbsp(
+            nals.iter()
+                .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+                .unwrap()
+                .payload(),
+        ),
+        &sps,
+        &pps,
+    )
+    .unwrap();
+    let ph_state = PhState {
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+        ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+        ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+        ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        num_extra_sh_bits: 0,
+        nal_unit_type: NalUnitType::IdrNLp,
+    };
+    let slice_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .expect("IDR slice");
+    let slice_rbsp = extract_rbsp(slice_nal.payload());
+    let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).unwrap();
+    let cabac_bytes = sh.trailing_bits.clone();
+
+    // CABAC walk: ALF picture bins (1×1 CTB grid) → 4 CUs in the CTB.
+    let alf_cfg = AlfSyntaxConfig {
+        alf_enabled: true,
+        cb_enabled: ph.ph_alf_cb_enabled_flag,
+        cr_enabled: ph.ph_alf_cr_enabled_flag,
+        cc_cb_enabled: ph.ph_alf_cc_cb_enabled_flag,
+        cc_cr_enabled: ph.ph_alf_cc_cr_enabled_flag,
+        sh_num_alf_aps_ids_luma: ph.ph_num_alf_aps_ids_luma,
+        alf_chroma_num_alt_filters_minus1: 0,
+        alf_cc_cb_filters_signalled_minus1: 0,
+        alf_cc_cr_filters_signalled_minus1: 0,
+        chroma_format_idc: sps.sps_chroma_format_idc as u32,
+        slice_type: SliceType::I,
+        sh_cabac_init_flag: false,
+    };
+    let padded = pad(cabac_bytes);
+    let mut dec = ArithDecoder::new(&padded).unwrap();
+    let mut alf_ctxs = AlfCtxs::init(slice_qp_y);
+    let mut alf_pic = AlfPicture::empty(1, 1);
+    decode_alf_picture(&mut dec, &mut alf_ctxs, &alf_cfg, &mut alf_pic).unwrap();
+
+    // Walk the 4 CUs (TBs in scan order: (0,0)=22, (1,0)=30, (0,1)=22,
+    // (1,1)=30 per the qp_for picker). Track the cumulative reconstructed
+    // QP via §8.7.1: `qp_y(cu_n) = qp_y(prev_qp_in_qg) + cu_qp_delta`.
+    let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
+    let mut tree_ctxs = TreeCtxs::init(slice_qp_y);
+    let mut prev_qp = slice_qp_y;
+    let mut deltas_seen = Vec::<(usize, i32)>::new();
+    let mut cbfs_seen = Vec::<(bool, bool, bool)>::new();
+    for tb_idx in 0..4 {
+        let split = decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut tree_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(split, 0, "round-52 split_cu_flag must decode as 0");
+        let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
+        let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
+        let cbf_y =
+            read_tu_y_coded_flag(&mut dec, &mut residual_ctxs, false, false, false).unwrap();
+        cbfs_seen.push((cbf_y, cbf_cb, cbf_cr));
+        let any_cbf = cbf_y || cbf_cb || cbf_cr;
+        if any_cbf {
+            // §7.3.13 + §8.7.1 — `cu_qp_delta` is signalled when any
+            // CBF is set under `pps_cu_qp_delta_enabled_flag = 1`.
+            let delta = read_cu_qp_delta(&mut dec, &mut residual_ctxs).unwrap();
+            deltas_seen.push((tb_idx, delta));
+            prev_qp += delta;
+        }
+        // Skip residual reads; this test only validates the syntax-level
+        // signalling, not the residual coefficient decoding.
+        if any_cbf {
+            // Decoding residual coefficients here would need full
+            // §7.3.11.11 wiring; bail after the first non-zero CBF CU.
+            break;
+        }
+    }
+
+    // CU(0,0) — flat luma 128 → all-zero residuals → no CBF → no delta
+    // emitted. CU(1,0) — textured → at least one non-zero CBF → delta
+    // emitted. The reconstructed `prev_qp` should reach 30 after the
+    // second CU's delta.
+    assert!(
+        cbfs_seen.iter().any(|(y, cb, cr)| *y || *cb || *cr),
+        "expected at least one CU with non-zero CBF (got {cbfs_seen:?})"
+    );
+    assert!(
+        !deltas_seen.is_empty(),
+        "expected at least one cu_qp_delta_abs emit (got {deltas_seen:?})"
+    );
+    // The first delta-emitting CU must shift QP from 22 → 30 (delta = 8)
+    // because the picker only assigns 22 / 30 and only the textured CU
+    // emits CBFs first. Encoder may also emit a 0-delta on the first
+    // textured CU if the textured CU happens to be picked at QP=22; the
+    // assertion below tolerates that by checking the cumulative QP.
+    assert_eq!(
+        prev_qp, 30,
+        "cumulative QP after delta walk must reach 30 (got {prev_qp})"
+    );
+}
+
+/// Round-52 — `encode_idr_with_residuals` (constant-QP wrapper) emits a
+/// zero `cu_qp_delta_abs` on every CU with non-zero CBFs. The decoder
+/// reads exactly one prefix-0 bin per such CU and recovers `delta = 0`,
+/// so the cumulative QP stays at the slice baseline throughout. This
+/// regression-tests the constant-QP path: even with
+/// `pps_cu_qp_delta_enabled_flag = 1` the per-CU QP must round-trip
+/// without drift.
+#[test]
+fn round52_constant_qp_path_round_trips_zero_delta() {
+    use oxideav_h266::alf::AlfPicture;
+    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::TreeCtxs;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::picture_header::parse_picture_header_stateful;
+    use oxideav_h266::pps::parse_pps;
+    use oxideav_h266::reconstruct::PictureBuffer;
+    use oxideav_h266::residual::{
+        read_cu_qp_delta, read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag,
+        ResidualCtxs,
+    };
+    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::sps::parse_sps;
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+
+    // 128×128 source with structured luma so at least one CU emits a
+    // non-zero CBF.
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
+    for y in 0..128 {
+        for x in 0..128 {
+            src.luma.samples[y * src.luma.stride + x] = if x < 64 { 60 } else { 200 };
+        }
+    }
+    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+
+    let nals: Vec<_> = iter_annex_b(&bs).collect();
+    let sps = parse_sps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    let pps = parse_pps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    let ph = parse_picture_header_stateful(
+        &extract_rbsp(
+            nals.iter()
+                .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+                .unwrap()
+                .payload(),
+        ),
+        &sps,
+        &pps,
+    )
+    .unwrap();
+    let ph_state = PhState {
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+        ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+        ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+        ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        num_extra_sh_bits: 0,
+        nal_unit_type: NalUnitType::IdrNLp,
+    };
+    let slice_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .expect("IDR slice");
+    let slice_rbsp = extract_rbsp(slice_nal.payload());
+    let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).unwrap();
+    let cabac_bytes = sh.trailing_bits.clone();
+    let alf_cfg = AlfSyntaxConfig {
+        alf_enabled: true,
+        cb_enabled: ph.ph_alf_cb_enabled_flag,
+        cr_enabled: ph.ph_alf_cr_enabled_flag,
+        cc_cb_enabled: ph.ph_alf_cc_cb_enabled_flag,
+        cc_cr_enabled: ph.ph_alf_cc_cr_enabled_flag,
+        sh_num_alf_aps_ids_luma: ph.ph_num_alf_aps_ids_luma,
+        alf_chroma_num_alt_filters_minus1: 0,
+        alf_cc_cb_filters_signalled_minus1: 0,
+        alf_cc_cr_filters_signalled_minus1: 0,
+        chroma_format_idc: sps.sps_chroma_format_idc as u32,
+        slice_type: SliceType::I,
+        sh_cabac_init_flag: false,
+    };
+    let padded = pad(cabac_bytes);
+    let mut dec = ArithDecoder::new(&padded).unwrap();
+    let mut alf_ctxs = AlfCtxs::init(26);
+    let mut alf_pic = AlfPicture::empty(1, 1);
+    decode_alf_picture(&mut dec, &mut alf_ctxs, &alf_cfg, &mut alf_pic).unwrap();
+
+    // For each of the 4 CUs read the split_cu_flag + CBF triplet, then
+    // (when CBFs are non-zero) read `cu_qp_delta`. Constant-QP path
+    // → every delta must decode as 0, leaving the cumulative QP at the
+    // slice baseline (26).
+    let mut residual_ctxs = ResidualCtxs::init(26);
+    let mut tree_ctxs = TreeCtxs::init(26);
+    let mut any_cbf_seen = false;
+    let mut max_abs_delta = 0i32;
+    for tb_idx in 0..4 {
+        let split = decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut tree_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            split, 0,
+            "constant-QP path: split_cu_flag mis-aligned at TB {tb_idx}"
+        );
+        let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
+        let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
+        let cbf_y =
+            read_tu_y_coded_flag(&mut dec, &mut residual_ctxs, false, false, false).unwrap();
+        let any_cbf = cbf_y || cbf_cb || cbf_cr;
+        if any_cbf {
+            any_cbf_seen = true;
+            let delta = read_cu_qp_delta(&mut dec, &mut residual_ctxs).unwrap();
+            assert_eq!(
+                delta, 0,
+                "constant-QP path TB {tb_idx}: cu_qp_delta must decode as 0"
+            );
+            max_abs_delta = max_abs_delta.max(delta.abs());
+            // Stop without consuming residual bins — they need the
+            // full §7.3.11.11 reader (not exercised here).
+            break;
+        }
+    }
+    assert!(
+        any_cbf_seen,
+        "structured 128×128 source must produce at least one non-zero CBF"
+    );
+    assert_eq!(
+        max_abs_delta, 0,
+        "constant-QP path must produce zero per-CU QP delta (got {max_abs_delta})"
     );
 }
