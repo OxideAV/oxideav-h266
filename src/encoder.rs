@@ -574,8 +574,31 @@ impl VvcEncoder {
         num_alf_aps_ids_luma: u8,
         first_aps_id: u8,
     ) -> Result<Vec<u8>> {
+        self.emit_picture_header_nal_with_alf_chain_full(AlfPhChain {
+            num_alf_aps_ids_luma,
+            luma_aps_id: first_aps_id,
+            ph_alf_cb_enabled_flag: true,
+            ph_alf_cr_enabled_flag: true,
+            ph_alf_aps_id_chroma: 0,
+            ph_alf_cc_cb_enabled_flag: true,
+            ph_alf_cc_cb_aps_id: 1,
+            ph_alf_cc_cr_enabled_flag: true,
+            ph_alf_cc_cr_aps_id: 1,
+        })
+    }
+
+    /// Round-51 — emit a §7.3.2.7 PH NAL with a fully-parameterised
+    /// §7.3.2.8 ALF chain (luma + chroma + CC-ALF). The round-48 entry
+    /// point [`emit_nal_with_alf_aps_chain`] forwards through this with
+    /// the chroma + CC flags pinned on; round-51 callers that ran the
+    /// chroma APS / CC-ALF APS RDO trade-off use this directly to drop
+    /// individual flags when the trade-off skipped the corresponding APS.
+    pub fn emit_picture_header_nal_with_alf_chain_full(
+        &self,
+        chain: AlfPhChain,
+    ) -> Result<Vec<u8>> {
         let mut bw = BitWriter::new();
-        self.emit_picture_header_body(&mut bw, num_alf_aps_ids_luma, first_aps_id);
+        self.emit_picture_header_body(&mut bw, &chain);
         bw.rbsp_trailing_bits();
         let rbsp = bw.into_bytes();
         Ok(Self::wrap_nal(NalUnitType::PhNut, 0, 1, &rbsp))
@@ -583,16 +606,14 @@ impl VvcEncoder {
 
     /// Emit the §7.3.2.8 `picture_header_structure()` body into `bw`.
     ///
-    /// `num_alf_aps_ids_luma` is the §7.4.3.8 `ph_num_alf_aps_ids_luma`;
-    /// when `> 0`, `first_aps_id` is repeated as
-    /// `ph_alf_aps_id_luma[i]` for every `i` (round-48 ships at most one
-    /// luma APS, so the trade-off cap is 1).
-    fn emit_picture_header_body(
-        &self,
-        bw: &mut BitWriter,
-        num_alf_aps_ids_luma: u8,
-        first_aps_id: u8,
-    ) {
+    /// `chain.num_alf_aps_ids_luma` is the §7.4.3.8
+    /// `ph_num_alf_aps_ids_luma`; when `> 0`, `chain.luma_aps_id` is
+    /// repeated as `ph_alf_aps_id_luma[i]` for every `i` (round-48 ships
+    /// at most one luma APS, so the trade-off cap is 1).
+    /// `chain.ph_alf_{cb,cr,cc_cb,cc_cr}_enabled_flag` mirror the §7.3.2.8
+    /// per-component gates; round-51 added per-APS RDO that may skip
+    /// the chroma + CC-ALF APSes independently.
+    fn emit_picture_header_body(&self, bw: &mut BitWriter, chain: &AlfPhChain) {
         // IRAP IDR intra-only picture.
         bw.write_bit(1); // ph_gdr_or_irap_pic_flag = 1
         bw.write_bit(0); // ph_non_ref_pic_flag = 0
@@ -605,32 +626,46 @@ impl VvcEncoder {
         // `sps.alf_enabled_flag && pps.pps_alf_info_in_ph_flag` per
         // §7.4.3.8. `pps_no_pic_partition_flag = 1` infers
         // `pps_alf_info_in_ph_flag = 1` (§7.4.3.5), so the chain lives
-        // here rather than in the slice header. We bind primary chroma
-        // ALF to APS id 0 (the one the encoder ships first) and CC-ALF
-        // Cb / Cr to APS id 1 (the second APS).
+        // here rather than in the slice header. The pipeline binds
+        // primary chroma ALF to APS id 0 (when shipped) and CC-ALF
+        // Cb / Cr to APS id 1 (when shipped); the round-48 luma APS
+        // (when shipped) lives at id 2.
         bw.write_bit(1); // ph_alf_enabled_flag
                          // Round-48 — luma APS chain count is parameterised: the
                          // picture-bits trade-off in `encode_idr_with_residuals` may
                          // skip the luma APS NAL entirely (`num = 0`) when the SSE
                          // gain is smaller than the APS byte cost.
-        bw.write_bits(num_alf_aps_ids_luma as u32, 3);
-        for _ in 0..num_alf_aps_ids_luma {
-            bw.write_bits(first_aps_id as u32, 3); // ph_alf_aps_id_luma[i]
+        bw.write_bits(chain.num_alf_aps_ids_luma as u32, 3);
+        for _ in 0..chain.num_alf_aps_ids_luma {
+            bw.write_bits(chain.luma_aps_id as u32, 3); // ph_alf_aps_id_luma[i]
         }
         // chroma_format_idc != 0 → emit per-component chroma flags.
-        bw.write_bit(1); // ph_alf_cb_enabled_flag
-        bw.write_bit(1); // ph_alf_cr_enabled_flag
-                         // At least one of cb/cr is on → APS id for primary chroma.
-        bw.write_bits(0, 3); // ph_alf_aps_id_chroma = 0
-                             // ccalf_enabled_flag = 1 → CC-ALF chain.
-        bw.write_bit(1); // ph_alf_cc_cb_enabled_flag
-        bw.write_bits(1, 3); // ph_alf_cc_cb_aps_id = 1
-        bw.write_bit(1); // ph_alf_cc_cr_enabled_flag
-        bw.write_bits(1, 3); // ph_alf_cc_cr_aps_id = 1
-                             // pps_rpl_info_in_ph_flag inferred = 1 → parse_ref_pic_lists()
-                             // is called. With num_ref_pic_lists[0/1] = 0 each list falls
-                             // into the inline branch which emits `num_ref_entries = 0`
-                             // (one ue(0) per list).
+        // Round-51 — when the picture-bits trade-off drops the chroma APS,
+        // the per-CTB chroma ALF passes never fired, so both chroma flags
+        // signal 0 here and the §7.4.3.8 `ph_alf_aps_id_chroma` field is
+        // suppressed by the spec gate `if (ph_alf_cb_enabled_flag ||
+        // ph_alf_cr_enabled_flag)`.
+        bw.write_bit(chain.ph_alf_cb_enabled_flag as u8);
+        bw.write_bit(chain.ph_alf_cr_enabled_flag as u8);
+        if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
+            bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
+        }
+        // ccalf_enabled_flag = 1 → CC-ALF chain. Round-51 — each
+        // component's enable bit is independent: the CC-ALF Cb APS RDO
+        // and the CC-ALF Cr APS RDO each pick their own ship/skip
+        // decision, mirrored here by the per-component flag.
+        bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
+        if chain.ph_alf_cc_cb_enabled_flag {
+            bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
+        }
+        bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
+        if chain.ph_alf_cc_cr_enabled_flag {
+            bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+        }
+        // pps_rpl_info_in_ph_flag inferred = 1 → parse_ref_pic_lists()
+        // is called. With num_ref_pic_lists[0/1] = 0 each list falls
+        // into the inline branch which emits `num_ref_entries = 0`
+        // (one ue(0) per list).
         bw.write_ue(0); // list 0: num_ref_entries = 0
         bw.write_ue(0); // list 1: num_ref_entries = 0
                         // pps_qp_delta_info_in_ph_flag inferred = 1 → emit ph_qp_delta.
@@ -672,6 +707,45 @@ pub enum EmittedNalKind {
     Pps,
     PictureHeader,
     IdrSlice,
+}
+
+/// Round-51 — fully-parameterised §7.3.2.8 picture-header ALF chain.
+///
+/// The encoder pipeline runs an APS-vs-fixed RDO trade-off per APS
+/// independently (round-51 extends round-48's luma trade-off to chroma
+/// and CC-ALF). This struct propagates each per-APS ship/skip decision
+/// into the PH bitstream emit by carrying every gate the §7.3.2.8 syntax
+/// reads when `ph_alf_enabled_flag = 1`.
+///
+/// Field semantics mirror the spec syntax names verbatim. Conditional
+/// fields (e.g. `ph_alf_aps_id_chroma`, `ph_alf_cc_*_aps_id`) are only
+/// written when the gating enable flag is set.
+#[derive(Clone, Copy, Debug)]
+pub struct AlfPhChain {
+    /// `ph_num_alf_aps_ids_luma` — 0 when the round-48 trade-off skipped
+    /// the luma APS NAL, 1 when it shipped.
+    pub num_alf_aps_ids_luma: u8,
+    /// `ph_alf_aps_id_luma[i]` repeated for each `i ∈ 0..num_alf_aps_ids_luma`.
+    /// The pipeline ships the luma APS at id 2.
+    pub luma_aps_id: u8,
+    /// `ph_alf_cb_enabled_flag`.
+    pub ph_alf_cb_enabled_flag: bool,
+    /// `ph_alf_cr_enabled_flag`.
+    pub ph_alf_cr_enabled_flag: bool,
+    /// `ph_alf_aps_id_chroma` — emitted only when at least one of the Cb /
+    /// Cr enable flags is set. The pipeline binds primary chroma ALF to
+    /// APS id 0.
+    pub ph_alf_aps_id_chroma: u8,
+    /// `ph_alf_cc_cb_enabled_flag`.
+    pub ph_alf_cc_cb_enabled_flag: bool,
+    /// `ph_alf_cc_cb_aps_id` — pipeline binds CC-ALF Cb to APS id 1 when
+    /// shipped.
+    pub ph_alf_cc_cb_aps_id: u8,
+    /// `ph_alf_cc_cr_enabled_flag`.
+    pub ph_alf_cc_cr_enabled_flag: bool,
+    /// `ph_alf_cc_cr_aps_id` — pipeline binds CC-ALF Cr to APS id 1 when
+    /// shipped.
+    pub ph_alf_cc_cr_aps_id: u8,
 }
 
 #[cfg(test)]
