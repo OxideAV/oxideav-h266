@@ -12,6 +12,8 @@
 //!
 //! * `split_cu_flag` — Table 59 (27 ctxIdx).
 //! * `split_qt_flag` — Table 60 (18 ctxIdx).
+//! * `mtt_split_cu_vertical_flag` — Table 61 (15 ctxIdx, 5 per initType).
+//! * `mtt_split_cu_binary_flag` — Table 62 (12 ctxIdx, 4 per initType).
 //! * `pred_mode_flag` — Table 66 (4 ctxIdx).
 //! * `intra_bdpcm_luma_flag` — Table 69 (3 ctxIdx).
 //! * `intra_bdpcm_luma_dir_flag` — Table 70 (3 ctxIdx).
@@ -63,6 +65,16 @@ use crate::cabac::ContextModel;
 pub enum SyntaxCtx {
     SplitCuFlag,
     SplitQtFlag,
+    /// Table 61 — `mtt_split_cu_vertical_flag` (15 ctxIdx, 5 per initType).
+    /// Round-55 §9.3.4.2.3: ctxInc derived from
+    /// `(allowSplitBtVer + allowSplitTtVer)` vs
+    /// `(allowSplitBtHor + allowSplitTtHor)` plus the `dA` / `dL`
+    /// neighbour-aspect ratios.
+    MttSplitCuVerticalFlag,
+    /// Table 62 — `mtt_split_cu_binary_flag` (12 ctxIdx, 4 per initType).
+    /// Round-55: per Table 132 the ctxInc =
+    /// `2 * mtt_split_cu_vertical_flag + (mttDepth <= 1 ? 1 : 0)`.
+    MttSplitCuBinaryFlag,
     PredModeFlag,
     IntraBdpcmLumaFlag,
     IntraBdpcmLumaDirFlag,
@@ -171,6 +183,18 @@ pub const SPLIT_QT_FLAG_INIT: &[u8] = &[
 ];
 pub const SPLIT_QT_FLAG_SHIFT: &[u8] =
     &[0, 8, 8, 12, 12, 8, 0, 8, 8, 12, 12, 8, 0, 8, 8, 12, 12, 8];
+
+/// Table 61 — `mtt_split_cu_vertical_flag` (15 ctxIdx, 5 per initType).
+/// Round-55 §9.3.4.2.3.
+pub const MTT_SPLIT_CU_VERTICAL_FLAG_INIT: &[u8] =
+    &[43, 42, 29, 27, 44, 43, 35, 37, 34, 52, 43, 42, 37, 42, 44];
+pub const MTT_SPLIT_CU_VERTICAL_FLAG_SHIFT: &[u8] = &[9, 8, 9, 8, 5, 9, 8, 9, 8, 5, 9, 8, 9, 8, 5];
+
+/// Table 62 — `mtt_split_cu_binary_flag` (12 ctxIdx, 4 per initType).
+/// Round-55: ctxInc per Table 132 =
+/// `2 * mtt_split_cu_vertical_flag + (mttDepth <= 1 ? 1 : 0)`.
+pub const MTT_SPLIT_CU_BINARY_FLAG_INIT: &[u8] = &[36, 45, 36, 45, 43, 37, 21, 22, 28, 29, 28, 29];
+pub const MTT_SPLIT_CU_BINARY_FLAG_SHIFT: &[u8] = &[12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13];
 
 /// Table 66 — `pred_mode_flag` (4 ctxIdx).
 pub const PRED_MODE_FLAG_INIT: &[u8] = &[40, 35, 40, 35];
@@ -509,6 +533,14 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
     let (init, shift) = match kind {
         SyntaxCtx::SplitCuFlag => (SPLIT_CU_FLAG_INIT, SPLIT_CU_FLAG_SHIFT),
         SyntaxCtx::SplitQtFlag => (SPLIT_QT_FLAG_INIT, SPLIT_QT_FLAG_SHIFT),
+        SyntaxCtx::MttSplitCuVerticalFlag => (
+            MTT_SPLIT_CU_VERTICAL_FLAG_INIT,
+            MTT_SPLIT_CU_VERTICAL_FLAG_SHIFT,
+        ),
+        SyntaxCtx::MttSplitCuBinaryFlag => (
+            MTT_SPLIT_CU_BINARY_FLAG_INIT,
+            MTT_SPLIT_CU_BINARY_FLAG_SHIFT,
+        ),
         SyntaxCtx::PredModeFlag => (PRED_MODE_FLAG_INIT, PRED_MODE_FLAG_SHIFT),
         SyntaxCtx::IntraBdpcmLumaFlag => (INTRA_BDPCM_LUMA_FLAG_INIT, INTRA_BDPCM_LUMA_FLAG_SHIFT),
         SyntaxCtx::IntraBdpcmLumaDirFlag => (
@@ -606,6 +638,8 @@ mod tests {
         for kind in [
             SyntaxCtx::SplitCuFlag,
             SyntaxCtx::SplitQtFlag,
+            SyntaxCtx::MttSplitCuVerticalFlag,
+            SyntaxCtx::MttSplitCuBinaryFlag,
             SyntaxCtx::PredModeFlag,
             SyntaxCtx::IntraBdpcmLumaFlag,
             SyntaxCtx::IntraBdpcmLumaDirFlag,
@@ -670,6 +704,15 @@ mod tests {
     #[test]
     fn split_cu_context_count_is_27() {
         assert_eq!(ctx_count(SyntaxCtx::SplitCuFlag), 27);
+    }
+
+    /// Round-55 — Tables 61 / 62 transcription length sanity. Per Table 51:
+    ///   * `mtt_split_cu_vertical_flag` ∈ 0..14 → 15 entries.
+    ///   * `mtt_split_cu_binary_flag` ∈ 0..11 → 12 entries.
+    #[test]
+    fn mtt_split_context_table_lengths() {
+        assert_eq!(ctx_count(SyntaxCtx::MttSplitCuVerticalFlag), 15);
+        assert_eq!(ctx_count(SyntaxCtx::MttSplitCuBinaryFlag), 12);
     }
 
     #[test]

@@ -62,7 +62,10 @@ use oxideav_core::Result;
 use crate::cabac::ArithDecoder;
 use crate::cabac_enc::ArithEncoder;
 use crate::coding_tree::TreeCtxs;
-use crate::ctx::{ctx_inc_split_cu_flag, ctx_inc_split_qt_flag};
+use crate::ctx::{
+    ctx_inc_mtt_split_cu_binary_flag, ctx_inc_mtt_split_cu_vertical_flag, ctx_inc_split_cu_flag,
+    ctx_inc_split_qt_flag,
+};
 
 /// Encode the I-slice `coding_tree_unit()` body for a single 64×64 CU per
 /// CTU (round-52 scope: no actual splitting). Emits one `split_cu_flag = 0`
@@ -150,12 +153,15 @@ pub fn encode_split_qt_flag(
 
 /// Encode a `coding_quadtree()` shell that emits a forced 4-way QT
 /// split: `split_cu_flag = 1` + `split_qt_flag = 1` + 4× recursion via
-/// `body_emit_quadrant(quadrant_idx, x0, y0, sub_w, sub_h)`.
+/// `body_emit_quadrant(enc, ctxs, quadrant_idx, sub_w, sub_h)`.
 ///
 /// Used when the current CU exceeds MaxBtSize (e.g. a 128×128 CTB
 /// requires a forced QT split because MaxCbSizeY = 64 in our profile).
-/// Round-52 encoder pipeline keeps to single 64×64 CUs and does not
-/// invoke this; exposed for future rounds.
+/// Round-55 encoder pipeline wires this for 128×128 CTBs: the emitted
+/// four 64×64 sub-CU shells follow inside `body_emit_quadrant`. The
+/// closure receives `(enc, ctxs)` so the per-quadrant body can call
+/// back into [`encode_coding_tree_leaf_iframe`] without needing to
+/// share the `TreeCtxs` borrow with the caller.
 pub fn encode_coding_quadtree_split<F>(
     enc: &mut ArithEncoder,
     ctxs: &mut TreeCtxs,
@@ -166,7 +172,7 @@ pub fn encode_coding_quadtree_split<F>(
     mut body_emit_quadrant: F,
 ) -> Result<()>
 where
-    F: FnMut(&mut ArithEncoder, u32, u32, u32) -> Result<()>,
+    F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32, u32, u32) -> Result<()>,
 {
     // split_cu_flag = 1.
     let inc = ctx_inc_split_cu_flag(
@@ -189,8 +195,185 @@ where
     let hw = cb_w / 2;
     let hh = cb_h / 2;
     for q in 0..4u32 {
-        body_emit_quadrant(enc, q, hw, hh)?;
+        body_emit_quadrant(enc, ctxs, q, hw, hh)?;
     }
+    Ok(())
+}
+
+/// Round-55 — direction selector for an MTT split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MttSplitDir {
+    /// Vertical split (`mtt_split_cu_vertical_flag = 1`).
+    Vertical,
+    /// Horizontal split (`mtt_split_cu_vertical_flag = 0`).
+    Horizontal,
+}
+
+impl MttSplitDir {
+    fn vertical_flag(self) -> u32 {
+        match self {
+            MttSplitDir::Vertical => 1,
+            MttSplitDir::Horizontal => 0,
+        }
+    }
+}
+
+/// Round-55 — encode a `coding_tree()` MTT binary-tree (BT) split:
+///   * `split_cu_flag = 1`
+///   * `split_qt_flag = 0`
+///   * `mtt_split_cu_vertical_flag` per `dir`
+///   * `mtt_split_cu_binary_flag = 1`
+///   * 2× recursion via `body_emit_subblock(idx, sub_w, sub_h)` (idx ∈ {0, 1}).
+///
+/// `mtt_depth` is the current MTT depth (= 0 for the first MTT split
+/// inside a quadtree leaf). Used by the §9.3.4.2.1 / Table 132 ctxInc
+/// derivation for the binary flag.
+///
+/// All four allow-split-* flags are passed `1` (no allowance restriction
+/// in the round-55 scope where every dir is available); §9.3.4.2.3
+/// collapses this to ctxInc 0 because vert_sum == hor_sum and the
+/// neighbour-aspect ratio is degenerate for picture-edge CUs.
+pub fn encode_coding_tree_bt_split<F>(
+    enc: &mut ArithEncoder,
+    ctxs: &mut TreeCtxs,
+    cb_w: u32,
+    cb_h: u32,
+    nbrs: TreeNeighbours,
+    cqt_depth: u32,
+    mtt_depth: u32,
+    dir: MttSplitDir,
+    mut body_emit_subblock: F,
+) -> Result<()>
+where
+    F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32, u32, u32) -> Result<()>,
+{
+    // split_cu_flag = 1.
+    let inc = ctx_inc_split_cu_flag(
+        nbrs.left_avail,
+        nbrs.above_avail,
+        nbrs.cb_height_left,
+        nbrs.cb_width_above,
+        cb_w,
+        cb_h,
+        1,
+        1,
+        1,
+        1,
+        1,
+    ) as usize;
+    let n = ctxs.split_cu.len() - 1;
+    enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 1)?;
+    // split_qt_flag = 0 (we're going into MTT).
+    encode_split_qt_flag(enc, ctxs, false, nbrs, cqt_depth)?;
+    // mtt_split_cu_vertical_flag.
+    let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
+        nbrs.left_avail,
+        nbrs.above_avail,
+        nbrs.cb_height_left,
+        nbrs.cb_width_above,
+        cb_w,
+        cb_h,
+        1,
+        1,
+        1,
+        1,
+    ) as usize;
+    let mtt_v_n = ctxs.mtt_split_vertical.len() - 1;
+    let mtt_v = dir.vertical_flag();
+    enc.encode_decision(&mut ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)], mtt_v)?;
+    // mtt_split_cu_binary_flag = 1 (BT).
+    let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_v, mtt_depth) as usize;
+    let mtt_b_n = ctxs.mtt_split_binary.len() - 1;
+    enc.encode_decision(&mut ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)], 1)?;
+
+    // Two sub-blocks of equal size.
+    let (sub_w, sub_h) = match dir {
+        MttSplitDir::Vertical => (cb_w / 2, cb_h),
+        MttSplitDir::Horizontal => (cb_w, cb_h / 2),
+    };
+    body_emit_subblock(enc, ctxs, 0, sub_w, sub_h)?;
+    body_emit_subblock(enc, ctxs, 1, sub_w, sub_h)?;
+    Ok(())
+}
+
+/// Round-55 — encode a `coding_tree()` MTT ternary-tree (TT) split:
+///   * `split_cu_flag = 1`
+///   * `split_qt_flag = 0`
+///   * `mtt_split_cu_vertical_flag` per `dir`
+///   * `mtt_split_cu_binary_flag = 0`
+///   * 3× recursion via `body_emit_subblock(idx, sub_w, sub_h)` with the
+///     1:2:1 ratio (idx ∈ {0, 1, 2}).
+///
+/// **Round-55 scope: skeleton only.** The encoder pipeline RDO picker
+/// stays leaf-or-BT for now (TT picker is round-56+), but the syntax /
+/// parse path is ready so future rounds can flip the picker.
+pub fn encode_coding_tree_tt_split<F>(
+    enc: &mut ArithEncoder,
+    ctxs: &mut TreeCtxs,
+    cb_w: u32,
+    cb_h: u32,
+    nbrs: TreeNeighbours,
+    cqt_depth: u32,
+    mtt_depth: u32,
+    dir: MttSplitDir,
+    mut body_emit_subblock: F,
+) -> Result<()>
+where
+    F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32, u32, u32) -> Result<()>,
+{
+    // split_cu_flag = 1.
+    let inc = ctx_inc_split_cu_flag(
+        nbrs.left_avail,
+        nbrs.above_avail,
+        nbrs.cb_height_left,
+        nbrs.cb_width_above,
+        cb_w,
+        cb_h,
+        1,
+        1,
+        1,
+        1,
+        1,
+    ) as usize;
+    let n = ctxs.split_cu.len() - 1;
+    enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 1)?;
+    // split_qt_flag = 0.
+    encode_split_qt_flag(enc, ctxs, false, nbrs, cqt_depth)?;
+    // mtt_split_cu_vertical_flag.
+    let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
+        nbrs.left_avail,
+        nbrs.above_avail,
+        nbrs.cb_height_left,
+        nbrs.cb_width_above,
+        cb_w,
+        cb_h,
+        1,
+        1,
+        1,
+        1,
+    ) as usize;
+    let mtt_v_n = ctxs.mtt_split_vertical.len() - 1;
+    let mtt_v = dir.vertical_flag();
+    enc.encode_decision(&mut ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)], mtt_v)?;
+    // mtt_split_cu_binary_flag = 0 (TT).
+    let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_v, mtt_depth) as usize;
+    let mtt_b_n = ctxs.mtt_split_binary.len() - 1;
+    enc.encode_decision(&mut ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)], 0)?;
+
+    // Three sub-blocks with the 1:2:1 ratio.
+    let (sub0_dim, sub1_dim, sub2_dim) = match dir {
+        MttSplitDir::Vertical => {
+            let q = cb_w / 4;
+            ((q, cb_h), (q * 2, cb_h), (q, cb_h))
+        }
+        MttSplitDir::Horizontal => {
+            let q = cb_h / 4;
+            ((cb_w, q), (cb_w, q * 2), (cb_w, q))
+        }
+    };
+    body_emit_subblock(enc, ctxs, 0, sub0_dim.0, sub0_dim.1)?;
+    body_emit_subblock(enc, ctxs, 1, sub1_dim.0, sub1_dim.1)?;
+    body_emit_subblock(enc, ctxs, 2, sub2_dim.0, sub2_dim.1)?;
     Ok(())
 }
 
@@ -218,6 +401,65 @@ pub fn decode_coding_tree_split_cu_flag(
     ) as usize;
     let n = ctxs.split_cu.len() - 1;
     dec.decode_decision(&mut ctxs.split_cu[inc.min(n)])
+}
+
+/// Round-55 — read `split_qt_flag` per §9.3.4.2.2. Decoder dual to
+/// [`encode_split_qt_flag`].
+pub fn decode_coding_tree_split_qt_flag(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut TreeCtxs,
+    nbrs: TreeNeighbours,
+    cqt_depth: u32,
+) -> Result<u32> {
+    let inc = ctx_inc_split_qt_flag(
+        nbrs.left_avail,
+        nbrs.above_avail,
+        nbrs.cqt_depth_left,
+        nbrs.cqt_depth_above,
+        cqt_depth,
+    ) as usize;
+    let n = ctxs.split_qt.len() - 1;
+    dec.decode_decision(&mut ctxs.split_qt[inc.min(n)])
+}
+
+/// Round-55 — read `mtt_split_cu_vertical_flag` per §9.3.4.2.3. Decoder
+/// dual to the corresponding emit inside
+/// [`encode_coding_tree_bt_split`] / [`encode_coding_tree_tt_split`].
+pub fn decode_coding_tree_mtt_split_vertical_flag(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut TreeCtxs,
+    cb_w: u32,
+    cb_h: u32,
+    nbrs: TreeNeighbours,
+) -> Result<u32> {
+    let inc = ctx_inc_mtt_split_cu_vertical_flag(
+        nbrs.left_avail,
+        nbrs.above_avail,
+        nbrs.cb_height_left,
+        nbrs.cb_width_above,
+        cb_w,
+        cb_h,
+        1,
+        1,
+        1,
+        1,
+    ) as usize;
+    let n = ctxs.mtt_split_vertical.len() - 1;
+    dec.decode_decision(&mut ctxs.mtt_split_vertical[inc.min(n)])
+}
+
+/// Round-55 — read `mtt_split_cu_binary_flag` per §9.3.4.2.1 / Table 132.
+/// Decoder dual to the corresponding emit inside
+/// [`encode_coding_tree_bt_split`] / [`encode_coding_tree_tt_split`].
+pub fn decode_coding_tree_mtt_split_binary_flag(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut TreeCtxs,
+    mtt_split_cu_vertical_flag: u32,
+    mtt_depth: u32,
+) -> Result<u32> {
+    let inc = ctx_inc_mtt_split_cu_binary_flag(mtt_split_cu_vertical_flag, mtt_depth) as usize;
+    let n = ctxs.mtt_split_binary.len() - 1;
+    dec.decode_decision(&mut ctxs.mtt_split_binary[inc.min(n)])
 }
 
 /// Neighbour availability + size info used by the §9.3.4.2.2 ctxInc
@@ -303,7 +545,7 @@ mod tests {
             128,
             TreeNeighbours::default(),
             0,
-            |_e, q, _w, _h| {
+            |_e, _ctxs, q, _w, _h| {
                 quadrants.push(q);
                 Ok(())
             },
@@ -331,5 +573,170 @@ mod tests {
             .decode_decision(&mut dec_ctxs.split_qt[inc.min(n)])
             .unwrap();
         assert_eq!(split_qt, 1);
+    }
+
+    /// Round-55 — `encode_coding_tree_bt_split` emits the four-flag
+    /// preamble (`split_cu_flag = 1`, `split_qt_flag = 0`,
+    /// `mtt_split_cu_vertical_flag = 1`, `mtt_split_cu_binary_flag = 1`)
+    /// for a vertical BT, then the two sub-block closures (idx 0 and 1)
+    /// each see equal half-width sub-blocks. The round-trip reads each
+    /// flag back through its matching decoder helper.
+    #[test]
+    fn coding_tree_bt_split_vertical_round_trips() {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = TreeCtxs::init(26);
+        let mut subblocks = Vec::<(u32, u32, u32)>::new();
+        encode_coding_tree_bt_split(
+            &mut enc,
+            &mut enc_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+            0,
+            0,
+            MttSplitDir::Vertical,
+            |_e, _ctxs, idx, w, h| {
+                subblocks.push((idx, w, h));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(subblocks, vec![(0, 32, 64), (1, 32, 64)]);
+        enc.encode_terminate(1).unwrap();
+        let bytes = enc.finish();
+
+        let mut dec = ArithDecoder::new(&bytes).unwrap();
+        let mut dec_ctxs = TreeCtxs::init(26);
+        let split_cu = decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut dec_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(split_cu, 1);
+        let split_qt =
+            decode_coding_tree_split_qt_flag(&mut dec, &mut dec_ctxs, TreeNeighbours::default(), 0)
+                .unwrap();
+        assert_eq!(split_qt, 0);
+        let mtt_v = decode_coding_tree_mtt_split_vertical_flag(
+            &mut dec,
+            &mut dec_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(mtt_v, 1);
+        let mtt_b =
+            decode_coding_tree_mtt_split_binary_flag(&mut dec, &mut dec_ctxs, mtt_v, 0).unwrap();
+        assert_eq!(mtt_b, 1);
+    }
+
+    /// Round-55 — `encode_coding_tree_bt_split` for a horizontal BT
+    /// emits `mtt_split_cu_vertical_flag = 0` and the two sub-blocks
+    /// each have full width and half height.
+    #[test]
+    fn coding_tree_bt_split_horizontal_round_trips() {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = TreeCtxs::init(26);
+        let mut subblocks = Vec::<(u32, u32, u32)>::new();
+        encode_coding_tree_bt_split(
+            &mut enc,
+            &mut enc_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+            0,
+            1,
+            MttSplitDir::Horizontal,
+            |_e, _ctxs, idx, w, h| {
+                subblocks.push((idx, w, h));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(subblocks, vec![(0, 64, 32), (1, 64, 32)]);
+        enc.encode_terminate(1).unwrap();
+        let bytes = enc.finish();
+
+        let mut dec = ArithDecoder::new(&bytes).unwrap();
+        let mut dec_ctxs = TreeCtxs::init(26);
+        decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut dec_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        decode_coding_tree_split_qt_flag(&mut dec, &mut dec_ctxs, TreeNeighbours::default(), 0)
+            .unwrap();
+        let mtt_v = decode_coding_tree_mtt_split_vertical_flag(
+            &mut dec,
+            &mut dec_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(mtt_v, 0);
+        let mtt_b =
+            decode_coding_tree_mtt_split_binary_flag(&mut dec, &mut dec_ctxs, mtt_v, 1).unwrap();
+        assert_eq!(mtt_b, 1);
+    }
+
+    /// Round-55 — `encode_coding_tree_tt_split` (skeleton): emits
+    /// `mtt_split_cu_binary_flag = 0` and the three sub-blocks have the
+    /// 1:2:1 ratio.
+    #[test]
+    fn coding_tree_tt_split_vertical_round_trips() {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = TreeCtxs::init(26);
+        let mut subblocks = Vec::<(u32, u32, u32)>::new();
+        encode_coding_tree_tt_split(
+            &mut enc,
+            &mut enc_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+            0,
+            0,
+            MttSplitDir::Vertical,
+            |_e, _ctxs, idx, w, h| {
+                subblocks.push((idx, w, h));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(subblocks, vec![(0, 16, 64), (1, 32, 64), (2, 16, 64)]);
+        enc.encode_terminate(1).unwrap();
+        let bytes = enc.finish();
+
+        let mut dec = ArithDecoder::new(&bytes).unwrap();
+        let mut dec_ctxs = TreeCtxs::init(26);
+        decode_coding_tree_split_cu_flag(
+            &mut dec,
+            &mut dec_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        decode_coding_tree_split_qt_flag(&mut dec, &mut dec_ctxs, TreeNeighbours::default(), 0)
+            .unwrap();
+        let mtt_v = decode_coding_tree_mtt_split_vertical_flag(
+            &mut dec,
+            &mut dec_ctxs,
+            64,
+            64,
+            TreeNeighbours::default(),
+        )
+        .unwrap();
+        assert_eq!(mtt_v, 1);
+        let mtt_b =
+            decode_coding_tree_mtt_split_binary_flag(&mut dec, &mut dec_ctxs, mtt_v, 0).unwrap();
+        assert_eq!(mtt_b, 0, "TT split must signal binary_flag = 0");
     }
 }

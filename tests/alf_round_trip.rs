@@ -598,7 +598,9 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{
+        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
+    };
 
     let src = PictureBuffer::yuv420_filled(128, 128, 128);
     let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
@@ -669,11 +671,34 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     let mut alf_pic = AlfPicture::empty(1, 1);
     decode_alf_picture(&mut dec, &mut alf_ctxs, &alf_cfg, &mut alf_pic).unwrap();
 
-    // Round-52 — every CU is wrapped in a `coding_tree() → split_cu_flag = 0`
-    // shell that precedes the §7.3.10 transform_unit() emit. Read the
-    // shell bin first, then the CBF triplet (Cb, Cr, luma per §7.3.10).
+    // Round-55 — 128×128 CTB: §7.3.11.4 mandates a forced QT split,
+    // so the wire stream begins with `split_cu_flag = 1` +
+    // `split_qt_flag = 1` before the four 64×64 leaf-CU shells.
     let mut residual_ctxs = ResidualCtxs::init(26);
     let mut tree_ctxs = TreeCtxs::init(26);
+    let split_root = decode_coding_tree_split_cu_flag(
+        &mut dec,
+        &mut tree_ctxs,
+        128,
+        128,
+        TreeNeighbours::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        split_root, 1,
+        "round-55 128×128 CTB: split_cu_flag must decode as 1 (forced QT)"
+    );
+    let split_qt =
+        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
+            .unwrap();
+    assert_eq!(
+        split_qt, 1,
+        "round-55 128×128 CTB: split_qt_flag must decode as 1"
+    );
+    // Round-52 — each of the four 64×64 sub-CUs is wrapped in a
+    // `coding_tree() → split_cu_flag = 0` shell that precedes the
+    // §7.3.10 transform_unit() emit. Read the shell bin first, then the
+    // CBF triplet (Cb, Cr, luma per §7.3.10).
     for _tb_idx in 0..4 {
         let split = decode_coding_tree_split_cu_flag(
             &mut dec,
@@ -717,7 +742,9 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{
+        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
+    };
 
     // High-contrast luma + chroma noise → the encoder's flat quant
     // ladder leaves non-trivial residuals on every plane.
@@ -800,10 +827,25 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     let mut alf_pic = AlfPicture::empty(1, 1);
     decode_alf_picture(&mut dec, &mut alf_ctxs, &alf_cfg, &mut alf_pic).unwrap();
 
-    // Round-52 — `coding_tree()` shell wraps every CU; read the
-    // `split_cu_flag = 0` bin per TB before the CBF triplet.
+    // Round-55 — read the forced QT split flag pair before the four
+    // 64×64 leaf-CU shells (128×128 CTB per §7.3.11.4).
     let mut residual_ctxs = ResidualCtxs::init(26);
     let mut tree_ctxs = TreeCtxs::init(26);
+    let split_root = decode_coding_tree_split_cu_flag(
+        &mut dec,
+        &mut tree_ctxs,
+        128,
+        128,
+        TreeNeighbours::default(),
+    )
+    .unwrap();
+    assert_eq!(split_root, 1, "round-55 forced QT split_cu_flag = 1");
+    let split_qt =
+        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
+            .unwrap();
+    assert_eq!(split_qt, 1, "round-55 forced QT split_qt_flag = 1");
+    // Round-52 — `coding_tree()` shell wraps every leaf CU; read the
+    // `split_cu_flag = 0` bin per TB before the CBF triplet.
     let mut any_nonzero_cbf = false;
     // Track whether we hit any non-zero CBF in the first TU; we stop
     // there because decoding the residual bins after a non-zero CBF
@@ -983,7 +1025,9 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{
+        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
+    };
 
     // 128×64 source: two stacked 64×64 CUs in row 0 of a 128×128 CTB
     // grid. CU(0,0) is the left half (flat 128 → all-zero residuals at
@@ -1091,6 +1135,20 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     let mut prev_qp = slice_qp_y;
     let mut deltas_seen = Vec::<(usize, i32)>::new();
     let mut cbfs_seen = Vec::<(bool, bool, bool)>::new();
+    // Round-55 — forced QT split for 128×128 CTBs.
+    let split_root = decode_coding_tree_split_cu_flag(
+        &mut dec,
+        &mut tree_ctxs,
+        128,
+        128,
+        TreeNeighbours::default(),
+    )
+    .unwrap();
+    assert_eq!(split_root, 1, "round-55 forced QT split_cu_flag = 1");
+    let split_qt =
+        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
+            .unwrap();
+    assert_eq!(split_qt, 1, "round-55 forced QT split_qt_flag = 1");
     for tb_idx in 0..4 {
         let split = decode_coding_tree_split_cu_flag(
             &mut dec,
@@ -1169,7 +1227,9 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{
+        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
+    };
 
     // 128×128 source with structured luma so at least one CU emits a
     // non-zero CBF.
@@ -1254,6 +1314,20 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     let mut tree_ctxs = TreeCtxs::init(26);
     let mut any_cbf_seen = false;
     let mut max_abs_delta = 0i32;
+    // Round-55 — forced QT split for 128×128 CTBs.
+    let split_root = decode_coding_tree_split_cu_flag(
+        &mut dec,
+        &mut tree_ctxs,
+        128,
+        128,
+        TreeNeighbours::default(),
+    )
+    .unwrap();
+    assert_eq!(split_root, 1, "round-55 forced QT split_cu_flag = 1");
+    let split_qt =
+        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
+            .unwrap();
+    assert_eq!(split_qt, 1, "round-55 forced QT split_qt_flag = 1");
     for tb_idx in 0..4 {
         let split = decode_coding_tree_split_cu_flag(
             &mut dec,
@@ -1394,5 +1468,58 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
     assert!(
         sh.sh_sao_chroma_used_flag,
         "chroma SAO inferred on from ph_sao_chroma_enabled_flag = 1"
+    );
+}
+
+/// Round-55 — encoder-side reconstruction PSNR_Y must be the same on a
+/// 128×128 source as on the round-52 baseline. Adding the §7.3.11.4
+/// forced QT split is a bitstream-only change (extra `split_cu_flag = 1`
+/// and `split_qt_flag = 1` bins ahead of the four 64×64 leaf shells); the
+/// per-TB DCT / quant / dequant / IDCT / SAO / ALF reconstruction path is
+/// unchanged, so the reconstructed picture must round-trip end-to-end at
+/// the same fidelity as before. Asserts PSNR_Y >= 30 dB on a 128×128
+/// gradient at QP=26, matching the round-52 PSNR test on a 64×64 source.
+#[test]
+fn round55_forced_qt_128x128_reconstruction_psnr_matches_baseline() {
+    use oxideav_h266::encoder_pipeline::{encode_idr_with_residuals, psnr_y};
+    use oxideav_h266::reconstruct::PictureBuffer;
+
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 128);
+    for y in 0..128 {
+        for x in 0..128 {
+            // Smooth gradient mirroring round-52's gradient_frame helper.
+            let v = (64 + (x * 127) / 128) as u8;
+            src.luma.samples[y * src.luma.stride + x] = v;
+        }
+    }
+    let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+    let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+    assert!(
+        psnr >= 30.0,
+        "round-55 128×128 forced-QT reconstruction PSNR_Y {psnr:.2} dB < 30 dB"
+    );
+}
+
+/// Round-55 — at QP=0 the round-trip must reproduce the source exactly
+/// (within IDCT rounding) on a 128×128 frame, just like the round-52
+/// 64×64 baseline. Confirms the forced QT split + per-quadrant leaf-CU
+/// shell does not introduce any reconstruction divergence.
+#[test]
+fn round55_forced_qt_128x128_qp0_high_psnr() {
+    use oxideav_h266::encoder_pipeline::{encode_idr_with_residuals, psnr_y};
+    use oxideav_h266::reconstruct::PictureBuffer;
+
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 128);
+    for y in 0..128 {
+        for x in 0..128 {
+            let v = (64 + (x * 127) / 128) as u8;
+            src.luma.samples[y * src.luma.stride + x] = v;
+        }
+    }
+    let (_, rec) = encode_idr_with_residuals(&src, 0).unwrap();
+    let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+    assert!(
+        psnr >= 40.0,
+        "round-55 128×128 QP=0 reconstruction PSNR_Y {psnr:.2} dB < 40 dB"
     );
 }

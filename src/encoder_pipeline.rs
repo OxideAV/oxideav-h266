@@ -64,7 +64,9 @@ use crate::residual_enc::{
 };
 use crate::sao::SaoConfig;
 use crate::sao_enc::sao_decide_picture;
-use crate::syntax_enc::{encode_coding_tree_leaf_iframe, TreeNeighbours};
+use crate::syntax_enc::{
+    encode_coding_quadtree_split, encode_coding_tree_leaf_iframe, TreeNeighbours,
+};
 use crate::transform::{inverse_transform_2d, TrType};
 use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_flat};
 
@@ -1276,31 +1278,86 @@ pub fn encode_idr_with_qp_picker_cfg(
             // `split_cu_flag = 0` bin is on the wire ahead of the
             // `transform_tree()` content.
             //
+            // Round-55 — the SPS signals `sps_log2_ctu_size_minus5 = 2` ⇒
+            // `CtbSizeY = 128`, while the encoder caps each TB / CU at
+            // 64×64 (`max_luma_transform_size_64_flag = 0` in
+            // [`crate::encoder::VvcEncoder::emit_sps`] keeps MaxTbSizeY at
+            // the SPS default 32, but our pipeline pushes 64×64 TBs which
+            // is the largest spec-supported DCT-II). For a 128×128 CTB
+            // §7.3.11.4 mandates `split_cu_flag = 1` + `split_qt_flag = 1`
+            // (forced QT split) before any leaf CUs are emitted; we wrap
+            // the four 64×64 shells in `encode_coding_quadtree_split` so
+            // the wire stream complies. For non-128 CTBs (e.g. 64×64
+            // pictures fitting in a single CTB equal to MaxTbSizeY) the
+            // forced split is skipped and we emit the leaf CU directly.
+            //
             // QG reset: §7.4.13.2 specifies the QG starts at the first CU
             // of the CTB when `cu_qp_delta_subdiv` is 0 (the round-52
             // default). `qp_state.begin_cu()` is called per TB so the
             // first CU with any non-zero CBF emits its delta and the
             // remainder of the CTB inherits.
-            for tb in &prepared_per_ctu[ry][rx] {
-                qp_state.begin_cu();
-                let tree_nbrs = TreeNeighbours::default();
-                encode_coding_tree_leaf_iframe(
+            let tbs = &prepared_per_ctu[ry][rx];
+            // Round-55 — forced QT split fires only when the actual CTB
+            // covers a 128×128 region and produces all four 64×64 leaf
+            // CUs. Picture-edge CTBs (when the picture is narrower /
+            // shorter than 128 so only some quadrants exist) keep the
+            // round-52 single-leaf path because the spec's
+            // implicit-split path would split-then-skip the missing
+            // quadrants — we don't need to emit `split_cu_flag = 1` for
+            // a single-leaf CTB.
+            let ctb_x = rx * ctb_size;
+            let ctb_y = ry * ctb_size;
+            let actual_ctb_w = ctb_size.min(w as usize - ctb_x);
+            let actual_ctb_h = ctb_size.min(h as usize - ctb_y);
+            let needs_forced_qt =
+                actual_ctb_w == ctb_size && actual_ctb_h == ctb_size && tbs.len() == 4;
+            if needs_forced_qt {
+                // Round-55 — 128×128 CTB: forced QT split into four 64×64
+                // sub-CUs. `encode_coding_quadtree_split` emits the
+                // `split_cu_flag = 1` + `split_qt_flag = 1` pair, then
+                // calls the per-quadrant closure which hands each 64×64
+                // sub-CU to the standard leaf shell.
+                encode_coding_quadtree_split(
                     &mut cabac_enc,
                     &mut tree_ctxs,
-                    tb.n_tb as u32,
-                    tb.n_tb as u32,
-                    tree_nbrs,
-                    |enc| {
-                        // §7.3.10 transform_unit() per TB: real
-                        // `tu_*_coded_flag` CABAC bins (round-51 closed
-                        // the implicit-CBF gap) + `cu_qp_delta` (round-52)
-                        // followed by the per-component residual blocks
-                        // for every component whose CBF is set. Residual
-                        // blocks emit in the order luma → Cb → Cr per
-                        // §7.3.11.
-                        emit_tu_with_cbf(enc, &mut residual_ctxs, tb, &mut qp_state)
+                    ctb_size as u32,
+                    ctb_size as u32,
+                    TreeNeighbours::default(),
+                    /*cqt_depth=*/ 0,
+                    |enc, ctxs, q, _w, _h| {
+                        let tb = &tbs[q as usize];
+                        qp_state.begin_cu();
+                        encode_coding_tree_leaf_iframe(
+                            enc,
+                            ctxs,
+                            tb.n_tb as u32,
+                            tb.n_tb as u32,
+                            TreeNeighbours::default(),
+                            |enc| emit_tu_with_cbf(enc, &mut residual_ctxs, tb, &mut qp_state),
+                        )
                     },
                 )?;
+            } else {
+                for tb in tbs {
+                    qp_state.begin_cu();
+                    encode_coding_tree_leaf_iframe(
+                        &mut cabac_enc,
+                        &mut tree_ctxs,
+                        tb.n_tb as u32,
+                        tb.n_tb as u32,
+                        TreeNeighbours::default(),
+                        |enc| {
+                            // §7.3.10 transform_unit() per TB: real
+                            // `tu_*_coded_flag` CABAC bins (round-51 closed
+                            // the implicit-CBF gap) + `cu_qp_delta` (round-52)
+                            // followed by the per-component residual blocks
+                            // for every component whose CBF is set. Residual
+                            // blocks emit in the order luma → Cb → Cr per
+                            // §7.3.11.
+                            emit_tu_with_cbf(enc, &mut residual_ctxs, tb, &mut qp_state)
+                        },
+                    )?;
+                }
             }
             // QG resets at the end of every CTB (§7.4.13.2 with
             // `cu_qp_delta_subdiv = 0`): the first CU of the next CTB

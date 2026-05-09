@@ -11,6 +11,8 @@
 //!
 //! * [`ctx_inc_split_cu_flag`] — §9.3.4.2.2 / eq. 1551 with Table 133.
 //! * [`ctx_inc_split_qt_flag`] — same clause, Table 133.
+//! * [`ctx_inc_mtt_split_cu_vertical_flag`] — §9.3.4.2.3 (round-55).
+//! * [`ctx_inc_mtt_split_cu_binary_flag`] — §9.3.4.2.1 / Table 132 (round-55).
 //! * [`ctx_inc_pred_mode_flag`] — §9.3.4.2.2 / eq. 1552.
 //! * [`ctx_inc_intra_luma_mpm_flag`] — fixed context 0 (Table 132).
 //! * [`ctx_inc_sig_coeff_flag`] — §9.3.4.2.8 / eqs. 1572 – 1574.
@@ -82,6 +84,75 @@ pub fn ctx_inc_split_qt_flag(
     let cond_a = available_a && cqt_depth_above > cqt_depth;
     let ctx_set_idx = if cqt_depth >= 2 { 1 } else { 0 };
     (cond_l as u32) + (cond_a as u32) + ctx_set_idx * 3
+}
+
+/// ctxInc for `mtt_split_cu_vertical_flag` per §9.3.4.2.3.
+///
+/// Inputs:
+/// * `available_l` / `available_a` — neighbour availability (§6.4.4).
+/// * `cb_width_above` / `cb_height_left` — neighbour CB dims at
+///   `(x0, y0 - 1)` / `(x0 - 1, y0)` (ignored when the corresponding
+///   availability is false).
+/// * `cb_width` / `cb_height` — current block size.
+/// * `allow_split_bt_ver` / `allow_split_bt_hor` / `allow_split_tt_ver`
+///   / `allow_split_tt_hor` — partition-allowance flags from §7.4.12.4.
+///
+/// Returns ctxInc ∈ {0, 1, 2, 3, 4} per the eq. 1553 / 1554 derivation:
+///   * If `allowSplitBtVer + allowSplitTtVer >
+///     allowSplitBtHor + allowSplitTtHor` → ctxInc = 4.
+///   * Else if `<` → ctxInc = 3.
+///   * Else `dA = cbWidth / (availableA ? cb_width_above : 1)`,
+///     `dL = cbHeight / (availableL ? cb_height_left : 1)`:
+///     - `dA == dL` or either neighbour unavailable → ctxInc = 0.
+///     - `dA < dL` → ctxInc = 1.
+///     - else → ctxInc = 2.
+pub fn ctx_inc_mtt_split_cu_vertical_flag(
+    available_l: bool,
+    available_a: bool,
+    cb_height_left: u32,
+    cb_width_above: u32,
+    cb_width: u32,
+    cb_height: u32,
+    allow_split_bt_ver: u32,
+    allow_split_bt_hor: u32,
+    allow_split_tt_ver: u32,
+    allow_split_tt_hor: u32,
+) -> u32 {
+    let ver_sum = allow_split_bt_ver + allow_split_tt_ver;
+    let hor_sum = allow_split_bt_hor + allow_split_tt_hor;
+    if ver_sum > hor_sum {
+        return 4;
+    }
+    if ver_sum < hor_sum {
+        return 3;
+    }
+    let d_a_div = if available_a {
+        cb_width_above.max(1)
+    } else {
+        1
+    };
+    let d_l_div = if available_l {
+        cb_height_left.max(1)
+    } else {
+        1
+    };
+    let d_a = cb_width / d_a_div;
+    let d_l = cb_height / d_l_div;
+    if !available_a || !available_l || d_a == d_l {
+        0
+    } else if d_a < d_l {
+        1
+    } else {
+        2
+    }
+}
+
+/// ctxInc for `mtt_split_cu_binary_flag` per §9.3.4.2.1 / Table 132.
+///
+/// `ctxInc = 2 * mtt_split_cu_vertical_flag + (mttDepth <= 1 ? 1 : 0)`.
+/// Returns ctxInc ∈ {0, 1, 2, 3}.
+pub fn ctx_inc_mtt_split_cu_binary_flag(mtt_split_cu_vertical_flag: u32, mtt_depth: u32) -> u32 {
+    2 * mtt_split_cu_vertical_flag + if mtt_depth <= 1 { 1 } else { 0 }
 }
 
 /// ctxInc for `pred_mode_flag` per §9.3.4.2.2 eq. 1552 + Table 133
@@ -639,6 +710,44 @@ mod tests {
         // Shallow depth, both conds true, cqt_depth >= 2 → set_idx=1.
         let inc = ctx_inc_split_qt_flag(true, true, 3, 3, 2);
         assert_eq!(inc, 5);
+    }
+
+    /// Round-55 — `mtt_split_cu_vertical_flag` ctxInc derivation per
+    /// §9.3.4.2.3. Asymmetric allowance flags route to ctxInc 4 / 3 with
+    /// no neighbour lookups, then the symmetric branch falls back to
+    /// dA/dL.
+    #[test]
+    fn mtt_split_cu_vertical_flag_basic() {
+        // Asymmetric allowance: vertical-only allowed → ctxInc = 4.
+        let inc = ctx_inc_mtt_split_cu_vertical_flag(false, false, 0, 0, 64, 64, 1, 0, 1, 0);
+        assert_eq!(inc, 4);
+        // Asymmetric allowance: horizontal-only allowed → ctxInc = 3.
+        let inc = ctx_inc_mtt_split_cu_vertical_flag(false, false, 0, 0, 64, 64, 0, 1, 0, 1);
+        assert_eq!(inc, 3);
+        // Symmetric allowance, no neighbours → ctxInc = 0.
+        let inc = ctx_inc_mtt_split_cu_vertical_flag(false, false, 0, 0, 64, 64, 1, 1, 1, 1);
+        assert_eq!(inc, 0);
+        // Symmetric allowance, both neighbours equal → dA == dL → ctxInc = 0.
+        let inc = ctx_inc_mtt_split_cu_vertical_flag(true, true, 64, 64, 64, 64, 1, 1, 1, 1);
+        assert_eq!(inc, 0);
+        // Symmetric allowance with above-neighbour wider → dA = 64 / 128 = 0,
+        // dL = 64 / 64 = 1 → dA < dL → ctxInc = 1.
+        let inc = ctx_inc_mtt_split_cu_vertical_flag(true, true, 64, 128, 64, 64, 1, 1, 1, 1);
+        assert_eq!(inc, 1);
+        // Symmetric allowance with left-neighbour taller → dA = 64 / 64 = 1,
+        // dL = 64 / 128 = 0 → dA > dL → ctxInc = 2.
+        let inc = ctx_inc_mtt_split_cu_vertical_flag(true, true, 128, 64, 64, 64, 1, 1, 1, 1);
+        assert_eq!(inc, 2);
+    }
+
+    /// Round-55 — `mtt_split_cu_binary_flag` ctxInc per Table 132.
+    #[test]
+    fn mtt_split_cu_binary_flag_basic() {
+        assert_eq!(ctx_inc_mtt_split_cu_binary_flag(0, 0), 1);
+        assert_eq!(ctx_inc_mtt_split_cu_binary_flag(0, 1), 1);
+        assert_eq!(ctx_inc_mtt_split_cu_binary_flag(0, 2), 0);
+        assert_eq!(ctx_inc_mtt_split_cu_binary_flag(1, 0), 3);
+        assert_eq!(ctx_inc_mtt_split_cu_binary_flag(1, 2), 2);
     }
 
     #[test]

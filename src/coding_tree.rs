@@ -30,7 +30,8 @@ use oxideav_core::Result;
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
-    ctx_inc_intra_luma_mpm_flag, ctx_inc_pred_mode_flag, ctx_inc_split_cu_flag,
+    ctx_inc_intra_luma_mpm_flag, ctx_inc_mtt_split_cu_binary_flag,
+    ctx_inc_mtt_split_cu_vertical_flag, ctx_inc_pred_mode_flag, ctx_inc_split_cu_flag,
     ctx_inc_split_qt_flag,
 };
 
@@ -56,18 +57,24 @@ pub struct Cu {
 pub struct TreeCtxs {
     pub split_cu: Vec<ContextModel>,
     pub split_qt: Vec<ContextModel>,
+    /// Round-55 — `mtt_split_cu_vertical_flag` per Table 61 (15 ctxIdx).
+    pub mtt_split_vertical: Vec<ContextModel>,
+    /// Round-55 — `mtt_split_cu_binary_flag` per Table 62 (12 ctxIdx).
+    pub mtt_split_binary: Vec<ContextModel>,
     pub pred_mode: Vec<ContextModel>,
     pub intra_luma_mpm: Vec<ContextModel>,
 }
 
 impl TreeCtxs {
-    /// Build the context arrays from Table 59 / 60 / 66 / 75 at the
-    /// supplied slice QP.
+    /// Build the context arrays from Table 59 / 60 / 61 / 62 / 66 / 75
+    /// at the supplied slice QP.
     pub fn init(slice_qp_y: i32) -> Self {
         use crate::tables::{init_contexts, SyntaxCtx};
         Self {
             split_cu: init_contexts(SyntaxCtx::SplitCuFlag, slice_qp_y),
             split_qt: init_contexts(SyntaxCtx::SplitQtFlag, slice_qp_y),
+            mtt_split_vertical: init_contexts(SyntaxCtx::MttSplitCuVerticalFlag, slice_qp_y),
+            mtt_split_binary: init_contexts(SyntaxCtx::MttSplitCuBinaryFlag, slice_qp_y),
             pred_mode: init_contexts(SyntaxCtx::PredModeFlag, slice_qp_y),
             intra_luma_mpm: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp_y),
         }
@@ -164,12 +171,23 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             self.recurse(x + hw, y + hh, hw, hh, cqt_depth + 1, mtt_depth)?;
             return Ok(());
         }
-        // Multi-type-tree split: read vertical / binary bypass-bins as
-        // a simplification — the spec reads them through dedicated
-        // contexts which we'll wire later. Using bypass here keeps
-        // the CABAC state sync'd (bypass does not update a context).
-        let mtt_vertical = self.dec.decode_bypass()?;
-        let mtt_binary = self.dec.decode_bypass()?;
+        // Round-55 — multi-type-tree split: read vertical + binary bins
+        // through their proper §9.3.4.2.3 / Table 132 contexts. The
+        // walker hasn't yet wired full neighbour tracking so we feed
+        // unavailable neighbours; under symmetric BT/TT allowance this
+        // collapses ctxInc to 0 (vertical) per the dA == dL or
+        // unavailable-neighbour branch of §9.3.4.2.3.
+        let mtt_v_inc =
+            ctx_inc_mtt_split_cu_vertical_flag(false, false, 0, 0, w, h, 1, 1, 1, 1) as usize;
+        let mtt_v_n = self.ctxs.mtt_split_vertical.len() - 1;
+        let mtt_vertical = self
+            .dec
+            .decode_decision(&mut self.ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)])?;
+        let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, mtt_depth) as usize;
+        let mtt_b_n = self.ctxs.mtt_split_binary.len() - 1;
+        let mtt_binary = self
+            .dec
+            .decode_decision(&mut self.ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)])?;
         if mtt_binary == 1 {
             // Binary split.
             if mtt_vertical == 1 {
