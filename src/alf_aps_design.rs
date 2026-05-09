@@ -1138,8 +1138,8 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let noise = ((bits >> 56) & 0x1f) as i32 - 16;
-                let v = (src.luma.samples[y * src.luma.stride + x] as i32 + noise)
-                    .clamp(0, 255) as u8;
+                let v =
+                    (src.luma.samples[y * src.luma.stride + x] as i32 + noise).clamp(0, 255) as u8;
                 rec.luma.samples[y * rec.luma.stride + x] = v;
             }
         }
