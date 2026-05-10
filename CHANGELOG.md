@@ -4,6 +4,34 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-h266/compare/v0.0.5...v0.0.6) - 2026-05-09
+
+### Other
+
+- round 56 — MTT BT picker RDO (opt-in) + multi-row CU neighbour tracking
+- round 55: forced QT split for 128×128 CTBs + MTT BT/TT split syntax
+- round 54: wire round-53 helpers into encoder pipeline + SAO merge-flag CABAC emit
+- round 53: rustfmt fixup
+- round 53: alf_luma_clip_idx joint coeff/clip RDO + chroma SAO merge (opt-in)
+- round 52 — coding_tree() / coding_unit() syntax shells + per-CU cu_qp_delta emit
+- round 51 — explicit tu_*_coded_flag CABAC emit + chroma APS / CC-ALF APS RDO trade-off
+- round 50 — chroma SAO RDO + apply (Cb / Cr) + per-picture CABAC bin cost in the APS-vs-fixed RDO
+- round 49 — chroma residual emit (forward DCT + flat quant + CABAC for Cb / Cr)
+- round 48 — per-class luma ALF Wiener design + APS-vs-fixed picture-bits trade-off
+- round 47 — encoder ALF luma APS design + APS-signalled-set RDO
+- round 46 — ALF wired end-to-end through SPS, PH and per-CTU CABAC
+- round 45 — ALF per-CTU CABAC syntax emit/decode + ALF APS RBSP emit
+- round 44 — encoder primary chroma ALF on/off + alt-filter RDO
+- round 43 — CC-ALF integration into the IDR encoder pipeline
+- round 42 — encoder CC-ALF per-CTB filter-selection RDO
+- round 41 — encoder ALF filter-set RDO over all 16 fixed filter sets
+- round 40 — GPM (geometric partitioning) decoder + AMVR helpers + encoder ALF RDO
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop needless &src re-borrow at sao_decide_picture call
+- drop dead `linkme` dep
+- h266 r35: residual emit + SAO encoder + IDR pipeline (PSNR ≥ 30 dB)
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+
 ### Added
 
 - **Round 56 — MTT BT picker RDO (opt-in) + multi-row CU neighbour tracking for §9.3.4.2 ctxInc** — closes the two long-deferred encoder + decoder gaps from round 55: (a) the `encode_coding_tree_bt_split` syntax helper landed in r55 was unreachable from `encode_idr_with_residuals` (the picker stayed leaf-or-QT-only); (b) `TreeWalker.nbrs.left/above_avail` were hard-coded `false` regardless of CTU position, biasing every `split_cu_flag` / `split_qt_flag` / `mtt_split_*` ctxInc derivation. **#2 BT picker (opt-in via new `EncoderConfig::enable_mtt_bt_picker`)**: for every full 64×64 luma CU candidate the encoder now evaluates three options — `Leaf` (one 64×64 TB), `BT_VERT` (two 32×64 sub-CUs), `BT_HORZ` (two 64×32 sub-CUs) — and picks the lowest-cost option per `cost = SSE_Y + λ * bits` (`bits` includes the `split_cu_flag` / `split_qt_flag` / `mtt_split_*` syntax bins via a fresh `measure_cu_bits` pass plus the residual coefficient bins). The picker uses `prepare_luma_tb` / `prepare_chroma_tb` extended to take independent `n_tb_w` / `n_tb_h` (was square-only) so non-square TBs run through the existing `forward_dct_ii_2d` (already non-square-capable) + `quantize_tb_flat` (already non-square-capable when both dims are powers of two) pipeline. New `PreparedCu` enum (`Leaf` / `BtSplit { dir, cqt_depth, mtt_depth, sub_a, sub_b }`) replaces the per-CTU flat `Vec<PreparedLumaTb>` so the second-pass CABAC walk can recurse into BT splits via the new `emit_prepared_cu` helper which dispatches to `encode_coding_tree_bt_split` (round-55) for split CUs and `encode_coding_tree_leaf_iframe` for leaves. The picker's `region_sse_y` measures luma SSE inside the candidate region; restoring the chosen option's reconstruction (luma + Cb + Cr) is done from a snapshot taken before each trial. Default `enable_mtt_bt_picker = false` keeps the round-55 wire stream byte-for-byte. **#4 Multi-row CU neighbour tracking**: new `coding_tree::CuNeighbourMap` is a picture-wide grid of CU descriptors (`cb_w`, `cb_h`, `cqt_depth`) at 4-sample granularity. `TreeWalker::with_neighbour_map(map)` (and `with_neighbour_map_rebased(map, base_x, base_y)` for the per-CTU walker which operates in CTU-local coords) wires the map into the §9.3.4.2 ctxInc derivations: `ctx_inc_split_cu_flag` reads `(left_avail, above_avail, cb_height_left, cb_width_above)` from the map (was `(false, false, 0, 0)` round-55), `ctx_inc_split_qt_flag` reads `(cqt_depth_left, cqt_depth_above)`, and `ctx_inc_mtt_split_cu_vertical_flag` reads the same six fields. Each leaf CU's commit inserts its descriptor into the map so look-ups inside the same CTU see siblings emitted earlier in the walk; cross-CTU look-ups see the previous CTU's right-edge / bottom-edge CUs. The decoder side mirrors the encoder: `CtuWalker` carries a `CuNeighbourMap` populated as each CTU's `decode_ctu_partitions` runs through the rebased walker. Encoder pipeline mirrors via the same struct (named `CuStateMap` to keep encoder-only types out of the public `coding_tree` API surface) — `cu_map` is the read-only snapshot the current CTU sees, `cu_map_write` accumulates this CTU's writes, both committed at end-of-CTB so siblings inside the same CTB don't race the spec's neighbour-availability rules. New tests cover (a) `round56_default_config_matches_round55` — both flags off produces a byte-identical bitstream + reconstruction to `encode_idr_with_residuals`; (b) `round56_mtt_bt_picker_runs_and_clears_psnr_floor` — BT picker on a 64×64 gradient runs to completion + clears the round-55 30 dB luma floor; (c) `round56_mtt_bt_picker_improves_sse_on_horizontal_edge` — synthetic 128×128 frame with a horizontal edge at every 32-line midpoint sees the BT_HORZ split picked: SSE_Y goes from 1024 (leaf-only baseline) to 0 (BT picker on), PSNR_Y from 60.17 dB to ∞; (d) `round56_cu_state_map_round_trips_descriptor` — encoder map insert + lookup round-trips a 32×64 CU descriptor; (e) `round56_build_tree_neighbours_packs_descriptors` — picture-edge default + populated-neighbour cases pack the descriptor correctly; (f) `round56_neighbour_state_drives_split_cu_ctx_inc` — `ctx_inc_split_cu_flag` returns 6 for picture-edge defaults vs 8 when both neighbours are smaller, demonstrating the new ctxInc accuracy; (g) `round56_multi_ctb_neighbour_state_runs_to_completion` — 256×128 multi-CTB encoder pipeline run completes + clears 30 dB; (h) `cu_neighbour_map_round_trips_descriptor` — public `CuNeighbourMap::neighbour_state` packs the six-field tuple correctly; (i) `tree_walker_populates_neighbour_map_on_leaf` — `TreeWalker::with_neighbour_map` inserts each emitted leaf into the map; (j) `tree_walker_rebased_inserts_picture_absolute` — rebased variant adds `(base_x, base_y)` to inserts so per-CTU walkers populate the picture-absolute map correctly.
