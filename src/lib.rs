@@ -163,6 +163,7 @@ pub mod deblock;
 pub mod decoder;
 pub mod dequant;
 pub mod encoder;
+pub mod encoder_inter;
 pub mod encoder_pipeline;
 pub mod gpm;
 pub mod hrd;

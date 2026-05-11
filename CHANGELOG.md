@@ -6,6 +6,35 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 58 — inter-frame P-slice encoder + decoder scaffold
+  ([`encoder_inter::encode_p_slice`] / [`encoder_inter::decode_p_slice`]).
+  Single-reference DPB (one L0 picture), integer-pel full-search motion
+  estimation (`±N` SAD on 4×4 luma blocks per VVC §7.4.10 minimum-PU
+  size), spatial MVP picker (left → above → zero per §7.4.7.3),
+  per-block CABAC bin emit covering `cu_skip_flag` (§7.4.10),
+  `general_merge_flag` (§7.4.10), `inter_pred_idc` (PRED_L0,
+  bypass), `ref_idx_l0` (single ref → 0), `mvd_coding(mvd_x, mvd_y)`
+  (§7.4.7.2 / §9.3.3.7 — bypass `abs_zero_flag` + EG1 magnitude +
+  `mvd_sign_flag`), `tu_y_coded_flag` (§7.4.10), and luma residual
+  coefficients via the existing
+  `crate::residual_enc::encode_tb_coefficients`. A custom
+  `OXAV_VVC_PSLIC` magic-prefixed wire chunk encapsulates the
+  slice-header bit prelude (`slice_type` / `slice_pic_order_cnt_lsb`
+  per §7.4.4.2.2 / `num_ref_idx_l0_active_minus1` / `slice_qp_delta`)
+  + the per-block CABAC payload; `decode_p_slice` is the matching
+  in-crate decoder. Achieves PSNR_Y 78.23 dB on the 4-px horizontal
+  translation fixture; encoder + decoder roundtrip is bit-identical.
+  - Sub-pel / fractional MVs deferred to round 59.
+  - Bi-pred and B-slice plumbing deferred (PRED_L0 only).
+  - Multi-reference DPB deferred (one L0 picture only).
+  - Wire format is in-crate (not Annex B NAL); the full
+    `encode_idr_with_residuals_cfg` IDR pipeline does not yet thread
+    multi-frame DPB plumbing.
+  - 9 new tests in `encoder_inter::tests` + 4 integration tests in
+    `tests/round58_pslice_basic.rs` (translation PSNR ≥ 35 dB,
+    no-motion roundtrip, byte-identical encoder/decoder roundtrip,
+    synthetic moving-square 2-frame fixture).
+
 - Round 57 — MTT TT picker RDO (opt-in via `EncoderConfig::enable_mtt_tt_picker`),
   parallel to round 56's BT picker. For each 64×64 candidate CU the picker
   additionally evaluates `TT_VERT` (1:2:1 three-column 16×64 / 32×64 / 16×64

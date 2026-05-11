@@ -228,15 +228,31 @@ An IDR-frame encoder pipeline (`encode_idr_with_residuals_cfg`) builds an
 Annex-B bitstream with real coded residuals, deblock, SAO, ALF, CC-ALF, and
 optional opt-in tools. Round-56 added the MTT BT picker
 (`EncoderConfig::enable_mtt_bt_picker`) which evaluates `{leaf, BT_VERT,
-BT_HORZ}` on `cost = SSE_Y + λ·bits` for each 64×64 CU. **Round-57
-extends this with the MTT TT picker** (`EncoderConfig::enable_mtt_tt_picker`)
+BT_HORZ}` on `cost = SSE_Y + λ·bits` for each 64×64 CU. Round-57
+extended this with the MTT TT picker (`EncoderConfig::enable_mtt_tt_picker`)
 which adds `TT_VERT` (1:2:1 three-column split, 16×64 / 32×64 / 16×64) and
 `TT_HORZ` (1:2:1 three-row split, 64×16 / 64×32 / 64×16) per VVC §7.3.10.4 /
 §7.4.10.4. Both flags compose: with both on, the candidate set is
 `{leaf, BT_VERT, BT_HORZ, TT_VERT, TT_HORZ}`. On a 3-stripe vertical
 fixture with the 1:2:1 ratio at QP 32, the TT picker takes leaf-only
-SSE_Y from 2576 to 0 (perfect reconstruction). Inter-frame P-slice
-encoding remains a future round.
+SSE_Y from 2576 to 0 (perfect reconstruction).
+
+**Round-58 lands the inter-frame P-slice encoder + decoder scaffold**
+(`encoder_inter::encode_p_slice` / `encoder_inter::decode_p_slice`):
+single-reference DPB (one L0 picture), integer-pel full-search motion
+estimation (SAD on 4×4 luma blocks, the VVC §7.4.10 minimum-PU size),
+spatial MVP picker (left → above → zero per §7.4.7.3), per-block CABAC
+bin emit for `cu_skip_flag` / `general_merge_flag` / `inter_pred_idc` /
+`ref_idx_l0` / `mvd_coding(mvd_x, mvd_y)` (§7.4.7.2 + §9.3.3.7) /
+`tu_y_coded_flag`, and luma residual through the existing
+`crate::residual_enc::encode_tb_coefficients` chain. A custom
+`OXAV_VVC_PSLIC` magic-prefixed wire chunk wraps the slice-header bit
+prelude (`slice_type` / `slice_pic_order_cnt_lsb` per §7.4.4.2.2 +
+`num_ref_idx_l0_active_minus1` + `slice_qp_delta`) and the per-block
+CABAC payload. On a 4-px horizontal translation fixture the scaffold
+hits PSNR_Y 78.23 dB; encoder + decoder roundtrip byte-identical.
+Sub-pel MC, multi-ref DPB, B-slice and the full Annex-B NAL
+integration with the IDR pipeline are deferred to later rounds.
 
 ## Usage
 
