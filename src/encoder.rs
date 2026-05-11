@@ -290,6 +290,16 @@ pub struct EncoderConfig {
     /// emit; the recursive sub-CU bodies follow the same
     /// `transform_tree()` / `cu_qp_delta` path as leaf CUs.
     pub enable_mtt_bt_picker: bool,
+    /// Round-57 — opt-in: enable the multi-type-tree ternary-split (MTT
+    /// TT) picker. Parallel to [`Self::enable_mtt_bt_picker`]; the
+    /// picker additionally evaluates `TT_VERT` (1:2:1 three-column split)
+    /// and `TT_HORZ` (1:2:1 three-row split) per VVC §7.3.10.4 /
+    /// §7.4.10.4. The chosen option minimises `cost = SSE + λ·bits` over
+    /// the union `{leaf, BT_VERT, BT_HORZ, TT_VERT, TT_HORZ}` when both
+    /// flags are on; with only the TT flag the candidate set collapses
+    /// to `{leaf, TT_VERT, TT_HORZ}`. Default `false` preserves the
+    /// round-56 behaviour.
+    pub enable_mtt_tt_picker: bool,
 }
 
 impl EncoderConfig {
@@ -302,6 +312,7 @@ impl EncoderConfig {
             enable_alf_clip_rdo: false,
             enable_chroma_sao_merge: false,
             enable_mtt_bt_picker: false,
+            enable_mtt_tt_picker: false,
         }
     }
 

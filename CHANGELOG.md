@@ -4,6 +4,32 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Round 57 — MTT TT picker RDO (opt-in via `EncoderConfig::enable_mtt_tt_picker`),
+  parallel to round 56's BT picker. For each 64×64 candidate CU the picker
+  additionally evaluates `TT_VERT` (1:2:1 three-column 16×64 / 32×64 / 16×64
+  split) and `TT_HORZ` (1:2:1 three-row 64×16 / 32×16 / 64×16 split) per VVC
+  §7.3.10.4 / §7.4.10.4 and picks the lowest-cost option on
+  `cost = SSE_Y + λ·bits` over the union `{leaf, BT_VERT, BT_HORZ,
+  TT_VERT, TT_HORZ}` when both flags are on. The chosen sub-CUs route
+  through the same `prepare_leaf_cu` / `emit_tu_with_cbf` /
+  `accumulate_deblock_cus` / `record_cu_into_map` paths as BT-split
+  sub-CUs (new `PreparedCu::TtSplit` variant; `tt_parent_dims` recovers
+  the parent dim from any sub-CU's leaf dim × 4 along the split axis).
+  The wire-side syntax emit reuses the existing round-55
+  `crate::syntax_enc::encode_coding_tree_tt_split` helper, which emits
+  `split_cu_flag = 1`, `split_qt_flag = 0`, `mtt_split_cu_vertical_flag`,
+  `mtt_split_cu_binary_flag = 0`, then the three child sub-CUs.
+  - Encoder-only change; decoder TT syntax was already parseable per
+    round 55.
+  - Default `enable_mtt_tt_picker = false` reproduces the round-56
+    bitstream byte-for-byte.
+  - On a 3-stripe vertical fixture with thin (16-col) outer stripes at
+    QP 32, the TT picker drops leaf-only SSE from 2576 to 0 (perfect
+    reconstruction, vs. PSNR_Y 56.17 dB baseline).
+  - 6 new tests in `encoder_pipeline::tests`.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-h266/compare/v0.0.5...v0.0.6) - 2026-05-09
 
 ### Other

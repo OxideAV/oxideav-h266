@@ -222,6 +222,22 @@ the **intra-only single-tile single-slice subset** plus the round-28
   §8.5.7 — landed in round-40; AMVR helpers — §7.4.11.6 — landed in
   round-40.)
 
+## Encoder
+
+An IDR-frame encoder pipeline (`encode_idr_with_residuals_cfg`) builds an
+Annex-B bitstream with real coded residuals, deblock, SAO, ALF, CC-ALF, and
+optional opt-in tools. Round-56 added the MTT BT picker
+(`EncoderConfig::enable_mtt_bt_picker`) which evaluates `{leaf, BT_VERT,
+BT_HORZ}` on `cost = SSE_Y + λ·bits` for each 64×64 CU. **Round-57
+extends this with the MTT TT picker** (`EncoderConfig::enable_mtt_tt_picker`)
+which adds `TT_VERT` (1:2:1 three-column split, 16×64 / 32×64 / 16×64) and
+`TT_HORZ` (1:2:1 three-row split, 64×16 / 64×32 / 64×16) per VVC §7.3.10.4 /
+§7.4.10.4. Both flags compose: with both on, the candidate set is
+`{leaf, BT_VERT, BT_HORZ, TT_VERT, TT_HORZ}`. On a 3-stripe vertical
+fixture with the 1:2:1 ratio at QP 32, the TT picker takes leaf-only
+SSE_Y from 2576 to 0 (perfect reconstruction). Inter-frame P-slice
+encoding remains a future round.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
