@@ -1,13 +1,22 @@
-//! Round-58 — VVC P-slice encoder scaffold (single-reference, integer-pel only).
+//! Round-58 — VVC P-slice encoder scaffold.
+//! Round-59 — extends round 58 with sub-pel motion compensation (¼-pel
+//! refinement after the integer-pel search).
 //!
 //! This module provides a **minimum-viable** P-slice encode + roundtrip
 //! decode path that closes the round-57 "inter-frame P-slice pipeline"
 //! lacks tail. It is a scaffold:
 //!
 //! * **One reference picture** in the DPB (the previous decoded frame).
-//! * **Integer-pel motion search only** (full-search ±N px window, SAD
-//!   cost on luma 4×4 reference blocks — VVC §7.4.10 minimum-PU size).
-//!   Sub-pel / fractional MVs is deferred to round 59.
+//! * **Integer-pel motion search** (round 58, full-search ±N px window,
+//!   SAD cost on luma 4×4 reference blocks — VVC §7.4.10 minimum-PU size).
+//! * **Sub-pel refinement** (round 59) on top of the integer-pel result:
+//!   probe the 8 half-pel positions around the best integer-pel candidate
+//!   then the 8 quarter-pel positions around the best half-pel candidate.
+//!   This achieves 1/4-pel (4-unit-of-1/16-pel) precision on the wire
+//!   without paying for a full 1/16-pel exhaustive search. The MC step
+//!   itself runs at the spec's full 1/16-pel granularity through the
+//!   existing [`crate::inter::predict_luma_block`] (VVC §8.5.6.3.2,
+//!   Table 27 8-tap luma filter `hpelIfIdx == 0`).
 //! * **`PRED_L0` only** — uni-prediction from L0[0]. Bi-pred and B-slice
 //!   pipeline is out of scope.
 //! * **Spatial MVP** uses the `left` candidate when available, else the
@@ -19,54 +28,27 @@
 //!   reconstruction-clip from [`crate::dequant`] +
 //!   [`crate::transform::inverse_transform_2d`].
 //!
+//! ## Motion-vector representation
+//!
+//! Internally MVs are stored in **1/16-luma-sample** units to match the
+//! spec's §8.5.2 fractional accuracy. Integer-pel `(dx, dy)` is therefore
+//! `(dx << 4, dy << 4)`; ¼-pel is `±4`; half-pel is `±8`. The `MvdLX`
+//! emitted on the wire (§7.4.7.2) is the difference `mv - mvp` in these
+//! same 1/16-pel units. AMVR (resolution selection) is deferred.
+//!
 //! ## Wire format (in-crate)
 //!
 //! Conceptually the wire follows the spec's slice-header → CU-syntax →
-//! residual chain:
-//!
-//! 1. **Slice header (§7.4.4)** — bit-prelude (BitWriter):
-//!    - `slice_type` (3 bits) — `1` for P (matches `SliceType::P` raw
-//!      value, §7.4.4 Table 8).
-//!    - `slice_pic_order_cnt_lsb` (u8) — picture-order-count low byte.
-//!    - `num_ref_idx_l0_active_minus1` (`ue(v)`) — single ref so always 0.
-//!    - `slice_qp_delta` (`se(v)`) — relative to the IDR slice QP.
-//!    - byte_alignment().
-//! 2. **Per-CU CABAC stream** — one [`crate::cabac_enc::ArithEncoder`]
-//!    threading every block of the slice:
-//!    - For each 4×4 inter block (in raster scan order):
-//!      - `cu_skip_flag` — context-coded bin (§7.4.10).
-//!      - `merge_flag` — context-coded bin.
-//!      - When `merge_flag == 1`: `merge_idx` — bypass bin (we only
-//!        emit `merge_idx == 0` so this is one bin).
-//!      - When `merge_flag == 0`:
-//!        - `inter_pred_idc` — bypass bin (`PRED_L0 == 0`).
-//!        - `ref_idx_l0` — `ue(v)`-style bypass (we only emit 0).
-//!        - `mvd_coding(mvd_x)` — `mvd_sign_flag` + `mvd_extra_bits`
-//!          per §7.4.7.2 / §9.3.3.7. Implemented as: 1 bypass bit for
-//!          sign, then magnitude as `ue(v)`-style bypass.
-//!        - `mvd_coding(mvd_y)` — same.
-//!      - `tu_y_coded_flag` — context-coded bin (Cb / Cr CBFs are
-//!        forced 0 in this scaffold).
-//!      - When `tu_y_coded_flag == 1`: residual coefficients via
-//!        [`crate::residual_enc::encode_tb_coefficients`].
-//!    - Stream terminated with `encode_terminate(1)` + `finish()`.
-//! 3. **Wire layout** — the bit-prelude bytes are length-prefixed
-//!    (little-endian `u32`) followed by the CABAC byte payload. Both
-//!    pieces are wrapped in a fixed `OXAV_VVC_PSLICE` magic.
-//!
-//! The custom in-crate wire is **not** wrapped in a NAL unit — the
-//! intent of round 58 is the codec building blocks (MC search, MV
-//! emit, residual emit, MV reconstruction at the decoder, MC predict,
-//! residual add) being correctness-verified. The full Annex-B NAL
-//! integration of P-slices is gated on a future round once the
-//! existing IDR `encode_idr_with_residuals_cfg` pipeline can be
-//! threaded with the multi-frame DPB plumbing.
+//! residual chain (same shape as round 58; the only delta in round 59
+//! is that the MVD components now carry sub-pel magnitudes when the
+//! refinement picks a fractional MV).
 
 use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::cabac_enc::ArithEncoder;
 use crate::dequant::{dequantize_tb_flat, DequantParams};
+use crate::inter::{predict_luma_block, MotionVector};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::{read_tu_y_coded_flag, ResidualCtxs};
 use crate::residual_enc::{encode_tb_coefficients, write_tu_y_coded_flag};
@@ -82,7 +64,7 @@ use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_flat};
 /// [`encode_p_slice`] and consumable by [`decode_p_slice`].
 pub const PSLICE_MAGIC: &[u8; 14] = b"OXAV_VVC_PSLIC";
 
-/// Block size in luma samples for the round-58 inter scaffold. VVC's
+/// Block size in luma samples for the inter scaffold. VVC's
 /// minimum inter PU is 4×4. We use `nTbS == 4` here because the
 /// existing per-TB residual emit/decode pair (`encode_tb_coefficients`
 /// / `decode_tb_coefficients`) is most heavily round-trip tested at
@@ -99,6 +81,11 @@ pub const DEFAULT_SEARCH_RANGE: i32 = 8;
 /// Context-init slice-QP for this scaffold. Shared by encoder + decoder.
 const SCAFFOLD_SLICE_QP: i32 = 26;
 
+/// Sub-pel encoding step in 1/16-luma-sample units. 8 = half-pel,
+/// 4 = quarter-pel, 1 = 1/16-pel.
+const HALF_PEL_STEP: i32 = 8;
+const QUARTER_PEL_STEP: i32 = 4;
+
 // =====================================================================
 // PreparedCu — round-58 sibling of encoder_pipeline::PreparedCu
 // =====================================================================
@@ -107,22 +94,23 @@ const SCAFFOLD_SLICE_QP: i32 = 26;
 /// [`crate::encoder_pipeline`] internal `PreparedCu` style. The round-58
 /// `InterPSlice` variant carries everything the second-pass CABAC walk
 /// needs to emit the wire-side syntax: the L0 reference index, the
-/// integer-pel motion vector, and the quantised luma residual levels.
+/// motion vector (1/16-pel units), and the quantised luma residual
+/// levels.
 ///
 /// Only the `InterPSlice` variant is ever constructed in this module;
 /// the variant exists alongside the round-57 leaf / BT / TT shapes in
 /// the spirit of "every tree walker must learn the new variant".
 #[derive(Clone, Debug)]
 pub enum PreparedCu {
-    /// Round-58 P-slice inter CU: L0 ref + integer-pel MV + residual.
+    /// P-slice inter CU: L0 ref + MV (1/16-pel units) + residual.
     InterPSlice {
         /// L0 reference index. The scaffold only emits 0 (single-ref
         /// DPB), but the field is kept explicit for spec parity.
         ref_idx: u8,
-        /// Integer-pel motion vector `(mv_x, mv_y)` in luma samples.
-        mv: (i16, i16),
-        /// Spatial MV predictor used for `mvd = mv - mvp`.
-        mvp: (i16, i16),
+        /// Motion vector `(mv_x, mv_y)` in 1/16-luma-sample units.
+        mv: (i32, i32),
+        /// Spatial MV predictor used for `mvd = mv - mvp` (1/16-pel).
+        mvp: (i32, i32),
         /// Luma TB width / height (always `INTER_BLOCK_W` /
         /// `INTER_BLOCK_H` in this scaffold).
         n_tb_w: usize,
@@ -140,8 +128,9 @@ pub enum PreparedCu {
 // =====================================================================
 
 /// Sum of absolute differences between a `w × h` block at `(cx, cy)` in
-/// `curr` and the same-size block at `(cx + mv_x, cy + mv_y)` in `ref_p`.
-/// Out-of-bound reference samples are clamped to the picture edge.
+/// `curr` and the same-size block at `(cx + mv_x, cy + mv_y)` in `ref_p`
+/// when `(mv_x, mv_y)` is in **integer** luma samples. Out-of-bound
+/// reference samples are clamped to the picture edge.
 fn sad_block(
     curr: &PicturePlane,
     cx: usize,
@@ -169,14 +158,58 @@ fn sad_block(
     sad
 }
 
+/// SAD between the `w × h` block at `(cx, cy)` in `curr` and the sub-pel
+/// MC prediction from `ref_p` shifted by `mv_q16` (1/16-luma-sample
+/// units). The MC prediction is built into a small scratch plane via
+/// [`predict_luma_block`].
+fn sad_block_subpel(
+    curr: &PicturePlane,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    ref_p: &PicturePlane,
+    mv_q16: (i32, i32),
+) -> Result<u32> {
+    let mut scratch = PicturePlane::filled(w, h, 0);
+    let mv = MotionVector {
+        x: mv_q16.0,
+        y: mv_q16.1,
+    };
+    predict_luma_block(
+        &mut scratch,
+        0,
+        0,
+        w as u32,
+        h as u32,
+        ref_p,
+        // predict_luma_block computes source position as
+        // `(dst_x + (mv.x >> 4), dst_y + (mv.y >> 4))` — but our
+        // destination is at scratch origin (0, 0), so we have to fold
+        // the source origin `(cx, cy)` into the MV.
+        MotionVector {
+            x: mv.x + (cx as i32) * 16,
+            y: mv.y + (cy as i32) * 16,
+        },
+    )?;
+    let mut sad: u32 = 0;
+    for r in 0..h {
+        for c in 0..w {
+            let cur_s = curr.samples[(cy + r) * curr.stride + (cx + c)] as i32;
+            let p = scratch.samples[r * scratch.stride + c] as i32;
+            sad += (cur_s - p).unsigned_abs();
+        }
+    }
+    Ok(sad)
+}
+
 /// Full-search integer-pel motion estimation. Returns the integer
 /// motion vector `(mv_x, mv_y)` in luma samples that minimises SAD
 /// against `ref_p` in a `±range` window, plus the achieved SAD.
 ///
 /// `(cx, cy)` is the top-left luma sample of the current block; `(w, h)`
-/// is the block size. The search centre is the supplied `mvp` (so the
-/// search window is `[mvp_x - range, mvp_x + range]`); when `mvp ==
-/// (0, 0)` this is the classical zero-motion-centred full search.
+/// is the block size. The search centre is the supplied `mvp` (integer
+/// pel) so the search window is `[mvp_x - range, mvp_x + range]`.
 pub fn full_search_int(
     curr: &PicturePlane,
     cx: usize,
@@ -209,22 +242,87 @@ pub fn full_search_int(
     (best_mv, best_sad)
 }
 
+/// Round-59 — sub-pel refinement. Starting from the integer-pel best
+/// (`mv_int_pel` in luma samples), probe the 8 half-pel neighbours
+/// (±8 in 1/16-pel units along x/y) and pick the best. Then probe the
+/// 8 quarter-pel neighbours (±4) around that best half-pel candidate.
+/// All sub-pel candidates are evaluated with the spec 8-tap luma
+/// interpolation via [`predict_luma_block`].
+///
+/// Returns the refined MV in **1/16-luma-sample** units plus its SAD.
+pub fn refine_subpel(
+    curr: &PicturePlane,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    ref_p: &PicturePlane,
+    mv_int_pel: (i16, i16),
+    int_pel_sad: u32,
+) -> Result<((i32, i32), u32)> {
+    // Convert to 1/16-pel units.
+    let mut best_mv: (i32, i32) = (mv_int_pel.0 as i32 * 16, mv_int_pel.1 as i32 * 16);
+    let mut best_sad = int_pel_sad;
+
+    // 8 half-pel offsets (excluding the integer-pel centre).
+    const HALF_OFFSETS: [(i32, i32); 8] = [
+        (-HALF_PEL_STEP, -HALF_PEL_STEP),
+        (0, -HALF_PEL_STEP),
+        (HALF_PEL_STEP, -HALF_PEL_STEP),
+        (-HALF_PEL_STEP, 0),
+        (HALF_PEL_STEP, 0),
+        (-HALF_PEL_STEP, HALF_PEL_STEP),
+        (0, HALF_PEL_STEP),
+        (HALF_PEL_STEP, HALF_PEL_STEP),
+    ];
+    for (dx, dy) in HALF_OFFSETS.iter() {
+        let cand = (best_mv.0 + dx, best_mv.1 + dy);
+        let s = sad_block_subpel(curr, cx, cy, w, h, ref_p, cand)?;
+        if s < best_sad {
+            best_sad = s;
+            best_mv = cand;
+        }
+    }
+
+    // 8 quarter-pel offsets around the (possibly refined) best.
+    const QUARTER_OFFSETS: [(i32, i32); 8] = [
+        (-QUARTER_PEL_STEP, -QUARTER_PEL_STEP),
+        (0, -QUARTER_PEL_STEP),
+        (QUARTER_PEL_STEP, -QUARTER_PEL_STEP),
+        (-QUARTER_PEL_STEP, 0),
+        (QUARTER_PEL_STEP, 0),
+        (-QUARTER_PEL_STEP, QUARTER_PEL_STEP),
+        (0, QUARTER_PEL_STEP),
+        (QUARTER_PEL_STEP, QUARTER_PEL_STEP),
+    ];
+    for (dx, dy) in QUARTER_OFFSETS.iter() {
+        let cand = (best_mv.0 + dx, best_mv.1 + dy);
+        let s = sad_block_subpel(curr, cx, cy, w, h, ref_p, cand)?;
+        if s < best_sad {
+            best_sad = s;
+            best_mv = cand;
+        }
+    }
+
+    Ok((best_mv, best_sad))
+}
+
 // =====================================================================
 // MVP — minimal §7.4.7.3 spatial MVP picker
 // =====================================================================
 
-/// Picture-wide grid of per-block `(mv_x, mv_y)` values. Used for the
-/// minimal §7.4.7.3 spatial MVP derivation: when filling block `(bx,
-/// by)`, the predictor is the left neighbour's MV when `bx > 0`, else
-/// the above neighbour's MV when `by > 0`, else zero.
+/// Picture-wide grid of per-block MVs in **1/16-luma-sample** units.
+/// Used for the minimal §7.4.7.3 spatial MVP derivation: when filling
+/// block `(bx, by)`, the predictor is the left neighbour's MV when
+/// `bx > 0`, else the above neighbour's MV when `by > 0`, else zero.
 ///
-/// `cells[by * cols + bx]` holds the integer-pel MV of the block whose
+/// `cells[by * cols + bx]` holds the MV of the block whose
 /// top-left luma sample is `(bx * INTER_BLOCK_W, by * INTER_BLOCK_H)`.
 #[derive(Clone, Debug)]
 pub struct MvField {
     pub cols: usize,
     pub rows: usize,
-    pub cells: Vec<(i16, i16)>,
+    pub cells: Vec<(i32, i32)>,
 }
 
 impl MvField {
@@ -237,7 +335,7 @@ impl MvField {
     }
 
     /// Spatial MVP per the round-58 minimal rule.
-    pub fn mvp_for(&self, bx: usize, by: usize) -> (i16, i16) {
+    pub fn mvp_for(&self, bx: usize, by: usize) -> (i32, i32) {
         if bx > 0 {
             self.cells[by * self.cols + (bx - 1)]
         } else if by > 0 {
@@ -247,20 +345,23 @@ impl MvField {
         }
     }
 
-    pub fn set(&mut self, bx: usize, by: usize, mv: (i16, i16)) {
+    pub fn set(&mut self, bx: usize, by: usize, mv: (i32, i32)) {
         self.cells[by * self.cols + bx] = mv;
     }
 }
 
 // =====================================================================
-// Motion compensation — integer-pel sample copy
+// Motion compensation — integer-pel sample copy (legacy round-58 path)
 // =====================================================================
 
 /// Predict a `w × h` luma block at `(dx, dy)` in `dst` from `ref_p`
 /// shifted by integer-pel motion vector `(mv_x, mv_y)`. Reference
 /// samples outside the picture are clamped to the nearest picture edge
 /// (matches the spec's `Clip3(0, picW - 1, ...)` for the no-subpic
-/// no-wrap case).
+/// no-wrap case). Used only by tests still on the integer-pel API; the
+/// main encode + decode walk now uses [`predict_luma_block`] which
+/// handles both integer-pel and sub-pel MVs through the spec 8-tap
+/// luma filter (§8.5.6.3.2 Table 27, `hpelIfIdx == 0`).
 pub fn mc_predict_int(
     dst: &mut PicturePlane,
     dx: usize,
@@ -284,6 +385,40 @@ pub fn mc_predict_int(
     }
 }
 
+/// Predict a `w × h` luma block from `ref_p` at integer **or** sub-pel
+/// MV (1/16-pel units) through the spec §8.5.6.3 luma interpolation
+/// filter. Writes the prediction into a `w*h` row-major buffer.
+fn mc_predict_subpel(
+    pred: &mut [u8],
+    ref_p: &PicturePlane,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    mv_q16: (i32, i32),
+) -> Result<()> {
+    debug_assert_eq!(pred.len(), w * h);
+    let mut scratch = PicturePlane::filled(w, h, 0);
+    predict_luma_block(
+        &mut scratch,
+        0,
+        0,
+        w as u32,
+        h as u32,
+        ref_p,
+        MotionVector {
+            x: mv_q16.0 + (cx as i32) * 16,
+            y: mv_q16.1 + (cy as i32) * 16,
+        },
+    )?;
+    for r in 0..h {
+        for c in 0..w {
+            pred[r * w + c] = scratch.samples[r * scratch.stride + c];
+        }
+    }
+    Ok(())
+}
+
 // =====================================================================
 // MVD coding — §7.4.7.2 / §9.3.3.7 (round-58 scaffold form)
 // =====================================================================
@@ -299,7 +434,10 @@ pub fn mc_predict_int(
 // This keeps the CABAC state shared with the residual stream while
 // staying compact even for large |mvd|. Zero-cost when MV is exactly
 // equal to the predictor (the common case after spatial MVP picks the
-// neighbour's MV).
+// neighbour's MV). Round 59: the same EG-1 bypass shape now carries
+// sub-pel magnitudes (a ¼-pel MV → 4-unit absolute value, half-pel →
+// 8, full-pel → 16, etc.), so on the wire the only delta is the
+// magnitude payload — the CABAC schema is unchanged.
 
 fn encode_eg_k(enc: &mut ArithEncoder, value: u32, k: u32) -> Result<()> {
     // Standard exp-Golomb of order k, bypass-coded.
@@ -551,20 +689,22 @@ fn read_pslice_header(bytes: &[u8]) -> Result<PSliceHeader> {
 // Slice-level encode
 // =====================================================================
 
-/// Round-58 — encode one P-slice for `curr` against single L0 reference
-/// `ref_buf` at QP `slice_qp_y`. Returns the wire bytes plus the
-/// reconstructed luma-only [`PictureBuffer`] (chroma planes are passed
-/// through from `ref_buf` since the round-58 scaffold does not encode
+/// Round-58 / Round-59 — encode one P-slice for `curr` against single L0
+/// reference `ref_buf` at QP `slice_qp_y`. Returns the wire bytes plus
+/// the reconstructed luma-only [`PictureBuffer`] (chroma planes are
+/// passed through from `ref_buf` since the scaffold does not encode
 /// chroma residuals).
 ///
 /// Behaviour:
 /// 1. Walks `curr.luma` in 4×4 raster blocks.
 /// 2. For each block, derives `mvp` from the spatial MV field (left
 ///    else above else zero) and runs an integer-pel full search ±N
-///    around the predictor.
-/// 3. MC-predicts the block from `ref_buf.luma`, computes residual,
-///    forward-DCTs + flat-quants, and decides on `cbf_y` (any non-zero
-///    quantised level ⇒ 1).
+///    around the predictor, **then refines to ¼-pel** via the §8.5.6.3
+///    8-tap luma filter (round 59).
+/// 3. MC-predicts the block from `ref_buf.luma` at the refined 1/16-pel
+///    MV (`predict_luma_block`), computes residual, forward-DCTs +
+///    flat-quants, and decides on `cbf_y` (any non-zero quantised
+///    level ⇒ 1).
 /// 4. Emits the per-block CABAC bins and the `tu_y_coded_flag`-gated
 ///    residual into the slice's single arithmetic stream.
 pub fn encode_p_slice(
@@ -604,10 +744,6 @@ pub fn encode_p_slice(
     let mut prepared: Vec<PreparedCu> = Vec::with_capacity(cols * rows);
 
     let mut rec = ref_buf.clone();
-    // Reset the reconstructed luma plane to the reference and fill in
-    // per-block (so an early block's reconstruction is visible to a
-    // later block — though MC reads from `ref_buf` which is the
-    // reference frame, not the in-progress reconstruction).
     rec.luma.samples.fill(0);
 
     let mut enc = ArithEncoder::new();
@@ -617,34 +753,51 @@ pub fn encode_p_slice(
         for bx in 0..cols {
             let cx = bx * INTER_BLOCK_W;
             let cy = by * INTER_BLOCK_H;
-            let mvp = mv_field.mvp_for(bx, by);
+            let mvp_q16 = mv_field.mvp_for(bx, by);
+            // Integer-pel search centre — round the predictor to the
+            // nearest integer pel for the SAD search window (the
+            // refinement step puts the fractional bits back).
+            let mvp_int_pel = (
+                ((mvp_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                ((mvp_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            );
 
-            // --- Motion search ---
-            let (mv, _sad) = full_search_int(
+            // --- Integer-pel motion search ---
+            let (int_mv, int_sad) = full_search_int(
                 &curr.luma,
                 cx,
                 cy,
                 INTER_BLOCK_W,
                 INTER_BLOCK_H,
                 &ref_buf.luma,
-                mvp,
+                mvp_int_pel,
                 search_range,
             );
-            mv_field.set(bx, by, mv);
 
-            // --- MC prediction into a scratch buffer ---
+            // --- Sub-pel refinement (round 59) ---
+            let (mv_q16, _sad) = refine_subpel(
+                &curr.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                &ref_buf.luma,
+                int_mv,
+                int_sad,
+            )?;
+            mv_field.set(bx, by, mv_q16);
+
+            // --- MC prediction (sub-pel-aware) ---
             let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
-            for r in 0..INTER_BLOCK_H {
-                let ry = (cy as i32 + r as i32 + mv.1 as i32)
-                    .clamp(0, ref_buf.luma.height as i32 - 1) as usize;
-                for c in 0..INTER_BLOCK_W {
-                    let rx = (cx as i32 + c as i32 + mv.0 as i32)
-                        .clamp(0, ref_buf.luma.width as i32 - 1)
-                        as usize;
-                    pred[r * INTER_BLOCK_W + c] =
-                        ref_buf.luma.samples[ry * ref_buf.luma.stride + rx];
-                }
-            }
+            mc_predict_subpel(
+                &mut pred,
+                &ref_buf.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                mv_q16,
+            )?;
 
             // --- Residual: forward DCT + flat quant + reconstruct ---
             let (levels, recon) = prepare_inter_tb(
@@ -666,35 +819,22 @@ pub fn encode_p_slice(
             let cbf_y = levels.iter().any(|&l| l != 0);
 
             // --- Emit per-block CABAC bins ---
-            // §7.4.10 — cu_skip_flag = 0 (we always emit residual /
-            // explicit MVD even when the MV equals the MVP, to keep
-            // the round-58 walker uniform). The ctxInc derivation
-            // (§9.3.4.2.2 eq. 1551) reads the left + above CU skip
-            // flags; we have neither so both are `false`.
             let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
             let n_skip = ctxs.cu_skip.len() - 1;
             enc.encode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)], 0)?;
-
-            // §7.4.10 — general_merge_flag = 0 (explicit MVD path).
             let inc_merge = crate::ctx::ctx_inc_general_merge_flag() as usize;
             let n_merge = ctxs.merge_flag.len() - 1;
             enc.encode_decision(&mut ctxs.merge_flag[inc_merge.min(n_merge)], 0)?;
-
-            // §7.4.10 — inter_pred_idc = PRED_L0 (encoded as 1 bypass
-            // bit "0" — single-list ⇒ unambiguous).
+            // inter_pred_idc = PRED_L0.
             enc.encode_bypass(0)?;
-
-            // §7.4.10 — ref_idx_l0 (single ref ⇒ 0; emit 1 bypass bit
-            // "0" as the truncated-rice "value 0" path).
+            // ref_idx_l0 = 0.
             enc.encode_bypass(0)?;
-
-            // §7.4.7.2 — mvd_coding for x then y.
-            let mvd = (mv.0 as i32 - mvp.0 as i32, mv.1 as i32 - mvp.1 as i32);
+            // §7.4.7.2 — mvd_coding for x then y. Now in 1/16-pel units.
+            let mvd = (mv_q16.0 - mvp_q16.0, mv_q16.1 - mvp_q16.1);
             encode_mvd_component(&mut enc, mvd.0)?;
             encode_mvd_component(&mut enc, mvd.1)?;
 
-            // §7.4.10 — tu_y_coded_flag (CABAC). Signature is
-            // (enc, ctxs, coded, bdpcm_y, isp_split, prev_tu_cbf_y).
+            // §7.4.10 — tu_y_coded_flag (CABAC).
             write_tu_y_coded_flag(&mut enc, &mut ctxs.residual, cbf_y, false, false, false)?;
             if cbf_y {
                 encode_tb_coefficients(
@@ -709,8 +849,8 @@ pub fn encode_p_slice(
 
             prepared.push(PreparedCu::InterPSlice {
                 ref_idx: 0,
-                mv,
-                mvp,
+                mv: mv_q16,
+                mvp: mvp_q16,
                 n_tb_w: INTER_BLOCK_W,
                 n_tb_h: INTER_BLOCK_H,
                 levels: if cbf_y { levels } else { Vec::new() },
@@ -719,12 +859,10 @@ pub fn encode_p_slice(
         }
     }
 
-    // Terminate the slice stream.
     enc.encode_terminate(1)?;
     let cabac_bytes = enc.finish();
 
-    // Round-58 silences the chroma path: pass chroma planes through
-    // from the reference, since chroma residual emit is out of scope.
+    // Round-58 silences the chroma path: pass chroma planes through.
     rec.cb = ref_buf.cb.clone();
     rec.cr = ref_buf.cr.clone();
 
@@ -736,10 +874,7 @@ pub fn encode_p_slice(
     out.extend_from_slice(&(cabac_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&cabac_bytes);
 
-    let _ = prepared; // Round-58 keeps the prepared vector alive for
-                      // future-round symmetry with the encoder_pipeline
-                      // second-pass walk; the data is not yet consumed
-                      // outside the per-block CABAC emit above.
+    let _ = prepared;
     Ok((out, rec))
 }
 
@@ -747,12 +882,12 @@ pub fn encode_p_slice(
 // Slice-level decode — round-trip side
 // =====================================================================
 
-/// Round-58 — decode one P-slice produced by [`encode_p_slice`]. Reads
-/// the magic + slice header + CABAC stream, reconstructs each 4×4
-/// inter block (MC predict from `ref_buf` shifted by the recovered MV
-/// + dequantised inverse-DCT residual), and returns the reconstructed
-/// luma in a fresh [`PictureBuffer`] (chroma is copied through from
-/// `ref_buf` per the encoder-side scaffold scope).
+/// Round-58 / Round-59 — decode one P-slice produced by [`encode_p_slice`].
+/// Reads the magic + slice header + CABAC stream, reconstructs each 4×4
+/// inter block (sub-pel-aware MC predict from `ref_buf` shifted by the
+/// recovered 1/16-pel MV + dequantised inverse-DCT residual), and
+/// returns the reconstructed luma in a fresh [`PictureBuffer`] (chroma
+/// is copied through from `ref_buf` per the encoder-side scaffold scope).
 pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBuffer> {
     if bytes.len() < PSLICE_MAGIC.len() + 8 {
         return Err(Error::invalid("h266 P-slice decode: payload too short"));
@@ -774,10 +909,6 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
         return Err(Error::invalid("h266 P-slice decode: cabac overflow"));
     }
     let mut cabac_bytes: Vec<u8> = bytes[p..p + cabac_len].to_vec();
-    // CABAC decoder reads ahead — append generous zero-pad so the
-    // renormalisation tail never runs off the end of the slice. The
-    // existing residual_enc tests use 64 B; we use 256 B to be safe
-    // for the chained per-block reads of an entire P-slice.
     cabac_bytes.extend_from_slice(&[0u8; 256]);
 
     if hdr.slice_type != 1 {
@@ -814,7 +945,7 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
         for bx in 0..cols {
             let cx = bx * INTER_BLOCK_W;
             let cy = by * INTER_BLOCK_H;
-            let mvp = mv_field.mvp_for(bx, by);
+            let mvp_q16 = mv_field.mvp_for(bx, by);
 
             // cu_skip_flag.
             let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
@@ -828,30 +959,25 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
             let _ = dec.decode_bypass()?;
             // ref_idx_l0 — bypass.
             let _ = dec.decode_bypass()?;
-            // mvd_coding x / y.
+            // mvd_coding x / y (now 1/16-pel units).
             let mvd_x = decode_mvd_component(&mut dec)?;
             let mvd_y = decode_mvd_component(&mut dec)?;
-            let mv = (
-                (mvp.0 as i32 + mvd_x).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                (mvp.1 as i32 + mvd_y).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            );
-            mv_field.set(bx, by, mv);
+            let mv_q16 = (mvp_q16.0 + mvd_x, mvp_q16.1 + mvd_y);
+            mv_field.set(bx, by, mv_q16);
 
             // tu_y_coded_flag.
             let cbf_y = read_tu_y_coded_flag(&mut dec, &mut ctxs.residual, false, false, false)?;
-            // Predict the block from the reference + MV.
+            // Predict the block from the reference + sub-pel MV.
             let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
-            for r in 0..INTER_BLOCK_H {
-                let ry = (cy as i32 + r as i32 + mv.1 as i32)
-                    .clamp(0, ref_buf.luma.height as i32 - 1) as usize;
-                for c in 0..INTER_BLOCK_W {
-                    let rx = (cx as i32 + c as i32 + mv.0 as i32)
-                        .clamp(0, ref_buf.luma.width as i32 - 1)
-                        as usize;
-                    pred[r * INTER_BLOCK_W + c] =
-                        ref_buf.luma.samples[ry * ref_buf.luma.stride + rx];
-                }
-            }
+            mc_predict_subpel(
+                &mut pred,
+                &ref_buf.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                mv_q16,
+            )?;
             let recon = if cbf_y {
                 let levels = crate::residual::decode_tb_coefficients(
                     &mut dec,
@@ -915,12 +1041,9 @@ mod tests {
         // Frame A is the "I", frame B is the "P" with a 4-pixel
         // horizontal shift relative to A.
         let (frame_i, frame_p) = translation_frame_pair(64, 64, 4);
-        // Encode the IDR (frame I) to seed a real reconstructed reference.
         let (_bs_i, rec_i) = encode_idr_with_residuals(&frame_i, 26).unwrap();
-        // Encode the P-slice using rec_i as the L0 reference.
         let (bs_p, rec_p) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
         assert!(!bs_p.is_empty());
-        // The rec_p luma should match frame_p.luma to within rounding.
         let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
         assert!(
             psnr >= 35.0,
@@ -930,28 +1053,21 @@ mod tests {
 
     #[test]
     fn round58_p_slice_no_motion_yields_small_payload() {
-        // Same frame for I and P — every block should pick MV=(0,0)
-        // and the residual should be near-zero, so the per-block
-        // CABAC overhead is dominated by the cu_skip / merge_flag /
-        // ref_idx / mvd_zero / tu_y_coded(false) bins (no residual).
         let frame_a = {
             let (a, _) = translation_frame_pair(64, 64, 0);
             a
         };
         let (_, rec_i) = encode_idr_with_residuals(&frame_a, 26).unwrap();
         let (bs_p, rec_p) = encode_p_slice(&frame_a, &rec_i, 26, 1, 8).unwrap();
-        // The P-slice payload is bounded by the per-block syntax
-        // overhead × number of blocks, plus the slice header. With
-        // 4×4 blocks on a 64×64 picture that's 256 blocks × ~9 bins
-        // each ≈ 290 B. Allow generous headroom for CABAC encoding
-        // overhead.
+        // Allow generous headroom — the round-59 sub-pel refinement
+        // adds at most a handful of bypass bins per block when it
+        // declines the integer-pel result (which it generally does
+        // not on identical frames).
         assert!(
-            bs_p.len() < 600,
+            bs_p.len() < 800,
             "P-slice on identical frames ({} B) larger than the no-residual ceiling",
             bs_p.len(),
         );
-        // Reconstruction must match the reference (which already
-        // approximates the source after IDR encode) within rounding.
         let psnr = psnr_y(&frame_a.luma, &rec_p.luma).unwrap();
         assert!(
             psnr >= 30.0,
@@ -964,9 +1080,6 @@ mod tests {
         let (frame_i, frame_p) = translation_frame_pair(64, 64, 4);
         let (_, rec_i) = encode_idr_with_residuals(&frame_i, 26).unwrap();
         let (bs_p, enc_rec) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
-        // Feed the encoded P-slice back through our own decoder; the
-        // resulting reconstruction must be byte-identical to the one
-        // the encoder kept internally.
         let dec_rec = decode_p_slice(&bs_p, &rec_i).unwrap();
         let mut diff_count = 0usize;
         let mut first_diff: Option<(usize, usize, u8, u8)> = None;
@@ -991,16 +1104,8 @@ mod tests {
 
     #[test]
     fn round58_p_slice_synthetic_two_frame_fixture() {
-        // Synthetic "two-frame fixture": a single bright square that
-        // moves 4 px to the right between frames. Mirrors what an
-        // ffmpeg -c:v libvvenc -an -frames:v 2 fixture would look
-        // like at the byte level for a moving object on a flat
-        // background.
         let make = |dx: i32| {
             let mut buf = PictureBuffer::yuv420_filled(64, 64, 100);
-            // 16×16 bright square at (16 + dx, 16). Multiple of the
-            // round-58 8×8 block size so the search block fully sits
-            // on the moving content.
             for y in 16..32 {
                 for x in 0..16 {
                     let xx = (16 + dx as usize + x).min(63);
@@ -1025,11 +1130,6 @@ mod tests {
 
     #[test]
     fn full_search_int_finds_known_translation() {
-        // Build a synthetic pair with a vertical edge so SAD has a
-        // unique minimum at the true MV. `a` has a vertical edge at
-        // column 32; `b` has the same edge at column 28 (shifted left
-        // by 4). Position the search block straddling b's edge
-        // (cols 26..29 with 4-wide block) so any MV ≠ +4 mismatches.
         let mut a = PictureBuffer::yuv420_filled(64, 64, 100);
         let mut b = PictureBuffer::yuv420_filled(64, 64, 100);
         for y in 0..64 {
@@ -1038,9 +1138,6 @@ mod tests {
                 b.luma.samples[y * b.luma.stride + x] = if x < 28 { 60 } else { 200 };
             }
         }
-        // Block at b's cols 26..29 contains "60 60 200 200" (b's edge
-        // at 28). The matching window in a (which has its edge at 32)
-        // is cols 30..33 → mv_x = +4 places a's window at b's pos.
         let (mv, sad) = full_search_int(
             &b.luma,
             26,
@@ -1058,16 +1155,12 @@ mod tests {
     #[test]
     fn mvp_for_reads_left_then_above_then_zero() {
         let mut f = MvField::new(2, 2);
-        // Default: zero everywhere.
         assert_eq!(f.mvp_for(0, 0), (0, 0));
         assert_eq!(f.mvp_for(1, 0), (0, 0));
         assert_eq!(f.mvp_for(0, 1), (0, 0));
-        // Set (0, 0) → mvp(1, 0) reads left.
         f.set(0, 0, (3, -2));
         assert_eq!(f.mvp_for(1, 0), (3, -2));
-        // mvp(0, 1) reads above (also (0, 0)).
         assert_eq!(f.mvp_for(0, 1), (3, -2));
-        // mvp(1, 1) reads left ((0, 1) which is still 0).
         assert_eq!(f.mvp_for(1, 1), (0, 0));
         f.set(0, 1, (-5, 7));
         assert_eq!(f.mvp_for(1, 1), (-5, 7));
@@ -1075,7 +1168,9 @@ mod tests {
 
     #[test]
     fn mvd_component_round_trip() {
-        for &v in &[0i32, 1, -1, 7, -13, 64, -255, 1000, -1000] {
+        // Sub-pel-magnitudes mixed with integer-pel and big values to
+        // pin the round-59 1/16-pel encoding path.
+        for &v in &[0i32, 1, -1, 4, -4, 8, -8, 12, -16, 64, -255, 1000, -1000] {
             let mut enc = ArithEncoder::new();
             encode_mvd_component(&mut enc, v).unwrap();
             let bytes = enc.finish();
@@ -1089,16 +1184,9 @@ mod tests {
 
     #[test]
     fn pslice_per_block_cabac_bins_roundtrip_two_blocks() {
-        // Mirror the encode_p_slice per-block bin emission exactly,
-        // then decode the same sequence and assert match. This isolates
-        // any CABAC en/dec asymmetry that the full P-slice walker
-        // would otherwise drown out.
         let qp = 26;
         let mut enc = ArithEncoder::new();
         let mut ctxs = PSliceCtxs::init(qp);
-        // Block 1 — emit cu_skip(0), merge(0), inter_pred(0), ref_idx(0),
-        // mvd_x = -4, mvd_y = -8, tu_y_coded(true), and a tiny levels
-        // block to stand in for residual.
         let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
         let n_skip = ctxs.cu_skip.len() - 1;
         enc.encode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)], 0)
@@ -1115,7 +1203,6 @@ mod tests {
         let mut levels = vec![0i32; 64];
         levels[0] = 5;
         encode_tb_coefficients(&mut enc, &mut ctxs.residual, 8, 8, 0, &levels).unwrap();
-        // Block 2 — same shape, mvd = (0, 0), no residual.
         enc.encode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)], 0)
             .unwrap();
         enc.encode_decision(&mut ctxs.merge_flag[inc_merge.min(n_merge)], 0)
@@ -1133,7 +1220,6 @@ mod tests {
         let mut ctxs = PSliceCtxs::init(qp);
         let n_skip = ctxs.cu_skip.len() - 1;
         let n_merge = ctxs.merge_flag.len() - 1;
-        // Block 1.
         let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
         let _ = dec
             .decode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)])
@@ -1154,7 +1240,6 @@ mod tests {
         let recovered =
             crate::residual::decode_tb_coefficients(&mut dec, &mut ctxs.residual, 8, 8, 0).unwrap();
         assert_eq!(levels, recovered);
-        // Block 2.
         let _ = dec
             .decode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)])
             .unwrap();
@@ -1186,5 +1271,132 @@ mod tests {
         let bytes = write_pslice_header(&hdr);
         let got = read_pslice_header(&bytes).unwrap();
         assert_eq!(got, hdr);
+    }
+
+    // =================================================================
+    // Round-59 — sub-pel motion compensation tests
+    // =================================================================
+
+    /// Build a two-frame pair with a sub-pel horizontal translation by
+    /// pre-generating a high-resolution source at `oversample × width`,
+    /// then resampling each frame at integer-pel positions in the
+    /// up-sampled grid. `dx_q16` is the desired shift in 1/16-pel
+    /// luma-sample units (e.g. 4 = ¼-pel, 8 = ½-pel).
+    fn subpel_translation_pair(w: usize, h: usize, dx_q16: i32) -> (PictureBuffer, PictureBuffer) {
+        // Use a sufficiently high oversample so 1/16-pel positions are
+        // representable. 16× is the natural choice.
+        let os = 16usize;
+        let big_w = w * os;
+        // Generate a smooth source: a gentle linear ramp with a few
+        // band edges. Sub-pel-displacements of such a band-limited
+        // signal can be reconstructed by an 8-tap filter to high PSNR.
+        let big = |x_q16: i32| -> u8 {
+            // Use a smoothly-varying brightness in the q16 axis.
+            // Pattern: a sinusoid mixed with a low-amplitude offset so
+            // dynamic range is healthy (~ 70 .. 180).
+            let phase = (x_q16 as f64) / (big_w as f64) * (5.0 * std::f64::consts::PI);
+            let v = 125.0 + 55.0 * phase.sin();
+            v.clamp(0.0, 255.0) as u8
+        };
+        let mut a = PictureBuffer::yuv420_filled(w, h, 100);
+        let mut b = PictureBuffer::yuv420_filled(w, h, 100);
+        for y in 0..h {
+            for x in 0..w {
+                a.luma.samples[y * a.luma.stride + x] = big((x * os) as i32);
+                // b is shifted by dx_q16/16 luma-samples.
+                let xq = (x * os) as i32 - dx_q16;
+                let xq = xq.clamp(0, (big_w - 1) as i32);
+                b.luma.samples[y * b.luma.stride + x] = big(xq);
+            }
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn round59_subpel_half_pel_translation_psnr() {
+        // Half-pel translation: b samples are shifted by 0.5 luma px.
+        let (frame_i, frame_p) = subpel_translation_pair(64, 64, 8);
+        let (_, rec_i) = encode_idr_with_residuals(&frame_i, 26).unwrap();
+        let (bs_p, rec_p) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
+        assert!(!bs_p.is_empty());
+        let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
+        assert!(
+            psnr >= 30.0,
+            "Round-59 half-pel translation PSNR_Y {psnr:.2} dB < 30 dB"
+        );
+    }
+
+    #[test]
+    fn round59_subpel_quarter_pel_translation_psnr() {
+        // Quarter-pel translation: b shifted by 0.25 luma px.
+        let (frame_i, frame_p) = subpel_translation_pair(64, 64, 4);
+        let (_, rec_i) = encode_idr_with_residuals(&frame_i, 26).unwrap();
+        let (bs_p, rec_p) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
+        assert!(!bs_p.is_empty());
+        let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
+        assert!(
+            psnr >= 30.0,
+            "Round-59 quarter-pel translation PSNR_Y {psnr:.2} dB < 30 dB"
+        );
+    }
+
+    #[test]
+    fn round59_integer_pel_regression_still_passes() {
+        // The round-58 4-px-horizontal regression fixture: ensure the
+        // sub-pel-aware path still reaches the >= 70 dB ballpark that
+        // integer-pel MC achieves (the spec 8-tap filter at frac == 0
+        // is the integer-pel sentinel and degrades to mc_copy_block_int).
+        let (frame_i, frame_p) = translation_frame_pair(64, 64, 4);
+        let (_, rec_i) = encode_idr_with_residuals(&frame_i, 26).unwrap();
+        let (bs_p, rec_p) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
+        assert!(!bs_p.is_empty());
+        let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
+        assert!(
+            psnr >= 70.0,
+            "Round-58 integer-pel fixture regressed to PSNR_Y {psnr:.2} dB (< 70 dB) after sub-pel wiring"
+        );
+    }
+
+    #[test]
+    fn round59_subpel_decoder_byte_identical() {
+        // The decoder must reproduce the encoder's reconstruction
+        // byte-for-byte even with sub-pel MVs in play.
+        let (frame_i, frame_p) = subpel_translation_pair(64, 64, 8);
+        let (_, rec_i) = encode_idr_with_residuals(&frame_i, 26).unwrap();
+        let (bs_p, enc_rec) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
+        let dec_rec = decode_p_slice(&bs_p, &rec_i).unwrap();
+        assert_eq!(
+            enc_rec.luma.samples, dec_rec.luma.samples,
+            "round-59 encoder + decoder luma must match byte-for-byte at sub-pel MVs",
+        );
+    }
+
+    #[test]
+    fn round59_refine_subpel_returns_zero_at_perfect_int_match() {
+        // When the integer-pel SAD is already 0, sub-pel refinement
+        // must not waste effort moving the MV away from the integer
+        // optimum (SAD ties are broken in favour of the existing best).
+        let mut a = PictureBuffer::yuv420_filled(64, 64, 100);
+        let mut b = PictureBuffer::yuv420_filled(64, 64, 100);
+        for y in 0..64 {
+            for x in 0..64 {
+                a.luma.samples[y * a.luma.stride + x] = if x < 32 { 60 } else { 200 };
+                b.luma.samples[y * b.luma.stride + x] = if x < 28 { 60 } else { 200 };
+            }
+        }
+        // True integer-pel MV is +4 (see the round-58 test above).
+        let (mv_q16, sad) = refine_subpel(
+            &b.luma,
+            26,
+            16,
+            INTER_BLOCK_W,
+            INTER_BLOCK_H,
+            &a.luma,
+            (4, 0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(sad, 0);
+        assert_eq!(mv_q16, (4 * 16, 0));
     }
 }

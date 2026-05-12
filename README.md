@@ -251,8 +251,20 @@ prelude (`slice_type` / `slice_pic_order_cnt_lsb` per §7.4.4.2.2 +
 `num_ref_idx_l0_active_minus1` + `slice_qp_delta`) and the per-block
 CABAC payload. On a 4-px horizontal translation fixture the scaffold
 hits PSNR_Y 78.23 dB; encoder + decoder roundtrip byte-identical.
-Sub-pel MC, multi-ref DPB, B-slice and the full Annex-B NAL
-integration with the IDR pipeline are deferred to later rounds.
+
+**Round-59 extends the P-slice path with sub-pel motion compensation.**
+The integer-pel SAD full search is now followed by a two-stage refinement:
+8 half-pel offsets (±8 in 1/16-pel units) around the integer-pel best,
+then 8 quarter-pel offsets (±4) around the half-pel best. All sub-pel
+candidates are evaluated through the spec §8.5.6.3.2 Table 27 8-tap
+luma interpolation filter (`hpelIfIdx == 0`) via the existing
+`crate::inter::predict_luma_block`. The on-wire `MvdLX` magnitudes now
+carry 1/16-luma-sample units; the CABAC schema is unchanged. On a
+band-limited oversampled fixture, ½-pel reconstructs to PSNR_Y 51.6 dB
+and ¼-pel to 52.4 dB; the round-58 4-px integer-pel fixture holds at
+78.23 dB. AMVR, `hpelIfIdx` filter selection, the full 1/16-pel
+exhaustive search, chroma sub-pel MC, multi-ref DPB, B-slice, and the
+Annex-B NAL integration with the IDR pipeline remain deferred.
 
 ## Usage
 

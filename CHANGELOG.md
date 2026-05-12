@@ -6,6 +6,35 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 59 — sub-pel motion compensation for the P-slice
+  encoder + decoder (`encoder_inter::encode_p_slice` /
+  `encoder_inter::decode_p_slice`). The integer-pel SAD full search
+  from round 58 is now followed by a two-stage refinement:
+  8 half-pel offsets around the integer-pel best, then 8 quarter-pel
+  offsets around the half-pel best. All sub-pel candidates are
+  evaluated through the spec §8.5.6.3.2 Table 27 8-tap luma
+  interpolation filter (`hpelIfIdx == 0`) via the existing
+  `crate::inter::predict_luma_block`. The on-wire `MvdLX` magnitudes
+  per §7.4.7.2 / §9.3.3.7 now carry 1/16-luma-sample units (¼-pel
+  ⇒ |mvd|=4, half-pel ⇒ 8, full-pel ⇒ 16); the CABAC schema is
+  unchanged (bypass `abs_zero_flag` + EG1 magnitude + sign). The
+  decoder reproduces the encoder's reconstruction byte-for-byte
+  even at fractional MVs. On the round-58 4-px integer-pel
+  translation fixture, PSNR_Y holds at 78.23 dB (no regression);
+  on a band-limited oversampled fixture, ½-pel reconstructs to
+  51.6 dB and ¼-pel to 52.4 dB. AMVR, `hpelIfIdx` selection, the
+  full 1/16-pel exhaustive search, and chroma sub-pel MC are
+  deferred to later rounds (chroma stays pass-through from the
+  reference per the round-58 scaffold).
+  - 6 new tests in `encoder_inter::tests` (half-pel +
+    quarter-pel PSNR floors, integer-pel regression, byte-identical
+    decoder roundtrip at sub-pel MVs, sub-pel refinement returns
+    integer optimum when SAD already 0, MVD round-trip sub-pel
+    magnitudes).
+  - 4 new integration tests in `tests/round59_subpel_basic.rs`
+    (half-pel ≥ 30 dB, quarter-pel ≥ 30 dB, integer-pel
+    regression ≥ 70 dB, sub-pel decoder byte-identical).
+
 - Round 58 — inter-frame P-slice encoder + decoder scaffold
   ([`encoder_inter::encode_p_slice`] / [`encoder_inter::decode_p_slice`]).
   Single-reference DPB (one L0 picture), integer-pel full-search motion
