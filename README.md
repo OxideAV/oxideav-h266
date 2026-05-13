@@ -280,9 +280,23 @@ deferred). Slice header carries `slice_type == B` plus both
 4-px translation fixture with `ref_l0 == ref_l1` the B-slice
 degenerates to P-slice quality (PSNR_Y 78.23 dB); on a
 split-translation fixture the RDO matches the corresponding P-slice
-at 54.15 dB. Multi-reference DPB (more than one picture per list),
-sub-pel ME on the B-slice path (deferred to round 61), and weighted
-bi-pred remain deferred.
+at 54.15 dB.
+
+**Round-61 extends the B-slice path with sub-pel motion estimation.**
+After the integer-pel SAD search, each list (L0 and L1) now goes
+through the same two-stage refinement that round 59 added to the
+P-slice path: 8 half-pel neighbours probed through the §8.5.6.3.2
+Table 27 8-tap luma filter (`hpelIfIdx == 0`), then 8 quarter-pel
+neighbours around the best half-pel candidate. The RDO over `{L0,
+L1, BI}` runs with each list's MV at 1/16-pel precision; bi-pred
+reconstruction is still the §8.5.6.4 simple average. On a half-pel
+B-slice translation fixture with matched references PSNR_Y reaches
+51.57 dB; quarter-pel reaches 52.39 dB; a split-translation BI
+fixture (L0=+2 px / L1=-2 px with the current frame mid-way)
+reconstructs essentially exactly. The round-60 integer-pel 4-px
+fixture holds at 78.23 dB. Multi-reference DPB (more than one
+picture per list), chroma sub-pel MC, and weighted bi-pred remain
+deferred.
 
 ## Usage
 

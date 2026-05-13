@@ -6,6 +6,39 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 61 — sub-pel motion estimation on the B-slice
+  (bi-prediction) encoder + decoder
+  (`encoder_inter::encode_b_slice` / `encoder_inter::decode_b_slice`).
+  Round 60 added the B-slice scaffold with integer-pel ME only. Round
+  61 extends each per-list ME with the same two-stage refinement
+  round 59 added to the P-slice path: after the integer-pel SAD full
+  search, probe 8 half-pel neighbours through the §8.5.6.3.2 Table 27
+  8-tap luma filter (`hpelIfIdx == 0`) via `predict_luma_block`, then
+  8 quarter-pel neighbours around the best half-pel candidate. Both
+  L0 and L1 lists are refined independently; the RDO over
+  `{L0-only, L1-only, BI}` then runs with each list's MV at
+  1/16-pel precision. Bi-pred reconstruction is still the §8.5.6.4
+  simple average `pred = (predL0 + predL1 + 1) >> 1` (weighted
+  bi-pred remains deferred). The decoder is unchanged on the wire
+  side — `mc_predict_subpel` is the single per-list MC path and
+  already handles sub-pel MVs. Multi-reference DPB (more than one
+  picture per list), chroma sub-pel MC, and weighted bi-pred remain
+  deferred.
+  - On a half-pel B-slice translation fixture with matched
+    references (`ref_l0 == ref_l1` so BI degenerates to uni-pred)
+    PSNR_Y reaches 51.57 dB (matching the round-59 P-slice
+    half-pel ceiling). On a ¼-pel B-slice translation fixture
+    PSNR_Y reaches 52.39 dB. On a split-translation fixture
+    (L0=+2 px / L1=-2 px with the current frame mid-way) the RDO
+    picks BI and reconstructs the current frame essentially exactly
+    (PSNR_Y = inf). The round-60 4-px integer-pel B-slice fixture
+    still hits 78.23 dB (no regression).
+  - 5 new integration tests in `tests/round61_bslice_subpel.rs`
+    (half-pel B ≥ 50 dB, quarter-pel B ≥ 48 dB, BI-split-translation
+    ≥ 50 dB with byte-identical decode roundtrip, integer-pel
+    B-slice regression ≥ 70 dB, sub-pel B-slice decoder
+    byte-identical).
+
 - Round 60 — B-slice (bi-prediction) encoder + decoder scaffold
   (`encoder_inter::encode_b_slice` / `encoder_inter::decode_b_slice`).
   The B-slice path mirrors the round 58 / 59 P-slice path but threads

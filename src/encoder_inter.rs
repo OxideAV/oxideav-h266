@@ -1053,7 +1053,7 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
 }
 
 // =====================================================================
-// Round-60 — B-slice (bi-prediction) encoder + decoder scaffold
+// Round-60 / Round-61 — B-slice (bi-prediction) encoder + decoder
 // =====================================================================
 //
 // The B-slice path mirrors the P-slice path but threads TWO reference
@@ -1061,9 +1061,12 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
 //
 //   1. Run integer-pel full-search SAD against L0[0] and L1[0]
 //      independently (each produces its own integer-pel MV).
-//   2. For each list, sub-pel-refine (½-pel deferred to keep the
-//      scaffold's compile budget; the integer-pel optimum is
-//      sufficient to validate the §7.4.7.2 syntax + §8.5.6.4 average).
+//   2. For each list, run a two-stage sub-pel refinement (round 61):
+//      8 half-pel neighbours around the integer-pel best, then
+//      8 quarter-pel neighbours around the half-pel best, each
+//      probed with the §8.5.6.3.2 Table 27 8-tap luma filter
+//      (`hpelIfIdx == 0`) via `predict_luma_block`. This produces
+//      a 1/16-pel MV per list.
 //   3. Form three candidate predictions: L0-only, L1-only, and BI
 //      (`(predL0 + predL1 + 1) >> 1` per §8.5.6.4 — simple average,
 //      weighted bi-pred is out of scope).
@@ -1188,11 +1191,18 @@ fn average_bi(p0: &[u8], p1: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// Round-60 — encode one B-slice for `curr` against L0 + L1 reference
-/// pictures `ref_l0` / `ref_l1` at QP `slice_qp_y`. Returns the wire
-/// bytes plus the reconstructed luma-only [`PictureBuffer`]. Chroma is
-/// passed through from `ref_l0` (the scaffold does not encode chroma
-/// residuals).
+/// Round-60 / Round-61 — encode one B-slice for `curr` against L0 + L1
+/// reference pictures `ref_l0` / `ref_l1` at QP `slice_qp_y`. Returns
+/// the wire bytes plus the reconstructed luma-only [`PictureBuffer`].
+/// Chroma is passed through from `ref_l0` (the scaffold does not
+/// encode chroma residuals).
+///
+/// Round 61 adds per-list sub-pel ME refinement: integer-pel full
+/// search then 8-neighbour ½-pel + 8-neighbour ¼-pel refinement, each
+/// stage using the §8.5.6.3.2 Table 27 8-tap luma filter. The RDO over
+/// `{L0, L1, BI}` runs after both lists have settled at 1/16-pel
+/// precision; BI reconstruction is the §8.5.6.4 simple average
+/// `(predL0 + predL1 + 1) >> 1`.
 pub fn encode_b_slice(
     curr: &PictureBuffer,
     ref_l0: &PictureBuffer,
@@ -1247,13 +1257,20 @@ pub fn encode_b_slice(
             let cx = bx * INTER_BLOCK_W;
             let cy = by * INTER_BLOCK_H;
 
-            // ----- L0 list: MVP + integer-pel search -----
+            // ----- L0 list: MVP + integer-pel search + sub-pel refine -----
+            // Round 61: each list now gets the same two-stage sub-pel
+            // refinement (½-pel then ¼-pel) that round 59 added to the
+            // P-slice path. Both stages reuse the §8.5.6.3.2 Table 27
+            // 8-tap luma filter via `predict_luma_block`. The on-wire
+            // MVDs end up in 1/16-pel units (¼-pel ⇒ |mvd| = 4, ½-pel
+            // ⇒ 8, full-pel ⇒ 16), which the round-58 EG1 magnitude
+            // schema already handles unchanged.
             let mvp_l0_q16 = mv_field_l0.mvp_for(bx, by);
             let mvp_l0_int = (
                 ((mvp_l0_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 ((mvp_l0_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             );
-            let (int_mv_l0, _sad_l0) = full_search_int(
+            let (int_mv_l0, int_sad_l0) = full_search_int(
                 &curr.luma,
                 cx,
                 cy,
@@ -1263,15 +1280,24 @@ pub fn encode_b_slice(
                 mvp_l0_int,
                 search_range,
             );
-            let mv_l0_q16 = (int_mv_l0.0 as i32 * 16, int_mv_l0.1 as i32 * 16);
+            let (mv_l0_q16, _sad_l0) = refine_subpel(
+                &curr.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                &ref_l0.luma,
+                int_mv_l0,
+                int_sad_l0,
+            )?;
 
-            // ----- L1 list: MVP + integer-pel search -----
+            // ----- L1 list: MVP + integer-pel search + sub-pel refine -----
             let mvp_l1_q16 = mv_field_l1.mvp_for(bx, by);
             let mvp_l1_int = (
                 ((mvp_l1_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 ((mvp_l1_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             );
-            let (int_mv_l1, _sad_l1) = full_search_int(
+            let (int_mv_l1, int_sad_l1) = full_search_int(
                 &curr.luma,
                 cx,
                 cy,
@@ -1281,7 +1307,16 @@ pub fn encode_b_slice(
                 mvp_l1_int,
                 search_range,
             );
-            let mv_l1_q16 = (int_mv_l1.0 as i32 * 16, int_mv_l1.1 as i32 * 16);
+            let (mv_l1_q16, _sad_l1) = refine_subpel(
+                &curr.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                &ref_l1.luma,
+                int_mv_l1,
+                int_sad_l1,
+            )?;
 
             // ----- Form three candidate predictions -----
             let mut pred_l0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
@@ -1431,7 +1466,10 @@ pub fn encode_b_slice(
     Ok((out, rec))
 }
 
-/// Round-60 — decode one B-slice produced by [`encode_b_slice`].
+/// Round-60 / Round-61 — decode one B-slice produced by
+/// [`encode_b_slice`]. Sub-pel MVs are handled transparently because
+/// the per-list MC prediction goes through the same `mc_predict_subpel`
+/// helper used by the P-slice decoder.
 pub fn decode_b_slice(
     bytes: &[u8],
     ref_l0: &PictureBuffer,
