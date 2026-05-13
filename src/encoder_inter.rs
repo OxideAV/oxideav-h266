@@ -64,6 +64,10 @@ use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_flat};
 /// [`encode_p_slice`] and consumable by [`decode_p_slice`].
 pub const PSLICE_MAGIC: &[u8; 14] = b"OXAV_VVC_PSLIC";
 
+/// Magic prefix identifying an in-crate VVC B-slice payload built by
+/// [`encode_b_slice`] and consumable by [`decode_b_slice`].
+pub const BSLICE_MAGIC: &[u8; 14] = b"OXAV_VVC_BSLIC";
+
 /// Block size in luma samples for the inter scaffold. VVC's
 /// minimum inter PU is 4×4. We use `nTbS == 4` here because the
 /// existing per-TB residual emit/decode pair (`encode_tb_coefficients`
@@ -121,6 +125,43 @@ pub enum PreparedCu {
         /// Whether this CU has a non-zero luma CBF on the wire.
         cbf_y: bool,
     },
+    /// Round-60 — B-slice inter CU. Carries `inter_pred_idc` selecting
+    /// uni-pred L0 / uni-pred L1 / bi-pred plus per-list MVs and the
+    /// luma residual. Per-list MV / MVP are stored in 1/16-pel units.
+    InterBSlice {
+        /// `inter_pred_idc` per §7.4.7.2 (PRED_L0 / PRED_L1 / PRED_BI).
+        inter_pred_idc: InterPredIdc,
+        /// L0 reference index — 0 in the single-pic-per-list scaffold.
+        ref_idx_l0: u8,
+        /// L1 reference index — 0 in the single-pic-per-list scaffold.
+        ref_idx_l1: u8,
+        /// L0 motion vector (1/16-pel). Inferred zero when not active.
+        mv_l0: (i32, i32),
+        /// L1 motion vector (1/16-pel). Inferred zero when not active.
+        mv_l1: (i32, i32),
+        /// L0 spatial MV predictor (1/16-pel).
+        mvp_l0: (i32, i32),
+        /// L1 spatial MV predictor (1/16-pel).
+        mvp_l1: (i32, i32),
+        /// Luma TB width / height.
+        n_tb_w: usize,
+        n_tb_h: usize,
+        /// Quantised luma residual levels; empty when `cbf_y == 0`.
+        levels: Vec<i32>,
+        /// `cbf_y`.
+        cbf_y: bool,
+    },
+}
+
+/// `inter_pred_idc` per VVC §7.4.7.2 — bi-prediction selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterPredIdc {
+    /// Uni-pred from L0 (`inter_pred_idc == PRED_L0`).
+    L0 = 0,
+    /// Uni-pred from L1 (`inter_pred_idc == PRED_L1`).
+    L1 = 1,
+    /// Bi-pred — both L0 and L1 active (`inter_pred_idc == PRED_BI`).
+    Bi = 2,
 }
 
 // =====================================================================
@@ -1012,6 +1053,573 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
 }
 
 // =====================================================================
+// Round-60 — B-slice (bi-prediction) encoder + decoder scaffold
+// =====================================================================
+//
+// The B-slice path mirrors the P-slice path but threads TWO reference
+// lists (L0 + L1). For each 4×4 luma block:
+//
+//   1. Run integer-pel full-search SAD against L0[0] and L1[0]
+//      independently (each produces its own integer-pel MV).
+//   2. For each list, sub-pel-refine (½-pel deferred to keep the
+//      scaffold's compile budget; the integer-pel optimum is
+//      sufficient to validate the §7.4.7.2 syntax + §8.5.6.4 average).
+//   3. Form three candidate predictions: L0-only, L1-only, and BI
+//      (`(predL0 + predL1 + 1) >> 1` per §8.5.6.4 — simple average,
+//      weighted bi-pred is out of scope).
+//   4. Pick the cheapest of {L0, L1, BI} by SSE (Lagrangian SSE + λ·R
+//      with the per-mode "bits" approximated as a small fixed cost so
+//      ties favour uni-pred). This is the encoder-side RDO.
+//   5. Emit the chosen `inter_pred_idc` + per-list MVDs + residual.
+//
+// The decoder reverses the process: read `inter_pred_idc`, read each
+// list's MVD chain, reconstruct each MV from the per-list MVP, MC-predict
+// from `ref_l0` and/or `ref_l1`, average for BI, add residual.
+//
+// Multi-reference is implicit: L0 and L1 are TWO references. For this
+// round, both lists hold a SINGLE picture — enough to validate the
+// §7.4.7.2 / §8.5.6.4 syntax + reconstruction. Real multi-ref-per-list
+// DPB plumbing comes later.
+
+/// `inter_pred_idc` wire encoding — bypass-coded as two bins:
+///   bit 0: 0 → uni-pred, 1 → bi-pred.
+///   bit 1 (uni-pred only): 0 → L0, 1 → L1.
+fn encode_inter_pred_idc(enc: &mut ArithEncoder, idc: InterPredIdc) -> Result<()> {
+    match idc {
+        InterPredIdc::L0 => {
+            enc.encode_bypass(0)?;
+            enc.encode_bypass(0)?;
+        }
+        InterPredIdc::L1 => {
+            enc.encode_bypass(0)?;
+            enc.encode_bypass(1)?;
+        }
+        InterPredIdc::Bi => {
+            enc.encode_bypass(1)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_inter_pred_idc(dec: &mut ArithDecoder<'_>) -> Result<InterPredIdc> {
+    let bi = dec.decode_bypass()?;
+    if bi == 1 {
+        return Ok(InterPredIdc::Bi);
+    }
+    let which = dec.decode_bypass()?;
+    if which == 0 {
+        Ok(InterPredIdc::L0)
+    } else {
+        Ok(InterPredIdc::L1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BSliceHeader {
+    /// `slice_type` per §7.4.4 Table 8 — `0` for B.
+    pub slice_type: u8,
+    pub poc_lsb: u8,
+    /// `num_ref_idx_l0_active_minus1` — single ref ⇒ 0.
+    pub num_ref_idx_l0_active_minus1: u32,
+    /// `num_ref_idx_l1_active_minus1` — single ref ⇒ 0.
+    pub num_ref_idx_l1_active_minus1: u32,
+    pub slice_qp_delta: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn write_bslice_header(hdr: &BSliceHeader) -> Vec<u8> {
+    use crate::encoder::BitWriter;
+    let mut bw = BitWriter::new();
+    bw.write_bits(hdr.slice_type as u32, 3);
+    bw.write_bits(hdr.poc_lsb as u32, 8);
+    bw.write_ue(hdr.num_ref_idx_l0_active_minus1);
+    bw.write_ue(hdr.num_ref_idx_l1_active_minus1);
+    bw.write_se(hdr.slice_qp_delta);
+    bw.write_bits(hdr.width, 16);
+    bw.write_bits(hdr.height, 16);
+    bw.byte_alignment();
+    bw.into_bytes()
+}
+
+fn read_bslice_header(bytes: &[u8]) -> Result<BSliceHeader> {
+    use crate::bitreader::BitReader;
+    let mut br = BitReader::new(bytes);
+    let slice_type = br.u(3)? as u8;
+    let poc_lsb = br.u(8)? as u8;
+    let num_ref_idx_l0_active_minus1 = br.ue()?;
+    let num_ref_idx_l1_active_minus1 = br.ue()?;
+    let slice_qp_delta = br.se()?;
+    let width = br.u(16)?;
+    let height = br.u(16)?;
+    Ok(BSliceHeader {
+        slice_type,
+        poc_lsb,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+        slice_qp_delta,
+        width,
+        height,
+    })
+}
+
+/// Per-block SSE between the source luma and a candidate prediction.
+fn sse_block(src: &PicturePlane, cx: usize, cy: usize, pred: &[u8], w: usize, h: usize) -> u32 {
+    let mut sse: u32 = 0;
+    for r in 0..h {
+        for c in 0..w {
+            let s = src.samples[(cy + r) * src.stride + (cx + c)] as i32;
+            let p = pred[r * w + c] as i32;
+            let d = s - p;
+            sse = sse.saturating_add((d * d) as u32);
+        }
+    }
+    sse
+}
+
+/// Average two predictions per §8.5.6.4 — `(p0 + p1 + 1) >> 1`.
+fn average_bi(p0: &[u8], p1: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    for i in 0..w * h {
+        let a = p0[i] as u16;
+        let b = p1[i] as u16;
+        out[i] = ((a + b + 1) >> 1) as u8;
+    }
+    out
+}
+
+/// Round-60 — encode one B-slice for `curr` against L0 + L1 reference
+/// pictures `ref_l0` / `ref_l1` at QP `slice_qp_y`. Returns the wire
+/// bytes plus the reconstructed luma-only [`PictureBuffer`]. Chroma is
+/// passed through from `ref_l0` (the scaffold does not encode chroma
+/// residuals).
+pub fn encode_b_slice(
+    curr: &PictureBuffer,
+    ref_l0: &PictureBuffer,
+    ref_l1: &PictureBuffer,
+    slice_qp_y: i32,
+    poc_lsb: u8,
+    search_range: i32,
+) -> Result<(Vec<u8>, PictureBuffer)> {
+    let w = curr.luma.width;
+    let h = curr.luma.height;
+    if w != ref_l0.luma.width
+        || h != ref_l0.luma.height
+        || w != ref_l1.luma.width
+        || h != ref_l1.luma.height
+    {
+        return Err(Error::invalid(
+            "h266 B-slice: current and reference picture dimensions differ",
+        ));
+    }
+    if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
+        return Err(Error::invalid(format!(
+            "h266 B-slice scaffold requires picture {}x{} divisible by {}x{}",
+            w, h, INTER_BLOCK_W, INTER_BLOCK_H,
+        )));
+    }
+    let cols = w / INTER_BLOCK_W;
+    let rows = h / INTER_BLOCK_H;
+
+    let hdr = BSliceHeader {
+        slice_type: 0, // B per §7.4.4 Table 8 (B=0, P=1, I=2 in local mapping)
+        poc_lsb,
+        num_ref_idx_l0_active_minus1: 0,
+        num_ref_idx_l1_active_minus1: 0,
+        slice_qp_delta: slice_qp_y - SCAFFOLD_SLICE_QP,
+        width: w as u32,
+        height: h as u32,
+    };
+    let hdr_bytes = write_bslice_header(&hdr);
+
+    let mut mv_field_l0 = MvField::new(cols, rows);
+    let mut mv_field_l1 = MvField::new(cols, rows);
+    let mut prepared: Vec<PreparedCu> = Vec::with_capacity(cols * rows);
+
+    let mut rec = ref_l0.clone();
+    rec.luma.samples.fill(0);
+
+    let mut enc = ArithEncoder::new();
+    let mut ctxs = PSliceCtxs::init(slice_qp_y);
+
+    for by in 0..rows {
+        for bx in 0..cols {
+            let cx = bx * INTER_BLOCK_W;
+            let cy = by * INTER_BLOCK_H;
+
+            // ----- L0 list: MVP + integer-pel search -----
+            let mvp_l0_q16 = mv_field_l0.mvp_for(bx, by);
+            let mvp_l0_int = (
+                ((mvp_l0_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                ((mvp_l0_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            );
+            let (int_mv_l0, _sad_l0) = full_search_int(
+                &curr.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                &ref_l0.luma,
+                mvp_l0_int,
+                search_range,
+            );
+            let mv_l0_q16 = (int_mv_l0.0 as i32 * 16, int_mv_l0.1 as i32 * 16);
+
+            // ----- L1 list: MVP + integer-pel search -----
+            let mvp_l1_q16 = mv_field_l1.mvp_for(bx, by);
+            let mvp_l1_int = (
+                ((mvp_l1_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                ((mvp_l1_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            );
+            let (int_mv_l1, _sad_l1) = full_search_int(
+                &curr.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                &ref_l1.luma,
+                mvp_l1_int,
+                search_range,
+            );
+            let mv_l1_q16 = (int_mv_l1.0 as i32 * 16, int_mv_l1.1 as i32 * 16);
+
+            // ----- Form three candidate predictions -----
+            let mut pred_l0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+            mc_predict_subpel(
+                &mut pred_l0,
+                &ref_l0.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                mv_l0_q16,
+            )?;
+            let mut pred_l1 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+            mc_predict_subpel(
+                &mut pred_l1,
+                &ref_l1.luma,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                mv_l1_q16,
+            )?;
+            let pred_bi = average_bi(&pred_l0, &pred_l1, INTER_BLOCK_W, INTER_BLOCK_H);
+
+            // ----- RDO: pick cheapest of {L0, L1, BI} on SSE + bias -----
+            // The bias term stands in for the per-mode bin-cost
+            // difference (BI emits an extra MVD chain, ~+8 bits). A
+            // small fixed bias keeps the encoder away from BI when the
+            // uni-pred predictions are already perfect.
+            const BI_BIAS: u32 = 1; // negligible vs typical SSE
+            let sse_l0 = sse_block(&curr.luma, cx, cy, &pred_l0, INTER_BLOCK_W, INTER_BLOCK_H);
+            let sse_l1 = sse_block(&curr.luma, cx, cy, &pred_l1, INTER_BLOCK_W, INTER_BLOCK_H);
+            let sse_bi = sse_block(&curr.luma, cx, cy, &pred_bi, INTER_BLOCK_W, INTER_BLOCK_H)
+                .saturating_add(BI_BIAS);
+
+            let (idc, pred) = if sse_l0 <= sse_l1 && sse_l0 <= sse_bi {
+                (InterPredIdc::L0, pred_l0)
+            } else if sse_l1 <= sse_bi {
+                (InterPredIdc::L1, pred_l1)
+            } else {
+                (InterPredIdc::Bi, pred_bi)
+            };
+
+            // ----- Wire-side MV/MVD: only emit active lists' MVDs -----
+            let (active_l0, active_l1) = match idc {
+                InterPredIdc::L0 => (true, false),
+                InterPredIdc::L1 => (false, true),
+                InterPredIdc::Bi => (true, true),
+            };
+            // For inactive lists, the MV is "inferred zero" — and the
+            // mv_field cell is set to zero so neighbour MVPs reflect
+            // what the decoder will see.
+            if active_l0 {
+                mv_field_l0.set(bx, by, mv_l0_q16);
+            } else {
+                mv_field_l0.set(bx, by, (0, 0));
+            }
+            if active_l1 {
+                mv_field_l1.set(bx, by, mv_l1_q16);
+            } else {
+                mv_field_l1.set(bx, by, (0, 0));
+            }
+
+            // ----- Residual: forward DCT + flat quant + reconstruct -----
+            let (levels, recon) = prepare_inter_tb(
+                &curr.luma,
+                &pred,
+                cx,
+                cy,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+                slice_qp_y,
+            )?;
+            for r in 0..INTER_BLOCK_H {
+                for c in 0..INTER_BLOCK_W {
+                    rec.luma.samples[(cy + r) * rec.luma.stride + (cx + c)] =
+                        recon[r * INTER_BLOCK_W + c];
+                }
+            }
+            let cbf_y = levels.iter().any(|&l| l != 0);
+
+            // ----- Emit per-block CABAC bins -----
+            let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+            let n_skip = ctxs.cu_skip.len() - 1;
+            enc.encode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)], 0)?;
+            let inc_merge = crate::ctx::ctx_inc_general_merge_flag() as usize;
+            let n_merge = ctxs.merge_flag.len() - 1;
+            enc.encode_decision(&mut ctxs.merge_flag[inc_merge.min(n_merge)], 0)?;
+            // inter_pred_idc (compact bypass form).
+            encode_inter_pred_idc(&mut enc, idc)?;
+            if active_l0 {
+                // ref_idx_l0 = 0.
+                enc.encode_bypass(0)?;
+                let mvd_l0 = (mv_l0_q16.0 - mvp_l0_q16.0, mv_l0_q16.1 - mvp_l0_q16.1);
+                encode_mvd_component(&mut enc, mvd_l0.0)?;
+                encode_mvd_component(&mut enc, mvd_l0.1)?;
+            }
+            if active_l1 {
+                // ref_idx_l1 = 0.
+                enc.encode_bypass(0)?;
+                let mvd_l1 = (mv_l1_q16.0 - mvp_l1_q16.0, mv_l1_q16.1 - mvp_l1_q16.1);
+                encode_mvd_component(&mut enc, mvd_l1.0)?;
+                encode_mvd_component(&mut enc, mvd_l1.1)?;
+            }
+            write_tu_y_coded_flag(&mut enc, &mut ctxs.residual, cbf_y, false, false, false)?;
+            if cbf_y {
+                encode_tb_coefficients(
+                    &mut enc,
+                    &mut ctxs.residual,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    0,
+                    &levels,
+                )?;
+            }
+
+            prepared.push(PreparedCu::InterBSlice {
+                inter_pred_idc: idc,
+                ref_idx_l0: 0,
+                ref_idx_l1: 0,
+                mv_l0: if active_l0 { mv_l0_q16 } else { (0, 0) },
+                mv_l1: if active_l1 { mv_l1_q16 } else { (0, 0) },
+                mvp_l0: mvp_l0_q16,
+                mvp_l1: mvp_l1_q16,
+                n_tb_w: INTER_BLOCK_W,
+                n_tb_h: INTER_BLOCK_H,
+                levels: if cbf_y { levels } else { Vec::new() },
+                cbf_y,
+            });
+        }
+    }
+
+    enc.encode_terminate(1)?;
+    let cabac_bytes = enc.finish();
+
+    rec.cb = ref_l0.cb.clone();
+    rec.cr = ref_l0.cr.clone();
+
+    let mut out = Vec::with_capacity(BSLICE_MAGIC.len() + 8 + hdr_bytes.len() + cabac_bytes.len());
+    out.extend_from_slice(BSLICE_MAGIC);
+    out.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&hdr_bytes);
+    out.extend_from_slice(&(cabac_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&cabac_bytes);
+
+    let _ = prepared;
+    Ok((out, rec))
+}
+
+/// Round-60 — decode one B-slice produced by [`encode_b_slice`].
+pub fn decode_b_slice(
+    bytes: &[u8],
+    ref_l0: &PictureBuffer,
+    ref_l1: &PictureBuffer,
+) -> Result<PictureBuffer> {
+    if bytes.len() < BSLICE_MAGIC.len() + 8 {
+        return Err(Error::invalid("h266 B-slice decode: payload too short"));
+    }
+    if &bytes[..BSLICE_MAGIC.len()] != BSLICE_MAGIC {
+        return Err(Error::invalid("h266 B-slice decode: missing magic"));
+    }
+    let mut p = BSLICE_MAGIC.len();
+    let hdr_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    p += 4;
+    if p + hdr_len > bytes.len() {
+        return Err(Error::invalid("h266 B-slice decode: header overflow"));
+    }
+    let hdr = read_bslice_header(&bytes[p..p + hdr_len])?;
+    p += hdr_len;
+    let cabac_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    p += 4;
+    if p + cabac_len > bytes.len() {
+        return Err(Error::invalid("h266 B-slice decode: cabac overflow"));
+    }
+    let mut cabac_bytes: Vec<u8> = bytes[p..p + cabac_len].to_vec();
+    cabac_bytes.extend_from_slice(&[0u8; 256]);
+
+    if hdr.slice_type != 0 {
+        return Err(Error::invalid(format!(
+            "h266 B-slice decode: expected slice_type=0, got {}",
+            hdr.slice_type
+        )));
+    }
+    let w = hdr.width as usize;
+    let h = hdr.height as usize;
+    if w != ref_l0.luma.width
+        || h != ref_l0.luma.height
+        || w != ref_l1.luma.width
+        || h != ref_l1.luma.height
+    {
+        return Err(Error::invalid(format!(
+            "h266 B-slice decode: header geometry {}x{} vs refs {}x{} / {}x{}",
+            w, h, ref_l0.luma.width, ref_l0.luma.height, ref_l1.luma.width, ref_l1.luma.height,
+        )));
+    }
+    if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
+        return Err(Error::invalid(format!(
+            "h266 B-slice decode: dims not divisible by {}",
+            INTER_BLOCK_W,
+        )));
+    }
+    let cols = w / INTER_BLOCK_W;
+    let rows = h / INTER_BLOCK_H;
+    let slice_qp_y = SCAFFOLD_SLICE_QP + hdr.slice_qp_delta;
+
+    let mut dec = ArithDecoder::new(&cabac_bytes)?;
+    let mut ctxs = PSliceCtxs::init(slice_qp_y);
+    let mut mv_field_l0 = MvField::new(cols, rows);
+    let mut mv_field_l1 = MvField::new(cols, rows);
+
+    let mut out = ref_l0.clone();
+    out.luma.samples.fill(0);
+
+    for by in 0..rows {
+        for bx in 0..cols {
+            let cx = bx * INTER_BLOCK_W;
+            let cy = by * INTER_BLOCK_H;
+            let mvp_l0_q16 = mv_field_l0.mvp_for(bx, by);
+            let mvp_l1_q16 = mv_field_l1.mvp_for(bx, by);
+
+            // cu_skip_flag.
+            let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+            let n_skip = ctxs.cu_skip.len() - 1;
+            let _skip = dec.decode_decision(&mut ctxs.cu_skip[inc_skip.min(n_skip)])?;
+            // general_merge_flag.
+            let inc_merge = crate::ctx::ctx_inc_general_merge_flag() as usize;
+            let n_merge = ctxs.merge_flag.len() - 1;
+            let _merge = dec.decode_decision(&mut ctxs.merge_flag[inc_merge.min(n_merge)])?;
+            // inter_pred_idc.
+            let idc = decode_inter_pred_idc(&mut dec)?;
+            let (active_l0, active_l1) = match idc {
+                InterPredIdc::L0 => (true, false),
+                InterPredIdc::L1 => (false, true),
+                InterPredIdc::Bi => (true, true),
+            };
+            let mut mv_l0_q16 = (0i32, 0i32);
+            let mut mv_l1_q16 = (0i32, 0i32);
+            if active_l0 {
+                let _ = dec.decode_bypass()?; // ref_idx_l0
+                let mvd_x = decode_mvd_component(&mut dec)?;
+                let mvd_y = decode_mvd_component(&mut dec)?;
+                mv_l0_q16 = (mvp_l0_q16.0 + mvd_x, mvp_l0_q16.1 + mvd_y);
+            }
+            if active_l1 {
+                let _ = dec.decode_bypass()?; // ref_idx_l1
+                let mvd_x = decode_mvd_component(&mut dec)?;
+                let mvd_y = decode_mvd_component(&mut dec)?;
+                mv_l1_q16 = (mvp_l1_q16.0 + mvd_x, mvp_l1_q16.1 + mvd_y);
+            }
+            mv_field_l0.set(bx, by, mv_l0_q16);
+            mv_field_l1.set(bx, by, mv_l1_q16);
+
+            let cbf_y = read_tu_y_coded_flag(&mut dec, &mut ctxs.residual, false, false, false)?;
+            let pred = match idc {
+                InterPredIdc::L0 => {
+                    let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    mc_predict_subpel(
+                        &mut pred,
+                        &ref_l0.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        mv_l0_q16,
+                    )?;
+                    pred
+                }
+                InterPredIdc::L1 => {
+                    let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    mc_predict_subpel(
+                        &mut pred,
+                        &ref_l1.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        mv_l1_q16,
+                    )?;
+                    pred
+                }
+                InterPredIdc::Bi => {
+                    let mut p0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    mc_predict_subpel(
+                        &mut p0,
+                        &ref_l0.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        mv_l0_q16,
+                    )?;
+                    let mut p1 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    mc_predict_subpel(
+                        &mut p1,
+                        &ref_l1.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        mv_l1_q16,
+                    )?;
+                    average_bi(&p0, &p1, INTER_BLOCK_W, INTER_BLOCK_H)
+                }
+            };
+            let recon = if cbf_y {
+                let levels = crate::residual::decode_tb_coefficients(
+                    &mut dec,
+                    &mut ctxs.residual,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    0,
+                )?;
+                reconstruct_inter_tb_from_levels(
+                    &levels,
+                    &pred,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    slice_qp_y,
+                )?
+            } else {
+                pred
+            };
+            for r in 0..INTER_BLOCK_H {
+                for c in 0..INTER_BLOCK_W {
+                    out.luma.samples[(cy + r) * out.luma.stride + (cx + c)] =
+                        recon[r * INTER_BLOCK_W + c];
+                }
+            }
+        }
+    }
+
+    let _ = dec.decode_terminate()?;
+    out.cb = ref_l0.cb.clone();
+    out.cr = ref_l0.cr.clone();
+    Ok(out)
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 
@@ -1369,6 +1977,51 @@ mod tests {
             enc_rec.luma.samples, dec_rec.luma.samples,
             "round-59 encoder + decoder luma must match byte-for-byte at sub-pel MVs",
         );
+    }
+
+    // =================================================================
+    // Round-60 — B-slice unit tests
+    // =================================================================
+
+    #[test]
+    fn round60_bslice_header_round_trip() {
+        let hdr = BSliceHeader {
+            slice_type: 0,
+            poc_lsb: 9,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            slice_qp_delta: 2,
+            width: 64,
+            height: 64,
+        };
+        let bytes = write_bslice_header(&hdr);
+        let got = read_bslice_header(&bytes).unwrap();
+        assert_eq!(got, hdr);
+    }
+
+    #[test]
+    fn round60_inter_pred_idc_round_trip() {
+        for idc in [InterPredIdc::L0, InterPredIdc::L1, InterPredIdc::Bi] {
+            let mut enc = ArithEncoder::new();
+            encode_inter_pred_idc(&mut enc, idc).unwrap();
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            let got = decode_inter_pred_idc(&mut dec).unwrap();
+            assert_eq!(got, idc, "inter_pred_idc round-trip failed for {idc:?}");
+        }
+    }
+
+    #[test]
+    fn round60_average_bi_matches_spec_8_5_6_4() {
+        // pred = (a + b + 1) >> 1 per §8.5.6.4 (simple-average bi-pred).
+        let p0: Vec<u8> = (0..16).map(|i| i * 8).collect();
+        let p1: Vec<u8> = (0..16).map(|i| 128 + i).collect();
+        let avg = average_bi(&p0, &p1, 4, 4);
+        for i in 0..16 {
+            let expected = ((p0[i] as u16 + p1[i] as u16 + 1) >> 1) as u8;
+            assert_eq!(avg[i], expected, "mismatch at i={i}");
+        }
     }
 
     #[test]

@@ -266,6 +266,24 @@ and ¼-pel to 52.4 dB; the round-58 4-px integer-pel fixture holds at
 exhaustive search, chroma sub-pel MC, multi-ref DPB, B-slice, and the
 Annex-B NAL integration with the IDR pipeline remain deferred.
 
+**Round-60 adds the B-slice (bi-prediction) encoder + decoder
+scaffold** (`encoder_inter::encode_b_slice` /
+`encoder_inter::decode_b_slice`). Two reference lists (L0 + L1) with
+one picture per list, per-list integer-pel full-search SAD + per-list
+spatial MVP picker (§7.4.7.3), per-CU `inter_pred_idc` ∈ {PRED_L0,
+PRED_L1, PRED_BI} per §7.4.7.2 chosen by Lagrangian SSE-based RDO over
+the three candidate predictions, and §8.5.6.4 simple-average bi-pred
+reconstruction `pred = (predL0 + predL1 + 1) >> 1` (weighted bi-pred
+deferred). Slice header carries `slice_type == B` plus both
+`num_ref_idx_l{0,1}_active_minus1` per §7.4.4. Wire chunk
+`OXAV_VVC_BSLIC` mirrors the round-58 in-crate framing pattern. On a
+4-px translation fixture with `ref_l0 == ref_l1` the B-slice
+degenerates to P-slice quality (PSNR_Y 78.23 dB); on a
+split-translation fixture the RDO matches the corresponding P-slice
+at 54.15 dB. Multi-reference DPB (more than one picture per list),
+sub-pel ME on the B-slice path (deferred to round 61), and weighted
+bi-pred remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

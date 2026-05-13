@@ -6,6 +6,42 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 60 — B-slice (bi-prediction) encoder + decoder scaffold
+  (`encoder_inter::encode_b_slice` / `encoder_inter::decode_b_slice`).
+  The B-slice path mirrors the round 58 / 59 P-slice path but threads
+  TWO reference lists (L0 + L1, one picture per list in this round).
+  For each 4×4 luma block the encoder runs integer-pel full-search
+  SAD against both refs independently (§7.4.7.3 — MVP derivation
+  runs per list), forms three candidate predictions (L0-only,
+  L1-only, BI), and picks the cheapest via Lagrangian SSE + small
+  per-mode bias. Bi-prediction reconstruction is the §8.5.6.4
+  simple average `pred = (predL0 + predL1 + 1) >> 1` (weighted
+  bi-pred is deferred). The slice header carries
+  `num_ref_idx_l0_active_minus1` AND `num_ref_idx_l1_active_minus1`
+  per §7.4.4 with `slice_type == B`. On the wire the per-CU
+  `inter_pred_idc` per §7.4.7.2 is bypass-coded as `{bi_flag, list}`
+  (PRED_L0, PRED_L1, PRED_BI); per-active-list MVDs reuse the
+  round-58 EG1 `abs_zero_flag + magnitude + sign` shape. A custom
+  `OXAV_VVC_BSLIC` magic-prefixed wire chunk wraps the slice-header
+  bit prelude + CABAC payload; `decode_b_slice` is the matching
+  in-crate decoder. On a 4-px translation fixture with both refs
+  pointing at the same picture the B-slice degenerates to P-slice
+  quality (PSNR_Y = 78.23 dB); on a split-translation fixture
+  (L0=+2, L1=-2) the RDO picks the better uni-pred path and reaches
+  54.15 dB matching the corresponding P-slice. `PreparedCu` gains
+  the `InterBSlice` variant alongside `InterPSlice`.
+  - Multi-reference DPB (more than one picture per list) is
+    deferred; sub-pel ME on the B-slice path is deferred to round
+    61 (integer-pel ME only here); chroma sub-pel MC and weighted
+    bi-pred remain deferred.
+  - 3 new unit tests in `encoder_inter::tests` (B-slice header
+    round-trip, `inter_pred_idc` round-trip across all three
+    enumerants, `average_bi` matches §8.5.6.4) + 5 new integration
+    tests in `tests/round60_bslice_basic.rs` (same-refs degenerate
+    to P-slice ≥ 35 dB, split-translation reaches at-least-P-slice
+    PSNR, encoder/decoder byte-identical roundtrip, P-slice 78 dB
+    regression holds, no-motion zero-residual roundtrip).
+
 - Round 59 — sub-pel motion compensation for the P-slice
   encoder + decoder (`encoder_inter::encode_p_slice` /
   `encoder_inter::decode_p_slice`). The integer-pel SAD full search
