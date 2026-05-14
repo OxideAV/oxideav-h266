@@ -6,6 +6,54 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 62 — multi-reference DPB on the P-slice and B-slice
+  encoder + decoder (`encoder_inter::encode_p_slice_multi_ref` /
+  `encoder_inter::decode_p_slice_multi_ref` /
+  `encoder_inter::encode_b_slice_multi_ref` /
+  `encoder_inter::decode_b_slice_multi_ref`). Rounds 58/60/61 carried
+  a SINGLE reference per list; round 62 extends each list to hold up
+  to `MAX_REF_PICS = 4` pictures (matches the mainstream profile
+  constraint in §A.4; the wire-side truncated-unary encoding scales
+  to whatever active count the slice header advertises so the
+  constant is the encoder/test ceiling, not a wire-format limit). The
+  slice header now carries real `num_ref_idx_l0_active_minus1` and
+  (for B) `num_ref_idx_l1_active_minus1` values (§7.4.4.2); per-CU
+  `ref_idx_l0` / `ref_idx_l1` are emitted as truncated-unary
+  (§9.3.3.7 / Table 132 — collapsed to bypass coding for the scaffold,
+  matching the round-58/60 mvd "all bypass for the magnitude"
+  pattern) with `cMax = num_active - 1`. Encoder ME now iterates every
+  candidate reference in each list, runs the round-58 integer-pel SAD
+  full search plus round-59 sub-pel refinement against each
+  (§8.5.6.3.2 Table 27 8-tap luma filter), and picks the cheapest-SAD
+  reference index per list before the existing Lagrangian RDO over
+  `{L0, L1, BI}` runs for B-slices. Single-ref `encode_p_slice` /
+  `encode_b_slice` / `decode_p_slice` / `decode_b_slice` are now thin
+  wrappers over the multi-ref variants; the round-58/60 single-ref
+  wire is bit-for-bit unchanged. `PreparedCu::InterPSlice.ref_idx`
+  and `PreparedCu::InterBSlice.ref_idx_l{0,1}` now carry the actual
+  selected index (previously always 0). Weighted bi-pred and
+  chroma sub-pel MC remain deferred.
+  - On a 3-frame P-slice fixture (I, P, current) where the current
+    frame matches frame 0 better than frame 1, the encoder selects
+    `ref_idx=1` (frame 0) on every block and reconstructs to
+    PSNR_Y = 58.41 dB (vs. the L0[0]-only path at substantially
+    worse PSNR). On a 4-frame B-slice fixture with 2 refs in each
+    list (L0=[-2 px, -4 px], L1=[+2 px, +4 px], current = un-shifted)
+    the multi-ref-aware RDO splits the translation between L0[0]
+    and L1[0] for an exact BI average (PSNR_Y = inf). The round-58
+    single-ref 4-px P-slice regression holds at 78.23 dB; a forced
+    `ref_idx > 0` fixture (noisy L0[0], perfect L0[1]) round-trips
+    byte-identically with PSNR_Y = inf. Multi-ref + sub-pel still
+    reaches the round-59 quarter-pel ceiling at 52.39 dB.
+  - 3 new unit tests in `encoder_inter::tests` (truncated-unary
+    `ref_idx` round-trip across all sizes, single-active-list emits
+    no bins, cap clamping) + 6 new integration tests in
+    `tests/round62_multi_ref_dpb.rs` (3-frame P-slice prefers
+    better ref ≥ 50 dB, 4-ref B-slice ≥ 50 dB, single-ref
+    regression ≥ 78 dB, `ref_idx > 0` forced round-trip ≥ 70 dB,
+    multi-ref sub-pel ≥ 48 dB, B-slice multi-ref byte-identical
+    decoder roundtrip).
+
 - Round 61 — sub-pel motion estimation on the B-slice
   (bi-prediction) encoder + decoder
   (`encoder_inter::encode_b_slice` / `encoder_inter::decode_b_slice`).

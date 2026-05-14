@@ -298,6 +298,29 @@ fixture holds at 78.23 dB. Multi-reference DPB (more than one
 picture per list), chroma sub-pel MC, and weighted bi-pred remain
 deferred.
 
+**Round-62 adds multi-reference DPB to both the P-slice and B-slice
+encoder + decoder** (`encoder_inter::encode_p_slice_multi_ref` /
+`encoder_inter::encode_b_slice_multi_ref` and the matching decoder
+calls). Each list (L0 for P / L0 + L1 for B) now holds up to
+`MAX_REF_PICS = 4` pictures matching the §A.4 mainstream-profile
+constraint. The encoder ME iterates every candidate reference in
+each list, runs the round-58 integer-pel SAD search plus the
+round-59 sub-pel refinement against each, and picks the cheapest by
+SAD before the {L0, L1, BI} RDO runs. The slice header now
+advertises real `num_ref_idx_l0_active_minus1` (and, for B,
+`num_ref_idx_l1_active_minus1`) per §7.4.4.2; per-CU `ref_idx_l0`
+/ `ref_idx_l1` are emitted as truncated-unary per §9.3.3.7 / Table
+132 with `cMax = num_active - 1` (bypass-coded for the scaffold,
+collapses to zero bins when the list has only one picture so the
+single-ref wire stays bit-for-bit unchanged). On a 3-frame P-slice
+fixture where the current frame matches frame 0 better than frame
+1, the encoder picks `ref_idx=1` on every block and reaches PSNR_Y
+= 58.41 dB; on a 4-ref B-slice fixture the multi-ref-aware RDO
+splits the translation for an exact BI reconstruction. The
+round-58 4-px P-slice regression holds at 78.23 dB and multi-ref +
+sub-pel still reaches 52.39 dB. Chroma sub-pel MC and weighted
+bi-pred remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

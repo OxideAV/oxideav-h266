@@ -90,6 +90,14 @@ const SCAFFOLD_SLICE_QP: i32 = 26;
 const HALF_PEL_STEP: i32 = 8;
 const QUARTER_PEL_STEP: i32 = 4;
 
+/// Round-62 — maximum reference pictures per list. VVC §A.4 Main 10
+/// profile permits up to 15 active references per list; mainstream
+/// profiles typically use 1..4. The scaffold caps at 4 to keep the
+/// encoder ME RDO loop bounded; the wire-side truncated-unary encoding
+/// scales to whatever active count the slice header advertises so the
+/// constant is the encoder/test ceiling, not a wire-format limit.
+pub const MAX_REF_PICS: usize = 4;
+
 // =====================================================================
 // PreparedCu — round-58 sibling of encoder_pipeline::PreparedCu
 // =====================================================================
@@ -552,6 +560,57 @@ fn decode_mvd_component(dec: &mut ArithDecoder<'_>) -> Result<i32> {
 }
 
 // =====================================================================
+// ref_idx_lX coding — round-62 truncated unary, §9.3.3.7
+// =====================================================================
+//
+// VVC §9.3.3.7 / Table 132 codes `ref_idx_lX` as a truncated-unary
+// binarization with `cMax = NumRefIdxActive[X] - 1`. The first bin is
+// context-coded (two contexts indexed by `binIdx == 0 ? 0 : 1`); the
+// remainder are bypass. For the round-62 scaffold we collapse the
+// whole chain to bypass coding (matching the round-58/60 mvd schema's
+// "all bypass for the magnitude" pattern). The shape on the wire is:
+//
+//   - if `num_active <= 1`: zero bins emitted (decoder infers 0).
+//   - else: bins of value `min(ref_idx, num_active - 1)` zeros,
+//     terminated by a single `1` bit when `ref_idx < num_active - 1`,
+//     or by reaching `num_active - 1` zeros (no terminator needed).
+//
+// In other words: emit `ref_idx` zeros up to a cap of `num_active - 1`,
+// then a `1` unless we hit the cap.
+
+fn encode_ref_idx(enc: &mut ArithEncoder, ref_idx: u8, num_active: usize) -> Result<()> {
+    if num_active <= 1 {
+        // ref_idx is inferred to 0; nothing on the wire.
+        return Ok(());
+    }
+    let cap = num_active - 1;
+    let v = (ref_idx as usize).min(cap);
+    for _ in 0..v {
+        enc.encode_bypass(0)?; // unary "still bigger"
+    }
+    if v < cap {
+        enc.encode_bypass(1)?; // terminator
+    }
+    Ok(())
+}
+
+fn decode_ref_idx(dec: &mut ArithDecoder<'_>, num_active: usize) -> Result<u8> {
+    if num_active <= 1 {
+        return Ok(0);
+    }
+    let cap = num_active - 1;
+    let mut v: usize = 0;
+    while v < cap {
+        let b = dec.decode_bypass()?;
+        if b == 1 {
+            break;
+        }
+        v += 1;
+    }
+    Ok(v as u8)
+}
+
+// =====================================================================
 // Per-block residual emit / decode — luma TB only
 // =====================================================================
 
@@ -755,12 +814,41 @@ pub fn encode_p_slice(
     poc_lsb: u8,
     search_range: i32,
 ) -> Result<(Vec<u8>, PictureBuffer)> {
+    encode_p_slice_multi_ref(curr, &[ref_buf], slice_qp_y, poc_lsb, search_range)
+}
+
+/// Round-62 — encode one P-slice for `curr` against an L0 reference
+/// list of N (up to [`MAX_REF_PICS`]) pictures. Per-block ME iterates
+/// each candidate reference, runs the round-58 integer-pel SAD search
+/// plus round-59 sub-pel refinement against each, and picks the
+/// cheapest-SAD reference index. The wire-side per-block
+/// `ref_idx_l0` (truncated-unary per §9.3.3.7) and the slice-header
+/// `num_ref_idx_l0_active_minus1` (§7.4.4.2) are emitted accordingly.
+///
+/// `ref_list_l0` must contain at least one picture; all references in
+/// the list must match `curr`'s luma geometry. When the list length is
+/// 1 the wire reduces to the round-58 single-ref form (no `ref_idx_l0`
+/// bins emitted; `num_ref_idx_l0_active_minus1 == 0`).
+pub fn encode_p_slice_multi_ref(
+    curr: &PictureBuffer,
+    ref_list_l0: &[&PictureBuffer],
+    slice_qp_y: i32,
+    poc_lsb: u8,
+    search_range: i32,
+) -> Result<(Vec<u8>, PictureBuffer)> {
+    if ref_list_l0.is_empty() {
+        return Err(Error::invalid(
+            "h266 P-slice: ref_list_l0 must contain at least one picture",
+        ));
+    }
     let w = curr.luma.width;
     let h = curr.luma.height;
-    if w != ref_buf.luma.width || h != ref_buf.luma.height {
-        return Err(Error::invalid(
-            "h266 P-slice: current and reference picture dimensions differ",
-        ));
+    for r in ref_list_l0 {
+        if w != r.luma.width || h != r.luma.height {
+            return Err(Error::invalid(
+                "h266 P-slice: current and reference picture dimensions differ",
+            ));
+        }
     }
     if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
         return Err(Error::invalid(format!(
@@ -770,11 +858,12 @@ pub fn encode_p_slice(
     }
     let cols = w / INTER_BLOCK_W;
     let rows = h / INTER_BLOCK_H;
+    let num_active_l0 = ref_list_l0.len();
 
     let hdr = PSliceHeader {
         slice_type: 1, // P per §7.4.4 Table 8 (I=2, P=1, B=0 in our local mapping)
         poc_lsb,
-        num_ref_idx_l0_active_minus1: 0,
+        num_ref_idx_l0_active_minus1: (num_active_l0 - 1) as u32,
         slice_qp_delta: slice_qp_y - SCAFFOLD_SLICE_QP,
         width: w as u32,
         height: h as u32,
@@ -784,7 +873,9 @@ pub fn encode_p_slice(
     let mut mv_field = MvField::new(cols, rows);
     let mut prepared: Vec<PreparedCu> = Vec::with_capacity(cols * rows);
 
-    let mut rec = ref_buf.clone();
+    // Build the reconstruction skeleton from L0[0] for chroma + buffer
+    // dimensions; luma is rewritten below.
+    let mut rec = ref_list_l0[0].clone();
     rec.luma.samples.fill(0);
 
     let mut enc = ArithEncoder::new();
@@ -803,41 +894,51 @@ pub fn encode_p_slice(
                 ((mvp_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             );
 
-            // --- Integer-pel motion search ---
-            let (int_mv, int_sad) = full_search_int(
-                &curr.luma,
-                cx,
-                cy,
-                INTER_BLOCK_W,
-                INTER_BLOCK_H,
-                &ref_buf.luma,
-                mvp_int_pel,
-                search_range,
-            );
-
-            // --- Sub-pel refinement (round 59) ---
-            let (mv_q16, _sad) = refine_subpel(
-                &curr.luma,
-                cx,
-                cy,
-                INTER_BLOCK_W,
-                INTER_BLOCK_H,
-                &ref_buf.luma,
-                int_mv,
-                int_sad,
-            )?;
-            mv_field.set(bx, by, mv_q16);
+            // --- Multi-ref ME (round-62): iterate every L0 picture,
+            // refine to 1/16-pel, pick the cheapest by SAD. -----------
+            let mut best_ref_idx: u8 = 0;
+            let mut best_mv_q16: (i32, i32) = (0, 0);
+            let mut best_sad: u32 = u32::MAX;
+            for (idx, rp) in ref_list_l0.iter().enumerate() {
+                let (int_mv, int_sad) = full_search_int(
+                    &curr.luma,
+                    cx,
+                    cy,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    &rp.luma,
+                    mvp_int_pel,
+                    search_range,
+                );
+                let (mv_q16, sad) = refine_subpel(
+                    &curr.luma,
+                    cx,
+                    cy,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    &rp.luma,
+                    int_mv,
+                    int_sad,
+                )?;
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mv_q16 = mv_q16;
+                    best_ref_idx = idx as u8;
+                }
+            }
+            let ref_p = ref_list_l0[best_ref_idx as usize];
+            mv_field.set(bx, by, best_mv_q16);
 
             // --- MC prediction (sub-pel-aware) ---
             let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred,
-                &ref_buf.luma,
+                &ref_p.luma,
                 cx,
                 cy,
                 INTER_BLOCK_W,
                 INTER_BLOCK_H,
-                mv_q16,
+                best_mv_q16,
             )?;
 
             // --- Residual: forward DCT + flat quant + reconstruct ---
@@ -868,10 +969,11 @@ pub fn encode_p_slice(
             enc.encode_decision(&mut ctxs.merge_flag[inc_merge.min(n_merge)], 0)?;
             // inter_pred_idc = PRED_L0.
             enc.encode_bypass(0)?;
-            // ref_idx_l0 = 0.
-            enc.encode_bypass(0)?;
+            // ref_idx_l0 — truncated-unary, §9.3.3.7. Only emitted when
+            // the slice has more than one active L0 reference.
+            encode_ref_idx(&mut enc, best_ref_idx, num_active_l0)?;
             // §7.4.7.2 — mvd_coding for x then y. Now in 1/16-pel units.
-            let mvd = (mv_q16.0 - mvp_q16.0, mv_q16.1 - mvp_q16.1);
+            let mvd = (best_mv_q16.0 - mvp_q16.0, best_mv_q16.1 - mvp_q16.1);
             encode_mvd_component(&mut enc, mvd.0)?;
             encode_mvd_component(&mut enc, mvd.1)?;
 
@@ -889,8 +991,8 @@ pub fn encode_p_slice(
             }
 
             prepared.push(PreparedCu::InterPSlice {
-                ref_idx: 0,
-                mv: mv_q16,
+                ref_idx: best_ref_idx,
+                mv: best_mv_q16,
                 mvp: mvp_q16,
                 n_tb_w: INTER_BLOCK_W,
                 n_tb_h: INTER_BLOCK_H,
@@ -903,9 +1005,10 @@ pub fn encode_p_slice(
     enc.encode_terminate(1)?;
     let cabac_bytes = enc.finish();
 
-    // Round-58 silences the chroma path: pass chroma planes through.
-    rec.cb = ref_buf.cb.clone();
-    rec.cr = ref_buf.cr.clone();
+    // Round-58 silences the chroma path: pass chroma planes through
+    // from L0[0] (the canonical reference).
+    rec.cb = ref_list_l0[0].cb.clone();
+    rec.cr = ref_list_l0[0].cr.clone();
 
     // Wire layout: magic (14B) | hdr_len_le32 (4B) | hdr | cabac_len_le32 (4B) | cabac_bytes
     let mut out = Vec::with_capacity(PSLICE_MAGIC.len() + 8 + hdr_bytes.len() + cabac_bytes.len());
@@ -930,6 +1033,24 @@ pub fn encode_p_slice(
 /// returns the reconstructed luma in a fresh [`PictureBuffer`] (chroma
 /// is copied through from `ref_buf` per the encoder-side scaffold scope).
 pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBuffer> {
+    decode_p_slice_multi_ref(bytes, &[ref_buf])
+}
+
+/// Round-62 — decode one P-slice produced by [`encode_p_slice_multi_ref`].
+/// Reads `num_ref_idx_l0_active_minus1` from the slice header, then for
+/// each block reads the truncated-unary `ref_idx_l0` (§9.3.3.7) before
+/// the MVD chain, and reconstructs from the chosen reference in
+/// `ref_list_l0`. Backwards-compatible with the single-ref wire
+/// produced by [`encode_p_slice`].
+pub fn decode_p_slice_multi_ref(
+    bytes: &[u8],
+    ref_list_l0: &[&PictureBuffer],
+) -> Result<PictureBuffer> {
+    if ref_list_l0.is_empty() {
+        return Err(Error::invalid(
+            "h266 P-slice decode: ref_list_l0 must contain at least one picture",
+        ));
+    }
     if bytes.len() < PSLICE_MAGIC.len() + 8 {
         return Err(Error::invalid("h266 P-slice decode: payload too short"));
     }
@@ -958,13 +1079,24 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
             hdr.slice_type
         )));
     }
+    let num_active_l0 = (hdr.num_ref_idx_l0_active_minus1 as usize) + 1;
+    if num_active_l0 > ref_list_l0.len() {
+        return Err(Error::invalid(format!(
+            "h266 P-slice decode: slice header advertises {} active L0 refs but caller provided {}",
+            num_active_l0,
+            ref_list_l0.len(),
+        )));
+    }
     let w = hdr.width as usize;
     let h = hdr.height as usize;
-    if w != ref_buf.luma.width || h != ref_buf.luma.height {
-        return Err(Error::invalid(format!(
-            "h266 P-slice decode: header geometry {}x{} vs reference {}x{}",
-            w, h, ref_buf.luma.width, ref_buf.luma.height
-        )));
+    let ref0 = ref_list_l0[0];
+    for r in ref_list_l0 {
+        if w != r.luma.width || h != r.luma.height {
+            return Err(Error::invalid(format!(
+                "h266 P-slice decode: header geometry {}x{} vs reference {}x{}",
+                w, h, r.luma.width, r.luma.height
+            )));
+        }
     }
     if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
         return Err(Error::invalid(
@@ -979,7 +1111,7 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
     let mut ctxs = PSliceCtxs::init(slice_qp_y);
     let mut mv_field = MvField::new(cols, rows);
 
-    let mut out = ref_buf.clone();
+    let mut out = ref0.clone();
     out.luma.samples.fill(0);
 
     for by in 0..rows {
@@ -998,8 +1130,8 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
             let _merge = dec.decode_decision(&mut ctxs.merge_flag[inc_merge.min(n_merge)])?;
             // inter_pred_idc — bypass.
             let _ = dec.decode_bypass()?;
-            // ref_idx_l0 — bypass.
-            let _ = dec.decode_bypass()?;
+            // ref_idx_l0 — truncated-unary, only emitted when active > 1.
+            let ref_idx_l0 = decode_ref_idx(&mut dec, num_active_l0)?;
             // mvd_coding x / y (now 1/16-pel units).
             let mvd_x = decode_mvd_component(&mut dec)?;
             let mvd_y = decode_mvd_component(&mut dec)?;
@@ -1009,10 +1141,11 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
             // tu_y_coded_flag.
             let cbf_y = read_tu_y_coded_flag(&mut dec, &mut ctxs.residual, false, false, false)?;
             // Predict the block from the reference + sub-pel MV.
+            let ref_p = ref_list_l0[ref_idx_l0 as usize];
             let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred,
-                &ref_buf.luma,
+                &ref_p.luma,
                 cx,
                 cy,
                 INTER_BLOCK_W,
@@ -1047,8 +1180,8 @@ pub fn decode_p_slice(bytes: &[u8], ref_buf: &PictureBuffer) -> Result<PictureBu
     }
 
     let _ = dec.decode_terminate()?;
-    out.cb = ref_buf.cb.clone();
-    out.cr = ref_buf.cr.clone();
+    out.cb = ref0.cb.clone();
+    out.cr = ref0.cr.clone();
     Ok(out)
 }
 
@@ -1211,16 +1344,47 @@ pub fn encode_b_slice(
     poc_lsb: u8,
     search_range: i32,
 ) -> Result<(Vec<u8>, PictureBuffer)> {
+    encode_b_slice_multi_ref(
+        curr,
+        &[ref_l0],
+        &[ref_l1],
+        slice_qp_y,
+        poc_lsb,
+        search_range,
+    )
+}
+
+/// Round-62 — encode one B-slice for `curr` against L0 + L1 reference
+/// lists of N pictures each (up to [`MAX_REF_PICS`]). Per-block ME
+/// iterates every L0 and L1 reference independently, refines each to
+/// 1/16-pel, then runs the §7.4.7.2 `{PRED_L0, PRED_L1, PRED_BI}` RDO
+/// using each list's chosen best. Wire-side: slice header advertises
+/// `num_ref_idx_l{0,1}_active_minus1` (§7.4.4.2); per-CU
+/// `ref_idx_l0` / `ref_idx_l1` are emitted as truncated-unary
+/// (§9.3.3.7) when the corresponding list has more than one active
+/// reference. `ref_list_l1` may be the same list as `ref_list_l0` when
+/// the picture is a low-delay-B with co-equal lists.
+pub fn encode_b_slice_multi_ref(
+    curr: &PictureBuffer,
+    ref_list_l0: &[&PictureBuffer],
+    ref_list_l1: &[&PictureBuffer],
+    slice_qp_y: i32,
+    poc_lsb: u8,
+    search_range: i32,
+) -> Result<(Vec<u8>, PictureBuffer)> {
+    if ref_list_l0.is_empty() || ref_list_l1.is_empty() {
+        return Err(Error::invalid(
+            "h266 B-slice: both ref lists must contain at least one picture",
+        ));
+    }
     let w = curr.luma.width;
     let h = curr.luma.height;
-    if w != ref_l0.luma.width
-        || h != ref_l0.luma.height
-        || w != ref_l1.luma.width
-        || h != ref_l1.luma.height
-    {
-        return Err(Error::invalid(
-            "h266 B-slice: current and reference picture dimensions differ",
-        ));
+    for rp in ref_list_l0.iter().chain(ref_list_l1.iter()) {
+        if w != rp.luma.width || h != rp.luma.height {
+            return Err(Error::invalid(
+                "h266 B-slice: current and reference picture dimensions differ",
+            ));
+        }
     }
     if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
         return Err(Error::invalid(format!(
@@ -1230,12 +1394,14 @@ pub fn encode_b_slice(
     }
     let cols = w / INTER_BLOCK_W;
     let rows = h / INTER_BLOCK_H;
+    let num_active_l0 = ref_list_l0.len();
+    let num_active_l1 = ref_list_l1.len();
 
     let hdr = BSliceHeader {
         slice_type: 0, // B per §7.4.4 Table 8 (B=0, P=1, I=2 in local mapping)
         poc_lsb,
-        num_ref_idx_l0_active_minus1: 0,
-        num_ref_idx_l1_active_minus1: 0,
+        num_ref_idx_l0_active_minus1: (num_active_l0 - 1) as u32,
+        num_ref_idx_l1_active_minus1: (num_active_l1 - 1) as u32,
         slice_qp_delta: slice_qp_y - SCAFFOLD_SLICE_QP,
         width: w as u32,
         height: h as u32,
@@ -1246,7 +1412,7 @@ pub fn encode_b_slice(
     let mut mv_field_l1 = MvField::new(cols, rows);
     let mut prepared: Vec<PreparedCu> = Vec::with_capacity(cols * rows);
 
-    let mut rec = ref_l0.clone();
+    let mut rec = ref_list_l0[0].clone();
     rec.luma.samples.fill(0);
 
     let mut enc = ArithEncoder::new();
@@ -1257,72 +1423,89 @@ pub fn encode_b_slice(
             let cx = bx * INTER_BLOCK_W;
             let cy = by * INTER_BLOCK_H;
 
-            // ----- L0 list: MVP + integer-pel search + sub-pel refine -----
-            // Round 61: each list now gets the same two-stage sub-pel
-            // refinement (½-pel then ¼-pel) that round 59 added to the
-            // P-slice path. Both stages reuse the §8.5.6.3.2 Table 27
-            // 8-tap luma filter via `predict_luma_block`. The on-wire
-            // MVDs end up in 1/16-pel units (¼-pel ⇒ |mvd| = 4, ½-pel
-            // ⇒ 8, full-pel ⇒ 16), which the round-58 EG1 magnitude
-            // schema already handles unchanged.
+            // ----- L0 list: MVP + per-ref integer-pel + sub-pel refine -----
+            // Round 62 — iterate every L0 reference, refine each to
+            // 1/16-pel, keep the cheapest by SAD.
             let mvp_l0_q16 = mv_field_l0.mvp_for(bx, by);
             let mvp_l0_int = (
                 ((mvp_l0_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 ((mvp_l0_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             );
-            let (int_mv_l0, int_sad_l0) = full_search_int(
-                &curr.luma,
-                cx,
-                cy,
-                INTER_BLOCK_W,
-                INTER_BLOCK_H,
-                &ref_l0.luma,
-                mvp_l0_int,
-                search_range,
-            );
-            let (mv_l0_q16, _sad_l0) = refine_subpel(
-                &curr.luma,
-                cx,
-                cy,
-                INTER_BLOCK_W,
-                INTER_BLOCK_H,
-                &ref_l0.luma,
-                int_mv_l0,
-                int_sad_l0,
-            )?;
+            let mut best_ref_idx_l0: u8 = 0;
+            let mut mv_l0_q16: (i32, i32) = (0, 0);
+            let mut best_sad_l0: u32 = u32::MAX;
+            for (idx, rp) in ref_list_l0.iter().enumerate() {
+                let (int_mv, int_sad) = full_search_int(
+                    &curr.luma,
+                    cx,
+                    cy,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    &rp.luma,
+                    mvp_l0_int,
+                    search_range,
+                );
+                let (mv_q16, sad) = refine_subpel(
+                    &curr.luma,
+                    cx,
+                    cy,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    &rp.luma,
+                    int_mv,
+                    int_sad,
+                )?;
+                if sad < best_sad_l0 {
+                    best_sad_l0 = sad;
+                    mv_l0_q16 = mv_q16;
+                    best_ref_idx_l0 = idx as u8;
+                }
+            }
+            let ref_l0_p = ref_list_l0[best_ref_idx_l0 as usize];
 
-            // ----- L1 list: MVP + integer-pel search + sub-pel refine -----
+            // ----- L1 list: MVP + per-ref integer-pel + sub-pel refine -----
             let mvp_l1_q16 = mv_field_l1.mvp_for(bx, by);
             let mvp_l1_int = (
                 ((mvp_l1_q16.0 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 ((mvp_l1_q16.1 + 8) >> 4).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             );
-            let (int_mv_l1, int_sad_l1) = full_search_int(
-                &curr.luma,
-                cx,
-                cy,
-                INTER_BLOCK_W,
-                INTER_BLOCK_H,
-                &ref_l1.luma,
-                mvp_l1_int,
-                search_range,
-            );
-            let (mv_l1_q16, _sad_l1) = refine_subpel(
-                &curr.luma,
-                cx,
-                cy,
-                INTER_BLOCK_W,
-                INTER_BLOCK_H,
-                &ref_l1.luma,
-                int_mv_l1,
-                int_sad_l1,
-            )?;
+            let mut best_ref_idx_l1: u8 = 0;
+            let mut mv_l1_q16: (i32, i32) = (0, 0);
+            let mut best_sad_l1: u32 = u32::MAX;
+            for (idx, rp) in ref_list_l1.iter().enumerate() {
+                let (int_mv, int_sad) = full_search_int(
+                    &curr.luma,
+                    cx,
+                    cy,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    &rp.luma,
+                    mvp_l1_int,
+                    search_range,
+                );
+                let (mv_q16, sad) = refine_subpel(
+                    &curr.luma,
+                    cx,
+                    cy,
+                    INTER_BLOCK_W,
+                    INTER_BLOCK_H,
+                    &rp.luma,
+                    int_mv,
+                    int_sad,
+                )?;
+                if sad < best_sad_l1 {
+                    best_sad_l1 = sad;
+                    mv_l1_q16 = mv_q16;
+                    best_ref_idx_l1 = idx as u8;
+                }
+            }
+            let ref_l1_p = ref_list_l1[best_ref_idx_l1 as usize];
 
             // ----- Form three candidate predictions -----
             let mut pred_l0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred_l0,
-                &ref_l0.luma,
+                &ref_l0_p.luma,
                 cx,
                 cy,
                 INTER_BLOCK_W,
@@ -1332,7 +1515,7 @@ pub fn encode_b_slice(
             let mut pred_l1 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred_l1,
-                &ref_l1.luma,
+                &ref_l1_p.luma,
                 cx,
                 cy,
                 INTER_BLOCK_W,
@@ -1408,15 +1591,15 @@ pub fn encode_b_slice(
             // inter_pred_idc (compact bypass form).
             encode_inter_pred_idc(&mut enc, idc)?;
             if active_l0 {
-                // ref_idx_l0 = 0.
-                enc.encode_bypass(0)?;
+                // ref_idx_l0 — truncated-unary, §9.3.3.7.
+                encode_ref_idx(&mut enc, best_ref_idx_l0, num_active_l0)?;
                 let mvd_l0 = (mv_l0_q16.0 - mvp_l0_q16.0, mv_l0_q16.1 - mvp_l0_q16.1);
                 encode_mvd_component(&mut enc, mvd_l0.0)?;
                 encode_mvd_component(&mut enc, mvd_l0.1)?;
             }
             if active_l1 {
-                // ref_idx_l1 = 0.
-                enc.encode_bypass(0)?;
+                // ref_idx_l1 — truncated-unary, §9.3.3.7.
+                encode_ref_idx(&mut enc, best_ref_idx_l1, num_active_l1)?;
                 let mvd_l1 = (mv_l1_q16.0 - mvp_l1_q16.0, mv_l1_q16.1 - mvp_l1_q16.1);
                 encode_mvd_component(&mut enc, mvd_l1.0)?;
                 encode_mvd_component(&mut enc, mvd_l1.1)?;
@@ -1435,8 +1618,8 @@ pub fn encode_b_slice(
 
             prepared.push(PreparedCu::InterBSlice {
                 inter_pred_idc: idc,
-                ref_idx_l0: 0,
-                ref_idx_l1: 0,
+                ref_idx_l0: if active_l0 { best_ref_idx_l0 } else { 0 },
+                ref_idx_l1: if active_l1 { best_ref_idx_l1 } else { 0 },
                 mv_l0: if active_l0 { mv_l0_q16 } else { (0, 0) },
                 mv_l1: if active_l1 { mv_l1_q16 } else { (0, 0) },
                 mvp_l0: mvp_l0_q16,
@@ -1452,8 +1635,8 @@ pub fn encode_b_slice(
     enc.encode_terminate(1)?;
     let cabac_bytes = enc.finish();
 
-    rec.cb = ref_l0.cb.clone();
-    rec.cr = ref_l0.cr.clone();
+    rec.cb = ref_list_l0[0].cb.clone();
+    rec.cr = ref_list_l0[0].cr.clone();
 
     let mut out = Vec::with_capacity(BSLICE_MAGIC.len() + 8 + hdr_bytes.len() + cabac_bytes.len());
     out.extend_from_slice(BSLICE_MAGIC);
@@ -1475,6 +1658,26 @@ pub fn decode_b_slice(
     ref_l0: &PictureBuffer,
     ref_l1: &PictureBuffer,
 ) -> Result<PictureBuffer> {
+    decode_b_slice_multi_ref(bytes, &[ref_l0], &[ref_l1])
+}
+
+/// Round-62 — decode one B-slice produced by
+/// [`encode_b_slice_multi_ref`]. Reads
+/// `num_ref_idx_l{0,1}_active_minus1` from the slice header, then for
+/// each block reads the truncated-unary `ref_idx_l0` / `ref_idx_l1`
+/// before each active list's MVD chain, and reconstructs from the
+/// chosen reference in `ref_list_l0` / `ref_list_l1`. Backwards-
+/// compatible with the single-ref wire produced by [`encode_b_slice`].
+pub fn decode_b_slice_multi_ref(
+    bytes: &[u8],
+    ref_list_l0: &[&PictureBuffer],
+    ref_list_l1: &[&PictureBuffer],
+) -> Result<PictureBuffer> {
+    if ref_list_l0.is_empty() || ref_list_l1.is_empty() {
+        return Err(Error::invalid(
+            "h266 B-slice decode: both ref lists must contain at least one picture",
+        ));
+    }
     if bytes.len() < BSLICE_MAGIC.len() + 8 {
         return Err(Error::invalid("h266 B-slice decode: payload too short"));
     }
@@ -1503,17 +1706,26 @@ pub fn decode_b_slice(
             hdr.slice_type
         )));
     }
+    let num_active_l0 = (hdr.num_ref_idx_l0_active_minus1 as usize) + 1;
+    let num_active_l1 = (hdr.num_ref_idx_l1_active_minus1 as usize) + 1;
+    if num_active_l0 > ref_list_l0.len() || num_active_l1 > ref_list_l1.len() {
+        return Err(Error::invalid(format!(
+            "h266 B-slice decode: slice header advertises {} L0 / {} L1 active refs, caller provided {} / {}",
+            num_active_l0,
+            num_active_l1,
+            ref_list_l0.len(),
+            ref_list_l1.len(),
+        )));
+    }
     let w = hdr.width as usize;
     let h = hdr.height as usize;
-    if w != ref_l0.luma.width
-        || h != ref_l0.luma.height
-        || w != ref_l1.luma.width
-        || h != ref_l1.luma.height
-    {
-        return Err(Error::invalid(format!(
-            "h266 B-slice decode: header geometry {}x{} vs refs {}x{} / {}x{}",
-            w, h, ref_l0.luma.width, ref_l0.luma.height, ref_l1.luma.width, ref_l1.luma.height,
-        )));
+    for rp in ref_list_l0.iter().chain(ref_list_l1.iter()) {
+        if w != rp.luma.width || h != rp.luma.height {
+            return Err(Error::invalid(format!(
+                "h266 B-slice decode: header geometry {}x{} vs reference {}x{}",
+                w, h, rp.luma.width, rp.luma.height,
+            )));
+        }
     }
     if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
         return Err(Error::invalid(format!(
@@ -1530,7 +1742,7 @@ pub fn decode_b_slice(
     let mut mv_field_l0 = MvField::new(cols, rows);
     let mut mv_field_l1 = MvField::new(cols, rows);
 
-    let mut out = ref_l0.clone();
+    let mut out = ref_list_l0[0].clone();
     out.luma.samples.fill(0);
 
     for by in 0..rows {
@@ -1557,14 +1769,16 @@ pub fn decode_b_slice(
             };
             let mut mv_l0_q16 = (0i32, 0i32);
             let mut mv_l1_q16 = (0i32, 0i32);
+            let mut ref_idx_l0: u8 = 0;
+            let mut ref_idx_l1: u8 = 0;
             if active_l0 {
-                let _ = dec.decode_bypass()?; // ref_idx_l0
+                ref_idx_l0 = decode_ref_idx(&mut dec, num_active_l0)?;
                 let mvd_x = decode_mvd_component(&mut dec)?;
                 let mvd_y = decode_mvd_component(&mut dec)?;
                 mv_l0_q16 = (mvp_l0_q16.0 + mvd_x, mvp_l0_q16.1 + mvd_y);
             }
             if active_l1 {
-                let _ = dec.decode_bypass()?; // ref_idx_l1
+                ref_idx_l1 = decode_ref_idx(&mut dec, num_active_l1)?;
                 let mvd_x = decode_mvd_component(&mut dec)?;
                 let mvd_y = decode_mvd_component(&mut dec)?;
                 mv_l1_q16 = (mvp_l1_q16.0 + mvd_x, mvp_l1_q16.1 + mvd_y);
@@ -1575,10 +1789,11 @@ pub fn decode_b_slice(
             let cbf_y = read_tu_y_coded_flag(&mut dec, &mut ctxs.residual, false, false, false)?;
             let pred = match idc {
                 InterPredIdc::L0 => {
+                    let ref_p = ref_list_l0[ref_idx_l0 as usize];
                     let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut pred,
-                        &ref_l0.luma,
+                        &ref_p.luma,
                         cx,
                         cy,
                         INTER_BLOCK_W,
@@ -1588,10 +1803,11 @@ pub fn decode_b_slice(
                     pred
                 }
                 InterPredIdc::L1 => {
+                    let ref_p = ref_list_l1[ref_idx_l1 as usize];
                     let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut pred,
-                        &ref_l1.luma,
+                        &ref_p.luma,
                         cx,
                         cy,
                         INTER_BLOCK_W,
@@ -1601,10 +1817,12 @@ pub fn decode_b_slice(
                     pred
                 }
                 InterPredIdc::Bi => {
+                    let ref_l0_p = ref_list_l0[ref_idx_l0 as usize];
+                    let ref_l1_p = ref_list_l1[ref_idx_l1 as usize];
                     let mut p0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut p0,
-                        &ref_l0.luma,
+                        &ref_l0_p.luma,
                         cx,
                         cy,
                         INTER_BLOCK_W,
@@ -1614,7 +1832,7 @@ pub fn decode_b_slice(
                     let mut p1 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut p1,
-                        &ref_l1.luma,
+                        &ref_l1_p.luma,
                         cx,
                         cy,
                         INTER_BLOCK_W,
@@ -1652,8 +1870,8 @@ pub fn decode_b_slice(
     }
 
     let _ = dec.decode_terminate()?;
-    out.cb = ref_l0.cb.clone();
-    out.cr = ref_l0.cr.clone();
+    out.cb = ref_list_l0[0].cb.clone();
+    out.cr = ref_list_l0[0].cr.clone();
     Ok(out)
 }
 
@@ -2060,6 +2278,62 @@ mod tests {
             let expected = ((p0[i] as u16 + p1[i] as u16 + 1) >> 1) as u8;
             assert_eq!(avg[i], expected, "mismatch at i={i}");
         }
+    }
+
+    // =================================================================
+    // Round-62 — multi-ref DPB unit tests
+    // =================================================================
+
+    #[test]
+    fn round62_ref_idx_truncated_unary_round_trip_all_sizes() {
+        // For each list length 1..=MAX_REF_PICS, every ref_idx in
+        // [0, num_active) round-trips through encode_ref_idx +
+        // decode_ref_idx with zero residual bits.
+        for num_active in 1..=MAX_REF_PICS {
+            for ref_idx in 0..num_active {
+                let mut enc = ArithEncoder::new();
+                encode_ref_idx(&mut enc, ref_idx as u8, num_active).unwrap();
+                let mut bytes = enc.finish();
+                bytes.extend_from_slice(&[0u8; 32]);
+                let mut dec = ArithDecoder::new(&bytes).unwrap();
+                let got = decode_ref_idx(&mut dec, num_active).unwrap();
+                assert_eq!(
+                    got, ref_idx as u8,
+                    "ref_idx round-trip failed at num_active={num_active}, ref_idx={ref_idx}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round62_ref_idx_single_active_emits_no_bins() {
+        // num_active == 1 ⇒ ref_idx is inferred to 0; the encoder must
+        // not consume any bypass bins. Pin this via "encode followed by
+        // a sentinel bypass round-trips clean".
+        let mut enc = ArithEncoder::new();
+        encode_ref_idx(&mut enc, 0, 1).unwrap();
+        // Emit a sentinel that the decoder must read.
+        enc.encode_bypass(1).unwrap();
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&bytes).unwrap();
+        let got = decode_ref_idx(&mut dec, 1).unwrap();
+        assert_eq!(got, 0);
+        let sentinel = dec.decode_bypass().unwrap();
+        assert_eq!(sentinel, 1, "single-active ref_idx leaked a bin");
+    }
+
+    #[test]
+    fn round62_ref_idx_clamps_at_cap() {
+        // Trying to emit ref_idx == num_active - 1 (the largest valid
+        // value) writes no terminator; an over-cap value clamps to cap.
+        let mut enc = ArithEncoder::new();
+        encode_ref_idx(&mut enc, 3, 3).unwrap(); // clamps to 2
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&bytes).unwrap();
+        let got = decode_ref_idx(&mut dec, 3).unwrap();
+        assert_eq!(got, 2, "ref_idx clamp at cap not honoured");
     }
 
     #[test]
