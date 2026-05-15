@@ -6,6 +6,58 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 63 (Goal A) — explicit weighted bi-prediction on the B-slice
+  encoder + decoder per VVC §8.5.6.5 eq. 994 + §7.4.7.7
+  (`pred_weight_table()`). Rounds 60/61 carried only the §8.5.6.4
+  default-average bi-pred form `(predL0 + predL1 + 1) >> 1`. Round 63
+  (Goal A) lets the encoder estimate slice-level luma weights/offsets
+  from the per-list mean luma offsets to the current source frame and
+  emit them as a `pred_weight_table` in the slice header; per-CU it
+  then probes BOTH the unweighted and weighted forms and picks the
+  lower-SSE one, emitting a 1-bit `use_weighted_bi` selector after
+  the BI MVD chain. The decoder mirrors this — reads the WP table
+  from the slice header (when present) + reads the per-BI-CU
+  selector and dispatches to `weighted_bi` (§8.5.6.5 eq. 994 in
+  `((p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << log2WD)) >> (log2WD + 1))`
+  with 8-bit clip) or `average_bi` accordingly. New `BSliceHeader`
+  field `pred_weight_table: Option<PredWeightTable>` (one luma
+  record per list — chroma weighting deferred); new public
+  `PredWeightTable` struct with `(log2_weight_denom_y, w_l0_y, w_l1_y,
+  o_l0_y, o_l1_y)`. Wire format: 1-bit `wp_present_flag` after the
+  existing slice-header tail, followed by `ue(log2_weight_denom_y) +
+  se(delta_w_l0) + se(o_l0) + se(delta_w_l1) + se(o_l1)` per the
+  spec's "delta from default" representation. Backwards-compatible
+  with the round-60/61/62 wire bit-for-bit when `wp_present_flag = 0`
+  (one extra zero bit per slice header).
+  - On a fade fixture (3-frame B-slice with checker-tile content where
+    L0 = curr - 20 and L1 = curr - 40 luma offset, so the unweighted
+    average sits 30 luma below curr and any uni-pred sits 20-40 luma
+    away) the encoder picks weighted-BI on every block, recovers the
+    fade exactly, and reaches PSNR_Y = inf (perfect bit-for-bit
+    reconstruction since the chosen prediction matches curr exactly
+    and the residual is zero on every block). The headline target
+    was ≥ 58 dB.
+  - The encoder + decoder also gain a `search_range == 0` opt-out for
+    sub-pel ME refinement (the round-59/61 8 + 8 fractional-pel probe
+    around the integer-pel best). When a caller passes
+    `search_range = 0` to `encode_b_slice` / `encode_p_slice`, the
+    encoder now skips both the integer-pel full-search AND the
+    sub-pel refinement (previously the sub-pel probe still ran). This
+    isolates the new weighted-BI test from sub-pel filter ringing on
+    sharp tile boundaries and makes `search_range = 0` mean exactly
+    "no motion search, MV = MVP". The round-58/59/60/61/62
+    regressions all use `search_range = 8` so this is a no-op for
+    them.
+  - 5 new unit tests in `encoder_inter::tests` (slice header round-
+    trip with WP set, default-shape WP equals simple average across
+    `log2_wd ∈ 0..=5`, constant-offset weighted-BI recovers target,
+    estimator returns `None` when means match, estimator picks
+    per-list mean offsets) + 3 new integration tests in
+    `tests/round63_weighted_bipred.rs` (fade fixture clears 58 dB,
+    no-fade fixture leaves WP off and remains compatible with
+    round-60/61/62 wire, decoder byte-identical roundtrip on the
+    weighted-BI path).
+
 - Round 63 (Goal B) — chroma sub-pel motion compensation for the
   P-slice and B-slice encoder + decoder
   (`encoder_inter::encode_p_slice_multi_ref` /

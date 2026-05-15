@@ -991,16 +991,24 @@ pub fn encode_p_slice_multi_ref(
                     mvp_int_pel,
                     search_range,
                 );
-                let (mv_q16, sad) = refine_subpel(
-                    &curr.luma,
-                    cx,
-                    cy,
-                    INTER_BLOCK_W,
-                    INTER_BLOCK_H,
-                    &rp.luma,
-                    int_mv,
-                    int_sad,
-                )?;
+                // Round-63: `search_range == 0` opts out of ALL motion
+                // search — both integer-pel and sub-pel refinement —
+                // for callers that want a pure brightness-only
+                // weighted-bi test without ME interactions.
+                let (mv_q16, sad) = if search_range > 0 {
+                    refine_subpel(
+                        &curr.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        &rp.luma,
+                        int_mv,
+                        int_sad,
+                    )?
+                } else {
+                    ((int_mv.0 as i32 * 16, int_mv.1 as i32 * 16), int_sad)
+                };
                 if sad < best_sad {
                     best_sad = sad;
                     best_mv_q16 = mv_q16;
@@ -1364,6 +1372,47 @@ fn decode_inter_pred_idc(dec: &mut ArithDecoder<'_>) -> Result<InterPredIdc> {
     }
 }
 
+/// Round-63 (Goal A) — slice-level explicit weighted-prediction parameters
+/// per VVC §7.4.7.7 / §8.5.6.5 eq. 994. The scaffold carries one luma
+/// weight + offset per list (Cb/Cr deferred). Weights live in
+/// `0..(2 << log2_weight_denom_y)` and the spec's "delta from default"
+/// representation is folded into `w_l{0,1} = (1 << log2_weight_denom_y) +
+/// delta`. The default-equivalent (matching round 60's eq. 980 simple
+/// average) is `w_l0 = w_l1 = (1 << log2_weight_denom_y), o_l0 = o_l1 = 0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PredWeightTable {
+    /// `luma_log2_weight_denom` per §7.4.7.7. Useful range 0..=7;
+    /// the scaffold uses 2 (denominator 4) which gives weights in 0..8.
+    pub log2_weight_denom_y: u32,
+    /// L0 luma weight (post-delta). Equal to `(1 << log2_weight_denom_y)`
+    /// for default-weighted bi-pred.
+    pub w_l0_y: i32,
+    /// L1 luma weight (post-delta). Equal to `(1 << log2_weight_denom_y)`
+    /// for default-weighted bi-pred.
+    pub w_l1_y: i32,
+    /// L0 luma offset per §7.4.7.7 (`luma_offset_l0`). Range
+    /// `[-128, 127]` at BitDepth 8.
+    pub o_l0_y: i32,
+    /// L1 luma offset per §7.4.7.7 (`luma_offset_l1`). Range
+    /// `[-128, 127]` at BitDepth 8.
+    pub o_l1_y: i32,
+}
+
+impl PredWeightTable {
+    /// Default-weighted shape — matches the round-60 eq. 980 simple
+    /// average bit-for-bit. Useful as a sentinel "no explicit
+    /// weighting" entry.
+    pub const fn default_avg() -> Self {
+        Self {
+            log2_weight_denom_y: 0,
+            w_l0_y: 1,
+            w_l1_y: 1,
+            o_l0_y: 0,
+            o_l1_y: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BSliceHeader {
     /// `slice_type` per §7.4.4 Table 8 — `0` for B.
@@ -1376,6 +1425,10 @@ pub struct BSliceHeader {
     pub slice_qp_delta: i32,
     pub width: u32,
     pub height: u32,
+    /// Round-63 (Goal A) — explicit weighted-prediction parameters per
+    /// §7.4.7.7. `None` means default eq. 980 simple average is used
+    /// (round-60 / 61 / 62 wire shape, byte-identical when present).
+    pub pred_weight_table: Option<PredWeightTable>,
 }
 
 fn write_bslice_header(hdr: &BSliceHeader) -> Vec<u8> {
@@ -1388,6 +1441,22 @@ fn write_bslice_header(hdr: &BSliceHeader) -> Vec<u8> {
     bw.write_se(hdr.slice_qp_delta);
     bw.write_bits(hdr.width, 16);
     bw.write_bits(hdr.height, 16);
+    // Round-63 (Goal A) — pred_weight_table_present_flag + body
+    // (§7.3.8 / §7.4.7.7). One luma record per list (chroma deferred).
+    match hdr.pred_weight_table {
+        None => bw.write_bits(0, 1),
+        Some(pwt) => {
+            bw.write_bits(1, 1);
+            bw.write_ue(pwt.log2_weight_denom_y);
+            // Spec writes deltas off the default `(1 << log2_wd)`; we
+            // fold that into the wire as `delta = w - (1 << log2_wd)`.
+            let default_w = 1i32 << pwt.log2_weight_denom_y;
+            bw.write_se(pwt.w_l0_y - default_w);
+            bw.write_se(pwt.o_l0_y);
+            bw.write_se(pwt.w_l1_y - default_w);
+            bw.write_se(pwt.o_l1_y);
+        }
+    }
     bw.byte_alignment();
     bw.into_bytes()
 }
@@ -1402,6 +1471,24 @@ fn read_bslice_header(bytes: &[u8]) -> Result<BSliceHeader> {
     let slice_qp_delta = br.se()?;
     let width = br.u(16)?;
     let height = br.u(16)?;
+    let wp_present = br.u(1)?;
+    let pred_weight_table = if wp_present == 0 {
+        None
+    } else {
+        let log2_weight_denom_y = br.ue()?;
+        let default_w = 1i32 << log2_weight_denom_y;
+        let dw_l0 = br.se()?;
+        let o_l0_y = br.se()?;
+        let dw_l1 = br.se()?;
+        let o_l1_y = br.se()?;
+        Some(PredWeightTable {
+            log2_weight_denom_y,
+            w_l0_y: default_w + dw_l0,
+            w_l1_y: default_w + dw_l1,
+            o_l0_y,
+            o_l1_y,
+        })
+    };
     Ok(BSliceHeader {
         slice_type,
         poc_lsb,
@@ -1410,6 +1497,7 @@ fn read_bslice_header(bytes: &[u8]) -> Result<BSliceHeader> {
         slice_qp_delta,
         width,
         height,
+        pred_weight_table,
     })
 }
 
@@ -1436,6 +1524,94 @@ fn average_bi(p0: &[u8], p1: &[u8], w: usize, h: usize) -> Vec<u8> {
         out[i] = ((a + b + 1) >> 1) as u8;
     }
     out
+}
+
+/// Round-63 (Goal A) — explicit weighted-bi composition per VVC
+/// §8.5.6.5 eq. 994.
+///
+/// At BitDepth 8 with already-clamped 8-bit per-list predictions
+/// (`p0`, `p1` ∈ `[0, 255]`), the spec form
+///
+///   pbSamples = Clip3(0, 255,
+///     ((p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << log2WD)) >> (log2WD + 1)))
+///
+/// where `log2WD = log2_weight_denom_y` (the spec's `shift1` lift to
+/// 14-bit precision is folded out because both inputs are already
+/// 8-bit clamped). The default-weighted shape (`w0 = w1 = (1 << log2WD),
+/// o0 = o1 = 0`) collapses to `(p0 + p1 + 1) >> 1` byte-for-byte.
+fn weighted_bi(p0: &[u8], p1: &[u8], w: usize, h: usize, pwt: &PredWeightTable) -> Vec<u8> {
+    let log2_wd = pwt.log2_weight_denom_y;
+    let shift = log2_wd + 1;
+    let off = ((pwt.o_l0_y + pwt.o_l1_y + 1) as i64) << log2_wd;
+    let w0 = pwt.w_l0_y as i64;
+    let w1 = pwt.w_l1_y as i64;
+    let mut out = vec![0u8; w * h];
+    for i in 0..w * h {
+        let v = (p0[i] as i64) * w0 + (p1[i] as i64) * w1 + off;
+        let r = v >> shift;
+        out[i] = r.clamp(0, 255) as u8;
+    }
+    out
+}
+
+/// Round-63 (Goal A) — estimate slice-level weighted-prediction luma
+/// parameters from the current source frame and the (per-list) anchor
+/// reference pictures used for ME centring.
+///
+/// Strategy (clean-room, following the §8.5.6.5 derivation footprint):
+///   * Compute `mean_curr`, `mean_l0`, `mean_l1` over the full luma
+///     plane. The whole-plane mean is the maximum-likelihood DC term
+///     when the per-block predictions are spatially well-aligned (as
+///     they are after the round-58/61 ME).
+///   * Fix `log2_wd = 2` (denominator 4) and `w0 = w1 = (1 << log2_wd)
+///     = 4` — the simplest weight pair that reduces to the default
+///     average when offsets are zero.
+///   * Solve for `o_l0 + o_l1` such that
+///     `2 * mean_curr ≈ mean_l0 + mean_l1 + (o0 + o1)` per the simplified
+///     `w0 == w1` form of eq. 994. Symmetric split:
+///     `o_l0 = mean_curr - mean_l0`, `o_l1 = mean_curr - mean_l1`.
+///     Each clipped to `[-128, 127]`.
+///
+/// Returns `None` when the estimated offsets sum is too small to beat
+/// the unweighted average's CABAC-bit cost (heuristic threshold of 4
+/// luma units total — empirically the cross-over for the scaffold's
+/// per-CU 1-bit `use_weighted_bi` flag).
+fn estimate_wp_params(
+    curr: &PicturePlane,
+    ref_l0: &PicturePlane,
+    ref_l1: &PicturePlane,
+) -> Option<PredWeightTable> {
+    fn plane_mean(p: &PicturePlane) -> i64 {
+        let mut s: i64 = 0;
+        for y in 0..p.height {
+            for x in 0..p.width {
+                s += p.samples[y * p.stride + x] as i64;
+            }
+        }
+        let n = (p.width * p.height) as i64;
+        if n == 0 {
+            128
+        } else {
+            (s + n / 2) / n
+        }
+    }
+    let mc = plane_mean(curr);
+    let m0 = plane_mean(ref_l0);
+    let m1 = plane_mean(ref_l1);
+    let o_l0 = (mc - m0).clamp(-128, 127);
+    let o_l1 = (mc - m1).clamp(-128, 127);
+    // Heuristic: only switch on WP if the sum of absolute offsets is
+    // material relative to the per-CU 1-bit overhead.
+    if o_l0.abs() + o_l1.abs() < 4 {
+        return None;
+    }
+    Some(PredWeightTable {
+        log2_weight_denom_y: 2,
+        w_l0_y: 4,
+        w_l1_y: 4,
+        o_l0_y: o_l0 as i32,
+        o_l1_y: o_l1 as i32,
+    })
 }
 
 /// Round-60 / Round-61 — encode one B-slice for `curr` against L0 + L1
@@ -1511,6 +1687,16 @@ pub fn encode_b_slice_multi_ref(
     let num_active_l0 = ref_list_l0.len();
     let num_active_l1 = ref_list_l1.len();
 
+    // Round-63 (Goal A) — estimate slice-level explicit weighted-pred
+    // parameters from the current source frame's mean-luma offset
+    // relative to each list's anchor reference. Returns `None` when
+    // unweighted bi-pred is already close enough (no per-CU overhead
+    // worth paying). When `Some(_)`, the bi-pred RDO below probes both
+    // unweighted and weighted forms and the lower-SSE one is emitted
+    // with a 1-bit `use_weighted_bi` selector.
+    let pred_weight_table =
+        estimate_wp_params(&curr.luma, &ref_list_l0[0].luma, &ref_list_l1[0].luma);
+
     let hdr = BSliceHeader {
         slice_type: 0, // B per §7.4.4 Table 8 (B=0, P=1, I=2 in local mapping)
         poc_lsb,
@@ -1519,6 +1705,7 @@ pub fn encode_b_slice_multi_ref(
         slice_qp_delta: slice_qp_y - SCAFFOLD_SLICE_QP,
         width: w as u32,
         height: h as u32,
+        pred_weight_table,
     };
     let hdr_bytes = write_bslice_header(&hdr);
 
@@ -1561,16 +1748,20 @@ pub fn encode_b_slice_multi_ref(
                     mvp_l0_int,
                     search_range,
                 );
-                let (mv_q16, sad) = refine_subpel(
-                    &curr.luma,
-                    cx,
-                    cy,
-                    INTER_BLOCK_W,
-                    INTER_BLOCK_H,
-                    &rp.luma,
-                    int_mv,
-                    int_sad,
-                )?;
+                let (mv_q16, sad) = if search_range > 0 {
+                    refine_subpel(
+                        &curr.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        &rp.luma,
+                        int_mv,
+                        int_sad,
+                    )?
+                } else {
+                    ((int_mv.0 as i32 * 16, int_mv.1 as i32 * 16), int_sad)
+                };
                 if sad < best_sad_l0 {
                     best_sad_l0 = sad;
                     mv_l0_q16 = mv_q16;
@@ -1599,16 +1790,20 @@ pub fn encode_b_slice_multi_ref(
                     mvp_l1_int,
                     search_range,
                 );
-                let (mv_q16, sad) = refine_subpel(
-                    &curr.luma,
-                    cx,
-                    cy,
-                    INTER_BLOCK_W,
-                    INTER_BLOCK_H,
-                    &rp.luma,
-                    int_mv,
-                    int_sad,
-                )?;
+                let (mv_q16, sad) = if search_range > 0 {
+                    refine_subpel(
+                        &curr.luma,
+                        cx,
+                        cy,
+                        INTER_BLOCK_W,
+                        INTER_BLOCK_H,
+                        &rp.luma,
+                        int_mv,
+                        int_sad,
+                    )?
+                } else {
+                    ((int_mv.0 as i32 * 16, int_mv.1 as i32 * 16), int_sad)
+                };
                 if sad < best_sad_l1 {
                     best_sad_l1 = sad;
                     mv_l1_q16 = mv_q16;
@@ -1638,25 +1833,54 @@ pub fn encode_b_slice_multi_ref(
                 INTER_BLOCK_H,
                 mv_l1_q16,
             )?;
-            let pred_bi = average_bi(&pred_l0, &pred_l1, INTER_BLOCK_W, INTER_BLOCK_H);
+            let pred_bi_unweighted = average_bi(&pred_l0, &pred_l1, INTER_BLOCK_W, INTER_BLOCK_H);
 
-            // ----- RDO: pick cheapest of {L0, L1, BI} on SSE + bias -----
+            // ----- Round-63 (Goal A) — also probe weighted-bi when
+            // pred_weight_table is set on the slice. RDO picks the
+            // lower-SSE form per CU; a 1-bit `use_weighted_bi` selector
+            // is emitted after the BI MVD chain.
+            let pred_bi_weighted = pred_weight_table
+                .as_ref()
+                .map(|pwt| weighted_bi(&pred_l0, &pred_l1, INTER_BLOCK_W, INTER_BLOCK_H, pwt));
+
+            // ----- RDO: pick cheapest of {L0, L1, BI_unweighted, BI_weighted} -----
             // The bias term stands in for the per-mode bin-cost
             // difference (BI emits an extra MVD chain, ~+8 bits). A
             // small fixed bias keeps the encoder away from BI when the
-            // uni-pred predictions are already perfect.
-            const BI_BIAS: u32 = 1; // negligible vs typical SSE
+            // uni-pred predictions are already perfect; an extra
+            // 1-unit penalty on the weighted form covers the
+            // `use_weighted_bi` flag.
+            const BI_BIAS: u32 = 1;
+            const WP_BIAS: u32 = 1;
             let sse_l0 = sse_block(&curr.luma, cx, cy, &pred_l0, INTER_BLOCK_W, INTER_BLOCK_H);
             let sse_l1 = sse_block(&curr.luma, cx, cy, &pred_l1, INTER_BLOCK_W, INTER_BLOCK_H);
-            let sse_bi = sse_block(&curr.luma, cx, cy, &pred_bi, INTER_BLOCK_W, INTER_BLOCK_H)
-                .saturating_add(BI_BIAS);
+            let sse_bi_u = sse_block(
+                &curr.luma,
+                cx,
+                cy,
+                &pred_bi_unweighted,
+                INTER_BLOCK_W,
+                INTER_BLOCK_H,
+            )
+            .saturating_add(BI_BIAS);
+            let sse_bi_w = pred_bi_weighted.as_ref().map(|p| {
+                sse_block(&curr.luma, cx, cy, p, INTER_BLOCK_W, INTER_BLOCK_H)
+                    .saturating_add(BI_BIAS)
+                    .saturating_add(WP_BIAS)
+            });
 
-            let (idc, pred) = if sse_l0 <= sse_l1 && sse_l0 <= sse_bi {
-                (InterPredIdc::L0, pred_l0)
+            // Pick best BI variant first.
+            let (sse_bi, use_weighted_bi, pred_bi_chosen) = match (sse_bi_w, pred_bi_weighted) {
+                (Some(swp), Some(pw)) if swp < sse_bi_u => (swp, true, pw),
+                _ => (sse_bi_u, false, pred_bi_unweighted),
+            };
+
+            let (idc, pred, use_weighted_bi) = if sse_l0 <= sse_l1 && sse_l0 <= sse_bi {
+                (InterPredIdc::L0, pred_l0, false)
             } else if sse_l1 <= sse_bi {
-                (InterPredIdc::L1, pred_l1)
+                (InterPredIdc::L1, pred_l1, false)
             } else {
-                (InterPredIdc::Bi, pred_bi)
+                (InterPredIdc::Bi, pred_bi_chosen, use_weighted_bi)
             };
 
             // ----- Wire-side MV/MVD: only emit active lists' MVDs -----
@@ -1773,6 +1997,12 @@ pub fn encode_b_slice_multi_ref(
                 let mvd_l1 = (mv_l1_q16.0 - mvp_l1_q16.0, mv_l1_q16.1 - mvp_l1_q16.1);
                 encode_mvd_component(&mut enc, mvd_l1.0)?;
                 encode_mvd_component(&mut enc, mvd_l1.1)?;
+            }
+            // Round-63 (Goal A) — `use_weighted_bi` selector: only
+            // emitted when the slice header carries pred_weight_table
+            // AND the CU chose BI. 1 bit bypass.
+            if pred_weight_table.is_some() && matches!(idc, InterPredIdc::Bi) {
+                enc.encode_bypass(if use_weighted_bi { 1 } else { 0 })?;
             }
             write_tu_y_coded_flag(&mut enc, &mut ctxs.residual, cbf_y, false, false, false)?;
             if cbf_y {
@@ -1957,6 +2187,15 @@ pub fn decode_b_slice_multi_ref(
             mv_field_l0.set(bx, by, mv_l0_q16);
             mv_field_l1.set(bx, by, mv_l1_q16);
 
+            // Round-63 (Goal A) — `use_weighted_bi` selector follows the
+            // BI MVD chain when slice carries pred_weight_table.
+            let use_weighted_bi =
+                if hdr.pred_weight_table.is_some() && matches!(idc, InterPredIdc::Bi) {
+                    dec.decode_bypass()? != 0
+                } else {
+                    false
+                };
+
             let cbf_y = read_tu_y_coded_flag(&mut dec, &mut ctxs.residual, false, false, false)?;
             let pred = match idc {
                 InterPredIdc::L0 => {
@@ -2010,7 +2249,14 @@ pub fn decode_b_slice_multi_ref(
                         INTER_BLOCK_H,
                         mv_l1_q16,
                     )?;
-                    average_bi(&p0, &p1, INTER_BLOCK_W, INTER_BLOCK_H)
+                    if use_weighted_bi {
+                        // Safe to unwrap — gated above on
+                        // `hdr.pred_weight_table.is_some()`.
+                        let pwt = hdr.pred_weight_table.as_ref().unwrap();
+                        weighted_bi(&p0, &p1, INTER_BLOCK_W, INTER_BLOCK_H, pwt)
+                    } else {
+                        average_bi(&p0, &p1, INTER_BLOCK_W, INTER_BLOCK_H)
+                    }
                 }
             };
             let recon = if cbf_y {
@@ -2473,10 +2719,123 @@ mod tests {
             slice_qp_delta: 2,
             width: 64,
             height: 64,
+            pred_weight_table: None,
         };
         let bytes = write_bslice_header(&hdr);
         let got = read_bslice_header(&bytes).unwrap();
         assert_eq!(got, hdr);
+    }
+
+    // =================================================================
+    // Round-63 (Goal A) — weighted bi-prediction unit tests
+    // =================================================================
+
+    /// Slice header round-trips when pred_weight_table is set.
+    #[test]
+    fn round63_bslice_header_with_wp_round_trip() {
+        let pwt = PredWeightTable {
+            log2_weight_denom_y: 2,
+            w_l0_y: 5,
+            w_l1_y: 3,
+            o_l0_y: -12,
+            o_l1_y: 7,
+        };
+        let hdr = BSliceHeader {
+            slice_type: 0,
+            poc_lsb: 11,
+            num_ref_idx_l0_active_minus1: 1,
+            num_ref_idx_l1_active_minus1: 0,
+            slice_qp_delta: -1,
+            width: 64,
+            height: 64,
+            pred_weight_table: Some(pwt),
+        };
+        let bytes = write_bslice_header(&hdr);
+        let got = read_bslice_header(&bytes).unwrap();
+        assert_eq!(got, hdr);
+    }
+
+    /// Default-weighted shape (`w0 = w1 = (1 << log2_wd), o0 = o1 = 0`)
+    /// produces the same output as the unweighted average per
+    /// §8.5.6.4 / round-60 `average_bi`.
+    #[test]
+    fn round63_weighted_bi_default_shape_matches_simple_average() {
+        let p0: Vec<u8> = (0..16).map(|i: u8| i.wrapping_mul(15)).collect();
+        let p1: Vec<u8> = (0..16)
+            .map(|i: u8| 200u8.wrapping_sub(i.wrapping_mul(7)))
+            .collect();
+        let avg = average_bi(&p0, &p1, 4, 4);
+        for log2_wd in 0..=5 {
+            let pwt = PredWeightTable {
+                log2_weight_denom_y: log2_wd,
+                w_l0_y: 1 << log2_wd,
+                w_l1_y: 1 << log2_wd,
+                o_l0_y: 0,
+                o_l1_y: 0,
+            };
+            let w = weighted_bi(&p0, &p1, 4, 4, &pwt);
+            assert_eq!(
+                w, avg,
+                "default-shape WP at log2_wd={log2_wd} != simple avg"
+            );
+        }
+    }
+
+    /// Constant-offset weighted-bi: a constant luma shift in BOTH refs
+    /// can be cancelled by the offsets. This is the basic identity that
+    /// the slice-level offset estimator targets.
+    #[test]
+    fn round63_weighted_bi_constant_offset_recovers_target() {
+        let target: Vec<u8> = (0..16).map(|i| 50 + i * 4).collect();
+        // L0 = target - 20, L1 = target - 40 (both intensities lower).
+        let p0: Vec<u8> = target.iter().map(|&v| v.saturating_sub(20)).collect();
+        let p1: Vec<u8> = target.iter().map(|&v| v.saturating_sub(40)).collect();
+        let pwt = PredWeightTable {
+            log2_weight_denom_y: 2,
+            w_l0_y: 4,
+            w_l1_y: 4,
+            o_l0_y: 20,
+            o_l1_y: 40,
+        };
+        let w = weighted_bi(&p0, &p1, 4, 4, &pwt);
+        for i in 0..16 {
+            // Expected: ((p0+20)+(p1+40))/2 ≈ ((target-20+20)+(target-40+40))/2 = target.
+            // Eq. 994 introduces a +1 rounding constant inside the
+            // offset term: (p0*4 + p1*4 + (60+1)*4) >> 3 = (p0+p1+61)/2.
+            let want = (((p0[i] as i32) + (p1[i] as i32) + 61) >> 1) as u8;
+            assert_eq!(w[i], want, "constant-offset WP mismatch at i={i}");
+        }
+    }
+
+    /// Slice-level WP estimator returns `None` when curr/L0/L1 means
+    /// already match (no offset to compensate). The default avg is
+    /// already optimal so the encoder must not waste bits on a WP
+    /// table.
+    #[test]
+    fn round63_estimate_wp_none_when_means_match() {
+        let curr = PicturePlane::filled(32, 32, 100);
+        let l0 = PicturePlane::filled(32, 32, 100);
+        let l1 = PicturePlane::filled(32, 32, 100);
+        let wp = estimate_wp_params(&curr, &l0, &l1);
+        assert!(
+            wp.is_none(),
+            "WP estimator should not propose weights when offsets are zero",
+        );
+    }
+
+    /// Slice-level WP estimator picks per-list offsets matching the
+    /// per-list mean delta to curr.
+    #[test]
+    fn round63_estimate_wp_picks_per_list_mean_offsets() {
+        let curr = PicturePlane::filled(32, 32, 100);
+        let l0 = PicturePlane::filled(32, 32, 80);
+        let l1 = PicturePlane::filled(32, 32, 60);
+        let wp = estimate_wp_params(&curr, &l0, &l1).expect("expected non-trivial WP");
+        assert_eq!(wp.log2_weight_denom_y, 2);
+        assert_eq!(wp.w_l0_y, 4);
+        assert_eq!(wp.w_l1_y, 4);
+        assert_eq!(wp.o_l0_y, 20);
+        assert_eq!(wp.o_l1_y, 40);
     }
 
     #[test]

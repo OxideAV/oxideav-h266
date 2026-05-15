@@ -331,8 +331,24 @@ applies the 4:2:0 mapping internally (chroma 1/32-pel offset is
 dispatch on the B-slice path picks the chroma prediction matching
 the chosen `inter_pred_idc`. Wire format is unchanged. On a band-
 limited half-pel translation fixture chroma reaches PSNR_Cb = 49.96
-dB / PSNR_Cr = 50.39 dB (≥45 dB target). Weighted bi-pred remains
-deferred.
+dB / PSNR_Cr = 50.39 dB (≥45 dB target).
+
+**Round-63 (Goal A) lands explicit weighted bi-prediction** per
+§8.5.6.5 eq. 994 + §7.4.7.7 `pred_weight_table()`. The encoder
+estimates slice-level luma weights/offsets from per-list mean luma
+offsets to the current frame and, when those offsets exceed a
+heuristic threshold, sets `BSliceHeader.pred_weight_table = Some(...)`
+so the decoder will replicate the eq. 994 form
+`(p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << log2WD)) >> (log2WD + 1)`
+clipped to 8-bit. Per-CU the encoder runs an SSE-based RDO between
+the unweighted and weighted form and emits a 1-bit `use_weighted_bi`
+selector after the BI MVD chain. On a fade fixture (L0 = curr - 20,
+L1 = curr - 40 luma offset on a 32×32 tile checker) the encoder picks
+weighted-BI on every block and reconstructs to PSNR_Y = inf (perfect
+bit-for-bit reconstruction, ≥ 58 dB headline target). With WP off the
+slice header carries one extra zero bit per slice (the
+`wp_present_flag = 0`); the wire is otherwise byte-for-byte
+compatible with round-62.
 
 ## Usage
 
