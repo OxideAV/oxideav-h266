@@ -6,6 +6,44 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 63 (Goal B) — chroma sub-pel motion compensation for the
+  P-slice and B-slice encoder + decoder
+  (`encoder_inter::encode_p_slice_multi_ref` /
+  `encoder_inter::encode_b_slice_multi_ref` and the matching
+  `decode_*` calls). Rounds 58/60/61 carried luma 8-tap sub-pel MC
+  (§8.5.6.3.2 Table 27) but the chroma planes were passed through from
+  L0[0] unchanged. Round 63 wires the §8.5.6.3.4 4-tap chroma
+  interpolation filter (Table 28) so chroma half-pel + quarter-pel
+  positions get spec-correct interpolation, reusing the luma 1/16-pel
+  MV (predict_chroma_block applies the 4:2:0 mapping internally —
+  chroma 1/32-pel offset is `mv & 31`, integer chroma offset is
+  `mv >> 5`). New `encoder_inter::mc_predict_chroma_subpel` /
+  `mc_predict_chroma_subpel_bi` helpers wrap the existing
+  `crate::inter::predict_chroma_block` with the same `(cx, cy)`-folded
+  source-position derivation that `mc_predict_subpel` uses for luma.
+  The P-slice, B-slice {L0, L1, BI} dispatches now write
+  motion-compensated Cb + Cr into `rec.cb` / `rec.cr` instead of the
+  L0[0] pass-through; the decoder mirrors this so encoder + decoder
+  chroma are byte-identical. Wire format unchanged (no new bins —
+  chroma reuses the per-CU luma MVs already on the wire).
+  - On a half-pel translation fixture (band-limited horizontal
+    sinusoid in luma + chroma at different frequencies, 64×64 luma
+    with 32×32 4:2:0 chroma) the P-slice path reaches PSNR_Cb =
+    49.96 dB / PSNR_Cr = 50.39 dB while luma still hits the round-59
+    half-pel ceiling at PSNR_Y = 51.57 dB. Both chroma channels clear
+    the 45 dB headline target with ~5 dB of headroom. The B-slice
+    path on the same fixture (with matched references so BI
+    degenerates to uni-pred) hits the same chroma quality.
+  - 4 new unit tests in `encoder_inter::tests` (zero-MV chroma MC is
+    identity, integer-MV chroma MC translates the block exactly,
+    half-pel chroma MC preserves a constant DC plane across all 32×32
+    fractional positions, BI chroma helper averages per-list
+    predictions per §8.5.6.4) + 5 new integration tests in
+    `tests/round63_chroma_subpel.rs` (P-slice half-pel chroma ≥ 45 dB,
+    P-slice chroma decoder byte-identical, B-slice half-pel chroma
+    ≥ 45 dB, constant-chroma plane preserved through sub-pel,
+    integer-pel chroma recovers perfectly).
+
 - Round 62 — multi-reference DPB on the P-slice and B-slice
   encoder + decoder (`encoder_inter::encode_p_slice_multi_ref` /
   `encoder_inter::decode_p_slice_multi_ref` /

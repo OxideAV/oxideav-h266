@@ -48,7 +48,7 @@ use oxideav_core::{Error, Result};
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::cabac_enc::ArithEncoder;
 use crate::dequant::{dequantize_tb_flat, DequantParams};
-use crate::inter::{predict_luma_block, MotionVector};
+use crate::inter::{predict_chroma_block, predict_luma_block, MotionVector};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::{read_tu_y_coded_flag, ResidualCtxs};
 use crate::residual_enc::{encode_tb_coefficients, write_tu_y_coded_flag};
@@ -468,6 +468,84 @@ fn mc_predict_subpel(
     Ok(())
 }
 
+/// Round-63 — chroma 4-tap sub-pel motion-compensated prediction for one
+/// inter block (4:2:0, single chroma component).
+///
+/// Mirrors [`mc_predict_subpel`] but invokes the §8.5.6.3.4 4-tap chroma
+/// interpolation filter (Table 28) via [`predict_chroma_block`]. Inputs:
+///
+///   * `pred_c` — output buffer, `w_c * h_c` chroma samples (row-major).
+///   * `ref_c` — reference chroma plane (Cb or Cr).
+///   * `cx_c` / `cy_c` — destination position in **chroma** samples.
+///   * `w_c` / `h_c` — chroma block dimensions (luma `4 → 2` for 4:2:0).
+///   * `mv_q16` — the **luma-domain** 1/16-pel MV. Per §8.5.6.3.4 the
+///     same MV is reused for chroma; the 4:2:0 mapping doubles the
+///     effective fractional resolution to 1/32 chroma samples
+///     (`mv >> 5` integer chroma offset, `mv & 31` chroma frac index).
+///     [`predict_chroma_block`] handles the conversion internally.
+fn mc_predict_chroma_subpel(
+    pred_c: &mut [u8],
+    ref_c: &PicturePlane,
+    cx_c: usize,
+    cy_c: usize,
+    w_c: usize,
+    h_c: usize,
+    mv_q16: (i32, i32),
+) -> Result<()> {
+    debug_assert_eq!(pred_c.len(), w_c * h_c);
+    let mut scratch = PicturePlane::filled(w_c, h_c, 0);
+    // predict_chroma_block computes the integer chroma source as
+    // `(dst_x_c + (mv >> 5), dst_y_c + (mv >> 5))`. Our destination is
+    // at scratch origin (0, 0), so fold the chroma source origin
+    // `(cx_c, cy_c)` into the MV — but the MV is in luma-1/16 units
+    // and the scaling to chroma-1/32 happens inside the helper, so we
+    // pre-multiply each component by 2 (`<< 1`) to convert the chroma-
+    // pixel offset into the luma-1/16 equivalent that the helper expects.
+    predict_chroma_block(
+        &mut scratch,
+        0,
+        0,
+        w_c as u32,
+        h_c as u32,
+        ref_c,
+        MotionVector {
+            x: mv_q16.0 + ((cx_c as i32) << 5),
+            y: mv_q16.1 + ((cy_c as i32) << 5),
+        },
+    )?;
+    for r in 0..h_c {
+        for c in 0..w_c {
+            pred_c[r * w_c + c] = scratch.samples[r * scratch.stride + c];
+        }
+    }
+    Ok(())
+}
+
+/// Round-63 — chroma 4-tap sub-pel BI prediction for one inter block.
+/// Computes the per-list chroma predictions through
+/// [`mc_predict_chroma_subpel`] and averages them per §8.5.6.4
+/// (`(p0 + p1 + 1) >> 1`). Returns a fresh `w_c * h_c` buffer.
+fn mc_predict_chroma_subpel_bi(
+    ref_c_l0: &PicturePlane,
+    mv_l0_q16: (i32, i32),
+    ref_c_l1: &PicturePlane,
+    mv_l1_q16: (i32, i32),
+    cx_c: usize,
+    cy_c: usize,
+    w_c: usize,
+    h_c: usize,
+) -> Result<Vec<u8>> {
+    let mut p0 = vec![0u8; w_c * h_c];
+    let mut p1 = vec![0u8; w_c * h_c];
+    mc_predict_chroma_subpel(&mut p0, ref_c_l0, cx_c, cy_c, w_c, h_c, mv_l0_q16)?;
+    mc_predict_chroma_subpel(&mut p1, ref_c_l1, cx_c, cy_c, w_c, h_c, mv_l1_q16)?;
+    let mut out = vec![0u8; w_c * h_c];
+    for i in 0..w_c * h_c {
+        out[i] = (((p0[i] as u16) + (p1[i] as u16) + 1) >> 1) as u8;
+    }
+    Ok(out)
+}
+
 // =====================================================================
 // MVD coding — §7.4.7.2 / §9.3.3.7 (round-58 scaffold form)
 // =====================================================================
@@ -874,9 +952,12 @@ pub fn encode_p_slice_multi_ref(
     let mut prepared: Vec<PreparedCu> = Vec::with_capacity(cols * rows);
 
     // Build the reconstruction skeleton from L0[0] for chroma + buffer
-    // dimensions; luma is rewritten below.
+    // dimensions; luma is rewritten below. Round-63: chroma is also
+    // rewritten via per-block chroma MC (4-tap §8.5.6.3.4 filter).
     let mut rec = ref_list_l0[0].clone();
     rec.luma.samples.fill(0);
+    rec.cb.samples.fill(128);
+    rec.cr.samples.fill(128);
 
     let mut enc = ArithEncoder::new();
     let mut ctxs = PSliceCtxs::init(slice_qp_y);
@@ -940,6 +1021,25 @@ pub fn encode_p_slice_multi_ref(
                 INTER_BLOCK_H,
                 best_mv_q16,
             )?;
+
+            // Round-63 — chroma 4-tap sub-pel MC on Cb + Cr at 4:2:0
+            // (§8.5.6.3.4 / Table 28). The same luma 1/16-pel MV is
+            // reused; predict_chroma_block handles the 4:2:0 mapping
+            // (`mv >> 5` integer chroma offset, `mv & 31` chroma frac).
+            const CW: usize = INTER_BLOCK_W / 2;
+            const CH: usize = INTER_BLOCK_H / 2;
+            let cx_c = cx / 2;
+            let cy_c = cy / 2;
+            let mut pred_cb = vec![0u8; CW * CH];
+            mc_predict_chroma_subpel(&mut pred_cb, &ref_p.cb, cx_c, cy_c, CW, CH, best_mv_q16)?;
+            let mut pred_cr = vec![0u8; CW * CH];
+            mc_predict_chroma_subpel(&mut pred_cr, &ref_p.cr, cx_c, cy_c, CW, CH, best_mv_q16)?;
+            for r in 0..CH {
+                for c in 0..CW {
+                    rec.cb.samples[(cy_c + r) * rec.cb.stride + (cx_c + c)] = pred_cb[r * CW + c];
+                    rec.cr.samples[(cy_c + r) * rec.cr.stride + (cx_c + c)] = pred_cr[r * CW + c];
+                }
+            }
 
             // --- Residual: forward DCT + flat quant + reconstruct ---
             let (levels, recon) = prepare_inter_tb(
@@ -1005,10 +1105,8 @@ pub fn encode_p_slice_multi_ref(
     enc.encode_terminate(1)?;
     let cabac_bytes = enc.finish();
 
-    // Round-58 silences the chroma path: pass chroma planes through
-    // from L0[0] (the canonical reference).
-    rec.cb = ref_list_l0[0].cb.clone();
-    rec.cr = ref_list_l0[0].cr.clone();
+    // Round-63 — chroma was filled per-block above via the §8.5.6.3.4
+    // 4-tap chroma MC; no slice-tail pass-through needed.
 
     // Wire layout: magic (14B) | hdr_len_le32 (4B) | hdr | cabac_len_le32 (4B) | cabac_bytes
     let mut out = Vec::with_capacity(PSLICE_MAGIC.len() + 8 + hdr_bytes.len() + cabac_bytes.len());
@@ -1113,6 +1211,8 @@ pub fn decode_p_slice_multi_ref(
 
     let mut out = ref0.clone();
     out.luma.samples.fill(0);
+    out.cb.samples.fill(128);
+    out.cr.samples.fill(128);
 
     for by in 0..rows {
         for bx in 0..cols {
@@ -1176,12 +1276,26 @@ pub fn decode_p_slice_multi_ref(
                         recon[r * INTER_BLOCK_W + c];
                 }
             }
+
+            // Round-63 — chroma 4-tap sub-pel MC mirroring the encoder.
+            const CW: usize = INTER_BLOCK_W / 2;
+            const CH: usize = INTER_BLOCK_H / 2;
+            let cx_c = cx / 2;
+            let cy_c = cy / 2;
+            let mut pred_cb = vec![0u8; CW * CH];
+            mc_predict_chroma_subpel(&mut pred_cb, &ref_p.cb, cx_c, cy_c, CW, CH, mv_q16)?;
+            let mut pred_cr = vec![0u8; CW * CH];
+            mc_predict_chroma_subpel(&mut pred_cr, &ref_p.cr, cx_c, cy_c, CW, CH, mv_q16)?;
+            for r in 0..CH {
+                for c in 0..CW {
+                    out.cb.samples[(cy_c + r) * out.cb.stride + (cx_c + c)] = pred_cb[r * CW + c];
+                    out.cr.samples[(cy_c + r) * out.cr.stride + (cx_c + c)] = pred_cr[r * CW + c];
+                }
+            }
         }
     }
 
     let _ = dec.decode_terminate()?;
-    out.cb = ref0.cb.clone();
-    out.cr = ref0.cr.clone();
     Ok(out)
 }
 
@@ -1414,6 +1528,8 @@ pub fn encode_b_slice_multi_ref(
 
     let mut rec = ref_list_l0[0].clone();
     rec.luma.samples.fill(0);
+    rec.cb.samples.fill(128);
+    rec.cr.samples.fill(128);
 
     let mut enc = ArithEncoder::new();
     let mut ctxs = PSliceCtxs::init(slice_qp_y);
@@ -1581,6 +1697,60 @@ pub fn encode_b_slice_multi_ref(
             }
             let cbf_y = levels.iter().any(|&l| l != 0);
 
+            // ----- Round-63 — chroma 4-tap sub-pel MC (§8.5.6.3.4) -----
+            // Per the chosen `idc` we predict chroma from L0, L1, or BI
+            // average. The same per-list luma MVs are reused;
+            // predict_chroma_block applies the 4:2:0 mapping internally.
+            const CW: usize = INTER_BLOCK_W / 2;
+            const CH: usize = INTER_BLOCK_H / 2;
+            let cx_c = cx / 2;
+            let cy_c = cy / 2;
+            let (pred_cb, pred_cr) = match idc {
+                InterPredIdc::L0 => {
+                    let mut cb = vec![0u8; CW * CH];
+                    let mut cr = vec![0u8; CW * CH];
+                    mc_predict_chroma_subpel(&mut cb, &ref_l0_p.cb, cx_c, cy_c, CW, CH, mv_l0_q16)?;
+                    mc_predict_chroma_subpel(&mut cr, &ref_l0_p.cr, cx_c, cy_c, CW, CH, mv_l0_q16)?;
+                    (cb, cr)
+                }
+                InterPredIdc::L1 => {
+                    let mut cb = vec![0u8; CW * CH];
+                    let mut cr = vec![0u8; CW * CH];
+                    mc_predict_chroma_subpel(&mut cb, &ref_l1_p.cb, cx_c, cy_c, CW, CH, mv_l1_q16)?;
+                    mc_predict_chroma_subpel(&mut cr, &ref_l1_p.cr, cx_c, cy_c, CW, CH, mv_l1_q16)?;
+                    (cb, cr)
+                }
+                InterPredIdc::Bi => {
+                    let cb = mc_predict_chroma_subpel_bi(
+                        &ref_l0_p.cb,
+                        mv_l0_q16,
+                        &ref_l1_p.cb,
+                        mv_l1_q16,
+                        cx_c,
+                        cy_c,
+                        CW,
+                        CH,
+                    )?;
+                    let cr = mc_predict_chroma_subpel_bi(
+                        &ref_l0_p.cr,
+                        mv_l0_q16,
+                        &ref_l1_p.cr,
+                        mv_l1_q16,
+                        cx_c,
+                        cy_c,
+                        CW,
+                        CH,
+                    )?;
+                    (cb, cr)
+                }
+            };
+            for r in 0..CH {
+                for c in 0..CW {
+                    rec.cb.samples[(cy_c + r) * rec.cb.stride + (cx_c + c)] = pred_cb[r * CW + c];
+                    rec.cr.samples[(cy_c + r) * rec.cr.stride + (cx_c + c)] = pred_cr[r * CW + c];
+                }
+            }
+
             // ----- Emit per-block CABAC bins -----
             let inc_skip = crate::ctx::ctx_inc_cu_skip_flag(false, false, false, false) as usize;
             let n_skip = ctxs.cu_skip.len() - 1;
@@ -1635,8 +1805,7 @@ pub fn encode_b_slice_multi_ref(
     enc.encode_terminate(1)?;
     let cabac_bytes = enc.finish();
 
-    rec.cb = ref_list_l0[0].cb.clone();
-    rec.cr = ref_list_l0[0].cr.clone();
+    // Round-63 — chroma was filled per-block above via the 4-tap MC.
 
     let mut out = Vec::with_capacity(BSLICE_MAGIC.len() + 8 + hdr_bytes.len() + cabac_bytes.len());
     out.extend_from_slice(BSLICE_MAGIC);
@@ -1744,6 +1913,8 @@ pub fn decode_b_slice_multi_ref(
 
     let mut out = ref_list_l0[0].clone();
     out.luma.samples.fill(0);
+    out.cb.samples.fill(128);
+    out.cr.samples.fill(128);
 
     for by in 0..rows {
         for bx in 0..cols {
@@ -1866,12 +2037,65 @@ pub fn decode_b_slice_multi_ref(
                         recon[r * INTER_BLOCK_W + c];
                 }
             }
+
+            // Round-63 — chroma 4-tap sub-pel MC (mirror encoder).
+            const CW: usize = INTER_BLOCK_W / 2;
+            const CH: usize = INTER_BLOCK_H / 2;
+            let cx_c = cx / 2;
+            let cy_c = cy / 2;
+            let (pred_cb, pred_cr) = match idc {
+                InterPredIdc::L0 => {
+                    let ref_p = ref_list_l0[ref_idx_l0 as usize];
+                    let mut cb = vec![0u8; CW * CH];
+                    let mut cr = vec![0u8; CW * CH];
+                    mc_predict_chroma_subpel(&mut cb, &ref_p.cb, cx_c, cy_c, CW, CH, mv_l0_q16)?;
+                    mc_predict_chroma_subpel(&mut cr, &ref_p.cr, cx_c, cy_c, CW, CH, mv_l0_q16)?;
+                    (cb, cr)
+                }
+                InterPredIdc::L1 => {
+                    let ref_p = ref_list_l1[ref_idx_l1 as usize];
+                    let mut cb = vec![0u8; CW * CH];
+                    let mut cr = vec![0u8; CW * CH];
+                    mc_predict_chroma_subpel(&mut cb, &ref_p.cb, cx_c, cy_c, CW, CH, mv_l1_q16)?;
+                    mc_predict_chroma_subpel(&mut cr, &ref_p.cr, cx_c, cy_c, CW, CH, mv_l1_q16)?;
+                    (cb, cr)
+                }
+                InterPredIdc::Bi => {
+                    let ref_l0_p = ref_list_l0[ref_idx_l0 as usize];
+                    let ref_l1_p = ref_list_l1[ref_idx_l1 as usize];
+                    let cb = mc_predict_chroma_subpel_bi(
+                        &ref_l0_p.cb,
+                        mv_l0_q16,
+                        &ref_l1_p.cb,
+                        mv_l1_q16,
+                        cx_c,
+                        cy_c,
+                        CW,
+                        CH,
+                    )?;
+                    let cr = mc_predict_chroma_subpel_bi(
+                        &ref_l0_p.cr,
+                        mv_l0_q16,
+                        &ref_l1_p.cr,
+                        mv_l1_q16,
+                        cx_c,
+                        cy_c,
+                        CW,
+                        CH,
+                    )?;
+                    (cb, cr)
+                }
+            };
+            for r in 0..CH {
+                for c in 0..CW {
+                    out.cb.samples[(cy_c + r) * out.cb.stride + (cx_c + c)] = pred_cb[r * CW + c];
+                    out.cr.samples[(cy_c + r) * out.cr.stride + (cx_c + c)] = pred_cr[r * CW + c];
+                }
+            }
         }
     }
 
     let _ = dec.decode_terminate()?;
-    out.cb = ref_list_l0[0].cb.clone();
-    out.cr = ref_list_l0[0].cr.clone();
     Ok(out)
 }
 
@@ -2363,5 +2587,102 @@ mod tests {
         .unwrap();
         assert_eq!(sad, 0);
         assert_eq!(mv_q16, (4 * 16, 0));
+    }
+
+    // =================================================================
+    // Round-63 — chroma sub-pel MC unit tests
+    // =================================================================
+
+    /// Integer-pel chroma MC (`mv_q16 == (0, 0)` and the destination
+    /// equals the source position) reproduces the source byte-for-byte.
+    #[test]
+    fn round63_chroma_mc_zero_mv_is_identity() {
+        let mut src = PicturePlane::filled(8, 8, 0);
+        for y in 0..8 {
+            for x in 0..8 {
+                src.samples[y * src.stride + x] = (10 + x as u8 * 7 + y as u8 * 3) & 0xFF;
+            }
+        }
+        let mut dst = vec![0u8; 4];
+        mc_predict_chroma_subpel(&mut dst, &src, 2, 2, 2, 2, (0, 0)).unwrap();
+        let mut expected: Vec<u8> = Vec::with_capacity(4);
+        for r in 0..2 {
+            for c in 0..2 {
+                expected.push(src.samples[(2 + r) * src.stride + (2 + c)]);
+            }
+        }
+        assert_eq!(dst, expected, "zero-MV chroma MC must be identity");
+    }
+
+    /// Integer-pel chroma MC with a non-zero integer MV reproduces the
+    /// shifted block byte-for-byte (the §8.5.6.3.4 helper falls through
+    /// to `mc_copy_block_int` at `xFracC == 0 && yFracC == 0`).
+    #[test]
+    fn round63_chroma_mc_int_mv_translates_block() {
+        let mut src = PicturePlane::filled(16, 16, 0);
+        for y in 0..16 {
+            for x in 0..16 {
+                src.samples[y * src.stride + x] = (x as u8) ^ ((y as u8) << 1);
+            }
+        }
+        // mv = (+2 chroma px, -1 chroma px) in luma 1/16 units (chroma
+        // 1/32 = 2 luma 1/16 ⇒ +2 chroma px = +64 luma 1/16).
+        let mv_q16 = (2 * 32, -32);
+        let mut dst = vec![0u8; 9];
+        mc_predict_chroma_subpel(&mut dst, &src, 4, 4, 3, 3, mv_q16).unwrap();
+        for r in 0..3 {
+            for c in 0..3 {
+                let sx = (4 + c + 2) as usize;
+                let sy = (4 + r) as i32 - 1;
+                let sy = sy.max(0) as usize; // clamp at top edge
+                let want = src.samples[sy * src.stride + sx];
+                assert_eq!(
+                    dst[r * 3 + c],
+                    want,
+                    "int-MV chroma MC mismatch at (r={r}, c={c})",
+                );
+            }
+        }
+    }
+
+    /// Half-pel chroma MC on a constant plane reconstructs the constant
+    /// (DC-preserving property of any normalised interpolation filter).
+    #[test]
+    fn round63_chroma_mc_half_pel_constant_plane_dc_preserving() {
+        let src = PicturePlane::filled(16, 16, 137);
+        for x_frac in 0..32 {
+            for y_frac in 0..32 {
+                let mv_q16 = (x_frac, y_frac);
+                let mut dst = vec![0u8; 4];
+                mc_predict_chroma_subpel(&mut dst, &src, 4, 4, 2, 2, mv_q16).unwrap();
+                for &v in &dst {
+                    assert_eq!(
+                        v, 137,
+                        "chroma MC at frac (x={x_frac}, y={y_frac}) corrupted DC plane",
+                    );
+                }
+            }
+        }
+    }
+
+    /// BI chroma helper produces the per-list rounding average (eq.
+    /// 8.5.6.4 form: `(p0 + p1 + 1) >> 1`).
+    #[test]
+    fn round63_chroma_bi_averages_per_list_predictions() {
+        let mut s0 = PicturePlane::filled(8, 8, 0);
+        let mut s1 = PicturePlane::filled(8, 8, 0);
+        for i in 0..64 {
+            s0.samples[i] = (i * 3) as u8;
+            s1.samples[i] = (255 - i * 2) as u8;
+        }
+        let mut p0 = vec![0u8; 4];
+        let mut p1 = vec![0u8; 4];
+        mc_predict_chroma_subpel(&mut p0, &s0, 2, 2, 2, 2, (0, 0)).unwrap();
+        mc_predict_chroma_subpel(&mut p1, &s1, 2, 2, 2, 2, (0, 0)).unwrap();
+        let bi = mc_predict_chroma_subpel_bi(&s0, (0, 0), &s1, (0, 0), 2, 2, 2, 2).unwrap();
+        for i in 0..4 {
+            let want = (((p0[i] as u16) + (p1[i] as u16) + 1) >> 1) as u8;
+            assert_eq!(bi[i], want, "BI chroma average mismatch at i={i}");
+        }
     }
 }

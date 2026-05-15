@@ -318,8 +318,21 @@ fixture where the current frame matches frame 0 better than frame
 = 58.41 dB; on a 4-ref B-slice fixture the multi-ref-aware RDO
 splits the translation for an exact BI reconstruction. The
 round-58 4-px P-slice regression holds at 78.23 dB and multi-ref +
-sub-pel still reaches 52.39 dB. Chroma sub-pel MC and weighted
-bi-pred remain deferred.
+sub-pel still reaches 52.39 dB.
+
+**Round-63 (Goal B) wires §8.5.6.3.4 4-tap chroma sub-pel MC** into
+both encoder + decoder paths. Rounds 58/60/61 had luma 8-tap sub-pel
+MC but chroma planes were passed through from L0[0]. Round 63 calls
+the existing `crate::inter::predict_chroma_block` (Table 28 4-tap
+filter) at chroma block scale (2×2 chroma per 4×4 luma block in
+4:2:0), reusing the per-CU luma 1/16-pel MV — `predict_chroma_block`
+applies the 4:2:0 mapping internally (chroma 1/32-pel offset is
+`mv & 31`, integer chroma offset is `mv >> 5`). The {L0, L1, BI}
+dispatch on the B-slice path picks the chroma prediction matching
+the chosen `inter_pred_idc`. Wire format is unchanged. On a band-
+limited half-pel translation fixture chroma reaches PSNR_Cb = 49.96
+dB / PSNR_Cr = 50.39 dB (≥45 dB target). Weighted bi-pred remains
+deferred.
 
 ## Usage
 
