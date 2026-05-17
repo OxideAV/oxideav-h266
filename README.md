@@ -368,6 +368,31 @@ exactly on that delta and the resulting bi-pred MC reaches PSNR_Y =
 inf dB vs a DMVR-off baseline of 52.39 dB — well past the +1.5 dB
 headline improvement target.
 
+**Round-65 lands the §8.5.5.9 affine sub-block motion compensation
+scaffold** (4-parameter + 6-parameter affine motion models plus
+Tables 30 / 31 / 32 affine-mode luma interpolation filters). The new
+`affine` module exposes `MotionModel` (the §7.4.10.5 Table 15
+`MotionModelIdc` triple), `AffineCpmvs` (the 2 / 3 control point MV
+record per `numCpMv = motionModelIdc + 1`), `derive_subblock_mvs(...)`
+implementing eqs. 850 – 875 (the `(mvScaleHor, mvScaleVer)` base, the
+four partials `(dHorX, dVerX, dHorY, dVerY)` with the 4-parameter
+similarity constraint `dHorY = -dVerX, dVerY = dHorX`, sub-block centre
+sampling `(xPosCb, yPosCb) = (2 + 4*sbIdxX, 2 + 4*sbIdxY)`, §8.5.2.14
+`>> 7` rounding, and the `Clip3(-2^17, 2^17 - 1, ·)` final clip),
+`fallback_mode_triggered(...)` per eqs. 858 – 867 (bxWX4 * bxHX4 ≤ 225
+under bi-pred or per-axis 165 under uni-pred), `predict_luma_subblock_affine(...)`
+(separable 8-tap MC for one sub-block against any of the three
+affine luma filter sets), and `predict_luma_block_affine(...)` (full-CU
+driver that walks the 4×4 sub-block grid and dispatches each through
+the per-sub-block MV). On a zoom fixture (uniform 1.5 % shrink + small
+translation on a 32×32 CU) the 6-parameter affine reaches PSNR_Y =
+**53.75 dB** vs the best 5×5 translational MV search at 42.88 dB
+(**+10.87 dB**); on a horizontal-shear fixture the 6-parameter affine
+reaches **52.32 dB** vs translational's 34.88 dB (**+17.44 dB**).
+Affine merge / AMVP candidate list construction, affine sub-block
+chroma MC (eqs. 876 – 879), PROF (§8.5.5.10), and the §8.8.3.4
+sub-block boundary deblock propagation remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

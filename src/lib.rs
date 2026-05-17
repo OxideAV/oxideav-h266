@@ -142,6 +142,7 @@
 #![allow(clippy::erasing_op)]
 #![allow(clippy::same_item_push)]
 
+pub mod affine;
 pub mod alf;
 pub mod alf_aps_design;
 pub mod alf_enc;

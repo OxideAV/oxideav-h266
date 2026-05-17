@@ -6,6 +6,78 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 65 — **Affine sub-block motion compensation scaffold** per VVC
+  §8.5.5.9 (eqs. 847 – 887) + Tables 30 / 31 / 32 (affine-mode luma
+  1/16-pel interpolation filters). VVC supports 4-parameter and
+  6-parameter affine motion in addition to translational motion;
+  rounds 21 – 64 covered only the translational path. Round 65 lands
+  the affine decoder primitives a future CTU walker will call once
+  affine-flagged CUs come online. New `affine` module exposes:
+  - `MotionModel` enum — `Translational` / `Affine4Param` /
+    `Affine6Param`, the §7.4.10.5 Table 15 `MotionModelIdc` triple.
+  - `AffineCpmvs` — control point MV record (2 CPMVs for
+    4-parameter, 3 for 6-parameter); constructors `new_4param` /
+    `new_6param`; `is_translational` degeneracy detector.
+  - `derive_subblock_mvs(cb_w, cb_h, cpmvs, bipred)` — the §8.5.5.9
+    sub-block MV array derivation. Implements eqs. 850 – 875: the
+    `(mvScaleHor, mvScaleVer)` base, the four affine partials
+    `(dHorX, dVerX, dHorY, dVerY)` with the 4-parameter similarity
+    constraint `dHorY = -dVerX, dVerY = dHorX` (eqs. 856 / 857), per
+    sub-block centre sampling at `(xPosCb, yPosCb) = (2 + 4*sbIdxX,
+    2 + 4*sbIdxY)` (eqs. 870 / 871), §8.5.2.14 `>> 7` signed-
+    magnitude rounding, and the eqs. 874 / 875 `Clip3(-2^17,
+    2^17 - 1, ·)` final clip. Outputs a `SubblockMvGrid` with
+    `numSbX = cbW >> 2` × `numSbY = cbH >> 2` per-4×4 MVs.
+  - `fallback_mode_triggered(cb_w, cb_h, cpmvs, bipred)` — the
+    §8.5.5.9 eqs. 858 – 867 `fallbackModeTriggered` threshold (bxWX4
+    * bxHX4 ≤ 225 under bi-pred or per-axis 165 under uni-pred);
+    when triggered the per-sub-block grid collapses to a single
+    CU-centre MV per eqs. 868 / 869.
+  - `AFFINE_LUMA_FILTER_SET_0` / `_1` / `_2` — Tables 30 / 31 / 32
+    (the spec's affine-mode luma 1/16-pel interpolation filter
+    families). All three coefficient sets sum to 64 per the
+    §8.5.6.3 separable-filter normalisation; Set0's row 0 is the
+    integer-pel sentinel, Set1 / Set2 row 0 are non-trivial spec
+    filter rows used by §8.5.6.3.2's affine-mode integer-position
+    path. `AffineLumaFilterSet::table()` returns the static
+    coefficient table.
+  - `predict_luma_subblock_affine(dst, dst_x, dst_y, sb_w, sb_h, src,
+    mv, filter_set)` — separable 8-tap MC helper for one affine
+    sub-block. Picture-edge clamping, `shift1 = 0` for BitDepth 8,
+    `shift2 = 6`, §8.5.6.6.2 `(v + 32) >> 6 → u8` uni-pred clamp,
+    matching the existing translational `inter::predict_luma_block`
+    semantics but with caller-selected affine luma filter table.
+    Integer-pel + Set0 fast path collapses to a memcpy.
+  - `predict_luma_block_affine(dst, dst_x, dst_y, cb_w, cb_h, src,
+    cpmvs, filter_set)` — full-CU driver. Walks the 4×4 sub-block
+    grid from `derive_subblock_mvs` and dispatches each sub-block
+    through `predict_luma_subblock_affine`. The future CTU walker
+    will call this for affine inter CUs.
+  - **Headline measurement (zoom fixture):** 6-parameter affine
+    reconstructs a synthetically zoomed reference at PSNR_Y =
+    **53.75 dB** on a 32×32 CU while the best 5×5 translational MV
+    search caps at **42.88 dB** — a **+10.87 dB** improvement.
+  - **Headline measurement (shear fixture):** 6-parameter affine
+    reconstructs a horizontally sheared reference at PSNR_Y =
+    **52.32 dB** while the best 7×7 translational MV search caps at
+    **34.88 dB** — a **+17.44 dB** improvement.
+  - 14 unit tests in `affine::tests` (filter-table normalisation,
+    `MotionModel` ↔ `MotionModelIdc` mapping, identity-CPMV
+    degeneracy on both 4 / 6-param paths, shear monotonicity in x and
+    y, spec-exact centre-sampling values for a pure horizontal-shear
+    4-parameter affine, sub-8×8 floor rejection, fallback threshold
+    on a small CPMV delta, filter-set table dispatch, integer-pel
+    Set0 copy, translational `predict_luma_block_affine` byte-
+    identical to translational MC) + 3 integration tests in
+    `tests/round65_affine_subblock.rs` (zoom fixture clears +3 dB
+    delta, shear fixture clears +3 dB delta + 25 dB floor, identity
+    CPMV byte-identical to translational at int-pel).
+  - Deferred to later rounds: affine merge / AMVP candidate list
+    construction (§8.5.5.6 / §8.5.5.7 / §8.5.5.8), affine sub-block
+    chroma MC (eqs. 876 – 879 `mvAvgLX`), PROF (§8.5.5.10), and the
+    affine flag propagation into the §8.8.3.4 sub-block boundary
+    deblock.
+
 - Round 64 — **Decoder-side Motion Vector Refinement (DMVR)** per VVC
   §8.5.3.2.4 / §8.5.3.2.5. New `dmvr` module exposes:
   - `dmvr_used_flag(...)` — the §8.5.3.2.4 step-1 gating bullet list
