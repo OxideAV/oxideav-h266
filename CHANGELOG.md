@@ -6,6 +6,37 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 64 — **Decoder-side Motion Vector Refinement (DMVR)** per VVC
+  §8.5.3.2.4 / §8.5.3.2.5. New `dmvr` module exposes:
+  - `dmvr_used_flag(...)` — the §8.5.3.2.4 step-1 gating bullet list
+    (SPS/PH flags + merge + bi-pred + symmetric-POC bracketing + STRP
+    refs + translational motion + non-subblock merge + no
+    CIIP/BCW/WP + block size ≥ 8×8 with `cb_w*cb_h >= 128` + luma
+    only).
+  - `bilateral_matching_sad(predL0, predL1, w, h)` — the §8.5.3.2.5 BM
+    cost (full-grid SAD).
+  - `refine_mv_pair(mv_l0_init, mv_l1_init, w, h, predictor)` — 2-pass
+    refinement: a 5×5 integer-pel search (`(δx,δy) ∈ {-2..2}²`) using
+    the spec's opposite-direction pairing `(MV0 + δ, MV1 − δ)`,
+    followed by a 3-point parabolic half-pel pass on each axis
+    (clamped to ±½-pel ⇒ ±8 in 1/16-pel units; non-convex
+    neighbourhoods skip the refinement).
+  - `apply_dmvr(...)` — convenience driver that combines the above
+    with a `PlanePairPredictor` adapter over the existing
+    `crate::inter::predict_luma_block`.
+  - On the symmetric-bipred regression fixture (3 luma planes where L0
+    and L1 are shifted by ±1 sample around a hidden "truth" plane,
+    integer-pel BM optimum at `δ = (-1, 0)`) DMVR converges to exactly
+    that delta and the resulting bi-pred MC reaches PSNR_Y = ∞ dB
+    (byte-exact reconstruction of truth), starting from a DMVR-off
+    baseline of 52.39 dB on the same 16×16 CU — far past the +1.5 dB
+    headline target.
+  - 12 unit tests in `dmvr::tests` (gating bullets, BM SAD, parabolic
+    estimator edge cases, refinement convergence on a synthetic
+    shift, refined-vs-baseline SSE) + 5 integration tests in
+    `tests/round64_dmvr.rs` (headline PSNR delta, search-range
+    constant, three gate-off cases).
+
 - Round 63 (Goal A) — explicit weighted bi-prediction on the B-slice
   encoder + decoder per VVC §8.5.6.5 eq. 994 + §7.4.7.7
   (`pred_weight_table()`). Rounds 60/61 carried only the §8.5.6.4

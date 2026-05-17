@@ -162,6 +162,7 @@ pub mod dci;
 pub mod deblock;
 pub mod decoder;
 pub mod dequant;
+pub mod dmvr;
 pub mod encoder;
 pub mod encoder_inter;
 pub mod encoder_pipeline;
