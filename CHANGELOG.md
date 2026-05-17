@@ -4,6 +4,21 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-h266/compare/v0.0.6...v0.0.7) - 2026-05-17
+
+### Other
+
+- round 65 — affine sub-block MC scaffold per §8.5.5.9 + Tables 30 / 31 / 32
+- round 64 — Decoder-side Motion Vector Refinement (DMVR) per §8.5.3.2.4 / §8.5.3.2.5
+- round 63 (Goal A) — explicit weighted bi-prediction on B-slice encoder + decoder
+- round 63 (Goal B) — chroma sub-pel motion compensation on P-slice + B-slice encoder + decoder
+- round 62 — multi-reference DPB on P-slice and B-slice encoder + decoder
+- round 61 — sub-pel ME on B-slice (½-pel + ¼-pel per L0/L1)
+- round 60 — B-slice (bi-prediction) encoder + decoder scaffold
+- round 59 — sub-pel motion compensation for P-slice encoder + decoder
+- round 58 — inter-frame P-slice encoder + decoder scaffold
+- round 57 — MTT TT picker RDO (opt-in, parallel to round 56 BT picker)
+
 ### Added
 
 - Round 65 — **Affine sub-block motion compensation scaffold** per VVC
