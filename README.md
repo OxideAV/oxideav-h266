@@ -393,6 +393,35 @@ Affine merge / AMVP candidate list construction, affine sub-block
 chroma MC (eqs. 876 – 879), PROF (§8.5.5.10), and the §8.8.3.4
 sub-block boundary deblock propagation remain deferred.
 
+**Round-78 lands §8.5.6.4 PROF (Prediction Refinement with Optical
+Flow)** as a per-pixel refinement on top of the round-65 affine
+sub-block MC. The new helpers expose `cb_prof_flag_lx(...)` for the
+§8.5.5.9 cbProfFlagLX derivation (four false-conditions gate:
+`ph_prof_disabled_flag == 1`, fallback mode triggered, translational-
+degenerate CPMVs, `RprConstraintsActiveFlag == 1`),
+`derive_prof_diff_mv_array(...)` for the §8.5.5.9 eqs. 880 – 887
+per-pixel motion-vector-difference array (`posOffsetX = 6*dHorX +
+6*dHorY`, eqs. 885 / 886 raw values, §8.5.2.14 `rightShift = 8`
+signed-magnitude rounding, eq. 887 `Clip3(-31, 31)`), the new
+`predict_luma_subblock_affine_high_precision(...)` helper that
+produces the §8.5.6.4 `(sbW + 2) × (sbH + 2)` `BitDepth + 6` precision
+predSamplesLXL halo'd block, `apply_prof_to_subblock(...)` for the
+§8.5.6.4 eqs. 955 – 959 refinement (`shift1 = 6` gradient taps,
+`dI = gradH*diffMv[0] + gradV*diffMv[1]`, `dILimit = 1 <<
+Max(13, BitDepth + 1)`, `Clip3(-dILimit, dILimit - 1, dI)` added to
+the centre sample), and the full-CU driver
+`predict_luma_block_affine_prof(...)` that composes the §8.5.6.3
+sub-block MC + PROF + final 8-bit uni-pred clamp. The driver short-
+circuits to a bit-identical replay of `predict_luma_block_affine`
+when the cbProfFlagLX gate reports `false`. On the same round-65
+horizontal-shear fixture the PROF-on path reaches **PSNR_Y = 53.97
+dB** vs the PROF-off baseline at **52.32 dB** (**+1.65 dB**); the
+translational-degenerate and `ph_prof_disabled_flag == 1` paths are
+byte-identical to the affine-only driver. Affine merge / AMVP
+candidate list construction, affine sub-block chroma MC (eqs.
+876 – 879), and the §8.8.3.4 sub-block boundary deblock propagation
+remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

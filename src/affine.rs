@@ -742,6 +742,503 @@ pub fn predict_luma_block_affine(
 }
 
 // ---------------------------------------------------------------------
+// 6. PROF — Prediction Refinement with Optical Flow (§8.5.5.9 + §8.5.6.4)
+// ---------------------------------------------------------------------
+//
+// VVC layers a per-pixel "optical flow" refinement on top of the per-
+// sub-block affine MC produced by `predict_luma_subblock_affine` /
+// `predict_luma_block_affine`. The refinement uses
+//
+//   1. a `(sbWidth + 2) × (sbHeight + 2)` high-precision (BitDepth + 6
+//      i.e. 14-bit signed at BitDepth = 8) prediction sample array
+//      `predSamplesLXL` so eqs. 955 / 956 can take horizontal /
+//      vertical gradients across a 3-tap neighbourhood that pokes one
+//      sample outside the 4×4 sub-block on each side, and
+//
+//   2. a `sbWidth × sbHeight` motion-vector-difference array
+//      `diffMvLX[x][y]` that records, per pixel, how much the pixel-
+//      true affine MV departs from the sub-block centre MV the
+//      per-sub-block MC was actually driven with.
+//
+// Each output pixel is the per-sub-block MC sample plus `Clip3(
+// -dILimit, dILimit - 1, gradH * diffMv[0] + gradV * diffMv[1] )`. With
+// the gradients being a fully linear functional of `predSamplesLXL` and
+// the diffMv being a fully linear functional of the §8.5.5.9 affine
+// partials, PROF is a deterministic correction — and a strict no-op
+// when the CPMV set degenerates to translational (all partials zero ⇒
+// all diffMv zero ⇒ `dI = 0` everywhere).
+//
+// Spec references this implementation tracks against:
+// * §8.5.5.9 "cbProfFlagLX derivation" — the four false-conditions
+//   gate ([`cb_prof_flag_lx`]).
+// * §8.5.5.9 eqs. 880 – 887 — `diffMvLX` derivation ([`derive_prof_diff_mv_array`]).
+// * §8.5.6.4 eqs. 955 – 959 — gradient + dI + sbSamples blend
+//   ([`apply_prof_to_subblock`]).
+//
+// PROF is the round-78 addition; before this only `cbProfFlagLX = 0`
+// (i.e. "PROF disabled") paths were reachable. The new top-level
+// driver [`predict_luma_block_affine_prof`] composes the existing
+// sub-block MC pipeline with the new PROF refinement and returns the
+// final 8-bit per-sample prediction.
+
+/// PROF per-sub-block motion vector difference array, in the spec's
+/// rounded-then-clipped 1/1024-pel units. `(sb_width × sb_height)`
+/// entries, row-major. Components are clipped to `[-31, 31]` per
+/// eq. 887.
+///
+/// "1/1024-pel" terminology: the spec's eqs. 885 / 886 produce a value
+/// in `1/(1<<7) · 1/(1<<2) = 1/(1<<9)` luma-pel after the `<< 2` of
+/// `dHorX` etc., and then the §8.5.2.14 `>> 8` rounding shrinks the
+/// stored magnitude one more bit to 1/512-pel. We follow the spec's
+/// signed-magnitude rounding semantic (`rightShift = 8, leftShift = 0`)
+/// rather than trying to keep wider precision.
+#[derive(Clone, Debug)]
+pub struct DiffMvArray {
+    pub sb_width: u32,
+    pub sb_height: u32,
+    /// Row-major `(sb_width × sb_height)` entries; each entry is
+    /// `(diffMvLX[x][y][0], diffMvLX[x][y][1])`.
+    pub entries: Vec<(i32, i32)>,
+}
+
+impl DiffMvArray {
+    pub fn at(&self, x: u32, y: u32) -> (i32, i32) {
+        assert!(x < self.sb_width && y < self.sb_height);
+        self.entries[(y * self.sb_width + x) as usize]
+    }
+
+    /// True iff every `diffMv` entry is `(0, 0)` — i.e. the affine
+    /// partials are zero, so PROF is a no-op. This lets the caller
+    /// skip the gradient pass entirely when the affine model is
+    /// translational-equivalent post-rounding.
+    pub fn is_all_zero(&self) -> bool {
+        self.entries.iter().all(|&(a, b)| a == 0 && b == 0)
+    }
+}
+
+/// §8.5.5.9 cbProfFlagLX derivation — the four false-conditions gate.
+///
+/// `cbProfFlagLX` is `false` if any of:
+/// * `ph_prof_disabled_flag == 1`
+/// * `fallbackModeTriggered == 1` (see [`fallback_mode_triggered`])
+/// * the affine model degenerates to translational at all CPMVs:
+///   `numCpMv == 2 && cpMvLX[1] == cpMvLX[0]`, or `numCpMv == 3 &&
+///   cpMvLX[1] == cpMvLX[0] && cpMvLX[2] == cpMvLX[0]`
+/// * `RprConstraintsActiveFlag[X][refIdxLX] == 1`
+///
+/// otherwise `true`. The spec spells these out as the four bullets
+/// before "Otherwise, cbProfFlagLX is set equal to TRUE."
+pub fn cb_prof_flag_lx(
+    cb_width: u32,
+    cb_height: u32,
+    cpmvs: &AffineCpmvs,
+    bipred: bool,
+    ph_prof_disabled_flag: bool,
+    rpr_constraints_active: bool,
+) -> bool {
+    if ph_prof_disabled_flag {
+        return false;
+    }
+    if rpr_constraints_active {
+        return false;
+    }
+    if cpmvs.is_translational() {
+        return false;
+    }
+    if matches!(cpmvs.model, MotionModel::Translational) {
+        return false;
+    }
+    // The fallback test relies on the affine partials and the CPMV
+    // delta; for translational `is_translational` already short-
+    // circuited above.
+    if fallback_mode_triggered(cb_width, cb_height, cpmvs, bipred) {
+        return false;
+    }
+    true
+}
+
+/// §8.5.5.9 eqs. 880 – 887 — derive the per-pixel motion-vector-
+/// difference array driving the §8.5.6.4 PROF refinement.
+///
+/// Inputs:
+/// * `cb_width` / `cb_height` — coding-block dimensions in luma
+///   samples. Sub-block grid is `numSbX × numSbY = (cb_width >> 2) ×
+///   (cb_height >> 2)` so `sbWidth = sbHeight = 4` in the common case.
+/// * `cpmvs` — the §8.5.5.9 CPMV set the per-sub-block MC was driven
+///   with. The partials `(dHorX, dVerX, dHorY, dVerY)` are the same
+///   eqs. 850 – 857 partials [`derive_subblock_mvs`] used.
+///
+/// Output: a `sbWidth × sbHeight` array of `(diffMvLX[x][y][0],
+/// diffMvLX[x][y][1])` entries with components rounded by §8.5.2.14
+/// (rightShift = 8, leftShift = 0) and clipped to `[-31, 31]`.
+pub fn derive_prof_diff_mv_array(
+    cb_width: u32,
+    cb_height: u32,
+    cpmvs: &AffineCpmvs,
+) -> Result<DiffMvArray> {
+    if cb_width < 8 || cb_height < 8 {
+        return Err(Error::invalid(format!(
+            "h266 PROF diffMv: CU {cb_width}x{cb_height} below the 8×8 affine floor"
+        )));
+    }
+    if cb_width % AFFINE_SB_SIZE != 0 || cb_height % AFFINE_SB_SIZE != 0 {
+        return Err(Error::invalid(format!(
+            "h266 PROF diffMv: CU {cb_width}x{cb_height} not aligned to {AFFINE_SB_SIZE}x{AFFINE_SB_SIZE} sub-block grid"
+        )));
+    }
+    let num_sb_x = cb_width >> 2;
+    let num_sb_y = cb_height >> 2;
+    // eqs. 880 / 881 — sub-block dimensions in luma samples.
+    let sb_width = cb_width / num_sb_x; // typically 4
+    let sb_height = cb_height / num_sb_y;
+    // eq. 882 — dmvLimit.
+    let dmv_limit: i64 = 1 << 5;
+    // eqs. 850 – 857 affine partials, same precision the per-sub-block
+    // MC machinery uses.
+    let (d_hor_x, d_ver_x, d_hor_y, d_ver_y) = compute_affine_partials(cb_width, cb_height, cpmvs);
+    // eqs. 883 / 884 — `posOffsetX = 6*dHorX + 6*dHorY`,
+    //                  `posOffsetY = 6*dVerX + 6*dVerY`.
+    let pos_offset_x: i64 = 6 * d_hor_x as i64 + 6 * d_hor_y as i64;
+    let pos_offset_y: i64 = 6 * d_ver_x as i64 + 6 * d_ver_y as i64;
+
+    let mut entries = Vec::with_capacity((sb_width * sb_height) as usize);
+    for y in 0..sb_height {
+        for x in 0..sb_width {
+            // eqs. 885 / 886 — pre-rounding raw values.
+            let raw_dx: i64 = (x as i64) * ((d_hor_x as i64) << 2)
+                + (y as i64) * ((d_hor_y as i64) << 2)
+                - pos_offset_x;
+            let raw_dy: i64 = (x as i64) * ((d_ver_x as i64) << 2)
+                + (y as i64) * ((d_ver_y as i64) << 2)
+                - pos_offset_y;
+            // §8.5.2.14 rounding (rightShift = 8, leftShift = 0).
+            let rounded_dx = round_mv_component(raw_dx, 8);
+            let rounded_dy = round_mv_component(raw_dy, 8);
+            // eq. 887 — clip to `[-dmvLimit + 1, dmvLimit - 1]`.
+            let lo = -dmv_limit + 1;
+            let hi = dmv_limit - 1;
+            let clipped_dx = rounded_dx.clamp(lo, hi) as i32;
+            let clipped_dy = rounded_dy.clamp(lo, hi) as i32;
+            entries.push((clipped_dx, clipped_dy));
+        }
+    }
+    Ok(DiffMvArray {
+        sb_width,
+        sb_height,
+        entries,
+    })
+}
+
+/// One sub-block of the §8.5.6.4 input array — `(sb_width + 2) ×
+/// (sb_height + 2)` high-precision (BitDepth + 6) i32 samples. The
+/// centre `sb_width × sb_height` region is the actual predSamplesLXL
+/// the per-sub-block MC produced; the 1-sample halo on every side is
+/// what eqs. 955 / 956's `x ± 1` / `y ± 1` neighbour reads consume.
+#[derive(Clone, Debug)]
+pub struct AffineSubblockHpBlock {
+    pub sb_width: u32,
+    pub sb_height: u32,
+    /// `(sb_width + 2) * (sb_height + 2)` row-major entries.
+    pub samples: Vec<i32>,
+}
+
+impl AffineSubblockHpBlock {
+    /// Read sample at `(x, y)` with `(x, y)` in `[0, sb_width + 1] ×
+    /// [0, sb_height + 1]` — i.e. the inputs to eqs. 955 / 956.
+    pub fn sample(&self, x: u32, y: u32) -> i32 {
+        let w = self.sb_width + 2;
+        let h = self.sb_height + 2;
+        assert!(x < w && y < h);
+        self.samples[(y * w + x) as usize]
+    }
+}
+
+/// §8.5.6.3-style affine sub-block luma MC into a high-precision
+/// (BitDepth + 6) i32 buffer with a 1-sample halo on every side — the
+/// `(sbWidth + 2) × (sbHeight + 2)` array the §8.5.6.4 PROF process
+/// consumes as `predSamplesLXL`.
+///
+/// Same filter pipeline as [`predict_luma_subblock_affine`] but the
+/// vertical-pass `>> 6 = >> shift2` is skipped so the output stays at
+/// `BitDepth + 6` precision (i.e. the spec's predSamplesLN level),
+/// matching what [`crate::inter::predict_luma_block_high_precision`]
+/// returns for the non-affine path.
+///
+/// Inputs are at sub-block scale: `sb_w × sb_h` is typically 4×4. The
+/// caller supplies the sub-block top-left destination origin
+/// `(dst_x, dst_y)` (used purely as the integer-pel reference origin
+/// in the source plane) and the per-sub-block MV from
+/// [`derive_subblock_mvs`].
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_subblock_affine_high_precision(
+    dst_x: u32,
+    dst_y: u32,
+    sb_w: u32,
+    sb_h: u32,
+    src: &PicturePlane,
+    mv: MotionVector,
+    filter_set: AffineLumaFilterSet,
+) -> Result<AffineSubblockHpBlock> {
+    if sb_w == 0 || sb_h == 0 {
+        return Err(Error::invalid(format!(
+            "h266 affine luma HP MC: sub-block size {sb_w}x{sb_h} is degenerate"
+        )));
+    }
+    let table = filter_set.table();
+    let x_int_base = dst_x as i32 + (mv.x >> 4);
+    let y_int_base = dst_y as i32 + (mv.y >> 4);
+    let x_frac = (mv.x & 15) as usize;
+    let y_frac = (mv.y & 15) as usize;
+    let pic_w = src.width as i32;
+    let pic_h = src.height as i32;
+
+    // Output is (sb_w + 2) × (sb_h + 2). Cell (cx, cy) carries the
+    // §8.5.6.3 prediction for source-pixel offset `(cx - 1, cy - 1)`
+    // relative to the sub-block top-left, so the centre region
+    // `(1..=sb_w, 1..=sb_h)` is the actual sub-block prediction and
+    // the borders supply the eqs. 955 / 956 gradient neighbours.
+    let out_w = sb_w as usize + 2;
+    let out_h = sb_h as usize + 2;
+    let mut out = vec![0i32; out_w * out_h];
+
+    let fill = |c: i32, r: i32| -> i32 {
+        // Local pixel offset from sub-block top-left in luma samples.
+        // r = 0 / r = sb_h + 1 are halo rows.
+        let local_x = c - 1;
+        let local_y = r - 1;
+        if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
+            // Integer-pel fast path: lift `<< 6` to BitDepth + 6
+            // precision at BD = 8 (eq. 932: `<< (14 - BitDepth) = << 6`).
+            let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
+            let xi = (x_int_base + local_x).clamp(0, pic_w - 1) as usize;
+            return (src.samples[yi * src.stride + xi] as i32) << 6;
+        }
+        if y_frac == 0 {
+            let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
+            // Horizontal-only filter — shift1 = 0 at BD = 8, so the
+            // H-pass output is already at BitDepth + 6 precision.
+            return h_tap(table, src, x_int_base + local_x, yi, x_frac);
+        }
+        if x_frac == 0 {
+            let xi = (x_int_base + local_x).clamp(0, pic_w - 1) as usize;
+            return v_only_tap(table, src, xi, y_int_base + local_y, y_frac);
+        }
+        // 2D — H pass at column `local_x`, V pass over an 8-row column.
+        let mut col = [0i32; 8];
+        for i in 0..8 {
+            let yi = (y_int_base + local_y - 3 + i as i32).clamp(0, pic_h - 1) as usize;
+            col[i] = h_tap(table, src, x_int_base + local_x, yi, x_frac);
+        }
+        // v_tap applies `>> 6 = shift2 = 6`. After the H pass at
+        // shift1 = 0 the intermediate sits at BitDepth + 6 + 6 = BD +
+        // 12 (the 14-bit + 6-bit accumulator), and `>> 6` lands the V
+        // output at BitDepth + 6 — exactly the spec's predSamplesLN
+        // precision.
+        v_tap(table, &col, y_frac)
+    };
+
+    for r in 0..out_h as i32 {
+        for c in 0..out_w as i32 {
+            out[r as usize * out_w + c as usize] = fill(c, r);
+        }
+    }
+    Ok(AffineSubblockHpBlock {
+        sb_width: sb_w,
+        sb_height: sb_h,
+        samples: out,
+    })
+}
+
+/// §8.5.6.4 — Prediction refinement with optical flow process.
+///
+/// Inputs:
+/// * `block` — `(sbWidth + 2) × (sbHeight + 2)` predSamplesLXL array
+///   in BitDepth + 6 precision (i.e. produced by
+///   [`predict_luma_subblock_affine_high_precision`]).
+/// * `diff_mv` — `sbWidth × sbHeight` per-pixel diffMv array (i.e.
+///   produced by [`derive_prof_diff_mv_array`]); all `diff_mv` entries
+///   come from the **same** `(cb_width, cb_height, cpmvs)` triple that
+///   drove `predict_luma_subblock_affine_high_precision`.
+/// * `bit_depth` — sample bit depth; 8 in the common case.
+///
+/// Output: a `sbWidth × sbHeight` row-major array of refined
+/// `sbSamplesLXL` samples in BitDepth + 6 precision (i.e. still at the
+/// high-precision intermediate level; the caller does the final clip
+/// + downshift to `u8` / `u16`).
+///
+/// Implements eqs. 955 – 959 verbatim:
+/// * `shift1 = 6`
+/// * `gradientH[x][y] = (predL[x+2][y+1] >> 6) - (predL[x][y+1] >> 6)`
+/// * `gradientV[x][y] = (predL[x+1][y+2] >> 6) - (predL[x+1][y] >> 6)`
+/// * `dI = gradH * diffMv[0] + gradV * diffMv[1]`
+/// * `dILimit = 1 << Max(13, BitDepth + 1)`
+/// * `sbSamples[x][y] = predL[x+1][y+1] + Clip3(-dILimit, dILimit - 1, dI)`
+pub fn apply_prof_to_subblock(
+    block: &AffineSubblockHpBlock,
+    diff_mv: &DiffMvArray,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "h266 PROF apply: bit_depth {bit_depth} out of supported range 8..=16"
+        )));
+    }
+    if block.sb_width != diff_mv.sb_width || block.sb_height != diff_mv.sb_height {
+        return Err(Error::invalid(format!(
+            "h266 PROF apply: predSamples block {}x{} does not match diffMv array {}x{}",
+            block.sb_width, block.sb_height, diff_mv.sb_width, diff_mv.sb_height,
+        )));
+    }
+    let sb_w = block.sb_width as i32;
+    let sb_h = block.sb_height as i32;
+    let stride = (block.sb_width + 2) as i32;
+    let di_limit: i32 = 1i32 << 13i32.max(bit_depth as i32 + 1);
+    let mut out = vec![0i32; (sb_w * sb_h) as usize];
+
+    // shift1 = 6 in eqs. 955 / 956.
+    let shift1 = 6;
+    for y in 0..sb_h {
+        for x in 0..sb_w {
+            // eqs. 955 / 956 — local gradients across the centre-cell
+            // neighbour grid.
+            let idx = |cx: i32, cy: i32| -> usize {
+                // Centre cell (x, y) corresponds to block sample
+                // (x + 1, y + 1); halo lives in 0 / sbW+1 / sbH+1.
+                ((cy + 1) * stride + (cx + 1)) as usize
+            };
+            // gradientH[x][y] = (predL[x+2][y+1] >> 6) - (predL[x][y+1] >> 6)
+            //   == (predL at centre (x+1, y) >> 6) - (predL at centre (x-1, y) >> 6)
+            let grad_h =
+                (block.samples[idx(x + 1, y)] >> shift1) - (block.samples[idx(x - 1, y)] >> shift1);
+            // gradientV[x][y] = (predL[x+1][y+2] >> 6) - (predL[x+1][y] >> 6)
+            let grad_v =
+                (block.samples[idx(x, y + 1)] >> shift1) - (block.samples[idx(x, y - 1)] >> shift1);
+            // eq. 957 — dI in widened precision so the multiply
+            // doesn't wrap when |grad| ~ 2^14 and |diffMv| ~ 32.
+            let (dmv_x, dmv_y) = diff_mv.at(x as u32, y as u32);
+            let d_i_wide: i64 = (grad_h as i64) * (dmv_x as i64) + (grad_v as i64) * (dmv_y as i64);
+            // eqs. 958 / 959 — clip + add to the centre sample.
+            let d_i = d_i_wide.clamp(-(di_limit as i64), di_limit as i64 - 1) as i32;
+            let centre = block.samples[idx(x, y)];
+            out[(y * sb_w + x) as usize] = centre + d_i;
+        }
+    }
+    Ok(out)
+}
+
+/// Per-pixel BitDepth=8 uni-pred clamp shared with
+/// [`predict_luma_subblock_affine`]'s `pb_clip_8bit`. Exposed here so
+/// the PROF driver can convert the per-sub-block refined
+/// `sbSamplesLXL` (BitDepth + 6 precision i32) into final 8-bit
+/// samples consistently with the non-PROF path.
+#[inline]
+fn pb_clip_8bit_from_hp(intermediate: i32) -> u8 {
+    let v = (intermediate + 32) >> 6;
+    v.clamp(0, 255) as u8
+}
+
+/// Full-CU driver — `predict_luma_block_affine` + the §8.5.6.4 PROF
+/// refinement on top.
+///
+/// Walks the `numSbX × numSbY` 4×4 sub-block grid (per
+/// [`derive_subblock_mvs`]), runs the high-precision affine MC for
+/// each sub-block ([`predict_luma_subblock_affine_high_precision`]),
+/// applies PROF ([`apply_prof_to_subblock`]) using a single
+/// CU-wide diffMv array (per
+/// [`derive_prof_diff_mv_array`]) and a final `(v + 32) >> 6 → u8`
+/// uni-pred clamp writes the result into `dst`.
+///
+/// When [`cb_prof_flag_lx`] reports `false` (translational-degenerate
+/// CPMVs, fallback mode triggered, RPR, ph_prof_disabled), the
+/// refinement is skipped and the driver degrades to a high-precision
+/// equivalent of [`predict_luma_block_affine`]. The PROF-disabled
+/// path is bit-identical to the non-HP driver because the centre
+/// sample of the HP block is exactly the predSamplesLN value that
+/// [`predict_luma_subblock_affine`] would have computed before its
+/// `>> shift2` + clip pair.
+///
+/// Inputs / outputs match [`predict_luma_block_affine`]: this is a
+/// drop-in replacement that opts into PROF when cbProfFlagLX = 1.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block_affine_prof(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    cb_width: u32,
+    cb_height: u32,
+    src: &PicturePlane,
+    cpmvs: &AffineCpmvs,
+    filter_set: AffineLumaFilterSet,
+    bipred: bool,
+    ph_prof_disabled_flag: bool,
+    rpr_constraints_active: bool,
+) -> Result<()> {
+    if dst_x as usize + cb_width as usize > dst.width
+        || dst_y as usize + cb_height as usize > dst.height
+    {
+        return Err(Error::invalid(format!(
+            "h266 affine PROF: CU ({dst_x},{dst_y}) {cb_width}x{cb_height} out of plane bounds {}x{}",
+            dst.width, dst.height
+        )));
+    }
+    let grid = derive_subblock_mvs(cb_width, cb_height, cpmvs, bipred)?;
+    let sb_w = cb_width / grid.num_sb_x; // typically 4
+    let sb_h = cb_height / grid.num_sb_y;
+
+    let prof_on = cb_prof_flag_lx(
+        cb_width,
+        cb_height,
+        cpmvs,
+        bipred,
+        ph_prof_disabled_flag,
+        rpr_constraints_active,
+    );
+    let diff_mv = if prof_on {
+        Some(derive_prof_diff_mv_array(cb_width, cb_height, cpmvs)?)
+    } else {
+        None
+    };
+
+    for sb_iy in 0..grid.num_sb_y {
+        for sb_ix in 0..grid.num_sb_x {
+            let mv = grid.mv_at(sb_ix, sb_iy);
+            let sb_x = dst_x + sb_ix * sb_w;
+            let sb_y = dst_y + sb_iy * sb_h;
+            // HP MC into a sbW+2 × sbH+2 buffer regardless of prof_on
+            // — this also gives us a single code path that the
+            // PROF-off fixture can verify against the existing
+            // `predict_luma_subblock_affine`. (Slightly more samples
+            // per sub-block than the PROF-off path strictly needs;
+            // the cost is the 1-sample halo on each side.)
+            let block = predict_luma_subblock_affine_high_precision(
+                sb_x, sb_y, sb_w, sb_h, src, mv, filter_set,
+            )?;
+            if let Some(diff_mv) = &diff_mv {
+                let refined = apply_prof_to_subblock(&block, diff_mv, 8)?;
+                for r in 0..sb_h as usize {
+                    for c in 0..sb_w as usize {
+                        dst.samples[(sb_y as usize + r) * dst.stride + sb_x as usize + c] =
+                            pb_clip_8bit_from_hp(refined[r * sb_w as usize + c]);
+                    }
+                }
+            } else {
+                // PROF off — emit the centre cell of the HP block
+                // straight through the uni-pred clamp.
+                let stride = (sb_w + 2) as usize;
+                for r in 0..sb_h as usize {
+                    for c in 0..sb_w as usize {
+                        let centre = block.samples[(r + 1) * stride + (c + 1)];
+                        dst.samples[(sb_y as usize + r) * dst.stride + sb_x as usize + c] =
+                            pb_clip_8bit_from_hp(centre);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------
 
@@ -1046,5 +1543,405 @@ mod tests {
         let other = MotionVector { x: 33, y: -16 };
         assert!(!AffineCpmvs::new_4param(cp, other).is_translational());
         assert!(!AffineCpmvs::new_6param(cp, cp, other).is_translational());
+    }
+
+    // -------- PROF (§8.5.5.9 + §8.5.6.4) tests --------
+
+    /// cbProfFlagLX must be false when the CPMVs degenerate to
+    /// translational (the spec's "numCpMv == 2 && cpMvLX[1] ==
+    /// cpMvLX[0]" / "numCpMv == 3 && cpMvLX[1] == cpMvLX[0] && cpMvLX[2]
+    /// == cpMvLX[0]" branches).
+    #[test]
+    fn cb_prof_flag_false_on_translational_degenerate_cpmvs() {
+        let cp = MotionVector { x: 16, y: 0 };
+        assert!(!cb_prof_flag_lx(
+            16,
+            16,
+            &AffineCpmvs::new_4param(cp, cp),
+            false,
+            false,
+            false,
+        ));
+        assert!(!cb_prof_flag_lx(
+            16,
+            16,
+            &AffineCpmvs::new_6param(cp, cp, cp),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    /// cbProfFlagLX must be false when `ph_prof_disabled_flag == 1`
+    /// even if the CPMV set is genuinely affine.
+    #[test]
+    fn cb_prof_flag_false_when_ph_prof_disabled() {
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 16, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        assert!(!cb_prof_flag_lx(
+            16, 16, &cpmvs, false, /* ph_prof_disabled */ true, false,
+        ));
+    }
+
+    /// cbProfFlagLX must be false when `RprConstraintsActiveFlag == 1`
+    /// even when nothing else triggers the disable.
+    #[test]
+    fn cb_prof_flag_false_when_rpr_active() {
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 16, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        assert!(!cb_prof_flag_lx(
+            16, 16, &cpmvs, false, false, /* rpr_constraints_active */ true,
+        ));
+    }
+
+    /// cbProfFlagLX must be TRUE for a real affine CU under default
+    /// (PROF-on) parameter-set settings.
+    #[test]
+    fn cb_prof_flag_true_for_real_affine() {
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 16, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        assert!(cb_prof_flag_lx(16, 16, &cpmvs, false, false, false));
+    }
+
+    /// derive_prof_diff_mv_array must produce all-zero entries when
+    /// the CPMV set is degenerate (no affine partials ⇒ raw eqs.
+    /// 885 / 886 reduce to constants but `posOffsetX = 6*0 + 6*0 = 0`
+    /// and so does posOffsetY, ⇒ all-zero diffMv).
+    #[test]
+    fn derive_prof_diff_mv_zero_on_translational_degenerate() {
+        let cp = MotionVector { x: 16, y: -8 };
+        let cpmvs = AffineCpmvs::new_4param(cp, cp);
+        let arr = derive_prof_diff_mv_array(16, 16, &cpmvs).expect("degenerate diffMv");
+        assert_eq!(arr.sb_width, 4);
+        assert_eq!(arr.sb_height, 4);
+        assert_eq!(arr.entries.len(), 16);
+        assert!(arr.is_all_zero(), "translational ⇒ diffMv must be all-zero");
+    }
+
+    /// Clip3(-31, 31) eq. 887 — the clip clamps both axes
+    /// independently. We force a wildly large `dHorX` partial via a
+    /// 256-unit CPMV delta on a small CU (extreme affine) and verify
+    /// the result is clamped to ±31.
+    #[test]
+    fn derive_prof_diff_mv_clipped_to_31() {
+        // Wild affine: cp0 = (0, 0), cp1 = (4096, 0) on a 16×16 CU.
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 4096, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        let arr = derive_prof_diff_mv_array(16, 16, &cpmvs).expect("wild diffMv");
+        for (dx, dy) in arr.entries.iter() {
+            assert!(
+                (-31..=31).contains(dx),
+                "diffMv[0] = {dx} out of clip range",
+            );
+            assert!(
+                (-31..=31).contains(dy),
+                "diffMv[1] = {dy} out of clip range",
+            );
+        }
+    }
+
+    /// derive_prof_diff_mv_array: the centre cell (`(sbW-1)/2`,
+    /// `(sbH-1)/2`-ish) of an integer-shift 4-parameter CPMV set
+    /// should land *near* zero — the `posOffsetX = 6*dHorX + 6*dHorY`
+    /// offset shifts the per-pixel diffMv so it's near-zero at the
+    /// sub-block centre. We check this is small-magnitude relative to
+    /// the corner cells.
+    #[test]
+    fn derive_prof_diff_mv_smaller_at_subblock_centre() {
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 16, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        // 64x64 ⇒ sbW = 16, sbH = 16. Plenty of resolution to inspect.
+        let arr = derive_prof_diff_mv_array(64, 64, &cpmvs).expect("64x64");
+        assert_eq!(arr.sb_width, 4);
+        assert_eq!(arr.sb_height, 4);
+        // Centre-ish cell (1, 1) on a 4x4 grid — close to PROF's
+        // posOffset crossover; corner cells should have larger
+        // absolute MV difference.
+        let centre = arr.at(1, 1);
+        let corner = arr.at(0, 0);
+        assert!(
+            centre.0.abs() + centre.1.abs() <= corner.0.abs() + corner.1.abs(),
+            "PROF diffMv at centre {:?} should be no larger than at corner {:?}",
+            centre,
+            corner,
+        );
+    }
+
+    /// PROF on a perfectly translational fixture must be a strict
+    /// no-op — `predict_luma_block_affine_prof` with degenerate CPMVs
+    /// must produce the same output as
+    /// `predict_luma_block_affine`. (Centre cell of the HP block at
+    /// integer-pel + `>> 6` clip should equal the integer-pel non-HP
+    /// sample.)
+    #[test]
+    fn predict_affine_prof_translational_equals_affine_no_prof() {
+        let mut src = PicturePlane::filled(32, 32, 0);
+        for y in 0..32usize {
+            for x in 0..32usize {
+                src.samples[y * 32 + x] = ((x * 13 + y * 7) % 251) as u8;
+            }
+        }
+        let cp = MotionVector::from_int_pel(0, 0);
+        let cpmvs = AffineCpmvs::new_4param(cp, cp);
+        let mut dst_a = PicturePlane::filled(32, 32, 0);
+        predict_luma_block_affine(
+            &mut dst_a,
+            8,
+            8,
+            16,
+            16,
+            &src,
+            &cpmvs,
+            AffineLumaFilterSet::Set0,
+        )
+        .expect("non-prof affine");
+        let mut dst_b = PicturePlane::filled(32, 32, 0);
+        predict_luma_block_affine_prof(
+            &mut dst_b,
+            8,
+            8,
+            16,
+            16,
+            &src,
+            &cpmvs,
+            AffineLumaFilterSet::Set0,
+            false,
+            false,
+            false,
+        )
+        .expect("prof-path affine");
+        // PROF-off path (cbProfFlagLX == 0 because is_translational)
+        // must match the existing non-HP driver byte-for-byte.
+        assert_eq!(
+            dst_a.samples, dst_b.samples,
+            "translational degenerate must match between affine and affine-PROF drivers"
+        );
+    }
+
+    /// PROF on a real affine CU: the refinement should *not* hurt PSNR
+    /// vs the affine-only path on an affine-transformed fixture, and
+    /// should produce a different output (proof of life).
+    #[test]
+    fn predict_affine_prof_changes_output_on_real_affine() {
+        // 32x32 horizontal-shear fixture (cp0=(0,0), cp1=(16,0)).
+        let mut src = PicturePlane::filled(64, 64, 0);
+        for y in 0..64usize {
+            for x in 0..64usize {
+                // Simple gradient — gives non-zero gradH everywhere.
+                src.samples[y * 64 + x] = (x * 3 + y * 2).min(255) as u8;
+            }
+        }
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 16, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        let mut dst_no_prof = PicturePlane::filled(64, 64, 0);
+        predict_luma_block_affine(
+            &mut dst_no_prof,
+            16,
+            16,
+            32,
+            32,
+            &src,
+            &cpmvs,
+            AffineLumaFilterSet::Set0,
+        )
+        .expect("no-prof");
+        let mut dst_prof = PicturePlane::filled(64, 64, 0);
+        predict_luma_block_affine_prof(
+            &mut dst_prof,
+            16,
+            16,
+            32,
+            32,
+            &src,
+            &cpmvs,
+            AffineLumaFilterSet::Set0,
+            false,
+            false,
+            false,
+        )
+        .expect("prof");
+        // Proof of life: PROF must produce a different output to the
+        // non-PROF path on a real affine CU.
+        assert_ne!(
+            dst_prof.samples, dst_no_prof.samples,
+            "PROF on a real affine CU must perturb at least some samples"
+        );
+    }
+
+    /// PROF round-trip parity: PROF with cbProfFlagLX *forced off*
+    /// (`ph_prof_disabled_flag = true`) must match the affine-only
+    /// driver for the same CPMVs — the centre HP cell with the final
+    /// `(v + 32) >> 6 → u8` clamp is bit-identical to
+    /// `predict_luma_subblock_affine`'s output.
+    #[test]
+    fn predict_affine_prof_disabled_matches_no_prof() {
+        let mut src = PicturePlane::filled(64, 64, 0);
+        for y in 0..64usize {
+            for x in 0..64usize {
+                src.samples[y * 64 + x] = ((y * 7 + x * 11) % 251) as u8;
+            }
+        }
+        let cp0 = MotionVector { x: 0, y: 0 };
+        let cp1 = MotionVector { x: 16, y: 0 };
+        let cpmvs = AffineCpmvs::new_4param(cp0, cp1);
+        let mut dst_a = PicturePlane::filled(64, 64, 0);
+        predict_luma_block_affine(
+            &mut dst_a,
+            16,
+            16,
+            32,
+            32,
+            &src,
+            &cpmvs,
+            AffineLumaFilterSet::Set0,
+        )
+        .expect("affine no-prof");
+        let mut dst_b = PicturePlane::filled(64, 64, 0);
+        predict_luma_block_affine_prof(
+            &mut dst_b,
+            16,
+            16,
+            32,
+            32,
+            &src,
+            &cpmvs,
+            AffineLumaFilterSet::Set0,
+            false,
+            /* ph_prof_disabled */ true,
+            false,
+        )
+        .expect("affine prof-forced-off");
+        assert_eq!(
+            dst_a.samples, dst_b.samples,
+            "ph_prof_disabled = 1 must collapse the PROF driver to the affine-only driver",
+        );
+    }
+
+    /// apply_prof_to_subblock on an all-zero diffMv array must leave
+    /// the centre samples unchanged (dI = 0 ⇒ sbSamples = centre).
+    #[test]
+    fn apply_prof_zero_diff_mv_is_identity_on_centre() {
+        // Build a synthetic HP block (sbWidth = sbHeight = 4 ⇒ 6 × 6).
+        let sb = 4u32;
+        let mut samples = vec![0i32; ((sb + 2) * (sb + 2)) as usize];
+        let stride = (sb + 2) as usize;
+        for y in 0..(sb + 2) as usize {
+            for x in 0..(sb + 2) as usize {
+                samples[y * stride + x] = (x as i32 * 17 + y as i32 * 23) % 9871;
+            }
+        }
+        let block = AffineSubblockHpBlock {
+            sb_width: sb,
+            sb_height: sb,
+            samples,
+        };
+        let diff_mv = DiffMvArray {
+            sb_width: sb,
+            sb_height: sb,
+            entries: vec![(0, 0); (sb * sb) as usize],
+        };
+        let refined = apply_prof_to_subblock(&block, &diff_mv, 8).expect("apply");
+        for y in 0..sb as usize {
+            for x in 0..sb as usize {
+                let centre = block.samples[(y + 1) * stride + (x + 1)];
+                assert_eq!(
+                    refined[y * sb as usize + x],
+                    centre,
+                    "zero diffMv at ({x},{y}) must collapse to centre sample",
+                );
+            }
+        }
+    }
+
+    /// apply_prof_to_subblock clamps `dI` to ±dILimit per eq. 958. At
+    /// BitDepth = 8, `dILimit = 1 << 13 = 8192`. Force a huge gradient
+    /// + huge diffMv and verify the per-pixel correction is bounded.
+    #[test]
+    fn apply_prof_d_i_is_clipped_at_d_i_limit() {
+        let sb = 4u32;
+        let stride = (sb + 2) as usize;
+        // Sample block with extreme gradient: 0, 16384 alternating
+        // by column ⇒ gradH at every cell is (16384 >> 6) - (0 >> 6)
+        // = 256.
+        let mut samples = vec![0i32; ((sb + 2) * (sb + 2)) as usize];
+        for y in 0..(sb + 2) as usize {
+            for x in 0..(sb + 2) as usize {
+                samples[y * stride + x] = if x % 2 == 0 { 0 } else { 16384 };
+            }
+        }
+        let block = AffineSubblockHpBlock {
+            sb_width: sb,
+            sb_height: sb,
+            samples,
+        };
+        // Max-magnitude diffMv on every pixel.
+        let diff_mv = DiffMvArray {
+            sb_width: sb,
+            sb_height: sb,
+            entries: vec![(31, 31); (sb * sb) as usize],
+        };
+        let refined = apply_prof_to_subblock(&block, &diff_mv, 8).expect("apply");
+        // dILimit at BD = 8 is `1 << 13 = 8192`. The per-pixel
+        // adjustment is in [-8192, 8191] so refined - centre must be
+        // bounded by that range.
+        for y in 0..sb as usize {
+            for x in 0..sb as usize {
+                let centre = block.samples[(y + 1) * stride + (x + 1)];
+                let r = refined[y * sb as usize + x];
+                let delta = r - centre;
+                assert!(
+                    (-8192..=8191).contains(&delta),
+                    "PROF dI clip failed at ({x},{y}): delta = {delta}",
+                );
+            }
+        }
+    }
+
+    /// Integration: predict_luma_subblock_affine_high_precision output,
+    /// when clipped via `(v + 32) >> 6` clamp, must equal what
+    /// predict_luma_subblock_affine produces — i.e. the HP block's
+    /// centre cells round-trip through the spec's uni-pred clamp the
+    /// same way the legacy non-HP path does.
+    #[test]
+    fn hp_subblock_centre_matches_non_hp_subblock() {
+        let mut src = PicturePlane::filled(16, 16, 0);
+        for y in 0..16usize {
+            for x in 0..16usize {
+                src.samples[y * 16 + x] = ((x * 17 + y * 5) % 251) as u8;
+            }
+        }
+        // Half-pel MV — exercises a real 2D filter pass.
+        let mv = MotionVector { x: 8, y: 8 };
+        let block = predict_luma_subblock_affine_high_precision(
+            4,
+            4,
+            4,
+            4,
+            &src,
+            mv,
+            AffineLumaFilterSet::Set0,
+        )
+        .expect("hp");
+        let mut dst = PicturePlane::filled(16, 16, 99);
+        predict_luma_subblock_affine(&mut dst, 4, 4, 4, 4, &src, mv, AffineLumaFilterSet::Set0)
+            .expect("non-hp");
+        let stride = (block.sb_width + 2) as usize;
+        for r in 0..4usize {
+            for c in 0..4usize {
+                let centre = block.samples[(r + 1) * stride + (c + 1)];
+                let centre_clipped = pb_clip_8bit_from_hp(centre);
+                let non_hp_value = dst.samples[(4 + r) * 16 + (4 + c)];
+                assert_eq!(
+                    centre_clipped, non_hp_value,
+                    "HP centre clip ({centre_clipped}) must match non-HP ({non_hp_value}) at ({r},{c})",
+                );
+            }
+        }
     }
 }

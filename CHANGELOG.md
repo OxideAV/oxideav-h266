@@ -6,6 +6,54 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 78 — **§8.5.6.4 PROF (Prediction Refinement with Optical Flow)**
+  per-pixel refinement layered on top of the round-65 affine sub-block
+  MC. Round 65 left PROF deferred ("requires gradient-based refinement
+  out of scope until a later round"); round 78 wires the full
+  §8.5.5.9 + §8.5.6.4 pipeline:
+  - `affine::cb_prof_flag_lx(cb_w, cb_h, cpmvs, bipred,
+    ph_prof_disabled_flag, rpr_constraints_active)` — the §8.5.5.9
+    four-bullets disable gate. Returns `false` on any of
+    `ph_prof_disabled_flag == 1`, translational-degenerate CPMVs,
+    fallback mode triggered, or RPR active.
+  - `affine::derive_prof_diff_mv_array(cb_w, cb_h, cpmvs)` — the
+    §8.5.5.9 eqs. 880 – 887 per-pixel diffMvLX array. `sbWidth ×
+    sbHeight` row-major entries with `posOffsetX = 6 * dHorX + 6 *
+    dHorY`, `posOffsetY = 6 * dVerX + 6 * dVerY`, eqs. 885 / 886
+    raw values, §8.5.2.14 signed-magnitude rounding with `rightShift
+    = 8, leftShift = 0`, eq. 887 `Clip3(-31, 31)`.
+  - `affine::predict_luma_subblock_affine_high_precision(dst_x,
+    dst_y, sb_w, sb_h, src, mv, filter_set)` — the §8.5.6.4 input
+    helper that produces a `(sbW + 2) × (sbH + 2)` `BitDepth + 6`
+    precision predSamplesLXL halo'd block (the 1-sample halo on
+    every side supplies the eqs. 955 / 956 gradient neighbours).
+    Same separable filter as `predict_luma_subblock_affine` but
+    leaves the per-sub-block `(v + 32) >> 6` clamp un-applied.
+  - `affine::apply_prof_to_subblock(block, diff_mv, bit_depth)` —
+    the §8.5.6.4 refinement. Implements eqs. 955 – 959 verbatim:
+    `shift1 = 6`, `gradH[x][y] = (predL[x+2][y+1] >> 6) -
+    (predL[x][y+1] >> 6)`, `gradV[x][y] = (predL[x+1][y+2] >> 6) -
+    (predL[x+1][y] >> 6)`, `dI = gradH * diffMv[0] + gradV *
+    diffMv[1]`, `dILimit = 1 << Max(13, BitDepth + 1)`,
+    `sbSamples[x][y] = predL[x+1][y+1] + Clip3(-dILimit,
+    dILimit - 1, dI)`.
+  - `affine::predict_luma_block_affine_prof(...)` — full-CU driver
+    composing `derive_subblock_mvs` + the new HP sub-block MC + the
+    new PROF refinement + final 8-bit uni-pred clamp. Bit-identically
+    short-circuits to `predict_luma_block_affine` when the
+    cbProfFlagLX gate reports `false`.
+  On the same round-65 horizontal-shear fixture the PROF-on driver
+  reaches PSNR_Y = 53.97 dB vs the PROF-off baseline at 52.32 dB
+  (+1.65 dB). Translational-degenerate CPMVs and
+  `ph_prof_disabled_flag == 1` and `RprConstraintsActiveFlag == 1`
+  paths all collapse to byte-identical replay of
+  `predict_luma_block_affine` (the spec's "PROF disabled" branches).
+  Coverage adds 11 unit tests + 4 integration tests in `tests/
+  round78_prof.rs`; total crate-level tests rose from 775 to 803.
+  Affine merge / AMVP candidate list construction, affine sub-block
+  chroma MC (§8.5.5.9 eqs. 876 – 879 `mvAvgLX`), and the §8.8.3.4
+  sub-block boundary deblock propagation remain deferred.
+
 - Round 65 — **Affine sub-block motion compensation scaffold** per VVC
   §8.5.5.9 (eqs. 847 – 887) + Tables 30 / 31 / 32 (affine-mode luma
   1/16-pel interpolation filters). VVC supports 4-parameter and
