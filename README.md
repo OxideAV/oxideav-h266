@@ -458,6 +458,42 @@ per-CB CPMV storage lands; the §8.5.5.2 driver that fuses inherited A /
 inherited B / Const1..6 + zero-MV pad into `subblockMergeCandList` and
 the SbTMVP (§8.5.5.3 / §8.5.5.4) candidate path remain deferred.
 
+**Round-94 layers the §8.5.5.2 `subblockMergeCandList` insertion order +
+`merge_subblock_idx` pick on top.** New `build_subblock_merge_cand_list`
++ `SubblockMergeList::pick` helpers in the `affine_merge` module walk
+the spec's step-7 listing byte for byte: slot 0 = SbCol when
+`availableFlagSbCol`, then inherited A (A0/A1 cascade), then inherited B
+(B0/B1/B2 cascade), then Const1..Const6 in numeric order, then zero-MV
+padding to `MaxNumSubblockMergeCand`. Each guard is the spec's
+`availableFlagN && i < MaxNumSubblockMergeCand` clip. The zero-pad
+follows eqs. 686 – 695 exactly — uni-pred `(refIdxL0=0, predFlagL0=1,
+refIdxL1=−1, predFlagL1=0)` on P-slice, bi-pred `(refIdxL0=0,
+refIdxL1=0, predFlagL0=1, predFlagL1=1)` on B-slice, every CPMV zero,
+`motionModelIdc = 1` ⇒ `Affine4Param`, `bcwIdx = 0`. The pick step is
+`subblockMergeCandList[ merge_subblock_idx ]` — a single array index
+returning the slot's `SubblockMergeCandidateKind` (`SbCol` /
+`InheritedA` / `InheritedB` / `Const(K)` / `Zero`) plus the parallel
+`AffineMergeCandidate` payload. The list assembly emits **no
+pruning/equality pass** — §8.5.5.2 step 7 specifies no dedup step
+(contrast with §8.5.2.4 pairwise-average for regular merge, which is a
+separate explicit index pick rather than a comparison loop), so this
+module appends without dedup; any future amendment introducing a CPMV
+prune would slot into the same routine. 12 new lib tests cover the
+empty `max_num_cand = 0` edge case, the all-zero-pad fallback, P-slice
+vs B-slice zero-cand layout (eq. 690 / 691 flip), the canonical
+SbCol→A→B→Const1..Const2 (5-slot fill) order, SbCol-absent shift,
+inherited-A-absent / inherited-B-present, `max_num_cand` short-circuit
+clipping, `max_num_cand` clamp to `MAX_SUBBLOCK_MERGE_CAND`,
+`pick`-by-index round-trip, out-of-range index rejection, and an
+end-to-end test confirming a `pick`ed `AffineMergeCandidate` flows
+straight into `affine::derive_subblock_mvs`. The §8.5.5.3 / §8.5.5.4
+SbCol record itself + the affine AMVP (§8.5.5.7) path + the §8.5.5.2
+step-6 corner-selection cascade (B2/B3/A2, B1/B0, A1/A0 driven by
+per-CB neighbour availability) remain deferred — the list helper takes
+`InheritedAffineCandidate` and `ConstructedAffineCandidates` shaped
+inputs so the CTU walker can drop them in once per-CB CPMV storage and
+the cascade walker land.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

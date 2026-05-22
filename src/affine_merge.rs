@@ -821,6 +821,214 @@ fn shift_signed(v: i64, n: i32) -> i64 {
 }
 
 // =====================================================================
+// §8.5.5.2 — subblockMergeCandList assembly + merge_subblock_idx pick
+// =====================================================================
+
+/// Maximum legal value for `MaxNumSubblockMergeCand` per the §7.4.3.4
+/// "in the range of 0 to 5, inclusive" bullet (eq. 85). The
+/// per-list-slot arrays are sized to this constant.
+pub const MAX_SUBBLOCK_MERGE_CAND: usize = 5;
+
+/// Tag for one slot of `subblockMergeCandList`. Mirrors the spec's
+/// `SbCol` / `A` / `B` / `Const1..6` / `zeroCandm` symbolic names used
+/// in §8.5.5.2 step 7 + step 9. The `Zero` variant carries the spec's
+/// padded all-zero candidate — its payload sits at the same position in
+/// the parallel `cands` slot as the symbolic name in the spec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubblockMergeCandidateKind {
+    /// `SbCol` — §8.5.5.3 / §8.5.5.4 sub-block temporal candidate. Its
+    /// payload is *not* an `AffineMergeCandidate` (carries a per-4×4 MV
+    /// grid rather than CPMVs); the [`SubblockMergeList`] slot carries
+    /// only the kind, and the §8.5.5.2 step-10 dispatch reads the
+    /// pre-existing SbCol record directly.
+    SbCol,
+    /// `A` — inherited from the A0/A1 cascade. CPMVs were derived by
+    /// the caller via [`derive_inherited_affine_cpmvs`].
+    InheritedA,
+    /// `B` — inherited from the B0/B1/B2 cascade.
+    InheritedB,
+    /// `ConstK` with K = 1..6 — §8.5.5.6 constructed candidate K.
+    Const(u8),
+    /// `zeroCandm` — §8.5.5.2 step-9 zero-MV padding entry.
+    Zero,
+}
+
+/// Per-list inherited-candidate input to [`build_subblock_merge_cand_list`]
+/// — collects the `(availableFlagN, refIdxLXN, predFlagLXN, cpMvLXN, ...)`
+/// arrays the §8.5.5.2 step-4 / step-5 cascades emit, repackaged into a
+/// single [`AffineMergeCandidate`] (one for A, one for B).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InheritedAffineCandidate {
+    /// `availableFlagA` / `availableFlagB` per eq. 681 – 684's `availableFlagN`.
+    pub available: bool,
+    /// The fully-formed candidate record (CPMVs + per-list pred flags +
+    /// `motionModelIdcN` + `bcwIdxN`). Read only when [`Self::available`]
+    /// is `true`.
+    pub cand: AffineMergeCandidate,
+}
+
+/// Inputs to [`build_subblock_merge_cand_list`] capturing §8.5.5.2's
+/// `availableFlagSbCol`, `availableFlagA`, `availableFlagB`,
+/// `availableFlagConstK` (K=1..6), `MaxNumSubblockMergeCand`, and
+/// `sh_slice_type == B` (eq. 690 / 691 zero-cand L1 selector).
+#[derive(Clone, Copy, Debug)]
+pub struct SubblockMergeListInputs<'a> {
+    /// `MaxNumSubblockMergeCand` per eq. 85, clipped to `[0, 5]`.
+    pub max_num_cand: u32,
+    /// `sh_slice_type == B` — flips the zero-cand `(refIdxL1, predFlagL1)`
+    /// pair from `(-1, 0)` to `(0, 1)` per eqs. 690 / 691.
+    pub slice_type_b: bool,
+    /// `availableFlagSbCol` from §8.5.5.3. The SbCol record itself is not
+    /// passed in here — the §8.5.5.2 step-10 dispatch consumes it
+    /// separately (it's a sub-block MV grid, not a CPMV record).
+    pub sb_col_available: bool,
+    /// `availableFlagA` + the inherited-A `AffineMergeCandidate` (eq. 681
+    /// – 682). [`InheritedAffineCandidate::available`] mirrors the spec's
+    /// flag.
+    pub inherited_a: InheritedAffineCandidate,
+    /// `availableFlagB` + the inherited-B `AffineMergeCandidate` (eq. 683
+    /// – 684).
+    pub inherited_b: InheritedAffineCandidate,
+    /// `availableFlagConst1..6` + the six `ConstK` records emitted by
+    /// [`derive_constructed_affine_merge_candidates`].
+    pub constructed: &'a ConstructedAffineCandidates,
+}
+
+/// The assembled `subblockMergeCandList` per §8.5.5.2 steps 7 – 9 plus
+/// the `merge_subblock_idx`-based dispatch helper in step 10. Slots are
+/// filled in spec order (SbCol → A → B → Const1..6 → zero-pad) and
+/// clipped at `max_num_cand`.
+///
+/// Note: the spec specifies **no equality/pruning pass** for the
+/// sub-block merge candidate list — neither §8.5.5.2 step 7 nor §8.5.5.6
+/// invokes a "compare the new candidate against existing ones" branch
+/// (contrast with §8.5.2.4 pairwise-average for regular merge, which is
+/// gated by an explicit pair-of-indices selection rather than a
+/// pruning loop). This module therefore appends without dedup.
+#[derive(Clone, Debug, Default)]
+pub struct SubblockMergeList {
+    /// `numCurrMergeCand` after step 9 — always `== max_num_cand` once
+    /// step 9 has run. Sized as `usize` for direct indexing.
+    pub count: usize,
+    /// Slot-i symbolic name. Length is [`Self::count`]; trailing slots
+    /// (up to [`MAX_SUBBLOCK_MERGE_CAND`]) carry `Zero` defaults but are
+    /// not part of the visible list.
+    pub kinds: [SubblockMergeCandidateKind; MAX_SUBBLOCK_MERGE_CAND],
+    /// Parallel `AffineMergeCandidate` payloads. Slot `SbCol`'s payload
+    /// is the default record — the caller must consult the separately
+    /// derived SbCol grid when the picked kind is
+    /// [`SubblockMergeCandidateKind::SbCol`].
+    pub cands: [AffineMergeCandidate; MAX_SUBBLOCK_MERGE_CAND],
+}
+
+impl SubblockMergeList {
+    /// Read the slot-N kind + payload, where N is `merge_subblock_idx`
+    /// (§8.5.5.2 step 10). Out-of-range indices return `None`; well-formed
+    /// streams have `merge_subblock_idx ∈ [0, MaxNumSubblockMergeCand − 1]`
+    /// per §7.3.11.7's `cMax = MaxNumSubblockMergeCand − 1` constraint.
+    pub fn pick(
+        &self,
+        merge_subblock_idx: u32,
+    ) -> Option<(SubblockMergeCandidateKind, AffineMergeCandidate)> {
+        let idx = merge_subblock_idx as usize;
+        if idx >= self.count {
+            return None;
+        }
+        Some((self.kinds[idx], self.cands[idx]))
+    }
+
+    /// Length of the visible list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// `true` iff the list is empty (no SbCol, no inherited A/B, no
+    /// constructed, no zero pad — only happens when `max_num_cand == 0`).
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl Default for SubblockMergeCandidateKind {
+    fn default() -> Self {
+        SubblockMergeCandidateKind::Zero
+    }
+}
+
+/// §8.5.5.2 step 7 + step 8 + step 9 — assemble `subblockMergeCandList`
+/// in the exact spec order, then zero-pad to `MaxNumSubblockMergeCand`.
+///
+/// No pruning. The spec's step-7 listing is a straight append guarded
+/// only by `i < MaxNumSubblockMergeCand`; this routine mirrors it byte
+/// for byte. If a future spec amendment introduces a CPMV-equality
+/// prune, it would go here — see the [`SubblockMergeList`] doc-comment.
+pub fn build_subblock_merge_cand_list(inputs: SubblockMergeListInputs<'_>) -> SubblockMergeList {
+    let max_n = (inputs.max_num_cand as usize).min(MAX_SUBBLOCK_MERGE_CAND);
+    let mut out = SubblockMergeList::default();
+
+    // --- §8.5.5.2 step 7: ordered append, guarded by `i < max_n`. -----
+    // SbCol first.
+    if inputs.sb_col_available && out.count < max_n {
+        out.kinds[out.count] = SubblockMergeCandidateKind::SbCol;
+        // SbCol payload is sub-block-grid-shaped; the placeholder
+        // AffineMergeCandidate default is a guard so the parallel array
+        // stays valid. Callers dispatch on `kinds[idx] == SbCol`.
+        out.cands[out.count] = AffineMergeCandidate::default();
+        out.count += 1;
+    }
+    // Inherited A.
+    if inputs.inherited_a.available && out.count < max_n {
+        out.kinds[out.count] = SubblockMergeCandidateKind::InheritedA;
+        out.cands[out.count] = inputs.inherited_a.cand;
+        out.count += 1;
+    }
+    // Inherited B.
+    if inputs.inherited_b.available && out.count < max_n {
+        out.kinds[out.count] = SubblockMergeCandidateKind::InheritedB;
+        out.cands[out.count] = inputs.inherited_b.cand;
+        out.count += 1;
+    }
+    // Const1..Const6.
+    for k in 0..6usize {
+        if inputs.constructed.available[k] && out.count < max_n {
+            out.kinds[out.count] = SubblockMergeCandidateKind::Const((k as u8) + 1);
+            out.cands[out.count] = inputs.constructed.cands[k];
+            out.count += 1;
+        }
+    }
+
+    // --- §8.5.5.2 step 8 (`numOrigMergeCand = numCurrMergeCand`) is
+    // implicit — we don't need to remember it; step 9 just fills up to
+    // max_n. -----------------------------------------------------------
+
+    // --- §8.5.5.2 step 9: zero-MV padding to max_n -------------------
+    while out.count < max_n {
+        out.kinds[out.count] = SubblockMergeCandidateKind::Zero;
+        out.cands[out.count] = zero_subblock_merge_candidate(inputs.slice_type_b);
+        out.count += 1;
+    }
+
+    out
+}
+
+/// §8.5.5.2 step 9 eqs. 686 – 695 — build one `zeroCandm` entry. The
+/// `slice_type_b` flag drives eq. 690 / 691 ((refIdxL1, predFlagL1) flips
+/// from (−1, 0) on P-slice to (0, 1) on B-slice). `motionModelIdc` is
+/// eq. 694 (1 ⇒ `MotionModel::Affine4Param`), `bcwIdx` is eq. 695 (0).
+fn zero_subblock_merge_candidate(slice_type_b: bool) -> AffineMergeCandidate {
+    AffineMergeCandidate {
+        pred_flag_l0: true,                            // eq. 687
+        pred_flag_l1: slice_type_b,                    // eq. 691
+        ref_idx_l0: 0,                                 // eq. 686
+        ref_idx_l1: if slice_type_b { 0 } else { -1 }, // eq. 690
+        cpmvs_l0: AffineCpmvs::new_4param(MotionVector::ZERO, MotionVector::ZERO),
+        cpmvs_l1: AffineCpmvs::new_4param(MotionVector::ZERO, MotionVector::ZERO),
+        motion_model: MotionModel::Affine4Param, // eq. 694 (motionModelIdc = 1)
+        bcw_idx: 0,                              // eq. 695
+    }
+}
+
+// =====================================================================
 // Tests — §8.5.5.5 inherited + §8.5.5.6 constructed derivation
 // =====================================================================
 
@@ -1412,5 +1620,348 @@ mod tests {
             "first sub-block x = {}",
             mv00.x
         );
+    }
+
+    // ----- §8.5.5.2 list assembly + merge_subblock_idx pick -----------
+
+    /// Helper: build one `InheritedAffineCandidate` from a CPMV record
+    /// (uni-pred L0, refIdx = 0, motionModelIdc forced to 6-param).
+    fn inh_l0_6param(
+        cp0: MotionVector,
+        cp1: MotionVector,
+        cp2: MotionVector,
+    ) -> InheritedAffineCandidate {
+        InheritedAffineCandidate {
+            available: true,
+            cand: AffineMergeCandidate {
+                pred_flag_l0: true,
+                pred_flag_l1: false,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+                cpmvs_l0: AffineCpmvs::new_6param(cp0, cp1, cp2),
+                cpmvs_l1: AffineCpmvs::new_4param(MotionVector::ZERO, MotionVector::ZERO),
+                motion_model: MotionModel::Affine6Param,
+                bcw_idx: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn list_empty_when_max_zero_emits_no_slots() {
+        let constructed = ConstructedAffineCandidates::default();
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 0,
+            slice_type_b: false,
+            sb_col_available: true,
+            inherited_a: inh_l0_6param(mv(1, 1), mv(2, 2), mv(3, 3)),
+            inherited_b: inh_l0_6param(mv(4, 4), mv(5, 5), mv(6, 6)),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn list_only_zero_pad_when_no_real_candidates_available() {
+        let constructed = ConstructedAffineCandidates::default();
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 3,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        assert_eq!(list.len(), 3);
+        for k in 0..3 {
+            assert_eq!(
+                list.kinds[k],
+                SubblockMergeCandidateKind::Zero,
+                "slot {k} should be Zero"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_pad_p_slice_emits_unipred_zero_candidate() {
+        let constructed = ConstructedAffineCandidates::default();
+        let list = build_subblock_merge_cand_list(SubblockMergeListInputs {
+            max_num_cand: 1,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        });
+        let (kind, cand) = list.pick(0).expect("slot 0 exists");
+        assert_eq!(kind, SubblockMergeCandidateKind::Zero);
+        // Eq. 686 / 687: refIdxL0 = 0, predFlagL0 = 1.
+        assert!(cand.pred_flag_l0);
+        assert_eq!(cand.ref_idx_l0, 0);
+        // Eq. 690 / 691: P-slice ⇒ refIdxL1 = -1, predFlagL1 = 0.
+        assert!(!cand.pred_flag_l1);
+        assert_eq!(cand.ref_idx_l1, -1);
+        // Eq. 688 / 689 / 692 / 693: all CPMVs zero.
+        assert_eq!(cand.cpmvs_l0.cpmvs[0], MotionVector::ZERO);
+        assert_eq!(cand.cpmvs_l0.cpmvs[1], MotionVector::ZERO);
+        // Eq. 694: motionModelIdc = 1 ⇒ Affine4Param.
+        assert_eq!(cand.motion_model, MotionModel::Affine4Param);
+        // Eq. 695: bcwIdx = 0.
+        assert_eq!(cand.bcw_idx, 0);
+    }
+
+    #[test]
+    fn zero_pad_b_slice_emits_bipred_zero_candidate() {
+        let constructed = ConstructedAffineCandidates::default();
+        let list = build_subblock_merge_cand_list(SubblockMergeListInputs {
+            max_num_cand: 1,
+            slice_type_b: true,
+            sb_col_available: false,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        });
+        let (_, cand) = list.pick(0).expect("slot 0");
+        // Eq. 691: B-slice ⇒ predFlagL1 = 1.
+        assert!(cand.pred_flag_l1);
+        // Eq. 690: B-slice ⇒ refIdxL1 = 0.
+        assert_eq!(cand.ref_idx_l1, 0);
+    }
+
+    /// Spec order: SbCol → InheritedA → InheritedB → Const1..6 → Zero.
+    /// With every flag set, slot 0 = SbCol, slot 1 = A, slot 2 = B,
+    /// slot 3 = Const1, slot 4 = Const2 (5 slots fill `max_num_cand = 5`).
+    #[test]
+    fn list_insertion_order_sbcol_then_a_then_b_then_const_then_zero() {
+        let mut constructed = ConstructedAffineCandidates::default();
+        for k in 0..6 {
+            constructed.available[k] = true;
+            constructed.cands[k] = AffineMergeCandidate {
+                pred_flag_l0: true,
+                ref_idx_l0: k as i32,
+                ..AffineMergeCandidate::default()
+            };
+        }
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 5,
+            slice_type_b: false,
+            sb_col_available: true,
+            inherited_a: inh_l0_6param(mv(1, 0), mv(2, 0), mv(3, 0)),
+            inherited_b: inh_l0_6param(mv(10, 0), mv(20, 0), mv(30, 0)),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        assert_eq!(list.len(), 5);
+        assert_eq!(list.kinds[0], SubblockMergeCandidateKind::SbCol);
+        assert_eq!(list.kinds[1], SubblockMergeCandidateKind::InheritedA);
+        assert_eq!(list.kinds[2], SubblockMergeCandidateKind::InheritedB);
+        assert_eq!(list.kinds[3], SubblockMergeCandidateKind::Const(1));
+        assert_eq!(list.kinds[4], SubblockMergeCandidateKind::Const(2));
+        // Inherited A payload appears at slot 1.
+        assert_eq!(list.cands[1].cpmvs_l0.cpmvs[0], mv(1, 0));
+        // Inherited B payload appears at slot 2.
+        assert_eq!(list.cands[2].cpmvs_l0.cpmvs[0], mv(10, 0));
+    }
+
+    /// SbCol absent — the list shifts: A → B → Const1..Const4.
+    #[test]
+    fn list_skips_sbcol_when_not_available() {
+        let mut constructed = ConstructedAffineCandidates::default();
+        for k in 0..6 {
+            constructed.available[k] = true;
+        }
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 5,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: inh_l0_6param(mv(1, 0), mv(2, 0), mv(3, 0)),
+            inherited_b: inh_l0_6param(mv(10, 0), mv(20, 0), mv(30, 0)),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        assert_eq!(list.kinds[0], SubblockMergeCandidateKind::InheritedA);
+        assert_eq!(list.kinds[1], SubblockMergeCandidateKind::InheritedB);
+        assert_eq!(list.kinds[2], SubblockMergeCandidateKind::Const(1));
+        assert_eq!(list.kinds[3], SubblockMergeCandidateKind::Const(2));
+        assert_eq!(list.kinds[4], SubblockMergeCandidateKind::Const(3));
+    }
+
+    /// Inherited A absent but inherited B present — Const1 follows
+    /// directly after B.
+    #[test]
+    fn list_inherited_b_lands_immediately_after_sbcol_when_a_missing() {
+        let mut constructed = ConstructedAffineCandidates::default();
+        constructed.available[0] = true;
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 5,
+            slice_type_b: false,
+            sb_col_available: true,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: inh_l0_6param(mv(10, 0), mv(20, 0), mv(30, 0)),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        assert_eq!(list.kinds[0], SubblockMergeCandidateKind::SbCol);
+        assert_eq!(list.kinds[1], SubblockMergeCandidateKind::InheritedB);
+        assert_eq!(list.kinds[2], SubblockMergeCandidateKind::Const(1));
+        // Remaining padded with zeros.
+        assert_eq!(list.kinds[3], SubblockMergeCandidateKind::Zero);
+        assert_eq!(list.kinds[4], SubblockMergeCandidateKind::Zero);
+    }
+
+    /// `max_num_cand = 2` short-circuits insertion: only SbCol + A
+    /// land; B / Const1..6 / Zero are dropped.
+    #[test]
+    fn list_clipped_to_max_num_cand_drops_remaining_candidates() {
+        let mut constructed = ConstructedAffineCandidates::default();
+        constructed.available[0] = true;
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 2,
+            slice_type_b: false,
+            sb_col_available: true,
+            inherited_a: inh_l0_6param(mv(1, 0), mv(2, 0), mv(3, 0)),
+            inherited_b: inh_l0_6param(mv(10, 0), mv(20, 0), mv(30, 0)),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.kinds[0], SubblockMergeCandidateKind::SbCol);
+        assert_eq!(list.kinds[1], SubblockMergeCandidateKind::InheritedA);
+    }
+
+    /// `max_num_cand` clamped to `MAX_SUBBLOCK_MERGE_CAND` for safety:
+    /// a malformed input of `max = 99` is treated as `max = 5`.
+    #[test]
+    fn list_clamps_oversize_max_num_cand_to_internal_constant() {
+        let constructed = ConstructedAffineCandidates::default();
+        let list = build_subblock_merge_cand_list(SubblockMergeListInputs {
+            max_num_cand: 99,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        });
+        assert_eq!(list.len(), MAX_SUBBLOCK_MERGE_CAND);
+    }
+
+    /// `pick(merge_subblock_idx)` round-trips: slot k always returns the
+    /// kind + payload that landed there.
+    #[test]
+    fn pick_returns_slot_kind_and_payload_in_order() {
+        let mut constructed = ConstructedAffineCandidates::default();
+        for k in 0..6 {
+            constructed.available[k] = true;
+            constructed.cands[k] = AffineMergeCandidate {
+                pred_flag_l0: true,
+                ref_idx_l0: (k as i32) + 10,
+                cpmvs_l0: AffineCpmvs::new_4param(mv((k as i32) + 100, 0), mv((k as i32) + 200, 0)),
+                ..AffineMergeCandidate::default()
+            };
+        }
+        let inputs = SubblockMergeListInputs {
+            max_num_cand: 5,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        };
+        let list = build_subblock_merge_cand_list(inputs);
+        // First five constructed slots fill the list (Const1..Const5).
+        for k in 0..5 {
+            let (kind, cand) = list.pick(k as u32).expect("slot");
+            assert_eq!(kind, SubblockMergeCandidateKind::Const((k as u8) + 1));
+            assert_eq!(cand.ref_idx_l0, (k as i32) + 10);
+            assert_eq!(cand.cpmvs_l0.cpmvs[0], mv((k as i32) + 100, 0));
+        }
+    }
+
+    /// `pick` rejects out-of-range indices.
+    #[test]
+    fn pick_returns_none_for_out_of_range_index() {
+        let constructed = ConstructedAffineCandidates::default();
+        let list = build_subblock_merge_cand_list(SubblockMergeListInputs {
+            max_num_cand: 2,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: InheritedAffineCandidate::default(),
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        });
+        assert!(list.pick(2).is_none());
+        assert!(list.pick(99).is_none());
+    }
+
+    /// End-to-end: derive an inherited CPMV record, derive a separate
+    /// constructed candidate, fuse via the spec list assembly, then pick
+    /// via `merge_subblock_idx = 1` and feed the result into
+    /// `affine::derive_subblock_mvs` — confirms the list output flows
+    /// straight into the round-65 sub-block MV grid without conversion.
+    #[test]
+    fn list_pick_feeds_existing_subblock_mv_derivation() {
+        // Inherited record — same construction as the round-91 trace
+        // test: 16×16 neighbour, uniform horizontal shear.
+        let geom = InheritedAffineGeom {
+            xcb: 16,
+            ycb: 0,
+            cb_width: 16,
+            cb_height: 16,
+            xnb: 0,
+            ynb: 0,
+            nb_w: 16,
+            nb_h: 16,
+        };
+        let inherited = derive_inherited_affine_cpmvs(
+            geom,
+            NeighbourCpmvSource::SameOrLeftCtu {
+                cpmvs: AffineCpmvs::new_4param(mv(0, 0), mv(256, 0)),
+            },
+            2,
+        )
+        .expect("derive inherited");
+        let inh_a = InheritedAffineCandidate {
+            available: true,
+            cand: AffineMergeCandidate {
+                pred_flag_l0: true,
+                pred_flag_l1: false,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+                cpmvs_l0: inherited,
+                cpmvs_l1: AffineCpmvs::new_4param(MotionVector::ZERO, MotionVector::ZERO),
+                motion_model: MotionModel::Affine4Param,
+                bcw_idx: 0,
+            },
+        };
+        // One constructed candidate (Const1 from a uniform L0 corner set).
+        let corners = l0_corners(mv(0, 0), mv(64, 0), mv(0, 64), mv(64, 64));
+        let constructed = derive_constructed_affine_merge_candidates(
+            16,
+            16,
+            &corners,
+            ConstructedAffineFlags {
+                sps_6param_affine_enabled_flag: true,
+                slice_type_b: false,
+            },
+        );
+        let list = build_subblock_merge_cand_list(SubblockMergeListInputs {
+            max_num_cand: 5,
+            slice_type_b: false,
+            sb_col_available: false,
+            inherited_a: inh_a,
+            inherited_b: InheritedAffineCandidate::default(),
+            constructed: &constructed,
+        });
+        // Slot 0 = InheritedA, slot 1 = Const1. Pick slot 1.
+        let (kind, cand) = list.pick(1).expect("slot 1 (Const1)");
+        assert_eq!(kind, SubblockMergeCandidateKind::Const(1));
+        // Feed CPMVs into derive_subblock_mvs.
+        let grid = crate::affine::derive_subblock_mvs(16, 16, &cand.cpmvs_l0, false)
+            .expect("sub-block grid");
+        assert_eq!(grid.num_sb_x, 4);
+        assert_eq!(grid.num_sb_y, 4);
+        assert_eq!(grid.mvs.len(), 16);
     }
 }

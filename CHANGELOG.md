@@ -6,6 +6,63 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 94 — **§8.5.5.2 `subblockMergeCandList` insertion order +
+  `merge_subblock_idx` pick** layered on top of the round-91 inherited
+  + constructed derivation. Adds to the `affine_merge` module:
+  - `MAX_SUBBLOCK_MERGE_CAND` const (== 5 per eq. 85 + the
+    §7.4.3.4 "in the range of 0 to 5" bullet).
+  - `SubblockMergeCandidateKind` enum tagging each slot with the
+    spec's symbolic name (`SbCol`, `InheritedA`, `InheritedB`,
+    `Const(K)` for K = 1..6, `Zero`).
+  - `InheritedAffineCandidate` — `(available, AffineMergeCandidate)`
+    pair matching the spec's `availableFlagA / availableFlagB`
+    one-bit + the eqs. 681 – 684 fully-formed candidate record.
+  - `SubblockMergeListInputs` — bundle of `MaxNumSubblockMergeCand`,
+    `sh_slice_type == B` (eq. 690 / 691 zero-cand `L1` flip),
+    `availableFlagSbCol`, the inherited-A + inherited-B records, and
+    a borrowed `&ConstructedAffineCandidates`.
+  - `SubblockMergeList { count, kinds, cands }` — the assembled list
+    with parallel kind + payload arrays (length
+    `MAX_SUBBLOCK_MERGE_CAND`); `count` is the visible-slot count
+    after step-9 padding.
+  - `build_subblock_merge_cand_list(inputs) -> SubblockMergeList` —
+    §8.5.5.2 steps 7 – 9 verbatim: SbCol → InheritedA → InheritedB →
+    Const1..Const6, each guarded by `availableFlagN && i <
+    MaxNumSubblockMergeCand`, then zero-MV padding to
+    `MaxNumSubblockMergeCand`.
+  - `SubblockMergeList::pick(merge_subblock_idx)` — §8.5.5.2 step 10
+    array-index lookup returning `(SubblockMergeCandidateKind,
+    AffineMergeCandidate)`.
+  - `zero_subblock_merge_candidate(slice_type_b)` — eqs. 686 – 695
+    zero-cand record (uni-pred refIdxL1 = -1 on P-slice, bi-pred
+    refIdxL1 = 0 on B-slice).
+
+  **No pruning / equality pass.** §8.5.5.2 step 7 is a straight
+  ordered append with no compare-against-existing branch; the spec
+  is silent on dedup for the sub-block merge list (contrast with
+  §8.5.2.4 regular-merge pairwise-average, which is a separate
+  explicit index pick rather than a compare loop). This module
+  therefore appends without dedup; any future spec amendment adding
+  CPMV-equality pruning would slot into the same routine.
+
+  12 new lib tests: `max_num_cand == 0` produces empty list;
+  `max_num_cand == 3` with no real candidates emits three Zero
+  slots; P-slice vs B-slice zero-cand layout (eqs. 690 / 691 flip);
+  canonical SbCol → A → B → Const1 → Const2 (5-slot fill) order;
+  SbCol-absent shift; A-absent / B-present case; `max_num_cand = 2`
+  short-circuit drops B / Const1..6 / Zero; `max_num_cand` clamp to
+  `MAX_SUBBLOCK_MERGE_CAND`; `pick` round-trips slot kind + payload
+  in order; `pick` rejects out-of-range; end-to-end test fusing
+  derived inherited + derived constructed records and confirming the
+  `pick`ed payload flows straight into `affine::derive_subblock_mvs`.
+
+  Out of scope (next round): the §8.5.5.2 step-6 corner-selection
+  cascade (B2/B3/A2, B1/B0, A1/A0 driven by per-CB neighbour
+  `MotionModelIdc` lookup); the SbTMVP (§8.5.5.3 / §8.5.5.4)
+  candidate that fills `SbCol`; the affine AMVP (§8.5.5.7) path; the
+  CTU-walker wire-up that loads per-CB CPMV storage + invokes this
+  helper.
+
 - Round 91 — **§8.5.5.5 inherited + §8.5.5.6 constructed affine merge
   candidate derivation** in the new `affine_merge` module. Feeds the
   round-65 sub-block MV machinery (`affine::derive_subblock_mvs`) and
