@@ -6,6 +6,75 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 91 — **§8.5.5.5 inherited + §8.5.5.6 constructed affine merge
+  candidate derivation** in the new `affine_merge` module. Feeds the
+  round-65 sub-block MV machinery (`affine::derive_subblock_mvs`) and
+  the round-78 PROF refinement (`affine::predict_luma_block_affine_prof`)
+  with candidate CPMV records produced either from a single neighbour
+  CB's CPMV state (the inherited path) or from per-corner triples
+  combining up to four spatial+temporal neighbours (the constructed
+  path):
+  - `AffineCpRecord` — per-corner record carrying `(available,
+    predFlagL0/L1, refIdxL0/L1, mvL0/L1, bcwIdx)`. Mirrors the spec's
+    `cpMvLXCorner[k]` / `predFlagLXCorner[k]` /
+    `refIdxLXCorner[k]` / `bcwIdxCorner[k]` arrays for
+    `k ∈ {0, 1, 2, 3}` ↔ {top-left, top-right, bottom-left,
+    temporal-BR}.
+  - `AffineMergeCandidate` — per-candidate output carrying per-list
+    `(predFlag, refIdx, AffineCpmvs)` + `MotionModelIdc` + `bcwIdx`.
+  - `NeighbourCpmvSource::AboveCtuBoundary { mv_bottom_left,
+    mv_bottom_right }` + `NeighbourCpmvSource::SameOrLeftCtu { cpmvs
+    }` — the §8.5.5.5 `isCTUboundary` split. The CTU-boundary branch
+    reads the neighbour's bottom-row sub-block MVs per eqs. 736 – 739
+    and forces eqs. 746 / 747 4-parameter similarity even when the
+    neighbour was 6-parameter; the regular branch reads the neighbour
+    CB's stored CPMVs (`CpMvLX[xNb][yNb]`) per eqs. 740 – 743 and
+    takes the eqs. 744 / 745 dHorY/dVerY branch only when
+    `MotionModelIdc == 2`.
+  - `derive_inherited_affine_cpmvs(geom, source, numCpMv)` — §8.5.5.5
+    eqs. 748 – 753 inherited CPMV emission at `(xCb, yCb)`,
+    `(xCb + cbWidth, yCb)`, and (for `numCpMv == 3`) `(xCb,
+    yCb + cbHeight)`. §8.5.2.14 signed-magnitude round with
+    `rightShift = 7`, eqs. 754 / 755 `Clip3(-2^17, 2^17 - 1, ·)`
+    final clip.
+  - `derive_constructed_affine_merge_candidates(cb_w, cb_h, corners,
+    flags)` — §8.5.5.6 six-candidate construction. Const1..4 are the
+    3-corner 6-parameter triples (gated by
+    `sps_6param_affine_enabled_flag`); Const5 is the 4-parameter (CP0,
+    CP1) pair from corners {0, 1}; Const6 is the 4-parameter pair from
+    corners {0, 2} with the eq. 811 / 812 diagonal-projection top-
+    right derivation. Per-list `(predFlag, refIdx)` gates fire
+    independently for L0 + L1. bcwIdx inherits from corner 0
+    (Const1/2/3/5/6) or corner 1 (Const4) when both lists materialise,
+    else 0.
+  - `ConstructedAffineCandidates::{available, cands, count}` —
+    parallel `[bool; 6]` availability flags + `[AffineMergeCandidate;
+    6]` payloads.
+
+  22 new lib tests cover the §8.5.2.14 rounding edge cases, the
+  `Clip3` saturation, every Const1..6 assembly path (`(CP0, CP1,
+  CP2)` for Const1, `(CP0, CP1, CP3+CP0-CP1)` for Const2, `(CP0,
+  CP3+CP0-CP2, CP2)` for Const3, `(CP1+CP2-CP3, CP1, CP2)` for
+  Const4, `(CP0, CP1)` for Const5, the eq. 811 / 812 90° rotation
+  for Const6), the "missing corner" / "refIdx mismatch" / "predFlag
+  mismatch" short-circuits, bipred bcwIdx inheritance (corner 0 for
+  Const1/3/5, corner 1 for Const4), `sps_6param` SPS-gate
+  suppression, and the §8.5.5.5 inherited paths for translational-
+  collapsed neighbour, 4-param shear neighbour (with the eq. 752 /
+  753 third-CP emission via the similarity), and the CTU-boundary
+  bullet. One integration test feeds a derived inherited CPMV record
+  into `affine::derive_subblock_mvs` to confirm shape compatibility
+  with the round-65 pipeline.
+
+  Out of scope: the §8.5.5.2 driver that fuses inherited A / inherited
+  B / SbTMVP / Const1..6 + zero-MV pad into `subblockMergeCandList`
+  (needs per-CB CPMV storage wired into the CTU walker — a separate
+  cross-module change); SbTMVP (§8.5.5.3 / §8.5.5.4) — the SbCol
+  candidate (needs per-CB collocated 8×8 motion buffer); the §8.5.5.7
+  affine AMVP candidate list (explicit `mvp_lx_flag` + per-CPMV
+  `mvd_coding`) — same neighbour-availability rules but different
+  output shape.
+
 - Round 78 — **§8.5.6.4 PROF (Prediction Refinement with Optical Flow)**
   per-pixel refinement layered on top of the round-65 affine sub-block
   MC. Round 65 left PROF deferred ("requires gradient-based refinement

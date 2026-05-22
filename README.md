@@ -422,6 +422,42 @@ candidate list construction, affine sub-block chroma MC (eqs.
 876 – 879), and the §8.8.3.4 sub-block boundary deblock propagation
 remain deferred.
 
+**Round-91 lands the §8.5.5.5 inherited + §8.5.5.6 constructed affine
+merge candidate derivation** that feeds the round-65 sub-block MV
+machinery + round-78 PROF refinement. The new `affine_merge` module
+exposes `derive_inherited_affine_cpmvs(geom, source, numCpMv)` for the
+§8.5.5.5 from-neighbour CPMV derivation (both the `isCTUboundary`
+bullet — eqs. 736 – 739 reading the neighbour's two bottom-row
+sub-block MVs with the eq. 746 / 747 4-parameter similarity forced —
+and the regular bullet — eqs. 740 – 743 reading the neighbour CB's
+stored `CpMvLX` directly, with eqs. 744 / 745 only consulting `cpMv[2]`
+when `MotionModelIdc == 2`; eqs. 748 – 753 emit the inherited CPMVs at
+the current CU's origin / top-right / bottom-left positions, eqs. 754 /
+755 clip to `[-2^17, 2^17 - 1]`, §8.5.2.14 round with `rightShift = 7`)
+and `derive_constructed_affine_merge_candidates(cb_w, cb_h, corners,
+flags)` for the §8.5.5.6 six-candidate constructed list (corner-record
+inputs reflect the §8.5.5.2 step-6 B2/B3/A2 cascade for top-left,
+B1/B0 for top-right, A1/A0 for bottom-left, temporal bottom-right; per
+candidate the spec's per-list gate `all-three-predFlagLX == 1 ∧
+matching-refIdxLX` runs independently for L0 + L1; Const1..4 are the
+3-corner 6-parameter triples — Const1 = (CP0, CP1, CP2), Const2 emits
+CP[2] = CP3 + CP0 − CP1, Const3 emits CP[1] = CP3 + CP0 − CP2, Const4
+emits CP[0] = CP1 + CP2 − CP3, every derived CP clipped to `[-2^17,
+2^17 - 1]`; Const5 is the 4-parameter (CP0, CP1) pair; Const6 is the
+4-parameter pair from corners {0, 2} with the eq. 811 / 812 diagonal-
+projection top-right derivation; `sps_6param_affine_enabled_flag == 0`
+suppresses Const1..4; bcwIdx inherits from corner 0 (Const1/2/3/5/6) or
+corner 1 (Const4) when both L0 + L1 sides materialise, else 0). 22
+new lib tests cover the §8.5.2.14 rounding edge cases, the `Clip3`
+saturation, every Const1..6 assembly + the corresponding "missing
+corner" / "refIdx mismatch" / "predFlag mismatch" short-circuits, plus
+an end-to-end integration test confirming an inherited CPMV record
+drops straight into `affine::derive_subblock_mvs`. Both helpers
+operate on pure-data inputs so the CTU walker can wire them up once
+per-CB CPMV storage lands; the §8.5.5.2 driver that fuses inherited A /
+inherited B / Const1..6 + zero-MV pad into `subblockMergeCandList` and
+the SbTMVP (§8.5.5.3 / §8.5.5.4) candidate path remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
