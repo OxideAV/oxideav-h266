@@ -494,6 +494,39 @@ per-CB neighbour availability) remain deferred — the list helper takes
 inputs so the CTU walker can drop them in once per-CB CPMV storage and
 the cascade walker land.
 
+**Round-100 lands the §8.5.5.2 steps 3 – 6 neighbour / corner-selection
+cascade** — the missing wiring between the round-91 derivations and the
+round-94 list assembly. `derive_affine_neighbour_cascade(xcb, ycb, cb_w,
+cb_h, nbrs, log2_par_mrg_level, sps_affine_enabled_flag)` derives the
+step-3 sample locations (eqs. 674 – 680: `A0 = (xCb−1, yCb+cbH)`, `A1 =
+(xCb−1, yCb+cbH−1)`, `A2 = (xCb−1, yCb)`, `B0 = (xCb+cbW, yCb−1)`, `B1 =
+(xCb+cbW−1, yCb−1)`, `B2 = (xCb−1, yCb−1)`, `B3 = (xCb, yCb−1)`), runs
+the step-4 A0 → A1 and step-5 B0 → B1 → B2 first-affine scans (each
+picks the FIRST effectively-available neighbour with `MotionModelIdc >
+0`, short-circuiting at the spec's `availableFlagN == FALSE` gate), and
+computes the step-6 seven `availableA0/A1/A2/B0/B1/B2/B3` corner flags
+for §8.5.5.6. The §6.4.4 availability the CTU walker supplies per
+`NeighbourBlock` is AND-NOT'd with the parallel-merge-level suppression
+(`xCb >> Log2ParMrgLevel == xNbN >> Log2ParMrgLevel && yCb >>
+Log2ParMrgLevel == yNbN >> Log2ParMrgLevel` ⇒ `availableN = FALSE`, eq.
+60). Corner availability does **not** gate on `MotionModelIdc` (a
+translational-but-available neighbour still contributes a constructed
+corner MV even though the affine-only inherited scan skips it);
+`sps_affine_enabled_flag == 0` short-circuits the whole cascade to no
+inherited candidates + all corners unavailable. The cascade's chosen
+`inherited_a`/`inherited_b` blocks feed `derive_inherited_affine_cpmvs`
+and its `corner_availability` flags feed
+`derive_constructed_affine_merge_candidates`. 9 new lib tests cover the
+eqs. 674 – 680 positions, the SPS-disable short-circuit, the A0-first /
+A1-fallthrough / no-affine-neighbour A-side cases, the B0 → B1 → B2 scan
+order, parallel-merge-level same-cell suppression (`Log2ParMrgLevel ==
+6` suppresses, `== 2` does not), translational-neighbour corner
+inclusion, the per-position corner-flag map, and an end-to-end test
+feeding a cascade-chosen inherited-A block's geometry into
+`derive_inherited_affine_cpmvs`. The SbTMVP (§8.5.5.3 / §8.5.5.4) SbCol
+candidate, the §8.5.5.7 affine AMVP path, and the CTU-walker wire-up
+that populates `NeighbourQuery` from live per-CB grids remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

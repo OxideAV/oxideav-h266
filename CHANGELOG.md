@@ -6,6 +6,80 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 100 — **§8.5.5.2 steps 3 – 6 neighbour / corner-selection
+  cascade** — the precursor round 94 (§8.5.5.2 steps 7 – 9 list
+  assembly) and round 91 (§8.5.5.5 / §8.5.5.6 derivations) deferred.
+  This cascade answers which neighbour CBs feed the inherited-A /
+  inherited-B candidates and which of the seven A0/A1/A2/B0/B1/B2/B3
+  corners are available for the constructed candidates. Adds to the
+  `affine_merge` module:
+  - `AffineNeighbourPositions` + `affine_neighbour_positions(xcb, ycb,
+    cb_w, cb_h)` — §8.5.5.2 step 3 eqs. 674 – 680 sample-location
+    derivation (`A0 = (xCb−1, yCb+cbH)`, `A1 = (xCb−1, yCb+cbH−1)`,
+    `A2 = (xCb−1, yCb)`, `B0 = (xCb+cbW, yCb−1)`, `B1 = (xCb+cbW−1,
+    yCb−1)`, `B2 = (xCb−1, yCb−1)`, `B3 = (xCb, yCb−1)`).
+  - `NeighbourBlock` — per-position metadata the CTU walker supplies
+    from its per-CB grids: the §6.4.4 `available` flag (queried with
+    `checkPredModeY = TRUE`, `cIdx = 0`), `MotionModelIdc[xNbN][yNbN]`,
+    `(CbPosX/Y[0][·])`, `CbWidth/Height[0][·]`, `PredFlagLX[xNbN][yNbN]`,
+    and `BcwIdx[xNbN][yNbN]`.
+  - `MotionModelOpt` — a thin `Default`-providing newtype over
+    `MotionModel` (so `NeighbourBlock` can `#[derive(Default)]`); its
+    `is_affine()` is the step-4 / step-5 `MotionModelIdc > 0` gate.
+  - `NeighbourQuery` — the seven step-3 neighbour blocks bundled.
+  - `select_inherited_a` (step 4: scan A0 → A1) + `select_inherited_b`
+    (step 5: scan B0 → B1 → B2) — return the FIRST effectively-available
+    affine neighbour, short-circuiting at the spec's
+    `availableFlagN == FALSE` gate; each emits a `ChosenAffineNeighbour
+    { available, slot, block }` carrying the originating
+    `AffineNeighbourSlot` and the picked block (its `motionModelIdc` ⇒
+    `numCpMv`, `cb_pos` ⇒ `(xNb, yNb)`, `cb_w/cb_h` ⇒ `nbW/nbH`, pred
+    flags ⇒ eqs. 681 – 684, `bcw_idx` ⇒ `bcwIdxA`/`bcwIdxB`).
+  - `parallel_merge_suppressed` / `effective_available` — the step-2 /
+    step-4 / step-5 / step-6 "`xCb >> Log2ParMrgLevel == xNbN >>
+    Log2ParMrgLevel && yCb >> Log2ParMrgLevel == yNbN >>
+    Log2ParMrgLevel` ⇒ `availableN = FALSE`" suppression (eq. 60
+    `Log2ParMrgLevel`), folded into a single per-position effective
+    availability used by both the inherited scan and the corner flags.
+  - `ConstructedCornerAvailability` + `constructed_corner_availability`
+    (step 6) — the seven `availableA0/A1/A2/B0/B1/B2/B3` flags the
+    §8.5.5.6 constructed derivation consumes. A2 / B3 are queried fresh
+    here; the other five reuse the same `effective_available`
+    evaluation the inherited scan saw. Corner availability does NOT
+    gate on `MotionModelIdc` (a translational-but-available neighbour
+    still contributes a corner MV, even though the affine-only
+    inherited scan skips it).
+  - `AffineNeighbourCascade` + `derive_affine_neighbour_cascade(xcb,
+    ycb, cb_w, cb_h, nbrs, log2_par_mrg_level, sps_affine_enabled_flag)`
+    — the steps 3 – 6 driver. `sps_affine_enabled_flag == 0`
+    short-circuits to no inherited candidates + all corners
+    unavailable (the spec's "When sps_affine_enabled_flag is equal to
+    1, ..." gate on steps 4 / 5 / 6).
+
+  This is the missing wiring between the round-91 derivations and the
+  round-94 list assembly: the cascade's `inherited_a`/`inherited_b`
+  blocks feed `derive_inherited_affine_cpmvs`, and its
+  `corner_availability` flags feed
+  `derive_constructed_affine_merge_candidates`.
+
+  9 new lib tests: eqs. 674 – 680 position derivation; SPS-disable
+  short-circuit; inherited-A picks A0-first then falls through to A1;
+  inherited-A unavailable with no affine neighbour; inherited-B B0 →
+  B1 → B2 scan order; parallel-merge-level same-cell suppression
+  (`Log2ParMrgLevel == 6` suppresses, `== 2` does not); corner
+  availability includes translational neighbours that the inherited
+  scan skips; per-position corner-flag map; and an end-to-end test
+  feeding a cascade-chosen inherited-A block's geometry straight into
+  `derive_inherited_affine_cpmvs`.
+
+  Out of scope (next round): the SbTMVP (§8.5.5.3 / §8.5.5.4) `SbCol`
+  candidate (needs a per-CB collocated 8×8 motion buffer); the
+  §8.5.5.7 affine AMVP candidate list (explicit `mvp_lx_flag` +
+  per-CPMV `mvd_coding`); and the CTU-walker wire-up that populates
+  `NeighbourQuery` from live per-CB grids and invokes the full
+  §8.5.5.2 chain (cascade → inherited/constructed derivations → list
+  assembly → `merge_subblock_idx` pick → sub-block MV grid).
+
 - Round 94 — **§8.5.5.2 `subblockMergeCandList` insertion order +
   `merge_subblock_idx` pick** layered on top of the round-91 inherited
   + constructed derivation. Adds to the `affine_merge` module:

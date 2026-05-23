@@ -1029,6 +1029,405 @@ fn zero_subblock_merge_candidate(slice_type_b: bool) -> AffineMergeCandidate {
 }
 
 // =====================================================================
+// §8.5.5.2 steps 3 – 6 — neighbour / corner-selection cascade
+// =====================================================================
+//
+// Round 100 adds the precursor cascade that round 91 (§8.5.5.5 / §8.5.5.6
+// derivations) and round 94 (§8.5.5.2 step 7 – 9 list assembly) deferred.
+// It answers three questions the rest of the sub-block-merge pipeline
+// needs:
+//
+//   * Step 4 — which neighbour CB (if any) feeds the inherited-A
+//     candidate? Scan the A-side positions `(xNbA0, yNbA0)` → `(xNbA1,
+//     yNbA1)` (eqs. 674 / 675) and pick the FIRST that is available,
+//     affine (`MotionModelIdc > 0`), and not parallel-merge-suppressed.
+//   * Step 5 — which neighbour CB feeds inherited-B? Scan `(xNbB0,
+//     yNbB0)` → `(xNbB1, yNbB1)` → `(xNbB2, yNbB2)` (eqs. 677 – 679)
+//     under the same first-affine rule.
+//   * Step 6 — what are the seven `availableA0/A1/A2/B0/B1/B2/B3`
+//     availability flags the §8.5.5.6 constructed derivation consumes?
+//     A0/A1 reuse step-4's lookups; B0/B1/B2 reuse step-5's; A2 (eq.
+//     676) and B3 (eq. 680) are queried fresh here.
+//
+// The cascade itself is pure neighbour-metadata logic; it does NOT read
+// the picture buffer or the CPMV grid. The CTU walker is expected to
+// populate a [`NeighbourQuery`] from its per-CB grids (the §6.4.4
+// availability flag, `MotionModelIdc[x][y]`, `CbPosX/Y[0][x][y]`,
+// `CbWidth/Height[0][x][y]`, `PredFlagLX[x][y]`, `BcwIdx[x][y]`), call
+// this routine to find the chosen A / B neighbours + the seven flags,
+// then hand the chosen neighbours to [`derive_inherited_affine_cpmvs`]
+// (round 91) and the flags to
+// [`derive_constructed_affine_merge_candidates`] (round 91).
+
+/// The five A-side / B-side sample locations the §8.5.5.2 step-3 eqs.
+/// 674 – 680 derive, plus A2 / B3. Each tuple is a picture-absolute
+/// `(x, y)` luma sample location. `Ak` / `Bk` follow the spec's
+/// subscripts exactly.
+///
+/// Eqs. 674 – 680:
+/// * `A0 = (xCb − 1, yCb + cbHeight)`
+/// * `A1 = (xCb − 1, yCb + cbHeight − 1)`
+/// * `A2 = (xCb − 1, yCb)`
+/// * `B0 = (xCb + cbWidth, yCb − 1)`
+/// * `B1 = (xCb + cbWidth − 1, yCb − 1)`
+/// * `B2 = (xCb − 1, yCb − 1)`
+/// * `B3 = (xCb, yCb − 1)`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineNeighbourPositions {
+    pub a0: (i32, i32),
+    pub a1: (i32, i32),
+    pub a2: (i32, i32),
+    pub b0: (i32, i32),
+    pub b1: (i32, i32),
+    pub b2: (i32, i32),
+    pub b3: (i32, i32),
+}
+
+/// §8.5.5.2 step 3 — derive the seven neighbour sample locations from
+/// the current CU geometry. `xcb` / `ycb` are picture-absolute; `cb_w` /
+/// `cb_h` are luma-sample dimensions.
+pub fn affine_neighbour_positions(
+    xcb: i32,
+    ycb: i32,
+    cb_w: u32,
+    cb_h: u32,
+) -> AffineNeighbourPositions {
+    let cw = cb_w as i32;
+    let ch = cb_h as i32;
+    AffineNeighbourPositions {
+        a0: (xcb - 1, ycb + ch),     // eq. 674
+        a1: (xcb - 1, ycb + ch - 1), // eq. 675
+        a2: (xcb - 1, ycb),          // eq. 676
+        b0: (xcb + cw, ycb - 1),     // eq. 677
+        b1: (xcb + cw - 1, ycb - 1), // eq. 678
+        b2: (xcb - 1, ycb - 1),      // eq. 679
+        b3: (xcb, ycb - 1),          // eq. 680
+    }
+}
+
+/// Per-position neighbour metadata the CTU walker hands the cascade. One
+/// of these is produced for each queried `(xNbN, yNbN)` location.
+///
+/// Field provenance (all read from the CTU walker's per-CB grids):
+/// * `available` — output of §6.4.4 (neighbouring-block availability)
+///   invoked with `checkPredModeY = TRUE`, `cIdx = 0`. The walker is
+///   responsible for the picture-boundary / slice / tile / WPP /
+///   `IsAvailable` / pred-mode checks; this struct only carries the
+///   final boolean.
+/// * `motion_model` — `MotionModelIdc[xNbN][yNbN]` (`Translational` ⇒ 0,
+///   `Affine4Param` ⇒ 1, `Affine6Param` ⇒ 2). `MotionModelIdc > 0` is
+///   the §8.5.5.2 step-4 / step-5 "is this neighbour affine?" gate.
+/// * `cb_pos` — `(CbPosX[0][xNbN][yNbN], CbPosY[0][xNbN][yNbN])` — the
+///   top-left of the CB that *covers* the sample location (used as
+///   `(xNb, yNb)` by §8.5.5.5).
+/// * `cb_w` / `cb_h` — `CbWidth[0][·]` / `CbHeight[0][·]` of the
+///   covering CB (`nbW` / `nbH` for §8.5.5.5).
+/// * `pred_flag_l0` / `pred_flag_l1` — `PredFlagLX[xNbN][yNbN]` (eqs.
+///   681 / 683 assignments).
+/// * `bcw_idx` — `BcwIdx[xNbN][yNbN]` (the `bcwIdxA` / `bcwIdxB`
+///   assignment in step 4 / step 5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NeighbourBlock {
+    /// §6.4.4 availability of the queried sample location.
+    pub available: bool,
+    /// `MotionModelIdc[xNbN][yNbN]`.
+    pub motion_model: MotionModelOpt,
+    /// `(CbPosX[0][·], CbPosY[0][·])` of the covering CB.
+    pub cb_pos: (i32, i32),
+    /// `CbWidth[0][·]` of the covering CB.
+    pub cb_w: u32,
+    /// `CbHeight[0][·]` of the covering CB.
+    pub cb_h: u32,
+    /// `PredFlagL0[xNbN][yNbN]`.
+    pub pred_flag_l0: bool,
+    /// `PredFlagL1[xNbN][yNbN]`.
+    pub pred_flag_l1: bool,
+    /// `BcwIdx[xNbN][yNbN]`.
+    pub bcw_idx: u8,
+}
+
+/// `MotionModelIdc[x][y]` with `Translational` as the `Default` (the
+/// `Default` impl of [`NeighbourBlock`] needs a concrete variant; an
+/// unavailable / non-affine neighbour reports `Translational`).
+///
+/// This is a thin newtype over [`MotionModel`] only so `NeighbourBlock`
+/// can `#[derive(Default)]`; [`MotionModel`] itself has no `Default`
+/// because there is no neutral affine model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MotionModelOpt(pub MotionModel);
+
+impl Default for MotionModelOpt {
+    fn default() -> Self {
+        MotionModelOpt(MotionModel::Translational)
+    }
+}
+
+impl MotionModelOpt {
+    /// `true` iff `MotionModelIdc > 0` (4- or 6-parameter affine) — the
+    /// step-4 / step-5 "affine neighbour" gate.
+    pub fn is_affine(self) -> bool {
+        self.0 != MotionModel::Translational
+    }
+}
+
+/// Borrowed view of the seven neighbour blocks at the §8.5.5.2 step-3
+/// positions. The CTU walker fills all seven; the cascade reads A0/A1/A2
+/// for the A-side and B0/B1/B2/B3 for the B-side.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NeighbourQuery {
+    pub a0: NeighbourBlock,
+    pub a1: NeighbourBlock,
+    pub a2: NeighbourBlock,
+    pub b0: NeighbourBlock,
+    pub b1: NeighbourBlock,
+    pub b2: NeighbourBlock,
+    pub b3: NeighbourBlock,
+}
+
+/// Which step-3 position a chosen inherited neighbour came from. Carried
+/// alongside the picked [`NeighbourBlock`] so the caller can label the
+/// resulting candidate / debug the cascade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffineNeighbourSlot {
+    A0,
+    A1,
+    A2,
+    B0,
+    B1,
+    B2,
+    B3,
+}
+
+/// The chosen inherited neighbour for one side (A or B). Carries the
+/// `availableFlagA` / `availableFlagB` flag (eq. step-4 / step-5
+/// `availableFlagA`), the originating position slot, and the picked
+/// `NeighbourBlock` (its `motionModelIdc` ⇒ `numCpMv`, `cb_pos` ⇒
+/// `(xNb, yNb)`, `cb_w`/`cb_h` ⇒ `nbW`/`nbH`, pred flags ⇒ eqs. 681 –
+/// 684, `bcw_idx` ⇒ `bcwIdxA`/`bcwIdxB`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChosenAffineNeighbour {
+    /// `availableFlagA` (step 4) / `availableFlagB` (step 5).
+    pub available: bool,
+    /// Originating position when [`Self::available`]; `None` otherwise.
+    pub slot: Option<AffineNeighbourSlot>,
+    /// The picked neighbour block. Read only when [`Self::available`].
+    pub block: NeighbourBlock,
+}
+
+/// Parallel-merge-level suppression per the step-4 / step-5 (and step-2)
+/// bullet: *"When `xCb >> Log2ParMrgLevel == xNbN >> Log2ParMrgLevel`
+/// and `yCb >> Log2ParMrgLevel == yNbN >> Log2ParMrgLevel`, availableN
+/// is set equal to FALSE."*
+///
+/// `log2_par_mrg_level` is the §7.4.3.3 eq. 60 `Log2ParMrgLevel =
+/// sps_log2_parallel_merge_level_minus2 + 2`. The neighbour
+/// `(x_nb, y_nb)` here is the queried *sample* location (the step-3
+/// position), not the covering CB's top-left.
+fn parallel_merge_suppressed(
+    xcb: i32,
+    ycb: i32,
+    x_nb: i32,
+    y_nb: i32,
+    log2_par_mrg_level: u32,
+) -> bool {
+    (xcb >> log2_par_mrg_level) == (x_nb >> log2_par_mrg_level)
+        && (ycb >> log2_par_mrg_level) == (y_nb >> log2_par_mrg_level)
+}
+
+/// Effective per-position availability after the parallel-merge-level
+/// suppression: §6.4.4 `available` AND NOT parallel-merge-suppressed.
+/// This is the boolean the constructed derivation's `availableN` flags
+/// and the step-4 / step-5 scan both consult.
+fn effective_available(
+    block: &NeighbourBlock,
+    xcb: i32,
+    ycb: i32,
+    pos: (i32, i32),
+    log2_par_mrg_level: u32,
+) -> bool {
+    block.available && !parallel_merge_suppressed(xcb, ycb, pos.0, pos.1, log2_par_mrg_level)
+}
+
+/// §8.5.5.2 step 4 — pick the inherited-A neighbour. Scans `A0` then
+/// `A1` (eqs. 674 / 675) and returns the FIRST that is
+/// effectively-available AND affine (`MotionModelIdc > 0`). The
+/// "availableFlagA == FALSE so far" gate in the spec means the scan
+/// stops at the first hit — exactly the `find` short-circuit here.
+///
+/// `xcb` / `ycb` are the current CU top-left; `positions` come from
+/// [`affine_neighbour_positions`]; `log2_par_mrg_level` is eq. 60.
+fn select_inherited_a(
+    xcb: i32,
+    ycb: i32,
+    positions: &AffineNeighbourPositions,
+    nbrs: &NeighbourQuery,
+    log2_par_mrg_level: u32,
+) -> ChosenAffineNeighbour {
+    for (slot, pos, blk) in [
+        (AffineNeighbourSlot::A0, positions.a0, &nbrs.a0),
+        (AffineNeighbourSlot::A1, positions.a1, &nbrs.a1),
+    ] {
+        if effective_available(blk, xcb, ycb, pos, log2_par_mrg_level)
+            && blk.motion_model.is_affine()
+        {
+            return ChosenAffineNeighbour {
+                available: true,
+                slot: Some(slot),
+                block: *blk,
+            };
+        }
+    }
+    ChosenAffineNeighbour::default()
+}
+
+/// §8.5.5.2 step 5 — pick the inherited-B neighbour. Scans `B0` → `B1`
+/// → `B2` (eqs. 677 – 679) under the same first-affine rule as
+/// [`select_inherited_a`].
+fn select_inherited_b(
+    xcb: i32,
+    ycb: i32,
+    positions: &AffineNeighbourPositions,
+    nbrs: &NeighbourQuery,
+    log2_par_mrg_level: u32,
+) -> ChosenAffineNeighbour {
+    for (slot, pos, blk) in [
+        (AffineNeighbourSlot::B0, positions.b0, &nbrs.b0),
+        (AffineNeighbourSlot::B1, positions.b1, &nbrs.b1),
+        (AffineNeighbourSlot::B2, positions.b2, &nbrs.b2),
+    ] {
+        if effective_available(blk, xcb, ycb, pos, log2_par_mrg_level)
+            && blk.motion_model.is_affine()
+        {
+            return ChosenAffineNeighbour {
+                available: true,
+                slot: Some(slot),
+                block: *blk,
+            };
+        }
+    }
+    ChosenAffineNeighbour::default()
+}
+
+/// The seven `availableA0/A1/A2/B0/B1/B2/B3` flags the §8.5.5.6
+/// constructed derivation consumes (its `ConstructedAffineFlags` is the
+/// SPS-gate pair; the per-corner availability lives in the
+/// `AffineCpRecord::available` fields the caller assembles from these).
+///
+/// Each flag is the §6.4.4 availability AND-NOT the parallel-merge-level
+/// suppression (`effective_available`). Note step 6 does NOT gate these
+/// on `MotionModelIdc` — the constructed candidate reads the
+/// translational MV at each corner, so a non-affine but available
+/// neighbour still contributes a corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConstructedCornerAvailability {
+    pub a0: bool,
+    pub a1: bool,
+    pub a2: bool,
+    pub b0: bool,
+    pub b1: bool,
+    pub b2: bool,
+    pub b3: bool,
+}
+
+/// §8.5.5.2 step 6 — compute the seven corner-availability flags. A2 and
+/// B3 are queried fresh here (eqs. 676 / 680); A0/A1/B0/B1/B2 reuse the
+/// same `effective_available` evaluation the step-4 / step-5 scans use,
+/// so the flag a corner reports here is identical to the availability the
+/// inherited scan saw.
+fn constructed_corner_availability(
+    xcb: i32,
+    ycb: i32,
+    positions: &AffineNeighbourPositions,
+    nbrs: &NeighbourQuery,
+    log2_par_mrg_level: u32,
+) -> ConstructedCornerAvailability {
+    let ea = |blk: &NeighbourBlock, pos: (i32, i32)| {
+        effective_available(blk, xcb, ycb, pos, log2_par_mrg_level)
+    };
+    ConstructedCornerAvailability {
+        a0: ea(&nbrs.a0, positions.a0),
+        a1: ea(&nbrs.a1, positions.a1),
+        a2: ea(&nbrs.a2, positions.a2),
+        b0: ea(&nbrs.b0, positions.b0),
+        b1: ea(&nbrs.b1, positions.b1),
+        b2: ea(&nbrs.b2, positions.b2),
+        b3: ea(&nbrs.b3, positions.b3),
+    }
+}
+
+/// Bundled output of the §8.5.5.2 steps 3 – 6 cascade.
+#[derive(Clone, Copy, Debug)]
+pub struct AffineNeighbourCascade {
+    /// Step-3 sample locations (eqs. 674 – 680).
+    pub positions: AffineNeighbourPositions,
+    /// Step-4 inherited-A choice (`availableFlagA` + picked block).
+    pub inherited_a: ChosenAffineNeighbour,
+    /// Step-5 inherited-B choice (`availableFlagB` + picked block).
+    pub inherited_b: ChosenAffineNeighbour,
+    /// Step-6 seven corner-availability flags for §8.5.5.6.
+    pub corner_availability: ConstructedCornerAvailability,
+}
+
+/// §8.5.5.2 steps 3 – 6 driver — derive the step-3 positions, run the
+/// step-4 (A0/A1) + step-5 (B0/B1/B2) first-affine scans, and compute
+/// the step-6 (A0/A1/A2/B0/B1/B2/B3) corner-availability flags in one
+/// pass.
+///
+/// `sps_affine_enabled_flag` gates the whole cascade: when `false`, the
+/// spec's step-4 / step-5 / step-6 bullets are all "When
+/// sps_affine_enabled_flag is equal to 1, ..." — so the result reports
+/// no inherited candidates and all corners unavailable.
+///
+/// Inputs:
+/// * `(xcb, ycb)` — current CU top-left luma sample (picture-absolute).
+/// * `cb_w` / `cb_h` — current CU luma dimensions.
+/// * `nbrs` — per-position neighbour metadata (the CTU walker fills all
+///   seven from its per-CB grids; see [`NeighbourBlock`]).
+/// * `log2_par_mrg_level` — eq. 60 `Log2ParMrgLevel`.
+/// * `sps_affine_enabled_flag` — the cascade master gate.
+pub fn derive_affine_neighbour_cascade(
+    xcb: i32,
+    ycb: i32,
+    cb_w: u32,
+    cb_h: u32,
+    nbrs: &NeighbourQuery,
+    log2_par_mrg_level: u32,
+    sps_affine_enabled_flag: bool,
+) -> AffineNeighbourCascade {
+    let positions = affine_neighbour_positions(xcb, ycb, cb_w, cb_h);
+
+    if !sps_affine_enabled_flag {
+        return AffineNeighbourCascade {
+            positions,
+            inherited_a: ChosenAffineNeighbour::default(),
+            inherited_b: ChosenAffineNeighbour::default(),
+            corner_availability: ConstructedCornerAvailability {
+                a0: false,
+                a1: false,
+                a2: false,
+                b0: false,
+                b1: false,
+                b2: false,
+                b3: false,
+            },
+        };
+    }
+
+    AffineNeighbourCascade {
+        positions,
+        inherited_a: select_inherited_a(xcb, ycb, &positions, nbrs, log2_par_mrg_level),
+        inherited_b: select_inherited_b(xcb, ycb, &positions, nbrs, log2_par_mrg_level),
+        corner_availability: constructed_corner_availability(
+            xcb,
+            ycb,
+            &positions,
+            nbrs,
+            log2_par_mrg_level,
+        ),
+    }
+}
+
+// =====================================================================
 // Tests — §8.5.5.5 inherited + §8.5.5.6 constructed derivation
 // =====================================================================
 
@@ -1963,5 +2362,228 @@ mod tests {
         assert_eq!(grid.num_sb_x, 4);
         assert_eq!(grid.num_sb_y, 4);
         assert_eq!(grid.mvs.len(), 16);
+    }
+
+    // ----- §8.5.5.2 steps 3 – 6 neighbour / corner cascade ------------
+
+    /// Helper: an available affine neighbour at a covering CB.
+    fn affine_nb(model: MotionModel, cb_pos: (i32, i32), cb_w: u32, cb_h: u32) -> NeighbourBlock {
+        NeighbourBlock {
+            available: true,
+            motion_model: MotionModelOpt(model),
+            cb_pos,
+            cb_w,
+            cb_h,
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            bcw_idx: 0,
+        }
+    }
+
+    /// Eqs. 674 – 680 sample-location derivation for a 32×16 CU at
+    /// (64, 32).
+    #[test]
+    fn neighbour_positions_match_eqs_674_680() {
+        let p = affine_neighbour_positions(64, 32, 32, 16);
+        assert_eq!(p.a0, (63, 48)); // (xCb − 1, yCb + cbHeight)
+        assert_eq!(p.a1, (63, 47)); // (xCb − 1, yCb + cbHeight − 1)
+        assert_eq!(p.a2, (63, 32)); // (xCb − 1, yCb)
+        assert_eq!(p.b0, (96, 31)); // (xCb + cbWidth, yCb − 1)
+        assert_eq!(p.b1, (95, 31)); // (xCb + cbWidth − 1, yCb − 1)
+        assert_eq!(p.b2, (63, 31)); // (xCb − 1, yCb − 1)
+        assert_eq!(p.b3, (64, 31)); // (xCb, yCb − 1)
+    }
+
+    /// `sps_affine_enabled_flag == 0` short-circuits the whole cascade:
+    /// no inherited A / B, all corners unavailable, positions still
+    /// derived.
+    #[test]
+    fn affine_disabled_yields_empty_cascade() {
+        let nbrs = NeighbourQuery {
+            a0: affine_nb(MotionModel::Affine4Param, (0, 64), 64, 64),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(64, 0, 64, 64, &nbrs, 2, false);
+        assert!(!c.inherited_a.available);
+        assert!(!c.inherited_b.available);
+        assert!(!c.corner_availability.a0);
+        // Positions are derived regardless of the SPS gate.
+        assert_eq!(c.positions.a0, (63, 64));
+    }
+
+    /// Step 4: A0 is affine + available ⇒ inherited-A picks A0 and stops
+    /// (does not look at A1).
+    #[test]
+    fn inherited_a_picks_a0_first() {
+        let nbrs = NeighbourQuery {
+            a0: affine_nb(MotionModel::Affine6Param, (0, 64), 32, 16),
+            a1: affine_nb(MotionModel::Affine4Param, (0, 48), 32, 16),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(64, 0, 32, 16, &nbrs, 2, true);
+        assert!(c.inherited_a.available);
+        assert_eq!(c.inherited_a.slot, Some(AffineNeighbourSlot::A0));
+        assert_eq!(
+            c.inherited_a.block.motion_model.0,
+            MotionModel::Affine6Param
+        );
+    }
+
+    /// Step 4: A0 unavailable / non-affine ⇒ fall through to A1.
+    #[test]
+    fn inherited_a_falls_through_to_a1() {
+        // A0 available but translational (MotionModelIdc == 0) — skipped.
+        let mut a0 = affine_nb(MotionModel::Translational, (0, 64), 32, 16);
+        a0.motion_model = MotionModelOpt(MotionModel::Translational);
+        let nbrs = NeighbourQuery {
+            a0,
+            a1: affine_nb(MotionModel::Affine4Param, (0, 48), 32, 16),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(64, 0, 32, 16, &nbrs, 2, true);
+        assert!(c.inherited_a.available);
+        assert_eq!(c.inherited_a.slot, Some(AffineNeighbourSlot::A1));
+    }
+
+    /// Step 4: no affine A-side neighbour ⇒ availableFlagA == FALSE.
+    #[test]
+    fn inherited_a_unavailable_when_no_affine_neighbour() {
+        let nbrs = NeighbourQuery {
+            a0: affine_nb(MotionModel::Translational, (0, 64), 32, 16),
+            a1: affine_nb(MotionModel::Translational, (0, 48), 32, 16),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(64, 0, 32, 16, &nbrs, 2, true);
+        assert!(!c.inherited_a.available);
+        assert_eq!(c.inherited_a.slot, None);
+    }
+
+    /// Step 5: B-side scan order B0 → B1 → B2. B0 non-affine, B1 affine
+    /// ⇒ pick B1.
+    #[test]
+    fn inherited_b_scans_b0_b1_b2() {
+        let nbrs = NeighbourQuery {
+            b0: affine_nb(MotionModel::Translational, (96, -64), 32, 16),
+            b1: affine_nb(MotionModel::Affine4Param, (64, -64), 32, 16),
+            b2: affine_nb(MotionModel::Affine6Param, (0, -64), 32, 16),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(64, 0, 32, 16, &nbrs, 2, true);
+        assert!(c.inherited_b.available);
+        assert_eq!(c.inherited_b.slot, Some(AffineNeighbourSlot::B1));
+        assert_eq!(
+            c.inherited_b.block.motion_model.0,
+            MotionModel::Affine4Param
+        );
+    }
+
+    /// Parallel-merge-level suppression: when the neighbour sample shares
+    /// the parallel-merge cell with the current CU, `availableN` is
+    /// forced FALSE (step-4 / step-6 bullet). With a 6×6 CU at the
+    /// origin and `Log2ParMrgLevel == 5` (32-sample cells), A1 at
+    /// (−1, 5) is in cell (−1, 0) — different x-cell, so NOT suppressed.
+    /// But B3 at (0, −1) is in cell (0, −1) — different y-cell, also not
+    /// suppressed. A neighbour inside the same 32×32 cell (e.g. an
+    /// internal query) would be. Use a small Log2ParMrgLevel to make a
+    /// genuinely-suppressed case: CU at (32, 32) size 32×32,
+    /// Log2ParMrgLevel == 6 (64-sample cells) — A1 at (31, 63) shares
+    /// cell (0, 0) with CU cell (0, 0) ⇒ suppressed.
+    #[test]
+    fn parallel_merge_level_suppresses_same_cell_neighbour() {
+        let nbrs = NeighbourQuery {
+            a1: affine_nb(MotionModel::Affine4Param, (0, 0), 32, 32),
+            ..Default::default()
+        };
+        // CU at (32, 32), 32×32. A1 = (31, 63). Log2ParMrgLevel == 6:
+        // CU cell = (32>>6, 32>>6) = (0, 0); A1 cell = (31>>6, 63>>6) =
+        // (0, 0) ⇒ same cell ⇒ suppressed.
+        let c = derive_affine_neighbour_cascade(32, 32, 32, 32, &nbrs, 6, true);
+        assert!(!c.inherited_a.available);
+        assert!(!c.corner_availability.a1);
+
+        // Same geometry, Log2ParMrgLevel == 2 (4-sample cells): CU cell
+        // = (8, 8); A1 cell = (7, 15) ⇒ different ⇒ NOT suppressed.
+        let c2 = derive_affine_neighbour_cascade(32, 32, 32, 32, &nbrs, 2, true);
+        assert!(c2.inherited_a.available);
+        assert!(c2.corner_availability.a1);
+    }
+
+    /// Step 6: corner availability does NOT gate on MotionModelIdc — a
+    /// translational-but-available neighbour still contributes a
+    /// constructed corner (it carries a usable translational MV), even
+    /// though it is skipped by the inherited (affine-only) scan.
+    #[test]
+    fn corner_availability_includes_translational_neighbours() {
+        let nbrs = NeighbourQuery {
+            a2: affine_nb(MotionModel::Translational, (0, 0), 32, 32),
+            b3: affine_nb(MotionModel::Translational, (32, -64), 32, 32),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(64, 0, 32, 16, &nbrs, 2, true);
+        // Inherited scans skip translational neighbours...
+        assert!(!c.inherited_a.available);
+        assert!(!c.inherited_b.available);
+        // ...but the constructed corners report them available.
+        assert!(c.corner_availability.a2);
+        assert!(c.corner_availability.b3);
+        assert!(!c.corner_availability.a0); // default ⇒ unavailable
+    }
+
+    /// Step 6: all seven flags reflect the per-position §6.4.4
+    /// availability (after parallel-merge suppression). Build a query
+    /// where exactly A0, B1, B3 are available and confirm the flag map.
+    #[test]
+    fn corner_availability_maps_each_position() {
+        let nbrs = NeighbourQuery {
+            a0: affine_nb(MotionModel::Affine4Param, (0, 64), 32, 16),
+            b1: affine_nb(MotionModel::Affine4Param, (64, -64), 32, 16),
+            b3: affine_nb(MotionModel::Translational, (32, -64), 32, 16),
+            ..Default::default()
+        };
+        let ca = derive_affine_neighbour_cascade(64, 0, 32, 16, &nbrs, 2, true).corner_availability;
+        assert!(ca.a0);
+        assert!(!ca.a1);
+        assert!(!ca.a2);
+        assert!(!ca.b0);
+        assert!(ca.b1);
+        assert!(!ca.b2);
+        assert!(ca.b3);
+    }
+
+    /// End-to-end: feed a cascade-chosen inherited-A neighbour into the
+    /// round-91 §8.5.5.5 derivation, confirming the chosen block's
+    /// `(cb_pos, cb_w, cb_h, motion_model)` flow straight into
+    /// `InheritedAffineGeom` + `derive_inherited_affine_cpmvs`.
+    #[test]
+    fn cascade_choice_feeds_inherited_derivation() {
+        let nbrs = NeighbourQuery {
+            a0: affine_nb(MotionModel::Affine4Param, (0, 0), 16, 16),
+            ..Default::default()
+        };
+        let c = derive_affine_neighbour_cascade(16, 0, 16, 16, &nbrs, 2, true);
+        assert!(c.inherited_a.available);
+        let blk = c.inherited_a.block;
+        // numCpMv = motionModelIdc + 1.
+        let num_cp_mv = blk.motion_model.0.num_cp_mv() as u32;
+        assert_eq!(num_cp_mv, 2);
+        let geom = InheritedAffineGeom {
+            xcb: 16,
+            ycb: 0,
+            cb_width: 16,
+            cb_height: 16,
+            xnb: blk.cb_pos.0,
+            ynb: blk.cb_pos.1,
+            nb_w: blk.cb_w,
+            nb_h: blk.cb_h,
+        };
+        let cpmvs = derive_inherited_affine_cpmvs(
+            geom,
+            NeighbourCpmvSource::SameOrLeftCtu {
+                cpmvs: AffineCpmvs::new_4param(mv(0, 0), mv(256, 0)),
+            },
+            num_cp_mv,
+        )
+        .expect("inherited derivation accepts cascade-chosen geometry");
+        assert_eq!(cpmvs.model, MotionModel::Affine4Param);
     }
 }
