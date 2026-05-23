@@ -6,6 +6,52 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 108 — **§7.3.10.8 non-merge inter MVP-side syntax
+  (`inter_pred_idc` / `sym_mvd_flag` / `ref_idx_lX` / `mvp_lX_flag`)** —
+  the four AMVP-side CABAC reads that surround the round-103
+  `mvd_coding()` in the MODE_INTER `coding_unit()` else-branch. Adds:
+  - `LeafCuReader::read_inter_pred_idc(cb_width, cb_height)` — §9.3.3.9 /
+    Table 131 binarisation. When `cbWidth + cbHeight > 12` the two-bin
+    form gives `PRED_L0 = 00`, `PRED_L1 = 01`, `PRED_BI = 1`; when the
+    sum equals 12 `PRED_BI` is suppressed and a single bin gives
+    `PRED_L0 = 0` / `PRED_L1 = 1`. Bin 0's ctxInc is
+    `7 − ((1 + Log2(cbWidth) + Log2(cbHeight)) >> 1)` (or 5 at sum 12),
+    bin 1's ctxInc is fixed 5 (Table 132). Returns a new
+    `leaf_cu::InterPredDir` enum (`PredL0` / `PredL1` / `PredBi`,
+    `value()` ⇒ the §7.4.12.4 numeric syntax value).
+  - `LeafCuReader::read_sym_mvd_flag()` — Table 132 FL `cMax = 1`,
+    one ctx-coded bin (`ctxInc = 0`); §7.4.12.4 symmetric-MVD signalling.
+  - `LeafCuReader::read_ref_idx_lx(num_ref_idx_active)` — Table 127 TR
+    `cMax = NumRefIdxActive[X] − 1`, bin 0 ctxInc 0, bin 1 ctxInc 1,
+    bins 2.. bypass (Table 132). `cMax == 0` (single ref) reads no bins.
+  - `LeafCuReader::read_mvp_lx_flag()` — Table 132 FL `cMax = 1`, one
+    ctx-coded bin (`ctxInc = 0`); the §8.5.2.8 AMVP candidate index.
+  - `SyntaxCtx::{InterPredIdc, SymMvdFlag, RefIdxLx, MvpLxFlag}` + Table
+    83 / 86 / 87 / 88 `initValue` / `shiftIdx` arrays, wired through
+    `LeafCuCtxs` (`inter_pred_idc` / `sym_mvd_flag` / `ref_idx_lx` /
+    `mvp_lx_flag` Vec fields) + `init_with_init_type`. Per Table 51 the
+    per-initType slot blocks are `(init_type − 1) * 6` (inter_pred_idc),
+    `init_type − 1` (sym_mvd_flag), `(init_type − 1) * 2` (ref_idx_lX),
+    and `init_type` (mvp_lX_flag).
+  - `ctx::{ctx_inc_inter_pred_idc_bin0, ctx_inc_inter_pred_idc_bin1,
+    ctx_inc_sym_mvd_flag, ctx_inc_ref_idx_lx, ctx_inc_mvp_lx_flag}`
+    per Table 132.
+
+  9 new lib tests (encoder-mirror round-trips driving the same context
+  bundle bin-for-bin): inter_pred_idc two-bin form (all three dirs) +
+  single-bin form (sum == 12) + bin-0 ctxInc derivation across
+  power-of-two sizes; sym_mvd_flag both init types; ref_idx_lX
+  single-ref (no bins) + truncated-unary 0..3 across the ctx/bypass
+  boundary + two-ref ctx-bin0-only; mvp_lX_flag all three init types.
+
+  Out of scope (next round): fusing these reads into a complete
+  non-merge inter `coding_unit()` walk — needs the §8.5.2.8 / §8.5.2.9
+  AMVP MVP-candidate list derivation to consume `mvp_lX_flag`, the
+  §7.4.11.6 AMVR shift applied to the round-103 `lMvd`, the
+  `ph_mvd_l1_zero_flag` / `RefIdxSymL{0,1}` inference cascade around
+  `sym_mvd_flag`, and `inter_affine_flag` / `cu_affine_type_flag` /
+  `bcw_idx` / `amvr_flag` for the affine-AMVP and BCW branches.
+
 - Round 103 — **§7.3.10.10 `mvd_coding()` decode syntax + §9.3.3.14
   limited-EGk binarisation** — the spec-conformant CABAC parser for one
   motion-vector-difference structure, the first concrete step against

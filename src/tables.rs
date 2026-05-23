@@ -144,6 +144,29 @@ pub enum SyntaxCtx {
     /// non-skip merge / non-merge inter paths to gate the
     /// `transform_tree()` body.
     CuCodedFlag,
+    /// Table 83 — `inter_pred_idc` (12 ctxIdx; 6 per non-I initType). Per
+    /// Table 51 the slot block is `(init_type − 1) * 6` (initType 1 →
+    /// 0..5, initType 2 → 6..11); `inter_pred_idc` is never signalled in
+    /// I slices so there is no initType-0 block. Bin 0's ctxInc spans
+    /// 0..4 (`7 − ((1 + Log2(cbWidth) + Log2(cbHeight)) >> 1)` or 5),
+    /// bin 1's ctxInc is fixed 5, so the 6 slots cover the full
+    /// {0,1,2,3,4,5} ctxInc range used by §9.3.3.9 / Table 131.
+    InterPredIdc,
+    /// Table 86 — `sym_mvd_flag` (2 ctxIdx, one per non-I initType). Per
+    /// Table 51 initType 1 → 0, initType 2 → 1 (indexed at parse time as
+    /// `init_type - 1`). Single ctx-coded bin (FL `cMax = 1`) with
+    /// `ctxInc = 0` per Table 132; only signalled for inter slices.
+    SymMvdFlag,
+    /// Table 87 — `ref_idx_l0` / `ref_idx_l1` (4 ctxIdx; 2 per non-I
+    /// initType). Per Table 51 initType 1 → 0..1, initType 2 → 2..3
+    /// (indexed at parse time as `(init_type - 1) * 2 + ctxInc`). TR
+    /// binarisation (`cMax = NumRefIdxActive[X] − 1`): bin 0 ctxInc 0,
+    /// bin 1 ctxInc 1, bins 2.. bypass per Table 132.
+    RefIdxLx,
+    /// Table 88 — `mvp_l0_flag` / `mvp_l1_flag` (3 ctxIdx, one per
+    /// initType). Per Table 51 indexed by `init_type`. Single ctx-coded
+    /// bin (FL `cMax = 1`) with `ctxInc = 0` per Table 132.
+    MvpLxFlag,
     /// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6. The four
     /// slots map to `(initType, ctxInc) ∈ ({0,1,2}, {0,1,2})` per
     /// Tables 51 / 132 — regular AMVR / affine-AMVR / IBC-AMVR rows.
@@ -472,6 +495,41 @@ pub const CIIP_FLAG_SHIFT: &[u8] = &[1, 1];
 pub const CU_CODED_FLAG_INIT: &[u8] = &[6, 5, 12];
 pub const CU_CODED_FLAG_SHIFT: &[u8] = &[4, 4, 4];
 
+/// Table 83 — `inter_pred_idc` (12 ctxIdx, 6 per non-I initType).
+/// Round-108 §9.3.3.9 transcription:
+///   ctxIdx     | 0 | 1 | 2 | 3  | 4 | 5  | 6  | 7  | 8 | 9 | 10 | 11 |
+///   initValue  | 7 | 6 | 5 | 12 | 4 | 40 | 14 | 13 | 5 | 4 | 3  | 40 |
+///   shiftIdx   | 0 | 0 | 1 | 4  | 4 | 0  | 0  | 0  | 1 | 4 | 4  | 0  |
+/// Per Table 51 the initType-1 (P) block is ctxIdx 0..5 and the
+/// initType-2 (B) block is ctxIdx 6..11; the unused initType-0 (I)
+/// block has no entries.
+pub const INTER_PRED_IDC_INIT: &[u8] = &[7, 6, 5, 12, 4, 40, 14, 13, 5, 4, 3, 40];
+pub const INTER_PRED_IDC_SHIFT: &[u8] = &[0, 0, 1, 4, 4, 0, 0, 0, 1, 4, 4, 0];
+
+/// Table 86 — `sym_mvd_flag` (2 ctxIdx, one per non-I initType).
+/// Round-108 transcription:
+///   ctxIdx     | 0  | 1  |
+///   initValue  | 28 | 28 |
+///   shiftIdx   |  5 |  5 |
+pub const SYM_MVD_FLAG_INIT: &[u8] = &[28, 28];
+pub const SYM_MVD_FLAG_SHIFT: &[u8] = &[5, 5];
+
+/// Table 87 — `ref_idx_l0` / `ref_idx_l1` (4 ctxIdx, 2 per non-I
+/// initType). Round-108 transcription:
+///   ctxIdx     | 0  | 1  | 2 | 3  |
+///   initValue  | 20 | 35 | 5 | 35 |
+///   shiftIdx   |  0 |  4 | 0 |  4 |
+pub const REF_IDX_LX_INIT: &[u8] = &[20, 35, 5, 35];
+pub const REF_IDX_LX_SHIFT: &[u8] = &[0, 4, 0, 4];
+
+/// Table 88 — `mvp_l0_flag` / `mvp_l1_flag` (3 ctxIdx, one per
+/// initType). Round-108 transcription:
+///   ctxIdx     | 0  | 1  | 2  |
+///   initValue  | 42 | 34 | 34 |
+///   shiftIdx   | 12 | 12 | 12 |
+pub const MVP_LX_FLAG_INIT: &[u8] = &[42, 34, 34];
+pub const MVP_LX_FLAG_SHIFT: &[u8] = &[12, 12, 12];
+
 /// Table 110 — `abs_mvd_greater0_flag` (3 ctxIdx, one per initType).
 /// Round-103 §7.3.10.10 / §9.3.3.14 transcription:
 ///   initType  | 0  | 1  | 2  |
@@ -626,6 +684,10 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::AbsMvdGreater0Flag => (ABS_MVD_GREATER0_FLAG_INIT, ABS_MVD_GREATER0_FLAG_SHIFT),
         SyntaxCtx::AbsMvdGreater1Flag => (ABS_MVD_GREATER1_FLAG_INIT, ABS_MVD_GREATER1_FLAG_SHIFT),
         SyntaxCtx::CuCodedFlag => (CU_CODED_FLAG_INIT, CU_CODED_FLAG_SHIFT),
+        SyntaxCtx::InterPredIdc => (INTER_PRED_IDC_INIT, INTER_PRED_IDC_SHIFT),
+        SyntaxCtx::SymMvdFlag => (SYM_MVD_FLAG_INIT, SYM_MVD_FLAG_SHIFT),
+        SyntaxCtx::RefIdxLx => (REF_IDX_LX_INIT, REF_IDX_LX_SHIFT),
+        SyntaxCtx::MvpLxFlag => (MVP_LX_FLAG_INIT, MVP_LX_FLAG_SHIFT),
         SyntaxCtx::AmvrFlag => (AMVR_FLAG_INIT, AMVR_FLAG_SHIFT),
         SyntaxCtx::AmvrPrecisionIdx => (AMVR_PRECISION_IDX_INIT, AMVR_PRECISION_IDX_SHIFT),
         SyntaxCtx::AlfCtbFlag => (ALF_CTB_FLAG_INIT, ALF_CTB_FLAG_SHIFT),

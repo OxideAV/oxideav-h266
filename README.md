@@ -213,8 +213,12 @@ the **intra-only single-tile single-slice subset** plus the round-28
 * **In-loop filters**: §8.8.3 deblocking, §8.8.4 SAO (Edge + Band
   offset), §8.8.5 ALF including the fixed-filter family + CC-ALF.
 * **Non-skip merge with cu_coded_flag == 1 (residual transform_tree),
-  mvd_coding (non-merge inter)**: still surface
-  `Error::Unsupported`.
+  full non-merge inter CU reconstruction**: still surface
+  `Error::Unsupported`. The §7.3.10.10 `mvd_coding()` parser (round-103)
+  and the §7.3.10.8 MVP-side flags `inter_pred_idc` / `sym_mvd_flag` /
+  `ref_idx_lX` / `mvp_lX_flag` (round-108) are now decoded, but the
+  §8.5.2.8/§8.5.2.9 AMVP candidate derivation that consumes them and the
+  §7.4.11.6 AMVR shift remain deferred.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in
@@ -552,6 +556,30 @@ non-merge inter CU (which needs the §8.5.2.8/§8.5.2.9 AMVP
 MVP-candidate derivation, `ref_idx_lX`, `mvp_lX_flag`, and the §7.4.11.6
 AMVR shift) plus the SbTMVP SbCol record and the §8.5.5.7 affine-AMVP
 path (`mvd_coding` × numCpMv) remain deferred.
+
+**Round-108 lands the §7.3.10.8 non-merge inter MVP-side syntax** — the
+four AMVP-side CABAC reads that surround the round-103 `mvd_coding()` in
+the MODE_INTER `coding_unit()` else-branch.
+`LeafCuReader::read_inter_pred_idc(cb_width, cb_height)` decodes the
+§9.3.3.9 / Table 131 binarisation (`PRED_L0 = 00`, `PRED_L1 = 01`,
+`PRED_BI = 1` when `cbWidth + cbHeight > 12`; a single bin with
+`PRED_BI` suppressed when the sum equals 12) into a new
+`leaf_cu::InterPredDir` enum, with bin 0's ctxInc =
+`7 - ((1 + Log2(cbWidth) + Log2(cbHeight)) >> 1)` (or 5) and bin 1's
+ctxInc fixed 5 per Table 132. `read_sym_mvd_flag()` (Table 86, FL
+`cMax = 1`), `read_ref_idx_lx(num_ref_idx_active)` (Table 87, TR
+`cMax = NumRefIdxActive[X] - 1`, bins 0/1 ctx-coded then bypass), and
+`read_mvp_lx_flag()` (Table 88, FL `cMax = 1`) complete the set. The
+new `SyntaxCtx::{InterPredIdc, SymMvdFlag, RefIdxLx, MvpLxFlag}` carry
+Tables 83 / 86 / 87 / 88 with the Table 51 per-initType slot blocks
+(`(initType-1)*6` / `initType-1` / `(initType-1)*2` / `initType`). 9 new
+lib tests round-trip every reader through a bin-for-bin encoder mirror.
+Fusing these reads into a complete non-merge inter CU walk (the
+§8.5.2.8 AMVP candidate list that consumes `mvp_lX_flag`, the §7.4.11.6
+AMVR shift on `lMvd`, the `ph_mvd_l1_zero_flag` / `RefIdxSymL{0,1}`
+inference around `sym_mvd_flag`, and the `inter_affine_flag` /
+`cu_affine_type_flag` / `bcw_idx` / `amvr_flag` branches) remains
+deferred.
 
 ## Usage
 

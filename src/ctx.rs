@@ -341,6 +341,53 @@ pub fn ctx_inc_cu_coded_flag() -> u32 {
     0
 }
 
+/// ctxInc for the *first* bin of `inter_pred_idc[x0][y0]` per Table 132.
+/// Binarised per §9.3.3.9 / Table 131 (`PRED_L0 = 00`, `PRED_L1 = 01`,
+/// `PRED_BI = 1` when `cbWidth + cbHeight > 12`; the BI value is
+/// suppressed when the sum equals 12, leaving `PRED_L0 = 0` /
+/// `PRED_L1 = 1`). Bin 0's ctxInc is
+/// `(cbWidth + cbHeight) > 12 ? 7 − ((1 + Log2(cbWidth) +
+/// Log2(cbHeight)) >> 1) : 5`. Both `cbWidth` / `cbHeight` are powers of
+/// two in VVC so `Log2` is exact.
+pub fn ctx_inc_inter_pred_idc_bin0(cb_width: u32, cb_height: u32) -> u32 {
+    if cb_width + cb_height > 12 {
+        let l = 1 + cb_width.trailing_zeros() + cb_height.trailing_zeros();
+        7 - (l >> 1)
+    } else {
+        5
+    }
+}
+
+/// ctxInc for the *second* bin of `inter_pred_idc[x0][y0]` per Table 132
+/// — fixed 5. Only present when `cbWidth + cbHeight > 12` (the first bin
+/// chose between `{PRED_L0, PRED_L1}` and `PRED_BI`).
+pub fn ctx_inc_inter_pred_idc_bin1() -> u32 {
+    5
+}
+
+/// ctxInc for `sym_mvd_flag[x0][y0]` per Table 132 — fixed 0. Single
+/// ctx-coded bin (FL `cMax = 1`); §7.4.12.4 governs its semantic
+/// meaning (symmetric MVD signalling).
+pub fn ctx_inc_sym_mvd_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `ref_idx_l0[x0][y0]` / `ref_idx_l1[x0][y0]` per Table 132.
+/// TR binarisation (`cMax = NumRefIdxActive[X] − 1`, `cRiceParam = 0`):
+/// bin 0 has `ctxInc = 0`, bin 1 has `ctxInc = 1`, all subsequent bins
+/// are bypass-coded. `bin_idx` is the zero-based truncated-unary bin
+/// index.
+pub fn ctx_inc_ref_idx_lx(bin_idx: u32) -> u32 {
+    bin_idx.min(1)
+}
+
+/// ctxInc for `mvp_l0_flag[x0][y0]` / `mvp_l1_flag[x0][y0]` per Table 132
+/// — fixed 0. Single ctx-coded bin (FL `cMax = 1`); selects the AMVP
+/// candidate-list index per §8.5.2.8.
+pub fn ctx_inc_mvp_lx_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///

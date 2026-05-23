@@ -50,12 +50,13 @@ use oxideav_core::{Error, Result};
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
     ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_cu_skip_flag,
-    ctx_inc_general_merge_flag, ctx_inc_intra_bdpcm_chroma_dir_flag,
-    ctx_inc_intra_bdpcm_chroma_flag, ctx_inc_intra_bdpcm_luma_dir_flag,
-    ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+    ctx_inc_general_merge_flag, ctx_inc_inter_pred_idc_bin0, ctx_inc_inter_pred_idc_bin1,
+    ctx_inc_intra_bdpcm_chroma_dir_flag, ctx_inc_intra_bdpcm_chroma_flag,
+    ctx_inc_intra_bdpcm_luma_dir_flag, ctx_inc_intra_bdpcm_luma_flag,
+    ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
-    ctx_inc_regular_merge_flag,
+    ctx_inc_mvp_lx_flag, ctx_inc_ref_idx_lx, ctx_inc_regular_merge_flag, ctx_inc_sym_mvd_flag,
 };
 use crate::inter::{InterCuInfo, MergeData, MotionVector};
 use crate::residual::{
@@ -75,6 +76,38 @@ pub enum CuPredMode {
     Ibc,
     /// Palette-mode CU.
     Plt,
+}
+
+/// Inter prediction direction (§7.4.12.4 / Table for `inter_pred_idc`).
+/// The numeric value matches the spec's `inter_pred_idc` syntax value
+/// (`PRED_L0 = 0`, `PRED_L1 = 1`, `PRED_BI = 2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterPredDir {
+    /// `PRED_L0` — uni-prediction from reference list 0.
+    PredL0,
+    /// `PRED_L1` — uni-prediction from reference list 1.
+    PredL1,
+    /// `PRED_BI` — bi-prediction from both reference lists.
+    PredBi,
+}
+
+impl InterPredDir {
+    /// The §7.4.12.4 numeric `inter_pred_idc` value.
+    pub fn value(self) -> u32 {
+        match self {
+            InterPredDir::PredL0 => 0,
+            InterPredDir::PredL1 => 1,
+            InterPredDir::PredBi => 2,
+        }
+    }
+
+    fn from_value(v: u32) -> Self {
+        match v {
+            0 => InterPredDir::PredL0,
+            1 => InterPredDir::PredL1,
+            _ => InterPredDir::PredBi,
+        }
+    }
 }
 
 /// Intra subpartitions split type (Table 13).
@@ -428,6 +461,23 @@ pub struct LeafCuCtxs {
     /// `transform_tree()` body. Single ctx-coded bin (FL `cMax = 1`)
     /// per Table 132.
     pub cu_coded_flag: Vec<ContextModel>,
+    /// `inter_pred_idc` (Table 83) — 12 entries, 6 per non-I initType.
+    /// Indexed at parse time as `(init_type - 1) * 6 + ctxInc` (the
+    /// per-bin ctxInc is derived from cbWidth / cbHeight per §9.3.3.9).
+    /// Only signalled for B slices.
+    pub inter_pred_idc: Vec<ContextModel>,
+    /// `sym_mvd_flag` (Table 86) — 2 entries, one per non-I initType.
+    /// Indexed as `(init_type - 1)`. Single ctx-coded bin (FL
+    /// `cMax = 1`).
+    pub sym_mvd_flag: Vec<ContextModel>,
+    /// `ref_idx_l0` / `ref_idx_l1` (Table 87) — 4 entries, 2 per non-I
+    /// initType. Indexed as `(init_type - 1) * 2 + ctxInc` with ctxInc
+    /// ∈ {0, 1} for the first two TR bins (bins 2.. bypass).
+    pub ref_idx_lx: Vec<ContextModel>,
+    /// `mvp_l0_flag` / `mvp_l1_flag` (Table 88) — 3 entries, one per
+    /// initType. Indexed by `init_type`. Single ctx-coded bin (FL
+    /// `cMax = 1`).
+    pub mvp_lx_flag: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -514,6 +564,10 @@ impl LeafCuCtxs {
             mmvd_distance_idx: init_contexts(SyntaxCtx::MmvdDistanceIdx, slice_qp_y),
             ciip_flag: init_contexts(SyntaxCtx::CiipFlag, slice_qp_y),
             cu_coded_flag: init_contexts(SyntaxCtx::CuCodedFlag, slice_qp_y),
+            inter_pred_idc: init_contexts(SyntaxCtx::InterPredIdc, slice_qp_y),
+            sym_mvd_flag: init_contexts(SyntaxCtx::SymMvdFlag, slice_qp_y),
+            ref_idx_lx: init_contexts(SyntaxCtx::RefIdxLx, slice_qp_y),
+            mvp_lx_flag: init_contexts(SyntaxCtx::MvpLxFlag, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -1441,6 +1495,109 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             x: lmvd[0],
             y: lmvd[1],
         })
+    }
+
+    /// Decode `inter_pred_idc[x0][y0]` per §9.3.3.9 / Table 131. The
+    /// binarisation depends on `cbWidth + cbHeight`:
+    ///
+    /// * `> 12` — bin 0 distinguishes `PRED_BI` (`1`) from the uni-pred
+    ///   pair (`0`); when the uni-pred pair is taken bin 1 picks
+    ///   `PRED_L0` (`0`) vs `PRED_L1` (`1`), giving `PRED_L0 = 00`,
+    ///   `PRED_L1 = 01`, `PRED_BI = 1`.
+    /// * `== 12` — `PRED_BI` is not allowed; a single bin gives
+    ///   `PRED_L0 = 0` / `PRED_L1 = 1`.
+    ///
+    /// Bin 0's ctxInc is the cbWidth / cbHeight expression
+    /// (`ctx_inc_inter_pred_idc_bin0`); bin 1's ctxInc is fixed 5
+    /// (`ctx_inc_inter_pred_idc_bin1`). Per Table 51 the per-initType
+    /// slot block is `(init_type − 1) * 6` (initType 1 → 0..5,
+    /// initType 2 → 6..11; the I-slice initType-0 block is unused since
+    /// `inter_pred_idc` is only signalled for inter slices, and the
+    /// two-bin form only for B slices).
+    pub fn read_inter_pred_idc(&mut self, cb_width: u32, cb_height: u32) -> Result<InterPredDir> {
+        let block = (self.ctxs.init_type as usize).saturating_sub(1) * 6;
+        let n = self.ctxs.inter_pred_idc.len();
+        if cb_width + cb_height > 12 {
+            let inc0 = ctx_inc_inter_pred_idc_bin0(cb_width, cb_height) as usize;
+            let slot0 = (block + inc0).min(n - 1);
+            let bin0 = self
+                .dec
+                .decode_decision(&mut self.ctxs.inter_pred_idc[slot0])?;
+            if bin0 == 1 {
+                return Ok(InterPredDir::PredBi);
+            }
+            let inc1 = ctx_inc_inter_pred_idc_bin1() as usize;
+            let slot1 = (block + inc1).min(n - 1);
+            let bin1 = self
+                .dec
+                .decode_decision(&mut self.ctxs.inter_pred_idc[slot1])?;
+            Ok(InterPredDir::from_value(bin1))
+        } else {
+            // (cbWidth + cbHeight) == 12: single bin, PRED_BI suppressed.
+            let inc0 = ctx_inc_inter_pred_idc_bin0(cb_width, cb_height) as usize;
+            let slot0 = (block + inc0).min(n - 1);
+            let bin0 = self
+                .dec
+                .decode_decision(&mut self.ctxs.inter_pred_idc[slot0])?;
+            Ok(InterPredDir::from_value(bin0))
+        }
+    }
+
+    /// Decode `sym_mvd_flag[x0][y0]` per Table 132 — FL `cMax = 1`, a
+    /// single ctx-coded bin with `ctxInc = 0`. Per Table 51 the slot is
+    /// `init_type - 1` (only signalled in inter slices). Returns the
+    /// flag as a `bool`.
+    pub fn read_sym_mvd_flag(&mut self) -> Result<bool> {
+        let _ = ctx_inc_sym_mvd_flag();
+        let slot = (self.ctxs.init_type as usize)
+            .saturating_sub(1)
+            .min(self.ctxs.sym_mvd_flag.len() - 1);
+        let bit = self
+            .dec
+            .decode_decision(&mut self.ctxs.sym_mvd_flag[slot])?;
+        Ok(bit == 1)
+    }
+
+    /// Decode `ref_idx_l0[x0][y0]` / `ref_idx_l1[x0][y0]` per Table 127 —
+    /// TR binarisation with `cMax = NumRefIdxActive[X] − 1`,
+    /// `cRiceParam = 0`. Bin 0 ctxInc = 0, bin 1 ctxInc = 1, bins 2..
+    /// bypass-coded (Table 132). Per Table 51 the slot block is
+    /// `(init_type - 1) * 2`. `num_ref_idx_active` is `NumRefIdxActive[X]`
+    /// (the value of the syntax element, not minus one); a value of 1
+    /// (or 0) makes `cMax == 0` so no bins are read and the index is 0.
+    pub fn read_ref_idx_lx(&mut self, num_ref_idx_active: u32) -> Result<u32> {
+        let cmax = num_ref_idx_active.saturating_sub(1);
+        if cmax == 0 {
+            return Ok(0);
+        }
+        let block = (self.ctxs.init_type as usize).saturating_sub(1) * 2;
+        let n = self.ctxs.ref_idx_lx.len();
+        let mut val = 0u32;
+        while val < cmax {
+            let inc = ctx_inc_ref_idx_lx(val) as usize;
+            let bit = if val < 2 {
+                let slot = (block + inc).min(n - 1);
+                self.dec.decode_decision(&mut self.ctxs.ref_idx_lx[slot])?
+            } else {
+                self.dec.decode_bypass()?
+            };
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
+    }
+
+    /// Decode `mvp_l0_flag[x0][y0]` / `mvp_l1_flag[x0][y0]` per Table 132
+    /// — FL `cMax = 1`, a single ctx-coded bin with `ctxInc = 0`. Per
+    /// Table 51 the slot is `init_type`. The returned flag is the AMVP
+    /// candidate-list index in `0..=1`.
+    pub fn read_mvp_lx_flag(&mut self) -> Result<u32> {
+        let _ = ctx_inc_mvp_lx_flag();
+        let slot = (self.ctxs.init_type as usize).min(self.ctxs.mvp_lx_flag.len() - 1);
+        let bit = self.dec.decode_decision(&mut self.ctxs.mvp_lx_flag[slot])?;
+        Ok(bit)
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -2745,6 +2902,244 @@ mod tests {
             let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
             let got = reader.read_abs_mvd_minus2().unwrap();
             assert_eq!(got, sym, "abs_mvd_minus2 round trip failed at {sym}");
+        }
+    }
+
+    // ---- Round-108: inter MVP-side syntax (inter_pred_idc /
+    // sym_mvd_flag / ref_idx_lX / mvp_lX_flag) ----
+
+    /// Encoder mirror of `read_inter_pred_idc` driving the same context
+    /// bundle bin-for-bin (§9.3.3.9 / Table 131).
+    fn encode_inter_pred_idc(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        dir: InterPredDir,
+        cb_width: u32,
+        cb_height: u32,
+    ) {
+        let block = (ctxs.init_type as usize).saturating_sub(1) * 6;
+        let n = ctxs.inter_pred_idc.len();
+        if cb_width + cb_height > 12 {
+            let inc0 = ctx_inc_inter_pred_idc_bin0(cb_width, cb_height) as usize;
+            let slot0 = (block + inc0).min(n - 1);
+            let bin0 = if dir == InterPredDir::PredBi { 1 } else { 0 };
+            enc.encode_decision(&mut ctxs.inter_pred_idc[slot0], bin0)
+                .unwrap();
+            if dir != InterPredDir::PredBi {
+                let inc1 = ctx_inc_inter_pred_idc_bin1() as usize;
+                let slot1 = (block + inc1).min(n - 1);
+                let bin1 = if dir == InterPredDir::PredL1 { 1 } else { 0 };
+                enc.encode_decision(&mut ctxs.inter_pred_idc[slot1], bin1)
+                    .unwrap();
+            }
+        } else {
+            let inc0 = ctx_inc_inter_pred_idc_bin0(cb_width, cb_height) as usize;
+            let slot0 = (block + inc0).min(n - 1);
+            let bin0 = if dir == InterPredDir::PredL1 { 1 } else { 0 };
+            enc.encode_decision(&mut ctxs.inter_pred_idc[slot0], bin0)
+                .unwrap();
+        }
+    }
+
+    fn inter_pred_idc_round_trip(
+        dir: InterPredDir,
+        cb_width: u32,
+        cb_height: u32,
+        init_type: u8,
+    ) -> InterPredDir {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_inter_pred_idc(&mut enc, &mut enc_ctxs, dir, cb_width, cb_height);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_inter_pred_idc(cb_width, cb_height).unwrap()
+    }
+
+    #[test]
+    fn inter_pred_idc_two_bin_form_round_trips() {
+        // (cbWidth + cbHeight) > 12: PRED_L0 = 00, PRED_L1 = 01,
+        // PRED_BI = 1. 32x32 sum = 64 > 12. B-slice init_type = 2.
+        for dir in [
+            InterPredDir::PredL0,
+            InterPredDir::PredL1,
+            InterPredDir::PredBi,
+        ] {
+            assert_eq!(inter_pred_idc_round_trip(dir, 32, 32, 2), dir);
+        }
+    }
+
+    #[test]
+    fn inter_pred_idc_single_bin_form_when_sum_is_12() {
+        // (cbWidth + cbHeight) == 12: PRED_BI suppressed, single bin
+        // gives PRED_L0 = 0 / PRED_L1 = 1. 4x8 sum = 12.
+        assert_eq!(
+            inter_pred_idc_round_trip(InterPredDir::PredL0, 4, 8, 2),
+            InterPredDir::PredL0
+        );
+        assert_eq!(
+            inter_pred_idc_round_trip(InterPredDir::PredL1, 8, 4, 2),
+            InterPredDir::PredL1
+        );
+    }
+
+    #[test]
+    fn inter_pred_idc_bin0_ctx_inc_matches_spec() {
+        // Bin 0 ctxInc = 7 − ((1 + Log2(W) + Log2(H)) >> 1) for sum > 12,
+        // else 5. Spot-check a few power-of-two sizes.
+        // 32x32: 7 − ((1 + 5 + 5) >> 1) = 7 − (11 >> 1) = 7 − 5 = 2.
+        assert_eq!(ctx_inc_inter_pred_idc_bin0(32, 32), 2);
+        // 16x16: 7 − ((1 + 4 + 4) >> 1) = 7 − 4 = 3.
+        assert_eq!(ctx_inc_inter_pred_idc_bin0(16, 16), 3);
+        // 8x8: 7 − ((1 + 3 + 3) >> 1) = 7 − 3 = 4. sum = 16 > 12.
+        assert_eq!(ctx_inc_inter_pred_idc_bin0(8, 8), 4);
+        // 64x64: 7 − ((1 + 6 + 6) >> 1) = 7 − 6 = 1.
+        assert_eq!(ctx_inc_inter_pred_idc_bin0(64, 64), 1);
+        // sum == 12 → 5.
+        assert_eq!(ctx_inc_inter_pred_idc_bin0(4, 8), 5);
+        // Both P (init 1) and B (init 2) slot blocks must stay in range.
+        // Block offset is (init_type - 1) * 6 per Table 51.
+        for it in [1u8, 2] {
+            let ctxs = LeafCuCtxs::init_with_init_type(26, it);
+            let block = (it as usize - 1) * 6;
+            let inc = ctx_inc_inter_pred_idc_bin0(64, 64) as usize;
+            assert!(block + inc < ctxs.inter_pred_idc.len());
+            // Bin 1 ctxInc = 5 → top slot of the per-initType block.
+            assert!(block + 5 < ctxs.inter_pred_idc.len());
+        }
+    }
+
+    fn sym_mvd_flag_round_trip(flag: bool, init_type: u8) -> bool {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let slot = (init_type as usize)
+            .saturating_sub(1)
+            .min(enc_ctxs.sym_mvd_flag.len() - 1);
+        enc.encode_decision(&mut enc_ctxs.sym_mvd_flag[slot], flag as u32)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_sym_mvd_flag().unwrap()
+    }
+
+    #[test]
+    fn sym_mvd_flag_round_trips_both_init_types() {
+        for it in [1u8, 2] {
+            assert!(!sym_mvd_flag_round_trip(false, it));
+            assert!(sym_mvd_flag_round_trip(true, it));
+        }
+    }
+
+    /// Encoder mirror of `read_ref_idx_lx` (TR, cMax = numActive − 1).
+    fn encode_ref_idx_lx(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        value: u32,
+        num_ref_idx_active: u32,
+    ) {
+        let cmax = num_ref_idx_active.saturating_sub(1);
+        if cmax == 0 {
+            return;
+        }
+        let block = (ctxs.init_type as usize).saturating_sub(1) * 2;
+        let n = ctxs.ref_idx_lx.len();
+        let mut i = 0u32;
+        while i < cmax {
+            let bit = if i < value { 1 } else { 0 };
+            if i < 2 {
+                let inc = ctx_inc_ref_idx_lx(i) as usize;
+                let slot = (block + inc).min(n - 1);
+                enc.encode_decision(&mut ctxs.ref_idx_lx[slot], bit)
+                    .unwrap();
+            } else {
+                enc.encode_bypass(bit).unwrap();
+            }
+            if bit == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    fn ref_idx_lx_round_trip(value: u32, num_ref_idx_active: u32, init_type: u8) -> u32 {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_ref_idx_lx(&mut enc, &mut enc_ctxs, value, num_ref_idx_active);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_ref_idx_lx(num_ref_idx_active).unwrap()
+    }
+
+    #[test]
+    fn ref_idx_lx_single_ref_reads_no_bins() {
+        // cMax = 0 ⇒ no bins, always 0. Verified by feeding an all-zero
+        // stream and reading numActive = 1; the result must be exactly 0
+        // regardless of bytes available.
+        for it in [1u8, 2] {
+            assert_eq!(ref_idx_lx_round_trip(0, 1, it), 0);
+        }
+    }
+
+    #[test]
+    fn ref_idx_lx_truncated_unary_round_trip() {
+        // numActive = 4 ⇒ cMax = 3. Values 0..=3 cover ctx-coded bins 0/1
+        // plus the bypass tail (bin 2) and the cMax-truncation (value 3
+        // stops without a terminating zero bin).
+        for it in [1u8, 2] {
+            for v in 0..=3u32 {
+                assert_eq!(
+                    ref_idx_lx_round_trip(v, 4, it),
+                    v,
+                    "ref_idx_lx round trip failed for v={v} init={it}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ref_idx_lx_two_ref_uses_only_ctx_bin0() {
+        // numActive = 2 ⇒ cMax = 1 ⇒ a single ctx-coded bin (ctxInc 0).
+        for it in [1u8, 2] {
+            assert_eq!(ref_idx_lx_round_trip(0, 2, it), 0);
+            assert_eq!(ref_idx_lx_round_trip(1, 2, it), 1);
+        }
+    }
+
+    fn mvp_lx_flag_round_trip(value: u32, init_type: u8) -> u32 {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let slot = (init_type as usize).min(enc_ctxs.mvp_lx_flag.len() - 1);
+        enc.encode_decision(&mut enc_ctxs.mvp_lx_flag[slot], value)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_mvp_lx_flag().unwrap()
+    }
+
+    #[test]
+    fn mvp_lx_flag_round_trips_all_init_types() {
+        for it in [0u8, 1, 2] {
+            assert_eq!(mvp_lx_flag_round_trip(0, it), 0);
+            assert_eq!(mvp_lx_flag_round_trip(1, it), 1);
         }
     }
 }
