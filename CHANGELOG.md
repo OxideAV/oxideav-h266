@@ -6,6 +6,44 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 103 — **§7.3.10.10 `mvd_coding()` decode syntax + §9.3.3.14
+  limited-EGk binarisation** — the spec-conformant CABAC parser for one
+  motion-vector-difference structure, the first concrete step against
+  the "full mvd_coding" lacks-tail item. Adds:
+  - `LeafCuReader::read_mvd_coding()` — decodes the §7.3.10.10 bin
+    sequence (`abs_mvd_greater0_flag[0/1]` → `abs_mvd_greater1_flag` per
+    non-zero component → `abs_mvd_minus2` + `mvd_sign_flag`) and returns
+    the `lMvd[0..1]` pair (eq. 190 `lMvd = greater0 *
+    (abs_mvd_minus2 + 2) * (1 − 2*sign)`, with `abs_mvd_minus2` inferred
+    −1 when greater1 == 0) packed into a `MotionVector`. Exposed `pub`
+    so the still-deferred non-merge inter / affine-AMVP CU paths can
+    drive the shared CABAC engine through one structure.
+  - `LeafCuReader::read_abs_mvd_minus2()` — the §9.3.3.14 / §9.3.3.6
+    *limited* k-th order Exp-Golomb decode (`k = 1`, `maxPreExtLen = 15`,
+    `truncSuffixLen = 17`), all bins bypass-coded; handles the escape
+    boundary at the 15-bit prefix cap (17-bit truncated suffix).
+  - `SyntaxCtx::{AbsMvdGreater0Flag, AbsMvdGreater1Flag}` + Table 110 /
+    111 `initValue` / `shiftIdx` arrays (`{14, 44, 51}` / `{45, 43, 36}`,
+    3 ctxIdx each, one per initType), wired through `LeafCuCtxs`
+    (`abs_mvd_greater0_flag` / `abs_mvd_greater1_flag` Vec fields) and
+    `init_with_init_type`.
+  - `ctx::ctx_inc_abs_mvd_greater0_flag` / `ctx_inc_abs_mvd_greater1_flag`
+    (both fixed 0 per Table 132; the per-initType slot selection follows
+    Table 51).
+
+  6 new lib tests: zero-both-components; unit-magnitude (greater1 == 0,
+  no `abs_mvd_minus2` bin); mixed zero/non-zero per component; large
+  magnitudes round-trip up to the spec's max `|lMvd| = 2^17` (encoder
+  mirror drives the same context bundle bin-for-bin); eq. 190 sign
+  derivation; and a direct §9.3.3.6 limited-EGk codec round-trip across
+  the value range including the escape boundary.
+
+  Out of scope (next round): wiring `read_mvd_coding()` into a full
+  non-merge inter CU path (needs §8.5.2.8/§8.5.2.9 AMVP MVP-candidate
+  derivation, `ref_idx_lX`, `mvp_lX_flag`, and the §7.4.11.6 AMVR shift
+  applied to the parsed `lMvd`); the SbTMVP (§8.5.5.3 / §8.5.5.4) SbCol
+  candidate; and the §8.5.5.7 affine-AMVP path (`mvd_coding` × numCpMv).
+
 - Round 100 — **§8.5.5.2 steps 3 – 6 neighbour / corner-selection
   cascade** — the precursor round 94 (§8.5.5.2 steps 7 – 9 list
   assembly) and round 91 (§8.5.5.5 / §8.5.5.6 derivations) deferred.

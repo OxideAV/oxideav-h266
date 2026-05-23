@@ -129,6 +129,15 @@ pub enum SyntaxCtx {
     CiipFlag,
     /// Table 109 — `merge_idx` (3 ctxIdx, one per initType).
     MergeIdx,
+    /// Table 110 — `abs_mvd_greater0_flag` (3 ctxIdx, one per initType).
+    /// Per Table 51 the slot is `init_type`; per Table 132 the single
+    /// ctx-coded bin uses `ctxInc = 0` (FL `cMax = 1`). Read once per
+    /// component (compIdx 0 / 1) inside `mvd_coding()` §7.3.10.10.
+    AbsMvdGreater0Flag,
+    /// Table 111 — `abs_mvd_greater1_flag` (3 ctxIdx, one per initType).
+    /// Same shape as `AbsMvdGreater0Flag`; only read when the matching
+    /// `abs_mvd_greater0_flag` was 1.
+    AbsMvdGreater1Flag,
     /// Table 92 — `cu_coded_flag` (3 ctxIdx, one per initType). Single
     /// ctx-coded bin (FL `cMax = 1`) with `ctxInc = 0` per Table 132.
     /// Indexed at parse time as `init_type` (0 / 1 / 2). Used by the
@@ -463,6 +472,22 @@ pub const CIIP_FLAG_SHIFT: &[u8] = &[1, 1];
 pub const CU_CODED_FLAG_INIT: &[u8] = &[6, 5, 12];
 pub const CU_CODED_FLAG_SHIFT: &[u8] = &[4, 4, 4];
 
+/// Table 110 — `abs_mvd_greater0_flag` (3 ctxIdx, one per initType).
+/// Round-103 §7.3.10.10 / §9.3.3.14 transcription:
+///   initType  | 0  | 1  | 2  |
+///   initValue | 14 | 44 | 51 |
+///   shiftIdx  |  9 |  9 |  9 |
+pub const ABS_MVD_GREATER0_FLAG_INIT: &[u8] = &[14, 44, 51];
+pub const ABS_MVD_GREATER0_FLAG_SHIFT: &[u8] = &[9, 9, 9];
+
+/// Table 111 — `abs_mvd_greater1_flag` (3 ctxIdx, one per initType).
+/// Round-103 §7.3.10.10 / §9.3.3.14 transcription:
+///   initType  | 0  | 1  | 2  |
+///   initValue | 45 | 43 | 36 |
+///   shiftIdx  |  5 |  5 |  5 |
+pub const ABS_MVD_GREATER1_FLAG_INIT: &[u8] = &[45, 43, 36];
+pub const ABS_MVD_GREATER1_FLAG_SHIFT: &[u8] = &[5, 5, 5];
+
 /// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6 transcription:
 ///   ctxIdx     | 0  | 1  | 2  | 3  |
 ///   initValue  | 59 | 58 | 59 | 50 |
@@ -598,6 +623,8 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::MmvdDistanceIdx => (MMVD_DISTANCE_IDX_INIT, MMVD_DISTANCE_IDX_SHIFT),
         SyntaxCtx::CiipFlag => (CIIP_FLAG_INIT, CIIP_FLAG_SHIFT),
         SyntaxCtx::MergeIdx => (MERGE_IDX_INIT, MERGE_IDX_SHIFT),
+        SyntaxCtx::AbsMvdGreater0Flag => (ABS_MVD_GREATER0_FLAG_INIT, ABS_MVD_GREATER0_FLAG_SHIFT),
+        SyntaxCtx::AbsMvdGreater1Flag => (ABS_MVD_GREATER1_FLAG_INIT, ABS_MVD_GREATER1_FLAG_SHIFT),
         SyntaxCtx::CuCodedFlag => (CU_CODED_FLAG_INIT, CU_CODED_FLAG_SHIFT),
         SyntaxCtx::AmvrFlag => (AMVR_FLAG_INIT, AMVR_FLAG_SHIFT),
         SyntaxCtx::AmvrPrecisionIdx => (AMVR_PRECISION_IDX_INIT, AMVR_PRECISION_IDX_SHIFT),

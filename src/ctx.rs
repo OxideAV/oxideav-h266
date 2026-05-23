@@ -300,6 +300,21 @@ pub fn ctx_inc_mmvd_merge_flag() -> u32 {
     0
 }
 
+/// ctxInc for `abs_mvd_greater0_flag[compIdx]` per Table 132 — fixed 0.
+/// FL `cMax = 1` (a single ctx-coded bin); read once per component
+/// inside `mvd_coding()` §7.3.10.10. The per-initType ctxIdx selection
+/// (Table 51) is handled by the `init_type` slot, not this increment.
+pub fn ctx_inc_abs_mvd_greater0_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `abs_mvd_greater1_flag[compIdx]` per Table 132 — fixed 0.
+/// FL `cMax = 1`; only read when the matching `abs_mvd_greater0_flag`
+/// was 1.
+pub fn ctx_inc_abs_mvd_greater1_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `mmvd_cand_flag[x0][y0]` — fixed 0 per Table 132.
 /// `mmvd_cand_flag` is binarised FL with cMax = 1 (one ctx-coded bin).
 pub fn ctx_inc_mmvd_cand_flag() -> u32 {

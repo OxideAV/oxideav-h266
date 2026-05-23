@@ -49,14 +49,15 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
-    ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_intra_bdpcm_chroma_dir_flag,
+    ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_cu_skip_flag,
+    ctx_inc_general_merge_flag, ctx_inc_intra_bdpcm_chroma_dir_flag,
     ctx_inc_intra_bdpcm_chroma_flag, ctx_inc_intra_bdpcm_luma_dir_flag,
     ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
     ctx_inc_regular_merge_flag,
 };
-use crate::inter::{InterCuInfo, MergeData};
+use crate::inter::{InterCuInfo, MergeData, MotionVector};
 use crate::residual::{
     decode_tb_coefficients, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
     read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
@@ -399,6 +400,14 @@ pub struct LeafCuCtxs {
     pub regular_merge_flag: Vec<ContextModel>,
     /// `merge_idx` (Table 109) — 3-entry, indexed by `init_type`.
     pub merge_idx: Vec<ContextModel>,
+    /// `abs_mvd_greater0_flag` (Table 110) — 3-entry, one per initType.
+    /// Indexed at parse time by `init_type`. Single ctx-coded bin (FL
+    /// `cMax = 1`) per Table 132 with `ctxInc = 0`; read once per
+    /// component inside `mvd_coding()` §7.3.10.10.
+    pub abs_mvd_greater0_flag: Vec<ContextModel>,
+    /// `abs_mvd_greater1_flag` (Table 111) — 3-entry, one per initType.
+    /// Same shape as `abs_mvd_greater0_flag`.
+    pub abs_mvd_greater1_flag: Vec<ContextModel>,
     /// `mmvd_merge_flag` (Table 103) — 2-entry, one per non-I
     /// initType. Indexed at parse time as `(init_type - 1)` (init_type
     /// 1 / 2 only — MMVD is never signalled in I slices).
@@ -498,6 +507,8 @@ impl LeafCuCtxs {
             general_merge_flag: init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp_y),
             regular_merge_flag: init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp_y),
             merge_idx: init_contexts(SyntaxCtx::MergeIdx, slice_qp_y),
+            abs_mvd_greater0_flag: init_contexts(SyntaxCtx::AbsMvdGreater0Flag, slice_qp_y),
+            abs_mvd_greater1_flag: init_contexts(SyntaxCtx::AbsMvdGreater1Flag, slice_qp_y),
             mmvd_merge_flag: init_contexts(SyntaxCtx::MmvdMergeFlag, slice_qp_y),
             mmvd_cand_flag: init_contexts(SyntaxCtx::MmvdCandFlag, slice_qp_y),
             mmvd_distance_idx: init_contexts(SyntaxCtx::MmvdDistanceIdx, slice_qp_y),
@@ -1304,6 +1315,132 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             val += 1;
         }
         Ok(val)
+    }
+
+    /// Decode the absolute magnitude `abs_mvd_minus2` per §9.3.3.14 —
+    /// the *limited* k-th order Exp-Golomb binarisation (§9.3.3.6) with
+    /// `k = 1`, `maxPreExtLen = 15`, `truncSuffixLen = 17`. Returns the
+    /// raw `abs_mvd_minus2` value (so the caller adds 2 for the absolute
+    /// MVD component). All bins are bypass-coded.
+    ///
+    /// The decode mirrors the §9.3.3.6 binarisation in reverse: read the
+    /// `preExtLen` unary prefix (a run of `1`s, capped at `maxPreExtLen`,
+    /// terminated by a `0` unless the cap is reached), pick the suffix
+    /// length (`truncSuffixLen` at the cap, else `preExtLen + k`), read
+    /// that many fixed-length suffix bits MSB-first, then reconstruct
+    /// `symbolVal = suffix + (((1 << preExtLen) − 1) << k)`.
+    fn read_abs_mvd_minus2(&mut self) -> Result<u32> {
+        const K: u32 = 1;
+        const MAX_PRE_EXT_LEN: u32 = 15;
+        const TRUNC_SUFFIX_LEN: u32 = 17;
+
+        let mut pre_ext_len = 0u32;
+        while pre_ext_len < MAX_PRE_EXT_LEN {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            pre_ext_len += 1;
+        }
+        let escape_length = if pre_ext_len == MAX_PRE_EXT_LEN {
+            // The cap was hit; the spec emits no terminating `0` and the
+            // suffix is the fixed `truncSuffixLen`-bit escape field.
+            TRUNC_SUFFIX_LEN
+        } else {
+            // We already consumed the terminating `0` above when the loop
+            // broke on a 0 bin.
+            pre_ext_len + K
+        };
+        let mut suffix = 0u32;
+        for _ in 0..escape_length {
+            let bit = self.dec.decode_bypass()? as u32;
+            suffix = (suffix << 1) | bit;
+        }
+        // symbolVal = symbolVal_low + ((( 1 << preExtLen ) − 1 ) << k):
+        // `suffix` carries the low `escapeLength` bits of `symbolVal`,
+        // and the prefix run contributes the `(2^preExtLen − 1) << k`
+        // base. (For preExtLen == maxPreExtLen the base uses the same
+        // formula — the escape path widens only the suffix.)
+        let base = ((1u32 << pre_ext_len) - 1) << K;
+        Ok(suffix + base)
+    }
+
+    /// Decode one `mvd_coding(x0, y0, refList, cpIdx)` syntax structure
+    /// (§7.3.10.10) and return the resulting `lMvd[0..1]` pair packed
+    /// into a [`MotionVector`] (`x = lMvd[0]`, `y = lMvd[1]`). These are
+    /// the raw, pre-AMVR motion-vector differences in the spec's
+    /// 1/16-pel storage convention (the §7.4.11.6 AMVR shift, when
+    /// signalled, is applied separately by [`crate::amvr`]).
+    ///
+    /// Bin order per §7.3.10.10:
+    ///   1. `abs_mvd_greater0_flag[0]`, `abs_mvd_greater0_flag[1]`
+    ///      (both ctx-coded, Table 110 slot = `init_type`).
+    ///   2. for each component whose greater0 flag is 1:
+    ///      `abs_mvd_greater1_flag[c]` (ctx-coded, Table 111).
+    ///   3. for each component whose greater0 flag is 1:
+    ///      `abs_mvd_minus2[c]` (only when greater1 == 1, §9.3.3.14
+    ///      bypass EG) then `mvd_sign_flag[c]` (bypass).
+    ///
+    /// `lMvd[c] = greater0 ? (abs_mvd_minus2 + 2) * (1 − 2*sign) : 0`
+    /// (eq. 190), where `abs_mvd_minus2` is inferred to −1 when greater1
+    /// is 0 (so the magnitude collapses to 1) and to its decoded value
+    /// otherwise.
+    ///
+    /// Exposed `pub` so the (still-deferred) non-merge inter / affine
+    /// AMVP CU paths and the round-103 conformance tests can drive the
+    /// shared CABAC engine through one `mvd_coding()` structure without
+    /// duplicating the bin sequence.
+    pub fn read_mvd_coding(&mut self) -> Result<MotionVector> {
+        let init_type = self.ctxs.init_type as usize;
+        let g0n = self.ctxs.abs_mvd_greater0_flag.len() - 1;
+        let g1n = self.ctxs.abs_mvd_greater1_flag.len() - 1;
+        let g0_slot = (init_type + ctx_inc_abs_mvd_greater0_flag() as usize).min(g0n);
+        let g1_slot = (init_type + ctx_inc_abs_mvd_greater1_flag() as usize).min(g1n);
+
+        // Step 1: both greater0 flags, components 0 then 1.
+        let greater0 = [
+            self.dec
+                .decode_decision(&mut self.ctxs.abs_mvd_greater0_flag[g0_slot])?
+                == 1,
+            self.dec
+                .decode_decision(&mut self.ctxs.abs_mvd_greater0_flag[g0_slot])?
+                == 1,
+        ];
+
+        // Step 2: greater1 flag per component that was non-zero (in the
+        // spec's component-major order: c0 greater1, then c1 greater1).
+        let mut greater1 = [false; 2];
+        for c in 0..2 {
+            if greater0[c] {
+                greater1[c] = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.abs_mvd_greater1_flag[g1_slot])?
+                    == 1;
+            }
+        }
+
+        // Step 3: per non-zero component, the magnitude tail then sign.
+        let mut lmvd = [0i32; 2];
+        for c in 0..2 {
+            if !greater0[c] {
+                // abs_mvd_minus2 inferred −1, sign inferred 0 ⇒ lMvd = 0.
+                continue;
+            }
+            // abs_mvd_minus2 is present only when greater1; otherwise it
+            // is inferred to −1 so the absolute magnitude is exactly 1.
+            let abs = if greater1[c] {
+                self.read_abs_mvd_minus2()? as i32 + 2
+            } else {
+                1
+            };
+            let sign = self.dec.decode_bypass()?;
+            lmvd[c] = if sign == 1 { -abs } else { abs };
+        }
+
+        Ok(MotionVector {
+            x: lmvd[0],
+            y: lmvd[1],
+        })
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -2441,5 +2578,173 @@ mod tests {
         let data = [0u8; 4];
         let mut dec = ArithDecoder::new(&data).unwrap();
         assert_eq!(decode_tb_bypass(&mut dec, 4).unwrap(), 0);
+    }
+
+    // === mvd_coding() syntax (§7.3.10.10 / §9.3.3.14) ===
+
+    use crate::cabac_enc::ArithEncoder;
+
+    /// Encode `abs_mvd_minus2` per the §9.3.3.6 limited k-th order
+    /// Exp-Golomb binarisation with `k = 1`, `maxPreExtLen = 15`,
+    /// `truncSuffixLen = 17` — the encode counterpart of
+    /// `read_abs_mvd_minus2`. All bins bypass-coded.
+    fn encode_abs_mvd_minus2(enc: &mut ArithEncoder, symbol_val: u32) {
+        const K: u32 = 1;
+        const MAX_PRE_EXT_LEN: u32 = 15;
+        const TRUNC_SUFFIX_LEN: u32 = 17;
+
+        let code_value = symbol_val >> K;
+        let mut pre_ext_len = 0u32;
+        while pre_ext_len < MAX_PRE_EXT_LEN && code_value > ((2u32 << pre_ext_len) - 2) {
+            pre_ext_len += 1;
+            enc.encode_bypass(1).unwrap();
+        }
+        let escape_length = if pre_ext_len == MAX_PRE_EXT_LEN {
+            TRUNC_SUFFIX_LEN
+        } else {
+            enc.encode_bypass(0).unwrap();
+            pre_ext_len + K
+        };
+        let val = symbol_val - (((1u32 << pre_ext_len) - 1) << K);
+        for i in (0..escape_length).rev() {
+            enc.encode_bypass((val >> i) & 1).unwrap();
+        }
+    }
+
+    /// Encode one `mvd_coding()` structure bin-for-bin per §7.3.10.10,
+    /// driving the supplied context bundle (the mirror of
+    /// `read_mvd_coding`). `lmvd` is the `(lMvd[0], lMvd[1])` pair.
+    fn encode_mvd_coding(enc: &mut ArithEncoder, ctxs: &mut LeafCuCtxs, lmvd: (i32, i32)) {
+        let init_type = ctxs.init_type as usize;
+        let g0_slot = init_type.min(ctxs.abs_mvd_greater0_flag.len() - 1);
+        let g1_slot = init_type.min(ctxs.abs_mvd_greater1_flag.len() - 1);
+        let comp = [lmvd.0, lmvd.1];
+        let greater0 = [comp[0] != 0, comp[1] != 0];
+        let greater1 = [comp[0].abs() > 1, comp[1].abs() > 1];
+
+        // Step 1: both greater0 flags.
+        for c in 0..2 {
+            enc.encode_decision(&mut ctxs.abs_mvd_greater0_flag[g0_slot], greater0[c] as u32)
+                .unwrap();
+        }
+        // Step 2: greater1 per non-zero component.
+        for c in 0..2 {
+            if greater0[c] {
+                enc.encode_decision(&mut ctxs.abs_mvd_greater1_flag[g1_slot], greater1[c] as u32)
+                    .unwrap();
+            }
+        }
+        // Step 3: magnitude tail + sign per non-zero component.
+        for c in 0..2 {
+            if greater0[c] {
+                if greater1[c] {
+                    encode_abs_mvd_minus2(enc, comp[c].unsigned_abs() - 2);
+                }
+                enc.encode_bypass((comp[c] < 0) as u32).unwrap();
+            }
+        }
+    }
+
+    fn mvd_coding_round_trip(lmvd: (i32, i32), init_type: u8) -> MotionVector {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_mvd_coding(&mut enc, &mut enc_ctxs, lmvd);
+        enc.encode_terminate(1).unwrap();
+        let bytes = enc.finish();
+        let mut padded = bytes;
+        padded.extend_from_slice(&[0u8; 32]);
+
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_mvd_coding().unwrap()
+    }
+
+    #[test]
+    fn mvd_coding_zero_both_components() {
+        let mv = mvd_coding_round_trip((0, 0), 1);
+        assert_eq!(mv, MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn mvd_coding_unit_magnitude_skips_minus2() {
+        // |lMvd| == 1 ⇒ greater1 == 0 ⇒ no abs_mvd_minus2 bin, just the
+        // sign. Both signs and one positive / one negative.
+        assert_eq!(
+            mvd_coding_round_trip((1, -1), 1),
+            MotionVector { x: 1, y: -1 }
+        );
+        assert_eq!(
+            mvd_coding_round_trip((-1, 1), 2),
+            MotionVector { x: -1, y: 1 }
+        );
+    }
+
+    #[test]
+    fn mvd_coding_mixed_zero_and_nonzero() {
+        // x == 0 (no greater1/minus2/sign for x), y == 5 (greater1 set,
+        // abs_mvd_minus2 == 3).
+        assert_eq!(
+            mvd_coding_round_trip((0, 5), 1),
+            MotionVector { x: 0, y: 5 }
+        );
+        assert_eq!(
+            mvd_coding_round_trip((-7, 0), 2),
+            MotionVector { x: -7, y: 0 }
+        );
+    }
+
+    #[test]
+    fn mvd_coding_large_magnitudes_round_trip() {
+        // Values spanning small, sub-pel-scale, and large magnitudes to
+        // exercise the §9.3.3.6 unary-prefix growth of the EG1 suffix.
+        for &(x, y) in &[
+            (2, 2),
+            (-2, 3),
+            (16, -16),
+            (255, -255),
+            (1000, -1234),
+            (65535, -65535),
+            (131070, -131070), // 2^17 − 2: the max |lMvd| for abs_mvd
+        ] {
+            let mv = mvd_coding_round_trip((x, y), 1);
+            assert_eq!(
+                mv,
+                MotionVector { x, y },
+                "mvd round trip failed at ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn mvd_coding_eq190_derivation_matches_components() {
+        // Spot-check eq. 190 directly: lMvd[c] = greater0 *
+        // (abs_mvd_minus2 + 2) * (1 − 2*sign). For lMvd = 9 the encoder
+        // emits abs_mvd_minus2 = 7, sign = 0; the decoder must rebuild 9.
+        // For lMvd = −9 sign = 1.
+        assert_eq!(
+            mvd_coding_round_trip((9, -9), 2),
+            MotionVector { x: 9, y: -9 }
+        );
+    }
+
+    #[test]
+    fn abs_mvd_minus2_limited_egk_round_trip() {
+        // Directly exercise the §9.3.3.6 limited-EGk codec across the
+        // value range, including the escape boundary (maxPreExtLen).
+        for sym in [0u32, 1, 2, 3, 7, 8, 100, 1000, 65533, 131068] {
+            let mut enc = ArithEncoder::new();
+            encode_abs_mvd_minus2(&mut enc, sym);
+            enc.encode_terminate(1).unwrap();
+            let mut padded = enc.finish();
+            padded.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&padded).unwrap();
+            let mut ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+            let tools = CuToolFlags::default();
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            let got = reader.read_abs_mvd_minus2().unwrap();
+            assert_eq!(got, sym, "abs_mvd_minus2 round trip failed at {sym}");
+        }
     }
 }

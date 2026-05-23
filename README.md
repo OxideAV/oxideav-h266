@@ -527,6 +527,32 @@ feeding a cascade-chosen inherited-A block's geometry into
 candidate, the §8.5.5.7 affine AMVP path, and the CTU-walker wire-up
 that populates `NeighbourQuery` from live per-CB grids remain deferred.
 
+**Round-103 lands the §7.3.10.10 `mvd_coding()` decode syntax** — the
+first concrete step against the "full mvd_coding" lacks-tail item.
+`LeafCuReader::read_mvd_coding()` (exposed `pub`) decodes one
+motion-vector-difference structure bin-for-bin per §7.3.10.10:
+`abs_mvd_greater0_flag[0]` then `[1]` (both ctx-coded against the new
+Table 110 slot = `init_type`), `abs_mvd_greater1_flag[c]` (Table 111)
+for each component whose greater0 flag is 1, then `abs_mvd_minus2[c]`
+(only when greater1 is 1) followed by `mvd_sign_flag[c]` (bypass). It
+returns the `lMvd[0..1]` pair packed into a `MotionVector` via eq. 190
+`lMvd[c] = greater0 * (abs_mvd_minus2 + 2) * (1 − 2*sign)` with
+`abs_mvd_minus2` inferred −1 when greater1 is 0 (so the magnitude
+collapses to 1). The magnitude tail uses `read_abs_mvd_minus2()`, a
+§9.3.3.14 / §9.3.3.6 *limited* k-th order Exp-Golomb decode (`k = 1`,
+`maxPreExtLen = 15`, `truncSuffixLen = 17`, all bins bypass) that
+handles the 15-bit prefix-cap escape into a 17-bit truncated suffix —
+covering the full spec range up to `|lMvd| = 2^17`. 6 new lib tests
+exercise an encoder-mirror round-trip (zero components, unit magnitude
+that skips `abs_mvd_minus2`, mixed zero/non-zero, large magnitudes to
+the 2^17 max, eq. 190 sign derivation) plus a direct limited-EGk codec
+round-trip across the value range including the escape boundary. The
+parsed `lMvd` is the raw, pre-AMVR difference; wiring it into a full
+non-merge inter CU (which needs the §8.5.2.8/§8.5.2.9 AMVP
+MVP-candidate derivation, `ref_idx_lX`, `mvp_lX_flag`, and the §7.4.11.6
+AMVR shift) plus the SbTMVP SbCol record and the §8.5.5.7 affine-AMVP
+path (`mvd_coding` × numCpMv) remain deferred.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
