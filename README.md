@@ -242,11 +242,19 @@ the **intra-only single-tile single-slice subset** plus the round-28
   AMVR-rounded LY MV when its `RefIdxLY` references the current CU's
   `RefPicList[X][refIdxLX]` (`DiffPicOrderCnt == 0`); a bi-pred entry
   matching on both lists contributes twice. The
-  §8.5.2.11 temporal Col candidate is still taken **injected** (it reuses
-  the existing merge §8.5.2.11/§8.5.2.12 collocated machinery byte for
-  byte — only the AMVP-specific step-3 gate is new here); wiring the
-  live §8.5.2.11 invocation behind that gate and the CTU-walker fuse
-  into a full non-merge inter CU walk remain deferred.
+  **Round-117 makes the §8.5.2.11 temporal Col candidate live**
+  (`derive_temporal_amvp_candidate`): it applies the §8.5.2.11 first-
+  bullet gate (`ph_temporal_mvp_enabled_flag == 0 || cbWidth * cbHeight
+  <= 32` ⇒ `availableFlagLXCol = 0`), invokes the shared merge
+  §8.5.2.11/§8.5.2.12 collocated walk byte for byte (bottom-right →
+  centre fallback, §8.5.2.12 list selection, §8.5.2.15 buffer
+  compression, eqs. 598 – 605 POC scaling) via
+  `derive_temporal_merge_candidate`, and AMVR-rounds the produced
+  `mvLXCol` per the §8.5.2.9 step-3 last bullet — returning the
+  `Option<MotionVector>` that `build_mvp_cand_list` already feeds through
+  its step-3 suppression gate. The CTU-walker fuse (resolving `ColPic` +
+  `RefPicList[X][refIdxLX]` POC from the live non-merge inter path) into
+  a full non-merge inter CU walk remains deferred.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in

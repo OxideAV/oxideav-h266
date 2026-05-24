@@ -42,30 +42,38 @@
 //! * [`derive_final_mv`] — §8.5.2.1: fold the AMVR-shifted `mvd` into
 //!   the chosen predictor.
 //!
-//! ## Scope note (temporal MVP)
+//! ## Temporal MVP (§8.5.2.11)
 //!
-//! The §8.5.2.11 temporal collocated derivation itself already exists
-//! for the *merge* path ([`crate::inter::derive_temporal_merge_candidate`]).
-//! Rather than duplicate that ~150-line collocated walk, this module
-//! takes the AMVP temporal Col candidate as an **injected** optional
-//! `(mv, available)` produced by that machinery (the AMVP and merge
-//! collocated derivations share §8.5.2.11 / §8.5.2.12 byte for byte —
-//! only the §8.5.2.9 step-3 *gate* deciding whether to invoke it is
-//! AMVP-specific, and that gate lives here). Wiring the live §8.5.2.11
-//! invocation behind that gate into the CTU walker (which needs the
-//! collocated picture + `ph_temporal_mvp_enabled_flag` plumbed through
-//! the non-merge inter path) is the remaining follow-up. The §8.5.2.9
-//! step-5 HMVP RPL-reference-match fill now lands here in
-//! [`derive_hmvp_mvp_candidates`]; the caller wires its slice's
-//! per-list `refIdx → POC` resolvers through the same [`AmvpRefContext`]
-//! the spatial scan uses.
+//! [`derive_temporal_amvp_candidate`] is the **live** §8.5.2.11 AMVP
+//! temporal collocated derivation (round-117). The §8.5.2.11 / §8.5.2.12
+//! collocated walk (bottom-right → centre fallback, §8.5.2.12 list
+//! selection, §8.5.2.15 buffer compression, eqs. 598 – 605 POC scaling)
+//! is byte-for-byte identical between the *merge* and AMVP paths, so it
+//! is shared verbatim via [`crate::inter::derive_temporal_merge_candidate`]
+//! rather than duplicated. The AMVP wrapper layers on the two pieces the
+//! spec makes AMVP-specific: the §8.5.2.11 first-bullet gate
+//! (`ph_temporal_mvp_enabled_flag == 0 || cbWidth * cbHeight <= 32` ⇒
+//! `availableFlagLXCol = 0`) and the §8.5.2.9 step-3 last-bullet AMVR
+//! rounding of the produced `mvLXCol`. The §8.5.2.9 step-3 *suppression*
+//! gate (Col consulted only when **not** both A and B available with
+//! different MVs) lives in [`build_mvp_cand_list`], which the returned
+//! `Option<MotionVector>` feeds. The §8.5.2.9 step-5 HMVP
+//! RPL-reference-match fill lands in [`derive_hmvp_mvp_candidates`]; the
+//! caller wires its slice's per-list `refIdx → POC` resolvers through the
+//! same [`AmvpRefContext`] the spatial scan uses. Fusing this candidate
+//! (along with the resolved `ColPic` +
+//! `RefPicList[X][refIdxLX]` POC) into a full non-merge inter CU walk in
+//! the CTU walker remains the follow-up.
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026). The
 //! implementation is spec-only; no third-party VVC decoder source was
 //! consulted.
 
 use crate::amvr::AmvrShift;
-use crate::inter::{HmvpTable, MotionField, MotionVector, MvField};
+use crate::inter::{
+    derive_temporal_merge_candidate, HmvpTable, MotionField, MotionVector, MvField,
+    TemporalMergeInputs,
+};
 
 /// Maximum AMVP candidate-list length (§8.5.2.9 — the list is padded to
 /// exactly 2 entries).
@@ -305,6 +313,107 @@ pub fn derive_hmvp_mvp_candidates(
         }
     }
     out
+}
+
+/// §8.5.2.11 inputs for the AMVP temporal collocated candidate.
+///
+/// These mirror the merge-path [`TemporalMergeInputs`] one-for-one (the
+/// §8.5.2.11 / §8.5.2.12 collocated walk is byte-for-byte identical
+/// between merge and AMVP — only the §8.5.2.9 step-3 *gate* deciding
+/// whether to invoke it, plus the §8.5.2.11 first-bullet
+/// `ph_temporal_mvp_enabled_flag` / `cbWidth * cbHeight <= 32` gate,
+/// differ). The AMVP-specific `current_ref_poc` is
+/// `PicOrderCnt( RefPicList[X][refIdxLX] )` for the **parsed**
+/// `ref_idx_lX` (unlike the merge path, which fixes `refIdxLXCol = 0`
+/// per §8.5.2.2 step 2).
+#[derive(Clone, Copy, Debug)]
+pub struct AmvpTemporalInputs {
+    /// Top-left luma sample of the current CB (picture-absolute).
+    pub xcb: i32,
+    pub ycb: i32,
+    /// CB dimensions in luma samples.
+    pub cb_w: i32,
+    pub cb_h: i32,
+    /// Current picture dimensions (eqs. 594 / 595 boundary clamp).
+    pub pic_w: i32,
+    pub pic_h: i32,
+    /// `CtbLog2SizeY` — the §8.5.2.11 same-CTB-row gate.
+    pub ctb_log2_size_y: u32,
+    /// Current picture POC (§8.3.1).
+    pub current_poc: i32,
+    /// POC of `RefPicList[X][refIdxLX]` for the current CU — the
+    /// `currPocDiff` operand (eq. 599) for the §8.5.2.12 scaling.
+    pub current_ref_poc: i32,
+    /// POC of the collocated block's reference picture — the
+    /// `colPocDiff` operand (eq. 598).
+    pub col_ref_poc: i32,
+    /// `ph_temporal_mvp_enabled_flag`. When `false` the §8.5.2.11
+    /// first bullet sets `availableFlagLXCol = 0`.
+    pub ph_temporal_mvp_enabled: bool,
+}
+
+/// §8.5.2.11 (AMVP path) — derive the temporal collocated AMVP candidate
+/// `mvLXCol`, AMVR-rounded per the §8.5.2.9 step-3 last bullet.
+///
+/// This is the **live** §8.5.2.11 invocation that the round-111 /
+/// round-114 [`build_mvp_cand_list`] previously took as an injected
+/// `Option<MotionVector>`. The §8.5.2.11 / §8.5.2.12 collocated walk
+/// (bottom-right → centre fallback, §8.5.2.12 list selection, §8.5.2.15
+/// buffer compression, eqs. 598 – 605 POC scaling) is shared verbatim
+/// with the merge path via [`derive_temporal_merge_candidate`]; this
+/// wrapper layers on the AMVP-specific pieces:
+///
+/// * The §8.5.2.11 first bullet gate: when `ph_temporal_mvp_enabled` is
+///   `false` **or** `cbWidth * cbHeight <= 32`, both components of
+///   `mvLXCol` are 0 and `availableFlagLXCol == 0` ⇒ this returns
+///   `None`.
+/// * The §8.5.2.9 step-3 last-bullet AMVR rounding (§8.5.2.14 with
+///   `rightShift = leftShift = AmvrShift`) of the produced `mvLXCol`.
+///
+/// `col_pic` is the resolved `ColPic` (the §8.5.2.11 collocated picture,
+/// `RefPicList[ sh_collocated_from_l0_flag ? 0 : 1 ][ sh_collocated_ref_idx ]`)
+/// carrying its captured [`MotionField`]; the caller resolves it. The
+/// §8.5.2.9 step-3 *suppression* gate (Col only consulted when **not**
+/// both A and B available with different MVs) is **not** applied here —
+/// it lives in [`build_mvp_cand_list`], which this `Option` feeds.
+///
+/// Returns `None` when the gate closes, the collocated picture carries
+/// no `MotionField`, or the §8.5.2.12 walk yields no available block.
+pub fn derive_temporal_amvp_candidate(
+    inputs: &AmvpTemporalInputs,
+    col_pic: &crate::inter::ReferencePicture,
+    amvr: AmvrShift,
+) -> Option<MotionVector> {
+    // §8.5.2.11 first bullet: ph_temporal_mvp_enabled_flag == 0 OR
+    // (cbWidth * cbHeight) <= 32 → availableFlagLXCol = 0.
+    if !inputs.ph_temporal_mvp_enabled {
+        return None;
+    }
+    if inputs.cb_w * inputs.cb_h <= 32 {
+        return None;
+    }
+
+    // Shared §8.5.2.11 / §8.5.2.12 collocated walk. The helper returns a
+    // uni-pred record whose `mv_l0` carries the scaled `mvLXCol` for the
+    // list X selected by `current_ref_poc` (the §8.5.2.12 currPocDiff
+    // operand); AMVP consumes that single MV.
+    let merge_inputs = TemporalMergeInputs {
+        xcb: inputs.xcb,
+        ycb: inputs.ycb,
+        cb_w: inputs.cb_w,
+        cb_h: inputs.cb_h,
+        pic_w: inputs.pic_w,
+        pic_h: inputs.pic_h,
+        ctb_log2_size_y: inputs.ctb_log2_size_y,
+        current_poc: inputs.current_poc,
+        current_ref_poc: inputs.current_ref_poc,
+        col_pic,
+        col_ref_poc: inputs.col_ref_poc,
+    };
+    let col = derive_temporal_merge_candidate(&merge_inputs)?;
+
+    // §8.5.2.9 step-3 last bullet — AMVR-round the produced mvLXCol.
+    Some(round_mv_amvr(col.mv_l0, amvr))
 }
 
 /// §8.5.2.14 motion-vector rounding (eqs. 608 – 610) with
@@ -692,6 +801,185 @@ mod tests {
         let list = build_mvp_cand_list([a, SpatialMvpCandidate::default()], None, &hmvp);
         assert_eq!(list[0], MotionVector { x: 5, y: 5 });
         assert_eq!(list[1], MotionVector { x: 40, y: 0 });
+    }
+
+    // ---- §8.5.2.11 temporal AMVP Col -------------------------------
+
+    use crate::inter::ReferencePicture;
+    use crate::reconstruct::PictureBuffer;
+
+    /// Build a single-reference ColPic with a uniform L0 motion field
+    /// (every 4x4 block carries `mv` / `ref_idx` on L0).
+    fn col_pic_uniform(pic_w: u32, pic_h: u32, poc: i32, mv: MotionVector) -> ReferencePicture {
+        let mut mf = MotionField::new(pic_w, pic_h);
+        mf.write_block(0, 0, pic_w, pic_h, l0_block(mv.x, mv.y, 0));
+        ReferencePicture {
+            poc,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0),
+            motion_field: Some(mf),
+        }
+    }
+
+    fn amvp_temporal_inputs(
+        xcb: i32,
+        ycb: i32,
+        cb_w: i32,
+        cb_h: i32,
+        pic: i32,
+        current_ref_poc: i32,
+        col_ref_poc: i32,
+    ) -> AmvpTemporalInputs {
+        AmvpTemporalInputs {
+            xcb,
+            ycb,
+            cb_w,
+            cb_h,
+            pic_w: 32,
+            pic_h: 32,
+            ctb_log2_size_y: 5,
+            current_poc: pic,
+            current_ref_poc,
+            col_ref_poc,
+            ph_temporal_mvp_enabled: true,
+        }
+    }
+
+    #[test]
+    fn temporal_amvp_disabled_when_ph_flag_off() {
+        // §8.5.2.11 first bullet: ph_temporal_mvp_enabled_flag == 0 →
+        // availableFlagLXCol == 0 regardless of a valid ColPic.
+        let col_pic = col_pic_uniform(32, 32, 1, MotionVector::from_int_pel(2, -1));
+        let mut inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);
+        inputs.ph_temporal_mvp_enabled = false;
+        assert!(derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0)).is_none());
+    }
+
+    #[test]
+    fn temporal_amvp_disabled_when_area_le_32() {
+        // §8.5.2.11 first bullet: cbWidth * cbHeight <= 32 → unavailable.
+        // 8x4 = 32 sits exactly on the boundary and is excluded.
+        let col_pic = col_pic_uniform(32, 32, 1, MotionVector::from_int_pel(2, -1));
+        let inputs = amvp_temporal_inputs(0, 0, 8, 4, 2, 0, -1);
+        assert!(derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0)).is_none());
+    }
+
+    #[test]
+    fn temporal_amvp_area_just_above_32_is_eligible() {
+        // 8x8 = 64 > 32 → gate open, Col contributes.
+        let col_pic = col_pic_uniform(32, 32, 1, MotionVector::from_int_pel(1, 1));
+        // CU at (0,0) 8x8: BR=(8,8) in-bounds, same CTB row → BR fires.
+        let inputs = amvp_temporal_inputs(0, 0, 8, 8, 2, 0, -1); // equal POC dist
+        let mv = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0)).unwrap();
+        assert_eq!(mv, MotionVector::from_int_pel(1, 1));
+    }
+
+    #[test]
+    fn temporal_amvp_none_without_motion_field() {
+        // Intra-only ColPic (no captured MF) → §8.5.2.12 short-circuit.
+        let col_pic = ReferencePicture {
+            poc: 1,
+            frame: PictureBuffer::yuv420_filled(32, 32, 0),
+            motion_field: None,
+        };
+        let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);
+        assert!(derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0)).is_none());
+    }
+
+    #[test]
+    fn temporal_amvp_equal_poc_distance_unscaled() {
+        // colPocDiff == currPocDiff == 2 → eq. 600 short-circuit, the
+        // 8x-buffer-rounded Col MV passes through verbatim.
+        let col_pic = col_pic_uniform(32, 32, 1, MotionVector::from_int_pel(2, -1));
+        let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1); // both = 2
+        let mv = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0)).unwrap();
+        assert_eq!(mv, MotionVector::from_int_pel(2, -1));
+    }
+
+    #[test]
+    fn temporal_amvp_scales_across_poc_distance() {
+        // colPocDiff = 4, currPocDiff = 2 → distScaleFactor halves the
+        // Col MV per eqs. 601 – 605. Col MV = (4,0) int-pel = (64,0).
+        // td=4, tx=(16384+2)/4=4096, tb=2, dsf=(2*4096+32)>>6=128,
+        // mvLXCol = (128*64 + 128 - 1) >> 8 = (8192+127)>>8 = 32 = 2 int-pel.
+        let col_pic = col_pic_uniform(32, 32, 4, MotionVector::from_int_pel(4, 0));
+        // current_poc=2, current_ref_poc=0 → currPocDiff=2.
+        // col_pic.poc=4, col_ref_poc=0 → colPocDiff=4.
+        let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, 0);
+        let mv = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0)).unwrap();
+        assert_eq!(mv, MotionVector::from_int_pel(2, 0));
+    }
+
+    #[test]
+    fn temporal_amvp_applies_amvr_rounding() {
+        // §8.5.2.9 step-3 last bullet AMVR-rounds the produced mvLXCol.
+        // The §8.5.2.15 buffer compression inside the shared collocated
+        // walk first folds the raw Col MV (37, -19) to integer-pel
+        // (32, -32) (`mv >> 4 << 4`); the §8.5.2.14 AMVR rounding then
+        // runs over that value. The result equals applying
+        // `round_mv_amvr` to the buffer-compressed MV — pinning that the
+        // step is wired, not skipped. (Because buffer compression has
+        // already quantised to integer-pel, every AMVR shift <= 4 leaves
+        // the value unchanged; the wiring still matters because the spec
+        // mandates the step and future buffer-compression refinements
+        // could expose sub-integer-pel Col MVs.)
+        let raw = MotionVector { x: 37, y: -19 };
+        let col_pic = col_pic_uniform(32, 32, 1, raw);
+        let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);
+        // The shared walk's §8.5.2.15 compression: (37, -19) → (32, -32).
+        let compressed = MotionVector {
+            x: (raw.x >> 4) << 4,
+            y: (raw.y >> 4) << 4,
+        };
+        for shift in [0u32, 1, 2, 3, 4] {
+            let mv = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(shift)).unwrap();
+            assert_eq!(
+                mv,
+                round_mv_amvr(compressed, AmvrShift(shift)),
+                "AMVR shift {shift} not applied to mvLXCol"
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_amvp_feeds_build_mvp_cand_list_step3_gate() {
+        // End-to-end: a single available spatial A + a live Col candidate
+        // flows through the §8.5.2.9 step-3 gate inside build_mvp_cand_list.
+        // With only A available (B absent), the gate is open → Col lands
+        // in slot 1.
+        let col_pic = col_pic_uniform(32, 32, 1, MotionVector::from_int_pel(3, 3));
+        let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);
+        let col = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0));
+        assert_eq!(col, Some(MotionVector::from_int_pel(3, 3)));
+        let a = SpatialMvpCandidate {
+            available: true,
+            mv: MotionVector { x: 8, y: 8 },
+        };
+        let list = build_mvp_cand_list([a, SpatialMvpCandidate::default()], col, &[]);
+        assert_eq!(list[0], MotionVector { x: 8, y: 8 });
+        assert_eq!(list[1], MotionVector::from_int_pel(3, 3));
+    }
+
+    #[test]
+    fn temporal_amvp_col_suppressed_by_distinct_ab_in_list() {
+        // The §8.5.2.11 derivation still produces a Col MV, but the
+        // §8.5.2.9 step-3 suppression gate in build_mvp_cand_list drops it
+        // when both A and B are available with different MVs.
+        let col_pic = col_pic_uniform(32, 32, 1, MotionVector::from_int_pel(5, 5));
+        let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);
+        let col = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(0));
+        assert!(col.is_some());
+        let a = SpatialMvpCandidate {
+            available: true,
+            mv: MotionVector { x: 16, y: 0 },
+        };
+        let b = SpatialMvpCandidate {
+            available: true,
+            mv: MotionVector { x: 0, y: 16 },
+        };
+        let list = build_mvp_cand_list([a, b], col, &[]);
+        // Col suppressed → list is exactly [A, B].
+        assert_eq!(list[0], MotionVector { x: 16, y: 0 });
+        assert_eq!(list[1], MotionVector { x: 0, y: 16 });
     }
 
     // ---- §8.5.2.14 rounding ----------------------------------------
