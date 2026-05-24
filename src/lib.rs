@@ -149,6 +149,7 @@ pub mod alf_aps_design;
 pub mod alf_enc;
 pub mod alf_fixed;
 pub mod alf_syntax;
+pub mod amvp;
 pub mod amvr;
 pub mod aps;
 pub mod aps_enc;

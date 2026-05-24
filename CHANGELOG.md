@@ -6,6 +6,57 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 111 — **§8.5.2.8 / §8.5.2.9 / §8.5.2.10 AMVP luma
+  motion-vector-prediction candidate-list derivation** — the decode-side
+  process that consumes the round-108 `mvp_lX_flag` / `inter_pred_idc` /
+  `ref_idx_lX` and the round-103 `mvd_coding()` `lMvd`. New `amvp`
+  module:
+  - `derive_spatial_mvp_candidates(xcb, ycb, cb_w, cb_h, mvf, ctx)` —
+    §8.5.2.10 spatial scan. The A group walks `A0 = (xCb−1, yCb+cbH)` →
+    `A1 = (A0, A0_y−1)`; the B group walks `B0 = (xCb+cbW, yCb−1)` →
+    `B1 = (xCb+cbW−1, yCb−1)` → `B2 = (xCb−1, yCb−1)`. Each group picks
+    the first effectively-available neighbour whose prediction — list X
+    first (eqs. 588 / 590), then list `Y = 1 − X` (eqs. 589 / 591) —
+    points at a reference picture with `DiffPicOrderCnt == 0` relative
+    to the current CU's `RefPicList[X][refIdxLX]`. Unlike §8.5.2.3
+    spatial *merge*, AMVP performs **no** POC scaling — a non-zero POC
+    difference disqualifies the neighbour outright. POC matching is
+    supplied via an `AmvpRefContext` (the current ref POC + two
+    `refIdx → poc` resolver closures the CTU walker wires from its
+    slice's `RefPicList`).
+  - `round_mv_amvr(mv, AmvrShift)` — §8.5.2.14 eqs. 608 – 610 rounding
+    with `rightShift = leftShift = AmvrShift` (signed-magnitude
+    requantise; identity at shift 0).
+  - `build_mvp_cand_list(spatial, col, hmvp)` — §8.5.2.9 steps 3 – 6:
+    the step-3 Col gate (Col consulted only when *not* both A and B
+    available with **different** MVs), the step-4 list construction
+    (eq. 584 — A first, then B when `mvLXA != mvLXB`, then Col when
+    `numCurrMvpCand < 2`), the step-5 HMVP fill (caller pre-filtered),
+    and the step-6 zero-MV pad to exactly `MAX_MVP_CAND == 2`
+    (eqs. 585 – 587).
+  - `select_mvp(list, mvp_lx_flag)` — §8.5.2.8 step 2, eq. 583.
+  - `derive_final_mv(mvp, raw_mvd, AmvrShift)` — §8.5.2.1 fold
+    `mvLX = mvpLX + (mvd << AmvrShift)`, clipped to `[−2^17, 2^17 − 1]`.
+
+  20 new lib tests: A0-first / A0→A1 fall-through / opposite-list
+  (eq. 589) fallback / POC-never-matches unavailable / B0→B1→B2 scan /
+  intra-neighbour-skipped; §8.5.2.14 rounding at shift 0 / 2 / 4;
+  list assembly across both-distinct (Col suppressed) / both-equal (Col
+  admitted) / only-A-then-Col / only-B-then-HMVP / all-zero-pad /
+  single-spatial-zero-pad / HMVP-clipped-to-2; select-by-flag;
+  final-MV fold + 18-bit clip; and an end-to-end spatial→round→list→
+  select→fold flow.
+
+  Out of scope (next round): the live §8.5.2.11 temporal Col invocation
+  behind the §8.5.2.9 step-3 gate (the collocated derivation itself is
+  shared with the merge path's existing §8.5.2.11/§8.5.2.12 code — only
+  the AMVP-specific gate is new and lands here; Col is taken as an
+  injected optional candidate for now), the §8.5.2.9 step-5 HMVP
+  RPL-reference-match filter, and the CTU-walker fuse that drives a
+  complete non-merge inter `coding_unit()` reconstruction (also needs
+  the `ph_mvd_l1_zero_flag` / `RefIdxSymL{0,1}` cascade around
+  `sym_mvd_flag` and the affine-AMVP / BCW branches).
+
 - Round 108 — **§7.3.10.8 non-merge inter MVP-side syntax
   (`inter_pred_idc` / `sym_mvd_flag` / `ref_idx_lX` / `mvp_lX_flag`)** —
   the four AMVP-side CABAC reads that surround the round-103

@@ -216,9 +216,30 @@ the **intra-only single-tile single-slice subset** plus the round-28
   full non-merge inter CU reconstruction**: still surface
   `Error::Unsupported`. The §7.3.10.10 `mvd_coding()` parser (round-103)
   and the §7.3.10.8 MVP-side flags `inter_pred_idc` / `sym_mvd_flag` /
-  `ref_idx_lX` / `mvp_lX_flag` (round-108) are now decoded, but the
-  §8.5.2.8/§8.5.2.9 AMVP candidate derivation that consumes them and the
-  §7.4.11.6 AMVR shift remain deferred.
+  `ref_idx_lX` / `mvp_lX_flag` (round-108) are decoded, and **round-111
+  lands the §8.5.2.8 / §8.5.2.9 / §8.5.2.10 AMVP candidate derivation**
+  that consumes `mvp_lX_flag` (new `amvp` module). The §8.5.2.10
+  spatial scan walks the A group (`A0 = (xCb−1, yCb+cbH)` → `A1`) and
+  the B group (`B0 = (xCb+cbW, yCb−1)` → `B1` → `B2`), each picking the
+  first effectively-available neighbour whose prediction — list X first
+  (eqs. 588 / 590), then list `Y = 1 − X` (eqs. 589 / 591) — points at a
+  reference picture with the **same POC** as the current CU's
+  `RefPicList[X][refIdxLX]` (`DiffPicOrderCnt == 0`; AMVP does not scale
+  across POC distance, unlike spatial *merge*). `round_mv_amvr`
+  implements the §8.5.2.14 eqs. 608 – 610 rounding with
+  `rightShift = leftShift = AmvrShift`; `build_mvp_cand_list` runs the
+  §8.5.2.9 step-3 Col gate (Col consulted only when *not* both A and B
+  available with different MVs), the step-4 list assembly (eq. 584), the
+  step-5 HMVP fill, and the step-6 zero-MV pad to exactly 2 candidates
+  (eqs. 585 – 587); `select_mvp` is eq. 583 (`mvpListLX[mvp_lX_flag]`)
+  and `derive_final_mv` folds the AMVR-shifted `mvd` into the predictor
+  (`mvLX = mvpLX + mvdLX`, clipped to `[−2^17, 2^17 − 1]`). The
+  §8.5.2.11 temporal Col candidate is taken **injected** (it reuses the
+  existing merge §8.5.2.11/§8.5.2.12 collocated machinery byte for
+  byte — only the AMVP-specific step-3 gate is new here); wiring the
+  live §8.5.2.11 invocation behind that gate, the HMVP step-5
+  RPL-reference filter, and the CTU-walker fuse into a full non-merge
+  inter CU walk remain deferred.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in
