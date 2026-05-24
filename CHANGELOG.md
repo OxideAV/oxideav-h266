@@ -6,6 +6,72 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 120 — **§8.5.5.7 affine AMVP — luma affine control-point
+  motion-vector predictor candidate list**. New `affine_amvp` module
+  drives the spec's 9-step process end-to-end on pure-data inputs
+  (the CTU walker wires `NeighbourAffineQuery` from the live per-CB
+  CPMV grid in a follow-up round):
+  - `derive_inherited_affine_mvp_candidate(xCb, yCb, cb_w, cb_h, nb,
+    ctx, amvr, num_cp_mv, is_ctu_boundary_above)` — the per-neighbour
+    inherited CPMVP wrapper around the round-91
+    `affine_merge::derive_inherited_affine_cpmvs`. Applies the
+    §8.5.5.7 step-4 / step-5 gates: neighbour available + affine
+    (`MotionModelIdc > 0`) + list X first then list Y = 1 − X with
+    `DiffPicOrderCnt == 0`. Builds the `NeighbourCpmvSource::SameOrLeftCtu`
+    or `::AboveCtuBoundary` variant from the neighbour record (the
+    CTU-boundary path reconstructs the two bottom-row sub-block MVs from
+    the neighbour's CPMVs using a local §8.5.5.9 driver, mirroring what
+    the spec's `MvLX[x][y]` sub-block grid would carry). Every emitted
+    CP component is AMVR-rounded (§8.5.2.14 with
+    `rightShift = leftShift = AmvrShift`).
+  - `derive_constructed_affine_mvp_candidate(top_left, top_right,
+    bottom_left, num_cp_mv, amvr)` — the §8.5.5.8 inner derivation
+    that emits `availableConsFlagLX = 1` plus the per-CP candidate when
+    all `numCpMv` corners are available. Each corner is fed by
+    `pick_constructed_corner(&[NeighbourAffineQuery], &ctx)` which walks
+    the per-corner cascade (B2/B3/A2 for TL, B1/B0 for TR, A1/A0 for
+    BL) and picks the first effectively-available neighbour with a
+    POC-matching prediction on list X or Y. Unlike the §8.5.5.6
+    *merge* constructed path, §8.5.5.8 reads the neighbour's
+    sample-anchor MV directly (`MvLX[xNbTL][yNbTL]`) — translational
+    neighbours contribute here.
+  - `build_affine_mvp_cand_list(AffineMvpListInputs<'_>)` — §8.5.5.7
+    steps 1 – 9 assembled in spec order: inherited A → inherited B
+    → constructed full → standalone corners (`nbCpIdx = 2, 1, 0`,
+    each replicating one corner's MV across every CP) → temporal MV
+    (replicated across every CP) → zero-MV pad to exactly
+    `MAX_AFFINE_MVP_CAND == 2` entries. No pruning step is specified
+    by §8.5.5.7.
+  - `select_affine_mvp(list, mvp_lx_flag)` — eq. 840
+    `cpMvpLX[cpIdx] = cpMvpListLX[mvp_lX_flag][cpIdx]`.
+  - `derive_final_affine_cpmvs(mvp, mvd_cp)` — eqs. 664 – 667 final
+    MV folding with the modular 18-bit `(mvpCp + mvdCp) & (2^18 − 1)`
+    wrap and the `>= 2^17 ? − 2^18 : ·` two's-complement unwrap, per
+    CP. Produces an `AffineCpmvs` ready for the round-65 sub-block
+    MV derivation.
+
+  24 new lib tests covering: translational-neighbour rejection,
+  unavailable-neighbour rejection, POC-mismatch rejection, 2-cp + 3-cp
+  inherited emission, cross-list (`Y = 1 − X`) fallback,
+  AMVR-rounding of components (rightShift = leftShift = AmvrShift), the
+  §8.5.5.8 per-corner cascade (translational-neighbour acceptance,
+  first-available pick, no-hit default), the §8.5.5.8 4-param vs
+  6-param all-corners-required gate, full 6-param constructed
+  emission, the 9-step list assembly (inherited-only, constructed
+  after one inherited, step-7 single-corner order 2 → 1 → 0, step-8
+  temporal replication, zero-pad), step-order dominance (inherited
+  takes both slots even when constructed / temporal are available),
+  `select_affine_mvp` indexing, `derive_final_affine_cpmvs` per-CP
+  MVD folding + two's-complement wrap + 6-param, and the CTU-boundary
+  inherited path. End-to-end round-trip test runs the full
+  inherited → list → select → final-MV-fold chain. Module total 24
+  tests; crate 909 (previously 885).
+
+  The CTU-walker fuse (populating `NeighbourAffineQuery` from the live
+  per-CB CPMV grid + the §6.4.4 neighbour-availability table) and
+  wiring the §8.5.2.11 temporal MV resolver into the per-CU path
+  remain follow-ups.
+
 - Round 114 — **§8.5.2.9 step-5 AMVP history-based (HMVP)
   candidate fill** — the RPL-reference-match filter the round-111
   `build_mvp_cand_list` previously consumed pre-injected. New

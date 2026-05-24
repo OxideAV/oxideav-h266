@@ -255,6 +255,33 @@ the **intra-only single-tile single-slice subset** plus the round-28
   its step-3 suppression gate. The CTU-walker fuse (resolving `ColPic` +
   `RefPicList[X][refIdxLX]` POC from the live non-merge inter path) into
   a full non-merge inter CU walk remains deferred.
+  **Round-120 lands the §8.5.5.7 affine AMVP candidate list**
+  (new `affine_amvp` module). The 9-step driver assembles
+  `cpMvpListLX` with exactly 2 entries: (1) inherited A from the
+  A0 → A1 cascade and (2) inherited B from B0 → B1 → B2, both via
+  the round-91 §8.5.5.5 derivation
+  (`derive_inherited_affine_mvp_candidate` applies the §8.5.5.7
+  step-4 / step-5 AMVP gate — neighbour available + affine
+  (`MotionModelIdc > 0`) + list-X-then-list-Y POC match — and
+  AMVR-rounds every emitted CP component); (3) the §8.5.5.8
+  constructed CPMV-predictor candidate
+  (`derive_constructed_affine_mvp_candidate` reads per-corner
+  neighbour sample MVs at TL (`B2 → B3 → A2`), TR (`B1 → B0`), BL
+  (`A1 → A0`), accepting translational neighbours via
+  `pick_constructed_corner`, and emits `availableConsFlagLX = 1`
+  only when all `numCpMv` corners are available); (4) up to three
+  §8.5.5.7 step-7 single-corner standalone candidates (`nbCpIdx =
+  2, 1, 0`, each replicating one available corner MV across every
+  CP); (5) the §8.5.2.11 temporal MV (replicated across every CP);
+  (6) zero-MV pad to exactly 2 entries. `select_affine_mvp` is
+  eq. 840 (`cpMvpListLX[mvp_lX_flag]`) and `derive_final_affine_cpmvs`
+  folds the per-CP AMVR-shifted `mvdCpLX` into the chosen predictor
+  via eqs. 664 – 667 (modular `(mvpCp + mvdCp) & (2^18 − 1)` wrap +
+  `≥ 2^17 ? − 2^18 : ·` two's-complement unwrap), per CP. The
+  CTU-walker fuse — populating `NeighbourAffineQuery` from the live
+  per-CB CPMV grid + the §6.4.4 neighbour-availability table — and
+  wiring the §8.5.2.11 temporal MV resolver into the per-CU path
+  remain deferred.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in

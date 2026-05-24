@@ -143,6 +143,7 @@
 #![allow(clippy::same_item_push)]
 
 pub mod affine;
+pub mod affine_amvp;
 pub mod affine_merge;
 pub mod alf;
 pub mod alf_aps_design;
