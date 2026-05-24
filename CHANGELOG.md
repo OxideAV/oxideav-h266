@@ -6,6 +6,46 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 114 — **§8.5.2.9 step-5 AMVP history-based (HMVP)
+  candidate fill** — the RPL-reference-match filter the round-111
+  `build_mvp_cand_list` previously consumed pre-injected. New
+  `amvp::derive_hmvp_mvp_candidates(table, ctx, AmvrShift,
+  slots_remaining)`:
+  - Walks `HmvpCandList[i − 1]` for `i = 1..Min(4, NumHmvpCand)` —
+    i.e. `entries[0]`, `entries[1]`, … in **oldest-first** order
+    (index 0 = oldest), capped at the first 4 entries. This is the
+    *opposite* traversal from the §8.5.2.6 *merge* HMVP walk
+    (`HmvpCandList[NumHmvpCand − hMvpIdx]`, newest-first, all
+    `NumHmvpCand`), and carries no A1/B1 `sameMotion` prune.
+  - For each consulted entry and for each RPL `LY` with `Y = X`
+    first then `Y = 1 − X`, admits the entry's LY motion vector when
+    that entry's `RefIdxLY` references the same reference picture as
+    the current CU's `RefPicList[X][refIdxLX]` — established via POC
+    equality (`DiffPicOrderCnt == 0`) against the same
+    `AmvpRefContext` the spatial scan uses. Because the inner loop is
+    over both lists (not the spatial scan's mutually-exclusive
+    `If … Otherwise`), a bi-pred entry whose **both** lists reference
+    the current picture contributes *twice*.
+  - Each admitted MV is §8.5.2.14 AMVR-rounded; the walk halts at the
+    caller's `slots_remaining` (= `MAX_MVP_CAND − numCurrMvpCand`),
+    the step-5 `until numCurrMvpCand is equal to 2` cap.
+  - New private `AmvpRefContext::hmvp_entry_mvs` helper yields the
+    per-list matches in `X`-then-`(1 − X)` order.
+
+  10 new lib tests: oldest-first ordering / RPL mismatch drop /
+  opposite-list match / bi-pred-contributes-twice / Min(4,N) cap
+  excludes the newest entry / slots_remaining cap / zero-slots /
+  empty-table / AMVR rounding / end-to-end feed into
+  `build_mvp_cand_list`. Module total 30 amvp tests; crate 876.
+
+  Out of scope (next round): the live §8.5.2.11 temporal Col
+  invocation behind the §8.5.2.9 step-3 gate, and the CTU-walker fuse
+  that drives a complete non-merge inter `coding_unit()`
+  reconstruction (wiring the slice's per-list `RefPicList` POC tables
+  into the `AmvpRefContext` resolvers, plus the
+  `ph_mvd_l1_zero_flag` / `sym_mvd_flag` / affine-AMVP / BCW
+  cascade).
+
 - Round 111 — **§8.5.2.8 / §8.5.2.9 / §8.5.2.10 AMVP luma
   motion-vector-prediction candidate-list derivation** — the decode-side
   process that consumes the round-108 `mvp_lX_flag` / `inter_pred_idc` /

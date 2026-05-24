@@ -25,11 +25,18 @@
 //!   `rightShift = leftShift = AmvrShift`, applied to each available
 //!   spatial / temporal candidate so the predictor lands on the same
 //!   granularity grid as the AMVR-shifted MVD.
+//! * [`derive_hmvp_mvp_candidates`] — §8.5.2.9 step 5. The history-based
+//!   AMVP fill: walk `HmvpCandList[i − 1]` for `i = 1..Min(4,
+//!   NumHmvpCand)` (oldest-first, capped at 4 — distinct from the
+//!   §8.5.2.6 merge walk), and for each RPL `LY` (`Y = X` then `1 − X`)
+//!   admit + AMVR-round the entry's LY MV when its `RefIdxLY` references
+//!   the current CU's reference picture (`DiffPicOrderCnt == 0`).
 //! * [`build_mvp_cand_list`] — §8.5.2.9 steps 3 – 6: the §8.5.2.9 step-3
 //!   Col gate (Col is only consulted when *not* both A and B are
 //!   available with **different** MVs), step-4 list construction
-//!   (eq. 584), the step-5 HMVP fill (injected pre-filtered), and the
-//!   step-6 zero-MV pad to exactly 2 candidates (eqs. 585 – 587).
+//!   (eq. 584), the step-5 HMVP fill (the `hmvp` slice produced by
+//!   [`derive_hmvp_mvp_candidates`]), and the step-6 zero-MV pad to
+//!   exactly 2 candidates (eqs. 585 – 587).
 //! * [`select_mvp`] — §8.5.2.8 step 2 (eq. 583): `mvpLX =
 //!   mvpListLX[mvp_lX_flag]`.
 //! * [`derive_final_mv`] — §8.5.2.1: fold the AMVR-shifted `mvd` into
@@ -47,16 +54,18 @@
 //! AMVP-specific, and that gate lives here). Wiring the live §8.5.2.11
 //! invocation behind that gate into the CTU walker (which needs the
 //! collocated picture + `ph_temporal_mvp_enabled_flag` plumbed through
-//! the non-merge inter path) is the remaining follow-up. The HMVP
-//! step-5 fill is similarly injected pre-filtered (the caller applies
-//! the §8.5.2.9 step-5 RPL-reference-match against `refIdxLX`).
+//! the non-merge inter path) is the remaining follow-up. The §8.5.2.9
+//! step-5 HMVP RPL-reference-match fill now lands here in
+//! [`derive_hmvp_mvp_candidates`]; the caller wires its slice's
+//! per-list `refIdx → POC` resolvers through the same [`AmvpRefContext`]
+//! the spatial scan uses.
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026). The
 //! implementation is spec-only; no third-party VVC decoder source was
 //! consulted.
 
 use crate::amvr::AmvrShift;
-use crate::inter::{MotionField, MotionVector, MvField};
+use crate::inter::{HmvpTable, MotionField, MotionVector, MvField};
 
 /// Maximum AMVP candidate-list length (§8.5.2.9 — the list is padded to
 /// exactly 2 entries).
@@ -130,7 +139,9 @@ impl AmvpRefContext<'_> {
     /// §8.5.2.10 per-neighbour contribution: list X first (eq. 588 /
     /// 590), then list `Y = 1 − X` (eq. 589 / 591). A neighbour
     /// contributes only when the picked reference's POC equals the
-    /// current CU's `current_ref_poc` (`DiffPicOrderCnt == 0`).
+    /// current CU's `current_ref_poc` (`DiffPicOrderCnt == 0`). The
+    /// spatial scan picks the *first* matching list and stops (eqs. 588 –
+    /// 591 are mutually-exclusive `If … Otherwise when …` branches).
     fn neighbour_mv(&self, nb: &MvField) -> Option<MotionVector> {
         // Try list X.
         if let Some((poc, mv)) = self.neighbour_list_match(nb, self.list) {
@@ -145,6 +156,28 @@ impl AmvpRefContext<'_> {
             }
         }
         None
+    }
+
+    /// §8.5.2.9 step-5 per-HMVP-entry contributions. Unlike the spatial
+    /// scan (which is a mutually-exclusive `If … Otherwise` and picks one
+    /// list), step 5 loops "for each RPL LY with Y equal to X or
+    /// (1 − X)" — so an entry whose **both** lists reference the current
+    /// CU's reference picture contributes *twice*. Yields the matching
+    /// list MVs in `X`-then-`(1 − X)` order; the caller AMVR-rounds and
+    /// applies the `until numCurrMvpCand == 2` cap.
+    fn hmvp_entry_mvs(&self, e: &MvField) -> impl Iterator<Item = MotionVector> {
+        let mut found: [Option<MotionVector>; 2] = [None, None];
+        if let Some((poc, mv)) = self.neighbour_list_match(e, self.list) {
+            if poc == self.current_ref_poc {
+                found[0] = Some(mv);
+            }
+        }
+        if let Some((poc, mv)) = self.neighbour_list_match(e, self.list.other()) {
+            if poc == self.current_ref_poc {
+                found[1] = Some(mv);
+            }
+        }
+        found.into_iter().flatten()
     }
 }
 
@@ -218,6 +251,62 @@ fn scan_spatial_group(
     SpatialMvpCandidate::default()
 }
 
+/// §8.5.2.9 step 5 — derive the history-based (HMVP) AMVP candidates.
+///
+/// This is the RPL-reference-match filter the round-111
+/// [`build_mvp_cand_list`] previously consumed pre-filtered. The spec
+/// walk is distinct from the §8.5.2.6 *merge* HMVP walk in three ways:
+///
+/// * **Index order.** §8.5.2.9 step 5 reads `HmvpCandList[i − 1]` for
+///   `i = 1..Min(4, NumHmvpCand)` — i.e. `HmvpCandList[0]`,
+///   `HmvpCandList[1]`, … in **oldest-first** order (index 0 = oldest),
+///   the opposite of the merge path's `HmvpCandList[NumHmvpCand −
+///   hMvpIdx]` newest-first walk.
+/// * **Bound.** Only the first `Min(4, NumHmvpCand)` entries are
+///   consulted (the merge path walks all `NumHmvpCand`).
+/// * **No A1/B1 pruning.** The merge path's `sameMotion` prune is absent
+///   here; the only admission test is the RPL-reference match.
+///
+/// For each consulted HMVP entry and for each RPL `LY` with `Y = X`
+/// first then `Y = 1 − X`, the entry contributes when the reference
+/// picture corresponding to that entry's `RefIdxLY` in RPL `LY` is the
+/// same reference picture as the current CU's `RefPicList[X][refIdxLX]`
+/// — established here, as throughout §8.5.2, via POC equality against
+/// `ctx.current_ref_poc`. A contributing entry's LY motion vector is
+/// AMVR-rounded (§8.5.2.14) and appended.
+///
+/// The walk halts as soon as `slots_remaining` admissions have been
+/// produced (the caller passes `MAX_MVP_CAND − numCurrMvpCand`, the
+/// step-5 `until numCurrMvpCand is equal to 2` cap). Returns the rounded
+/// MVs in admission order, ready to splice into [`build_mvp_cand_list`]
+/// via its `hmvp` slice.
+pub fn derive_hmvp_mvp_candidates(
+    table: &HmvpTable,
+    ctx: &AmvpRefContext<'_>,
+    amvr: AmvrShift,
+    slots_remaining: usize,
+) -> Vec<MotionVector> {
+    let mut out = Vec::with_capacity(slots_remaining);
+    if slots_remaining == 0 {
+        return out;
+    }
+    // i = 1..Min( 4, NumHmvpCand ) → HmvpCandList[ i − 1 ] = entries[0],
+    // entries[1], … (oldest-first), capped at 4 entries.
+    let limit = table.entries.len().min(4);
+    'outer: for entry in table.entries.iter().take(limit) {
+        // For each RPL LY with Y = X first, then Y = 1 − X. Both lists
+        // may contribute (the step-5 inner loop is over LY); the "until
+        // numCurrMvpCand is equal to 2" cap is `slots_remaining`.
+        for mv in ctx.hmvp_entry_mvs(entry) {
+            out.push(round_mv_amvr(mv, amvr));
+            if out.len() >= slots_remaining {
+                break 'outer;
+            }
+        }
+    }
+    out
+}
+
 /// §8.5.2.14 motion-vector rounding (eqs. 608 – 610) with
 /// `rightShift = leftShift = AmvrShift`. Signed-magnitude round-toward-
 /// zero-then-requantise: when `AmvrShift == 0` this is the identity.
@@ -248,10 +337,10 @@ fn round_component(v: i32, shift: u32) -> i32 {
 ///   AMVR-rounded (`None` ⇒ `availableFlagLXCol == 0`). The §8.5.2.9
 ///   step-3 gate (Col only consulted when *not* both A and B available
 ///   with **different** MVs) is applied here.
-/// * `hmvp` — the §8.5.2.9 step-5 history candidates, already filtered
-///   by the caller to the RPL-reference-matching subset and AMVR-
-///   rounded, in newest-to-oldest order. Consumed until the list
-///   reaches 2.
+/// * `hmvp` — the §8.5.2.9 step-5 history candidates from
+///   [`derive_hmvp_mvp_candidates`] (already RPL-reference-filtered and
+///   AMVR-rounded), in admission order. Consumed until the list reaches
+///   2.
 ///
 /// Returns the list (length exactly [`MAX_MVP_CAND`]) — eqs. 584 – 587.
 pub fn build_mvp_cand_list(
@@ -360,6 +449,21 @@ mod tests {
         }
     }
 
+    /// Build a bi-pred inter MvField with independent L0 / L1 MVs + refs.
+    fn bi_block(l0: (i32, i32, i32), l1: (i32, i32, i32)) -> MvField {
+        MvField {
+            mv_l0: MotionVector { x: l0.0, y: l0.1 },
+            ref_idx_l0: l0.2,
+            pred_flag_l0: true,
+            mv_l1: MotionVector { x: l1.0, y: l1.1 },
+            ref_idx_l1: l1.2,
+            pred_flag_l1: true,
+            mode_inter: true,
+            available: true,
+            ..MvField::UNAVAILABLE
+        }
+    }
+
     /// A trivial single-reference POC table: refIdx 0 → POC 0, refIdx 1
     /// → POC 8; anything else (incl. −1) → None.
     fn poc_table(ref_idx: i32) -> Option<i32> {
@@ -455,6 +559,139 @@ mod tests {
         let ctx = ctx_l0(0);
         let [a, _b] = derive_spatial_mvp_candidates(16, 16, 8, 8, &mvf, &ctx);
         assert!(!a.available);
+    }
+
+    // ---- §8.5.2.9 step-5 HMVP fill ---------------------------------
+
+    fn hmvp_table(entries: &[MvField]) -> HmvpTable {
+        let mut t = HmvpTable::new();
+        for &e in entries {
+            t.update_with(e);
+        }
+        t
+    }
+
+    #[test]
+    fn hmvp_oldest_first_order() {
+        // §8.5.2.9 step 5 walks HmvpCandList[i−1] for i=1.. — oldest
+        // first (entries[0]), the OPPOSITE of the merge path. Push three
+        // distinct L0 ref-0 (POC 0) entries; the oldest pushed must be
+        // emitted first.
+        let table = hmvp_table(&[
+            l0_block(10, 0, 0), // oldest
+            l0_block(20, 0, 0),
+            l0_block(30, 0, 0), // newest
+        ]);
+        let ctx = ctx_l0(0);
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], MotionVector { x: 10, y: 0 }); // oldest first
+        assert_eq!(out[1], MotionVector { x: 20, y: 0 });
+    }
+
+    #[test]
+    fn hmvp_rpl_reference_filter_drops_mismatch() {
+        // Two entries: first ref 1 (POC 8 ≠ current 0) → dropped; second
+        // ref 0 (POC 0) → admitted.
+        let table = hmvp_table(&[l0_block(99, 0, 1), l0_block(7, 7, 0)]);
+        let ctx = ctx_l0(0);
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 2);
+        assert_eq!(out, vec![MotionVector { x: 7, y: 7 }]);
+    }
+
+    #[test]
+    fn hmvp_opposite_list_match() {
+        // Entry predicts only on L1 (ref 0 → POC 0). Current list L0,
+        // POC 0 → the Y = 1 − X branch admits the L1 MV.
+        let table = hmvp_table(&[l1_block(44, 4, 0)]);
+        let ctx = ctx_l0(0);
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 2);
+        assert_eq!(out, vec![MotionVector { x: 44, y: 4 }]);
+    }
+
+    #[test]
+    fn hmvp_bipred_entry_contributes_twice() {
+        // A bi-pred entry whose BOTH lists reference POC 0 contributes
+        // its L0 MV (X branch) then its L1 MV (Y branch) — distinct from
+        // the spatial scan, which picks only the first matching list.
+        let table = hmvp_table(&[bi_block((11, 0, 0), (0, 22, 0))]);
+        let ctx = ctx_l0(0);
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 2);
+        assert_eq!(
+            out,
+            vec![MotionVector { x: 11, y: 0 }, MotionVector { x: 0, y: 22 }]
+        );
+    }
+
+    #[test]
+    fn hmvp_capped_at_four_entries() {
+        // Five entries (capacity), all matching ref 0. Step 5 reads only
+        // Min(4, NumHmvpCand) = 4 — the newest pushed (entries[4]) is
+        // never consulted even though slots remain unbounded here.
+        let table = hmvp_table(&[
+            l0_block(1, 0, 0),
+            l0_block(2, 0, 0),
+            l0_block(3, 0, 0),
+            l0_block(4, 0, 0),
+            l0_block(5, 0, 0), // newest — outside the i=1..Min(4,N) window
+        ]);
+        let ctx = ctx_l0(0);
+        // Ask for 5 slots so the cap, not slots_remaining, is the bound.
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 5);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[3], MotionVector { x: 4, y: 0 });
+        assert!(!out.contains(&MotionVector { x: 5, y: 0 }));
+    }
+
+    #[test]
+    fn hmvp_respects_slots_remaining_cap() {
+        // numCurrMvpCand already at 1 → one slot left. Stop after one
+        // admission even with multiple matches.
+        let table = hmvp_table(&[l0_block(8, 0, 0), l0_block(9, 0, 0)]);
+        let ctx = ctx_l0(0);
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 1);
+        assert_eq!(out, vec![MotionVector { x: 8, y: 0 }]);
+    }
+
+    #[test]
+    fn hmvp_zero_slots_emits_nothing() {
+        let table = hmvp_table(&[l0_block(8, 0, 0)]);
+        let ctx = ctx_l0(0);
+        assert!(derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 0).is_empty());
+    }
+
+    #[test]
+    fn hmvp_empty_table_emits_nothing() {
+        let table = HmvpTable::new();
+        let ctx = ctx_l0(0);
+        assert!(derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), 2).is_empty());
+    }
+
+    #[test]
+    fn hmvp_applies_amvr_rounding() {
+        // Entry MV (37, -19) at quarter-pel (shift 2) rounds to (36,-20),
+        // matching round_mv_amvr.
+        let table = hmvp_table(&[l0_block(37, -19, 0)]);
+        let ctx = ctx_l0(0);
+        let out = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(2), 2);
+        assert_eq!(out, vec![MotionVector { x: 36, y: -20 }]);
+    }
+
+    #[test]
+    fn hmvp_feeds_build_mvp_cand_list() {
+        // End-to-end step 4 → step 5: only A available (one spatial), so
+        // build_mvp_cand_list has one HMVP slot to fill from the derived
+        // candidates.
+        let a = SpatialMvpCandidate {
+            available: true,
+            mv: MotionVector { x: 5, y: 5 },
+        };
+        let table = hmvp_table(&[l0_block(40, 0, 0)]);
+        let ctx = ctx_l0(0);
+        let hmvp = derive_hmvp_mvp_candidates(&table, &ctx, AmvrShift(0), MAX_MVP_CAND - 1);
+        let list = build_mvp_cand_list([a, SpatialMvpCandidate::default()], None, &hmvp);
+        assert_eq!(list[0], MotionVector { x: 5, y: 5 });
+        assert_eq!(list[1], MotionVector { x: 40, y: 0 });
     }
 
     // ---- §8.5.2.14 rounding ----------------------------------------

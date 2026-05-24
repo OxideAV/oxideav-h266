@@ -233,13 +233,20 @@ the **intra-only single-tile single-slice subset** plus the round-28
   step-5 HMVP fill, and the step-6 zero-MV pad to exactly 2 candidates
   (eqs. 585 – 587); `select_mvp` is eq. 583 (`mvpListLX[mvp_lX_flag]`)
   and `derive_final_mv` folds the AMVR-shifted `mvd` into the predictor
-  (`mvLX = mvpLX + mvdLX`, clipped to `[−2^17, 2^17 − 1]`). The
-  §8.5.2.11 temporal Col candidate is taken **injected** (it reuses the
-  existing merge §8.5.2.11/§8.5.2.12 collocated machinery byte for
+  (`mvLX = mvpLX + mvdLX`, clipped to `[−2^17, 2^17 − 1]`).
+  **Round-114 lands the §8.5.2.9 step-5 HMVP RPL-reference filter**
+  (`derive_hmvp_mvp_candidates`): it walks `HmvpCandList[i − 1]` for
+  `i = 1..Min(4, NumHmvpCand)` — oldest-first, capped at 4 entries, the
+  *opposite* traversal from the §8.5.2.6 merge walk and with no A1/B1
+  prune — and for each RPL `LY` (`Y = X` then `1 − X`) admits the entry's
+  AMVR-rounded LY MV when its `RefIdxLY` references the current CU's
+  `RefPicList[X][refIdxLX]` (`DiffPicOrderCnt == 0`); a bi-pred entry
+  matching on both lists contributes twice. The
+  §8.5.2.11 temporal Col candidate is still taken **injected** (it reuses
+  the existing merge §8.5.2.11/§8.5.2.12 collocated machinery byte for
   byte — only the AMVP-specific step-3 gate is new here); wiring the
-  live §8.5.2.11 invocation behind that gate, the HMVP step-5
-  RPL-reference filter, and the CTU-walker fuse into a full non-merge
-  inter CU walk remain deferred.
+  live §8.5.2.11 invocation behind that gate and the CTU-walker fuse
+  into a full non-merge inter CU walk remain deferred.
   (HMVP — §8.5.2.6 + §8.5.2.16 — landed in round-24; temporal merge
   — §8.5.2.11 + §8.5.2.12 — landed in round-25; pairwise-average
   merge — §8.5.2.4 — landed in round-26; MMVD — §8.5.2.7 — landed in
