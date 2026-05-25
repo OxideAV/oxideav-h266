@@ -198,6 +198,15 @@ pub enum SyntaxCtx {
     /// Per Table 132 every TR bin uses the same ctxInc derived from
     /// chromaIdx (0 → ctx 0 of the row, 1 → ctx 1 of the row).
     AlfCtbFilterAltIdx,
+    /// Table 91 — `bcw_idx` (2 ctxIdx, one per non-I initType). Per
+    /// Table 51 initType 1 → ctxIdx 0, initType 2 → ctxIdx 1 (indexed
+    /// at parse time as `init_type - 1`). Per Table 132 only bin 0 of
+    /// the TR sequence is context-coded (`ctxInc = 0`); bins 1.. are
+    /// bypass-coded. The TR `cMax = NoBackwardPredFlag ? 4 : 2`,
+    /// `cRiceParam = 0` (so the value range is 0..=4 with backward
+    /// prediction absent on B slices, 0..=2 otherwise). `bcw_idx` is
+    /// never signalled in I slices.
+    BcwIdx,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -546,6 +555,18 @@ pub const ABS_MVD_GREATER0_FLAG_SHIFT: &[u8] = &[9, 9, 9];
 pub const ABS_MVD_GREATER1_FLAG_INIT: &[u8] = &[45, 43, 36];
 pub const ABS_MVD_GREATER1_FLAG_SHIFT: &[u8] = &[5, 5, 5];
 
+/// Table 91 — `bcw_idx` (2 ctxIdx, one per non-I initType). Round-126
+/// transcription from the spec Table 91:
+///   ctxIdx     | 0  | 1  |
+///   initValue  | 4  | 5  |
+///   shiftIdx   | 1  | 1  |
+/// Per Table 51 the indexing rule is `init_type - 1` (initType 1 →
+/// ctxIdx 0, initType 2 → ctxIdx 1; never signalled in I slices). Per
+/// Table 132 only bin 0 of the TR sequence is context-coded with
+/// `ctxInc = 0`; bins 1.. are bypass-coded.
+pub const BCW_IDX_INIT: &[u8] = &[4, 5];
+pub const BCW_IDX_SHIFT: &[u8] = &[1, 1];
+
 /// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6 transcription:
 ///   ctxIdx     | 0  | 1  | 2  | 3  |
 ///   initValue  | 59 | 58 | 59 | 50 |
@@ -697,6 +718,7 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::AlfCtbFilterAltIdx => {
             (ALF_CTB_FILTER_ALT_IDX_INIT, ALF_CTB_FILTER_ALT_IDX_SHIFT)
         }
+        SyntaxCtx::BcwIdx => (BCW_IDX_INIT, BCW_IDX_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -772,6 +794,7 @@ mod tests {
             SyntaxCtx::AlfCtbCcCbIdc,
             SyntaxCtx::AlfCtbCcCrIdc,
             SyntaxCtx::AlfCtbFilterAltIdx,
+            SyntaxCtx::BcwIdx,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);

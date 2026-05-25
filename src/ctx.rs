@@ -388,6 +388,22 @@ pub fn ctx_inc_mvp_lx_flag() -> u32 {
     0
 }
 
+/// ctxInc for `bcw_idx[x0][y0]` per Table 132. TR binarisation
+/// (`cMax = NoBackwardPredFlag ? 4 : 2`, `cRiceParam = 0`): bin 0 is
+/// context-coded with `ctxInc = 0`; bins 1.. are bypass-coded.
+/// `bin_idx` is the zero-based truncated-unary bin index — only
+/// `bin_idx == 0` is a legal ctx-coded bin (all higher bins go through
+/// the bypass coder and must not invoke this helper). The §7.3.10.5
+/// gate that calls `bcw_idx` is `sps_bcw_enabled_flag &&
+/// inter_pred_idc == PRED_BI && no per-list luma/chroma weight present
+/// && cbWidth * cbHeight >= 256`; this helper is independent of those
+/// gates — it only addresses the CABAC context once the gate has been
+/// passed by the caller.
+pub fn ctx_inc_bcw_idx(bin_idx: u32) -> u32 {
+    debug_assert_eq!(bin_idx, 0, "only bin 0 of bcw_idx is context-coded");
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///

@@ -6,6 +6,40 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 126 — **§7.3.10.5 `bcw_idx` CABAC reader** (the last
+  unparsed AMVP-side bin in the non-merge inter CU `coding_unit()`
+  else-branch). `LeafCuReader::read_bcw_idx(no_backward_pred_flag)`
+  decodes the §7.4.12.5 syntax element per Tables 91 / 131 / 132:
+  TR binarisation with `cMax = NoBackwardPredFlag ? 4 : 2,
+  cRiceParam = 0`; bin 0 is context-coded against the new
+  `SyntaxCtx::BcwIdx` slot `init_type - 1` (initValue/shiftIdx
+  `(4, 1)` for initType 1, `(5, 1)` for initType 2 — never
+  signalled in I slices); bins 1.. are bypass-coded; truncation at
+  `cMax - 1` ones (no terminating zero on the maximum-value path).
+  The §7.3.10.5 caller is responsible for the gating conditional
+  (`sps_bcw_enabled_flag && inter_pred_idc == PRED_BI &&
+   luma_weight_lX_flag[refIdxLX] == 0 (X = 0, 1) &&
+   chroma_weight_lX_flag[refIdxLX] == 0 (X = 0, 1) &&
+   cbWidth * cbHeight >= 256`); when closed the value is inferred 0
+  per §7.4.12.5 (matching the existing per-block default in
+  `crate::ctu` / `crate::affine_merge`). The returned value flows
+  into the round-29 `inter` `bcwWLut[k] = {4, 5, 3, 10, -2}` weight
+  lookup once the CTU walker drops the per-CU read into the
+  non-merge inter path. New `tables::{BCW_IDX_INIT,
+  BCW_IDX_SHIFT}` and `ctx::ctx_inc_bcw_idx(bin_idx)` (Table 132
+  fixed 0 for bin 0; debug-asserts no higher bin is asked) plus the
+  `LeafCuCtxs::bcw_idx` 2-entry bundle. 6 new lib tests cover an
+  encoder-mirror round-trip across all five legal values for both
+  `cMax` cases on both non-I initTypes, prove `bcw_idx == 0` reads
+  exactly one context bin (zero bypass tail) via a sentinel-byte
+  check, and pin the Table 91 transcription + per-initType slot
+  isolation. The CTU-walker fuse (the §7.3.10.5 gate evaluator
+  populating `(sps_bcw_enabled, inter_pred_idc, luma_weight_*,
+  chroma_weight_*, cb_w * cb_h)` and pushing the decoded value into
+  `MvField::bcw_idx`) and the matching encoder-side emission for
+  the round-58 `encode_p_slice` / `encode_b_slice` BCW-RDO winners
+  remain a follow-up.
+
 - Round 120 — **§8.5.5.7 affine AMVP — luma affine control-point
   motion-vector predictor candidate list**. New `affine_amvp` module
   drives the spec's 9-step process end-to-end on pure-data inputs

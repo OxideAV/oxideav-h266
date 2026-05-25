@@ -644,6 +644,31 @@ inference around `sym_mvd_flag`, and the `inter_affine_flag` /
 `cu_affine_type_flag` / `bcw_idx` / `amvr_flag` branches) remains
 deferred.
 
+**Round-126 lands the §7.3.10.5 `bcw_idx` CABAC reader** — the last
+unparsed AMVP-side bin in the `coding_unit()` else-branch.
+`LeafCuReader::read_bcw_idx(no_backward_pred_flag)` decodes the
+§7.4.12.5 syntax element per Tables 91 / 131 / 132: TR with
+`cMax = NoBackwardPredFlag ? 4 : 2`, `cRiceParam = 0`; bin 0 is
+context-coded against the new `SyntaxCtx::BcwIdx` 2-entry bundle
+(slot = `init_type - 1`; Table 91 `initValue/shiftIdx = (4, 1)` for
+initType 1, `(5, 1)` for initType 2; never signalled in I slices)
+with `ctxInc = 0`; bins 1.. are bypass-coded; the truncation point
+at `cMax - 1` ones sends no terminating zero on the max-value path.
+The caller is responsible for the §7.3.10.5 gate
+(`sps_bcw_enabled_flag && inter_pred_idc == PRED_BI && no per-list
+weighted-prediction flags set on the chosen reference indices &&
+cbWidth * cbHeight >= 256`); when closed the value is inferred 0 per
+§7.4.12.5. The returned `bcw_idx` flows into the round-29
+`inter::bcwWLut[k] = {4, 5, 3, 10, -2}` weight lookup once the CTU
+walker drops the per-CU read into the non-merge inter path. 6 new
+lib tests round-trip every legal value across both `cMax` cases on
+both non-I initTypes, prove `bcw_idx == 0` reads exactly one
+context bin (zero bypass tail) via a sentinel-byte check, and pin
+the Table 91 transcription. The §7.3.10.5 gate evaluator that
+pushes the decoded value into `MvField::bcw_idx` and the matching
+encoder-side emission for the round-58 / round-60 BCW-RDO winners
+remain a follow-up.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

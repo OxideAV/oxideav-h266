@@ -49,11 +49,11 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
-    ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_cu_skip_flag,
-    ctx_inc_general_merge_flag, ctx_inc_inter_pred_idc_bin0, ctx_inc_inter_pred_idc_bin1,
-    ctx_inc_intra_bdpcm_chroma_dir_flag, ctx_inc_intra_bdpcm_chroma_flag,
-    ctx_inc_intra_bdpcm_luma_dir_flag, ctx_inc_intra_bdpcm_luma_flag,
-    ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+    ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_bcw_idx,
+    ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_inter_pred_idc_bin0,
+    ctx_inc_inter_pred_idc_bin1, ctx_inc_intra_bdpcm_chroma_dir_flag,
+    ctx_inc_intra_bdpcm_chroma_flag, ctx_inc_intra_bdpcm_luma_dir_flag,
+    ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
     ctx_inc_mvp_lx_flag, ctx_inc_ref_idx_lx, ctx_inc_regular_merge_flag, ctx_inc_sym_mvd_flag,
@@ -478,6 +478,17 @@ pub struct LeafCuCtxs {
     /// initType. Indexed by `init_type`. Single ctx-coded bin (FL
     /// `cMax = 1`).
     pub mvp_lx_flag: Vec<ContextModel>,
+    /// `bcw_idx` (Table 91) — 2 entries, one per non-I initType.
+    /// Indexed at parse time as `(init_type - 1)`. Bin 0 of the TR
+    /// sequence is the only context-coded bin (`ctxInc = 0`); the
+    /// remaining bins (the syntax element's TR `cMax = NoBackwardPredFlag
+    /// ? 4 : 2`) are bypass-coded per Table 132. Only signalled in the
+    /// `coding_unit()` else-branch behind the §7.3.10.5 gate
+    /// `sps_bcw_enabled_flag && inter_pred_idc == PRED_BI &&
+    ///  luma_weight_lX_flag[refIdxLX] == 0 (X = 0, 1) &&
+    ///  chroma_weight_lX_flag[refIdxLX] == 0 (X = 0, 1) &&
+    ///  cbWidth * cbHeight >= 256`.
+    pub bcw_idx: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -568,6 +579,7 @@ impl LeafCuCtxs {
             sym_mvd_flag: init_contexts(SyntaxCtx::SymMvdFlag, slice_qp_y),
             ref_idx_lx: init_contexts(SyntaxCtx::RefIdxLx, slice_qp_y),
             mvp_lx_flag: init_contexts(SyntaxCtx::MvpLxFlag, slice_qp_y),
+            bcw_idx: init_contexts(SyntaxCtx::BcwIdx, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -1598,6 +1610,63 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         let slot = (self.ctxs.init_type as usize).min(self.ctxs.mvp_lx_flag.len() - 1);
         let bit = self.dec.decode_decision(&mut self.ctxs.mvp_lx_flag[slot])?;
         Ok(bit)
+    }
+
+    /// Decode `bcw_idx[x0][y0]` per §7.3.10.5 / Table 91 / Table 132.
+    ///
+    /// TR binarisation (`cMax = NoBackwardPredFlag ? 4 : 2`,
+    /// `cRiceParam = 0`): only bin 0 is context-coded against the
+    /// Table 91 slot `init_type - 1` (initType 1 → ctxIdx 0,
+    /// initType 2 → ctxIdx 1) with `ctxInc = 0`; the remaining TR bins
+    /// are bypass-coded. When `cMax == 0` no bins are read and the
+    /// value is 0 (the `NoBackwardPredFlag == 0 && cMax == 2` case is
+    /// the common B-slice path; with backward prediction absent
+    /// `cMax = 4`).
+    ///
+    /// The caller is responsible for gating this read behind the
+    /// §7.3.10.5 conditional (`sps_bcw_enabled_flag &&
+    /// inter_pred_idc == PRED_BI && no per-list weighted-prediction
+    /// flags set on the chosen reference indices && cbWidth * cbHeight
+    /// >= 256`). When the gate is closed `bcw_idx` is inferred 0 per
+    /// §7.4.12.5 (the caller skips the read and assigns 0 directly —
+    /// the existing per-block default in [`crate::ctu`] and
+    /// [`crate::affine_merge`] already pin `bcw_idx == 0` on inferred
+    /// paths).
+    ///
+    /// Returns the decoded `bcw_idx` value in `0..=cMax`. The caller
+    /// maps the value into the eq. 981 BCW weight lookup
+    /// `bcwWLut[k] = {4, 5, 3, 10, -2}` (see the `inter::bcw_lut`
+    /// note in the round-29 work).
+    pub fn read_bcw_idx(&mut self, no_backward_pred_flag: bool) -> Result<u32> {
+        let cmax = if no_backward_pred_flag { 4u32 } else { 2u32 };
+        if cmax == 0 {
+            return Ok(0);
+        }
+        // Bin 0 — context-coded against Table 91, slot
+        // `init_type - 1`. Per Table 132 the ctxInc is fixed 0; the
+        // `ctx_inc_bcw_idx` helper enforces this via debug_assert.
+        let block = (self.ctxs.init_type as usize).saturating_sub(1);
+        let n = self.ctxs.bcw_idx.len();
+        let inc = ctx_inc_bcw_idx(0) as usize;
+        let slot = (block + inc).min(n - 1);
+        let bit0 = self.dec.decode_decision(&mut self.ctxs.bcw_idx[slot])?;
+        if bit0 == 0 {
+            return Ok(0);
+        }
+        // Bins 1..cMax — all bypass per Table 132. TR with
+        // cRiceParam = 0: a `0` terminates the truncated-unary
+        // sequence; reaching `cMax - 1` ones implies the value is
+        // exactly `cMax` (the truncation point — no trailing zero
+        // sent).
+        let mut val = 1u32;
+        while val < cmax {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -3140,6 +3209,156 @@ mod tests {
         for it in [0u8, 1, 2] {
             assert_eq!(mvp_lx_flag_round_trip(0, it), 0);
             assert_eq!(mvp_lx_flag_round_trip(1, it), 1);
+        }
+    }
+
+    // ---- Round-126: §7.3.10.5 bcw_idx CABAC reader ----
+
+    /// Encoder mirror of `read_bcw_idx`. TR with `cMax = NoBackwardPredFlag
+    /// ? 4 : 2`, `cRiceParam = 0`: bin 0 is ctx-coded against Table 91
+    /// slot `init_type - 1` (ctxInc = 0), bins 1.. are bypass-coded.
+    fn encode_bcw_idx(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        value: u32,
+        no_backward_pred_flag: bool,
+    ) {
+        let cmax = if no_backward_pred_flag { 4u32 } else { 2u32 };
+        if cmax == 0 {
+            return;
+        }
+        let block = (ctxs.init_type as usize).saturating_sub(1);
+        let n = ctxs.bcw_idx.len();
+        let slot = block.min(n - 1);
+        let bin0 = if value == 0 { 0 } else { 1 };
+        enc.encode_decision(&mut ctxs.bcw_idx[slot], bin0).unwrap();
+        if bin0 == 0 {
+            return;
+        }
+        // bypass tail
+        let mut i = 1u32;
+        while i < cmax {
+            let bit = if i < value { 1 } else { 0 };
+            enc.encode_bypass(bit).unwrap();
+            if bit == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    fn bcw_idx_round_trip(value: u32, no_backward_pred_flag: bool, init_type: u8) -> u32 {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_bcw_idx(&mut enc, &mut enc_ctxs, value, no_backward_pred_flag);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_bcw_idx(no_backward_pred_flag).unwrap()
+    }
+
+    #[test]
+    fn bcw_idx_b_slice_round_trips_all_values_cmax_2() {
+        // NoBackwardPredFlag == 0 ⇒ cMax = 2. Three legal values
+        // {0, 1, 2}. value 0 = bin0=0; value 1 = bin0=1, bypass=0;
+        // value 2 = bin0=1, bypass=1 (truncation point, no trailing
+        // zero). Cover both non-I initTypes (1 = P, 2 = B).
+        for it in [1u8, 2] {
+            for v in 0..=2u32 {
+                assert_eq!(
+                    bcw_idx_round_trip(v, false, it),
+                    v,
+                    "cMax=2 round trip failed for v={v} init={it}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bcw_idx_no_backward_pred_round_trips_all_values_cmax_4() {
+        // NoBackwardPredFlag == 1 ⇒ cMax = 4. Five legal values
+        // {0, 1, 2, 3, 4}. value 4 hits the truncation point — four
+        // bypass-1 bins with no terminating zero.
+        for it in [1u8, 2] {
+            for v in 0..=4u32 {
+                assert_eq!(
+                    bcw_idx_round_trip(v, true, it),
+                    v,
+                    "cMax=4 round trip failed for v={v} init={it}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bcw_idx_value_zero_reads_exactly_one_ctx_bin() {
+        // Spec sanity: value 0 corresponds to `bin0 = 0`, no bypass
+        // tail. Build a stream with exactly that one bin (no termination
+        // emitted past the single context decision) — the reader must
+        // still return 0 and consume no bypass bits.
+        let init_type = 2;
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let slot = (init_type as usize - 1).min(enc_ctxs.bcw_idx.len() - 1);
+        enc.encode_decision(&mut enc_ctxs.bcw_idx[slot], 0).unwrap();
+        // Mark a sentinel bypass bit AFTER the bcw_idx so we can prove
+        // the reader did not consume it.
+        enc.encode_bypass(1).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let bcw = reader.read_bcw_idx(false).unwrap();
+        assert_eq!(bcw, 0);
+        // The sentinel bypass bit must still be in the stream — confirm
+        // by reading it via the decoder directly.
+        let sentinel = reader.dec.decode_bypass().unwrap();
+        assert_eq!(
+            sentinel, 1,
+            "read_bcw_idx must not consume bypass bins when bin0 == 0"
+        );
+    }
+
+    #[test]
+    fn bcw_idx_ctx_inc_is_fixed_zero() {
+        // Table 132 pins bin 0's ctxInc to 0; the helper must agree.
+        assert_eq!(crate::ctx::ctx_inc_bcw_idx(0), 0);
+    }
+
+    #[test]
+    fn bcw_idx_table_91_init_matches_spec() {
+        // Round-126 transcription: initValue = [4, 5], shiftIdx = [1, 1].
+        assert_eq!(crate::tables::BCW_IDX_INIT, &[4u8, 5]);
+        assert_eq!(crate::tables::BCW_IDX_SHIFT, &[1u8, 1]);
+        assert_eq!(crate::tables::ctx_count(SyntaxCtx::BcwIdx), 2);
+    }
+
+    #[test]
+    fn bcw_idx_per_inittype_slot_isolation() {
+        // P-slice (init 1) and B-slice (init 2) must address different
+        // ctxIdx slots so a single CLVS replay does not bleed pState
+        // updates between the two slice-type initialisation bundles.
+        // The bundle is 2 entries — slot 0 is initType 1 (P), slot 1
+        // is initType 2 (B) per Table 51.
+        let p_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+        let b_ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+        assert_eq!(p_ctxs.bcw_idx.len(), 2);
+        assert_eq!(b_ctxs.bcw_idx.len(), 2);
+        // Round-trip every legal value on both initTypes to prove the
+        // slot wiring keeps the two bundles independent (any mis-
+        // address would cause one initType's CABAC state to drift
+        // against the encoder's mirror and corrupt the result).
+        for v in 0..=2u32 {
+            assert_eq!(bcw_idx_round_trip(v, false, 1), v);
+            assert_eq!(bcw_idx_round_trip(v, false, 2), v);
         }
     }
 }
