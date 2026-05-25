@@ -723,7 +723,9 @@ cbW/2, yCb + cbH/2)`); `SbTmvpGrid::derive(cb_w, cb_h)` for eqs. 715 –
 `mvL0A1` when `predFlagL0A1 && DiffPicOrderCnt(ColPic,
 RefPicList[0][refIdxL0A1]) == 0`, B-slice fallback to `mvL1A1`
 similarly, then §8.5.2.14 rounding with `rightShift = 4, leftShift =
-0` via the round-111 `amvp::round_mv_amvr`); `PictureBoundary::{Picture,
+0` — note `leftShift = 0` discards the 1/16-pel fraction so the
+returned `tempMv` is an integer-luma-sample offset, distinct from the
+AMVR `rightShift == leftShift` path); `PictureBoundary::{Picture,
 Subpic}` + `clip_col_subblock_location` / `clip_col_centre_location`
 for §8.5.5.3 eqs. 722 – 724 and §8.5.5.4 eqs. 729 – 731 (CTB-aligned
 lower bound, picture-or-subpic right bound, both branches of

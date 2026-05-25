@@ -20,7 +20,9 @@ All notable changes to this crate are recorded here.
   `derive_temp_mv(...)` for §8.5.5.4 (A1-neighbour `mvL{0,1}A1`
   fallback chain with the `DiffPicOrderCnt(ColPic,
   RefPicList[X][refIdxLXA1]) == 0` POC-match gate and the §8.5.2.14
-  `rightShift = 4` rounding via the round-111 `amvp::round_mv_amvr`);
+  `rightShift = 4, leftShift = 0` rounding — `leftShift = 0` yields an
+  integer-luma-sample `tempMv`, distinct from the AMVR symmetric-shift
+  path);
   `PictureBoundary::{Picture, Subpic}` +
   `clip_col_subblock_location` / `clip_col_centre_location` for
   §8.5.5.3 eqs. 722 – 724 and §8.5.5.4 eqs. 729 – 731; and the

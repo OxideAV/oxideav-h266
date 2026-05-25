@@ -97,8 +97,6 @@
 //! No third-party VVC decoder source was consulted; the implementation
 //! is spec-only.
 
-use crate::amvp::round_mv_amvr;
-use crate::amvr::AmvrShift;
 use crate::inter::MotionVector;
 use crate::slice_header::SliceType;
 
@@ -298,6 +296,14 @@ pub struct SbTmvpTempMvInputs<'a> {
 /// §8.5.5.4 — derive `tempMv` from the A1 neighbour, then apply the
 /// §8.5.2.14 rounding with `rightShift = 4, leftShift = 0`.
 ///
+/// **Units note.** Unlike the AMVR `rightShift == leftShift` rounding
+/// used elsewhere in §8.5.2, the SbTMVP rounding has `leftShift = 0`,
+/// so the eq. 609 / 610 `<< leftShift` term does **not** re-expand the
+/// shifted value. The returned `tempMv` is therefore an **integer-luma-
+/// sample** offset (1/16-pel precision discarded), which matches the
+/// way §8.5.5.3 eqs. 722 – 724 add it directly to integer pixel
+/// coordinates (`xSb + tempMv[0]`).
+///
 /// Returns `MotionVector::ZERO` whenever the A1 neighbour is
 /// unavailable or its lists don't reference `ColPic` (eqs. 727 / 728
 /// initial value, preserved through the rounding which is the identity
@@ -321,14 +327,28 @@ pub fn derive_temp_mv(inputs: SbTmvpTempMvInputs<'_>) -> MotionVector {
         }
     }
 
-    // §8.5.2.14 rounding with rightShift = 4, leftShift = 0. The
-    // round-111 amvp::round_mv_amvr helper implements eqs. 608 – 610
-    // with rightShift = leftShift = shift, and the leftShift = 0 case
-    // for §8.5.5.4 collapses to the same signed-magnitude round-toward-
-    // zero-then-requantise behaviour (the leftShift only re-expands the
-    // value back; the SbTMVP path's leftShift = 0 keeps the rounded
-    // value at the rounded magnitude).
-    round_mv_amvr(temp_mv, AmvrShift(4))
+    // §8.5.2.14 rounding with rightShift = 4, leftShift = 0 (eqs. 608 –
+    // 610).
+    MotionVector {
+        x: round_mv_component(temp_mv.x, 4, 0),
+        y: round_mv_component(temp_mv.y, 4, 0),
+    }
+}
+
+/// §8.5.2.14 eqs. 608 – 610 — signed-magnitude motion-vector rounding
+/// with explicit `rightShift` / `leftShift`. Distinct from the
+/// `amvp::round_mv_amvr` helper, which pins `rightShift == leftShift`;
+/// the §8.5.5.4 SbTMVP path needs `leftShift = 0`.
+fn round_mv_component(v: i32, right_shift: u32, left_shift: u32) -> i32 {
+    // eq. 608.
+    let offset = if right_shift == 0 {
+        0
+    } else {
+        (1i32 << (right_shift - 1)) - 1
+    };
+    // eqs. 609 / 610: Sign(v) * (((Abs(v) + offset) >> rightShift) << leftShift).
+    let sign = v.signum();
+    sign * (((v.abs() + offset) >> right_shift) << left_shift)
 }
 
 // ============================================================ §8.5.5.3
@@ -724,10 +744,10 @@ mod tests {
             poc_of_l0_ref: &resolver,
             poc_of_l1_ref: &resolver,
         };
-        // mv (64, 32) is already 1/16-pel aligned to whole pel; the §8.5.2.14
-        // rightShift = 4 rounding lands at (64, 32) (offset = 7,
-        // (64+7) >> 4 << 4 = 64).
-        assert_eq!(derive_temp_mv(inputs), mv(64, 32));
+        // mv (64, 32) in 1/16-pel; §8.5.2.14 rightShift = 4, leftShift =
+        // 0 collapses to integer-luma units: (64 + 7) >> 4 = 4,
+        // (32 + 7) >> 4 = 2.
+        assert_eq!(derive_temp_mv(inputs), mv(4, 2));
     }
 
     #[test]
@@ -748,8 +768,9 @@ mod tests {
             poc_of_l1_ref: &l1_resolver,
         };
         // L0 doesn't match ⇒ try L1. L1 matches.
-        // (48, -16) is whole-pel aligned ⇒ rounds to (48, -16).
-        assert_eq!(derive_temp_mv(inputs), mv(48, -16));
+        // (48, -16) in 1/16-pel ⇒ integer-luma (48 + 7) >> 4 = 3,
+        // -((16 + 7) >> 4) = -1.
+        assert_eq!(derive_temp_mv(inputs), mv(3, -1));
     }
 
     #[test]
@@ -795,14 +816,14 @@ mod tests {
             poc_of_l0_ref: &l0_resolver,
             poc_of_l1_ref: &l1_resolver,
         };
-        assert_eq!(derive_temp_mv(inputs), mv(32, 32));
+        // (32, 32) in 1/16-pel ⇒ integer-luma (32 + 7) >> 4 = 2.
+        assert_eq!(derive_temp_mv(inputs), mv(2, 2));
     }
 
     #[test]
     fn temp_mv_rounds_per_8_5_2_14_with_right_shift_4() {
-        // mv (5, -5) in 1/16-pel units; rightShift = 4 ⇒
-        // round-toward-zero-then-requantise lands at 0 (offset = 7,
-        // (5 + 7) >> 4 << 4 = 0).
+        // mv (5, -5) in 1/16-pel units; rightShift = 4, leftShift = 0 ⇒
+        // integer-luma (5 + 7) >> 4 = 0.
         let resolver = always(7);
         let inputs = SbTmvpTempMvInputs {
             available_a1: true,
@@ -822,9 +843,8 @@ mod tests {
 
     #[test]
     fn temp_mv_rounds_half_pel_to_whole_pel() {
-        // mv (8, -8) — exactly 1/2-pel. rightShift = 4 with offset = 7 ⇒
-        // sign * (((8 + 7) >> 4) << 4) = 0 for positive; for negative
-        // sign * (((|-8| + 7) >> 4) << 4) = -1 * 0 = 0.
+        // mv (8, -8) — exactly 1/2-pel. rightShift = 4, leftShift = 0,
+        // offset = 7 ⇒ ((8 + 7) >> 4) = 0 both components (integer-luma).
         let resolver = always(7);
         let inputs = SbTmvpTempMvInputs {
             available_a1: true,
@@ -844,7 +864,8 @@ mod tests {
 
     #[test]
     fn temp_mv_rounds_three_quarter_pel_up_to_one_pel() {
-        // mv (12, 0) is 3/4-pel; offset = 7 ⇒ (12 + 7) >> 4 << 4 = 16.
+        // mv (12, 0) is 3/4-pel; offset = 7 ⇒ (12 + 7) >> 4 = 1
+        // integer-luma sample (leftShift = 0).
         let resolver = always(7);
         let inputs = SbTmvpTempMvInputs {
             available_a1: true,
@@ -859,7 +880,7 @@ mod tests {
             poc_of_l0_ref: &resolver,
             poc_of_l1_ref: &resolver,
         };
-        assert_eq!(derive_temp_mv(inputs), mv(16, 0));
+        assert_eq!(derive_temp_mv(inputs), mv(1, 0));
     }
 
     // ---------- §8.5.5.3 + §8.5.5.4 clip ----------------------------
