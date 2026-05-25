@@ -749,6 +749,34 @@ fuses SbTMVP into the live CTU dispatch (sourcing `ColPic`, the A1
 query, and the per-sub-block §8.5.2.12 collocated-MV reads for
 `mvLXSbCol` / `predFlagLXSbCol`) remains the next milestone.
 
+**Round-135 lands the §8.5.5.3 CTU-walker fuse: per-sub-block motion
+fill** — the main-body loop the round-132 record reserved.
+`fill_subblock_motion(record, inputs, col_sampler)` iterates the
+`numSbX × numSbY` 8×8 grid; for each sub-block it derives the centre
+(eqs. 720 / 721), clips `(xSb + tempMv[0], ySb + tempMv[1])` (eqs.
+722 – 724), snaps to the 8×8 collocated cell `(xColCb, yColCb) =
+((xColSb >> 3) << 3, (yColSb >> 3) << 3)`, samples the collocated
+picture's per-cell motion via a `ColMotionSampler` closure, runs
+§8.5.2.12 with `sbFlag = 1` per list (the `predFlagColLX == 1` LX
+path, the `NoBackwardPredFlag && predFlagColLY == 1` cross-list LY
+fallback, §8.5.2.15 integer-pel buffer compression, and the eqs.
+598 – 605 POC scaling with the eq. 600 equal-distance passthrough),
+and applies eqs. 725 / 726 — when both list reads report
+`predFlagLXSbCol == 0` the sub-block inherits the record's CU-centre
+default `ctrMvLX` / `ctrPredFlagLX` (the intra / unavailable
+fallback). New types: `ColBlockMotion` (the per-cell collocated
+read-back), `ColMotionSampler`, `SbTmvpFuseInputs` (CU origin,
+`CtbLog2SizeY`, clip boundary, slice type, `NoBackwardPredFlag`, POC
+operands + the `poc_of_col_ref(listCol, refIdxCol)` resolver),
+`SbColMotion`, and `SbColGrid` (row-major fill + `at(xSbIdx,
+ySbIdx)`). L1 reads gate on `sh_slice_type == B`. 7 new lib tests
+pin the uniform-field fill, the all-intra centre fallback, a mixed
+inter/intra grid, the B-slice bi-pred both-lists fill, the P-slice
+L1-suppression with L0 borrowing L1 via `NoBackwardPredFlag`, the
+eqs. 601 – 605 POC scaling, and the `tempMv` collocated-sample
+offset. The §7.4.6 `merge_subblock_flag` reader wire-up for live
+SbCol selection + the encoder-side SbCol emission remain follow-ups.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

@@ -526,6 +526,344 @@ impl SbTmvpRecord {
     }
 }
 
+// ============================================================ §8.5.5.3
+// + §8.5.2.12 — CTU-walker fuse: per-sub-block motion fill.
+// =====================================================================
+//
+// Round 135 lands the §8.5.5.3 main-body loop that the round-132 record
+// reserved: for each 8×8 sub-block of the CU, derive the collocated
+// location `(xColSb, yColSb)` (centre + tempMv, clipped per eqs.
+// 722 – 724), snap it to the 8×8 grid `(xColCb, yColCb)`, read the
+// collocated picture's per-4×4 `CuPredMode` + `MvLX` / `predFlagLX`
+// motion field at that grid cell, run the §8.5.2.12 collocated-MV
+// derivation (with `sbFlag = 1`), POC-scale per eqs. 598 – 605, and fill
+// the per-sub-block `mvLXSbCol` / `predFlagLXSbCol` arrays. When a
+// sub-block's collocated block is intra/unavailable (both list reads
+// report `predFlagLXSbCol == 0`), eqs. 725 / 726 substitute the
+// CU-centre default motion `ctrMvLX` / `ctrPredFlagLX` carried on the
+// record.
+
+/// The §8.5.2.12 collocated-block motion record at one 8×8 grid cell of
+/// `ColPic`. Mirrors the spec arrays `CuPredMode[0]`, `PredFlagLX`,
+/// `MvDmvrLX`, `RefIdxLX` of the collocated picture, sampled at the
+/// `(xColCb, yColCb)` location §8.5.5.3 snaps the per-sub-block
+/// collocated coordinate to.
+///
+/// `mode_inter == false` models the §8.5.2.12 first bullet —
+/// "`colCb` is coded in an intra, IBC, or palette prediction mode" —
+/// which forces `availableFlagLXCol = 0` for both lists (and therefore
+/// the §8.5.5.3 eqs. 725 / 726 centre fallback).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColBlockMotion {
+    /// `CuPredMode[0][xColCb][yColCb] == MODE_INTER` of the collocated
+    /// picture. `false` ⇒ intra / IBC / palette ⇒ no collocated MV.
+    pub mode_inter: bool,
+    /// `predFlagColL0[xColCb][yColCb]`.
+    pub pred_flag_l0: bool,
+    /// `predFlagColL1[xColCb][yColCb]`.
+    pub pred_flag_l1: bool,
+    /// `mvL0Col[xColCb][yColCb]` (1/16-pel; pre-§8.5.2.15 compression).
+    pub mv_l0: MotionVector,
+    /// `mvL1Col[xColCb][yColCb]` (1/16-pel; pre-§8.5.2.15 compression).
+    pub mv_l1: MotionVector,
+    /// `refIdxL0Col[xColCb][yColCb]` — index into the collocated
+    /// slice's RPL[0]. `-1` ⇒ no L0 reference.
+    pub ref_idx_l0: i32,
+    /// `refIdxL1Col[xColCb][yColCb]` — index into the collocated
+    /// slice's RPL[1]. `-1` ⇒ no L1 reference.
+    pub ref_idx_l1: i32,
+}
+
+/// A read-back of the collocated picture's per-4×4 motion field at an
+/// 8×8-snapped `(xColCb, yColCb)` luma location. Returns the default
+/// (`mode_inter == false` ⇒ unavailable) when the coordinate is outside
+/// the collocated picture or no CU wrote there.
+pub type ColMotionSampler<'a> = &'a dyn Fn(i32, i32) -> ColBlockMotion;
+
+/// Per-list POC operands + `NoBackwardPredFlag` for the §8.5.2.12
+/// scaling. The same operands apply to every sub-block of one CU (the
+/// current picture POC and the per-list current-RPL[0] reference POC are
+/// fixed at `refIdxLXSbCol = 0`), so they live on the CU-scoped input
+/// bundle rather than being recomputed per sub-block.
+pub struct SbTmvpFuseInputs<'a> {
+    /// CU origin `(xCb, yCb)` — picture-absolute luma top-left.
+    pub xcb: i32,
+    /// CU origin Y.
+    pub ycb: i32,
+    /// `CtbLog2SizeY` from the active SPS (§7.4.3.4 eq. 31).
+    pub ctb_log2_size_y: u32,
+    /// The §8.5.5.3 eqs. 722 – 724 clip boundary selector.
+    pub boundary: PictureBoundary,
+    /// `sh_slice_type` of the current slice. The L1 sub-block read +
+    /// the `NoBackwardPredFlag` LY fallback only fire on `SliceType::B`.
+    pub slice_type: SliceType,
+    /// `NoBackwardPredFlag` (§8.5.2.1) — `1` when every active reference
+    /// has POC ≤ the current picture POC. Drives the §8.5.2.12 sbFlag=1
+    /// `predFlagColLX == 0` cross-list (LY) fallback.
+    pub no_backward_pred: bool,
+    /// `PicOrderCnt( ColPic )` — POC of the collocated picture.
+    pub col_pic_poc: i32,
+    /// `PicOrderCnt( currPic )` — current picture POC.
+    pub curr_pic_poc: i32,
+    /// `DiffPicOrderCnt( currPic, RefPicList[0][0] )` operand:
+    /// `PicOrderCnt( RefPicList[0][refIdxL0SbCol=0] )`. Used for
+    /// `currPocDiff` (eq. 599) on the L0 sub-block read.
+    pub curr_ref_poc_l0: i32,
+    /// Same for L1 (`RefPicList[1][refIdxL1SbCol=0]`). Only consulted on
+    /// B-slices.
+    pub curr_ref_poc_l1: i32,
+    /// Resolve the collocated block's `refIdxCol` (on the collocated
+    /// slice's RPL `listCol`) into the referenced picture's POC. Used
+    /// for `colPocDiff` (eq. 598). `listCol` is passed as the first
+    /// argument (0 or 1), `refIdxCol` as the second. Returns `None`
+    /// when the reference cannot be resolved (treated as
+    /// `availableFlagLXCol = 0`).
+    pub poc_of_col_ref: &'a dyn Fn(i32, i32) -> Option<i32>,
+}
+
+/// Per-sub-block SbCol motion — the §8.5.5.3 outputs
+/// `mvLXSbCol[xSbIdx][ySbIdx]` / `predFlagLXSbCol[xSbIdx][ySbIdx]` plus
+/// the fixed `refIdxLXSbCol = 0` (eq. 719).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SbColMotion {
+    /// `mvL0SbCol[xSbIdx][ySbIdx]`.
+    pub mv_l0: MotionVector,
+    /// `predFlagL0SbCol[xSbIdx][ySbIdx]`.
+    pub pred_flag_l0: bool,
+    /// `mvL1SbCol[xSbIdx][ySbIdx]` (B-slice only).
+    pub mv_l1: MotionVector,
+    /// `predFlagL1SbCol[xSbIdx][ySbIdx]` (B-slice only).
+    pub pred_flag_l1: bool,
+    /// `refIdxL0SbCol = 0` per eq. 719 (only meaningful when
+    /// `pred_flag_l0`).
+    pub ref_idx_l0: i32,
+    /// `refIdxL1SbCol = 0` per eq. 719 (only meaningful when
+    /// `pred_flag_l1`).
+    pub ref_idx_l1: i32,
+}
+
+/// The CU's filled SbCol sub-block grid, indexed `[ySbIdx * numSbX +
+/// xSbIdx]` (row-major). The geometry (`num_sb_x`, `num_sb_y`) is copied
+/// from the record's grid so callers can iterate without re-deriving it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SbColGrid {
+    /// `numSbX` (eq. 715).
+    pub num_sb_x: i32,
+    /// `numSbY` (eq. 716).
+    pub num_sb_y: i32,
+    /// Row-major per-sub-block motion; `len() == num_sb_x * num_sb_y`.
+    pub sub_blocks: Vec<SbColMotion>,
+}
+
+impl SbColGrid {
+    /// Fetch the sub-block at `(xSbIdx, ySbIdx)` — panics on an
+    /// out-of-range index (callers iterate within the derived grid).
+    pub fn at(&self, xs_idx: i32, ys_idx: i32) -> SbColMotion {
+        let idx = (ys_idx * self.num_sb_x + xs_idx) as usize;
+        self.sub_blocks[idx]
+    }
+}
+
+/// §8.5.2.12 with `sbFlag = 1` — derive one list's (`X`) collocated MV
+/// at the 8×8-snapped `(xColCb, yColCb)` cell already sampled into
+/// `col`. Returns `(mvLXCol, availableFlagLXCol)`.
+///
+/// `x` selects the list this invocation is for (0 or 1).
+/// `curr_ref_poc` is `PicOrderCnt( RefPicList[X][refIdxLX=0] )` — the
+/// `currPocDiff` operand (eq. 599). The §8.5.2.15 buffer compression is
+/// applied to `mvCol` before scaling, matching the round-25 temporal
+/// merge convention of integer-pel rounding (`mv >> 4 << 4`) which is
+/// sample-exact for the integer-pel test vectors.
+fn derive_collocated_mv_subblock(
+    col: ColBlockMotion,
+    x: i32,
+    curr_ref_poc: i32,
+    inputs: &SbTmvpFuseInputs<'_>,
+) -> (MotionVector, bool) {
+    // §8.5.2.12 first bullet — intra / IBC / palette colCb.
+    if !col.mode_inter {
+        return (MotionVector::ZERO, false);
+    }
+
+    // §8.5.2.12, sbFlag == 1 branch — per-list selection.
+    let (pred_flag_lx, mv_lx, ref_idx_lx) = if x == 0 {
+        (col.pred_flag_l0, col.mv_l0, col.ref_idx_l0)
+    } else {
+        (col.pred_flag_l1, col.mv_l1, col.ref_idx_l1)
+    };
+    let (pred_flag_ly, mv_ly, ref_idx_ly) = if x == 0 {
+        (col.pred_flag_l1, col.mv_l1, col.ref_idx_l1)
+    } else {
+        (col.pred_flag_l0, col.mv_l0, col.ref_idx_l0)
+    };
+
+    // Pick (mvCol, refIdxCol, listCol).
+    let (mv_col, ref_idx_col, list_col) = if pred_flag_lx {
+        // predFlagColLX == 1 → use LX.
+        (mv_lx, ref_idx_lx, x)
+    } else if inputs.no_backward_pred && pred_flag_ly {
+        // predFlagColLX == 0, NoBackwardPredFlag == 1, predFlagColLY == 1
+        // → use LY (Y = 1 − X).
+        (mv_ly, ref_idx_ly, 1 - x)
+    } else {
+        // predFlagColLX == 0 and the LY fallback gate is closed →
+        // availableFlagLXCol = 0.
+        return (MotionVector::ZERO, false);
+    };
+
+    // §8.5.2.15 buffer compression — integer-pel rounding (matches the
+    // §8.5.2.11 round-25 temporal-merge convention; sample-exact for the
+    // integer-pel vectors the fuse tests exercise).
+    let mv_col = MotionVector {
+        x: (mv_col.x >> 4) << 4,
+        y: (mv_col.y >> 4) << 4,
+    };
+
+    // §8.5.2.12 eqs. 598 / 599 — POC distances.
+    let col_ref_poc = match (inputs.poc_of_col_ref)(list_col, ref_idx_col) {
+        Some(p) => p,
+        // Cannot resolve the collocated reference's POC → treat as
+        // availableFlagLXCol = 0.
+        None => return (MotionVector::ZERO, false),
+    };
+    let col_poc_diff = inputs.col_pic_poc.wrapping_sub(col_ref_poc);
+    let curr_poc_diff = inputs.curr_pic_poc.wrapping_sub(curr_ref_poc);
+
+    if col_poc_diff == 0 {
+        // Degenerate scaling (division by zero in eq. 601).
+        return (MotionVector::ZERO, false);
+    }
+
+    // Eq. 600 short-circuit when the POC distances are equal (also the
+    // long-term-reference path, which the fuse models as equal-distance).
+    let scaled = if col_poc_diff == curr_poc_diff {
+        MotionVector {
+            x: mv_col.x.clamp(-131072, 131071),
+            y: mv_col.y.clamp(-131072, 131071),
+        }
+    } else {
+        // Eqs. 601 – 605.
+        let td = col_poc_diff.clamp(-128, 127);
+        let tb = curr_poc_diff.clamp(-128, 127);
+        let abs_td = td.unsigned_abs() as i32;
+        let tx = (16384 + (abs_td >> 1)) / td;
+        let dist_scale_factor = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
+        let scale = |c: i32| -> i32 {
+            let prod = dist_scale_factor * c;
+            let bias: i32 = if prod >= 0 { 1 } else { 0 };
+            ((prod + 128 - bias) >> 8).clamp(-131072, 131071)
+        };
+        MotionVector {
+            x: scale(mv_col.x),
+            y: scale(mv_col.y),
+        }
+    };
+
+    (scaled, true)
+}
+
+/// §8.5.5.3 main body — the CTU-walker fuse. Iterates the record's
+/// `numSbX × numSbY` 8×8 sub-block grid, deriving each sub-block's
+/// collocated motion per eqs. 720 – 726.
+///
+/// For each `(xSbIdx, ySbIdx)`:
+/// 1. Eqs. 720 / 721 — `(xSb, ySb)` below-right centre.
+/// 2. Eqs. 722 – 724 — clip `(xSb + tempMv[0], ySb + tempMv[1])` to the
+///    CTB-aligned bounds → `(xColSb, yColSb)`.
+/// 3. Snap to the 8×8 grid — `(xColCb, yColCb) = ((xColSb >> 3) << 3,
+///    (yColSb >> 3) << 3)`.
+/// 4. Sample the collocated motion field at `(xColCb, yColCb)`.
+/// 5. §8.5.2.12 (sbFlag = 1) for L0, and for L1 when the slice is B,
+///    filling `mvLXSbCol` / `predFlagLXSbCol`.
+/// 6. Eqs. 725 / 726 — when **both** list reads report
+///    `predFlagLXSbCol == 0`, substitute the record's CU-centre default
+///    `ctrMvLX` / `ctrPredFlagLX`.
+///
+/// The record must already carry the §8.5.5.4 centre-block result
+/// (`ctr_mv_l{0,1}`, `ctr_pred_flag_l{0,1}`) and the derived `temp_mv`;
+/// this fuse does not re-run §8.5.5.4.
+pub fn fill_subblock_motion(
+    record: &SbTmvpRecord,
+    inputs: &SbTmvpFuseInputs<'_>,
+    col_sampler: ColMotionSampler<'_>,
+) -> SbColGrid {
+    let grid = record.grid;
+    let num_sb_x = grid.num_sb_x;
+    let num_sb_y = grid.num_sb_y;
+    let mut sub_blocks = Vec::with_capacity((num_sb_x.max(0) * num_sb_y.max(0)) as usize);
+
+    let is_b = inputs.slice_type == SliceType::B;
+
+    for ys_idx in 0..num_sb_y {
+        for xs_idx in 0..num_sb_x {
+            // Eqs. 720 / 721.
+            let (x_sb, y_sb) = grid.subblock_centre(inputs.xcb, inputs.ycb, xs_idx, ys_idx);
+
+            // Eqs. 722 – 724.
+            let (x_col_sb, y_col_sb) = clip_col_subblock_location(
+                record.centre.x_ctb,
+                record.centre.y_ctb,
+                inputs.ctb_log2_size_y,
+                inputs.boundary,
+                x_sb,
+                y_sb,
+                record.temp_mv,
+            );
+
+            // Snap to the 8×8 collocated grid.
+            let x_col_cb = (x_col_sb >> 3) << 3;
+            let y_col_cb = (y_col_sb >> 3) << 3;
+            let col = col_sampler(x_col_cb, y_col_cb);
+
+            // §8.5.2.12 (sbFlag = 1) — L0.
+            let (mv_l0, avail_l0) =
+                derive_collocated_mv_subblock(col, 0, inputs.curr_ref_poc_l0, inputs);
+            // L1 only on B-slices.
+            let (mv_l1, avail_l1) = if is_b {
+                derive_collocated_mv_subblock(col, 1, inputs.curr_ref_poc_l1, inputs)
+            } else {
+                (MotionVector::ZERO, false)
+            };
+
+            let mut sb = SbColMotion {
+                mv_l0,
+                pred_flag_l0: avail_l0,
+                mv_l1,
+                pred_flag_l1: avail_l1,
+                ref_idx_l0: if avail_l0 { SBCOL_REF_IDX } else { -1 },
+                ref_idx_l1: if avail_l1 { SBCOL_REF_IDX } else { -1 },
+            };
+
+            // Eqs. 725 / 726 — centre-default fallback when both list
+            // reads are unavailable.
+            if !sb.pred_flag_l0 && !sb.pred_flag_l1 {
+                sb.mv_l0 = record.ctr_mv_l0;
+                sb.pred_flag_l0 = record.ctr_pred_flag_l0;
+                sb.ref_idx_l0 = if record.ctr_pred_flag_l0 {
+                    SBCOL_REF_IDX
+                } else {
+                    -1
+                };
+                sb.mv_l1 = record.ctr_mv_l1;
+                sb.pred_flag_l1 = record.ctr_pred_flag_l1;
+                sb.ref_idx_l1 = if record.ctr_pred_flag_l1 {
+                    SBCOL_REF_IDX
+                } else {
+                    -1
+                };
+            }
+
+            sub_blocks.push(sb);
+        }
+    }
+
+    SbColGrid {
+        num_sb_x,
+        num_sb_y,
+        sub_blocks,
+    }
+}
+
 // =====================================================================
 // Tests
 // =====================================================================
@@ -989,5 +1327,272 @@ mod tests {
     #[test]
     fn sbtmvp_subblock_size_is_eight_per_eqs_717_718() {
         assert_eq!(SBTMVP_SUBBLOCK_SIZE, 8);
+    }
+
+    // ---------- §8.5.5.3 main-body fuse ------------------------------
+
+    /// Build a record covering a 16×16 CU at `(xCb, yCb)` with a 2×2
+    /// sub-block grid, a known `tempMv`, and a centre-default motion.
+    fn fuse_record(xcb: i32, ycb: i32, temp_mv: MotionVector) -> SbTmvpRecord {
+        SbTmvpRecord {
+            col_pic_poc: 8,
+            centre: SbTmvpCenterLoc::derive(xcb, ycb, 16, 16, 7),
+            grid: SbTmvpGrid::derive(16, 16),
+            ref_idx_l0_sb_col: SBCOL_REF_IDX,
+            ref_idx_l1_sb_col: SBCOL_REF_IDX,
+            temp_mv,
+            // Centre default: uni-pred L0, used by the eqs. 725 / 726
+            // fallback only.
+            ctr_pred_flag_l0: true,
+            ctr_pred_flag_l1: false,
+            ctr_mv_l0: mv(64, -32),
+            ctr_mv_l1: MotionVector::ZERO,
+        }
+    }
+
+    fn pic_boundary() -> PictureBoundary {
+        PictureBoundary::Picture {
+            pic_width_luma: 1024,
+            pic_height_luma: 1024,
+        }
+    }
+
+    /// L0-only collocated block (MODE_INTER, L0 active) at every cell.
+    fn col_inter_l0(mv_l0: MotionVector) -> ColBlockMotion {
+        ColBlockMotion {
+            mode_inter: true,
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            mv_l0,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+        }
+    }
+
+    fn fuse_inputs<'a>(
+        xcb: i32,
+        ycb: i32,
+        slice_type: SliceType,
+        poc_of_col_ref: &'a dyn Fn(i32, i32) -> Option<i32>,
+    ) -> SbTmvpFuseInputs<'a> {
+        SbTmvpFuseInputs {
+            xcb,
+            ycb,
+            ctb_log2_size_y: 7,
+            boundary: pic_boundary(),
+            slice_type,
+            no_backward_pred: true,
+            col_pic_poc: 8,
+            curr_pic_poc: 12,
+            // Equal POC distances ⇒ eq. 600 passthrough (no scaling):
+            // colPocDiff = 8 − 4 = 4 (resolver returns 4 below), and
+            // currPocDiff = 12 − 8 = 4.
+            curr_ref_poc_l0: 8,
+            curr_ref_poc_l1: 8,
+            poc_of_col_ref,
+        }
+    }
+
+    #[test]
+    fn fuse_fills_each_subblock_from_collocated_field() {
+        // 16×16 CU ⇒ 2×2 sub-blocks. Collocated field is uniform L0
+        // MODE_INTER with integer-pel MV (32, 16) at every cell; tempMv
+        // = 0. With equal POC distances the §8.5.2.12 scaling collapses
+        // to passthrough.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let rec = fuse_record(0, 0, MotionVector::ZERO);
+        let inputs = fuse_inputs(0, 0, SliceType::P, &resolver);
+        let col_mv = MotionVector::from_int_pel(2, 1); // (32, 16) in 1/16.
+        let sampler = |_x: i32, _y: i32| col_inter_l0(col_mv);
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        assert_eq!(g.num_sb_x, 2);
+        assert_eq!(g.num_sb_y, 2);
+        assert_eq!(g.sub_blocks.len(), 4);
+        for sb in &g.sub_blocks {
+            assert!(sb.pred_flag_l0);
+            assert!(!sb.pred_flag_l1);
+            assert_eq!(sb.mv_l0, col_mv);
+            assert_eq!(sb.ref_idx_l0, SBCOL_REF_IDX);
+            assert_eq!(sb.ref_idx_l1, -1);
+        }
+    }
+
+    #[test]
+    fn fuse_intra_subblock_falls_back_to_centre_default() {
+        // Every collocated cell is intra (mode_inter == false) ⇒ each
+        // sub-block read reports predFlagLXSbCol == 0 for both lists ⇒
+        // eqs. 725 / 726 substitute the record's ctrMvL0 / ctrPredFlagL0.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let rec = fuse_record(0, 0, MotionVector::ZERO);
+        let inputs = fuse_inputs(0, 0, SliceType::P, &resolver);
+        let sampler = |_x: i32, _y: i32| ColBlockMotion {
+            mode_inter: false,
+            ..Default::default()
+        };
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        assert_eq!(g.sub_blocks.len(), 4);
+        for sb in &g.sub_blocks {
+            // Centre default is uni-pred L0 (64, -32).
+            assert!(sb.pred_flag_l0);
+            assert!(!sb.pred_flag_l1);
+            assert_eq!(sb.mv_l0, mv(64, -32));
+            assert_eq!(sb.ref_idx_l0, SBCOL_REF_IDX);
+            assert_eq!(sb.ref_idx_l1, -1);
+        }
+    }
+
+    #[test]
+    fn fuse_mixed_field_fills_inter_and_falls_back_intra() {
+        // Sub-block (0, 0) collocated cell is inter; the other three are
+        // intra. tempMv = 0, CU at (0, 0), 2×2 grid. Sub-block (0, 0)
+        // centre = (4, 4) ⇒ xColCb/yColCb snap to (0, 0). Mark cell (0,
+        // 0) inter and the rest intra.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let rec = fuse_record(0, 0, MotionVector::ZERO);
+        let inputs = fuse_inputs(0, 0, SliceType::P, &resolver);
+        let inter_mv = MotionVector::from_int_pel(1, -1);
+        let sampler = |x: i32, y: i32| {
+            if x == 0 && y == 0 {
+                col_inter_l0(inter_mv)
+            } else {
+                ColBlockMotion {
+                    mode_inter: false,
+                    ..Default::default()
+                }
+            }
+        };
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        // (0, 0): inter read.
+        let sb00 = g.at(0, 0);
+        assert!(sb00.pred_flag_l0);
+        assert_eq!(sb00.mv_l0, inter_mv);
+        // (1, 0), (0, 1), (1, 1): intra ⇒ centre fallback.
+        for (xi, yi) in [(1, 0), (0, 1), (1, 1)] {
+            let sb = g.at(xi, yi);
+            assert!(sb.pred_flag_l0);
+            assert_eq!(sb.mv_l0, mv(64, -32));
+        }
+    }
+
+    #[test]
+    fn fuse_b_slice_fills_both_lists() {
+        // Bi-pred collocated cell on a B-slice ⇒ both lists fill.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let mut rec = fuse_record(0, 0, MotionVector::ZERO);
+        rec.ctr_pred_flag_l1 = true;
+        rec.ctr_mv_l1 = mv(16, 16);
+        let inputs = fuse_inputs(0, 0, SliceType::B, &resolver);
+        let mv0 = MotionVector::from_int_pel(2, 0);
+        let mv1 = MotionVector::from_int_pel(-2, 0);
+        let sampler = |_x: i32, _y: i32| ColBlockMotion {
+            mode_inter: true,
+            pred_flag_l0: true,
+            pred_flag_l1: true,
+            mv_l0: mv0,
+            mv_l1: mv1,
+            ref_idx_l0: 0,
+            ref_idx_l1: 0,
+        };
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        for sb in &g.sub_blocks {
+            assert!(sb.pred_flag_l0);
+            assert!(sb.pred_flag_l1);
+            assert_eq!(sb.mv_l0, mv0);
+            assert_eq!(sb.mv_l1, mv1);
+            assert_eq!(sb.ref_idx_l0, SBCOL_REF_IDX);
+            assert_eq!(sb.ref_idx_l1, SBCOL_REF_IDX);
+        }
+    }
+
+    #[test]
+    fn fuse_p_slice_never_reads_l1() {
+        // On a P-slice the L1 read is skipped even if the collocated
+        // cell carries L1 — predFlagL1SbCol stays false. The cell is L1-
+        // only, so the L0 read is unavailable; NoBackwardPredFlag lets
+        // L0 borrow L1 (LY fallback) — but only the L0 slot is filled.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let rec = fuse_record(0, 0, MotionVector::ZERO);
+        let inputs = fuse_inputs(0, 0, SliceType::P, &resolver);
+        let mv1 = MotionVector::from_int_pel(3, 3);
+        let sampler = |_x: i32, _y: i32| ColBlockMotion {
+            mode_inter: true,
+            pred_flag_l0: false,
+            pred_flag_l1: true,
+            mv_l0: MotionVector::ZERO,
+            mv_l1: mv1,
+            ref_idx_l0: -1,
+            ref_idx_l1: 0,
+        };
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        for sb in &g.sub_blocks {
+            // L0 borrowed L1 via NoBackwardPredFlag.
+            assert!(sb.pred_flag_l0);
+            assert_eq!(sb.mv_l0, mv1);
+            // P-slice never lights L1.
+            assert!(!sb.pred_flag_l1);
+        }
+    }
+
+    #[test]
+    fn fuse_poc_scaling_applied_when_distances_differ() {
+        // colPocDiff != currPocDiff ⇒ eqs. 601 – 605 scaling. ColPic POC
+        // = 8, col ref POC = 4 ⇒ colPocDiff = 4. currPic POC = 12, curr
+        // ref POC = 4 ⇒ currPocDiff = 8. td = 4, tb = 8, tx = (16384 +
+        // 2) / 4 = 4096, distScaleFactor = (8 * 4096 + 32) >> 6 =
+        // 32800 >> 6 = 512. mvCol = (16, 0) (1 int-pel). scaled.x =
+        // (512 * 16 + 128 - 1) >> 8 = (8192 + 127) >> 8 = 8319 >> 8 = 32.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let rec = fuse_record(0, 0, MotionVector::ZERO);
+        let mut inputs = fuse_inputs(0, 0, SliceType::P, &resolver);
+        inputs.curr_ref_poc_l0 = 4;
+        let col_mv = MotionVector::from_int_pel(1, 0); // (16, 0).
+        let sampler = |_x: i32, _y: i32| col_inter_l0(col_mv);
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        for sb in &g.sub_blocks {
+            assert!(sb.pred_flag_l0);
+            assert_eq!(sb.mv_l0, mv(32, 0));
+        }
+    }
+
+    #[test]
+    fn fuse_tempmv_shifts_collocated_sample_position() {
+        // tempMv is already-rounded integer-luma (§8.5.5.4 leftShift =
+        // 0): tempMv = (8, 0). CU at (0, 0), 2×2 grid. Sub-block (0, 0)
+        // centre = (4, 4); + tempMv (8, 0) ⇒ (12, 4); snap ⇒ (8, 0).
+        // Sub-block (1, 0) centre = (12, 4); + (8, 0) ⇒ (20, 4); snap ⇒
+        // (16, 0). The sampler distinguishes columns by xColCb so we can
+        // confirm the tempMv offset moved the read.
+        let resolver = |_list: i32, _idx: i32| Some(4);
+        let rec = fuse_record(0, 0, MotionVector { x: 8, y: 0 });
+        let inputs = fuse_inputs(0, 0, SliceType::P, &resolver);
+        let left_mv = MotionVector::from_int_pel(1, 0);
+        let right_mv = MotionVector::from_int_pel(2, 0);
+        let sampler = move |x: i32, _y: i32| {
+            if x == 8 {
+                col_inter_l0(left_mv)
+            } else if x == 16 {
+                col_inter_l0(right_mv)
+            } else {
+                ColBlockMotion {
+                    mode_inter: false,
+                    ..Default::default()
+                }
+            }
+        };
+
+        let g = fill_subblock_motion(&rec, &inputs, &sampler);
+        // Column 0 sampled at xColCb = 8 ⇒ left_mv.
+        assert_eq!(g.at(0, 0).mv_l0, left_mv);
+        assert_eq!(g.at(0, 1).mv_l0, left_mv);
+        // Column 1 sampled at xColCb = 16 ⇒ right_mv.
+        assert_eq!(g.at(1, 0).mv_l0, right_mv);
+        assert_eq!(g.at(1, 1).mv_l0, right_mv);
     }
 }

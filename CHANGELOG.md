@@ -6,6 +6,37 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 135 — **§8.5.5.3 SbTMVP CTU-walker fuse: per-sub-block motion
+  fill.** Builds on the round-132 `SbTmvpRecord` + availability gate to
+  land the §8.5.5.3 main-body loop. New `sbtmvp` surface:
+  `ColBlockMotion` (the collocated picture's per-8×8-cell `CuPredMode`
+  / `predFlagColLX` / `mvLXCol` / `refIdxLXCol` read-back),
+  `ColMotionSampler` (the `(xColCb, yColCb) → ColBlockMotion`
+  closure), `SbTmvpFuseInputs` (CU origin, `CtbLog2SizeY`, clip
+  boundary, slice type, `NoBackwardPredFlag`, the POC operands for
+  §8.5.2.12 scaling + the `poc_of_col_ref(listCol, refIdxCol)`
+  resolver), `SbColMotion` (per-sub-block `mvLXSbCol` /
+  `predFlagLXSbCol` / `refIdxLXSbCol = 0`), and `SbColGrid` (the
+  row-major `numSbX × numSbY` fill with an `at(xSbIdx, ySbIdx)`
+  accessor). `fill_subblock_motion(record, inputs, col_sampler)`
+  iterates the grid: eqs. 720 / 721 sub-block centre → eqs. 722 – 724
+  clip → 8×8 snap `(xColCb, yColCb) = ((xColSb >> 3) << 3, …)` →
+  §8.5.2.12 (with `sbFlag = 1`) per-list collocated-MV read (the
+  `predFlagColLX == 1` LX path, the `NoBackwardPredFlag &&
+  predFlagColLY == 1` cross-list LY fallback, §8.5.2.15 integer-pel
+  buffer compression, and the eqs. 598 – 605 POC scaling with the
+  eq. 600 equal-distance passthrough) → eqs. 725 / 726 substitute the
+  record's CU-centre default `ctrMvLX` / `ctrPredFlagLX` when both
+  list reads report `predFlagLXSbCol == 0` (the intra / unavailable
+  fallback). L1 reads are gated on `sh_slice_type == B`. 7 new lib
+  tests pin the uniform-field fill, the all-intra centre fallback, a
+  mixed inter/intra grid, the B-slice bi-pred both-lists fill, the
+  P-slice L1-suppression (with L0 borrowing L1 via
+  `NoBackwardPredFlag`), the eqs. 601 – 605 POC scaling, and the
+  `tempMv` collocated-sample offset. The §7.4.6 `merge_subblock_flag`
+  reader wire-up for live SbCol selection + the encoder-side SbCol
+  emission remain follow-ups.
+
 - Round 132 — **§8.5.5.3 / §8.5.5.4 SbTMVP record + availability gate**
   for the SbCol slot of the §8.5.5.2 sub-block merge candidate list.
   New `sbtmvp` module exposes: `SbTmvpAvailability` capturing the
