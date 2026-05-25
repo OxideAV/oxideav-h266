@@ -6,6 +6,42 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 132 — **§8.5.5.3 / §8.5.5.4 SbTMVP record + availability gate**
+  for the SbCol slot of the §8.5.5.2 sub-block merge candidate list.
+  New `sbtmvp` module exposes: `SbTmvpAvailability` capturing the
+  §8.5.5.3 first-bullet inputs (`sps_sbtmvp_enabled`,
+  `ph_temporal_mvp_enabled`, `cb_width`, `cb_height`,
+  `col_pic_present`); `is_sbtmvp_available(g)` implementing the
+  first-bullet short-circuit (`true` iff `cbWidth >= 8 && cbHeight
+  >= 8 && both flags == 1 && ColPic present`);
+  `SbTmvpCenterLoc::derive(xcb, ycb, cb_w, cb_h, ctb_log2_size_y)`
+  for §8.5.5.3 eqs. 711 – 714; `SbTmvpGrid::derive(cb_w, cb_h)` for
+  eqs. 715 – 718 plus `subblock_centre` for eqs. 720 / 721;
+  `derive_temp_mv(...)` for §8.5.5.4 (A1-neighbour `mvL{0,1}A1`
+  fallback chain with the `DiffPicOrderCnt(ColPic,
+  RefPicList[X][refIdxLXA1]) == 0` POC-match gate and the §8.5.2.14
+  `rightShift = 4` rounding via the round-111 `amvp::round_mv_amvr`);
+  `PictureBoundary::{Picture, Subpic}` +
+  `clip_col_subblock_location` / `clip_col_centre_location` for
+  §8.5.5.3 eqs. 722 – 724 and §8.5.5.4 eqs. 729 – 731; and the
+  `SbTmvpRecord` typed record (collocated picture POC, sub-block
+  grid geometry, `refIdxLXSbCol = 0` per eq. 719, `tempMv`, the
+  walker-populated `(ctrPredFlagLX, ctrMvLX)` slots + the
+  `is_sb_col_available()` step-3 final-decision helper). 31 new lib
+  tests pin the gate truth table (each close-condition + the
+  all-open path + the exact 8×8 boundary), the centre-loc
+  derivation, the grid geometry, the tempMv derivation across the
+  A1-availability / per-list-match / slice-type / §8.5.2.14
+  rounding axes, the Clip3 helpers across the picture / sub-picture
+  branches and the CTB-upper / CTB-lower clamps, and the
+  `SbTmvpRecord` defaults / `is_sb_col_available` truth table. The
+  CTU walker fuse that populates the per-sub-block `mvLXSbCol` /
+  `predFlagLXSbCol` arrays from the collocated picture's
+  `CuPredMode` + per-4×4 motion field (the §8.5.2.12 collocated-MV
+  derivation invoked per sub-block) and the wire-up of the §7.4.6
+  `merge_subblock_flag` reader for live SbCol selection remain
+  follow-ups.
+
 - Round 129 — **§7.3.10.5 `bcw_idx` gate evaluator + `MvField` fuse**
   (the round-126 reader-side note's call-out). New
   `leaf_cu::BcwIdxGate` packs the spec's seven gate inputs

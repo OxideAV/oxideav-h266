@@ -704,6 +704,49 @@ pushes the decoded value into `MvField::bcw_idx` and the matching
 encoder-side emission for the round-58 / round-60 BCW-RDO winners
 remain a follow-up.
 
+**Round-132 lands the §8.5.5.3 / §8.5.5.4 SbTMVP record + availability
+gate** — the first SbCol-side concrete data path for the
+`subblockMergeCandList` slot 0 the round-94 `affine_merge` driver
+already reserves. New `sbtmvp` module exposes: `SbTmvpAvailability`
+(the §8.5.5.3 first-bullet inputs: `sps_sbtmvp_enabled`,
+`ph_temporal_mvp_enabled`, `cb_width`, `cb_height`,
+`col_pic_present`); `is_sbtmvp_available(g)` returning `true` iff all
+four spec conditions plus the collocated-picture presence hold
+(`cbWidth >= 8 && cbHeight >= 8 && both flags == 1 && ColPic
+present`); `SbTmvpCenterLoc::derive(xcb, ycb, cb_w, cb_h,
+ctb_log2_size_y)` for §8.5.5.3 eqs. 711 – 714 (`(xCtb, yCtb) = (xCb,
+yCb) >> CtbLog2SizeY << CtbLog2SizeY`, `(xCtrCb, yCtrCb) = (xCb +
+cbW/2, yCb + cbH/2)`); `SbTmvpGrid::derive(cb_w, cb_h)` for eqs. 715 –
+718 (`numSbX = cbW >> 3`, `sbWidth = sbHeight = 8`) plus
+`subblock_centre(xcb, ycb, xs_idx, ys_idx)` for eqs. 720 / 721;
+`derive_temp_mv(...)` for §8.5.5.4 (zero-init `tempMv`, prefer
+`mvL0A1` when `predFlagL0A1 && DiffPicOrderCnt(ColPic,
+RefPicList[0][refIdxL0A1]) == 0`, B-slice fallback to `mvL1A1`
+similarly, then §8.5.2.14 rounding with `rightShift = 4, leftShift =
+0` via the round-111 `amvp::round_mv_amvr`); `PictureBoundary::{Picture,
+Subpic}` + `clip_col_subblock_location` / `clip_col_centre_location`
+for §8.5.5.3 eqs. 722 – 724 and §8.5.5.4 eqs. 729 – 731 (CTB-aligned
+lower bound, picture-or-subpic right bound, both branches of
+`sps_subpic_treated_as_pic_flag`); and `SbTmvpRecord` carrying
+`col_pic_poc`, `centre`, `grid`, `refIdxLXSbCol = 0` (eq. 719),
+`temp_mv`, plus the walker-populated `(ctrPredFlagLX, ctrMvLX)` fields
+with the `is_sb_col_available() == ctr_pred_flag_l0 ||
+ctr_pred_flag_l1` helper for the §8.5.5.3 step-3 final decision. 31
+new lib tests pin the gate truth table (each of the five
+close-conditions checked individually + the all-open path + the exact
+8×8 boundary), the centre-loc derivation (CTU-aligned + non-aligned +
+floor-div on odd dims), the grid geometry (8×8 single-subblock case,
+32×16 4×2 grid, below-8 zero-grid edge case, sub-block centre
+arithmetic), the tempMv derivation (A1-unavailable zero, L0-match pick,
+B-slice L1 fallback, P-slice no L1 fallback, predFlag-off branching,
+§8.5.2.14 rounding at 1/4-pel / 1/2-pel / 3/4-pel inputs), the Clip3
+helpers (in-bounds passthrough, CTB-upper clamp, CTB-lower clamp,
+subpic branch), and the `SbTmvpRecord` defaults /
+`is_sb_col_available` truth table. The non-merge inter CU walk that
+fuses SbTMVP into the live CTU dispatch (sourcing `ColPic`, the A1
+query, and the per-sub-block §8.5.2.12 collocated-MV reads for
+`mvLXSbCol` / `predFlagLXSbCol`) remains the next milestone.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

@@ -190,6 +190,7 @@ pub mod residual_enc;
 pub mod sao;
 pub mod sao_enc;
 pub mod sao_syntax;
+pub mod sbtmvp;
 pub mod scan;
 pub mod slice_header;
 pub mod sps;
