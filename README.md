@@ -777,6 +777,41 @@ eqs. 601 – 605 POC scaling, and the `tempMv` collocated-sample
 offset. The §7.4.6 `merge_subblock_flag` reader wire-up for live
 SbCol selection + the encoder-side SbCol emission remain follow-ups.
 
+**Round-139 lands the §7.3.11.7 `merge_subblock_flag` +
+`merge_subblock_idx` CABAC readers** — the live-stream entry into the
+round-135 SbTMVP / round-94 sub-block-merge-cand-list driver. The
+`tables` module gains `SyntaxCtx::MergeSubblockFlag` (Table 107: 6
+ctxIdx — 3 per non-I initType, initValue `[48, 57, 44, 25, 58, 45]`,
+shiftIdx all 4) and `SyntaxCtx::MergeSubblockIdx` (Table 108: 2
+ctxIdx, initValue `[5, 4]`, shiftIdx all 0); the `ctx` module gains
+`ctx_inc_merge_subblock_flag(left_msb, left_aff, avail_l, above_msb,
+above_aff, avail_a)` implementing §9.3.4.2.2 / eq. 1551 with the
+Table 133 merge-side row `cond{L,A} = MergeSubblockFlag[{L,A}] ||
+InterAffineFlag[{L,A}]`, `ctxSetIdx = 0` — yielding
+`ctxInc ∈ {0, 1, 2}` after the §6.4.4 availability mask folds in.
+`LeafCuReader::read_merge_subblock_flag(...)` decodes the FL `cMax = 1`
+ctx-coded bin against the `(init_type − 1) * 3 + ctxInc` slot;
+`LeafCuReader::read_merge_subblock_idx(max_num_subblock_merge_cand)`
+decodes the TR sub-block-merge-candidate index (`cMax =
+MaxNumSubblockMergeCand − 1`, `cRiceParam = 0`) — bin 0 ctx-coded
+against the Table 108 slot `init_type − 1` with `ctxInc = 0`, bins
+1.. bypass-coded; returns 0 without consuming bits when
+`max_num_subblock_merge_cand ≤ 1` (the §7.4.12.7 inference for the
+single-candidate case). 16 new lib tests pin the Table-133 ctxInc
+truth table (no-neighbours / one-active / both-active /
+availability-masked), the Tables 107 + 108 initValue / shiftIdx
+transcription bit-exact, both reader round-trips on both non-I
+initTypes through an encoder mirror (no-neighbour and active-
+neighbour ctxInc selection), the `cMax = 1` and full `cMax = 4` TR
+ranges of `merge_subblock_idx`, the `MaxNumSubblockMergeCand ≤ 1`
+suppression branch (sentinel-byte non-consumption check), the value-0
+exact-one-ctx-bin path, and the per-initType slot-addressability
+guard for Table 107. The §7.3.11.7 merge_data wire-up that calls
+these readers behind the size gate (`MaxNumSubblockMergeCand > 0 &&
+cbW >= 8 && cbH >= 8`) + the SPS-side `MaxNumSubblockMergeCand`
+derivation per §7.4.3.4 eq. 85 + the encoder-side emission remain
+follow-ups.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

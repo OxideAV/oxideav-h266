@@ -6,6 +6,40 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 139 — **§7.3.11.7 `merge_subblock_flag` + `merge_subblock_idx`
+  CABAC readers** — the live-stream entry into the round-135 SbTMVP
+  CTU-walker fuse. New `SyntaxCtx::MergeSubblockFlag` (Table 107: 6
+  ctxIdx, 3 per non-I initType, initValue = `[48, 57, 44, 25, 58, 45]`,
+  shiftIdx all 4) + `SyntaxCtx::MergeSubblockIdx` (Table 108: 2 ctxIdx,
+  one per non-I initType, initValue = `[5, 4]`, shiftIdx all 0). New
+  `ctx_inc_merge_subblock_flag(left_msb, left_aff, avail_l, above_msb,
+  above_aff, avail_a)` implements §9.3.4.2.2 / eq. 1551 with the Table
+  133 merge-side row `cond{L,A} = MergeSubblockFlag[{L,A}] ||
+  InterAffineFlag[{L,A}]`, `ctxSetIdx = 0` — yielding `ctxInc ∈
+  {0, 1, 2}` after the §6.4.4 availability mask. `ctx_inc_merge_subblock_idx`
+  is fixed 0 (only bin 0 ctx-coded). `LeafCuReader::read_merge_subblock_flag`
+  consumes one ctx-coded bin against the `(init_type − 1) * 3 + ctxInc`
+  slot and returns the §7.3.11.7 flag value (FL `cMax = 1`).
+  `LeafCuReader::read_merge_subblock_idx(max_num_subblock_merge_cand)`
+  decodes the TR-binarised sub-block-merge-candidate index (`cMax =
+  MaxNumSubblockMergeCand − 1`, `cRiceParam = 0`) — bin 0 ctx-coded
+  against the Table 108 slot `init_type − 1` with `ctxInc = 0`, bins
+  1.. bypass-coded; returns 0 without consuming bits when
+  `max_num_subblock_merge_cand ≤ 1` (matching §7.4.12.7's "inferred to
+  0" rule). The two new context arrays land on `LeafCuCtxs` and are
+  populated by `init_with_init_type`. 16 new lib tests pin the
+  Table-133 ctxInc truth table (no-neighbours / one-neighbour /
+  both-neighbours / availability-masked), the Tables 107 + 108
+  transcription bit-exact, the `read_merge_subblock_flag` round-trips
+  on both non-I initTypes with neighbour-driven ctxInc selection, the
+  `read_merge_subblock_idx` round-trips at `cMax = 1` and full
+  `cMax = 4`, the `MaxNumSubblockMergeCand ≤ 1` suppression branch
+  (sentinel-byte non-consumption check), and the value-0 exact-one-
+  ctx-bin path. The non-merge inter CU walk fuse that calls these
+  readers + populates the round-135 `SbColGrid` from the live ColPic
+  + the encoder-side emission for both syntax elements remain
+  follow-ups.
+
 - Round 135 — **§8.5.5.3 SbTMVP CTU-walker fuse: per-sub-block motion
   fill.** Builds on the round-132 `SbTmvpRecord` + availability gate to
   land the §8.5.5.3 main-body loop. New `sbtmvp` surface:

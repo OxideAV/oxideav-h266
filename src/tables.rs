@@ -207,6 +207,24 @@ pub enum SyntaxCtx {
     /// prediction absent on B slices, 0..=2 otherwise). `bcw_idx` is
     /// never signalled in I slices.
     BcwIdx,
+    /// Table 107 — `merge_subblock_flag` (6 ctxIdx, 3 per non-I
+    /// initType). Per Table 51 the per-initType slot block is
+    /// `(initType − 1) * 3` (initType 1 → ctxIdx 0..2, initType 2 →
+    /// ctxIdx 3..5; merge data is never signalled in I slices). Per
+    /// Table 132 the single ctx-coded bin uses the §9.3.4.2.2 / eq. 1551
+    /// derivation with the Table 133 merge-side row
+    /// `condL = MergeSubblockFlag[L] || InterAffineFlag[L]`,
+    /// `condA = MergeSubblockFlag[A] || InterAffineFlag[A]`,
+    /// `ctxSetIdx = 0` — yielding `ctxInc ∈ {0, 1, 2}` and indexing the
+    /// per-initType triplet directly.
+    MergeSubblockFlag,
+    /// Table 108 — `merge_subblock_idx` (2 ctxIdx, one per non-I
+    /// initType). Per Table 51 the slot is `initType − 1` (initType 1 →
+    /// ctxIdx 0, initType 2 → ctxIdx 1). Per Table 132 only bin 0 of
+    /// the TR sequence is context-coded (`ctxInc = 0`); bins 1.. (when
+    /// `MaxNumSubblockMergeCand ≥ 3`) are bypass-coded. The TR
+    /// `cMax = MaxNumSubblockMergeCand − 1`, `cRiceParam = 0`.
+    MergeSubblockIdx,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -567,6 +585,31 @@ pub const ABS_MVD_GREATER1_FLAG_SHIFT: &[u8] = &[5, 5, 5];
 pub const BCW_IDX_INIT: &[u8] = &[4, 5];
 pub const BCW_IDX_SHIFT: &[u8] = &[1, 1];
 
+/// Table 107 — `merge_subblock_flag` (6 ctxIdx, 3 per non-I initType).
+/// Transcription from the spec Table 107:
+///   ctxIdx     | 0  | 1  | 2  | 3  | 4  | 5  |
+///   initValue  | 48 | 57 | 44 | 25 | 58 | 45 |
+///   shiftIdx   |  4 |  4 |  4 |  4 |  4 |  4 |
+/// Per Table 51 the indexing rule is `(init_type − 1) * 3 + ctxInc`
+/// (initType 1 → ctxIdx 0..2, initType 2 → ctxIdx 3..5; merge data is
+/// never signalled in I slices). The single ctx-coded bin uses
+/// §9.3.4.2.2 / eq. 1551 with `ctxSetIdx = 0` and the Table 133 merge-
+/// side `condL` / `condA` derivation, yielding `ctxInc ∈ {0, 1, 2}`.
+pub const MERGE_SUBBLOCK_FLAG_INIT: &[u8] = &[48, 57, 44, 25, 58, 45];
+pub const MERGE_SUBBLOCK_FLAG_SHIFT: &[u8] = &[4, 4, 4, 4, 4, 4];
+
+/// Table 108 — `merge_subblock_idx` (2 ctxIdx, one per non-I initType).
+/// Transcription from the spec Table 108:
+///   ctxIdx     | 0  | 1  |
+///   initValue  |  5 |  4 |
+///   shiftIdx   |  0 |  0 |
+/// Per Table 51 the slot is `init_type − 1` (initType 1 → ctxIdx 0,
+/// initType 2 → ctxIdx 1). Per Table 132 only bin 0 of the TR sequence
+/// is context-coded with `ctxInc = 0`; bins 1.. (only present when
+/// `MaxNumSubblockMergeCand ≥ 3`) are bypass-coded.
+pub const MERGE_SUBBLOCK_IDX_INIT: &[u8] = &[5, 4];
+pub const MERGE_SUBBLOCK_IDX_SHIFT: &[u8] = &[0, 0];
+
 /// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6 transcription:
 ///   ctxIdx     | 0  | 1  | 2  | 3  |
 ///   initValue  | 59 | 58 | 59 | 50 |
@@ -719,6 +762,8 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
             (ALF_CTB_FILTER_ALT_IDX_INIT, ALF_CTB_FILTER_ALT_IDX_SHIFT)
         }
         SyntaxCtx::BcwIdx => (BCW_IDX_INIT, BCW_IDX_SHIFT),
+        SyntaxCtx::MergeSubblockFlag => (MERGE_SUBBLOCK_FLAG_INIT, MERGE_SUBBLOCK_FLAG_SHIFT),
+        SyntaxCtx::MergeSubblockIdx => (MERGE_SUBBLOCK_IDX_INIT, MERGE_SUBBLOCK_IDX_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -795,6 +840,8 @@ mod tests {
             SyntaxCtx::AlfCtbCcCrIdc,
             SyntaxCtx::AlfCtbFilterAltIdx,
             SyntaxCtx::BcwIdx,
+            SyntaxCtx::MergeSubblockFlag,
+            SyntaxCtx::MergeSubblockIdx,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);
@@ -825,6 +872,33 @@ mod tests {
     fn mtt_split_context_table_lengths() {
         assert_eq!(ctx_count(SyntaxCtx::MttSplitCuVerticalFlag), 15);
         assert_eq!(ctx_count(SyntaxCtx::MttSplitCuBinaryFlag), 12);
+    }
+
+    /// Round-139 — Tables 107 / 108 transcription length sanity. Per
+    /// Table 51 / Table 132:
+    ///   * `merge_subblock_flag` ∈ 0..5 → 6 entries (3 per non-I initType,
+    ///     covering the `ctxInc ∈ {0, 1, 2}` range of §9.3.4.2.2 /
+    ///     eq. 1551).
+    ///   * `merge_subblock_idx` ∈ 0..1 → 2 entries (one per non-I
+    ///     initType; only bin 0 of the TR sequence is ctx-coded).
+    #[test]
+    fn merge_subblock_context_table_lengths() {
+        assert_eq!(ctx_count(SyntaxCtx::MergeSubblockFlag), 6);
+        assert_eq!(ctx_count(SyntaxCtx::MergeSubblockIdx), 2);
+    }
+
+    /// Pin Tables 107 + 108 initValue / shiftIdx transcription bit-exact
+    /// to guard against silent table-rewrite drift.
+    #[test]
+    fn merge_subblock_init_values_match_spec() {
+        // Table 107: initValue = [48, 57, 44, 25, 58, 45], shiftIdx all 4.
+        let (init, shift) = (MERGE_SUBBLOCK_FLAG_INIT, MERGE_SUBBLOCK_FLAG_SHIFT);
+        assert_eq!(init, &[48, 57, 44, 25, 58, 45]);
+        assert_eq!(shift, &[4, 4, 4, 4, 4, 4]);
+        // Table 108: initValue = [5, 4], shiftIdx all 0.
+        let (init, shift) = (MERGE_SUBBLOCK_IDX_INIT, MERGE_SUBBLOCK_IDX_SHIFT);
+        assert_eq!(init, &[5, 4]);
+        assert_eq!(shift, &[0, 0]);
     }
 
     #[test]

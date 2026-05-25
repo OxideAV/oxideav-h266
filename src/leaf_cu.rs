@@ -56,7 +56,8 @@ use crate::ctx::{
     ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
-    ctx_inc_mvp_lx_flag, ctx_inc_ref_idx_lx, ctx_inc_regular_merge_flag, ctx_inc_sym_mvd_flag,
+    ctx_inc_merge_subblock_flag, ctx_inc_merge_subblock_idx, ctx_inc_mvp_lx_flag,
+    ctx_inc_ref_idx_lx, ctx_inc_regular_merge_flag, ctx_inc_sym_mvd_flag,
 };
 use crate::inter::{InterCuInfo, MergeData, MotionVector, MvField};
 use crate::residual::{
@@ -559,6 +560,22 @@ pub struct LeafCuCtxs {
     ///  chroma_weight_lX_flag[refIdxLX] == 0 (X = 0, 1) &&
     ///  cbWidth * cbHeight >= 256`.
     pub bcw_idx: Vec<ContextModel>,
+    /// `merge_subblock_flag` (Table 107) — 6 entries split as 3 ctx
+    /// slots per non-I initType (initType 1 → slots 0..2, initType 2 →
+    /// slots 3..5). Indexed at parse time as `(init_type - 1) * 3 +
+    /// ctxInc` with the ctxInc derived via [`ctx_inc_merge_subblock_flag`]
+    /// per §9.3.4.2.2 / Table 133. Single ctx-coded bin (FL `cMax = 1`)
+    /// gated by §7.3.11.7's `MaxNumSubblockMergeCand > 0 && cbW >= 8 &&
+    /// cbH >= 8` size check; merge data is never signalled in I slices.
+    pub merge_subblock_flag: Vec<ContextModel>,
+    /// `merge_subblock_idx` (Table 108) — 2 entries, one per non-I
+    /// initType. Indexed at parse time as `init_type - 1`. Only bin 0
+    /// of the TR sequence is context-coded (`ctxInc = 0` per Table
+    /// 132); bins 1.. (when `MaxNumSubblockMergeCand ≥ 3`) are
+    /// bypass-coded. The TR `cMax = MaxNumSubblockMergeCand − 1`,
+    /// `cRiceParam = 0`; only emitted when `merge_subblock_flag == 1
+    /// && MaxNumSubblockMergeCand > 1`.
+    pub merge_subblock_idx: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -650,6 +667,8 @@ impl LeafCuCtxs {
             ref_idx_lx: init_contexts(SyntaxCtx::RefIdxLx, slice_qp_y),
             mvp_lx_flag: init_contexts(SyntaxCtx::MvpLxFlag, slice_qp_y),
             bcw_idx: init_contexts(SyntaxCtx::BcwIdx, slice_qp_y),
+            merge_subblock_flag: init_contexts(SyntaxCtx::MergeSubblockFlag, slice_qp_y),
+            merge_subblock_idx: init_contexts(SyntaxCtx::MergeSubblockIdx, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -1779,6 +1798,95 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         let v = self.read_bcw_idx_gated(gate)?;
         mvf.bcw_idx = v as u8;
         Ok(v)
+    }
+
+    /// Decode `merge_subblock_flag[x0][y0]` per §7.3.11.7 / Table 107 /
+    /// Table 132.
+    ///
+    /// Binarisation: FL `cMax = 1` — a single ctx-coded bin per Table
+    /// 132. The ctx-slot is `(init_type - 1) * 3 + ctxInc` with the
+    /// ctxInc derived by [`ctx_inc_merge_subblock_flag`] (§9.3.4.2.2 /
+    /// eq. 1551 with the Table 133 merge-side row
+    /// `cond{L,A} = MergeSubblockFlag[{L,A}] || InterAffineFlag[{L,A}]`).
+    /// Returns the decoded flag as a `bool`.
+    ///
+    /// **The caller is responsible for the §7.3.11.7 size gate**
+    /// (`MaxNumSubblockMergeCand > 0 && cbW >= 8 && cbH >= 8`). When
+    /// the gate is closed, `merge_subblock_flag` is inferred to 0
+    /// per §7.4.12.7 and this reader must NOT be invoked. Likewise the
+    /// reader assumes the slice is non-I (initType ∈ {1, 2}); merge
+    /// data is never signalled in I slices.
+    pub fn read_merge_subblock_flag(
+        &mut self,
+        left_merge_subblock: bool,
+        left_inter_affine: bool,
+        left_available: bool,
+        above_merge_subblock: bool,
+        above_inter_affine: bool,
+        above_available: bool,
+    ) -> Result<bool> {
+        let inc = ctx_inc_merge_subblock_flag(
+            left_merge_subblock,
+            left_inter_affine,
+            left_available,
+            above_merge_subblock,
+            above_inter_affine,
+            above_available,
+        ) as usize;
+        // Table 107: 6 entries split as initType 1 → slots 0..2, initType
+        // 2 → slots 3..5 (per Table 51). Indexed as `(init_type - 1) * 3
+        // + ctxInc`.
+        let init_off = (self.ctxs.init_type as usize).saturating_sub(1) * 3;
+        let n = self.ctxs.merge_subblock_flag.len() - 1;
+        let slot = (init_off + inc).min(n);
+        let bit = self
+            .dec
+            .decode_decision(&mut self.ctxs.merge_subblock_flag[slot])?;
+        Ok(bit == 1)
+    }
+
+    /// Decode `merge_subblock_idx[x0][y0]` per §7.3.11.7 / Table 108 /
+    /// Table 132.
+    ///
+    /// Binarisation: TR with `cMax = MaxNumSubblockMergeCand − 1`,
+    /// `cRiceParam = 0`. Bin 0 is ctx-coded against the Table 108 slot
+    /// `init_type - 1` (initType 1 → ctxIdx 0, initType 2 → ctxIdx 1)
+    /// with `ctxInc = 0` per Table 132; bins 1.. (only present when
+    /// `MaxNumSubblockMergeCand ≥ 3`) are bypass-coded.
+    ///
+    /// `max_num_subblock_merge_cand` is `MaxNumSubblockMergeCand` per
+    /// §7.4.3.4 eq. 85 (clipped to `[0, 5]`). §7.3.11.7 only emits this
+    /// syntax element when `MaxNumSubblockMergeCand > 1`; with
+    /// `max_num_subblock_merge_cand ≤ 1` the reader returns 0 without
+    /// consuming a bit (matching the §7.4.12.7 inference). Returns the
+    /// decoded sub-block-merge-candidate index in `0..=cMax`.
+    pub fn read_merge_subblock_idx(&mut self, max_num_subblock_merge_cand: u32) -> Result<u32> {
+        if max_num_subblock_merge_cand <= 1 {
+            return Ok(0);
+        }
+        let cmax = max_num_subblock_merge_cand - 1;
+        // Bin 0 — context-coded against Table 108, slot `init_type - 1`.
+        // Per Table 132 the ctxInc is fixed 0.
+        let _ = ctx_inc_merge_subblock_idx();
+        let block = (self.ctxs.init_type as usize).saturating_sub(1);
+        let n = self.ctxs.merge_subblock_idx.len();
+        let slot = block.min(n - 1);
+        let bin0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.merge_subblock_idx[slot])?;
+        if bin0 == 0 {
+            return Ok(0);
+        }
+        // Bypass tail.
+        let mut val = 1u32;
+        while val < cmax {
+            let bit = self.dec.decode_bypass()?;
+            if bit == 0 {
+                break;
+            }
+            val += 1;
+        }
+        Ok(val)
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -3674,5 +3782,298 @@ mod tests {
         let mut g = open_gate();
         g.no_backward_pred_flag = true;
         assert_eq!(reader.read_bcw_idx_gated(g).unwrap(), 4);
+    }
+
+    // ---- Round-139: §7.3.11.7 `merge_subblock_flag` + `merge_subblock_idx`
+    // reader round-trips ----
+
+    /// Encoder mirror of `read_merge_subblock_flag` driving the same
+    /// context bundle bin-for-bin per §9.3.4.2.2 / eq. 1551 with the
+    /// Table 133 merge-side row. Used by the round-trip tests below.
+    fn encode_merge_subblock_flag(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        flag: bool,
+        left_merge_subblock: bool,
+        left_inter_affine: bool,
+        left_available: bool,
+        above_merge_subblock: bool,
+        above_inter_affine: bool,
+        above_available: bool,
+    ) {
+        let inc = crate::ctx::ctx_inc_merge_subblock_flag(
+            left_merge_subblock,
+            left_inter_affine,
+            left_available,
+            above_merge_subblock,
+            above_inter_affine,
+            above_available,
+        ) as usize;
+        let init_off = (ctxs.init_type as usize).saturating_sub(1) * 3;
+        let n = ctxs.merge_subblock_flag.len() - 1;
+        let slot = (init_off + inc).min(n);
+        let bit = if flag { 1 } else { 0 };
+        enc.encode_decision(&mut ctxs.merge_subblock_flag[slot], bit)
+            .unwrap();
+    }
+
+    /// Encoder mirror of `read_merge_subblock_idx` driving the same
+    /// context bundle bin-for-bin per Table 108 / Table 132.
+    fn encode_merge_subblock_idx(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        value: u32,
+        max_num_subblock_merge_cand: u32,
+    ) {
+        if max_num_subblock_merge_cand <= 1 {
+            // §7.3.11.7 suppression — nothing on the wire.
+            return;
+        }
+        let cmax = max_num_subblock_merge_cand - 1;
+        let block = (ctxs.init_type as usize).saturating_sub(1);
+        let n = ctxs.merge_subblock_idx.len();
+        let slot = block.min(n - 1);
+        let bin0 = if value == 0 { 0 } else { 1 };
+        enc.encode_decision(&mut ctxs.merge_subblock_idx[slot], bin0)
+            .unwrap();
+        if bin0 == 0 {
+            return;
+        }
+        // Bypass tail.
+        let mut i = 1u32;
+        while i < cmax {
+            let bit = if i < value { 1 } else { 0 };
+            enc.encode_bypass(bit).unwrap();
+            if bit == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    /// Per-bin round-trip helper for `merge_subblock_flag`.
+    fn merge_subblock_flag_round_trip(
+        flag: bool,
+        init_type: u8,
+        left_merge_subblock: bool,
+        left_inter_affine: bool,
+        left_available: bool,
+        above_merge_subblock: bool,
+        above_inter_affine: bool,
+        above_available: bool,
+    ) -> bool {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_merge_subblock_flag(
+            &mut enc,
+            &mut enc_ctxs,
+            flag,
+            left_merge_subblock,
+            left_inter_affine,
+            left_available,
+            above_merge_subblock,
+            above_inter_affine,
+            above_available,
+        );
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .read_merge_subblock_flag(
+                left_merge_subblock,
+                left_inter_affine,
+                left_available,
+                above_merge_subblock,
+                above_inter_affine,
+                above_available,
+            )
+            .unwrap()
+    }
+
+    /// Per-value round-trip helper for `merge_subblock_idx`.
+    fn merge_subblock_idx_round_trip(
+        value: u32,
+        max_num_subblock_merge_cand: u32,
+        init_type: u8,
+    ) -> u32 {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_merge_subblock_idx(&mut enc, &mut enc_ctxs, value, max_num_subblock_merge_cand);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .read_merge_subblock_idx(max_num_subblock_merge_cand)
+            .unwrap()
+    }
+
+    #[test]
+    fn merge_subblock_flag_round_trips_no_neighbours_both_init_types() {
+        // No neighbour info (cond_l = cond_a = 0). Both P-slice (init 1)
+        // and B-slice (init 2) initTypes round-trip the flag value.
+        for it in [1u8, 2] {
+            for flag in [false, true] {
+                assert_eq!(
+                    merge_subblock_flag_round_trip(
+                        flag, it, false, false, true, false, false, true,
+                    ),
+                    flag,
+                    "merge_subblock_flag round trip failed at init={it} flag={flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_subblock_flag_round_trips_with_one_active_neighbour() {
+        // Left neighbour was a sub-block-merge or affine CU → cond_l = 1
+        // → ctxInc = 1.
+        for flag in [false, true] {
+            assert_eq!(
+                merge_subblock_flag_round_trip(
+                    flag, 2, // B-slice
+                    true, false, true, // left MergeSubblockFlag, available
+                    false, false, true,
+                ),
+                flag
+            );
+            // Above neighbour was an affine CU → cond_a = 1 → ctxInc = 1.
+            assert_eq!(
+                merge_subblock_flag_round_trip(flag, 2, false, false, true, false, true, true,),
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn merge_subblock_flag_round_trips_with_both_active_neighbours() {
+        // Both neighbours contribute → ctxInc = 2 (max).
+        for flag in [false, true] {
+            for it in [1u8, 2] {
+                assert_eq!(
+                    merge_subblock_flag_round_trip(flag, it, true, false, true, false, true, true,),
+                    flag
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_subblock_flag_unavailable_neighbour_masks_active_flags() {
+        // MergeSubblockFlag set on left but available_l = false should
+        // produce ctxInc = 0 → still round-trips through that slot.
+        for flag in [false, true] {
+            assert_eq!(
+                merge_subblock_flag_round_trip(flag, 2, true, true, false, false, false, true,),
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn merge_subblock_idx_round_trips_max_cand_2() {
+        // MaxNumSubblockMergeCand = 2 → cMax = 1 → only the ctx bin
+        // (value 0 vs 1) is on the wire.
+        for it in [1u8, 2] {
+            for v in 0..=1u32 {
+                assert_eq!(
+                    merge_subblock_idx_round_trip(v, 2, it),
+                    v,
+                    "merge_subblock_idx round trip failed at init={it} v={v} cMax=1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_subblock_idx_round_trips_full_range_cand_5() {
+        // MaxNumSubblockMergeCand = 5 (clip cap of eq. 85) → cMax = 4
+        // → values 0..=4, with value 4 hitting the TR truncation point
+        // (four bins, no trailing zero).
+        for it in [1u8, 2] {
+            for v in 0..=4u32 {
+                assert_eq!(
+                    merge_subblock_idx_round_trip(v, 5, it),
+                    v,
+                    "merge_subblock_idx round trip failed at init={it} v={v} cMax=4"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_subblock_idx_suppressed_when_max_cand_le_1() {
+        // §7.3.11.7 only emits `merge_subblock_idx` when
+        // `MaxNumSubblockMergeCand > 1`. With 0 or 1 candidate, the
+        // reader returns 0 without consuming any bits — prove this by
+        // letting a sentinel bypass bit survive past the call.
+        for max_cand in [0u32, 1] {
+            let init_type = 2;
+            let mut enc = ArithEncoder::new();
+            // Sentinel-only stream: a single bypass `1`.
+            enc.encode_bypass(1).unwrap();
+            enc.encode_terminate(1).unwrap();
+            let mut padded = enc.finish();
+            padded.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&padded).unwrap();
+            let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+            let tools = CuToolFlags::default();
+            let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+            assert_eq!(reader.read_merge_subblock_idx(max_cand).unwrap(), 0);
+            // Sentinel bit must still be on the wire.
+            assert_eq!(reader.dec.decode_bypass().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn merge_subblock_idx_value_zero_reads_exactly_one_ctx_bin() {
+        // Spec sanity: value 0 corresponds to `bin0 = 0`, no bypass
+        // tail. Encode exactly that bin then a sentinel bypass-1; the
+        // reader must return 0 and leave the sentinel for the next read.
+        let init_type = 2;
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let slot = (init_type as usize - 1).min(enc_ctxs.merge_subblock_idx.len() - 1);
+        enc.encode_decision(&mut enc_ctxs.merge_subblock_idx[slot], 0)
+            .unwrap();
+        enc.encode_bypass(1).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        // cMax = 4 chosen to make sure the reader doesn't accidentally
+        // consume the sentinel as part of the bypass tail.
+        assert_eq!(reader.read_merge_subblock_idx(5).unwrap(), 0);
+        assert_eq!(reader.dec.decode_bypass().unwrap(), 1);
+    }
+
+    #[test]
+    fn merge_subblock_flag_per_ctx_slots_are_addressable() {
+        // Defensive: confirm that for every legal (init_type, ctxInc)
+        // pair the slot index lands inside the per-Table 107 6-entry
+        // bundle. This guards against future expansions of the table or
+        // a stale clamp.
+        for it in [1u8, 2] {
+            let ctxs = LeafCuCtxs::init_with_init_type(26, it);
+            let init_off = (it as usize - 1) * 3;
+            for inc in 0..=2usize {
+                let slot = init_off + inc;
+                assert!(
+                    slot < ctxs.merge_subblock_flag.len(),
+                    "slot {slot} out of range for init_type {it}"
+                );
+            }
+        }
     }
 }

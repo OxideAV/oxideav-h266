@@ -404,6 +404,40 @@ pub fn ctx_inc_bcw_idx(bin_idx: u32) -> u32 {
     0
 }
 
+/// ctxInc for `merge_subblock_flag[x0][y0]` per §9.3.4.2.2 / eq. 1551 with
+/// Table 133. The §7.3.11.7 syntax element is a single ctx-coded bin
+/// (FL `cMax = 1`); its ctxSetIdx is 0, and the per-neighbour `condL` /
+/// `condA` predicates collapse to
+///
+///   condL = MergeSubblockFlag[xNbL][yNbL] || InterAffineFlag[xNbL][yNbL]
+///   condA = MergeSubblockFlag[xNbA][yNbA] || InterAffineFlag[xNbA][yNbA]
+///
+/// per the merge-side row of Table 133. The standard §6.4.4 availability
+/// gate folds in here as `(cond && avail)`; unavailable neighbours
+/// contribute 0 to the sum. The yielded value lies in `0..=2` and
+/// addresses the per-initType triplet in Table 107 (3 ctxIdx per
+/// non-I initType, 6 ctxIdx total).
+pub fn ctx_inc_merge_subblock_flag(
+    left_merge_subblock: bool,
+    left_inter_affine: bool,
+    left_available: bool,
+    above_merge_subblock: bool,
+    above_inter_affine: bool,
+    above_available: bool,
+) -> u32 {
+    let cond_l = (left_merge_subblock || left_inter_affine) && left_available;
+    let cond_a = (above_merge_subblock || above_inter_affine) && above_available;
+    cond_l as u32 + cond_a as u32
+}
+
+/// ctxInc for the *first* bin of `merge_subblock_idx[x0][y0]` per Table
+/// 132 — fixed 0. The TR `cMax = MaxNumSubblockMergeCand − 1` and the
+/// remaining bins (when `cMax >= 2`) are bypass-coded. §7.3.11.7 only
+/// emits `merge_subblock_idx` when `MaxNumSubblockMergeCand > 1`.
+pub fn ctx_inc_merge_subblock_idx() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///
@@ -1081,5 +1115,82 @@ mod tests {
         let a = vec![0u32; 16];
         assert_eq!(loc_sum_abs_rice(3, 3, &a, 2, 2, 4, 0), 0);
         assert_eq!(loc_sum_abs_rice(0, 0, &a, 2, 2, 4, 0), 0);
+    }
+
+    /// Round-139 — `merge_subblock_flag` ctxInc per §9.3.4.2.2 / eq. 1551
+    /// with the Table 133 merge-side row
+    /// `cond{L,A} = MergeSubblockFlag[{L,A}] || InterAffineFlag[{L,A}]`
+    /// and `ctxSetIdx = 0`. Yields 0/1/2 by counting available
+    /// sub-block-or-affine neighbours.
+    #[test]
+    fn merge_subblock_flag_no_neighbours() {
+        // Both neighbours unavailable → cond_l = cond_a = 0 → ctxInc = 0.
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(true, true, false, true, true, false),
+            0
+        );
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(false, false, true, false, false, true),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_subblock_flag_one_neighbour_active() {
+        // Left has MergeSubblockFlag set + available → cond_l = 1, cond_a = 0.
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(true, false, true, false, false, true),
+            1
+        );
+        // Above has InterAffineFlag set + available → cond_a = 1, cond_l = 0.
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(false, false, true, false, true, true),
+            1
+        );
+        // Available but neither flag set → both conditions false.
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(false, false, true, false, false, true),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_subblock_flag_both_neighbours_active() {
+        // Both neighbours available with at least one of the two flags set.
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(true, false, true, false, true, true),
+            2
+        );
+        // Mix of MergeSubblockFlag and InterAffineFlag — eq. 1551
+        // treats them as an OR per Table 133, so both still trigger.
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(false, true, true, true, false, true),
+            2
+        );
+        // Both neighbours have both flags simultaneously — still 2
+        // (the OR within each side is logical, not additive).
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(true, true, true, true, true, true),
+            2
+        );
+    }
+
+    #[test]
+    fn merge_subblock_flag_unavailable_masks_neighbour_flags() {
+        // Even if MergeSubblockFlag is set, an unavailable neighbour
+        // contributes 0 (§6.4.4 availability gate folded into eq. 1551).
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(true, true, false, true, true, true),
+            1
+        );
+        assert_eq!(
+            ctx_inc_merge_subblock_flag(true, true, true, true, true, false),
+            1
+        );
+    }
+
+    #[test]
+    fn merge_subblock_idx_fixed_zero() {
+        assert_eq!(ctx_inc_merge_subblock_idx(), 0);
     }
 }
