@@ -6,6 +6,43 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 129 — **§7.3.10.5 `bcw_idx` gate evaluator + `MvField` fuse**
+  (the round-126 reader-side note's call-out). New
+  `leaf_cu::BcwIdxGate` packs the spec's seven gate inputs
+  (`sps_bcw_enabled, inter_pred_idc, luma_weight_l0/l1_flag,
+  chroma_weight_l0/l1_flag, cb_width * cb_height, no_backward_pred_flag`)
+  into one pure-data struct; `BcwIdxGate::is_open()` reproduces the
+  §7.3.10.5 conditional verbatim (`sps_bcw_enabled_flag &&
+  inter_pred_idc == PRED_BI && every per-list weighted-prediction
+  flag == 0 && cbWidth * cbHeight >= 256`). New
+  `LeafCuReader::read_bcw_idx_gated(gate)` invokes `read_bcw_idx`
+  with the threaded `no_backward_pred_flag` when the gate opens and
+  returns 0 without consuming any bins when closed (per §7.4.12.5
+  "When `bcw_idx[x0][y0]` is not present, it is inferred to be equal
+  to 0"). `LeafCuReader::read_bcw_idx_into(gate, &mut MvField)` adds
+  the spec's `BcwIdx[x0][y0] = bcw_idx[x0][y0]` array-write step,
+  clearing stale `MvField::bcw_idx` to 0 when the gate is closed (the
+  CTU walker then broadcasts that value across every covered 4x4
+  block, matching the existing per-block default in `crate::ctu` and
+  `crate::affine_merge`). 9 new lib tests pin the gate truth table:
+  open with all preconditions met, closes on `sps_bcw_enabled =
+  false`, closes on uni-pred / `None` `inter_pred_idc`, closes on
+  any single weighted-prediction flag set (all four
+  individually-checked), the `>= 256` area threshold exhaustively
+  swept (16x16, 8x32, 32x8 open; 8x16, 16x8, 8x8, 4x32 close), the
+  closed-gate read leaves the bitstream pointer parked at a sentinel
+  bypass bit, the open-gate read returns the decoded value, the
+  `MvField` writer overwrites a stale value with the decoded one, the
+  closed-gate `_into` path clears a stale value to 0 (the §7.4.12.5
+  array-slot inference), and the `no_backward_pred_flag = true`
+  path threads cMax = 4 through to a value-4 round-trip. The §7.3.10.5
+  encoder-side emission for the round-58 / round-60 BCW-RDO winners
+  (the matching helper plumbing the chosen `bcw_idx` back into the
+  bitstream when the gate is open) and the CTU-walker drop-in that
+  fills `BcwIdxGate` from live per-CB state (the round-29
+  pred-weight-table walker output + the round-108 `inter_pred_idc` /
+  `ref_idx_lX` parse) remain a follow-up.
+
 - Round 126 — **§7.3.10.5 `bcw_idx` CABAC reader** (the last
   unparsed AMVP-side bin in the non-merge inter CU `coding_unit()`
   else-branch). `LeafCuReader::read_bcw_idx(no_backward_pred_flag)`

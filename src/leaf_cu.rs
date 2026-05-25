@@ -58,7 +58,7 @@ use crate::ctx::{
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
     ctx_inc_mvp_lx_flag, ctx_inc_ref_idx_lx, ctx_inc_regular_merge_flag, ctx_inc_sym_mvd_flag,
 };
-use crate::inter::{InterCuInfo, MergeData, MotionVector};
+use crate::inter::{InterCuInfo, MergeData, MotionVector, MvField};
 use crate::residual::{
     decode_tb_coefficients, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
     read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
@@ -107,6 +107,76 @@ impl InterPredDir {
             1 => InterPredDir::PredL1,
             _ => InterPredDir::PredBi,
         }
+    }
+}
+
+/// §7.3.10.5 gate inputs for the `bcw_idx[x0][y0]` syntax element.
+///
+/// The spec's `coding_unit()` else-branch only signals `bcw_idx` when
+/// *all* of these conditions hold (verbatim from §7.3.10.5):
+///
+/// ```text
+/// if( sps_bcw_enabled_flag && inter_pred_idc[x0][y0] == PRED_BI &&
+///     luma_weight_l0_flag[ ref_idx_l0[x0][y0] ]   == 0 &&
+///     luma_weight_l1_flag[ ref_idx_l1[x0][y0] ]   == 0 &&
+///     chroma_weight_l0_flag[ ref_idx_l0[x0][y0] ] == 0 &&
+///     chroma_weight_l1_flag[ ref_idx_l1[x0][y0] ] == 0 &&
+///     cbWidth * cbHeight >= 256 )
+///   bcw_idx[x0][y0]                                    ae(v)
+/// ```
+///
+/// When the gate is closed the value is inferred 0 per §7.4.12.5
+/// ("When `bcw_idx[x0][y0]` is not present, it is inferred to be equal
+/// to 0").
+///
+/// The caller (the CTU walker, once it brings the non-merge inter path
+/// online) fills this struct from live per-CB state: `inter_pred_idc`
+/// comes from [`LeafCuReader::read_inter_pred_idc`], the luma /
+/// chroma weight flags from the parsed `pred_weight_table()`
+/// (round-29), and `cb_w` / `cb_h` from the leaf rectangle. The
+/// `no_backward_pred_flag` field is `NoBackwardPredFlag` from
+/// §7.4.11.6 (true ⇔ none of the slice's L1 references are temporally
+/// after the current picture, so the BCW weight table's "backward"
+/// indices are unreachable and `cMax = 4` instead of `2`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BcwIdxGate {
+    /// `sps_bcw_enabled_flag` from the active SPS.
+    pub sps_bcw_enabled: bool,
+    /// `inter_pred_idc[x0][y0]` — the gate closes unless this is
+    /// [`InterPredDir::PredBi`].
+    pub inter_pred_idc: Option<InterPredDir>,
+    /// `luma_weight_l0_flag[ ref_idx_l0[x0][y0] ]` — true closes the
+    /// gate (explicit weighted-prediction on L0 luma).
+    pub luma_weight_l0_flag: bool,
+    /// `luma_weight_l1_flag[ ref_idx_l1[x0][y0] ]` — true closes the
+    /// gate.
+    pub luma_weight_l1_flag: bool,
+    /// `chroma_weight_l0_flag[ ref_idx_l0[x0][y0] ]` — true closes the
+    /// gate.
+    pub chroma_weight_l0_flag: bool,
+    /// `chroma_weight_l1_flag[ ref_idx_l1[x0][y0] ]` — true closes the
+    /// gate.
+    pub chroma_weight_l1_flag: bool,
+    /// CU luma-block width `cbWidth`.
+    pub cb_width: u32,
+    /// CU luma-block height `cbHeight`.
+    pub cb_height: u32,
+    /// `NoBackwardPredFlag` per §7.4.11.6. Threads straight into the
+    /// `cMax` selection inside [`LeafCuReader::read_bcw_idx`].
+    pub no_backward_pred_flag: bool,
+}
+
+impl BcwIdxGate {
+    /// `true` iff the §7.3.10.5 conditional opens, i.e. the next bin
+    /// in the bitstream really is `bcw_idx[x0][y0]`.
+    pub fn is_open(&self) -> bool {
+        self.sps_bcw_enabled
+            && self.inter_pred_idc == Some(InterPredDir::PredBi)
+            && !self.luma_weight_l0_flag
+            && !self.luma_weight_l1_flag
+            && !self.chroma_weight_l0_flag
+            && !self.chroma_weight_l1_flag
+            && (self.cb_width.saturating_mul(self.cb_height)) >= 256
     }
 }
 
@@ -1667,6 +1737,48 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             val += 1;
         }
         Ok(val)
+    }
+
+    /// Read `bcw_idx[x0][y0]` *with the §7.3.10.5 gate evaluated for
+    /// you*: when [`BcwIdxGate::is_open`] is true the reader is invoked
+    /// against the supplied `no_backward_pred_flag` (so the TR uses
+    /// `cMax = NoBackwardPredFlag ? 4 : 2`); otherwise the syntax
+    /// element is not signalled and the inferred value 0 is returned
+    /// (per §7.4.12.5 "When `bcw_idx[ x0 ][ y0 ]` is not present, it is
+    /// inferred to be equal to 0").
+    ///
+    /// This is the fuse the round-126 reader-side note called out: the
+    /// CTU walker fills in a [`BcwIdxGate`] from live per-CB state
+    /// (`(sps_bcw_enabled, inter_pred_idc, luma_weight_lX,
+    /// chroma_weight_lX, cb_w * cb_h)`), this routine decides whether to
+    /// pull bins, and the returned value drops straight into
+    /// [`MvField::bcw_idx`].
+    ///
+    /// Returns the decoded (or inferred) `bcw_idx` value. The caller
+    /// is responsible for broadcasting the value across every 4x4 block
+    /// the CU covers (the existing CTU writer in [`crate::ctu`] does
+    /// this for the merge path; the non-merge inter path consumes this
+    /// helper).
+    pub fn read_bcw_idx_gated(&mut self, gate: BcwIdxGate) -> Result<u32> {
+        if !gate.is_open() {
+            return Ok(0);
+        }
+        self.read_bcw_idx(gate.no_backward_pred_flag)
+    }
+
+    /// Convenience wrapper around [`Self::read_bcw_idx_gated`] that
+    /// also writes the decoded value into the supplied
+    /// [`MvField::bcw_idx`] slot in place. Returns the value written
+    /// (for assertion / RDO bookkeeping). This is the spec's "set
+    /// `BcwIdx[x0][y0] = bcw_idx[x0][y0]`" assignment from §7.4.12.5 +
+    /// the §8.5.2.1 final paragraph (the latter pins `bcwIdx = 0` when
+    /// the spec's symmetric / parallel-merge collapse fires; that
+    /// collapse is the CTU walker's responsibility — this helper only
+    /// handles the per-CU read / infer step).
+    pub fn read_bcw_idx_into(&mut self, gate: BcwIdxGate, mvf: &mut MvField) -> Result<u32> {
+        let v = self.read_bcw_idx_gated(gate)?;
+        mvf.bcw_idx = v as u8;
+        Ok(v)
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -3360,5 +3472,207 @@ mod tests {
             assert_eq!(bcw_idx_round_trip(v, false, 1), v);
             assert_eq!(bcw_idx_round_trip(v, false, 2), v);
         }
+    }
+
+    // ---- Round-129: §7.3.10.5 bcw_idx gate evaluator + MvField fuse ----
+
+    /// Build a fully-open gate: all five "weighted-prediction off"
+    /// preconditions met, `inter_pred_idc == PRED_BI`, SPS bit set,
+    /// CU 16x16 = 256 luma samples (the boundary).
+    fn open_gate() -> BcwIdxGate {
+        BcwIdxGate {
+            sps_bcw_enabled: true,
+            inter_pred_idc: Some(InterPredDir::PredBi),
+            luma_weight_l0_flag: false,
+            luma_weight_l1_flag: false,
+            chroma_weight_l0_flag: false,
+            chroma_weight_l1_flag: false,
+            cb_width: 16,
+            cb_height: 16,
+            no_backward_pred_flag: false,
+        }
+    }
+
+    #[test]
+    fn bcw_idx_gate_open_when_all_conditions_met() {
+        let g = open_gate();
+        assert!(g.is_open());
+    }
+
+    #[test]
+    fn bcw_idx_gate_closes_on_sps_disable() {
+        let mut g = open_gate();
+        g.sps_bcw_enabled = false;
+        assert!(!g.is_open());
+    }
+
+    #[test]
+    fn bcw_idx_gate_closes_on_uni_pred() {
+        // PRED_L0 and PRED_L1 both close the gate (only PRED_BI opens).
+        let mut g = open_gate();
+        g.inter_pred_idc = Some(InterPredDir::PredL0);
+        assert!(!g.is_open());
+        g.inter_pred_idc = Some(InterPredDir::PredL1);
+        assert!(!g.is_open());
+        // None (no inter_pred_idc decoded yet) also closes.
+        g.inter_pred_idc = None;
+        assert!(!g.is_open());
+    }
+
+    #[test]
+    fn bcw_idx_gate_closes_on_any_weighted_prediction_flag() {
+        // Each of the four weighted-prediction flags closes the gate
+        // individually — there's no "AND" relaxation in the §7.3.10.5
+        // conditional.
+        for set in [
+            |g: &mut BcwIdxGate| g.luma_weight_l0_flag = true,
+            |g: &mut BcwIdxGate| g.luma_weight_l1_flag = true,
+            |g: &mut BcwIdxGate| g.chroma_weight_l0_flag = true,
+            |g: &mut BcwIdxGate| g.chroma_weight_l1_flag = true,
+        ] {
+            let mut g = open_gate();
+            set(&mut g);
+            assert!(!g.is_open(), "any wp flag should close the gate");
+        }
+    }
+
+    #[test]
+    fn bcw_idx_gate_area_threshold_is_inclusive_at_256() {
+        // cbWidth * cbHeight >= 256 — the spec uses `>=`, so the 256-
+        // sample minimum (e.g. 16x16, 8x32, 32x8) opens; 8x16 = 128 and
+        // 16x8 = 128 close.
+        for (w, h, expect) in [
+            (16u32, 16u32, true),
+            (8, 32, true),
+            (32, 8, true),
+            (8, 16, false),
+            (16, 8, false),
+            (8, 8, false),
+            (32, 16, true),
+            (4, 64, true),
+            (4, 32, false),
+        ] {
+            let mut g = open_gate();
+            g.cb_width = w;
+            g.cb_height = h;
+            assert_eq!(g.is_open(), expect, "gate for {w}x{h} ({} samples)", w * h);
+        }
+    }
+
+    #[test]
+    fn read_bcw_idx_gated_returns_zero_without_consuming_when_closed() {
+        // Gate closed ⇒ no bins consumed ⇒ value inferred 0 per
+        // §7.4.12.5. Prove the bitstream pointer hasn't moved by
+        // letting the reader bypass-decode a sentinel bit right after.
+        let init_type = 2;
+        let mut enc = ArithEncoder::new();
+        let _ctxs_for_enc = LeafCuCtxs::init_with_init_type(26, init_type);
+        // Sentinel-only stream: just a single bypass `1`.
+        enc.encode_bypass(1).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+
+        // Closed gate: any of the §7.3.10.5 preconditions failing.
+        let mut g = open_gate();
+        g.sps_bcw_enabled = false;
+        assert_eq!(reader.read_bcw_idx_gated(g).unwrap(), 0);
+        // Stream still parked at the sentinel bypass bit.
+        assert_eq!(reader.dec.decode_bypass().unwrap(), 1);
+    }
+
+    #[test]
+    fn read_bcw_idx_gated_reads_when_open() {
+        // Gate open with `no_backward_pred_flag = false` (cMax = 2).
+        // Encode value 1 (bin0=1, bypass=0) and verify the gated read
+        // returns it.
+        let init_type = 2;
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_bcw_idx(&mut enc, &mut enc_ctxs, 1, false);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        assert_eq!(reader.read_bcw_idx_gated(open_gate()).unwrap(), 1);
+    }
+
+    #[test]
+    fn read_bcw_idx_into_writes_decoded_value_into_mvfield() {
+        // Round-trip value 2 with cMax = 2 (max-truncation point) and
+        // confirm the MvField slot is updated in place.
+        let init_type = 2;
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_bcw_idx(&mut enc, &mut enc_ctxs, 2, false);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+
+        let mut mvf = MvField::UNAVAILABLE;
+        // Seed with a non-zero "stale" value to prove the helper
+        // actually writes (not merely defaults).
+        mvf.bcw_idx = 7;
+        let returned = reader.read_bcw_idx_into(open_gate(), &mut mvf).unwrap();
+        assert_eq!(returned, 2);
+        assert_eq!(mvf.bcw_idx, 2);
+    }
+
+    #[test]
+    fn read_bcw_idx_into_clears_stale_when_gate_closed() {
+        // Closed gate ⇒ MvField.bcw_idx must be set to 0 per §7.4.12.5
+        // (the spec's "inferred to be equal to 0" rule applies to the
+        // *array slot*, not just the local variable — the CTU writer
+        // broadcasts this 0 across every 4x4 covered block).
+        let init_type = 2;
+        let mut enc = ArithEncoder::new();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+
+        let mut mvf = MvField::UNAVAILABLE;
+        mvf.bcw_idx = 3;
+        let mut g = open_gate();
+        g.cb_width = 8;
+        g.cb_height = 16; // 128 < 256 ⇒ closed
+        let returned = reader.read_bcw_idx_into(g, &mut mvf).unwrap();
+        assert_eq!(returned, 0);
+        assert_eq!(mvf.bcw_idx, 0);
+    }
+
+    #[test]
+    fn bcw_idx_gate_threads_no_backward_pred_flag_into_cmax() {
+        // When `no_backward_pred_flag = true` the reader must see
+        // `cMax = 4`, allowing values up to 4. Confirm via end-to-end
+        // gated round-trip of value 4 (the truncation-point max).
+        let init_type = 1; // P-slice with NoBackwardPredFlag = 1
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_bcw_idx(&mut enc, &mut enc_ctxs, 4, true);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let mut g = open_gate();
+        g.no_backward_pred_flag = true;
+        assert_eq!(reader.read_bcw_idx_gated(g).unwrap(), 4);
     }
 }
