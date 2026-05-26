@@ -438,6 +438,44 @@ pub fn ctx_inc_merge_subblock_idx() -> u32 {
     0
 }
 
+/// ctxInc for `inter_affine_flag[x0][y0]` per §9.3.4.2.2 / eq. 1551 with
+/// Table 133. The §7.3.11.7 syntax element is a single ctx-coded bin
+/// (FL `cMax = 1` per Table 132); its `ctxSetIdx` is 0, and the
+/// per-neighbour `condL` / `condA` predicates are identical to the
+/// `merge_subblock_flag` row of Table 133 (round-152: spec lists the
+/// two syntax elements side-by-side under one definition):
+///
+///   condL = MergeSubblockFlag[xNbL][yNbL] || InterAffineFlag[xNbL][yNbL]
+///   condA = MergeSubblockFlag[xNbA][yNbA] || InterAffineFlag[xNbA][yNbA]
+///
+/// The standard §6.4.4 availability gate folds in here as
+/// `(cond && avail)`; unavailable neighbours contribute 0 to the sum.
+/// The yielded value lies in `0..=2` and addresses the per-initType
+/// triplet in Table 84 (3 ctxIdx per non-I initType, 6 ctxIdx total).
+/// `inter_affine_flag` is only parsed under the §7.3.11.7 gate
+/// `sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16` — the
+/// caller is responsible for that check.
+pub fn ctx_inc_inter_affine_flag(
+    left_merge_subblock: bool,
+    left_inter_affine: bool,
+    left_available: bool,
+    above_merge_subblock: bool,
+    above_inter_affine: bool,
+    above_available: bool,
+) -> u32 {
+    // Table 133: `condL` / `condA` rows for `inter_affine_flag` and
+    // `merge_subblock_flag` are identical; delegate so the two parsers
+    // can never drift apart by accident.
+    ctx_inc_merge_subblock_flag(
+        left_merge_subblock,
+        left_inter_affine,
+        left_available,
+        above_merge_subblock,
+        above_inter_affine,
+        above_available,
+    )
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///
@@ -1192,5 +1230,68 @@ mod tests {
     #[test]
     fn merge_subblock_idx_fixed_zero() {
         assert_eq!(ctx_inc_merge_subblock_idx(), 0);
+    }
+
+    /// Round-152 — `inter_affine_flag` ctxInc per §9.3.4.2.2 / eq. 1551.
+    /// Table 133 lists `inter_affine_flag` and `merge_subblock_flag`
+    /// side-by-side under one row of `condL` / `condA` predicates, so
+    /// the two derivations must produce identical values for every
+    /// combination of the six neighbour-state inputs.
+    #[test]
+    fn inter_affine_flag_matches_merge_subblock_flag_row() {
+        for ml in [false, true] {
+            for la in [false, true] {
+                for lavail in [false, true] {
+                    for ma in [false, true] {
+                        for aa in [false, true] {
+                            for aavail in [false, true] {
+                                let expected =
+                                    ctx_inc_merge_subblock_flag(ml, la, lavail, ma, aa, aavail);
+                                let got = ctx_inc_inter_affine_flag(ml, la, lavail, ma, aa, aavail);
+                                assert_eq!(
+                                    got, expected,
+                                    "row drift at \
+                                     (ml={ml}, la={la}, lavail={lavail}, ma={ma}, aa={aa}, aavail={aavail})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Round-152 — three sentinel values from Table 133's eq. 1551.
+    #[test]
+    fn inter_affine_flag_no_neighbours_yields_zero() {
+        // Both neighbours unavailable → ctxInc = 0 regardless of flags.
+        assert_eq!(
+            ctx_inc_inter_affine_flag(true, true, false, true, true, false),
+            0
+        );
+    }
+
+    #[test]
+    fn inter_affine_flag_one_active_yields_one() {
+        // Left available with InterAffineFlag set → cond_l = 1.
+        assert_eq!(
+            ctx_inc_inter_affine_flag(false, true, true, false, false, true),
+            1
+        );
+        // Above available with MergeSubblockFlag set → cond_a = 1.
+        assert_eq!(
+            ctx_inc_inter_affine_flag(false, false, true, true, false, true),
+            1
+        );
+    }
+
+    #[test]
+    fn inter_affine_flag_both_active_yields_two() {
+        // Both neighbours available with at least one of the two flags
+        // set on each side.
+        assert_eq!(
+            ctx_inc_inter_affine_flag(true, false, true, false, true, true),
+            2
+        );
     }
 }

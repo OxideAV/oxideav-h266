@@ -50,8 +50,8 @@ use oxideav_core::{Error, Result};
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
     ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_bcw_idx,
-    ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_inter_pred_idc_bin0,
-    ctx_inc_inter_pred_idc_bin1, ctx_inc_intra_bdpcm_chroma_dir_flag,
+    ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_inter_affine_flag,
+    ctx_inc_inter_pred_idc_bin0, ctx_inc_inter_pred_idc_bin1, ctx_inc_intra_bdpcm_chroma_dir_flag,
     ctx_inc_intra_bdpcm_chroma_flag, ctx_inc_intra_bdpcm_luma_dir_flag,
     ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
@@ -591,6 +591,17 @@ pub struct LeafCuCtxs {
     /// `cRiceParam = 0`; only emitted when `merge_subblock_flag == 1
     /// && MaxNumSubblockMergeCand > 1`.
     pub merge_subblock_idx: Vec<ContextModel>,
+    /// Round-152 — `inter_affine_flag` (Table 84) — 6 entries split as
+    /// 3 ctx slots per non-I initType (initType 1 → slots 0..2,
+    /// initType 2 → slots 3..5). Indexed at parse time as
+    /// `(init_type - 1) * 3 + ctxInc` with the ctxInc derived via
+    /// [`ctx_inc_inter_affine_flag`] per §9.3.4.2.2 / Table 133 (whose
+    /// `condL` / `condA` predicates are identical to the
+    /// `merge_subblock_flag` row). Single ctx-coded bin (FL `cMax = 1`)
+    /// gated by §7.3.11.7's `sps_affine_enabled_flag && cbWidth >= 16
+    /// && cbHeight >= 16`; never signalled in I slices nor for the
+    /// `general_merge_flag == 1` branch.
+    pub inter_affine_flag: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -684,6 +695,7 @@ impl LeafCuCtxs {
             bcw_idx: init_contexts(SyntaxCtx::BcwIdx, slice_qp_y),
             merge_subblock_flag: init_contexts(SyntaxCtx::MergeSubblockFlag, slice_qp_y),
             merge_subblock_idx: init_contexts(SyntaxCtx::MergeSubblockIdx, slice_qp_y),
+            inter_affine_flag: init_contexts(SyntaxCtx::InterAffineFlag, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -2014,6 +2026,54 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             val += 1;
         }
         Ok(val)
+    }
+
+    /// Round-152 — Decode `inter_affine_flag[x0][y0]` per §7.3.11.7 /
+    /// Table 84 / Table 132.
+    ///
+    /// Binarisation: FL `cMax = 1` — a single ctx-coded bin per Table
+    /// 132. The ctx-slot is `(init_type - 1) * 3 + ctxInc` with the
+    /// ctxInc derived by [`ctx_inc_inter_affine_flag`] (§9.3.4.2.2 /
+    /// eq. 1551 with the Table 133 row whose `condL` / `condA` rules
+    /// are identical to `merge_subblock_flag`:
+    /// `cond{L,A} = MergeSubblockFlag[{L,A}] || InterAffineFlag[{L,A}]`).
+    /// Returns the decoded flag as a `bool`.
+    ///
+    /// **The caller is responsible for the §7.3.11.7 gates**:
+    /// `sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16` AND
+    /// the surrounding `general_merge_flag == 0` (`inter_affine_flag` is
+    /// only parsed on the non-merge inter branch). When any gate is
+    /// closed the syntax element is not present and §7.4.12.7 infers
+    /// it to 0 — this reader must NOT be invoked. Likewise the reader
+    /// assumes the slice is non-I (initType ∈ {1, 2}); affine flags are
+    /// never signalled in I slices.
+    pub fn read_inter_affine_flag(
+        &mut self,
+        left_merge_subblock: bool,
+        left_inter_affine: bool,
+        left_available: bool,
+        above_merge_subblock: bool,
+        above_inter_affine: bool,
+        above_available: bool,
+    ) -> Result<bool> {
+        let inc = ctx_inc_inter_affine_flag(
+            left_merge_subblock,
+            left_inter_affine,
+            left_available,
+            above_merge_subblock,
+            above_inter_affine,
+            above_available,
+        ) as usize;
+        // Table 84: 6 entries split as initType 1 → slots 0..2, initType
+        // 2 → slots 3..5 (per Table 51). Indexed as `(init_type - 1) * 3
+        // + ctxInc`.
+        let init_off = (self.ctxs.init_type as usize).saturating_sub(1) * 3;
+        let n = self.ctxs.inter_affine_flag.len() - 1;
+        let slot = (init_off + inc).min(n);
+        let bit = self
+            .dec
+            .decode_decision(&mut self.ctxs.inter_affine_flag[slot])?;
+        Ok(bit == 1)
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -4203,6 +4263,213 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Round-152: §7.3.11.7 `inter_affine_flag` reader round-trips ----
+    //
+    // The encoder mirror duplicates the reader's CABAC bin emission so a
+    // round-trip can be staged without a live encoder pipeline. The same
+    // pattern is used by the round-139 `merge_subblock_flag` tests above.
+
+    /// Encoder mirror of `read_inter_affine_flag` driving the same
+    /// context bundle bin-for-bin per §9.3.4.2.2 / eq. 1551 with the
+    /// Table 133 row identical to `merge_subblock_flag` and the Table 84
+    /// per-initType slot.
+    fn encode_inter_affine_flag(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        flag: bool,
+        left_merge_subblock: bool,
+        left_inter_affine: bool,
+        left_available: bool,
+        above_merge_subblock: bool,
+        above_inter_affine: bool,
+        above_available: bool,
+    ) {
+        let inc = crate::ctx::ctx_inc_inter_affine_flag(
+            left_merge_subblock,
+            left_inter_affine,
+            left_available,
+            above_merge_subblock,
+            above_inter_affine,
+            above_available,
+        ) as usize;
+        let init_off = (ctxs.init_type as usize).saturating_sub(1) * 3;
+        let n = ctxs.inter_affine_flag.len() - 1;
+        let slot = (init_off + inc).min(n);
+        let bit = if flag { 1 } else { 0 };
+        enc.encode_decision(&mut ctxs.inter_affine_flag[slot], bit)
+            .unwrap();
+    }
+
+    /// Per-bin round-trip helper for `inter_affine_flag`. Builds a
+    /// fresh CABAC stream with one bin and reads it back through the
+    /// matching context slot.
+    #[allow(clippy::too_many_arguments)]
+    fn inter_affine_flag_round_trip(
+        flag: bool,
+        init_type: u8,
+        left_merge_subblock: bool,
+        left_inter_affine: bool,
+        left_available: bool,
+        above_merge_subblock: bool,
+        above_inter_affine: bool,
+        above_available: bool,
+    ) -> bool {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_inter_affine_flag(
+            &mut enc,
+            &mut enc_ctxs,
+            flag,
+            left_merge_subblock,
+            left_inter_affine,
+            left_available,
+            above_merge_subblock,
+            above_inter_affine,
+            above_available,
+        );
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .read_inter_affine_flag(
+                left_merge_subblock,
+                left_inter_affine,
+                left_available,
+                above_merge_subblock,
+                above_inter_affine,
+                above_available,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn inter_affine_flag_round_trips_no_neighbours_both_init_types() {
+        // No neighbour info (cond_l = cond_a = 0). Both P-slice (init 1)
+        // and B-slice (init 2) initTypes round-trip the flag value.
+        for it in [1u8, 2] {
+            for flag in [false, true] {
+                assert_eq!(
+                    inter_affine_flag_round_trip(flag, it, false, false, true, false, false, true,),
+                    flag,
+                    "inter_affine_flag round trip failed at init={it} flag={flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inter_affine_flag_round_trips_with_one_active_neighbour() {
+        // Left neighbour was an affine inter CU → cond_l = 1 → ctxInc = 1.
+        for flag in [false, true] {
+            assert_eq!(
+                inter_affine_flag_round_trip(
+                    flag, 2, // B-slice
+                    false, true, true, // left InterAffineFlag, available
+                    false, false, true,
+                ),
+                flag
+            );
+            // Above neighbour was a sub-block-merge CU → cond_a = 1.
+            assert_eq!(
+                inter_affine_flag_round_trip(flag, 2, false, false, true, true, false, true,),
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn inter_affine_flag_round_trips_with_both_active_neighbours() {
+        // Both neighbours contribute → ctxInc = 2 (max).
+        for flag in [false, true] {
+            for it in [1u8, 2] {
+                assert_eq!(
+                    inter_affine_flag_round_trip(flag, it, true, false, true, false, true, true,),
+                    flag
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inter_affine_flag_unavailable_neighbour_masks_active_flags() {
+        // InterAffineFlag set on left but available_l = false should
+        // contribute 0 to ctxInc — the round-trip still works.
+        for flag in [false, true] {
+            assert_eq!(
+                inter_affine_flag_round_trip(
+                    flag, 2, false, true, false, // left affine but unavail
+                    false, true, true, // above affine + avail
+                ),
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn inter_affine_flag_per_ctx_slots_are_addressable() {
+        // Defensive: confirm that for every legal (init_type, ctxInc)
+        // pair the slot index lands inside the per-Table 84 6-entry
+        // bundle. Mirrors `merge_subblock_flag_per_ctx_slots_are_addressable`
+        // because the two tables share shape.
+        for it in [1u8, 2] {
+            let ctxs = LeafCuCtxs::init_with_init_type(26, it);
+            let init_off = (it as usize - 1) * 3;
+            for inc in 0..=2usize {
+                let slot = init_off + inc;
+                assert!(
+                    slot < ctxs.inter_affine_flag.len(),
+                    "slot {slot} out of range for init_type {it}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inter_affine_flag_ctx_bundle_disjoint_from_merge_subblock_flag() {
+        // The reader uses *separate* CABAC state machines for the two
+        // syntax elements (Table 84 vs Table 107). Confirm the two
+        // bundles are independent vectors of contexts — flipping one
+        // must not perturb the other's `pState`.
+        let mut ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+        let baseline_subblock: Vec<_> = ctxs
+            .merge_subblock_flag
+            .iter()
+            .map(|c| (c.p_state_idx0, c.p_state_idx1, c.shift_idx))
+            .collect();
+        let baseline_affine: Vec<_> = ctxs
+            .inter_affine_flag
+            .iter()
+            .map(|c| (c.p_state_idx0, c.p_state_idx1, c.shift_idx))
+            .collect();
+        // Sanity: the two tables must NOT initialise to identical
+        // pState pairs — Table 84 and Table 107 carry different
+        // initValue / shiftIdx rows per the spec transcription.
+        assert_ne!(
+            baseline_subblock, baseline_affine,
+            "Tables 84 and 107 should initialise to different ctx state"
+        );
+        // Drive a couple of decisions through one bundle and confirm
+        // the other is untouched.
+        let mut enc = ArithEncoder::new();
+        enc.encode_decision(&mut ctxs.inter_affine_flag[0], 1)
+            .unwrap();
+        enc.encode_decision(&mut ctxs.inter_affine_flag[1], 0)
+            .unwrap();
+        let after_subblock: Vec<_> = ctxs
+            .merge_subblock_flag
+            .iter()
+            .map(|c| (c.p_state_idx0, c.p_state_idx1, c.shift_idx))
+            .collect();
+        assert_eq!(
+            after_subblock, baseline_subblock,
+            "driving inter_affine_flag must not perturb merge_subblock_flag state"
+        );
     }
 
     // ---- Round-146: §7.3.11.7 merge_data() wire-up of

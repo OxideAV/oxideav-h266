@@ -821,6 +821,45 @@ Encoder-side subblock-merge emission + per-CB live-neighbour grid
 for the Table 133 ctxInc + the `cu_coded_flag = 1`
 `transform_tree()` body for subblock-merge CUs remain follow-ups.
 
+**Round-152 lands the §7.3.11.7 `inter_affine_flag[x0][y0]` CABAC
+reader + Table 84 context bundle** — the second round-149 follow-up.
+The new `SyntaxCtx::InterAffineFlag` ships Table 84's transcription
+verbatim (`initValue = [12, 13, 14, 19, 13, 6]`,
+`shiftIdx = [4, 0, 0, 4, 0, 0]` — 6 ctxIdx, 3 per non-I initType).
+`ctx_inc_inter_affine_flag(...)` derives the ctxInc per §9.3.4.2.2 /
+eq. 1551 with the Table 133 row whose `condL` / `condA` predicates are
+identical to `merge_subblock_flag` (the spec lists the two syntax
+elements side-by-side under a single definition); the new helper
+delegates to `ctx_inc_merge_subblock_flag` so the two derivations
+cannot drift apart by accident. A new
+`LeafCuCtxs::inter_affine_flag: Vec<ContextModel>` bundle is
+initialised from Table 84 alongside the round-139
+`merge_subblock_flag` bundle, and `LeafCuReader::read_inter_affine_flag`
+implements the FL `cMax = 1` single ctx-coded bin reader per Table
+132, indexing `(init_type - 1) * 3 + ctxInc` against the per-initType
+triplet. The reader contract is documented for the §7.3.11.7 gates the
+caller is responsible for: `sps_affine_enabled_flag && cbWidth >= 16
+&& cbHeight >= 16` AND the surrounding `general_merge_flag == 0` (the
+syntax element only appears on the non-merge inter branch); when any
+gate is closed §7.4.12.7 infers it to 0 and the reader must NOT be
+invoked. No CTU-walker wire-up yet — this round adds the bin-level
+parser only. The live consumer is the future non-merge affine inter
+CU walk, which will be the one-line drop-in that finally populates
+the round-149 `inter_affine_grid` with non-default values. 12 new lib
+tests pin Table 84 length + bit-exact init/shift, an exhaustive 64-case
+equality between `ctx_inc_inter_affine_flag` and
+`ctx_inc_merge_subblock_flag` over every combination of the six
+neighbour-state inputs, the three §9.3.4.2.2 sentinel cases
+(no-neighbours → 0, one-active → 1, both-active → 2),
+encoder-mirror round-trip across both initTypes for each case,
+unavailable-neighbour masking, per-ctx slot addressability for every
+legal `(init_type, ctxInc)` pair, and a bundle-isolation test
+confirming the `inter_affine_flag` and `merge_subblock_flag` CABAC
+state machines are disjoint and initialise to different `pState`
+rows. The non-merge affine inter CU walker that would actually parse
+`inter_affine_flag` on the wire + populate `inter_affine_grid`
+remains the next milestone.
+
 **Round-149 lands the per-CB live `MergeSubblockFlag[x][y]` /
 `InterAffineFlag[x][y]` neighbour grid fuse into
 `CtuWalker::compute_cu_neighbourhood`** — the first round-146
