@@ -892,6 +892,27 @@ pub struct CuNeighbourhood {
     pub left_cu_skip: bool,
     /// `CuSkipFlag[xNbA][yNbA]`.
     pub above_cu_skip: bool,
+    /// Round-149 — `MergeSubblockFlag[xNbL][yNbL]` per §9.3.4.2.2 /
+    /// Table 133 merge-side row. Folded with `left_inter_affine` into
+    /// the ctxInc input for [`Self::read_merge_subblock_flag`] (the
+    /// §7.3.11.7 wire-up). Spec semantics: the per-CB merge-side
+    /// neighbour flag — `true` only when the neighbouring CB was itself
+    /// decoded with `merge_subblock_flag == 1`.
+    pub left_merge_subblock: bool,
+    /// Round-149 — `MergeSubblockFlag[xNbA][yNbA]` (above neighbour
+    /// mirror of [`Self::left_merge_subblock`]).
+    pub above_merge_subblock: bool,
+    /// Round-149 — `InterAffineFlag[xNbL][yNbL]` per §9.3.4.2.2 /
+    /// Table 133. The encoder-side affine inter (non-merge) path is
+    /// not yet parsed by the CTU walker, so for round-149 this stays
+    /// `false` for every neighbour; the field is plumbed now so the
+    /// §7.3.11.7 wire-up no longer hard-codes the `(false, false)`
+    /// default and the eventual affine-inter walker has a one-line
+    /// drop-in point.
+    pub left_inter_affine: bool,
+    /// Round-149 — `InterAffineFlag[xNbA][yNbA]` (above neighbour
+    /// mirror of [`Self::left_inter_affine`]).
+    pub above_inter_affine: bool,
 }
 
 /// Leaf-CU syntax reader. Stateless w.r.t. the spec (each call to
@@ -1243,25 +1264,28 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         //     `merge_subblock_flag == 1` short-circuits the entire
         //     downstream regular / MMVD / CIIP / GPM tree.
         //
-        // Neighbour state for the §9.3.4.2.2 / Table 133 ctxInc
-        // derivation (`cond{L,A} = MergeSubblockFlag[{L,A}] ||
-        // InterAffineFlag[{L,A}]`) is not yet tracked per CB in
-        // `CuNeighbourhood` (the round-21..145 path only carries
-        // intra / cu_skip neighbour state). For the wire-up we pass
-        // the §7.4.12.7 defaults `(false, false)` for both
-        // neighbours; the live-neighbour fill stays a follow-up,
-        // alongside the rest of the per-CB merge-side neighbour
-        // grid. This matches the pre-r146 stub-call pattern in
-        // `bdof.rs` (`merge_subblock_flag: false` neighbour seed).
+        // Round-149: neighbour state for the §9.3.4.2.2 / Table 133
+        // ctxInc derivation (`cond{L,A} = MergeSubblockFlag[{L,A}] ||
+        // InterAffineFlag[{L,A}]`) is now sourced from the per-CB
+        // [`CuNeighbourhood::{left,above}_merge_subblock`] +
+        // [`CuNeighbourhood::{left,above}_inter_affine`] slots that
+        // the [`CtuWalker`] populates from the picture-wide live
+        // sub-block-merge / affine-inter grid. The walker writes
+        // `merge_subblock_flag` per leaf CU after decode (the affine-
+        // inter path is not yet parsed, so `inter_affine_flag` stays
+        // 0 across the whole picture — the field is plumbed for the
+        // future drop-in). When the §7.3.11.7 size gate is closed,
+        // §7.4.12.7 infers `merge_subblock_flag = 0` and we skip the
+        // reader entirely.
         let max_sb_merge = self.tools.max_num_subblock_merge_cand;
         let subblock_gate_open = max_sb_merge > 0 && info.cb_width >= 8 && info.cb_height >= 8;
         let merge_subblock_flag = if subblock_gate_open {
             self.read_merge_subblock_flag(
-                /* left_merge_subblock */ false,
-                /* left_inter_affine   */ false,
+                neigh.left_merge_subblock,
+                neigh.left_inter_affine,
                 neigh.left_available,
-                /* above_merge_subblock */ false,
-                /* above_inter_affine   */ false,
+                neigh.above_merge_subblock,
+                neigh.above_inter_affine,
                 neigh.above_available,
             )?
         } else {

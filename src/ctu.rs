@@ -652,6 +652,29 @@ pub struct CtuWalker<'a, 'b> {
     intra_grid_w: u32,
     /// Round-28 — height of [`Self::intra_grid`] in 4x4 blocks.
     intra_grid_h: u32,
+    /// Round-149 — per-CB live sub-block-merge grid sampled at 4x4
+    /// luma granularity. Mirrors `MergeSubblockFlag[x][y]` from
+    /// §7.3.11.7: every 4x4 block touched by a CU decoded with
+    /// `merge_subblock_flag == 1` carries `true`. The §9.3.4.2.2 /
+    /// Table 133 `cond{L,A}` ctxInc for `read_merge_subblock_flag`
+    /// samples this grid through [`Self::compute_cu_neighbourhood`].
+    /// Initialised to `false` (== unavailable / non-subblock-merge);
+    /// the inter leaf CU walker flips covered cells to `true` when
+    /// the parsed `merge_data.merge_subblock_flag == 1` and clears
+    /// them otherwise (e.g. when an intra or non-subblock-merge inter
+    /// CU later overwrites the same picture region — single-pass
+    /// scan in slice order, the merge-side neighbour query at a CU
+    /// only ever reads cells the prior CUs already wrote).
+    subblock_merge_grid: Vec<bool>,
+    /// Round-149 — per-CB live affine-inter grid sampled at 4x4 luma
+    /// granularity. Mirrors `InterAffineFlag[x][y]` from §7.3.11.7
+    /// (the non-merge affine inter path). The CTU walker does not
+    /// yet parse `inter_affine_flag`; every cell stays `false` for
+    /// round-149. The grid is plumbed so the §9.3.4.2.2 /
+    /// Table 133 `cond{L,A} = MergeSubblockFlag[...] ||
+    /// InterAffineFlag[...]` ctxInc only needs a one-line drop-in
+    /// when the affine-inter walker arrives.
+    inter_affine_grid: Vec<bool>,
     /// Round-56 — picture-wide CU neighbour map used by the
     /// [`TreeWalker`] to derive the §9.3.4.2 ctxInc. Populated as each
     /// CTU's leaf CUs commit; `decode_ctu_partitions` hands a `&mut`
@@ -775,6 +798,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let intra_grid_w = layout.pic_width_luma.div_ceil(4);
         let intra_grid_h = layout.pic_height_luma.div_ceil(4);
         let intra_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        // Round-149 — per-CB live sub-block-merge / affine-inter grids
+        // share the §8.5.6.7 intra-grid geometry (4x4 luma cells across
+        // the full picture). Both initialise to `false` so picture-edge
+        // and pre-decode neighbours register as "no merge_subblock /
+        // no inter_affine", matching the §7.4.12.7 inference for any
+        // unavailable neighbour.
+        let subblock_merge_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        let inter_affine_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         // §7.4.3.5 — Log2ParMrgLevel = pps_log2_parallel_merge_level_minus2
         // + 2. Our PPS parser does not yet surface that field, so we
         // default to the spec minimum (2 → ParMrgLevel = 4) which is
@@ -806,6 +837,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             intra_grid,
             intra_grid_w,
             intra_grid_h,
+            subblock_merge_grid,
+            inter_affine_grid,
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
         })
     }
@@ -865,6 +898,77 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let row_off = (by * self.intra_grid_w) as usize;
             for bx in bx0..bx1 {
                 self.intra_grid[row_off + bx as usize] = is_intra;
+            }
+        }
+    }
+
+    /// Round-149 — sample `MergeSubblockFlag[xCb][yCb]` at picture-
+    /// absolute luma `(x, y)`. Returns `false` when the position is
+    /// out of bounds (matching the §6.4.4 availability mask:
+    /// unavailable neighbour → `cond = 0`) and otherwise the cell's
+    /// stored sub-block-merge flag.
+    fn sample_subblock_merge_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.subblock_merge_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// Round-149 — sample `InterAffineFlag[xCb][yCb]` at picture-
+    /// absolute luma `(x, y)`. Mirrors
+    /// [`Self::sample_subblock_merge_at_luma`]; the non-merge affine
+    /// inter path is not yet parsed by the CTU walker so this is
+    /// always `false` for round-149.
+    fn sample_inter_affine_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.inter_affine_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// Round-149 — broadcast `is_subblock_merge` across every 4x4 cell
+    /// touched by the rectangle `[x, x+w) x [y, y+h)`. Mirrors
+    /// [`Self::write_intra_block`] for the §9.3.4.2.2 / Table 133
+    /// `MergeSubblockFlag` neighbour grid.
+    fn write_subblock_merge_block(&mut self, x: u32, y: u32, w: u32, h: u32, value: bool) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
+        let by1 = (y + h).div_ceil(4).min(self.intra_grid_h);
+        for by in by0..by1 {
+            let row_off = (by * self.intra_grid_w) as usize;
+            for bx in bx0..bx1 {
+                self.subblock_merge_grid[row_off + bx as usize] = value;
+            }
+        }
+    }
+
+    /// Round-149 — broadcast `is_inter_affine` across every 4x4 cell
+    /// touched by the rectangle `[x, x+w) x [y, y+h)`. Mirrors
+    /// [`Self::write_intra_block`] for the §9.3.4.2.2 / Table 133
+    /// `InterAffineFlag` neighbour grid. Not yet invoked from the
+    /// leaf-CU walker (the non-merge affine inter path is unparsed);
+    /// kept `pub(crate)`-callable for tests that pre-load the grid.
+    #[allow(dead_code)]
+    fn write_inter_affine_block(&mut self, x: u32, y: u32, w: u32, h: u32, value: bool) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
+        let by1 = (y + h).div_ceil(4).min(self.intra_grid_h);
+        for by in by0..by1 {
+            let row_off = (by * self.intra_grid_w) as usize;
+            for bx in bx0..bx1 {
+                self.inter_affine_grid[row_off + bx as usize] = value;
             }
         }
     }
@@ -1275,10 +1379,39 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         for ccu in &cus {
             let neigh = self.compute_cu_neighbourhood(ccu);
             let (info, residual) = self.decode_leaf_cu_syntax(ccu, &neigh)?;
+            // Round-149 — commit the per-CB `MergeSubblockFlag` so
+            // subsequent leaf CUs in the same CTU (and downstream CTUs
+            // in raster order) see this CU as a merge-side neighbour
+            // through [`Self::compute_cu_neighbourhood`]. The
+            // `InterAffineFlag` write is reserved for the future
+            // non-merge affine inter walker; until then every leaf CU
+            // emits `false` for the affine flag, which is the
+            // §7.4.12.7 inference.
+            self.commit_subblock_neighbour_state(ccu, &info);
             infos.push(info);
             residuals.push(residual);
         }
         Ok((cus, infos, residuals))
+    }
+
+    /// Round-149 — commit the per-CB `MergeSubblockFlag[x][y]` /
+    /// `InterAffineFlag[x][y]` for a freshly-decoded leaf CU into the
+    /// picture-wide grids that drive
+    /// [`Self::compute_cu_neighbourhood`]. Idempotent: callers may
+    /// invoke from both the syntax-only path
+    /// ([`Self::decode_ctu_full`]) and the reconstruction path
+    /// ([`Self::reconstruct_leaf_cu`]); the per-cell write is the
+    /// same boolean either way.
+    fn commit_subblock_neighbour_state(&mut self, cu: &CtuCu, info: &LeafCuInfo) {
+        let merge_sb = info.inter.merge_data.merge_subblock_flag;
+        self.write_subblock_merge_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, merge_sb);
+        // The non-merge affine inter path is not yet parsed by the
+        // CTU walker — `info.inter` carries no `inter_affine_flag`
+        // field today. Every leaf CU clears its 4x4 cells to `false`
+        // so any pre-existing stale state from a prior slice's
+        // overlapping picture region is wiped. When the affine
+        // walker lands, swap the `false` below for the parsed flag.
+        self.write_inter_affine_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
     }
 
     /// Build a [`CuNeighbourhood`] for a CU at `ccu.cu.(x, y)` by
@@ -1288,11 +1421,28 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// round-21 inter walker does not need MPM neighbour info, and
     /// the intra walker continues to use `CuNeighbourhood::default()`
     /// via the explicit zero fall-back.
+    ///
+    /// Round-149 — also samples the per-CB sub-block-merge /
+    /// inter-affine grids at the same `(x-1, y)` / `(x, y-1)` luma
+    /// positions, so the §7.3.11.7 `read_merge_subblock_flag` reader
+    /// gets a live Table-133 ctxInc input instead of the pre-r149
+    /// `(false, false)` stub. The inter-affine grid is reserved for
+    /// the future non-merge affine inter walker; until that lands,
+    /// every cell reads `false` and the ctxInc collapses to the
+    /// merge-side-only term.
     fn compute_cu_neighbourhood(&self, ccu: &CtuCu) -> CuNeighbourhood {
         let x = ccu.cu.x as i32;
         let y = ccu.cu.y as i32;
         let left = self.motion_field.get_at_luma(x - 1, y);
         let above = self.motion_field.get_at_luma(x, y - 1);
+        // §9.3.4.2.2 / Table 133 neighbour positions: the merge-side
+        // ctxInc samples the same `(xCb − 1, yCb)` (left) and
+        // `(xCb, yCb − 1)` (above) 4×4 cells the cu_skip_flag /
+        // pred_mode ctxInc already use.
+        let left_merge_subblock = self.sample_subblock_merge_at_luma(x - 1, y);
+        let above_merge_subblock = self.sample_subblock_merge_at_luma(x, y - 1);
+        let left_inter_affine = self.sample_inter_affine_at_luma(x - 1, y);
+        let above_inter_affine = self.sample_inter_affine_at_luma(x, y - 1);
         CuNeighbourhood {
             left_available: x > 0,
             above_available: y > 0,
@@ -1300,6 +1450,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             above: None,
             left_cu_skip: left.available && left.cu_skip_flag,
             above_cu_skip: above.available && above.cu_skip_flag,
+            left_merge_subblock,
+            above_merge_subblock,
+            left_inter_affine,
+            above_inter_affine,
         }
     }
 
@@ -1486,6 +1640,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cu.cu.h,
                 matches!(info.pred_mode, CuPredMode::Intra),
             );
+            self.commit_subblock_neighbour_state(cu, info);
             return Ok(());
         }
 
@@ -1687,6 +1842,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu.cu.h,
             matches!(info.pred_mode, CuPredMode::Intra),
         );
+        // Round-149 — mirror the §9.3.4.2.2 / Table 133 merge-side
+        // neighbour grid update. For intra CUs the per-CB
+        // `MergeSubblockFlag` is always 0 by spec; this clears any
+        // stale bit from a prior partition / slice that touched the
+        // same picture region.
+        self.commit_subblock_neighbour_state(cu, info);
         Ok(())
     }
 
@@ -2283,6 +2444,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // MODE_INTER per §7.4.12.7 — the spec uses the intra-flag of
         // the *neighbour* CU's pred mode, not the predictor mix.
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
+        // Round-149 — the regular-merge inter path (this method) sets
+        // `merge_subblock_flag = 0`; clear the per-CB grid so the
+        // §9.3.4.2.2 / Table 133 ctxInc reads it back as 0 for the
+        // next CU's merge-side neighbour query.
+        self.commit_subblock_neighbour_state(cu, info);
         Ok(())
     }
 
@@ -2519,6 +2685,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm_chroma: false,
         });
         self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);
+        // Round-149 — GPM CUs always carry `merge_subblock_flag = 0`
+        // (§7.3.11.7: the GPM merge sub-tree only opens after the
+        // subblock-merge branch was bypassed). Clear the per-CB grid
+        // so the next CU's merge-side ctxInc query reads 0 for this
+        // region.
+        self.write_subblock_merge_block(cb_x, cb_y, cb_w, cb_h, false);
+        self.write_inter_affine_block(cb_x, cb_y, cb_w, cb_h, false);
         // `cand_b` is not consulted again post-MC (its motion is folded
         // into the picture's pixels via the §8.5.7.2 blend), so swallow
         // it explicitly.
@@ -4295,5 +4468,297 @@ mod tests {
             ctu_addr_rs: 999,
         };
         assert!(walker.decode_ctu_partitions(&zero_ctu).unwrap().is_empty());
+    }
+
+    // =====================================================================
+    // Round-149 — per-CB live MergeSubblockFlag / InterAffineFlag grid
+    // fuse into [`CtuWalker::compute_cu_neighbourhood`]
+    // =====================================================================
+
+    /// A freshly-built walker initialises both per-CB grids to `false`.
+    /// Sampling at any in-bounds 4x4 cell returns `false`; the
+    /// out-of-bounds path returns `false` too (§6.4.4 unavailability
+    /// short-circuit).
+    #[test]
+    fn round149_grids_default_to_false_and_oob_returns_false() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // In-bounds samples — every cell defaults to false.
+        for (x, y) in &[(0, 0), (4, 0), (0, 4), (64, 64), (124, 124)] {
+            assert!(!walker.sample_subblock_merge_at_luma(*x, *y));
+            assert!(!walker.sample_inter_affine_at_luma(*x, *y));
+        }
+        // Out-of-bounds samples (negative + past-picture-edge) also
+        // return false — matches the §6.4.4 mask for an unavailable
+        // neighbour.
+        assert!(!walker.sample_subblock_merge_at_luma(-1, 0));
+        assert!(!walker.sample_subblock_merge_at_luma(0, -1));
+        assert!(!walker.sample_subblock_merge_at_luma(128, 0));
+        assert!(!walker.sample_subblock_merge_at_luma(0, 128));
+        assert!(!walker.sample_inter_affine_at_luma(-1, 0));
+        assert!(!walker.sample_inter_affine_at_luma(0, -1));
+        assert!(!walker.sample_inter_affine_at_luma(128, 0));
+        assert!(!walker.sample_inter_affine_at_luma(0, 128));
+    }
+
+    /// [`CtuWalker::write_subblock_merge_block`] broadcasts the boolean
+    /// across every 4x4 cell of the rectangle; reads at neighbouring
+    /// cells inside and outside the rectangle reflect the write.
+    #[test]
+    fn round149_write_subblock_merge_block_broadcasts_then_reads_back() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // Flip a 16x16 region at (32, 32) to true.
+        walker.write_subblock_merge_block(32, 32, 16, 16, true);
+        // Every covered 4x4 cell reads back true.
+        for dy in (0..16).step_by(4) {
+            for dx in (0..16).step_by(4) {
+                assert!(
+                    walker.sample_subblock_merge_at_luma(32 + dx, 32 + dy),
+                    "cell ({}, {}) should be true after write_subblock_merge_block",
+                    32 + dx,
+                    32 + dy
+                );
+            }
+        }
+        // Cells outside the written rectangle stay false.
+        assert!(!walker.sample_subblock_merge_at_luma(28, 32));
+        assert!(!walker.sample_subblock_merge_at_luma(32, 28));
+        assert!(!walker.sample_subblock_merge_at_luma(48, 32));
+        assert!(!walker.sample_subblock_merge_at_luma(32, 48));
+    }
+
+    /// [`CtuWalker::compute_cu_neighbourhood`] reads the per-CB grids
+    /// at `(xCb − 1, yCb)` for the left neighbour and `(xCb, yCb − 1)`
+    /// for the above neighbour, matching the §9.3.4.2.2 / Table 133
+    /// merge-side ctxInc neighbour positions.
+    #[test]
+    fn round149_compute_cu_neighbourhood_samples_left_above_subblock_merge() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // Pre-load: left neighbour of CU at (16, 0) carries
+        // MergeSubblockFlag = 1; above neighbour of CU at (16, 16)
+        // carries MergeSubblockFlag = 1.
+        walker.write_subblock_merge_block(0, 0, 16, 16, true);
+        let ccu_a = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh_a = walker.compute_cu_neighbourhood(&ccu_a);
+        assert!(neigh_a.left_available);
+        assert!(neigh_a.left_merge_subblock);
+        assert!(!neigh_a.above_available); // y == 0
+        assert!(!neigh_a.above_merge_subblock);
+        let ccu_b = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh_b = walker.compute_cu_neighbourhood(&ccu_b);
+        assert!(!neigh_b.left_available); // x == 0
+        assert!(neigh_b.above_available);
+        assert!(neigh_b.above_merge_subblock);
+    }
+
+    /// The `InterAffineFlag` grid plumbs through `compute_cu_neighbourhood`
+    /// even though the CTU walker does not yet write into it. A test-only
+    /// pre-load via [`CtuWalker::write_inter_affine_block`] confirms the
+    /// neighbour query reads it back correctly.
+    #[test]
+    fn round149_compute_cu_neighbourhood_samples_left_above_inter_affine() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.write_inter_affine_block(0, 0, 16, 16, true);
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh = walker.compute_cu_neighbourhood(&ccu);
+        // Left neighbour at (15, 16) is *outside* the (0,0)..(16,16)
+        // rectangle on y (rectangle is rows 0..16, so y=16 is outside).
+        assert!(!neigh.left_inter_affine);
+        // Above neighbour at (16, 15) is also outside the rectangle on
+        // x (col=16 is outside the cols 0..16 rectangle).
+        assert!(!neigh.above_inter_affine);
+        // Now load (16, 0)..(32, 16) so the left-of-(16, 16) cell at
+        // (15, 16) becomes irrelevant; the above-of-(16, 16) cell is
+        // (16, 15) which lives inside the new rectangle.
+        walker.write_inter_affine_block(16, 0, 16, 16, true);
+        let neigh2 = walker.compute_cu_neighbourhood(&ccu);
+        assert!(neigh2.above_inter_affine);
+        // Left-of-(16, 16) cell at (15, 16) still outside any
+        // written rectangle.
+        assert!(!neigh2.left_inter_affine);
+    }
+
+    /// [`CtuWalker::commit_subblock_neighbour_state`] writes the parsed
+    /// `MergeSubblockFlag` into the grid and clears
+    /// `InterAffineFlag` (the latter is not yet parsed). Verified end-
+    /// to-end: a CU with `merge_subblock_flag = 1` flips the cells the
+    /// next CU's neighbour query reads.
+    #[test]
+    fn round149_commit_subblock_neighbour_state_writes_merge_flag() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let cu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.merge_data.merge_subblock_flag = true;
+        walker.commit_subblock_neighbour_state(&cu, &info);
+        // The just-committed CU's region reads back true on the
+        // sub-block grid and false on the affine-inter grid.
+        assert!(walker.sample_subblock_merge_at_luma(0, 0));
+        assert!(walker.sample_subblock_merge_at_luma(12, 12));
+        assert!(!walker.sample_inter_affine_at_luma(0, 0));
+        assert!(!walker.sample_inter_affine_at_luma(12, 12));
+        // A CU at (16, 0) would now see the (0,0)..(16,16) region as
+        // its left neighbour with merge_subblock = true.
+        let next = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh = walker.compute_cu_neighbourhood(&next);
+        assert!(neigh.left_merge_subblock);
+        assert!(!neigh.left_inter_affine);
+    }
+
+    /// `commit_subblock_neighbour_state` for an intra CU clears the
+    /// merge-subblock cells (consistent with the §7.4.12.7 inference:
+    /// `MergeSubblockFlag` is always 0 for non-inter CUs). A stale `true`
+    /// from a prior overlapping region is wiped.
+    #[test]
+    fn round149_commit_subblock_neighbour_state_intra_clears_stale_flag() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // Pre-load a stale true.
+        walker.write_subblock_merge_block(0, 0, 16, 16, true);
+        assert!(walker.sample_subblock_merge_at_luma(8, 8));
+        let cu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Intra,
+            ..LeafCuInfo::default() // merge_subblock_flag default = false
+        };
+        walker.commit_subblock_neighbour_state(&cu, &info);
+        // Stale bit wiped — intra CU's `merge_subblock_flag = 0` per
+        // §7.4.12.7.
+        assert!(!walker.sample_subblock_merge_at_luma(8, 8));
+    }
+
+    /// A CU strictly outside any written rectangle reads
+    /// `(left_merge_subblock, above_merge_subblock) = (false, false)`,
+    /// which matches the §7.4.12.7 default-inference path the pre-r149
+    /// stub-call hard-coded — i.e. the round-149 fuse stays
+    /// backward-compatible on the existing fixture path.
+    #[test]
+    fn round149_default_neighbours_match_pre_r149_stub() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let cu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 32,
+                y: 32,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let neigh = walker.compute_cu_neighbourhood(&cu);
+        // Both neighbour positions are inside the picture (so
+        // `*_available` is true), but the per-CB grid was never
+        // written, so every per-CB flag stays false — same as the
+        // pre-r149 wire-up that passed (false, false) directly.
+        assert!(neigh.left_available);
+        assert!(neigh.above_available);
+        assert!(!neigh.left_merge_subblock);
+        assert!(!neigh.above_merge_subblock);
+        assert!(!neigh.left_inter_affine);
+        assert!(!neigh.above_inter_affine);
     }
 }

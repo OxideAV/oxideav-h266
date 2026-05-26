@@ -821,6 +821,48 @@ Encoder-side subblock-merge emission + per-CB live-neighbour grid
 for the Table 133 ctxInc + the `cu_coded_flag = 1`
 `transform_tree()` body for subblock-merge CUs remain follow-ups.
 
+**Round-149 lands the per-CB live `MergeSubblockFlag[x][y]` /
+`InterAffineFlag[x][y]` neighbour grid fuse into
+`CtuWalker::compute_cu_neighbourhood`** — the first round-146
+follow-up. Two picture-wide 4×4 grids (`subblock_merge_grid`,
+`inter_affine_grid`) sharing the existing round-28 §8.5.6.7 intra-
+grid geometry now drive the §9.3.4.2.2 / Table 133 `cond{L,A} =
+MergeSubblockFlag[{L,A}] || InterAffineFlag[{L,A}]` ctxInc input
+for `read_merge_subblock_flag`. Four new `CuNeighbourhood` fields
+(`left_merge_subblock`, `above_merge_subblock`, `left_inter_affine`,
+`above_inter_affine`) replace the pre-r149 hard-coded `(false,
+false)` stub in the §7.3.11.7 wire-up. A single-source-of-truth
+`commit_subblock_neighbour_state(cu, info)` helper is invoked from
+both the syntax-only path (`decode_ctu_full`) and every CU-completion
+site in the reconstruction path (intra single-TB, ISP, regular-merge
+inter, GPM) so the next CU's neighbour query reads the live state.
+`compute_cu_neighbourhood` samples both grids at the same
+`(xCb − 1, yCb)` / `(xCb, yCb − 1)` 4×4 cells the round-21
+cu_skip_flag / pred_mode ctxInc already use, and the §7.3.11.7
+wire-up now feeds the parsed flags straight into
+`read_merge_subblock_flag`. The non-merge affine inter path is not
+yet parsed by the CTU walker, so the `inter_affine_grid` always
+reads back `false` (matching the §7.4.12.7 inference); the field is
+plumbed end-to-end so the eventual affine-inter walker is a
+one-line drop-in (`write_inter_affine_block` already exists). 7 new
+lib tests pin (a) both grids default to false + out-of-bounds
+returns false per §6.4.4 unavailability, (b)
+`write_subblock_merge_block` broadcasts across every covered 4×4
+cell with surrounding cells unchanged, (c)
+`compute_cu_neighbourhood` reads the left-of-(16, 0) and
+above-of-(0, 16) cells correctly with picture-edge unavailability
+folded in, (d) the `inter_affine_grid` plumbs through the same
+neighbour positions, (e) a CU committed with
+`merge_subblock_flag = 1` flips the per-CB grid so a CU at (16, 0)
+reads `left_merge_subblock = true`, (f) an intra CU commit clears a
+stale pre-loaded `true` (the §7.4.12.7 inference for non-inter CUs),
+and (g) un-loaded neighbours read `(false, false)` so the pre-r149
+stub-call path stays byte-identical on every existing fixture.
+Encoder-side subblock-merge emission, the `cu_coded_flag = 1`
+`transform_tree()` body for subblock-merge CUs, the non-merge affine
+inter CU walk that would actually write into `inter_affine_grid`,
+and the rest of the non-merge inter CU walk remain follow-ups.
+
 **Round-142 lands the §7.4.3.4 eq. 85 `MaxNumSubblockMergeCand`
 derivation** — the SPS-side scalar that drives the round-139
 `merge_subblock_idx` `cMax = MaxNumSubblockMergeCand − 1` truncated-Rice
