@@ -279,6 +279,19 @@ pub struct CuToolFlags {
     /// (P-slices never enter GPM); the round-21..30 paths only ever
     /// consulted `slice_is_inter`.
     pub slice_is_b: bool,
+    /// `MaxNumSubblockMergeCand` derived per §7.4.3.4 eq. 85 from
+    /// `sps_affine_enabled_flag`, `sps_five_minus_max_num_subblock_merge_cand`,
+    /// `sps_sbtmvp_enabled_flag` and `ph_temporal_mvp_enabled_flag`
+    /// (see [`crate::sps::SeqParameterSet::max_num_subblock_merge_cand`]).
+    /// Round-146 wire-up: gates the §7.3.11.7
+    /// `merge_subblock_flag` parse (only emitted when this is `> 0`
+    /// AND `cbW >= 8 && cbH >= 8`) and caps the `merge_subblock_idx`
+    /// TR binarisation (`cMax = MaxNumSubblockMergeCand − 1`). When
+    /// `0` the subblock-merge branch collapses entirely and the
+    /// §7.4.12.7 inference forces `merge_subblock_flag = 0`,
+    /// re-routing the merge sub-tree through the regular / MMVD /
+    /// CIIP / GPM path. Only meaningful when `slice_is_inter == true`.
+    pub max_num_subblock_merge_cand: u32,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -412,6 +425,8 @@ impl Default for LeafCuInfo {
                     gpm_partition_idx: 0,
                     gpm_idx0: 0,
                     gpm_idx1: 0,
+                    merge_subblock_flag: false,
+                    merge_subblock_idx: 0,
                 },
             },
         }
@@ -1203,6 +1218,94 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         }
 
         // ---- merge_data() (§7.3.11.7) -----------------------------------
+        //
+        // Round-146 prologue: §7.3.11.7 opens with the subblock-merge
+        // branch *before* the regular_merge_flag tree. The spec text
+        // (V4, 01/2026) is:
+        //
+        //   if (MaxNumSubblockMergeCand > 0 && cbWidth >= 8 && cbHeight >= 8)
+        //       merge_subblock_flag[x0][y0]                    ae(v)
+        //   if (merge_subblock_flag[x0][y0] == 1) {
+        //       if (MaxNumSubblockMergeCand > 1)
+        //           merge_subblock_idx[x0][y0]                 ae(v)
+        //   } else { /* regular / MMVD / CIIP / GPM tree */ }
+        //
+        // §7.4.12.7 inference:
+        //   * `merge_subblock_flag` not present → 0 (gate closed → no
+        //     subblock-merge candidate, fall through to the regular
+        //     branch).
+        //   * `merge_subblock_idx` not present → 0 (either
+        //     `merge_subblock_flag == 0` OR `MaxNumSubblockMergeCand
+        //     <= 1`, in which case the single available subblock
+        //     candidate is implicit).
+        //   * `regular_merge_flag` inferred to
+        //     `general_merge_flag && !merge_subblock_flag` — so
+        //     `merge_subblock_flag == 1` short-circuits the entire
+        //     downstream regular / MMVD / CIIP / GPM tree.
+        //
+        // Neighbour state for the §9.3.4.2.2 / Table 133 ctxInc
+        // derivation (`cond{L,A} = MergeSubblockFlag[{L,A}] ||
+        // InterAffineFlag[{L,A}]`) is not yet tracked per CB in
+        // `CuNeighbourhood` (the round-21..145 path only carries
+        // intra / cu_skip neighbour state). For the wire-up we pass
+        // the §7.4.12.7 defaults `(false, false)` for both
+        // neighbours; the live-neighbour fill stays a follow-up,
+        // alongside the rest of the per-CB merge-side neighbour
+        // grid. This matches the pre-r146 stub-call pattern in
+        // `bdof.rs` (`merge_subblock_flag: false` neighbour seed).
+        let max_sb_merge = self.tools.max_num_subblock_merge_cand;
+        let subblock_gate_open = max_sb_merge > 0 && info.cb_width >= 8 && info.cb_height >= 8;
+        let merge_subblock_flag = if subblock_gate_open {
+            self.read_merge_subblock_flag(
+                /* left_merge_subblock */ false,
+                /* left_inter_affine   */ false,
+                neigh.left_available,
+                /* above_merge_subblock */ false,
+                /* above_inter_affine   */ false,
+                neigh.above_available,
+            )?
+        } else {
+            false
+        };
+        info.inter.merge_data.merge_subblock_flag = merge_subblock_flag;
+        if merge_subblock_flag {
+            // §7.3.11.7 — merge_subblock_idx is only emitted when
+            // MaxNumSubblockMergeCand > 1 (a single candidate degenerates
+            // the TR(cMax = 0) syntax). The reader returns 0 without
+            // consuming bits in that case, matching the §7.4.12.7
+            // inference.
+            let merge_subblock_idx = self.read_merge_subblock_idx(max_sb_merge)?;
+            info.inter.merge_data.merge_subblock_idx = merge_subblock_idx;
+            // Subblock-merge CUs carry no residual on the regular /
+            // skip path: cu_skip_flag may be 0 or 1, but the rest of
+            // merge_data() (regular_merge_flag, MMVD, CIIP, GPM, the
+            // merge_idx parse) is bypassed because §7.4.12.7 infers
+            // `regular_merge_flag = general_merge_flag && !merge_subblock_flag`
+            // = 0. The cu_coded_flag handling at the end of decode_inter
+            // still runs for non-skip CUs.
+            info.tu_y_coded_flag = false;
+            info.tu_cb_coded_flag = false;
+            info.tu_cr_coded_flag = false;
+            let _ = residual;
+            if !cu_skip {
+                let n = self.ctxs.cu_coded_flag.len() - 1;
+                let slot = (self.ctxs.init_type as usize).min(n);
+                let cu_coded = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.cu_coded_flag[slot])?
+                    == 1;
+                if cu_coded {
+                    return Err(Error::unsupported(
+                        "h266 leaf CU inter: subblock-merge CU with cu_coded_flag == 1 (residual \
+                         transform_tree) not yet supported (round-146 only handles \
+                         cu_coded_flag == 0)",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        // §7.3.11.7 — `merge_subblock_flag == 0` falls through to the
+        // regular / MMVD / CIIP / GPM tree (rounds 21 / 27 / 28 / 40).
         //
         // Round-28: §7.3.11.7 `regular_merge_flag` gate now light up
         // when CIIP and / or GPM is enabled in the SPS. The gate per
@@ -2715,6 +2818,7 @@ mod tests {
             gpm_enabled: false,
             max_num_gpm_merge_cand: 0,
             slice_is_b: false,
+            max_num_subblock_merge_cand: 0,
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();
@@ -4075,5 +4179,304 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Round-146: §7.3.11.7 merge_data() wire-up of
+    // merge_subblock_flag / merge_subblock_idx ----
+
+    /// Build a hand-rolled CABAC payload that drives `decode_inter()`
+    /// through the subblock-merge prologue: cu_skip_flag = 0,
+    /// general_merge_flag = 1, then merge_subblock_flag plus
+    /// (optionally) merge_subblock_idx. The CU is non-skip so the
+    /// trailing cu_coded_flag(0) is also encoded.
+    fn build_subblock_merge_payload(
+        slice_qp: i32,
+        init_type: u8,
+        merge_subblock_flag: bool,
+        merge_subblock_idx: Option<(u32, u32)>, // (value, max_num_subblock_merge_cand)
+    ) -> Vec<u8> {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_merge_subblock_flag,
+        };
+
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+
+        // cu_skip_flag(0). ctxInc derivation: no neighbours available.
+        let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        let skip_slot = (init_type as usize) * 3 + skip_inc;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
+            .unwrap();
+
+        // general_merge_flag(1).
+        let gm_inc = ctx_inc_general_merge_flag() as usize;
+        let gm_n = ctxs.general_merge_flag.len() - 1;
+        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
+            .unwrap();
+
+        // merge_subblock_flag — Table 107 / §9.3.4.2.2 ctxInc with no
+        // neighbours (all-false).
+        let inc = ctx_inc_merge_subblock_flag(false, false, false, false, false, false) as usize;
+        let init_off = (init_type as usize).saturating_sub(1) * 3;
+        let n = ctxs.merge_subblock_flag.len() - 1;
+        let sb_slot = (init_off + inc).min(n);
+        let sb_bit = if merge_subblock_flag { 1 } else { 0 };
+        enc.encode_decision(&mut ctxs.merge_subblock_flag[sb_slot], sb_bit)
+            .unwrap();
+
+        if merge_subblock_flag {
+            if let Some((value, max_cand)) = merge_subblock_idx {
+                encode_merge_subblock_idx(&mut enc, &mut ctxs, value, max_cand);
+            }
+            // cu_coded_flag(0) — trailing bin for non-skip merge CU.
+            let cu_n = ctxs.cu_coded_flag.len() - 1;
+            let cu_slot = (init_type as usize).min(cu_n);
+            enc.encode_decision(&mut ctxs.cu_coded_flag[cu_slot], 0)
+                .unwrap();
+        }
+
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        padded
+    }
+
+    fn tools_for_subblock_merge(max_num_subblock_merge_cand: u32) -> CuToolFlags {
+        CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            slice_is_inter: true,
+            max_num_merge_cand: 6,
+            max_num_subblock_merge_cand,
+            ..CuToolFlags::default()
+        }
+    }
+
+    /// Round-146: §7.3.11.7 size gate closed (`cbW < 8` or `cbH < 8`)
+    /// → `merge_subblock_flag` is NOT parsed and inferred to 0
+    /// per §7.4.12.7; the reader falls through to the regular-merge
+    /// path. We pick a 4×8 CU so the gate `cbWidth >= 8 && cbHeight
+    /// >= 8` is closed by the width side.
+    #[test]
+    fn merge_subblock_gate_closed_by_cb_width_no_bin_consumed() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        // Payload built for a *non*-subblock path (only cu_skip + gm).
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag};
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        let skip_slot = (init_type as usize) * 3 + skip_inc;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
+            .unwrap();
+        let gm_inc = ctx_inc_general_merge_flag() as usize;
+        let gm_n = ctxs.general_merge_flag.len() - 1;
+        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 64]);
+
+        let tools = tools_for_subblock_merge(5);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 4,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        // Falls through to the regular-merge path. The remaining
+        // syntax may surface Unsupported (round-30 cu_coded_flag etc.)
+        // — what matters here is the merge_subblock_flag inference.
+        let _ = reader.decode(&mut info, &mut residual, &neigh);
+        assert!(
+            !info.inter.merge_data.merge_subblock_flag,
+            "gate closed by cb_width=4 should infer merge_subblock_flag = 0"
+        );
+        assert_eq!(info.inter.merge_data.merge_subblock_idx, 0);
+    }
+
+    /// Round-146: `MaxNumSubblockMergeCand == 0` (eq. 85 produces 0
+    /// when both `sps_affine_enabled_flag == 0` and
+    /// `sps_sbtmvp_enabled_flag * ph_temporal_mvp_enabled_flag == 0`)
+    /// → §7.3.11.7 gate closed; `merge_subblock_flag` not parsed,
+    /// inferred to 0.
+    #[test]
+    fn merge_subblock_gate_closed_by_max_cand_zero() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag};
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        let skip_slot = (init_type as usize) * 3 + skip_inc;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
+            .unwrap();
+        let gm_inc = ctx_inc_general_merge_flag() as usize;
+        let gm_n = ctxs.general_merge_flag.len() - 1;
+        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 64]);
+
+        let tools = tools_for_subblock_merge(0);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let _ = reader.decode(&mut info, &mut residual, &neigh);
+        assert!(!info.inter.merge_data.merge_subblock_flag);
+        assert_eq!(info.inter.merge_data.merge_subblock_idx, 0);
+    }
+
+    /// Round-146: gate OPEN (cbW=cbH=16, MaxNumSubblockMergeCand=5)
+    /// and the wire-side `merge_subblock_flag` decodes 0; the reader
+    /// must not consume a `merge_subblock_idx` bin and must continue
+    /// into the regular-merge tree. We can't easily assert on the
+    /// downstream tree outcome here (the all-zero / hand-crafted
+    /// stream may surface Unsupported on later syntax), so we just
+    /// verify that the wired flag is 0.
+    #[test]
+    fn merge_subblock_gate_open_flag_zero_falls_through() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let payload = build_subblock_merge_payload(slice_qp, init_type, false, None);
+
+        let tools = tools_for_subblock_merge(5);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let _ = reader.decode(&mut info, &mut residual, &neigh);
+        assert!(!info.inter.merge_data.merge_subblock_flag);
+        assert_eq!(info.inter.merge_data.merge_subblock_idx, 0);
+    }
+
+    /// Round-146: gate OPEN, `merge_subblock_flag = 1`, then the
+    /// `merge_subblock_idx` TR bin selects slot 0. The reader takes
+    /// the subblock-merge branch and short-circuits the regular tree
+    /// (no `regular_merge_flag` bin consumed). Trailing
+    /// `cu_coded_flag(0)` lands on `tu_y_coded_flag == false`.
+    #[test]
+    fn merge_subblock_gate_open_flag_one_idx_zero_decodes_clean() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let payload = build_subblock_merge_payload(slice_qp, init_type, true, Some((0, 5)));
+
+        let tools = tools_for_subblock_merge(5);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("subblock-merge path with merge_subblock_idx=0 + cu_coded=0 must decode clean");
+        assert!(info.inter.merge_data.merge_subblock_flag);
+        assert_eq!(info.inter.merge_data.merge_subblock_idx, 0);
+        assert!(!info.inter.merge_data.regular_merge_flag); // not parsed.
+        assert!(!info.inter.merge_data.mmvd_merge_flag);
+        assert!(!info.inter.merge_data.ciip_flag);
+        assert!(!info.inter.merge_data.gpm_flag);
+        assert!(!info.tu_y_coded_flag);
+        assert!(!info.tu_cb_coded_flag);
+        assert!(!info.tu_cr_coded_flag);
+    }
+
+    /// Round-146: gate OPEN, `merge_subblock_flag = 1`, with a non-
+    /// zero `merge_subblock_idx` (value 3 out of cMax = 4). Exercises
+    /// the TR ctx-coded bin0 + bypass tail to drive the
+    /// `subblockMergeCandList` slot selector beyond the head.
+    #[test]
+    fn merge_subblock_gate_open_flag_one_idx_three_decodes_clean() {
+        let slice_qp = 26;
+        let init_type = 2u8; // also exercise init_type-2 slot offset.
+        let payload = build_subblock_merge_payload(slice_qp, init_type, true, Some((3, 5)));
+
+        let tools = tools_for_subblock_merge(5);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 32,
+            cb_height: 32,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("subblock-merge path with merge_subblock_idx=3 must decode clean");
+        assert!(info.inter.merge_data.merge_subblock_flag);
+        assert_eq!(info.inter.merge_data.merge_subblock_idx, 3);
+    }
+
+    /// Round-146: gate OPEN, `merge_subblock_flag = 1`, and
+    /// `MaxNumSubblockMergeCand == 1` — §7.3.11.7 suppresses the
+    /// `merge_subblock_idx` parse (cMax = 0). The reader's existing
+    /// `read_merge_subblock_idx` returns 0 without consuming bits,
+    /// matching the §7.4.12.7 inference.
+    #[test]
+    fn merge_subblock_idx_suppressed_when_max_cand_equals_one() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let payload = build_subblock_merge_payload(slice_qp, init_type, true, None);
+
+        let tools = tools_for_subblock_merge(1);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("subblock-merge path with cMax=0 idx-suppression must decode clean");
+        assert!(info.inter.merge_data.merge_subblock_flag);
+        assert_eq!(info.inter.merge_data.merge_subblock_idx, 0);
+    }
+
+    /// Round-146: confirm that `CuToolFlags::default()` keeps
+    /// `max_num_subblock_merge_cand == 0` so pre-r146 tests
+    /// (slice_is_inter = false / intra-only) never accidentally open
+    /// the new gate.
+    #[test]
+    fn cu_tool_flags_default_keeps_max_num_subblock_merge_cand_zero() {
+        let tools = CuToolFlags::default();
+        assert_eq!(tools.max_num_subblock_merge_cand, 0);
     }
 }

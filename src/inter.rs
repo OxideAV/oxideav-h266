@@ -963,6 +963,30 @@ pub struct MergeData {
     /// merge-cand index for partition B (the spec's eq. 647 increments
     /// past `m` automatically).
     pub gpm_idx1: u32,
+    /// `merge_subblock_flag[x0][y0]` per §7.3.11.7 / §7.4.12.7. `true`
+    /// when the CU uses the subblock-based merging candidate list
+    /// (affine inherited / constructed / SbTMVP) — the round-94
+    /// `subblockMergeCandList` is then indexed by
+    /// [`Self::merge_subblock_idx`]. Inferred to 0 per §7.4.12.7 when
+    /// the §7.3.11.7 size gate
+    /// (`MaxNumSubblockMergeCand > 0 && cbW >= 8 && cbH >= 8`) is
+    /// closed; when `merge_subblock_flag == 1` the regular / MMVD /
+    /// CIIP / GPM sub-trees are not entered (§10.7 inference of
+    /// `regular_merge_flag` = `general_merge_flag && !merge_subblock_flag`
+    /// resolves to 0). Round-146 wire-up: the leaf-CU reader calls
+    /// [`crate::leaf_cu::LeafCuReader::read_merge_subblock_flag`]
+    /// behind the size + `MaxNumSubblockMergeCand > 0` gate and stores
+    /// the result here.
+    pub merge_subblock_flag: bool,
+    /// `merge_subblock_idx[x0][y0]` per §7.3.11.7 — TR with
+    /// `cMax = MaxNumSubblockMergeCand − 1`, `cRiceParam = 0`. Bin 0
+    /// is ctx-coded against Table 108 / Table 132 slot
+    /// `init_type − 1` (ctxInc = 0); bins 1.. bypass-coded. Inferred
+    /// to 0 per §7.4.12.7 when the syntax element is not parsed
+    /// (either `merge_subblock_flag == 0` or `MaxNumSubblockMergeCand
+    /// ≤ 1`). Selects the slot into `subblockMergeCandList` per
+    /// §8.5.5.2.
+    pub merge_subblock_idx: u32,
 }
 
 // =====================================================================

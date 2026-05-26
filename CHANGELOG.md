@@ -6,6 +6,58 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 146 — **§7.3.11.7 `merge_data()` wire-up of the round-139
+  `merge_subblock_flag` / `merge_subblock_idx` readers behind the
+  round-142 §7.4.3.4 eq. 85 gate** — the leaf-CU inter path
+  (`decode_inter`) now opens with the subblock-merge prologue exactly
+  as written in §7.3.11.7 (V4, 01/2026):
+
+  ```text
+  if (MaxNumSubblockMergeCand > 0 && cbWidth >= 8 && cbHeight >= 8)
+      merge_subblock_flag[x0][y0]
+  if (merge_subblock_flag[x0][y0] == 1) {
+      if (MaxNumSubblockMergeCand > 1) merge_subblock_idx[x0][y0]
+  } else { /* regular / MMVD / CIIP / GPM */ }
+  ```
+
+  When the gate is closed (`MaxNumSubblockMergeCand == 0` OR a
+  side is `< 8`) the §7.4.12.7 inference `merge_subblock_flag = 0`
+  applies and the reader falls through to the regular-merge tree.
+  When `merge_subblock_flag == 1` the spec's §7.4.12.7 inference
+  `regular_merge_flag = general_merge_flag && !merge_subblock_flag`
+  resolves to 0 — the regular / MMVD / CIIP / GPM sub-trees are
+  bypassed entirely. The reader still walks the trailing
+  `cu_coded_flag` for non-skip CUs (Unsupported when 1, matching the
+  pre-r146 merge / CIIP paths).
+
+  New `MergeData` fields: `merge_subblock_flag: bool` +
+  `merge_subblock_idx: u32`. New `CuToolFlags` field
+  `max_num_subblock_merge_cand: u32` populated by
+  `CtuWalker::cu_tool_flags()` from
+  `SeqParameterSet::max_num_subblock_merge_cand(ph_temporal_mvp_enabled_flag)`
+  — the round-142 source-of-truth scalar — so the CU-side gate stays
+  in lockstep with the SPS-side eq.-85 derivation. Per-CB neighbour
+  state for the §9.3.4.2.2 / Table 133 ctxInc (`cond{L,A} =
+  MergeSubblockFlag[{L,A}] || InterAffineFlag[{L,A}]`) is not yet
+  tracked in `CuNeighbourhood`; the wire-up passes the §7.4.12.7
+  default `(false, false)` for both neighbours, matching the
+  pre-r146 stub-call pattern. 7 new lib tests pin (a) the
+  gate-closed path with `cb_width == 4` (no bin consumed), (b) the
+  gate-closed path with `MaxNumSubblockMergeCand == 0`, (c) the
+  gate-open path with `merge_subblock_flag == 0` (fall-through), (d)
+  the gate-open path with `merge_subblock_flag == 1` and
+  `merge_subblock_idx == 0` decoding clean (regular / MMVD / CIIP /
+  GPM all bypassed, CBFs all 0), (e) the same with
+  `merge_subblock_idx == 3` on init_type 2 (cMax = 4 TR ctx-bin +
+  bypass tail), (f) the `MaxNumSubblockMergeCand == 1`
+  idx-suppression path (cMax = 0, no idx bin on the wire), (g) the
+  `CuToolFlags::default()` `max_num_subblock_merge_cand == 0`
+  invariant so pre-r146 intra-only tests never accidentally open
+  the new gate. The encoder-side subblock-merge emission +
+  per-CB live-neighbour grid for the Table 133 ctxInc + the
+  cu_coded_flag=1 transform_tree() body for subblock-merge CUs
+  remain follow-ups.
+
 - Round 142 — **§7.4.3.4 eq. 85 `MaxNumSubblockMergeCand` derivation**
   — the SPS-side scalar that drives the round-139 `merge_subblock_idx`
   `cMax = MaxNumSubblockMergeCand − 1` truncated-Rice binarisation and

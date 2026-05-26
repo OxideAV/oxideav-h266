@@ -1206,6 +1206,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 0
             },
             slice_is_b: self.sh.sh_slice_type == SliceType::B,
+            // §7.4.3.4 eq. 85 — MaxNumSubblockMergeCand. Routed through
+            // the SeqParameterSet helper so the affine vs sbtmvp branch
+            // selection + range clamp live in one place. The picture-
+            // header input `ph_temporal_mvp_enabled_flag` only matters
+            // on the non-affine branch; the helper ignores it when
+            // sps_affine_enabled_flag == 1.
+            max_num_subblock_merge_cand: self
+                .sps
+                .max_num_subblock_merge_cand(self.ph_temporal_mvp_enabled),
         }
     }
 
