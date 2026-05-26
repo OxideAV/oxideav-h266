@@ -6,6 +6,29 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 142 — **§7.4.3.4 eq. 85 `MaxNumSubblockMergeCand` derivation**
+  — the SPS-side scalar that drives the round-139 `merge_subblock_idx`
+  `cMax = MaxNumSubblockMergeCand − 1` truncated-Rice binarisation and
+  the §7.3.11.7 size-gate `MaxNumSubblockMergeCand > 0` test. New
+  `SeqParameterSet::max_num_subblock_merge_cand(ph_temporal_mvp_enabled_flag)`
+  reproduces the eq.-85 derivation verbatim: when `sps_affine_enabled_flag
+  == 1` it returns `5 − sps_five_minus_max_num_subblock_merge_cand` and
+  ignores the PH input; otherwise it returns the boolean
+  `sps_sbtmvp_enabled_flag && ph_temporal_mvp_enabled_flag` (`0` or
+  `1`). Both branches clamp into the §7.4.3.4 trailing "0 to 5,
+  inclusive" range. Sibling `SeqParameterSet::max_num_merge_cand()`
+  exposes the §7.4.3.4 regular-merge derivation
+  `6 − sps_six_minus_max_num_merge_cand` (clamped `[1, 6]`) as a public
+  scalar so `MaxNumGpmMergeCand` derivation has one source of truth. 6
+  new lib tests cover the affine-branch full range (both PH
+  polarities), the out-of-range clamp, the non-affine branch truth
+  table (sbtmvp & PH-only branch), an exhaustive sweep proving the
+  result stays within `[0, 5]`, the `merge_subblock_idx`-driving
+  values, and the full `MaxNumMergeCand` `1..=6` mapping plus clamp.
+  The §7.3.11.7 `merge_data()` wire-up that calls the round-139
+  `read_merge_subblock_flag` / `read_merge_subblock_idx` behind this
+  gate + the encoder-side emission remain follow-ups.
+
 - Round 139 — **§7.3.11.7 `merge_subblock_flag` + `merge_subblock_idx`
   CABAC readers** — the live-stream entry into the round-135 SbTMVP
   CTU-walker fuse. New `SyntaxCtx::MergeSubblockFlag` (Table 107: 6

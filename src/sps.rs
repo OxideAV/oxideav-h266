@@ -390,6 +390,43 @@ impl SeqParameterSet {
         self.bit_depth_y()
     }
 
+    /// `MaxNumMergeCand` per §7.4.3.4: `6 − sps_six_minus_max_num_merge_cand`,
+    /// clipped to `[1, 6]` (the spec range bullet — and the SPS u(e) range
+    /// is implicitly `0..=5` for a conforming bitstream).
+    ///
+    /// This is the regular-merge candidate count and is also the source for
+    /// `MaxNumGpmMergeCand` via the SPS
+    /// `max_num_merge_cand_minus_max_num_gpm_cand` syntax element.
+    pub fn max_num_merge_cand(&self) -> u32 {
+        (6i32 - self.tool_flags.six_minus_max_num_merge_cand as i32).clamp(1, 6) as u32
+    }
+
+    /// `MaxNumSubblockMergeCand` per §7.4.3.4 eq. 85.
+    ///
+    /// The spec derivation reads:
+    /// * `if( sps_affine_enabled_flag )`
+    ///   `MaxNumSubblockMergeCand = 5 − sps_five_minus_max_num_subblock_merge_cand`
+    /// * `else`
+    ///   `MaxNumSubblockMergeCand = sps_sbtmvp_enabled_flag && ph_temporal_mvp_enabled_flag`
+    ///
+    /// The §7.4.3.4 trailing constraint clamps the result to `[0, 5]`.
+    ///
+    /// The `ph_temporal_mvp_enabled_flag` argument comes from the picture
+    /// header — when not yet known (e.g. SPS-only validation), pass `false`
+    /// to get the lower-bound estimate (which still produces the correct
+    /// answer whenever `sps_affine_enabled_flag == 1`, since the eq.-85
+    /// affine branch ignores the PH input).
+    pub fn max_num_subblock_merge_cand(&self, ph_temporal_mvp_enabled_flag: bool) -> u32 {
+        let raw = if self.tool_flags.affine_enabled_flag {
+            5i32 - self.tool_flags.five_minus_max_num_subblock_merge_cand as i32
+        } else if self.tool_flags.sbtmvp_enabled_flag && ph_temporal_mvp_enabled_flag {
+            1
+        } else {
+            0
+        };
+        raw.clamp(0, 5) as u32
+    }
+
     /// Luma width after the conformance-window crop, using SubWidthC /
     /// SubHeightC derived from `sps_chroma_format_idc`. Per Table 2 in
     /// §6.2: 4:2:0 → (2,2); 4:2:2 → (2,1); 4:4:4 → (1,1); mono → (1,1).
@@ -2041,5 +2078,127 @@ mod tests {
         assert_eq!(ladf.lowest_interval_qp_offset, -3);
         assert_eq!(ladf.intervals.len(), 1);
         assert_eq!(ladf.intervals[0], (2, 0));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.4.3.4 eq. 85 — MaxNumSubblockMergeCand derivation
+    // -----------------------------------------------------------------
+
+    /// Build a `SeqParameterSet` with only the three fields the eq.-85
+    /// derivation reads pre-populated. Built off the canonical minimal SPS
+    /// so every other field is realistic; the three eq.-85 inputs are then
+    /// overwritten directly.
+    fn sps_with_subblock_inputs(
+        affine: bool,
+        sbtmvp: bool,
+        five_minus_cand: u32,
+    ) -> SeqParameterSet {
+        let bits = build_minimal_sps_bits();
+        let bytes = pack(&bits);
+        let mut s = parse_sps(&bytes).expect("minimal SPS parses");
+        s.tool_flags.affine_enabled_flag = affine;
+        s.tool_flags.sbtmvp_enabled_flag = sbtmvp;
+        s.tool_flags.five_minus_max_num_subblock_merge_cand = five_minus_cand;
+        s
+    }
+
+    #[test]
+    fn max_num_subblock_merge_cand_affine_branch_full_range() {
+        // §7.4.3.4 eq. 85 affine branch: 5 − five_minus_max_num_subblock_merge_cand.
+        // PH ph_temporal_mvp_enabled_flag is ignored in this branch.
+        for k in 0u32..=5 {
+            let sps = sps_with_subblock_inputs(true, false, k);
+            assert_eq!(
+                sps.max_num_subblock_merge_cand(false),
+                5 - k,
+                "five_minus={k}, ph=false"
+            );
+            assert_eq!(
+                sps.max_num_subblock_merge_cand(true),
+                5 - k,
+                "five_minus={k}, ph=true (ignored in affine branch)"
+            );
+        }
+    }
+
+    #[test]
+    fn max_num_subblock_merge_cand_affine_branch_clamps_negative() {
+        // sps_five_minus_max_num_subblock_merge_cand > 5 would yield negative;
+        // the §7.4.3.4 range constraint forces the result to 0.
+        let sps = sps_with_subblock_inputs(true, false, 6);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 0);
+        let sps = sps_with_subblock_inputs(true, true, 100);
+        assert_eq!(sps.max_num_subblock_merge_cand(true), 0);
+    }
+
+    #[test]
+    fn max_num_subblock_merge_cand_non_affine_branch_sbtmvp_and_ph() {
+        // §7.4.3.4 eq. 85 else branch: sbtmvp && ph_temporal_mvp_enabled.
+        // Both on → 1; either off → 0. five_minus value is ignored.
+        let sps = sps_with_subblock_inputs(false, true, 3);
+        assert_eq!(sps.max_num_subblock_merge_cand(true), 1);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 0);
+
+        let sps = sps_with_subblock_inputs(false, false, 0);
+        assert_eq!(sps.max_num_subblock_merge_cand(true), 0);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 0);
+
+        // sbtmvp=on but ph=off (the SPS-only lower-bound case) → 0.
+        let sps = sps_with_subblock_inputs(false, true, 0);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 0);
+    }
+
+    #[test]
+    fn max_num_subblock_merge_cand_result_stays_within_zero_to_five() {
+        // §7.4.3.4 trailing bullet: "shall be in the range of 0 to 5, inclusive".
+        for affine in [false, true] {
+            for sbtmvp in [false, true] {
+                for five_minus in 0u32..=8 {
+                    for ph in [false, true] {
+                        let sps = sps_with_subblock_inputs(affine, sbtmvp, five_minus);
+                        let v = sps.max_num_subblock_merge_cand(ph);
+                        assert!(
+                            v <= 5,
+                            "out of range: affine={affine} sbtmvp={sbtmvp} \
+                             five_minus={five_minus} ph={ph} → {v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_num_subblock_merge_cand_drives_merge_subblock_idx_cmax() {
+        // §7.3.11.7 / Table 110 link: `merge_subblock_idx` has cMax =
+        // MaxNumSubblockMergeCand − 1, and the §7.3.11.7 size gate +
+        // §7.4.12.7 inference fold to 0 when MaxNumSubblockMergeCand ≤ 1.
+        // This test pins the derivation values the reader switches on.
+        let sps = sps_with_subblock_inputs(true, false, 0);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 5); // cMax=4
+        let sps = sps_with_subblock_inputs(true, false, 3);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 2); // cMax=1
+        let sps = sps_with_subblock_inputs(true, false, 4);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 1); // cMax suppressed → infer 0
+        let sps = sps_with_subblock_inputs(true, false, 5);
+        assert_eq!(sps.max_num_subblock_merge_cand(false), 0); // cMax suppressed → infer 0
+    }
+
+    #[test]
+    fn max_num_merge_cand_full_range() {
+        // §7.4.3.4: MaxNumMergeCand = 6 − sps_six_minus_max_num_merge_cand,
+        // legal range 1..=6. Pins the regular-merge cand derivation that
+        // gates the SPS gpm_enabled_flag emission (≥ 2 ≥ 3 thresholds in
+        // parse_tool_flags).
+        let bits = build_minimal_sps_bits();
+        let bytes = pack(&bits);
+        let mut s = parse_sps(&bytes).expect("minimal SPS parses");
+        for k in 0u32..=5 {
+            s.tool_flags.six_minus_max_num_merge_cand = k;
+            assert_eq!(s.max_num_merge_cand(), 6 - k);
+        }
+        // Clamp: out-of-range values still produce a legal 1..=6 result.
+        s.tool_flags.six_minus_max_num_merge_cand = 10;
+        assert_eq!(s.max_num_merge_cand(), 1);
     }
 }

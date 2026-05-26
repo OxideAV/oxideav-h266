@@ -777,6 +777,36 @@ eqs. 601 – 605 POC scaling, and the `tempMv` collocated-sample
 offset. The §7.4.6 `merge_subblock_flag` reader wire-up for live
 SbCol selection + the encoder-side SbCol emission remain follow-ups.
 
+**Round-142 lands the §7.4.3.4 eq. 85 `MaxNumSubblockMergeCand`
+derivation** — the SPS-side scalar that drives the round-139
+`merge_subblock_idx` `cMax = MaxNumSubblockMergeCand − 1` truncated-Rice
+binarisation and the §7.3.11.7 size-gate `MaxNumSubblockMergeCand > 0`
+test. New `SeqParameterSet::max_num_subblock_merge_cand(ph_temporal_mvp_enabled_flag)`
+reproduces the spec derivation verbatim: when `sps_affine_enabled_flag
+== 1` it returns `5 − sps_five_minus_max_num_subblock_merge_cand` and
+ignores the PH input; otherwise it returns the boolean
+`sps_sbtmvp_enabled_flag && ph_temporal_mvp_enabled_flag` (`0` or `1`).
+Both branches clamp into the §7.4.3.4 trailing "0 to 5, inclusive"
+range, so even an out-of-range
+`sps_five_minus_max_num_subblock_merge_cand = 6+` yields a legal `0`. A
+sibling `SeqParameterSet::max_num_merge_cand()` adds the §7.4.3.4
+regular-merge derivation `6 − sps_six_minus_max_num_merge_cand` clamped
+to `[1, 6]` (the same value the SPS-parse uses inline to gate
+`gpm_enabled_flag` / `max_num_merge_cand_minus_max_num_gpm_cand`),
+exposed as a public scalar so downstream `MaxNumGpmMergeCand`
+derivation has one source of truth. 6 new lib tests cover the affine
+branch full range (`five_minus = 0..=5 → 5..=0`, both PH polarities
+since PH is ignored), the affine-branch out-of-range clamp (`6 → 0`,
+`100 → 0`), the non-affine branch truth table (sbtmvp & PH on → 1,
+either off → 0, the SPS-only `ph = false` lower-bound case → 0), an
+exhaustive sweep proving the result stays within `[0, 5]` across every
+combination of the three inputs, the `merge_subblock_idx`-driving
+values (`5/2/1/0` for `five_minus = 0/3/4/5`), and the full
+`MaxNumMergeCand` `1..=6` mapping plus clamp. The §7.3.11.7
+`merge_data()` wire-up that calls the round-139 `read_merge_subblock_flag`
+/ `read_merge_subblock_idx` behind this gate + the encoder-side
+emission remain follow-ups.
+
 **Round-139 lands the §7.3.11.7 `merge_subblock_flag` +
 `merge_subblock_idx` CABAC readers** — the live-stream entry into the
 round-135 SbTMVP / round-94 sub-block-merge-cand-list driver. The
