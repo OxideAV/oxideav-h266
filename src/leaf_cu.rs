@@ -50,10 +50,11 @@ use oxideav_core::{Error, Result};
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
     ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_bcw_idx,
-    ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_inter_affine_flag,
-    ctx_inc_inter_pred_idc_bin0, ctx_inc_inter_pred_idc_bin1, ctx_inc_intra_bdpcm_chroma_dir_flag,
-    ctx_inc_intra_bdpcm_chroma_flag, ctx_inc_intra_bdpcm_luma_dir_flag,
-    ctx_inc_intra_bdpcm_luma_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+    ctx_inc_cu_affine_type_flag, ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag,
+    ctx_inc_inter_affine_flag, ctx_inc_inter_pred_idc_bin0, ctx_inc_inter_pred_idc_bin1,
+    ctx_inc_intra_bdpcm_chroma_dir_flag, ctx_inc_intra_bdpcm_chroma_flag,
+    ctx_inc_intra_bdpcm_luma_dir_flag, ctx_inc_intra_bdpcm_luma_flag,
+    ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
     ctx_inc_merge_subblock_flag, ctx_inc_merge_subblock_idx, ctx_inc_mvp_lx_flag,
@@ -602,6 +603,16 @@ pub struct LeafCuCtxs {
     /// && cbHeight >= 16`; never signalled in I slices nor for the
     /// `general_merge_flag == 1` branch.
     pub inter_affine_flag: Vec<ContextModel>,
+    /// Round-159 — `cu_affine_type_flag` (Table 85) — 2 entries, one
+    /// per non-I initType (initType 1 → slot 0, initType 2 → slot 1;
+    /// never signalled in I slices nor in the merge branch). Indexed
+    /// at parse time as `init_type - 1`. Single ctx-coded bin (FL
+    /// `cMax = 1`) with deterministic `ctxInc = 0` per Table 132,
+    /// gated by §7.3.11.7's `sps_6param_affine_enabled_flag &&
+    /// inter_affine_flag == 1`. Selects the affine motion model:
+    /// `0 → MotionModelIdc = 1` (4-parameter affine), `1 →
+    /// MotionModelIdc = 2` (6-parameter affine).
+    pub cu_affine_type_flag: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -696,6 +707,7 @@ impl LeafCuCtxs {
             merge_subblock_flag: init_contexts(SyntaxCtx::MergeSubblockFlag, slice_qp_y),
             merge_subblock_idx: init_contexts(SyntaxCtx::MergeSubblockIdx, slice_qp_y),
             inter_affine_flag: init_contexts(SyntaxCtx::InterAffineFlag, slice_qp_y),
+            cu_affine_type_flag: init_contexts(SyntaxCtx::CuAffineTypeFlag, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -2073,6 +2085,52 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         let bit = self
             .dec
             .decode_decision(&mut self.ctxs.inter_affine_flag[slot])?;
+        Ok(bit == 1)
+    }
+
+    /// Round-159 — Decode `cu_affine_type_flag[x0][y0]` per §7.3.11.7 /
+    /// Table 85 / Table 132.
+    ///
+    /// Binarisation: FL `cMax = 1` — a single ctx-coded bin per Table
+    /// 132. The per-initType ctx-slot is `init_type - 1` (initType 1 →
+    /// slot 0, initType 2 → slot 1); the ctxInc derivation per Table 132
+    /// is the deterministic `0` (no §9.3.4.2.2 neighbourhood lookup
+    /// applies — the spec entry simply lists "0" for this syntax
+    /// element). Returns the decoded flag value.
+    ///
+    /// The flag drives §8.5.5.2's `MotionModelIdc` derivation
+    /// (eq. 160 — `MotionModelIdc = inter_affine_flag + cu_affine_type_flag`):
+    /// * `cu_affine_type_flag == 0` → `MotionModelIdc = 1` (4-parameter
+    ///   affine, 2 CPMVs at corners A / B).
+    /// * `cu_affine_type_flag == 1` → `MotionModelIdc = 2` (6-parameter
+    ///   affine, 3 CPMVs at corners A / B / C).
+    ///
+    /// **The caller is responsible for the §7.3.11.7 gates**:
+    /// `sps_6param_affine_enabled_flag && inter_affine_flag[x0][y0] == 1`
+    /// (the outer affine gate `sps_affine_enabled_flag && cbWidth >= 16
+    /// && cbHeight >= 16` is already implicit because `inter_affine_flag`
+    /// itself is gated by it). When any gate is closed the syntax
+    /// element is not present and §7.4.12.7 infers it to 0 — this reader
+    /// must NOT be invoked in that case. Likewise the reader assumes the
+    /// slice is non-I (initType ∈ {1, 2}); the affine syntax is never
+    /// signalled in I slices.
+    pub fn read_cu_affine_type_flag(&mut self) -> Result<bool> {
+        // Table 85: 2 entries — initType 1 → slot 0, initType 2 → slot 1.
+        // Per Table 132 / Table 133 the ctxInc derivation is the
+        // deterministic `0`, so no neighbour inputs are required. We
+        // still route through `ctx_inc_cu_affine_type_flag` for spec
+        // traceability and so a future Table 133 amendment that
+        // introduces a non-trivial derivation is caught in one place.
+        debug_assert!(
+            self.ctxs.init_type >= 1,
+            "cu_affine_type_flag is not signalled in I slices"
+        );
+        let inc = ctx_inc_cu_affine_type_flag() as usize;
+        let n = self.ctxs.cu_affine_type_flag.len() - 1;
+        let slot = ((self.ctxs.init_type as usize).saturating_sub(1) + inc).min(n);
+        let bit = self
+            .dec
+            .decode_decision(&mut self.ctxs.cu_affine_type_flag[slot])?;
         Ok(bit == 1)
     }
 
@@ -4470,6 +4528,153 @@ mod tests {
             after_subblock, baseline_subblock,
             "driving inter_affine_flag must not perturb merge_subblock_flag state"
         );
+    }
+
+    // ---- Round-159: §7.3.11.7 `cu_affine_type_flag` reader round-trips ----
+    //
+    // The encoder mirror duplicates the reader's CABAC bin emission so a
+    // round-trip can be staged without a live encoder pipeline. The same
+    // pattern is used by the round-152 `inter_affine_flag` tests above.
+
+    /// Encoder mirror of `read_cu_affine_type_flag` driving the same
+    /// context bundle bin-for-bin per Table 132's deterministic
+    /// `ctxInc = 0` and the Table 85 per-initType slot.
+    fn encode_cu_affine_type_flag(enc: &mut ArithEncoder, ctxs: &mut LeafCuCtxs, flag: bool) {
+        // Per Table 132 / Table 133 the ctxInc is the deterministic 0
+        // (no neighbour lookup). The per-initType slot picks
+        // `init_type - 1` directly into the 2-entry Table 85 bundle.
+        debug_assert!(ctxs.init_type >= 1);
+        let n = ctxs.cu_affine_type_flag.len() - 1;
+        let slot = (ctxs.init_type as usize).saturating_sub(1).min(n);
+        let bit = if flag { 1 } else { 0 };
+        enc.encode_decision(&mut ctxs.cu_affine_type_flag[slot], bit)
+            .unwrap();
+    }
+
+    /// Per-bin round-trip helper for `cu_affine_type_flag`. Builds a
+    /// fresh CABAC stream with one bin and reads it back through the
+    /// matching context slot.
+    fn cu_affine_type_flag_round_trip(flag: bool, init_type: u8) -> bool {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_cu_affine_type_flag(&mut enc, &mut enc_ctxs, flag);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_cu_affine_type_flag().unwrap()
+    }
+
+    #[test]
+    fn cu_affine_type_flag_round_trips_both_init_types() {
+        // The deterministic `ctxInc = 0` means there is exactly one
+        // ctx-coded path per non-I initType. Both P-slice (init 1) and
+        // B-slice (init 2) round-trip both flag values bit-for-bit.
+        for it in [1u8, 2] {
+            for flag in [false, true] {
+                assert_eq!(
+                    cu_affine_type_flag_round_trip(flag, it),
+                    flag,
+                    "cu_affine_type_flag round trip failed at init={it} flag={flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cu_affine_type_flag_per_init_type_slots_are_addressable() {
+        // Defensive: confirm every legal init_type lands inside the
+        // 2-entry Table 85 bundle.
+        for it in [1u8, 2] {
+            let ctxs = LeafCuCtxs::init_with_init_type(26, it);
+            let slot = (it as usize) - 1;
+            assert!(
+                slot < ctxs.cu_affine_type_flag.len(),
+                "slot {slot} out of range for init_type {it}"
+            );
+        }
+    }
+
+    #[test]
+    fn cu_affine_type_flag_ctx_bundle_disjoint_from_inter_affine_flag() {
+        // The reader uses *separate* CABAC state machines for
+        // `inter_affine_flag` (Table 84, 6 ctxIdx) and
+        // `cu_affine_type_flag` (Table 85, 2 ctxIdx). Confirm the two
+        // bundles initialise independently and that driving one does
+        // not perturb the other.
+        let mut ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+        let baseline_inter: Vec<_> = ctxs
+            .inter_affine_flag
+            .iter()
+            .map(|c| (c.p_state_idx0, c.p_state_idx1, c.shift_idx))
+            .collect();
+        let baseline_type: Vec<_> = ctxs
+            .cu_affine_type_flag
+            .iter()
+            .map(|c| (c.p_state_idx0, c.p_state_idx1, c.shift_idx))
+            .collect();
+        // Sanity: the two tables MUST initialise to different pState
+        // pairs (Table 84 initValue {12,13,14,19,13,6} vs Table 85
+        // initValue {35,35}).
+        assert_ne!(
+            baseline_inter, baseline_type,
+            "Tables 84 and 85 should initialise to different ctx state"
+        );
+        // Drive a decision through cu_affine_type_flag and verify
+        // inter_affine_flag is untouched.
+        let mut enc = ArithEncoder::new();
+        enc.encode_decision(&mut ctxs.cu_affine_type_flag[0], 1)
+            .unwrap();
+        enc.encode_decision(&mut ctxs.cu_affine_type_flag[1], 0)
+            .unwrap();
+        let after_inter: Vec<_> = ctxs
+            .inter_affine_flag
+            .iter()
+            .map(|c| (c.p_state_idx0, c.p_state_idx1, c.shift_idx))
+            .collect();
+        assert_eq!(
+            after_inter, baseline_inter,
+            "driving cu_affine_type_flag must not perturb inter_affine_flag state"
+        );
+    }
+
+    #[test]
+    fn cu_affine_type_flag_init_pstate_matches_table_85() {
+        // Pin the per-initType ctx initialisation: Table 85 says
+        // initValue = [35, 35], shiftIdx = [4, 4]. Both initType 1 and
+        // initType 2 share the same row.
+        let ctxs1 = LeafCuCtxs::init_with_init_type(26, 1);
+        let ctxs2 = LeafCuCtxs::init_with_init_type(26, 2);
+        assert_eq!(ctxs1.cu_affine_type_flag[0].shift_idx, 4);
+        assert_eq!(ctxs2.cu_affine_type_flag[1].shift_idx, 4);
+        // Both contexts share initValue 35 → identical pState pair
+        // after initialisation against the same SliceQpY.
+        assert_eq!(
+            (
+                ctxs1.cu_affine_type_flag[0].p_state_idx0,
+                ctxs1.cu_affine_type_flag[0].p_state_idx1,
+            ),
+            (
+                ctxs2.cu_affine_type_flag[1].p_state_idx0,
+                ctxs2.cu_affine_type_flag[1].p_state_idx1,
+            ),
+            "Table 85 has identical rows for both initTypes (initValue 35 / shiftIdx 4)"
+        );
+    }
+
+    #[test]
+    fn cu_affine_type_flag_round_trip_independent_runs_recover_both_values() {
+        // Two independent fresh-stream round-trips (no shared CABAC
+        // state) should each recover the flag — verifying the reader
+        // doesn't depend on a prior decision having been consumed off
+        // a different bundle.
+        assert!(!cu_affine_type_flag_round_trip(false, 2));
+        assert!(cu_affine_type_flag_round_trip(true, 2));
+        assert!(!cu_affine_type_flag_round_trip(false, 1));
+        assert!(cu_affine_type_flag_round_trip(true, 1));
     }
 
     // ---- Round-146: §7.3.11.7 merge_data() wire-up of

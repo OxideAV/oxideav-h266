@@ -967,6 +967,43 @@ cbW >= 8 && cbH >= 8`) + the SPS-side `MaxNumSubblockMergeCand`
 derivation per §7.4.3.4 eq. 85 + the encoder-side emission remain
 follow-ups.
 
+**Round-159 lands the §7.3.11.7 `cu_affine_type_flag` CABAC reader +
+Table 85 context bundle** — the second of the two non-merge affine
+syntax elements that drive the §8.5.5.2 `MotionModelIdc` derivation
+(round-152 added the first, `inter_affine_flag`). When
+`sps_6param_affine_enabled_flag == 1` and the parser has just decoded
+`inter_affine_flag == 1`, the §7.3.11.7 inter else-branch signals
+`cu_affine_type_flag` to pick between 4-parameter (`0 →
+MotionModelIdc = 1`, two CPMVs at corners A / B) and 6-parameter
+(`1 → MotionModelIdc = 2`, three CPMVs at corners A / B / C) affine
+motion via eq. 160. The `tables` module gains
+`SyntaxCtx::CuAffineTypeFlag` (Table 85: 2 ctxIdx — one per non-I
+initType — `initValue = [35, 35]`, `shiftIdx = [4, 4]` transcribed
+bit-exact); the `ctx` module gains `ctx_inc_cu_affine_type_flag()`
+which is the deterministic `0` per Table 132 / Table 133 (the spec
+entry simply lists "0" — no §9.3.4.2.2 neighbour-lookup applies, so
+the per-initType slot is picked solely via `init_type − 1`).
+`LeafCuReader::read_cu_affine_type_flag()` decodes the FL `cMax = 1`
+single ctx-coded bin per Table 132 against the matching Table 85
+slot; the helper routes through `ctx_inc_cu_affine_type_flag` for
+spec traceability so a future Table 133 amendment that introduces a
+non-trivial derivation is caught in one place. 8 new lib tests pin
+the Table 85 length + bit-exact `init` / `shift`, the
+`ctx_inc_cu_affine_type_flag` deterministic-`0` value, encoder-mirror
+round-trip across both non-I initTypes for both flag values, the
+per-initType slot addressability, bundle isolation against the
+round-152 `inter_affine_flag` Table 84 state machine (Table 85's
+identical-row pState vs Table 84's diverging row pStates; driving
+one bundle does not perturb the other), the Table 85 identical-row
+spec pin (initValue `35` / shiftIdx `4` for both ctxIdx), and an
+independent-stream coverage sweep proving the reader doesn't depend
+on a prior decision on a different bundle. The §7.3.11.7 wire-up
+that calls this reader behind the `sps_6param_affine_enabled_flag &&
+inter_affine_flag == 1` gate + the encoder-side emission + the
+§8.5.5.2 eq. 160 `MotionModelIdc = inter_affine_flag +
+cu_affine_type_flag` write into the round-149 affine grid remain
+follow-ups.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

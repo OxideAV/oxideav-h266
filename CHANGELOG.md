@@ -6,6 +6,59 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 159 — **§7.3.11.7 `cu_affine_type_flag[x0][y0]` CABAC reader +
+  Table 85 context bundle.** Follow-on to the round-152
+  `inter_affine_flag` reader: the second of the two non-merge affine
+  syntax elements that drive the §8.5.5.2 `MotionModelIdc` derivation.
+  When `sps_6param_affine_enabled_flag == 1` and the parser has just
+  decoded `inter_affine_flag == 1`, the §7.3.11.7 inter else-branch
+  signals `cu_affine_type_flag` to pick between 4-parameter
+  (`flag == 0` → `MotionModelIdc = 1`) and 6-parameter
+  (`flag == 1` → `MotionModelIdc = 2`) affine motion via eq. 160
+  `MotionModelIdc = inter_affine_flag + cu_affine_type_flag`.
+
+  The new pieces:
+  * `SyntaxCtx::CuAffineTypeFlag` — Table 85 (2 ctxIdx, one per non-I
+    initType). `CU_AFFINE_TYPE_FLAG_INIT = [35, 35]`,
+    `CU_AFFINE_TYPE_FLAG_SHIFT = [4, 4]` transcribed bit-exact from
+    the spec. Per Table 51 the indexing rule is `init_type − 1`
+    (initType 1 → ctxIdx 0, initType 2 → ctxIdx 1; never signalled in
+    I slices nor in the merge branch).
+  * `ctx_inc_cu_affine_type_flag()` — deterministic `0` per Table 132
+    (the spec entry simply lists "0" — no §9.3.4.2.2 / Table 133
+    neighbourhood derivation applies). Wrapped in a helper so the
+    reader's call site is spec-traceable and a future Table 133
+    amendment that introduces a non-trivial derivation is caught in
+    one place.
+  * `LeafCuCtxs::cu_affine_type_flag: Vec<ContextModel>` initialised
+    from the new table.
+  * `LeafCuReader::read_cu_affine_type_flag()` — FL `cMax = 1` single
+    ctx-coded bin reader per Table 132, indexed as `init_type - 1`
+    against the per-initType pair. Caller is responsible for the
+    §7.3.11.7 gate `sps_6param_affine_enabled_flag &&
+    inter_affine_flag == 1` (the outer
+    `sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16`
+    gate is already implicit because `inter_affine_flag` itself is
+    gated by it); when the gate is closed §7.4.12.7 infers the flag
+    to 0 and the reader must NOT be invoked.
+  * No CTU-walker wire-up yet — this round adds the bin-level parser
+    only. The live consumer is the same future non-merge affine
+    inter CU walk that will also consume the round-152
+    `inter_affine_flag`, and the two flags' product feeds eq. 160's
+    `MotionModelIdc` write into the round-149 affine grids.
+  * 8 new lib tests covering: Table 85 length + bit-exact
+    `init` / `shift`, `ctx_inc_cu_affine_type_flag` deterministic `0`,
+    encoder-mirror round-trip across both non-I initTypes for both
+    flag values, per-initType slot addressability for every legal
+    `(init_type)` pair, bundle isolation against the round-152
+    `inter_affine_flag` Table 84 state machine (different `initValue`
+    / `shiftIdx` rows; driving one bundle leaves the other unchanged),
+    `pState` pin against Table 85's identical-row spec (initValue
+    `35` / shiftIdx `4` for both ctxIdx), and an independent-stream
+    coverage sweep that verifies the reader doesn't depend on a prior
+    decision on a different bundle.
+  * Test count: 1011 → 1019 (+8 lib tests).
+
 - Round 152 — **§7.3.11.7 `inter_affine_flag[x0][y0]` CABAC reader +
   Table 84 context bundle.** Adds the syntax-element parser that the
   round-149 `inter_affine_grid` neighbour-state cells will eventually

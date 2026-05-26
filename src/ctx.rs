@@ -476,6 +476,17 @@ pub fn ctx_inc_inter_affine_flag(
     )
 }
 
+/// ctxInc for `cu_affine_type_flag[x0][y0]` per Table 132 — deterministic
+/// `0`. The §7.3.11.7 syntax element is a single ctx-coded bin (FL
+/// `cMax = 1`) gated by `sps_6param_affine_enabled_flag &&
+/// inter_affine_flag[x0][y0] == 1`; per the spec's Table 133 entry the
+/// derivation never consults neighbouring CUs, so `ctxInc` is fixed at 0
+/// (the per-initType slot in Table 85 is picked through `init_type − 1`).
+/// Round-159.
+pub fn ctx_inc_cu_affine_type_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `sig_coeff_flag` in regular-residual-coding mode
 /// (transform_skip_flag = 0), per §9.3.4.2.8 eqs. 1573 / 1574.
 ///
@@ -1293,5 +1304,14 @@ mod tests {
             ctx_inc_inter_affine_flag(true, false, true, false, true, true),
             2
         );
+    }
+
+    /// Round-159 — `cu_affine_type_flag` ctxInc per Table 132 is the
+    /// constant 0 (no §9.3.4.2.2 neighbourhood derivation applies — the
+    /// spec entry simply lists "0"). The per-initType slot in Table 85
+    /// is picked elsewhere by the parser using `init_type − 1`.
+    #[test]
+    fn cu_affine_type_flag_ctx_inc_is_zero() {
+        assert_eq!(ctx_inc_cu_affine_type_flag(), 0);
     }
 }

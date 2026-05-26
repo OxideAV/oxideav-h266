@@ -238,6 +238,17 @@ pub enum SyntaxCtx {
     /// `ctxSetIdx = 0` — yielding `ctxInc ∈ {0, 1, 2}` and indexing the
     /// per-initType triplet directly.
     InterAffineFlag,
+    /// Table 85 — `cu_affine_type_flag` (2 ctxIdx, one per non-I
+    /// initType). Per Table 51 the slot is `initType − 1` (initType 1 →
+    /// ctxIdx 0, initType 2 → ctxIdx 1; never signalled in I slices —
+    /// the syntax element only appears on the non-merge inter branch
+    /// of §7.3.11.7 behind `sps_6param_affine_enabled_flag &&
+    /// inter_affine_flag == 1`). Per Table 132 the single ctx-coded
+    /// bin (FL `cMax = 1`) has `ctxInc = 0` deterministically; per
+    /// Table 133 the §9.3.4.2.2 derivation falls through to the
+    /// fixed-`0` row. The reader picks the per-initType slot directly
+    /// without any neighbour lookup.
+    CuAffineTypeFlag,
 }
 
 /// Table 59 — `split_cu_flag` (27 ctxIdx).
@@ -637,6 +648,21 @@ pub const MERGE_SUBBLOCK_IDX_SHIFT: &[u8] = &[0, 0];
 pub const INTER_AFFINE_FLAG_INIT: &[u8] = &[12, 13, 14, 19, 13, 6];
 pub const INTER_AFFINE_FLAG_SHIFT: &[u8] = &[4, 0, 0, 4, 0, 0];
 
+/// Table 85 — `cu_affine_type_flag` (2 ctxIdx, one per non-I initType).
+/// Round-159 §7.3.11.7 transcription:
+///   ctxIdx     | 0  | 1  |
+///   initValue  | 35 | 35 |
+///   shiftIdx   |  4 |  4 |
+/// Per Table 51 the indexing rule is `init_type − 1` (initType 1 →
+/// ctxIdx 0, initType 2 → ctxIdx 1; never signalled in I slices). The
+/// single ctx-coded bin uses Table 132's deterministic `ctxInc = 0`
+/// (no §9.3.4.2.2 / Table 133 row applies — the value is fixed). The
+/// surrounding syntax gate is
+/// `sps_6param_affine_enabled_flag && inter_affine_flag == 1`; the
+/// caller is responsible for the gate check.
+pub const CU_AFFINE_TYPE_FLAG_INIT: &[u8] = &[35, 35];
+pub const CU_AFFINE_TYPE_FLAG_SHIFT: &[u8] = &[4, 4];
+
 /// Table 89 — `amvr_flag` (4 ctxIdx). Round-40 §7.4.11.6 transcription:
 ///   ctxIdx     | 0  | 1  | 2  | 3  |
 ///   initValue  | 59 | 58 | 59 | 50 |
@@ -792,6 +818,7 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::MergeSubblockFlag => (MERGE_SUBBLOCK_FLAG_INIT, MERGE_SUBBLOCK_FLAG_SHIFT),
         SyntaxCtx::MergeSubblockIdx => (MERGE_SUBBLOCK_IDX_INIT, MERGE_SUBBLOCK_IDX_SHIFT),
         SyntaxCtx::InterAffineFlag => (INTER_AFFINE_FLAG_INIT, INTER_AFFINE_FLAG_SHIFT),
+        SyntaxCtx::CuAffineTypeFlag => (CU_AFFINE_TYPE_FLAG_INIT, CU_AFFINE_TYPE_FLAG_SHIFT),
     };
     let n = init.len().min(shift.len());
     (&init[..n], &shift[..n])
@@ -871,6 +898,7 @@ mod tests {
             SyntaxCtx::MergeSubblockFlag,
             SyntaxCtx::MergeSubblockIdx,
             SyntaxCtx::InterAffineFlag,
+            SyntaxCtx::CuAffineTypeFlag,
         ] {
             let (i, s) = table_for(kind);
             assert_eq!(i.len(), s.len(), "table {:?} length mismatch", kind);
@@ -948,6 +976,25 @@ mod tests {
         let (init, shift) = (INTER_AFFINE_FLAG_INIT, INTER_AFFINE_FLAG_SHIFT);
         assert_eq!(init, &[12, 13, 14, 19, 13, 6]);
         assert_eq!(shift, &[4, 0, 0, 4, 0, 0]);
+    }
+
+    /// Round-159 — Table 85 transcription length + initValue / shiftIdx
+    /// pin. Per Table 51 / Table 132 `cu_affine_type_flag` has 2 entries
+    /// (one per non-I initType), addressed by `init_type − 1` with the
+    /// deterministic `ctxInc = 0`. Never signalled in I slices; only on
+    /// the non-merge inter branch behind `sps_6param_affine_enabled_flag
+    /// && inter_affine_flag == 1`.
+    #[test]
+    fn cu_affine_type_flag_context_table_length() {
+        assert_eq!(ctx_count(SyntaxCtx::CuAffineTypeFlag), 2);
+    }
+
+    #[test]
+    fn cu_affine_type_flag_init_values_match_spec() {
+        // Table 85: initValue = [35, 35], shiftIdx = [4, 4].
+        let (init, shift) = (CU_AFFINE_TYPE_FLAG_INIT, CU_AFFINE_TYPE_FLAG_SHIFT);
+        assert_eq!(init, &[35, 35]);
+        assert_eq!(shift, &[4, 4]);
     }
 
     #[test]
