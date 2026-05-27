@@ -6,6 +6,82 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 164 — **§7.3.11.7 non-merge inter affine-syntax dispatcher +
+  §8.5.5.2 eq. 160 fold.** Composes the round-152 `inter_affine_flag`
+  reader and the round-159 `cu_affine_type_flag` reader into a single
+  entry point that mirrors the spec's `coding_unit()` text on the
+  non-merge inter branch, then folds the two decisions into a typed
+  `MotionModel` via §8.5.5.2 eq. 160
+  `MotionModelIdc = inter_affine_flag + cu_affine_type_flag`.
+
+  The new pieces:
+  * `leaf_cu::NonMergeInterAffineGate` — pure-data gate struct
+    bundling the §7.3.11.7 gating conditions (`sps_affine_enabled`,
+    `sps_6param_affine_enabled`, `cb_width`, `cb_height`) with the
+    four neighbour bits the §9.3.4.2.2 / Table 133 ctxInc derivation
+    reads. Exposes `outer_affine_gate_open()` (the
+    `sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16`
+    test) and `inner_6param_gate_open(inter_affine_flag)` (the
+    `sps_6param_affine_enabled_flag && inter_affine_flag == 1` test)
+    as testable predicates.
+  * `leaf_cu::NonMergeInterAffineDecision` — output struct carrying
+    the raw `inter_affine_flag` / `cu_affine_type_flag` bit values
+    (with §7.4.12.7 inferences applied — any flag whose gate was
+    closed comes back `false`) plus the typed `MotionModel` folded
+    via eq. 160.
+  * `LeafCuReader::read_non_merge_inter_affine(&gate)` — dispatcher
+    that reads `inter_affine_flag` only when the outer gate opens,
+    reads `cu_affine_type_flag` only when the inner 6-param gate
+    opens against the just-decoded `inter_affine_flag`, and returns
+    the decision struct. Pure-bitstream: no reconstruction-side
+    state is touched and the per-CB grid write is left to the
+    caller (the CTU walker, once it brings the non-merge inter
+    path online).
+  * `affine::MotionModel::from_idc(u8) -> Option<Self>` — inverse of
+    `MotionModel::idc()`. Rejects values outside `{0, 1, 2}` per
+    Table 15.
+  * `affine::derive_motion_model_idc(inter_affine_flag,
+    cu_affine_type_flag)` — pure function transcribing §8.5.5.2
+    eq. 160 as a typed mapping.
+
+  15 new lib tests pin:
+  * the eq. 160 truth table for every
+    `(inter_affine_flag, cu_affine_type_flag)` combination including
+    the unreachable `(false, true)` corner the parser never produces;
+  * `MotionModel::from_idc` round-trip + out-of-range rejection for
+    bogus inputs (3, 4, 7, 17, 255);
+  * the dispatcher's translational-on-outer-gate-closed paths via
+    both the SPS trigger and the four block-size triggers
+    (8x32 / 32x8 / 16x8 / 8x16);
+  * the inferred 4-param branch when
+    `sps_6param_affine_enabled == 0 && inter_affine_flag == 1`
+    (the inner gate stays closed and `cu_affine_type_flag` is
+    inferred 0);
+  * the full 6-param path with both bins driven;
+  * the round-trip-both-init-types matrix across all five reachable
+    `(sps_6param, inter_affine, cu_affine_type)` tuples for both
+    P-slice (initType 1) and B-slice (initType 2);
+  * the neighbour-state ctxInc threading through the
+    `inter_affine_flag` CABAC ctxInc derivation across the 0 / 1 / 2
+    ctxInc levels (the
+    `cond{L,A} = MergeSubblockFlag[N] || InterAffineFlag[N]`
+    Table 133 row);
+  * the §7.4.12.7 inferences against the decision struct
+    (gate-closed → `false` / `Translational`);
+  * the `outer_affine_gate_open` / `inner_6param_gate_open` gate-test
+    helpers in isolation across the AND-decomposition matrix.
+
+  Not yet:
+  * **CTU-walker call-site.** The dispatcher is implemented and
+    tested in isolation; the non-merge inter CU walker that calls
+    it (and then writes `MotionModelIdc` / `inter_affine_flag` /
+    `cu_affine_type_flag` into the round-149 affine grids) is the
+    next bounded step.
+  * **Encoder-side emission.** Round-152 / -159 added per-flag
+    encoder mirrors used by tests; an end-to-end encoder dispatcher
+    matching this reader (call when the non-merge inter encoder
+    path lands) is a separate follow-up.
+
 - Round 159 — **§7.3.11.7 `cu_affine_type_flag[x0][y0]` CABAC reader +
   Table 85 context bundle.** Follow-on to the round-152
   `inter_affine_flag` reader: the second of the two non-merge affine

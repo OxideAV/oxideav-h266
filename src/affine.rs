@@ -121,6 +121,51 @@ impl MotionModel {
             MotionModel::Affine6Param => 2,
         }
     }
+
+    /// Inverse of [`Self::idc`] — map the spec's numeric
+    /// `MotionModelIdc[ x0 ][ y0 ]` value (0 / 1 / 2) back to the typed
+    /// enum. Returns `None` for any out-of-range input; the spec only
+    /// defines values 0, 1, 2 via §7.4.10.5 Table 15. The §8.5.5.2
+    /// eq. 160 derivation `MotionModelIdc = inter_affine_flag +
+    /// cu_affine_type_flag` is the canonical producer of this value
+    /// on the non-merge inter path; see
+    /// [`derive_motion_model_idc`].
+    pub fn from_idc(idc: u8) -> Option<Self> {
+        match idc {
+            0 => Some(MotionModel::Translational),
+            1 => Some(MotionModel::Affine4Param),
+            2 => Some(MotionModel::Affine6Param),
+            _ => None,
+        }
+    }
+}
+
+/// §8.5.5.2 eq. 160 — derive the per-CU `MotionModelIdc[ x0 ][ y0 ]`
+/// numeric value from the two parsed non-merge inter syntax flags
+/// `inter_affine_flag` and `cu_affine_type_flag`.
+///
+/// The mapping is the spec's straight integer sum
+/// (`MotionModelIdc = inter_affine_flag + cu_affine_type_flag`):
+///
+/// | `inter_affine_flag` | `cu_affine_type_flag` | `MotionModelIdc` | enum                            |
+/// | ------------------- | --------------------- | ---------------- | ------------------------------- |
+/// | `false` (0)         | n/a (inferred `false`) | 0                | [`MotionModel::Translational`] |
+/// | `true`  (1)         | `false` (0)            | 1                | [`MotionModel::Affine4Param`]  |
+/// | `true`  (1)         | `true`  (1)            | 2                | [`MotionModel::Affine6Param`]  |
+///
+/// The `cu_affine_type_flag == 1 && inter_affine_flag == 0` corner is
+/// not reachable from the §7.3.11.7 parser (the inner read is gated on
+/// `inter_affine_flag == 1`); per §7.4.12.7 `cu_affine_type_flag` is
+/// then inferred to 0 anyway. Callers that have decoded both flags
+/// from the bitstream pass them through directly; the §7.3.11.7
+/// dispatcher in [`crate::leaf_cu::LeafCuReader::read_non_merge_inter_affine`]
+/// is the canonical caller.
+pub fn derive_motion_model_idc(inter_affine_flag: bool, cu_affine_type_flag: bool) -> MotionModel {
+    match (inter_affine_flag, cu_affine_type_flag) {
+        (false, _) => MotionModel::Translational,
+        (true, false) => MotionModel::Affine4Param,
+        (true, true) => MotionModel::Affine6Param,
+    }
 }
 
 /// Per-CU CPMV record for the affine modes. `cpmvs[0]` is `cpMvLX[0]`
@@ -1279,6 +1324,69 @@ mod tests {
         assert_eq!(MotionModel::Translational.idc(), 0);
         assert_eq!(MotionModel::Affine4Param.idc(), 1);
         assert_eq!(MotionModel::Affine6Param.idc(), 2);
+    }
+
+    #[test]
+    fn motion_model_from_idc_round_trip() {
+        // Round-164 — `from_idc` is the inverse of `idc` for every
+        // spec-defined value (Table 15). Round-trip every enum variant.
+        for m in [
+            MotionModel::Translational,
+            MotionModel::Affine4Param,
+            MotionModel::Affine6Param,
+        ] {
+            assert_eq!(MotionModel::from_idc(m.idc()), Some(m));
+        }
+    }
+
+    #[test]
+    fn motion_model_from_idc_rejects_out_of_range() {
+        // Round-164 — Table 15 only defines `MotionModelIdc ∈ {0, 1, 2}`.
+        // Any other value is out of spec and must return `None`.
+        for bogus in [3u8, 4, 7, 17, 255] {
+            assert!(
+                MotionModel::from_idc(bogus).is_none(),
+                "from_idc({bogus}) should be None"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_motion_model_idc_matches_eq_160() {
+        // Round-164 — §8.5.5.2 eq. 160 truth table.
+        //
+        // The cu_affine_type_flag column is irrelevant when
+        // inter_affine_flag == 0 (§7.4.12.7 inference forces it to 0),
+        // but the derivation helper still has to behave for both inputs
+        // because the parser may pass through a `false` default.
+        assert_eq!(
+            derive_motion_model_idc(false, false),
+            MotionModel::Translational
+        );
+        assert_eq!(
+            derive_motion_model_idc(false, true),
+            MotionModel::Translational
+        );
+        assert_eq!(
+            derive_motion_model_idc(true, false),
+            MotionModel::Affine4Param
+        );
+        assert_eq!(
+            derive_motion_model_idc(true, true),
+            MotionModel::Affine6Param
+        );
+    }
+
+    #[test]
+    fn derive_motion_model_idc_numeric_sum_matches_spec() {
+        // Round-164 — §8.5.5.2 eq. 160 spells out the derivation as a
+        // numeric integer sum. Verify that `idc()` of the resulting enum
+        // equals `inter_affine_flag + cu_affine_type_flag` for every
+        // legal `(flag, flag)` pair where the inner flag would actually
+        // be signalled (i.e. inter_affine_flag == 1).
+        assert_eq!(derive_motion_model_idc(false, false).idc(), 0);
+        assert_eq!(derive_motion_model_idc(true, false).idc(), 1);
+        assert_eq!(derive_motion_model_idc(true, true).idc(), 2);
     }
 
     /// Identity CPMV set (all CPMVs equal one translation) must

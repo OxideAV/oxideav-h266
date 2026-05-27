@@ -1004,6 +1004,49 @@ inter_affine_flag == 1` gate + the encoder-side emission + the
 cu_affine_type_flag` write into the round-149 affine grid remain
 follow-ups.
 
+**Round-164 lands the §7.3.11.7 non-merge inter affine-syntax
+dispatcher + §8.5.5.2 eq. 160 fold** — `LeafCuReader::read_non_merge_inter_affine`
+composes the round-152 `read_inter_affine_flag` and round-159
+`read_cu_affine_type_flag` CABAC readers under the §7.3.11.7
+gating cascade and folds the two decisions through
+`crate::affine::derive_motion_model_idc` (the spec's
+`MotionModelIdc = inter_affine_flag + cu_affine_type_flag`
+integer sum) into a typed `MotionModel`. The dispatcher takes a
+`NonMergeInterAffineGate` struct that bundles the §7.3.11.7
+outer gate (`sps_affine_enabled_flag && cbWidth >= 16 &&
+cbHeight >= 16`) + inner 6-param gate
+(`sps_6param_affine_enabled_flag && inter_affine_flag == 1`) +
+the four neighbour bits the §9.3.4.2.2 / Table 133 ctxInc
+derivation reads (left / above `MergeSubblockFlag` /
+`InterAffineFlag` + availability), and returns a
+`NonMergeInterAffineDecision { inter_affine_flag,
+cu_affine_type_flag, motion_model }`. §7.4.12.7 inferences
+(value-not-present ⇒ 0) are applied uniformly so the caller can
+write the decision into the per-CB grid without branching. The
+`affine` module gains `MotionModel::from_idc` (inverse of `idc`,
+rejects out-of-range values per Table 15) and
+`derive_motion_model_idc` (the spec's eq. 160 truth table as a
+standalone pure function). 15 new lib tests pin the eq. 160
+truth table for every `(inter_affine_flag, cu_affine_type_flag)`
+combination, the `from_idc` round-trip + out-of-range rejection,
+the dispatcher's translational-on-outer-gate-closed paths (both
+SPS and block-size triggers), the inferred 4-param branch when
+`sps_6param_affine_enabled == 0 && inter_affine_flag == 1`, the
+full 6-param path with both bins driven, the
+round-trip-both-init-types matrix across all five reachable
+(sps_6p, inter_affine, cu_affine_type) tuples, the neighbour-
+state ctxInc threading through the inter_affine_flag CABAC
+ctxInc derivation (the 0 / 1 / 2 ctxInc levels via the
+`cond{L,A} = MergeSubblockFlag[N] || InterAffineFlag[N]` Table
+133 row), the §7.4.12.7 inferences against the decision struct,
+and the `outer_affine_gate_open` / `inner_6param_gate_open`
+gate-test helpers in isolation. The CTU walker call-site that
+threads the per-CB neighbour state into this dispatcher + the
+write of `MotionModelIdc` / `inter_affine_flag` /
+`cu_affine_type_flag` into the round-149 affine grid + the
+encoder-side emission remain follow-ups for the broader
+non-merge inter CU walker.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

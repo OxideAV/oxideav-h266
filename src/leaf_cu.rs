@@ -182,6 +182,111 @@ impl BcwIdxGate {
     }
 }
 
+/// Round-164 — §7.3.11.7 non-merge inter CU affine-syntax gate.
+///
+/// Bundles the §7.3.11.7 gating conditions for the two affine syntax
+/// elements (`inter_affine_flag` and `cu_affine_type_flag`) on the
+/// non-merge inter branch together with the four neighbour bits the
+/// §9.3.4.2.2 / Table 133 ctxInc derivation reads. The caller (the CTU
+/// walker, once it brings the non-merge inter path online) fills this
+/// struct from live per-CB state — block size + SPS tool flags +
+/// neighbour CB descriptors — then passes it to
+/// [`LeafCuReader::read_non_merge_inter_affine`].
+///
+/// The struct is intentionally pure data: the §7.3.11.7 control flow is
+/// captured by [`Self::outer_affine_gate_open`] and
+/// [`Self::inner_6param_gate_open`] which encode the two `if` tests
+/// from the spec verbatim. This keeps the dispatcher itself short while
+/// making each gate testable in isolation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NonMergeInterAffineGate {
+    /// `sps_affine_enabled_flag` from the active SPS — the outer gate
+    /// for the entire affine syntax.
+    pub sps_affine_enabled: bool,
+    /// `sps_6param_affine_enabled_flag` from the active SPS — the inner
+    /// gate that admits `cu_affine_type_flag` on top of
+    /// `inter_affine_flag == 1`. The spec defines this flag as
+    /// `0 ⇒ 6-param affine is disabled, only 4-param is signalled`.
+    pub sps_6param_affine_enabled: bool,
+    /// CU luma-block width `cbWidth`. Must be `>= 16` for the outer
+    /// affine gate to open.
+    pub cb_width: u32,
+    /// CU luma-block height `cbHeight`. Must be `>= 16` for the outer
+    /// affine gate to open.
+    pub cb_height: u32,
+    /// `MergeSubblockFlag[xNbL][yNbL]` — left neighbour subblock-merge
+    /// status. Used (along with `left_inter_affine`) by the §9.3.4.2.2
+    /// Table 133 `condL = MergeSubblockFlag[L] || InterAffineFlag[L]`
+    /// derivation for the `inter_affine_flag` ctxInc.
+    pub left_merge_subblock: bool,
+    /// `InterAffineFlag[xNbL][yNbL]` — left neighbour non-merge affine
+    /// status.
+    pub left_inter_affine: bool,
+    /// `availableL` — left neighbour available per §6.4.4. When `false`
+    /// the spec masks both `MergeSubblockFlag[L]` and `InterAffineFlag[L]`
+    /// to 0 in the ctxInc derivation.
+    pub left_available: bool,
+    /// `MergeSubblockFlag[xNbA][yNbA]` — above neighbour subblock-merge
+    /// status.
+    pub above_merge_subblock: bool,
+    /// `InterAffineFlag[xNbA][yNbA]` — above neighbour non-merge affine
+    /// status.
+    pub above_inter_affine: bool,
+    /// `availableA` — above neighbour available per §6.4.4. When `false`
+    /// the above masking applies symmetrically.
+    pub above_available: bool,
+}
+
+impl NonMergeInterAffineGate {
+    /// `true` iff the §7.3.11.7 outer affine gate opens — i.e. the next
+    /// bin in the bitstream really is `inter_affine_flag[x0][y0]`:
+    ///
+    /// ```text
+    /// sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16
+    /// ```
+    pub fn outer_affine_gate_open(&self) -> bool {
+        self.sps_affine_enabled && self.cb_width >= 16 && self.cb_height >= 16
+    }
+
+    /// `true` iff the §7.3.11.7 inner 6-param gate opens for the given
+    /// already-decoded `inter_affine_flag`:
+    ///
+    /// ```text
+    /// sps_6param_affine_enabled_flag && inter_affine_flag[x0][y0] == 1
+    /// ```
+    ///
+    /// The outer affine gate is implicitly already open because
+    /// `inter_affine_flag == 1` is unreachable otherwise (§7.4.12.7
+    /// would have inferred it to 0). Callers don't need to AND with
+    /// [`Self::outer_affine_gate_open`].
+    pub fn inner_6param_gate_open(&self, inter_affine_flag: bool) -> bool {
+        self.sps_6param_affine_enabled && inter_affine_flag
+    }
+}
+
+/// Round-164 — output of [`LeafCuReader::read_non_merge_inter_affine`].
+///
+/// Carries the two raw flag values (with §7.4.12.7 inferences applied —
+/// any flag whose §7.3.11.7 gate was closed comes back `false`) plus
+/// the typed [`crate::affine::MotionModel`] folded via
+/// [`crate::affine::derive_motion_model_idc`] (§8.5.5.2 eq. 160). The
+/// numeric `MotionModelIdc` is recoverable via `motion_model.idc()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NonMergeInterAffineDecision {
+    /// `inter_affine_flag[x0][y0]` as decoded (or inferred 0 when the
+    /// outer affine gate was closed).
+    pub inter_affine_flag: bool,
+    /// `cu_affine_type_flag[x0][y0]` as decoded (or inferred 0 when the
+    /// inner 6-param gate was closed). Per §7.4.12.7 the inferred value
+    /// is always 0; the field carries the inference so the caller can
+    /// write it into the per-CB grid uniformly.
+    pub cu_affine_type_flag: bool,
+    /// `MotionModelIdc[x0][y0]` folded into the typed enum per
+    /// §8.5.5.2 eq. 160. `MotionModel::Translational` when the affine
+    /// path was gated off; `Affine4Param` / `Affine6Param` otherwise.
+    pub motion_model: crate::affine::MotionModel,
+}
+
 /// Intra subpartitions split type (Table 13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IspSplitType {
@@ -2132,6 +2237,96 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             .dec
             .decode_decision(&mut self.ctxs.cu_affine_type_flag[slot])?;
         Ok(bit == 1)
+    }
+
+    /// Round-164 — §7.3.11.7 non-merge inter CU affine-syntax dispatcher.
+    ///
+    /// Composes the round-152 [`Self::read_inter_affine_flag`] and the
+    /// round-159 [`Self::read_cu_affine_type_flag`] CABAC readers into
+    /// one entry point that mirrors the spec's `coding_unit()` text on
+    /// the **non-merge** inter branch (`general_merge_flag == 0` /
+    /// `cu_skip_flag == 0`). It is intentionally pure-bitstream — no
+    /// reconstruction-side state is touched and no encoder mirror is
+    /// invoked from here; the helper merely walks the two syntax
+    /// elements and returns the §8.5.5.2 eq. 160
+    /// `MotionModelIdc = inter_affine_flag + cu_affine_type_flag`
+    /// derivation alongside the raw bit values for the caller to fold
+    /// into the per-CB affine-grid record.
+    ///
+    /// The §7.3.11.7 control flow this helper implements (simplified
+    /// to the affine portion):
+    ///
+    /// ```text
+    /// /* outer affine gate */
+    /// if (sps_affine_enabled_flag &&
+    ///     cbWidth >= 16 && cbHeight >= 16)
+    ///   inter_affine_flag[x0][y0]            ae(v)
+    /// /* inner 6-param gate */
+    /// if (sps_6param_affine_enabled_flag &&
+    ///     inter_affine_flag[x0][y0] == 1)
+    ///   cu_affine_type_flag[x0][y0]          ae(v)
+    /// ```
+    ///
+    /// When either gate is closed the corresponding syntax element is
+    /// not present and §7.4.12.7 infers it to 0; the helper records the
+    /// inferred value(s) and returns `MotionModel::Translational` (the
+    /// inferred `MotionModelIdc == 0`).
+    ///
+    /// **Caller responsibility (the outer inter-branch gates).** The
+    /// helper assumes the surrounding non-merge inter gate is open —
+    /// i.e. the caller has already established:
+    ///
+    /// * the slice is non-I (`init_type >= 1` — affine syntax is never
+    ///   signalled in I slices), AND
+    /// * the parser is on the `general_merge_flag == 0 &&
+    ///   cu_skip_flag == 0` branch of §7.3.11.5.
+    ///
+    /// In particular the helper does **not** parse `cu_skip_flag`,
+    /// `pred_mode_flag`, `general_merge_flag`, `inter_pred_idc`, MVD,
+    /// `ref_idx`, `mvp_lX_flag`, `bcw_idx`, or `cu_qp_delta` — those
+    /// belong to the broader non-merge inter CU walker (a separate
+    /// follow-up) and the affine syntax sits inside that walker, not
+    /// in place of it.
+    ///
+    /// Returns a [`NonMergeInterAffineDecision`] carrying the raw flag
+    /// values (with §7.4.12.7 inferences applied) plus the typed
+    /// [`MotionModel`] folded via [`crate::affine::derive_motion_model_idc`].
+    pub fn read_non_merge_inter_affine(
+        &mut self,
+        gate: &NonMergeInterAffineGate,
+    ) -> Result<NonMergeInterAffineDecision> {
+        // §7.4.12.7 inference defaults — overwritten below only when the
+        // matching gate opens.
+        let mut inter_affine_flag = false;
+        let mut cu_affine_type_flag = false;
+
+        // Outer affine gate (§7.3.11.7):
+        //   sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16
+        if gate.outer_affine_gate_open() {
+            inter_affine_flag = self.read_inter_affine_flag(
+                gate.left_merge_subblock,
+                gate.left_inter_affine,
+                gate.left_available,
+                gate.above_merge_subblock,
+                gate.above_inter_affine,
+                gate.above_available,
+            )?;
+        }
+
+        // Inner 6-param gate (§7.3.11.7):
+        //   sps_6param_affine_enabled_flag && inter_affine_flag == 1
+        if gate.inner_6param_gate_open(inter_affine_flag) {
+            cu_affine_type_flag = self.read_cu_affine_type_flag()?;
+        }
+
+        let motion_model =
+            crate::affine::derive_motion_model_idc(inter_affine_flag, cu_affine_type_flag);
+
+        Ok(NonMergeInterAffineDecision {
+            inter_affine_flag,
+            cu_affine_type_flag,
+            motion_model,
+        })
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -4675,6 +4870,373 @@ mod tests {
         assert!(cu_affine_type_flag_round_trip(true, 2));
         assert!(!cu_affine_type_flag_round_trip(false, 1));
         assert!(cu_affine_type_flag_round_trip(true, 1));
+    }
+
+    // ---- Round-164: §7.3.11.7 non-merge inter affine-syntax
+    // dispatcher ----
+    //
+    // The dispatcher composes the round-152 `read_inter_affine_flag` and
+    // the round-159 `read_cu_affine_type_flag` readers under the
+    // §7.3.11.7 affine-portion gating cascade, then folds the two
+    // decisions through `crate::affine::derive_motion_model_idc`
+    // (§8.5.5.2 eq. 160) into a typed `MotionModel`.
+
+    /// Build a hand-rolled CABAC bitstream that emits the two affine
+    /// syntax bins corresponding to the given gate state + expected
+    /// flag pair, then drive the dispatcher and return the resulting
+    /// decision. Mirrors the encoder-side helpers above for the
+    /// individual readers but bundles them so the dispatcher's
+    /// gating cascade is exercised end-to-end.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_non_merge_inter_affine_round_trip(
+        init_type: u8,
+        gate: NonMergeInterAffineGate,
+        inter_affine_flag: bool,
+        cu_affine_type_flag: bool,
+    ) -> NonMergeInterAffineDecision {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+
+        // Only emit a bin for `inter_affine_flag` if the outer gate is
+        // open — otherwise the dispatcher won't read one.
+        if gate.outer_affine_gate_open() {
+            encode_inter_affine_flag(
+                &mut enc,
+                &mut enc_ctxs,
+                inter_affine_flag,
+                gate.left_merge_subblock,
+                gate.left_inter_affine,
+                gate.left_available,
+                gate.above_merge_subblock,
+                gate.above_inter_affine,
+                gate.above_available,
+            );
+        }
+        // Only emit a bin for `cu_affine_type_flag` if the inner gate is
+        // open against the value we just (notionally) emitted.
+        let effective_inter_affine = if gate.outer_affine_gate_open() {
+            inter_affine_flag
+        } else {
+            false
+        };
+        if gate.inner_6param_gate_open(effective_inter_affine) {
+            encode_cu_affine_type_flag(&mut enc, &mut enc_ctxs, cu_affine_type_flag);
+        }
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .read_non_merge_inter_affine(&gate)
+            .expect("dispatcher succeeds")
+    }
+
+    #[test]
+    fn dispatcher_translational_when_outer_gate_closed_sps() {
+        // sps_affine_enabled_flag == 0 → outer gate closed → both flags
+        // inferred 0 → MotionModel::Translational regardless of block
+        // size or neighbour state.
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: false,
+            sps_6param_affine_enabled: true, // irrelevant when outer closed
+            cb_width: 32,
+            cb_height: 32,
+            left_available: true,
+            above_available: true,
+            left_inter_affine: true,
+            above_inter_affine: true,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, true, true);
+        assert_eq!(
+            d,
+            NonMergeInterAffineDecision {
+                inter_affine_flag: false,
+                cu_affine_type_flag: false,
+                motion_model: crate::affine::MotionModel::Translational,
+            }
+        );
+    }
+
+    #[test]
+    fn dispatcher_translational_when_outer_gate_closed_block_size() {
+        // sps_affine_enabled_flag == 1 but cbWidth < 16 (or cbHeight <
+        // 16) → outer gate closed.
+        for (cb_w, cb_h) in [(8u32, 32u32), (32, 8), (16, 8), (8, 16)] {
+            let gate = NonMergeInterAffineGate {
+                sps_affine_enabled: true,
+                sps_6param_affine_enabled: true,
+                cb_width: cb_w,
+                cb_height: cb_h,
+                left_available: true,
+                above_available: true,
+                ..NonMergeInterAffineGate::default()
+            };
+            assert!(!gate.outer_affine_gate_open());
+            let d = dispatch_non_merge_inter_affine_round_trip(2, gate, true, true);
+            assert!(!d.inter_affine_flag);
+            assert!(!d.cu_affine_type_flag);
+            assert_eq!(d.motion_model, crate::affine::MotionModel::Translational);
+        }
+    }
+
+    #[test]
+    fn dispatcher_translational_when_inter_affine_flag_reads_zero() {
+        // Outer gate open, but the bitstream encodes inter_affine_flag
+        // = 0 — the inner 6-param gate then stays closed and
+        // cu_affine_type_flag is not signalled.
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: true,
+            cb_width: 16,
+            cb_height: 16,
+            left_available: true,
+            above_available: true,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, false, false);
+        assert!(!d.inter_affine_flag);
+        assert!(!d.cu_affine_type_flag);
+        assert_eq!(d.motion_model, crate::affine::MotionModel::Translational);
+    }
+
+    #[test]
+    fn dispatcher_affine4param_when_inner_gate_closed_by_sps() {
+        // sps_6param_affine_enabled_flag == 0 → only inter_affine_flag
+        // is signalled. inter_affine_flag = 1 → MotionModelIdc = 1
+        // (4-param affine), cu_affine_type_flag inferred 0.
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: false,
+            cb_width: 32,
+            cb_height: 16,
+            left_available: true,
+            above_available: true,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, true, false);
+        assert!(d.inter_affine_flag);
+        assert!(!d.cu_affine_type_flag);
+        assert_eq!(d.motion_model, crate::affine::MotionModel::Affine4Param);
+        assert_eq!(d.motion_model.idc(), 1);
+    }
+
+    #[test]
+    fn dispatcher_affine4param_when_inner_bin_reads_zero() {
+        // Both gates open; the encoder emits inter_affine_flag = 1
+        // followed by cu_affine_type_flag = 0 → MotionModelIdc = 1.
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: true,
+            cb_width: 16,
+            cb_height: 32,
+            left_available: true,
+            above_available: true,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, true, false);
+        assert!(d.inter_affine_flag);
+        assert!(!d.cu_affine_type_flag);
+        assert_eq!(d.motion_model, crate::affine::MotionModel::Affine4Param);
+    }
+
+    #[test]
+    fn dispatcher_affine6param_full_path() {
+        // Both gates open; encoder emits inter_affine_flag = 1 +
+        // cu_affine_type_flag = 1 → MotionModelIdc = 2 (6-param).
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: true,
+            cb_width: 32,
+            cb_height: 32,
+            left_available: true,
+            above_available: true,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, true, true);
+        assert!(d.inter_affine_flag);
+        assert!(d.cu_affine_type_flag);
+        assert_eq!(d.motion_model, crate::affine::MotionModel::Affine6Param);
+        assert_eq!(d.motion_model.idc(), 2);
+    }
+
+    #[test]
+    fn dispatcher_round_trips_both_init_types() {
+        // Both non-I initTypes (P-slice = 1, B-slice = 2) round-trip the
+        // full 4×combination matrix of (gate-open, gate-closed) for the
+        // 6-param inner gate together with the outer-gate-open case.
+        let cases = [
+            // (sps_6param_enabled, inter_affine, cu_affine_type,
+            //  expected motion model)
+            (
+                false,
+                false,
+                false,
+                crate::affine::MotionModel::Translational,
+            ),
+            (false, true, false, crate::affine::MotionModel::Affine4Param),
+            (
+                true,
+                false,
+                false,
+                crate::affine::MotionModel::Translational,
+            ),
+            (true, true, false, crate::affine::MotionModel::Affine4Param),
+            (true, true, true, crate::affine::MotionModel::Affine6Param),
+        ];
+        for it in [1u8, 2] {
+            for (sps_6p, ia, cat, expected) in cases {
+                let gate = NonMergeInterAffineGate {
+                    sps_affine_enabled: true,
+                    sps_6param_affine_enabled: sps_6p,
+                    cb_width: 16,
+                    cb_height: 16,
+                    left_available: true,
+                    above_available: true,
+                    ..NonMergeInterAffineGate::default()
+                };
+                let d = dispatch_non_merge_inter_affine_round_trip(it, gate, ia, cat);
+                assert_eq!(
+                    d.motion_model, expected,
+                    "init={it} sps_6p={sps_6p} ia={ia} cat={cat}: expected {:?}, got {:?}",
+                    expected, d.motion_model
+                );
+                assert_eq!(d.inter_affine_flag, ia);
+                // cu_affine_type_flag is only `cat` when the inner gate
+                // was actually opened (sps_6p && ia); otherwise it's
+                // the §7.4.12.7 inferred 0.
+                let expected_cat = sps_6p && ia && cat;
+                assert_eq!(d.cu_affine_type_flag, expected_cat);
+            }
+        }
+    }
+
+    #[test]
+    fn dispatcher_uses_neighbour_state_for_inter_affine_flag_ctxinc() {
+        // Vary the neighbour state across the three ctxInc values (0 /
+        // 1 / 2) and confirm the round-trip still recovers the flag in
+        // every case — i.e. the dispatcher really threads neighbour
+        // state into the inter_affine_flag CABAC ctxInc derivation.
+        let neighbour_configs: &[(bool, bool, bool, bool, bool, bool)] = &[
+            // (left_msb, left_inter, left_avail, above_msb, above_inter, above_avail)
+            (false, false, true, false, false, true), // cond_l=0, cond_a=0 → ctxInc=0
+            (true, false, true, false, false, true),  // cond_l=1, cond_a=0 → ctxInc=1
+            (false, false, true, false, true, true),  // cond_l=0, cond_a=1 → ctxInc=1
+            (true, false, true, false, true, true),   // cond_l=1, cond_a=1 → ctxInc=2
+        ];
+        for (l_msb, l_inter, l_avail, a_msb, a_inter, a_avail) in neighbour_configs.iter().copied()
+        {
+            for flag in [false, true] {
+                let gate = NonMergeInterAffineGate {
+                    sps_affine_enabled: true,
+                    sps_6param_affine_enabled: true,
+                    cb_width: 16,
+                    cb_height: 16,
+                    left_merge_subblock: l_msb,
+                    left_inter_affine: l_inter,
+                    left_available: l_avail,
+                    above_merge_subblock: a_msb,
+                    above_inter_affine: a_inter,
+                    above_available: a_avail,
+                };
+                // For flag == true, also drive cu_affine_type_flag = 0
+                // so the inner gate exercises one bin too.
+                let d = dispatch_non_merge_inter_affine_round_trip(2, gate, flag, false);
+                assert_eq!(
+                    d.inter_affine_flag, flag,
+                    "neighbour=({l_msb},{l_inter},{l_avail},{a_msb},{a_inter},{a_avail}) flag={flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatcher_inferences_match_section_7_4_12_7() {
+        // §7.4.12.7 inference: any syntax element not present is
+        // inferred to 0. Walk every gate-closed combination and check
+        // the decision struct carries (false, false, Translational) /
+        // (true, false, Affine4Param) as appropriate.
+        //
+        // Case 1: outer gate closed via sps_affine_enabled = 0 →
+        //         both flags inferred 0.
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: false,
+            sps_6param_affine_enabled: true,
+            cb_width: 32,
+            cb_height: 32,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, false, false);
+        assert!(!d.inter_affine_flag);
+        assert!(!d.cu_affine_type_flag);
+        // Case 2: outer open, inner closed by sps_6p = 0,
+        //         inter_affine_flag = 1 → cu_affine_type_flag inferred 0.
+        let gate = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: false,
+            cb_width: 16,
+            cb_height: 16,
+            left_available: true,
+            above_available: true,
+            ..NonMergeInterAffineGate::default()
+        };
+        let d = dispatch_non_merge_inter_affine_round_trip(2, gate, true, false);
+        assert!(d.inter_affine_flag);
+        assert!(!d.cu_affine_type_flag);
+        assert_eq!(d.motion_model, crate::affine::MotionModel::Affine4Param);
+    }
+
+    #[test]
+    fn dispatcher_gate_outer_affine_gate_open_matches_spec_text() {
+        // Pin the boolean function in `outer_affine_gate_open` against
+        // the §7.3.11.7 text: requires sps_affine_enabled_flag AND both
+        // dimensions >= 16. Any single failure closes the gate.
+        let base = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: true,
+            cb_width: 16,
+            cb_height: 16,
+            ..NonMergeInterAffineGate::default()
+        };
+        assert!(base.outer_affine_gate_open());
+        let mut g = base;
+        g.sps_affine_enabled = false;
+        assert!(!g.outer_affine_gate_open());
+        let mut g = base;
+        g.cb_width = 8;
+        assert!(!g.outer_affine_gate_open());
+        let mut g = base;
+        g.cb_height = 8;
+        assert!(!g.outer_affine_gate_open());
+        // 128x128 / 16x128 etc. obviously remain open.
+        let mut g = base;
+        g.cb_width = 128;
+        g.cb_height = 128;
+        assert!(g.outer_affine_gate_open());
+    }
+
+    #[test]
+    fn dispatcher_gate_inner_6param_gate_requires_both_inputs() {
+        // `inner_6param_gate_open(inter_affine_flag)` is a 2-input AND
+        // — sps_6param_affine_enabled_flag && inter_affine_flag.
+        let g_off = NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: false,
+            cb_width: 16,
+            cb_height: 16,
+            ..NonMergeInterAffineGate::default()
+        };
+        assert!(!g_off.inner_6param_gate_open(true));
+        assert!(!g_off.inner_6param_gate_open(false));
+        let g_on = NonMergeInterAffineGate {
+            sps_6param_affine_enabled: true,
+            ..g_off
+        };
+        assert!(!g_on.inner_6param_gate_open(false));
+        assert!(g_on.inner_6param_gate_open(true));
     }
 
     // ---- Round-146: §7.3.11.7 merge_data() wire-up of
