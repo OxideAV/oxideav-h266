@@ -6,6 +6,62 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 187 — **encoder-side mirror of the §7.3.10.10 `mvd_coding()`
+  structure plus its §9.3.3.6 limited-EGk `abs_mvd_minus2`
+  sub-binarisation.** New `mvd_coding_enc` module lifts the
+  `#[cfg(test)]`-only `encode_mvd_coding` / `encode_abs_mvd_minus2`
+  helpers in `leaf_cu.rs` (used since round 103 for conformance
+  round-trips) into a public encoder surface bin-for-bin parallel to
+  [`crate::leaf_cu::LeafCuReader::read_mvd_coding`]. The dispatcher
+  walks §7.3.10.10 in spec order: (1) both `abs_mvd_greater0_flag`
+  bins ctx-coded against Table 110 / Table 132 (slot `init_type`,
+  deterministic `ctxInc = 0`); (2) per non-zero component an
+  `abs_mvd_greater1_flag` bin ctx-coded against Table 111 / Table
+  132; (3) per non-zero component, when greater1 is set, an
+  `abs_mvd_minus2` bypass payload via [`encode_abs_mvd_minus2`]
+  followed by an `mvd_sign_flag` bypass bin. The §9.3.3.6 limited-EGk
+  sub-binarisation transcribes `k = 1`, `maxPreExtLen = 15`,
+  `truncSuffixLen = 17`: the prefix walks `(2 << preExtLen) - 2`
+  while `code_value > base`, emitting `1` bins; below the cap a
+  terminating `0` closes the run and the suffix is `preExtLen + k`
+  bits wide; at the cap the suffix is the fixed 17-bit escape field
+  with no terminating `0`. A convenience `pub const fn
+  max_mvd_magnitude() -> i32` returns `2^17 - 1`, the §7.4.10.10
+  positive conformance bound (the corresponding negative bound is
+  `-2^17 = -131_072`, the signed-18-bit floor; this asymmetry is
+  baked into the encoder's `debug_assert` range check). Together
+  with round-177's `affine_syntax_enc` (`inter_affine_flag` /
+  `cu_affine_type_flag`) and round-183's `non_merge_mvp_syntax_enc`
+  (`inter_pred_idc` / `sym_mvd_flag` / `ref_idx_lX` / `mvp_lX_flag`)
+  this completes the public encoder + decoder symmetry for the
+  entire §7.3.11.7 non-merge inter pre-residual syntax: an external
+  encoder can now drive a CU's full `inter_pred_idc → sym_mvd_flag →
+  ref_idx_lX → mvp_lX_flag → mvd_coding(L0) → mvd_coding(L1)`
+  cascade entirely through public encoder helpers. CTU-walker /
+  encoder-pipeline call-site that consumes this surface remains the
+  next-step follow-up. Tests: 11 new lib cases — `max_mvd_magnitude`
+  spec-bound assertion; zero-pair two-bin round-trip on both
+  non-I initTypes; unit-magnitude (`|lMvd| == 1`) sign-only
+  round-trip exhaustive over the 4-sign 2-initType 8-case truth
+  table (verifying eq. 190's `abs_mvd_minus2 = -1` inference path);
+  mixed zero / non-zero component round-trips; large-magnitude
+  sweep (`(2, 2)` through `(131_071, -131_071)`) exercising the
+  §9.3.3.6 prefix-growth path up to the §7.4.10.10 positive ceiling;
+  signed-18-bit-floor `-131_072` round-trip locking the negative
+  asymmetric bound (`abs_mvd_minus2 = 131_070` at the EGk cap with
+  17-bit escape suffix `65_536`); eq. 190 derivation spot-check at
+  `(±9, ∓9)`; isolated EGk codec sweep via synthetic
+  `mvd_coding()` cascade covering the maxPreExtLen escape boundary
+  with cross-check that the direct `encode_abs_mvd_minus2` path
+  produces a strictly-smaller wire than its `mvd_coding()`
+  envelope; both-components-negative round-trip sweep; sign-drift-
+  at-cap-magnitude round-trip across both axes and initTypes; and a
+  determinism pin verifying the zero-pair encoder is repeatable
+  byte-for-byte across runs. Spec reference: ITU-T H.266 | ISO/IEC
+  23090-3 (V4, 01/2026) §7.3.10.10 / §7.4.10.10 (eq. 190) /
+  §9.3.3.6 / §9.3.4.2.2 / Tables 51 / 110 / 111 / 132. No
+  third-party VVC encoder source consulted.
+
 - Round 183 — **encoder-side mirror of the §7.3.11.7 non-merge
   inter MVP-side syntax.** New `non_merge_mvp_syntax_enc` module
   lifts the four `#[cfg(test)]`-only encoder helpers in

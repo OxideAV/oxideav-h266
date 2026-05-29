@@ -179,6 +179,7 @@ pub mod isp;
 pub mod leaf_cu;
 pub mod mip;
 pub mod mip_tables;
+pub mod mvd_coding_enc;
 pub mod nal;
 pub mod non_merge_mvp_syntax_enc;
 pub mod opi;

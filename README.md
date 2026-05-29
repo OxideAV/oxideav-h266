@@ -1137,6 +1137,49 @@ encoder-pipeline call-site that consumes this surface — alongside
 the round-177 affine-syntax dispatcher — remains the next-step
 follow-up for the broader non-merge inter CU encoder.
 
+**Round-187 lands the encoder-side mirror of the §7.3.10.10
+`mvd_coding()` structure** — the third and final encoder-syntax
+module needed to drive a CU's full §7.3.11.7 non-merge inter
+pre-residual syntax through public encoder helpers. The new
+`mvd_coding_enc` module lifts the previously `#[cfg(test)]`-only
+`encode_mvd_coding` / `encode_abs_mvd_minus2` helpers (used since
+round 103 for conformance round-trips) into a public surface
+parallel to `LeafCuReader::read_mvd_coding`. The dispatcher walks
+§7.3.10.10 in spec order: both `abs_mvd_greater0_flag` bins
+ctx-coded against Table 110 / Table 132 (slot `init_type`,
+deterministic `ctxInc = 0`), per non-zero component an
+`abs_mvd_greater1_flag` bin ctx-coded against Table 111 / Table
+132, then per non-zero component (when greater1 is set) an
+`abs_mvd_minus2` bypass payload via `encode_abs_mvd_minus2`
+followed by a single bypass `mvd_sign_flag` bit. The §9.3.3.6
+limited-EGk sub-binarisation transcribes `k = 1`,
+`maxPreExtLen = 15`, `truncSuffixLen = 17` with the spec's
+prefix-then-fixed-width-suffix shape and the cap-no-terminator
+escape path. A `pub const fn max_mvd_magnitude() -> i32` returns
+`2^17 - 1`, the §7.4.10.10 positive conformance bound; the
+encoder's debug-assertion range check also admits `-2^17` (the
+signed-18-bit floor), encoded through the EGk cap path. Together
+with round-177's `affine_syntax_enc` and round-183's
+`non_merge_mvp_syntax_enc` this completes the public encoder +
+decoder symmetry for the entire §7.3.11.7 non-merge inter
+pre-residual syntax. 11 new lib tests pin the spec-bound assertion,
+the zero-pair two-bin round-trip on both non-I initTypes, the
+unit-magnitude (`|lMvd| == 1`) sign-only round-trip exhaustive
+over the 4-sign × 2-initType truth table, mixed zero / non-zero
+component round-trips, large-magnitude sweep up to the §7.4.10.10
+positive ceiling, signed-18-bit-floor `-131_072` round-trip
+locking the asymmetric negative bound, eq. 190 derivation
+spot-check, isolated EGk codec sweep across the maxPreExtLen
+escape boundary with cross-check that the direct
+`encode_abs_mvd_minus2` path produces a strictly-smaller wire than
+its `mvd_coding()` envelope, both-components-negative round-trip
+sweep, sign-drift-at-cap-magnitude round-trip across both axes
+and initTypes, and a determinism pin verifying the zero-pair
+encoder is repeatable byte-for-byte across runs. CTU-walker /
+encoder-pipeline call-site that consumes the three encoder-syntax
+modules together remains the next-step follow-up for the broader
+non-merge inter CU encoder.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
