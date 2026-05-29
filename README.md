@@ -1091,6 +1091,52 @@ CTU-walker / encoder-pipeline call-site that consumes this surface
 + the per-CB affine-grid write at encode time remain follow-ups
 for the broader non-merge inter CU encoder.
 
+**Round-183 lands the encoder-side mirror of the §7.3.11.7 non-merge
+inter MVP-side syntax** — companion to round-177's
+affine-syntax encoder. The new `non_merge_mvp_syntax_enc` module
+lifts the four `#[cfg(test)]`-only helpers in `leaf_cu.rs`
+(`encode_inter_pred_idc`, `encode_sym_mvd_flag`,
+`encode_ref_idx_lx`, `encode_mvp_lx_flag`) into a public encoder
+surface that mirrors the matching reader-side readers
+(`LeafCuReader::read_inter_pred_idc`, `read_sym_mvd_flag`,
+`read_ref_idx_lx`, `read_mvp_lx_flag`) bin-for-bin: Table 131's
+two-bin form for `cbWidth + cbHeight > 12` with bin 0 ctxInc per
+`ctx_inc_inter_pred_idc_bin0` and bin 1 per
+`ctx_inc_inter_pred_idc_bin1`, the one-bin form when sum == 12
+(PRED_BI suppressed), Table 86's deterministic-ctxInc-0
+`sym_mvd_flag` (slot `init_type - 1`), Table 127's TR `cMax =
+NumRefIdxActive[X] - 1` with bins 0/1 ctx-coded (ctxInc 0/1) and
+bins 2.. bypass-coded against slot block `(init_type - 1) * 2`,
+and Table 132's `mvp_lX_flag` single ctx-coded FL `cMax = 1` bin
+against slot `init_type`. A dispatcher
+`encode_non_merge_mvp_syntax(enc, ctxs, gate, decision)` walks
+§7.3.11.7 in spec order
+(`inter_pred_idc` → `sym_mvd_flag` → per-list `ref_idx_lX` →
+per-list `mvp_lX_flag` for active lists). The `NonMergeMvpSyntaxGate`
+exposes per-element gate predicates
+(`inter_pred_idc_gate_open` / `inter_pred_idc_two_bin_form` /
+`sym_mvd_signalled` / `l0_active` / `l1_active` /
+`ref_idx_l0_signalled` / `ref_idx_l1_signalled`) so callers can
+introspect the §7.4.12.7 inference branches without reproducing
+the logic. A convenience constructor
+`make_non_merge_mvp_syntax_decision(...)` clamps the L1 / sym-path
+fields to 0 on inactive paths so the encoder cannot drift away
+from the inferences the reader applies on decode. 10 new lib tests
+pin the P-slice zero-bin path, the B-slice two-bin form
+round-tripping all three PRED_L0 / PRED_L1 / PRED_BI directions,
+the B-slice one-bin (sum-12) form round-trips, the
+sym_mvd-gate-open path with `ref_idx_lX` correctly skipped, the
+single-active-list `ref_idx_lX` zero-bin path, the truncated-unary
+sweep over 0..=3 covering ctx + bypass + cMax-truncation bins, the
+both-`mvp_lX_flag` values round-trip, a full B-slice bi-pred
+round-trip exercising the entire §7.3.11.7 cascade end-to-end, the
+decision-helper clamping behaviour across all three direction
+modes, and the per-element gate-predicate truth table for both
+P-slice and B-slice plus the (4,8) one-bin edge case. CTU-walker /
+encoder-pipeline call-site that consumes this surface — alongside
+the round-177 affine-syntax dispatcher — remains the next-step
+follow-up for the broader non-merge inter CU encoder.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

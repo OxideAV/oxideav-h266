@@ -180,6 +180,7 @@ pub mod leaf_cu;
 pub mod mip;
 pub mod mip_tables;
 pub mod nal;
+pub mod non_merge_mvp_syntax_enc;
 pub mod opi;
 pub mod picture_header;
 pub mod pps;

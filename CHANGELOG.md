@@ -6,6 +6,56 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 183 — **encoder-side mirror of the §7.3.11.7 non-merge
+  inter MVP-side syntax.** New `non_merge_mvp_syntax_enc` module
+  lifts the four `#[cfg(test)]`-only encoder helpers in
+  `leaf_cu.rs` (`encode_inter_pred_idc`, `encode_sym_mvd_flag`,
+  `encode_ref_idx_lx`, `encode_mvp_lx_flag`) into a public
+  encoder surface bin-for-bin parallel to the matching reader-side
+  readers (`LeafCuReader::read_inter_pred_idc` /
+  `read_sym_mvd_flag` / `read_ref_idx_lx` / `read_mvp_lx_flag`).
+  Table 131 covers the two-bin form for `cbWidth + cbHeight > 12`
+  (`PRED_BI = 1`, `PRED_L0 = 00`, `PRED_L1 = 01`) with bin 0
+  ctxInc per `ctx_inc_inter_pred_idc_bin0` and bin 1 per
+  `ctx_inc_inter_pred_idc_bin1`, the one-bin form for sum == 12
+  (`PRED_BI` suppressed). Table 86 covers `sym_mvd_flag` (slot
+  `init_type - 1`, deterministic ctxInc 0). Table 127 covers
+  `ref_idx_lX` TR `cMax = NumRefIdxActive[X] - 1` with bins 0/1
+  ctx-coded (ctxInc 0/1) and bins 2.. bypass against slot block
+  `(init_type - 1) * 2`. Table 132 covers `mvp_lX_flag` single
+  ctx-coded FL `cMax = 1` bin against slot `init_type`. A
+  dispatcher `encode_non_merge_mvp_syntax(enc, ctxs, gate,
+  decision)` walks §7.3.11.7 in spec order
+  (`inter_pred_idc` → `sym_mvd_flag` → per-list `ref_idx_lX` →
+  per-list `mvp_lX_flag` for active lists). When a §7.4.12.7
+  inference holds (the corresponding `NonMergeMvpSyntaxGate`
+  predicate is closed) the dispatcher emits zero bins, matching
+  the reader's skip behaviour. A convenience constructor
+  `make_non_merge_mvp_syntax_decision(...)` clamps the L1 /
+  sym-path fields to 0 on inactive paths so a decision struct can
+  never disagree with the reader-side §7.4.12.7 inferences. The
+  module is companion to round-177's `affine_syntax_enc`; together
+  they form the complete public encoder surface for the
+  §7.3.11.7 non-merge inter pre-MVD syntax. Tests: 10 new lib
+  cases — P-slice inter_pred_idc-gate-closed zero-bin round-trip,
+  B-slice two-bin form round-trips for all three PRED_L0 /
+  PRED_L1 / PRED_BI directions, B-slice one-bin (sum-12) form
+  round-trips for both PRED_L0 and PRED_L1, sym_mvd_signalled-only-
+  under-PRED_BI-with-gate-open round-trip (verifying ref_idx_lX
+  correctly skipped per §7.3.11.7), single-active-list
+  (NumRefIdxActive == 1) ref_idx_lX zero-bin round-trip,
+  truncated-unary sweep over 0..=3 covering ctx-coded bins 0/1 +
+  bypass bin 2 + cMax-truncation, both `mvp_lX_flag` values
+  round-trip, full B-slice bi-pred round-trip exercising the entire
+  §7.3.11.7 MVP-side cascade end-to-end, decision-helper clamping
+  truth table across all three direction modes, and per-element
+  gate-predicate sanity check for P-slice + B-slice plus the (4,8)
+  one-bin edge case. CTU-walker / encoder-pipeline call-site that
+  consumes this surface remains the next-step follow-up. Spec
+  reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026)
+  §7.3.11.7 / §7.4.12.7 / §9.3.4.2.2 / Tables 51 / 86 / 127 /
+  131 / 132. No third-party VVC encoder source consulted.
+
 - Round 177 — **encoder-side mirror of the round-164 §7.3.11.7
   non-merge inter affine-syntax dispatcher.** New
   `affine_syntax_enc` module exposes the public CABAC encoder
