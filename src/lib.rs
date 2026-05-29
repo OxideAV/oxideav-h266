@@ -145,6 +145,7 @@
 pub mod affine;
 pub mod affine_amvp;
 pub mod affine_merge;
+pub mod affine_syntax_enc;
 pub mod alf;
 pub mod alf_aps_design;
 pub mod alf_enc;

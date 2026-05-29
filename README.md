@@ -1047,6 +1047,50 @@ write of `MotionModelIdc` / `inter_affine_flag` /
 encoder-side emission remain follow-ups for the broader
 non-merge inter CU walker.
 
+**Round-177 lands the encoder-side mirror of the round-164
+dispatcher** — the new `affine_syntax_enc` module exposes
+`encode_inter_affine_flag` (Table 84, ctx slot
+`(init_type - 1) * 3 + ctxInc` with the §9.3.4.2.2 / Table 133
+shared `condL = MergeSubblockFlag[L] || InterAffineFlag[L]`
+neighbour derivation) and `encode_cu_affine_type_flag` (Table 85,
+deterministic `ctxInc = 0` per Table 133, slot `init_type - 1`)
+plus the dispatcher `encode_non_merge_inter_affine(enc, ctxs, gate,
+decision)` that applies the same §7.3.11.7 gating cascade as the
+reader: emits one `inter_affine_flag` bin only when the outer gate
+(`sps_affine_enabled_flag && cbWidth >= 16 && cbHeight >= 16`)
+opens, then emits one `cu_affine_type_flag` bin only when the
+inner 6-param gate (`sps_6param_affine_enabled_flag &&
+inter_affine_flag == 1`) opens against the effective
+`inter_affine_flag`. When a gate is closed the encoder emits zero
+bins — matching the reader's §7.4.12.7 inference path — so the
+wire layout round-trips bit-identically through
+`LeafCuReader::read_non_merge_inter_affine`. A convenience
+constructor `make_non_merge_inter_affine_decision(inter_affine_flag,
+cu_affine_type_flag)` folds `motion_model` through
+`derive_motion_model_idc` (§8.5.5.2 eq. 160) so the encoder side
+cannot drift its typed enum from the raw flag pair, and a
+spec-traceability re-export
+`ctx_inc_shared_merge_subblock_inter_affine` surfaces the shared
+Table 133 row both `merge_subblock_flag` and `inter_affine_flag`
+consume. 13 new lib tests pin the truth table for
+`make_non_merge_inter_affine_decision` over all four flag pairs
+(including the unreachable `(false, true)` defensive mapping), the
+outer-gate-closed-by-SPS + outer-gate-closed-by-block-size
+zero-bin round-trips, the inner-gate-closed (sps_6p = 0) one-bin
+round-trip recovering `Affine4Param`, the both-gates-open
+round-trips for `Affine4Param` + `Affine6Param`, the 16-tuple
+`(left_msb, left_aff, above_msb, above_aff)` neighbour-state
+sweep, the §6.4.4 unavailable-neighbour masking round-trip across
+both non-I initTypes for every reachable flag pair, a six-case
+`(gate, decision)` sweep across both initTypes, the exhaustive
+64-case shared-row identity check, and two byte-stream identity
+pins (zero-bin emission under closed outer gate equals a
+no-dispatch terminator-only stream; one-bin emission under closed
+inner gate equals a direct `encode_inter_affine_flag` call). The
+CTU-walker / encoder-pipeline call-site that consumes this surface
++ the per-CB affine-grid write at encode time remain follow-ups
+for the broader non-merge inter CU encoder.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

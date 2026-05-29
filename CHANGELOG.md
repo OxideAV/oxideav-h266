@@ -6,6 +6,50 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 177 — **encoder-side mirror of the round-164 §7.3.11.7
+  non-merge inter affine-syntax dispatcher.** New
+  `affine_syntax_enc` module exposes the public CABAC encoder
+  helpers for `inter_affine_flag` (Table 84 / §9.3.4.2.2 Table 133
+  shared `condL`/`condA` row, ctx slot
+  `(init_type - 1) * 3 + ctxInc`) and `cu_affine_type_flag` (Table
+  85, deterministic `ctxInc = 0` per Table 133, ctx slot
+  `init_type - 1`) plus a full dispatcher
+  `encode_non_merge_inter_affine(enc, ctxs, gate, decision)` that
+  mirrors `LeafCuReader::read_non_merge_inter_affine` bin-for-bin
+  under the same §7.3.11.7 gating cascade. When the outer or inner
+  gate is closed the dispatcher emits zero bins, matching the reader's
+  §7.4.12.7 inference path; when both gates are open it emits the
+  two bins in the spec's order so the wire layout round-trips
+  bit-identically through the reader dispatcher. A convenience
+  constructor `make_non_merge_inter_affine_decision(inter_affine_flag,
+  cu_affine_type_flag)` folds `motion_model` through `derive_motion_model_idc`
+  (§8.5.5.2 eq. 160) so callers can't accidentally drift the typed
+  enum from the flag pair. The previously `#[cfg(test)]`-only
+  encoder helpers in `leaf_cu.rs` remain for the round-152 / -159 /
+  -164 reader-side tests; the new public module is the surface a
+  real non-merge inter CU encoder will call from outside the crate.
+  Tests: 13 new cases — `make_non_merge_inter_affine_decision`
+  truth-table per eq. 160 (all four input pairs, including the
+  defensive `(false, true)` mapping to `Translational`); outer-gate-
+  closed-by-SPS and outer-gate-closed-by-block-size round-trips
+  emitting zero bins; outer-gate-open with `inter_affine_flag = 0`
+  round-trip (one bin, inner gate stays closed); inner-gate-closed-
+  by-SPS one-bin round-trip recovering `MotionModel::Affine4Param`;
+  both-gates-open round-trips for `Affine4Param` and `Affine6Param`;
+  16-tuple `(left_msb, left_aff, above_msb, above_aff)` neighbour-
+  state sweep verifying ctxInc threads through end-to-end; §6.4.4
+  unavailable-neighbour masking round-trip across both initTypes
+  and all reachable flag pairs; six-case `(gate, decision)` sweep
+  across both non-I initTypes; exhaustive 64-case
+  `ctx_inc_shared_merge_subblock_inter_affine == ctx_inc_inter_affine_flag`
+  identity check (Table 133 shared row); zero-bin emission
+  identical-stream pin when outer gate closed; exactly-one-bin
+  emission identical-stream pin against direct
+  `encode_inter_affine_flag` when inner gate closed. The CTU-walker
+  call-site that actually consumes this encoder + the encoder-side
+  population of the round-149 affine grid remain follow-ups for the
+  broader non-merge inter CU walker.
+
 - Round 164 — **§7.3.11.7 non-merge inter affine-syntax dispatcher +
   §8.5.5.2 eq. 160 fold.** Composes the round-152 `inter_affine_flag`
   reader and the round-159 `cu_affine_type_flag` reader into a single
