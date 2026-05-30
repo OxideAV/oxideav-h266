@@ -4,6 +4,47 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-h266/compare/v0.0.6...v0.0.7) - 2026-05-30
+
+### Other
+
+- round 190: encoder-side composite walker for §7.3.11.7 non-merge inter pre-residual
+- round 187: encoder-side §7.3.10.10 mvd_coding() dispatcher + §9.3.3.6 limited-EGk abs_mvd_minus2
+- round 183: encoder-side §7.3.11.7 non-merge inter MVP-side syntax dispatcher
+- round 177: encoder-side §7.3.11.7 non-merge inter affine-syntax dispatcher
+- round 164: §7.3.11.7 non-merge inter affine-syntax dispatcher + §8.5.5.2 eq. 160 fold
+- round 159: §7.3.11.7 cu_affine_type_flag CABAC reader + Table 85 ctx bundle
+- round 152: §7.3.11.7 inter_affine_flag CABAC reader + Table 84 ctx bundle
+- round 149: per-CB MergeSubblockFlag/InterAffineFlag neighbour grid fuse
+- round 146: §7.3.11.7 merge_data() wire-up of merge_subblock_flag/idx
+- round 142: §7.4.3.4 eq. 85 MaxNumSubblockMergeCand derivation
+- round 139: §7.3.11.7 merge_subblock_flag + merge_subblock_idx CABAC readers
+- §8.5.5.3 CTU-walker fuse — per-sub-block motion fill
+- fix §8.5.5.4 tempMv rounding to leftShift=0 (integer-luma units)
+- §8.5.5.3/§8.5.5.4 SbTMVP record + availability gate (round 132)
+- round-129 §7.3.10.5 bcw_idx gate evaluator + MvField fuse
+- round 126 — §7.3.10.5 bcw_idx CABAC reader (Table 91 + Table 132)
+- round 120: §8.5.5.7 affine AMVP candidate list (luma CPMV predictors)
+- §8.5.2.11 live temporal Col AMVP candidate derivation
+- §8.5.2.9 step-5 HMVP RPL-reference-match candidate fill
+- §8.5.2.8/§8.5.2.9/§8.5.2.10 AMVP MVP candidate derivation
+- §7.3.10.8 non-merge inter MVP-side syntax (inter_pred_idc / sym_mvd_flag / ref_idx_lX / mvp_lX_flag)
+- §7.3.10.10 mvd_coding() decode syntax + §9.3.3.14 limited-EGk
+- round 100 — §8.5.5.2 steps 3-6 neighbour / corner-selection cascade
+- round 94 — §8.5.5.2 subblockMergeCandList insertion order + merge_subblock_idx pick
+- round 91 — §8.5.5.5 inherited + §8.5.5.6 constructed affine merge candidates
+- round 78 — §8.5.6.4 PROF (Prediction Refinement with Optical Flow)
+- round 65 — affine sub-block MC scaffold per §8.5.5.9 + Tables 30 / 31 / 32
+- round 64 — Decoder-side Motion Vector Refinement (DMVR) per §8.5.3.2.4 / §8.5.3.2.5
+- round 63 (Goal A) — explicit weighted bi-prediction on B-slice encoder + decoder
+- round 63 (Goal B) — chroma sub-pel motion compensation on P-slice + B-slice encoder + decoder
+- round 62 — multi-reference DPB on P-slice and B-slice encoder + decoder
+- round 61 — sub-pel ME on B-slice (½-pel + ¼-pel per L0/L1)
+- round 60 — B-slice (bi-prediction) encoder + decoder scaffold
+- round 59 — sub-pel motion compensation for P-slice encoder + decoder
+- round 58 — inter-frame P-slice encoder + decoder scaffold
+- round 57 — MTT TT picker RDO (opt-in, parallel to round 56 BT picker)
+
 ### Added
 
 - Round 190 — **encoder-side composite walker for the §7.3.11.7
