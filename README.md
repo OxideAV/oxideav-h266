@@ -1220,6 +1220,63 @@ encoder-pipeline call-site that consumes this dispatcher + the
 affine multi-CP / `amvr_flag` / `bcw_idx` extensions remain the
 next-step follow-ups.
 
+**Round-193 lands the §7.3.10.10 `amvr_flag` / `amvr_precision_idx`
+CABAC reader** (closing the round-40 wiring gap — the round-40
+`AmvrShift` / `apply_amvr_shift` Table 16 + eqs. 161-176 work landed
+the value-side of AMVR but the syntax-side bin readers were never
+written). The new `LeafCuReader::read_amvr_flag` and
+`LeafCuReader::read_amvr_precision_idx` mirror the spec's Table 132
+binarisations exactly: `amvr_flag` is FL `cMax = 1` ctx-coded at
+Table 89 slot `(init_type - 1) * 2 + (inter_affine_flag ? 1 : 0)`;
+`amvr_precision_idx` is TR with `cMax = (inter_affine_flag == 0 &&
+CuPredMode != MODE_IBC) ? 2 : 1` and `cRiceParam = 0`, with both
+bins ctx-coded (bin 0 against Table 90 slot `init_type * 3 +
+((MODE_IBC) ? 1 : (inter_affine_flag == 0 ? 0 : 2))`, bin 1 against
+`init_type * 3 + 1` — the deterministic Table 132 entry). The
+`AmvrGate` struct bundles the §7.3.10.10 outer-gate inputs:
+`sps_amvr_enabled_flag` + `sps_affine_amvr_enabled_flag` from the
+active SPS, the already-decoded `inter_affine_flag`, and the per-arm
+MVD-non-zero reductions over `MvdL0` / `MvdL1` for the regular arm
+and `MvdCpL0` / `MvdCpL1` over the three control points for the
+affine arm. The cascade dispatcher `read_amvr_inter_gated` walks
+`if(gate-open) { amvr_flag = read; if(amvr_flag) precision = read }`
+and returns `(amvr_flag, amvr_precision_idx, AmvrShift)` with the
+round-40 §7.4.11.6 / Table 16 shift already folded through
+`AmvrShift::for_inter` / `AmvrShift::for_affine` per
+`inter_affine_flag`. Two new `ContextModel` bundles thread the
+matching Table 89 / Table 90 init tables into `LeafCuCtxs`
+(`amvr_flag`: 4 ctxIdx as 2 ctx slots × 2 non-I initTypes;
+`amvr_precision_idx`: 9 ctxIdx as 3 ctx slots × 3 initTypes
+including I for the IBC AMVR path that round 193 deliberately
+exposes the per-bin reader for, even though the §7.3.10.10
+dispatcher itself is non-IBC only — the IBC branch shares
+`read_amvr_precision_idx` directly because §7.3.10.5 emits no
+`amvr_flag` there, the §7.4.12.7 inference assigns 1). The bin-0
+ctxInc helper for `amvr_precision_idx` corrected to match Table
+132's verbatim `(MODE_IBC) ? 1 : (inter_affine_flag == 0 ? 0 : 2)`
+mapping (regular → 0, IBC → 1, affine → 2); the prior round-40
+mapping had IBC and affine swapped and was unreachable until this
+round wired up the reader. New `ctx_inc_amvr_precision_idx_bin1`
+and `amvr_precision_idx_c_max` helpers surface the per-bin and
+per-arm derivations for spec traceability. 16 new lib tests pin the
+per-bin round-trip across both AMVR arms (regular / affine) × both
+non-I initTypes × every legal precision value × all three initTypes
+for the IBC path, plus the cascade dispatcher's four control flows:
+closed gate ⇒ inferred-default fallthrough (no bins consumed),
+open + `amvr_flag = 1` regular round-trip with `precision_idx = 2`
+folding to `AmvrShift = 6` (4-luma), open + affine `amvr_flag = 1`
+round-trip exhaustive over `precision_idx ∈ {0, 1}` folding to
+`AmvrShift ∈ {0, 4}` (1/16-luma vs 1-luma), open + `amvr_flag = 0`
+⇒ precision-idx-not-consumed (the reader debits exactly one bin
+from the bitstream). Two new gate tests confirm the regular and
+affine arms don't cross — an affine CU with non-zero regular MVDs
+but all-zero CP-MVDs keeps the gate closed, and a regular CU
+shielded behind `inter_affine_flag = 1` also stays closed.
+Multi-CP-MV affine MVD emission (`numCpMv > 1`), the encoder-side
+`amvr_flag` / `amvr_precision_idx` mirror, and the encoder-side
+`bcw_idx` mirror remain follow-ups for the broader non-merge inter
+CU encoder.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

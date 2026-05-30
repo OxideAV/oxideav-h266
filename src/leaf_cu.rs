@@ -264,6 +264,80 @@ impl NonMergeInterAffineGate {
     }
 }
 
+/// Round-193 — §7.3.10.10 / §7.3.11.7 gate inputs for the
+/// `amvr_flag[x0][y0]` + `amvr_precision_idx[x0][y0]` syntax elements
+/// on the non-merge inter branch (not IBC; the IBC branch has its own
+/// `amvr_precision_idx` reader path).
+///
+/// The spec's `coding_unit()` non-merge inter branch signals
+/// `amvr_flag` only when one of two cascade conditions holds (verbatim
+/// from §7.3.10.10 — both reduce to "AMVR is enabled for this CU's
+/// motion model AND at least one of the MVDs the CU just emitted is
+/// non-zero"):
+///
+/// ```text
+/// if( ( sps_amvr_enabled_flag && inter_affine_flag == 0 &&
+///         ( MvdL0[x0][y0][0] != 0 || MvdL0[x0][y0][1] != 0 ||
+///           MvdL1[x0][y0][0] != 0 || MvdL1[x0][y0][1] != 0 ) ) ||
+///       ( sps_affine_amvr_enabled_flag && inter_affine_flag == 1 &&
+///         ( any |MvdCpL0|/|MvdCpL1| coordinate != 0 over the
+///           three control points ) ) )
+///   amvr_flag[x0][y0]                                       ae(v)
+///   if( amvr_flag[x0][y0] )
+///     amvr_precision_idx[x0][y0]                            ae(v)
+/// ```
+///
+/// When the outer gate is closed `amvr_flag` is inferred per §7.4.12.7
+/// to `1` for `MODE_IBC` and to `0` otherwise; `amvr_precision_idx` is
+/// inferred to `0`.
+///
+/// The caller (the CTU walker, once it brings the non-merge inter path
+/// online) fills this struct from live per-CB state:
+/// `sps_amvr_enabled` / `sps_affine_amvr_enabled` from the active SPS,
+/// `inter_affine_flag` from the round-164 affine-syntax dispatcher,
+/// and the per-list / per-CP MVD-non-zero flags from the round-187
+/// `mvd_coding()` decisions.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AmvrGate {
+    /// `sps_amvr_enabled_flag` from the active SPS — the regular AMVR
+    /// outer gate.
+    pub sps_amvr_enabled: bool,
+    /// `sps_affine_amvr_enabled_flag` from the active SPS — the
+    /// affine-AMVR outer gate.
+    pub sps_affine_amvr_enabled: bool,
+    /// `inter_affine_flag[x0][y0]` — selects which cascade arm gates
+    /// the read. `false` ⇒ regular AMVR, `true` ⇒ affine AMVR. When
+    /// the §7.4.12.7 inference fires for `inter_affine_flag` the
+    /// caller should still pass `false`.
+    pub inter_affine_flag: bool,
+    /// `true` iff at least one of `MvdL0[*]` / `MvdL1[*]` is non-zero.
+    /// Drives the regular AMVR arm (`inter_affine_flag == 0`). The
+    /// caller computes this as `|MvdL0.x| | |MvdL0.y| | |MvdL1.x| |
+    /// |MvdL1.y| != 0` over the per-list `mvd_coding()` results.
+    pub any_mvd_l0_l1_nonzero: bool,
+    /// `true` iff at least one of `MvdCpL0[i][*]` / `MvdCpL1[i][*]`
+    /// is non-zero across the 3 control points `i ∈ {0, 1, 2}`.
+    /// Drives the affine AMVR arm (`inter_affine_flag == 1`). The
+    /// `MotionModelIdc == 1` 4-param affine case only populates CPs 0
+    /// and 1; the caller should pass `false` for the unused CP-2
+    /// inputs (round-177 / round-183 already debug-assert this).
+    pub any_mvd_cp_l0_l1_nonzero: bool,
+}
+
+impl AmvrGate {
+    /// `true` iff the §7.3.10.10 outer gate opens — i.e. the next bin
+    /// in the bitstream really is `amvr_flag[x0][y0]`. Per the spec
+    /// the disjunction is over the two cascade arms (regular vs
+    /// affine); only the arm matching `inter_affine_flag` contributes.
+    pub fn is_open(&self) -> bool {
+        let regular =
+            self.sps_amvr_enabled && !self.inter_affine_flag && self.any_mvd_l0_l1_nonzero;
+        let affine =
+            self.sps_affine_amvr_enabled && self.inter_affine_flag && self.any_mvd_cp_l0_l1_nonzero;
+        regular || affine
+    }
+}
+
 /// Round-164 — output of [`LeafCuReader::read_non_merge_inter_affine`].
 ///
 /// Carries the two raw flag values (with §7.4.12.7 inferences applied —
@@ -718,6 +792,31 @@ pub struct LeafCuCtxs {
     /// `0 → MotionModelIdc = 1` (4-parameter affine), `1 →
     /// MotionModelIdc = 2` (6-parameter affine).
     pub cu_affine_type_flag: Vec<ContextModel>,
+    /// Round-193 — `amvr_flag` (Table 89) — 4 entries split as 2 ctx
+    /// slots per non-I initType (initType 1 → slots 0..1, initType 2
+    /// → slots 2..3). Indexed at parse time as `(init_type - 1) * 2 +
+    /// ctxInc` with the ctxInc derived via [`crate::amvr::ctx_inc_amvr_flag`]
+    /// per §9.3.4.2 / Table 132 (`inter_affine_flag ? 1 : 0`). Single
+    /// ctx-coded bin (FL `cMax = 1`) gated by §7.3.10.10's
+    /// `sps_amvr_enabled_flag` (regular AMVR) or
+    /// `sps_affine_amvr_enabled_flag` (affine AMVR) plus a non-zero
+    /// MVD-on-list condition; never signalled when `CuPredMode ==
+    /// MODE_IBC` (the §7.4.12.7 inference assigns `amvr_flag = 1` in
+    /// that case).
+    pub amvr_flag: Vec<ContextModel>,
+    /// Round-193 — `amvr_precision_idx` (Table 90) — 9 entries split
+    /// as 3 ctx slots per initType (initType 0 → slots 0..2, initType
+    /// 1 → slots 3..5, initType 2 → slots 6..8). Indexed at parse
+    /// time as `init_type * 3 + ctxInc` with ctxInc derived via
+    /// [`crate::amvr::ctx_inc_amvr_precision_idx`] /
+    /// [`crate::amvr::ctx_inc_amvr_precision_idx_bin1`] per §9.3.4.2
+    /// / Table 132. TR binarisation with `cMax = (inter_affine_flag
+    /// == 0 && CuPredMode != MODE_IBC) ? 2 : 1`, `cRiceParam = 0`;
+    /// both bins are ctx-coded (no bypass). Signalled only when
+    /// `amvr_flag == 1` (regular / affine AMVR) or under the IBC
+    /// branch's standalone `sps_amvr_enabled_flag && |MvdL0| != 0`
+    /// gate.
+    pub amvr_precision_idx: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -813,6 +912,8 @@ impl LeafCuCtxs {
             merge_subblock_idx: init_contexts(SyntaxCtx::MergeSubblockIdx, slice_qp_y),
             inter_affine_flag: init_contexts(SyntaxCtx::InterAffineFlag, slice_qp_y),
             cu_affine_type_flag: init_contexts(SyntaxCtx::CuAffineTypeFlag, slice_qp_y),
+            amvr_flag: init_contexts(SyntaxCtx::AmvrFlag, slice_qp_y),
+            amvr_precision_idx: init_contexts(SyntaxCtx::AmvrPrecisionIdx, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -2327,6 +2428,153 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             cu_affine_type_flag,
             motion_model,
         })
+    }
+
+    /// Round-193 — Decode `amvr_flag[x0][y0]` per §7.3.10.10 / Table
+    /// 89 / Table 132.
+    ///
+    /// Binarisation: FL `cMax = 1` — a single ctx-coded bin per Table
+    /// 132. The Table 89 ctx-slot is `(init_type - 1) * 2 + ctxInc`
+    /// with `ctxInc = inter_affine_flag ? 1 : 0` derived via
+    /// [`crate::amvr::ctx_inc_amvr_flag`]. Returns the decoded flag as
+    /// a `bool` (`false` ⇒ 1/4-luma resolution, `true` ⇒ extended
+    /// resolution further specified by `amvr_precision_idx`).
+    ///
+    /// **The caller is responsible for the §7.3.10.10 outer gate**
+    /// ([`AmvrGate::is_open`]). When the gate is closed
+    /// `amvr_flag` is inferred per §7.4.12.7 (1 for `MODE_IBC`, 0
+    /// otherwise) and this reader must NOT be invoked. The IBC branch
+    /// has its own bitstream path that skips `amvr_flag` entirely and
+    /// reads `amvr_precision_idx` directly.
+    ///
+    /// The reader assumes the slice is non-I (`init_type ∈ {1, 2}`);
+    /// AMVR is never signalled in I slices because the non-merge
+    /// inter branch is unreachable there.
+    pub fn read_amvr_flag(&mut self, inter_affine_flag: bool) -> Result<bool> {
+        debug_assert!(
+            self.ctxs.init_type >= 1,
+            "amvr_flag is not signalled in I slices (non-merge inter branch is unreachable)"
+        );
+        let inc = crate::amvr::ctx_inc_amvr_flag(inter_affine_flag, false) as usize;
+        // Table 89: 4 entries split as initType 1 → slots 0..1,
+        // initType 2 → slots 2..3 (per Table 51). Indexed as
+        // `(init_type - 1) * 2 + ctxInc`.
+        let init_off = (self.ctxs.init_type as usize).saturating_sub(1) * 2;
+        let n = self.ctxs.amvr_flag.len() - 1;
+        let slot = (init_off + inc).min(n);
+        let bit = self.dec.decode_decision(&mut self.ctxs.amvr_flag[slot])?;
+        Ok(bit == 1)
+    }
+
+    /// Round-193 — Decode `amvr_precision_idx[x0][y0]` per §7.3.10.10
+    /// / Table 90 / Table 132.
+    ///
+    /// Binarisation: TR with `cMax = (inter_affine_flag == 0 &&
+    /// !mode_ibc) ? 2 : 1`, `cRiceParam = 0`. Both bins are
+    /// ctx-coded:
+    ///
+    /// * Bin 0 ctx-slot: `init_type * 3 + ctxInc` with `ctxInc =
+    ///   (mode_ibc) ? 1 : (inter_affine_flag == 0 ? 0 : 2)` per
+    ///   [`crate::amvr::ctx_inc_amvr_precision_idx`].
+    /// * Bin 1 ctx-slot: `init_type * 3 + 1` per
+    ///   [`crate::amvr::ctx_inc_amvr_precision_idx_bin1`] — the
+    ///   deterministic Table 132 entry `1`. Only the regular AMVR
+    ///   path (`cMax = 2`) reaches bin 1; affine and IBC truncate at
+    ///   bin 0.
+    ///
+    /// Returns the decoded value in `0..=cMax`. The caller maps the
+    /// triple `(amvr_flag, value, inter_affine_flag / mode_ibc)`
+    /// through [`crate::amvr::AmvrShift::for_inter`] /
+    /// [`crate::amvr::AmvrShift::for_affine`] /
+    /// [`crate::amvr::AmvrShift::for_ibc`] to get the §7.4.11.6
+    /// `AmvrShift` per Table 16, then applies it via
+    /// [`crate::amvr::apply_amvr_shift`].
+    ///
+    /// **The caller is responsible for the §7.3.10.10 gate**: this
+    /// reader must NOT be invoked when `amvr_flag == 0` on the
+    /// non-merge inter branch (the syntax element is not present and
+    /// §7.4.12.7 infers it to 0), and must NOT be invoked on the IBC
+    /// branch when `MvdL0[x0][y0][0] == 0 && MvdL0[x0][y0][1] == 0`
+    /// (the §7.3.10.5 IBC AMVR cascade closes).
+    pub fn read_amvr_precision_idx(
+        &mut self,
+        inter_affine_flag: bool,
+        mode_ibc: bool,
+    ) -> Result<u32> {
+        let cmax = crate::amvr::amvr_precision_idx_c_max(inter_affine_flag, mode_ibc);
+        let init_off = self.ctxs.init_type as usize * 3;
+        let n = self.ctxs.amvr_precision_idx.len() - 1;
+        // Bin 0 — ctx-coded.
+        let inc0 = crate::amvr::ctx_inc_amvr_precision_idx(inter_affine_flag, mode_ibc) as usize;
+        let slot0 = (init_off + inc0).min(n);
+        let bit0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.amvr_precision_idx[slot0])?;
+        if bit0 == 0 {
+            return Ok(0);
+        }
+        if cmax < 2 {
+            // Truncation point — affine / IBC stop after bin 0 = 1.
+            return Ok(1);
+        }
+        // Bin 1 — ctx-coded against the deterministic Table 132 slot
+        // `init_type * 3 + 1` (per Table 132 bin 1 always uses
+        // `ctxInc = 1`).
+        let inc1 = crate::amvr::ctx_inc_amvr_precision_idx_bin1() as usize;
+        let slot1 = (init_off + inc1).min(n);
+        let bit1 = self
+            .dec
+            .decode_decision(&mut self.ctxs.amvr_precision_idx[slot1])?;
+        // TR with cMax = 2: bin 0 = 1, bin 1 = 0 ⇒ value 1; bin 0 = 1,
+        // bin 1 = 1 ⇒ value 2 (truncation, no trailing zero).
+        Ok(if bit1 == 0 { 1 } else { 2 })
+    }
+
+    /// Round-193 — §7.3.10.10 AMVR dispatcher for the non-merge inter
+    /// branch (not IBC; see [`Self::read_amvr_precision_idx`] for the
+    /// standalone IBC AMVR read).
+    ///
+    /// Walks the §7.3.10.10 conditional:
+    ///
+    /// ```text
+    /// if( amvr-gate-open )
+    ///   amvr_flag = read_amvr_flag( inter_affine_flag )
+    ///   if( amvr_flag )
+    ///     amvr_precision_idx = read_amvr_precision_idx( inter_affine_flag, false )
+    /// ```
+    ///
+    /// Returns `(amvr_flag, amvr_precision_idx, AmvrShift)`. When the
+    /// gate is closed the §7.4.12.7 inferences apply (regular /
+    /// affine path ⇒ `amvr_flag = 0`, `amvr_precision_idx = 0`,
+    /// `AmvrShift = 2` for the default 1/4-luma resolution).
+    ///
+    /// The returned [`crate::amvr::AmvrShift`] is already folded
+    /// through [`crate::amvr::AmvrShift::for_inter`] or
+    /// [`crate::amvr::AmvrShift::for_affine`] per `gate.inter_affine_flag`
+    /// — the caller passes it straight to [`crate::amvr::apply_amvr_shift`]
+    /// on each per-list (or per-CP) MVD.
+    pub fn read_amvr_inter_gated(
+        &mut self,
+        gate: &AmvrGate,
+    ) -> Result<(bool, u32, crate::amvr::AmvrShift)> {
+        if !gate.is_open() {
+            // §7.4.12.7: amvr_flag inferred to 0 on the non-IBC path,
+            // amvr_precision_idx inferred to 0. AmvrShift defaults to
+            // 1/4-luma (= 2) per the `amvr_flag = 0` rows of Table 16.
+            return Ok((false, 0, crate::amvr::AmvrShift(2)));
+        }
+        let amvr_flag = self.read_amvr_flag(gate.inter_affine_flag)?;
+        if !amvr_flag {
+            // amvr_precision_idx is not present per §7.4.12.7.
+            return Ok((false, 0, crate::amvr::AmvrShift(2)));
+        }
+        let amvr_precision_idx = self.read_amvr_precision_idx(gate.inter_affine_flag, false)?;
+        let shift = if gate.inter_affine_flag {
+            crate::amvr::AmvrShift::for_affine(amvr_flag, amvr_precision_idx)
+        } else {
+            crate::amvr::AmvrShift::for_inter(amvr_flag, amvr_precision_idx)
+        };
+        Ok((amvr_flag, amvr_precision_idx, shift))
     }
 
     /// Decode `merge_gpm_partition_idx[x0][y0]` per Table 132 — FL
@@ -5536,5 +5784,353 @@ mod tests {
     fn cu_tool_flags_default_keeps_max_num_subblock_merge_cand_zero() {
         let tools = CuToolFlags::default();
         assert_eq!(tools.max_num_subblock_merge_cand, 0);
+    }
+
+    // ---- Round-193: §7.3.10.10 amvr_flag + amvr_precision_idx readers ----
+
+    /// Test-private encoder mirror of `read_amvr_flag`. Single ctx-coded
+    /// FL `cMax = 1` bin at slot `(init_type - 1) * 2 +
+    /// ctx_inc_amvr_flag(inter_affine_flag, false)`.
+    fn encode_amvr_flag(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        flag: bool,
+        inter_affine_flag: bool,
+    ) {
+        let inc = crate::amvr::ctx_inc_amvr_flag(inter_affine_flag, false) as usize;
+        let init_off = (ctxs.init_type as usize).saturating_sub(1) * 2;
+        let n = ctxs.amvr_flag.len() - 1;
+        let slot = (init_off + inc).min(n);
+        let bit = if flag { 1 } else { 0 };
+        enc.encode_decision(&mut ctxs.amvr_flag[slot], bit).unwrap();
+    }
+
+    /// Test-private encoder mirror of `read_amvr_precision_idx`. TR
+    /// with `cMax = (non-affine && non-IBC) ? 2 : 1`; bin 0 ctx-coded
+    /// at slot `init_type * 3 + ctx_inc_amvr_precision_idx(...)`, bin
+    /// 1 (when reached) ctx-coded at slot `init_type * 3 + 1`.
+    fn encode_amvr_precision_idx(
+        enc: &mut ArithEncoder,
+        ctxs: &mut LeafCuCtxs,
+        value: u32,
+        inter_affine_flag: bool,
+        mode_ibc: bool,
+    ) {
+        let cmax = crate::amvr::amvr_precision_idx_c_max(inter_affine_flag, mode_ibc);
+        let init_off = ctxs.init_type as usize * 3;
+        let n = ctxs.amvr_precision_idx.len() - 1;
+        // Bin 0.
+        let inc0 = crate::amvr::ctx_inc_amvr_precision_idx(inter_affine_flag, mode_ibc) as usize;
+        let slot0 = (init_off + inc0).min(n);
+        let bit0 = if value == 0 { 0 } else { 1 };
+        enc.encode_decision(&mut ctxs.amvr_precision_idx[slot0], bit0)
+            .unwrap();
+        if bit0 == 0 {
+            return;
+        }
+        if cmax < 2 {
+            // Truncation: bin 0 = 1 ⇒ value = 1, no further bin.
+            return;
+        }
+        // Bin 1.
+        let inc1 = crate::amvr::ctx_inc_amvr_precision_idx_bin1() as usize;
+        let slot1 = (init_off + inc1).min(n);
+        let bit1 = if value >= 2 { 1 } else { 0 };
+        enc.encode_decision(&mut ctxs.amvr_precision_idx[slot1], bit1)
+            .unwrap();
+    }
+
+    fn amvr_flag_round_trip(flag: bool, inter_affine_flag: bool, init_type: u8) -> bool {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_amvr_flag(&mut enc, &mut enc_ctxs, flag, inter_affine_flag);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader.read_amvr_flag(inter_affine_flag).unwrap()
+    }
+
+    fn amvr_precision_idx_round_trip(
+        value: u32,
+        inter_affine_flag: bool,
+        mode_ibc: bool,
+        init_type: u8,
+    ) -> u32 {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_amvr_precision_idx(&mut enc, &mut enc_ctxs, value, inter_affine_flag, mode_ibc);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .read_amvr_precision_idx(inter_affine_flag, mode_ibc)
+            .unwrap()
+    }
+
+    #[test]
+    fn amvr_flag_round_trips_regular_path_both_init_types() {
+        // Regular AMVR (inter_affine_flag = false) → ctxInc = 0. Both
+        // P-slice (init 1) and B-slice (init 2) round-trip both flag
+        // values.
+        for it in [1u8, 2] {
+            for flag in [false, true] {
+                assert_eq!(
+                    amvr_flag_round_trip(flag, false, it),
+                    flag,
+                    "regular amvr_flag round trip failed at init={it} flag={flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn amvr_flag_round_trips_affine_path_both_init_types() {
+        // Affine-AMVR (inter_affine_flag = true) → ctxInc = 1 → slot
+        // (init_type - 1) * 2 + 1.
+        for it in [1u8, 2] {
+            for flag in [false, true] {
+                assert_eq!(
+                    amvr_flag_round_trip(flag, true, it),
+                    flag,
+                    "affine amvr_flag round trip failed at init={it} flag={flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn amvr_precision_idx_regular_round_trips_all_values() {
+        // Regular AMVR (non-affine && non-IBC) — cMax = 2 ⇒ {0, 1, 2}.
+        // value 0 = bin0=0 (no trailing zero); value 1 = bin0=1,
+        // bin1=0; value 2 = bin0=1, bin1=1 (TR truncation, no trailing
+        // zero). Cover initType 1 (P) and 2 (B); initType 0 (I) is
+        // included for spec completeness (the IBC-only path can hit
+        // it).
+        for it in [0u8, 1, 2] {
+            for v in 0..=2u32 {
+                assert_eq!(
+                    amvr_precision_idx_round_trip(v, false, false, it),
+                    v,
+                    "regular amvr_precision_idx round trip failed at init={it} v={v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn amvr_precision_idx_affine_round_trips_all_values() {
+        // Affine AMVR — cMax = 1 ⇒ {0, 1}. value 0 = bin0=0; value 1
+        // = bin0=1 (TR truncation, no further bin).
+        for it in [1u8, 2] {
+            for v in 0..=1u32 {
+                assert_eq!(
+                    amvr_precision_idx_round_trip(v, true, false, it),
+                    v,
+                    "affine amvr_precision_idx round trip failed at init={it} v={v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn amvr_precision_idx_ibc_round_trips_all_values() {
+        // IBC AMVR — cMax = 1 ⇒ {0, 1}. value 0 = bin0=0 (1 luma);
+        // value 1 = bin0=1 (4 luma). IBC can appear in I, P, or B
+        // slices so cover all three initTypes.
+        for it in [0u8, 1, 2] {
+            for v in 0..=1u32 {
+                assert_eq!(
+                    amvr_precision_idx_round_trip(v, false, true, it),
+                    v,
+                    "IBC amvr_precision_idx round trip failed at init={it} v={v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn amvr_gate_open_regular_arm() {
+        // sps_amvr_enabled + not affine + any |Mvd*L0|/|Mvd*L1| != 0.
+        let gate = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: false,
+            inter_affine_flag: false,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        assert!(gate.is_open());
+        // Zero MVD ⇒ gate closes.
+        let gate2 = AmvrGate {
+            any_mvd_l0_l1_nonzero: false,
+            ..gate
+        };
+        assert!(!gate2.is_open());
+        // SPS bit off ⇒ gate closes.
+        let gate3 = AmvrGate {
+            sps_amvr_enabled: false,
+            ..gate
+        };
+        assert!(!gate3.is_open());
+    }
+
+    #[test]
+    fn amvr_gate_open_affine_arm() {
+        // sps_affine_amvr_enabled + inter_affine_flag + any CP-MVD != 0.
+        let gate = AmvrGate {
+            sps_amvr_enabled: false,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: false,
+            any_mvd_cp_l0_l1_nonzero: true,
+        };
+        assert!(gate.is_open());
+        // CP-MVD all-zero ⇒ gate closes.
+        let gate2 = AmvrGate {
+            any_mvd_cp_l0_l1_nonzero: false,
+            ..gate
+        };
+        assert!(!gate2.is_open());
+        // Affine-AMVR SPS bit off ⇒ gate closes.
+        let gate3 = AmvrGate {
+            sps_affine_amvr_enabled: false,
+            ..gate
+        };
+        assert!(!gate3.is_open());
+    }
+
+    #[test]
+    fn amvr_gate_arms_dont_cross() {
+        // affine arm should NOT open just because the regular SPS bit
+        // is set and the regular MVDs are non-zero.
+        let gate = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: false,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        assert!(!gate.is_open(), "affine CU must not open via regular MVD");
+        // regular arm should NOT open under inter_affine_flag = 1.
+        let gate2 = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        assert!(!gate2.is_open(), "affine CU with no CP-MVD must not open");
+    }
+
+    #[test]
+    fn amvr_dispatcher_closed_gate_returns_inference_defaults() {
+        // Closed outer gate ⇒ amvr_flag = 0, amvr_precision_idx = 0,
+        // AmvrShift = 2 (the §7.4.12.7 inference for non-IBC paths).
+        // No bins are consumed from the bitstream; the dispatcher
+        // doesn't touch the decoder state.
+        let bytes = vec![0u8; 64];
+        let mut dec = ArithDecoder::new(&bytes).unwrap();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+        let gate = AmvrGate::default();
+        let (flag, idx, shift) = reader.read_amvr_inter_gated(&gate).unwrap();
+        assert!(!flag);
+        assert_eq!(idx, 0);
+        assert_eq!(shift, crate::amvr::AmvrShift(2));
+    }
+
+    #[test]
+    fn amvr_dispatcher_open_regular_round_trips() {
+        // Open gate, regular arm, amvr_flag = 1, precision idx = 2
+        // (4-luma) ⇒ shift = 6.
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+        encode_amvr_flag(&mut enc, &mut enc_ctxs, true, false);
+        encode_amvr_precision_idx(&mut enc, &mut enc_ctxs, 2, false, false);
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let gate = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: false,
+            inter_affine_flag: false,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        let (flag, idx, shift) = reader.read_amvr_inter_gated(&gate).unwrap();
+        assert!(flag);
+        assert_eq!(idx, 2);
+        assert_eq!(shift, crate::amvr::AmvrShift(6));
+    }
+
+    #[test]
+    fn amvr_dispatcher_open_affine_round_trips_both_idx_values() {
+        // Open affine arm, amvr_flag = 1, precision idx ∈ {0, 1} ⇒
+        // shift ∈ {0, 4} (1/16-luma vs 1-luma).
+        for (idx_in, expected_shift) in [(0u32, 0u32), (1u32, 4u32)] {
+            let mut enc = ArithEncoder::new();
+            let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+            encode_amvr_flag(&mut enc, &mut enc_ctxs, true, true);
+            encode_amvr_precision_idx(&mut enc, &mut enc_ctxs, idx_in, true, false);
+            enc.encode_terminate(1).unwrap();
+            let mut padded = enc.finish();
+            padded.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&padded).unwrap();
+            let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, 2);
+            let tools = CuToolFlags::default();
+            let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+            let gate = AmvrGate {
+                sps_amvr_enabled: false,
+                sps_affine_amvr_enabled: true,
+                inter_affine_flag: true,
+                any_mvd_l0_l1_nonzero: false,
+                any_mvd_cp_l0_l1_nonzero: true,
+            };
+            let (flag, idx_out, shift) = reader.read_amvr_inter_gated(&gate).unwrap();
+            assert!(flag);
+            assert_eq!(idx_out, idx_in);
+            assert_eq!(shift, crate::amvr::AmvrShift(expected_shift));
+        }
+    }
+
+    #[test]
+    fn amvr_dispatcher_open_gate_amvr_flag_zero_skips_precision_idx() {
+        // Open gate but amvr_flag = 0 ⇒ precision_idx not consumed
+        // (§7.4.12.7 inference applies). AmvrShift stays at 2.
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+        encode_amvr_flag(&mut enc, &mut enc_ctxs, false, false);
+        // Deliberately do NOT emit a precision_idx bin; the reader
+        // must not pull one.
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let gate = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: false,
+            inter_affine_flag: false,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        let (flag, idx, shift) = reader.read_amvr_inter_gated(&gate).unwrap();
+        assert!(!flag);
+        assert_eq!(idx, 0);
+        assert_eq!(shift, crate::amvr::AmvrShift(2));
     }
 }

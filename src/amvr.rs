@@ -126,13 +126,14 @@ pub fn apply_amvr_shift(mvd: MotionVector, amvr_shift: AmvrShift) -> MotionVecto
     }
 }
 
-/// §9.3.4.2 ctxInc helper for `amvr_flag` (Table 132). Per the spec
-/// `amvr_flag` uses a single ctx-coded bin with `ctxInc = 0` (the
-/// neighbour-aware expression collapses to 0 for the regular AMVR
-/// path; affine-AMVR with `inter_affine_flag == 1` picks `ctxInc = 1`,
-/// IBC picks `ctxInc = 2`). Returns `0` for the regular AMVR path,
-/// `1` for affine-AMVR, `2` for IBC-AMVR (matching Table 89's slot
-/// layout — `0..3` ctxIdx).
+/// §9.3.4.2 / Table 132 ctxInc helper for `amvr_flag`. The Table 132
+/// row reads `inter_affine_flag[ ][ ] ? 1 : 0` (no IBC column — when
+/// `CuPredMode == MODE_IBC` the §7.4.12.7 inference fires and the
+/// flag is set to 1 without being parsed; see [`Self::for_ibc`] for
+/// the corresponding shift-table row). Returns `0` for the regular
+/// AMVR path and `1` for affine-AMVR. Callers that pass `mode_ibc =
+/// true` get the inactive sentinel `2`, which is never used to index
+/// the Table 89 bundle because IBC skips the bin entirely.
 #[inline]
 pub fn ctx_inc_amvr_flag(inter_affine_flag: bool, mode_ibc: bool) -> u32 {
     if mode_ibc {
@@ -144,18 +145,49 @@ pub fn ctx_inc_amvr_flag(inter_affine_flag: bool, mode_ibc: bool) -> u32 {
     }
 }
 
-/// §9.3.4.2 ctxInc helper for `amvr_precision_idx` (Table 132). Bin 0
-/// is ctx-coded with the same neighbour-aware split as `amvr_flag`
-/// (regular / affine / IBC), bin 1 (when present) is also ctx-coded
-/// with `ctxInc + 3`. Returns the bin-0 ctxInc; bin 1 should add 3.
+/// §9.3.4.2 / Table 132 ctxInc helper for `amvr_precision_idx` bin 0.
+/// Spec: `( CuPredMode == MODE_IBC ) ? 1 : ( inter_affine_flag == 0 ?
+/// 0 : 2 )`. The three returns map to Table 90's per-initType row of
+/// three slots (regular = 0, IBC = 1, affine = 2). Bin 1 (when
+/// present — only the regular AMVR path has `cMax = 2`, never IBC nor
+/// affine) is also ctx-coded with the deterministic `ctxInc = 1`,
+/// surfaced by [`ctx_inc_amvr_precision_idx_bin1`] for spec
+/// traceability.
 #[inline]
 pub fn ctx_inc_amvr_precision_idx(inter_affine_flag: bool, mode_ibc: bool) -> u32 {
     if mode_ibc {
-        2
-    } else if inter_affine_flag {
         1
+    } else if inter_affine_flag {
+        2
     } else {
         0
+    }
+}
+
+/// §9.3.4.2 / Table 132 ctxInc helper for `amvr_precision_idx` bin 1.
+/// Per the Table 132 row bin 1 is ctx-coded with the deterministic
+/// constant `1` — independent of `inter_affine_flag` / IBC / neighbour
+/// state. Bin 1 is only present on the regular AMVR path
+/// (`cMax = 2`); the affine / IBC rows truncate at bin 0 with
+/// `cMax = 1`.
+#[inline]
+pub fn ctx_inc_amvr_precision_idx_bin1() -> u32 {
+    1
+}
+
+/// Per §7.4.11.6 `amvr_precision_idx`'s `cMax` is
+/// `( inter_affine_flag == 0 && CuPredMode != MODE_IBC ) ? 2 : 1`.
+/// Returns `2` for the regular AMVR path (truncated-unary covers
+/// values 0 / 1 / 2 — i.e. 1/2 / 1 / 4 luma — at AmvrShift positions
+/// 3 / 4 / 6), `1` for affine and IBC (truncated-unary covers values
+/// 0 / 1 only — affine 1/16 vs 1 luma, IBC 1 vs 4 luma). The TR
+/// binarisation per Table 132 uses `cRiceParam = 0`.
+#[inline]
+pub fn amvr_precision_idx_c_max(inter_affine_flag: bool, mode_ibc: bool) -> u32 {
+    if !inter_affine_flag && !mode_ibc {
+        2
+    } else {
+        1
     }
 }
 
@@ -213,8 +245,43 @@ mod tests {
 
     #[test]
     fn ctx_inc_amvr_flag_routing() {
+        // Table 132 row: `inter_affine_flag ? 1 : 0`. IBC is the
+        // inactive sentinel (the flag is inferred to 1 and never
+        // parsed when MODE_IBC fires).
         assert_eq!(ctx_inc_amvr_flag(false, false), 0);
         assert_eq!(ctx_inc_amvr_flag(true, false), 1);
         assert_eq!(ctx_inc_amvr_flag(false, true), 2);
+    }
+
+    #[test]
+    fn ctx_inc_amvr_precision_idx_bin0_routing() {
+        // Table 132 row: `(MODE_IBC) ? 1 : (inter_affine_flag == 0 ?
+        // 0 : 2)`. Regular = 0, IBC = 1, affine = 2.
+        assert_eq!(ctx_inc_amvr_precision_idx(false, false), 0);
+        assert_eq!(ctx_inc_amvr_precision_idx(false, true), 1);
+        assert_eq!(ctx_inc_amvr_precision_idx(true, false), 2);
+        // IBC dominates affine (MODE_IBC and inter_affine_flag = 1 is
+        // illegal per the spec but the helper stays total).
+        assert_eq!(ctx_inc_amvr_precision_idx(true, true), 1);
+    }
+
+    #[test]
+    fn ctx_inc_amvr_precision_idx_bin1_is_one() {
+        // Bin 1 is deterministic per Table 132 — never neighbour-aware.
+        assert_eq!(ctx_inc_amvr_precision_idx_bin1(), 1);
+    }
+
+    #[test]
+    fn amvr_precision_idx_c_max_routing() {
+        // Regular AMVR — cMax = 2 (three legal values 0 / 1 / 2 →
+        // 1/2 / 1 / 4 luma).
+        assert_eq!(amvr_precision_idx_c_max(false, false), 2);
+        // Affine-AMVR — cMax = 1 (two legal values 0 / 1 → 1/16 / 1
+        // luma).
+        assert_eq!(amvr_precision_idx_c_max(true, false), 1);
+        // IBC-AMVR — cMax = 1 (two legal values 0 / 1 → 1 / 4 luma).
+        assert_eq!(amvr_precision_idx_c_max(false, true), 1);
+        // IBC + affine — illegal but the helper stays total at cMax = 1.
+        assert_eq!(amvr_precision_idx_c_max(true, true), 1);
     }
 }

@@ -47,6 +47,46 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 193 — **§7.3.10.10 `amvr_flag` / `amvr_precision_idx` CABAC
+  reader** + Table 89 / Table 90 context bundles in `LeafCuCtxs` +
+  outer-gate dispatcher `LeafCuReader::read_amvr_inter_gated` for the
+  non-merge inter branch (the IBC branch shares
+  `read_amvr_precision_idx` directly because §7.3.10.5 emits no
+  `amvr_flag` there — the §7.4.12.7 inference assigns 1 to it). The
+  `AmvrGate` struct bundles the §7.3.10.10 outer-gate inputs
+  (`sps_amvr_enabled_flag`, `sps_affine_amvr_enabled_flag`, the
+  already-decoded `inter_affine_flag`, and the per-arm MVD-non-zero
+  reductions over `MvdL0` / `MvdL1` for the regular arm and
+  `MvdCpL0` / `MvdCpL1` over the three control points for the affine
+  arm); the cascade dispatcher returns
+  `(amvr_flag, amvr_precision_idx, AmvrShift)` with the §7.4.11.6 /
+  Table 16 shift already folded through
+  `AmvrShift::for_inter` / `AmvrShift::for_affine` per
+  `inter_affine_flag`. The two new `ContextModel` bundles
+  (`amvr_flag`: 4 ctxIdx as 2 ctx slots × 2 non-I initTypes;
+  `amvr_precision_idx`: 9 ctxIdx as 3 ctx slots × 3 initTypes
+  including I for the IBC path) thread the matching Table 89 / Table
+  90 init tables into the new readers. The bin-0 ctxInc for
+  `amvr_precision_idx` corrected to match Table 132's verbatim
+  `(MODE_IBC) ? 1 : (inter_affine_flag == 0 ? 0 : 2)` (regular → 0,
+  IBC → 1, affine → 2); the prior mapping had IBC and affine swapped
+  and was unreachable until this round wired up the reader. The bin-1
+  ctxInc is the deterministic `1` per Table 132 (only the regular
+  AMVR `cMax = 2` path reaches it; affine and IBC truncate at bin 0
+  with `cMax = 1`). New `ctx_inc_amvr_precision_idx_bin1` and
+  `amvr_precision_idx_c_max` helpers surface the per-bin and
+  per-arm derivations for spec traceability. 16 new lib tests pin
+  the per-bin round-trip across both AMVR arms × both non-I
+  initTypes × every legal precision value × all three initTypes for
+  IBC, plus the cascade dispatcher's four control flows (closed
+  gate ⇒ inferred-default fallthrough, open + `amvr_flag = 1` regular
+  / affine round-trips for the `AmvrShift` fold, and open +
+  `amvr_flag = 0` ⇒ precision-idx-not-consumed). Pre-existing
+  `apply_amvr_shift` and the round-40 `AmvrShift` Table 16 rows are
+  consumed unchanged. Spec ref: ITU-T H.266 (V4, 01/2026) §7.3.10.10 /
+  §7.3.11.7 / §7.4.11.6 / §7.4.12.7 / Table 16 / Table 89 / Table 90 /
+  Table 132.
+
 - Round 190 — **encoder-side composite walker for the §7.3.11.7
   non-merge inter CU pre-residual syntax.** New
   `non_merge_inter_pre_residual_enc` module composes round-177's
