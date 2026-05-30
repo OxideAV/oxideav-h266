@@ -6,6 +6,41 @@ All notable changes to this crate are recorded here.
 
 ### Added
 
+- Round 190 — **encoder-side composite walker for the §7.3.11.7
+  non-merge inter CU pre-residual syntax.** New
+  `non_merge_inter_pre_residual_enc` module composes round-177's
+  `affine_syntax_enc`, round-183's `non_merge_mvp_syntax_enc`, and
+  round-187's `mvd_coding_enc` into a single dispatcher
+  `encode_non_merge_inter_pre_residual` that walks §7.3.11.7 in spec
+  order: `inter_affine_flag` → `cu_affine_type_flag` →
+  `inter_pred_idc` → `sym_mvd_flag` → `ref_idx_l0` → `ref_idx_l1` →
+  `mvd_coding(L0)` → `mvd_coding(L1)` → `mvp_l0_flag` →
+  `mvp_l1_flag`. The interleaved `mvd_coding` between `ref_idx_lX`
+  and `mvp_lX_flag` matches the §7.3.11.7 listing (the round-183
+  dispatcher collapses ref-idx then mvp and explicitly steps across
+  `mvd_coding`, so this composite walks the per-element encoder
+  helpers directly rather than re-using the MVP-side dispatcher). The
+  new `NonMergeInterPreResidualDecision` bundles the round-177 affine
+  decision, the round-183 MVP decision, and the per-list lMvd pair;
+  its `new(...)` constructor clamps inactive-list MVDs to zero (and
+  L1 MVD under `sym_mvd_flag == 1`, where §8.5.2.5 derives
+  `MvdL1 = -MvdL0` and the wire carries nothing). The dispatcher
+  applies the same §7.4.12.7 inference debug-asserts as the
+  underlying round-177 / round-183 dispatchers so a release-mode
+  caller can't silently drift from the round-trip-symmetric reader
+  path. Scope is translational only (one `mvd_coding` per active
+  list); multi-CP-MV affine MVD emission (`numCpMv > 1` ⇒ one
+  `mvd_coding` per control point per list), `amvr_flag`, and
+  `bcw_idx` remain follow-ups. 14 new lib tests pin the end-to-end
+  round-trip across the §7.3.11.7 pre-residual cascade (P-slice
+  zero / non-zero mvd round-trips on both non-I initTypes, B-slice
+  PRED_L0 / PRED_L1 / PRED_BI round-trips, B-slice SMVD round-trip
+  with both the inferred-`-MvdL0` and zero-clamp L1 variants, outer
+  affine-gate-closed zero-bin round-trip, (cbW + cbH) == 12 single-
+  bin inter_pred_idc form, `num_ref_idx_active == 1` ref_idx
+  suppression, §7.4.10.10 positive `|lMvd|` bound, and the
+  constructor's three clamp paths).
+
 - Round 187 — **encoder-side mirror of the §7.3.10.10 `mvd_coding()`
   structure plus its §9.3.3.6 limited-EGk `abs_mvd_minus2`
   sub-binarisation.** New `mvd_coding_enc` module lifts the
