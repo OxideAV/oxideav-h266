@@ -153,6 +153,7 @@ pub mod alf_fixed;
 pub mod alf_syntax;
 pub mod amvp;
 pub mod amvr;
+pub mod amvr_enc;
 pub mod aps;
 pub mod aps_enc;
 pub mod bdof;

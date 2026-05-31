@@ -1277,6 +1277,39 @@ Multi-CP-MV affine MVD emission (`numCpMv > 1`), the encoder-side
 `bcw_idx` mirror remain follow-ups for the broader non-merge inter
 CU encoder.
 
+**Round-195 lands the encoder-side §7.3.10.10 `amvr_flag` /
+`amvr_precision_idx` mirror** and wires it into the round-190
+non-merge inter pre-residual composite walker. The new public
+`amvr_enc` module lifts the round-193 `#[cfg(test)]` helpers in
+`leaf_cu.rs` into a real encoder surface: `encode_amvr_flag` emits
+the FL `cMax = 1` ctx bin at Table 89 slot `(init_type - 1) * 2 +
+ctx_inc_amvr_flag(inter_affine_flag, false)`;
+`encode_amvr_precision_idx` emits the TR `cMax = (non-affine &&
+!mode_ibc) ? 2 : 1` cascade (bin 0 ctx-coded at `init_type * 3 +
+ctx_inc_amvr_precision_idx(...)`, bin 1 ctx-coded at `init_type * 3
++ 1`); and the dispatcher `encode_amvr_inter_gated` walks the same
+§7.3.10.10 cascade the round-193 reader walks, applying the
+§7.4.12.7 inferences (gate closed ⇒ no bins on the wire). A new
+`AmvrDecision` carries `(amvr_flag, amvr_precision_idx, AmvrShift)`
+with the §7.4.11.6 / Table 16 shift pre-folded through
+`AmvrShift::for_inter` or `AmvrShift::for_affine` per the gate's
+`inter_affine_flag` — matching the round-193 reader's return triple
+exactly. The composite walker
+`encode_non_merge_inter_pre_residual_with_amvr` chains the round-190
+steps 1–9 with the new round-195 step 10 in §7.3.11.7 spec order
+(after `mvp_lX_flag`, before the deferred `bcw_idx` / residual
+tree). 9 new lib tests pin the dispatcher: exhaustive `(amvr_flag,
+amvr_precision_idx)` round-trip across both arms (regular cMax = 2
+⇒ {0, (1, 0), (1, 1), (1, 2)}, affine cMax = 1 ⇒ {0, (1, 0), (1,
+1)}) × both non-I initTypes, gate-closed inferred-default
+round-trip, regular-vs-affine non-crossing gate tests, and 2 new
+composite-walker tests pin the spec ordering (P-slice closed AMVR
+gate emits zero AMVR bins + recovers `AmvrShift = 2`; P-slice open
+regular AMVR + `prec = 2` recovers `AmvrShift = 6` / 4-luma).
+Multi-CP-MV affine MVD emission (`numCpMv > 1`) and the
+encoder-side `bcw_idx` mirror remain the final follow-ups for the
+full §7.3.11.7 non-merge inter pre-residual CU encoder.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

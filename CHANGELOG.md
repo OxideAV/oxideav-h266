@@ -4,6 +4,10 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Other
+
+- round 195: encoder-side §7.3.10.10 amvr_flag + amvr_precision_idx dispatcher (`amvr_enc` module) wired into the non-merge inter pre-residual composite walker
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-h266/compare/v0.0.6...v0.0.7) - 2026-05-30
 
 ### Other
