@@ -571,6 +571,414 @@ pub fn encode_non_merge_inter_pre_residual_with_amvr_and_bcw(
     Ok(())
 }
 
+// =====================================================================
+// Round-207 — multi-CP-MV affine non-merge inter pre-residual dispatcher
+// =====================================================================
+
+/// Round-207 — input to [`encode_non_merge_inter_pre_residual_affine`].
+///
+/// Generalises [`NonMergeInterPreResidualDecision`] from the
+/// translational case (one `lMvd[c]` pair per active list) to the full
+/// §7.3.10.5 non-merge inter affine case (one `lMvdCpLX[cpIdx][c]`
+/// pair per control point per active list). The per-CP MVD count is
+/// the §8.5.5.5 `numCpMv = MotionModelIdc + 1` derivation, surfaced
+/// here via [`crate::affine::MotionModel::num_cp_mv`].
+///
+/// Per §7.3.10.5 the spec listing is:
+/// ```text
+/// mvd_coding(x0, y0, 0, 0)
+/// if (MotionModelIdc > 0) mvd_coding(x0, y0, 0, 1)
+/// if (MotionModelIdc > 1) mvd_coding(x0, y0, 0, 2)
+/// mvp_l0_flag
+/// ...
+/// mvd_coding(x0, y0, 1, 0)   // unless sym_mvd_flag
+/// if (MotionModelIdc > 0) mvd_coding(x0, y0, 1, 1)
+/// if (MotionModelIdc > 1) mvd_coding(x0, y0, 1, 2)
+/// mvp_l1_flag
+/// ```
+///
+/// The translational case (`MotionModelIdc == 0`, i.e. `numCpMv == 1`)
+/// reduces to one `mvd_coding()` per active list — bit-identical to
+/// [`NonMergeInterPreResidualDecision`]. The dispatcher therefore
+/// degenerates to [`encode_non_merge_inter_pre_residual`] under
+/// translational motion (the round-trip tests pin this).
+///
+/// All `mvd_cp_l*[cpIdx]` slots beyond `numCpMv` are ignored on the
+/// wire; the constructor [`NonMergeInterPreResidualAffineDecision::new`]
+/// clamps them to zero so the struct can't carry stale state past the
+/// §7.3.10.5 per-CP gates. Likewise the L1 per-CP MVDs are clamped to
+/// zero under `sym_mvd_flag == 1` (the spec only suppresses the
+/// `cpIdx == 0` L1 MVD via the §8.5.2.5 inferred `MvdL1[0] = -MvdL0[0]`,
+/// but Table 16 / §7.4.10.10 conformance constrains the other CP MVDs
+/// independently — they are read verbatim from the wire on the affine
+/// path, so a `sym_mvd_flag == 1 && affine` combination is rejected by
+/// the round-177 outer gate via the §7.3.11.7 SMVD listing
+/// `inter_affine_flag == 0` precondition; we mirror that with a
+/// debug-assert below).
+#[derive(Clone, Copy, Debug)]
+pub struct NonMergeInterPreResidualAffineDecision {
+    /// Affine syntax decision (§7.3.11.7 affine pair). Drives the
+    /// §8.5.5.2 eq. 160 `MotionModelIdc` and the §8.5.5.5
+    /// `numCpMv = MotionModelIdc + 1` derivation.
+    pub affine: NonMergeInterAffineDecision,
+    /// MVP-side syntax decision (§7.3.11.7 inter_pred_idc /
+    /// sym_mvd_flag / ref_idx_lX / mvp_lX_flag).
+    pub mvp: NonMergeMvpSyntaxDecision,
+    /// `lMvdCpL0[cpIdx][c]` — post-AMVR `(x, y)` per CP. Slot
+    /// `cpIdx >= motion_model.num_cp_mv()` is ignored on the wire and
+    /// clamped to zero by [`Self::new`]; slot 0 doubles as the
+    /// translational `lMvd[L0]` when `numCpMv == 1`.
+    pub mvd_cp_l0: [MotionVector; 3],
+    /// `lMvdCpL1[cpIdx][c]` — post-AMVR `(x, y)` per CP. Same
+    /// constraints as [`Self::mvd_cp_l0`]; additionally suppressed
+    /// entirely (every `cpIdx`) when L1 is inactive
+    /// (`inter_pred_idc == PRED_L0`).
+    pub mvd_cp_l1: [MotionVector; 3],
+}
+
+impl NonMergeInterPreResidualAffineDecision {
+    /// Convenience constructor that clamps:
+    /// 1. Every per-CP MVD `cpIdx >= numCpMv` to zero (so the struct
+    ///    can't carry stale state past the §7.3.10.5 per-CP gates).
+    /// 2. Every L0-side MVD to zero when L0 is inactive.
+    /// 3. Every L1-side MVD to zero when L1 is inactive (the
+    ///    §7.3.11.7 `inter_pred_idc != PRED_L0` precondition).
+    ///
+    /// The `sym_mvd_flag` SMVD branch is intentionally NOT modelled
+    /// here — §7.3.11.7 requires `inter_affine_flag == 0` for SMVD to
+    /// open, so an SMVD-on-affine combination is invalid. The
+    /// dispatcher debug-asserts this independently.
+    pub fn new(
+        affine: NonMergeInterAffineDecision,
+        mvp: NonMergeMvpSyntaxDecision,
+        mvd_cp_l0: [MotionVector; 3],
+        mvd_cp_l1: [MotionVector; 3],
+    ) -> Self {
+        let num_cp = affine.motion_model.num_cp_mv();
+        let l0 = matches!(
+            mvp.inter_pred_idc,
+            InterPredDir::PredL0 | InterPredDir::PredBi
+        );
+        let l1 = matches!(
+            mvp.inter_pred_idc,
+            InterPredDir::PredL1 | InterPredDir::PredBi
+        );
+        let mut out_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        let mut out_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        if l0 {
+            for i in 0..num_cp {
+                out_l0[i] = mvd_cp_l0[i];
+            }
+        }
+        if l1 {
+            for i in 0..num_cp {
+                out_l1[i] = mvd_cp_l1[i];
+            }
+        }
+        Self {
+            affine,
+            mvp,
+            mvd_cp_l0: out_l0,
+            mvd_cp_l1: out_l1,
+        }
+    }
+
+    /// `numCpMv = MotionModelIdc + 1` per §8.5.5.5. Convenience accessor
+    /// — equivalent to `self.affine.motion_model.num_cp_mv()`.
+    pub fn num_cp_mv(&self) -> usize {
+        self.affine.motion_model.num_cp_mv()
+    }
+}
+
+/// Round-207 — encode the entire §7.3.11.7 non-merge inter CU
+/// pre-residual syntax in one call, with per-CP affine MVD support.
+///
+/// Generalises [`encode_non_merge_inter_pre_residual`] from the
+/// translational case (one `mvd_coding()` per active list) to the full
+/// §7.3.10.5 non-merge inter affine case (`numCpMv` `mvd_coding()`
+/// invocations per active list, in `cpIdx = 0, 1, 2` order). When
+/// `decision.affine.motion_model == MotionModel::Translational` (i.e.
+/// `numCpMv == 1`) the wire layout is bit-identical to
+/// [`encode_non_merge_inter_pre_residual`].
+///
+/// The dispatcher walks the per-element encoder helpers in §7.3.10.5
+/// spec order, applying the §7.4.12.7 inference rules so that no bin
+/// is emitted for a syntax element whose gate is closed.
+///
+/// # Spec order (per §7.3.10.5 + §7.3.11.7)
+///
+/// 1. `inter_affine_flag` + `cu_affine_type_flag` (round-177).
+/// 2. `inter_pred_idc` (round-183, B-slice only).
+/// 3. `sym_mvd_flag` (round-183, SMVD gate; gate is closed on the
+///    affine path per §7.3.11.7).
+/// 4. `ref_idx_l0` (round-183, per-list).
+/// 5. `ref_idx_l1` (round-183, per-list).
+/// 6. **`mvd_coding(L0, cpIdx = 0)` then per-CP `mvd_coding(L0, cpIdx)`
+///    for `cpIdx ∈ {1, 2}` gated on `MotionModelIdc > 0` and
+///    `MotionModelIdc > 1` respectively** (round-187 × `numCpMv`).
+/// 7. **Same per-CP cascade for L1, with `cpIdx = 0` suppressed under
+///    `sym_mvd_flag == 1` per §8.5.2.5.**
+/// 8. `mvp_l0_flag` (round-183, per-list).
+/// 9. `mvp_l1_flag` (round-183, per-list).
+///
+/// # Preconditions
+///
+/// * `decision.affine.motion_model` agrees with the two raw flags via
+///   §8.5.5.2 eq. 160 (`derive_motion_model_idc`). The dispatcher
+///   debug-asserts this.
+/// * `decision.mvp.sym_mvd_flag == 1` ⇒
+///   `decision.affine.inter_affine_flag == 0`. SMVD on the affine
+///   path is excluded by the §7.3.11.7 listing; the dispatcher
+///   debug-asserts this.
+/// * Per-CP MVD slots `cpIdx >= numCpMv` MUST be zero — the
+///   [`NonMergeInterPreResidualAffineDecision::new`] constructor
+///   enforces this.
+///
+/// No third-party VVC encoder source was consulted; the implementation
+/// is spec-only and composes the existing round-177 / round-183 /
+/// round-187 encoder-side code already shipped in this crate.
+pub fn encode_non_merge_inter_pre_residual_affine(
+    enc: &mut ArithEncoder,
+    ctxs: &mut LeafCuCtxs,
+    affine_gate: &NonMergeInterAffineGate,
+    mvp_gate: &NonMergeMvpSyntaxGate,
+    decision: &NonMergeInterPreResidualAffineDecision,
+) -> Result<()> {
+    // Round-trip safety: the typed `motion_model` field MUST agree
+    // with the two raw affine flag bools per §8.5.5.2 eq. 160.
+    debug_assert_eq!(
+        decision.affine.motion_model,
+        derive_motion_model_idc(
+            decision.affine.inter_affine_flag,
+            decision.affine.cu_affine_type_flag
+        ),
+        "NonMergeInterPreResidualAffineDecision.affine.motion_model disagrees with its flag pair"
+    );
+    // §7.3.11.7 excludes SMVD on the affine path (the SMVD listing is
+    // gated on `inter_affine_flag == 0`).
+    debug_assert!(
+        !(decision.mvp.sym_mvd_flag && decision.affine.inter_affine_flag),
+        "§7.3.11.7 excludes sym_mvd_flag on the affine path"
+    );
+
+    let num_cp = decision.num_cp_mv();
+
+    // ------------------------------------------------------------------
+    // Step 1 — affine syntax (round-177 dispatcher).
+    // ------------------------------------------------------------------
+    encode_non_merge_inter_affine(enc, ctxs, affine_gate, &decision.affine)?;
+
+    // ------------------------------------------------------------------
+    // Step 2 — inter_pred_idc (§7.3.11.7 B-slice only).
+    // ------------------------------------------------------------------
+    let outer = mvp_gate.inter_pred_idc_gate_open();
+    if outer {
+        encode_inter_pred_idc(
+            enc,
+            ctxs,
+            decision.mvp.inter_pred_idc,
+            mvp_gate.cb_width,
+            mvp_gate.cb_height,
+        )?;
+    } else {
+        debug_assert_eq!(
+            decision.mvp.inter_pred_idc,
+            InterPredDir::PredL0,
+            "P-slice → §7.4.12.7 requires inter_pred_idc = PRED_L0"
+        );
+    }
+    let effective_inter_pred_idc = if outer {
+        decision.mvp.inter_pred_idc
+    } else {
+        InterPredDir::PredL0
+    };
+
+    // ------------------------------------------------------------------
+    // Step 3 — sym_mvd_flag (§7.3.11.7 SMVD gate).
+    //
+    // The affine debug-assert above already rules out SMVD on the
+    // affine path; this branch covers the translational path where
+    // the SMVD gate may open.
+    // ------------------------------------------------------------------
+    if mvp_gate.sym_mvd_signalled(effective_inter_pred_idc) {
+        encode_sym_mvd_flag(enc, ctxs, decision.mvp.sym_mvd_flag)?;
+    } else {
+        debug_assert!(
+            !decision.mvp.sym_mvd_flag,
+            "sym_mvd_flag gate closed → §7.4.12.7 requires sym_mvd_flag = 0"
+        );
+    }
+    let effective_sym_mvd_flag = if mvp_gate.sym_mvd_signalled(effective_inter_pred_idc) {
+        decision.mvp.sym_mvd_flag
+    } else {
+        false
+    };
+
+    let l0_active = matches!(
+        effective_inter_pred_idc,
+        InterPredDir::PredL0 | InterPredDir::PredBi
+    );
+    let l1_active = matches!(
+        effective_inter_pred_idc,
+        InterPredDir::PredL1 | InterPredDir::PredBi
+    );
+
+    // ------------------------------------------------------------------
+    // Step 4 — ref_idx_l0.
+    // ------------------------------------------------------------------
+    if mvp_gate.ref_idx_l0_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
+        encode_ref_idx_lx(
+            enc,
+            ctxs,
+            decision.mvp.ref_idx_l0,
+            mvp_gate.num_ref_idx_active_l0,
+        )?;
+    } else {
+        debug_assert_eq!(
+            decision.mvp.ref_idx_l0, 0,
+            "ref_idx_l0 not signalled → §7.4.12.7 requires ref_idx_l0 = 0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 5 — ref_idx_l1.
+    // ------------------------------------------------------------------
+    if mvp_gate.ref_idx_l1_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
+        encode_ref_idx_lx(
+            enc,
+            ctxs,
+            decision.mvp.ref_idx_l1,
+            mvp_gate.num_ref_idx_active_l1,
+        )?;
+    } else {
+        debug_assert_eq!(
+            decision.mvp.ref_idx_l1, 0,
+            "ref_idx_l1 not signalled → §7.4.12.7 requires ref_idx_l1 = 0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 6 — per-CP mvd_coding for L0.
+    //
+    // §7.3.10.5 listing:
+    //   mvd_coding(x0, y0, 0, 0)
+    //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 0, 1)
+    //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 0, 2)
+    //
+    // Iterates 0..numCpMv on the L0 path when L0 is active.
+    // ------------------------------------------------------------------
+    if l0_active {
+        for cp_idx in 0..num_cp {
+            encode_mvd_coding(enc, ctxs, decision.mvd_cp_l0[cp_idx])?;
+        }
+        // Slots beyond numCpMv MUST be zero per the constructor's clamp.
+        for cp_idx in num_cp..3 {
+            debug_assert_eq!(
+                (decision.mvd_cp_l0[cp_idx].x, decision.mvd_cp_l0[cp_idx].y),
+                (0, 0),
+                "L0 per-CP MVD slot {} (>= numCpMv = {}) must be zero",
+                cp_idx,
+                num_cp,
+            );
+        }
+    } else {
+        for cp_idx in 0..3 {
+            debug_assert_eq!(
+                (decision.mvd_cp_l0[cp_idx].x, decision.mvd_cp_l0[cp_idx].y),
+                (0, 0),
+                "L0 inactive → mvd_cp_l0[{}] must be zero per the dispatcher's contract",
+                cp_idx,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7 — per-CP mvd_coding for L1.
+    //
+    // §7.3.10.5 listing (paraphrased per the spec's pseudocode):
+    //   if (sym_mvd_flag) { MvdL1[0] = -MvdL0[0]; }   // no bin
+    //   else mvd_coding(x0, y0, 1, 0)
+    //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 1, 1)
+    //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 1, 2)
+    //
+    // Note: the spec ONLY suppresses the `cpIdx == 0` L1 MVD under
+    // sym_mvd_flag; the higher-CP L1 MVDs are read verbatim. In
+    // practice the debug-assert above rules out the affine+SMVD
+    // combination, so `cpIdx >= 1` only fires under sym_mvd_flag == 0.
+    // The translational path with sym_mvd_flag == 1 has numCpMv == 1
+    // and never enters the `cp_idx >= 1` branch.
+    // ------------------------------------------------------------------
+    if l1_active {
+        // cpIdx = 0 is suppressed under sym_mvd_flag == 1 per §8.5.2.5.
+        if !effective_sym_mvd_flag {
+            encode_mvd_coding(enc, ctxs, decision.mvd_cp_l1[0])?;
+        } else {
+            // Caller-conformance check: an SMVD CU's mvd_cp_l1[0]
+            // should either be the inferred -mvd_cp_l0[0] or zero.
+            let inferred_match = decision.mvd_cp_l1[0].x == -decision.mvd_cp_l0[0].x
+                && decision.mvd_cp_l1[0].y == -decision.mvd_cp_l0[0].y;
+            let zero = decision.mvd_cp_l1[0].x == 0 && decision.mvd_cp_l1[0].y == 0;
+            debug_assert!(
+                inferred_match || zero,
+                "sym_mvd_flag = 1 → mvd_cp_l1[0] must be inferred -mvd_cp_l0[0] or zero \
+                 (was ({}, {}) for mvd_cp_l0[0] = ({}, {}))",
+                decision.mvd_cp_l1[0].x,
+                decision.mvd_cp_l1[0].y,
+                decision.mvd_cp_l0[0].x,
+                decision.mvd_cp_l0[0].y,
+            );
+        }
+        // cpIdx = 1, 2 — gated on MotionModelIdc per §7.3.10.5.
+        for cp_idx in 1..num_cp {
+            encode_mvd_coding(enc, ctxs, decision.mvd_cp_l1[cp_idx])?;
+        }
+        for cp_idx in num_cp..3 {
+            debug_assert_eq!(
+                (decision.mvd_cp_l1[cp_idx].x, decision.mvd_cp_l1[cp_idx].y),
+                (0, 0),
+                "L1 per-CP MVD slot {} (>= numCpMv = {}) must be zero",
+                cp_idx,
+                num_cp,
+            );
+        }
+    } else {
+        for cp_idx in 0..3 {
+            debug_assert_eq!(
+                (decision.mvd_cp_l1[cp_idx].x, decision.mvd_cp_l1[cp_idx].y),
+                (0, 0),
+                "L1 inactive → mvd_cp_l1[{}] must be zero per the dispatcher's contract",
+                cp_idx,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Step 8 — mvp_l0_flag.
+    // ------------------------------------------------------------------
+    if l0_active {
+        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l0_flag)?;
+    } else {
+        debug_assert_eq!(
+            decision.mvp.mvp_l0_flag, 0,
+            "L0 inactive → §7.4.12.7 requires mvp_l0_flag = 0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 9 — mvp_l1_flag.
+    // ------------------------------------------------------------------
+    if l1_active {
+        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l1_flag)?;
+    } else {
+        debug_assert_eq!(
+            decision.mvp.mvp_l1_flag, 0,
+            "L1 inactive → §7.4.12.7 requires mvp_l1_flag = 0"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1756,5 +2164,411 @@ mod tests {
         assert_eq!(snap.amvr.amvr_precision_idx, 1);
         assert_eq!(snap.amvr.amvr_shift, crate::amvr::AmvrShift(4));
         assert_eq!(snap.bcw_idx, 1);
+    }
+
+    // =================================================================
+    // Round-207 — multi-CP-MV affine dispatcher round-trip tests.
+    // =================================================================
+
+    use crate::affine::MotionModel;
+
+    /// Reader-side snapshot for the §7.3.10.5 per-CP-MV affine cascade.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct AffineReaderSnapshot {
+        affine: NonMergeInterAffineDecision,
+        inter_pred_idc: InterPredDir,
+        sym_mvd_flag: bool,
+        ref_idx_l0: u32,
+        ref_idx_l1: u32,
+        mvd_cp_l0: [MotionVector; 3],
+        mvd_cp_l1: [MotionVector; 3],
+        mvp_l0_flag: u32,
+        mvp_l1_flag: u32,
+    }
+
+    /// Drive the round-207 dispatcher and read back the resulting
+    /// stream through the reader-side `LeafCuReader`. Walks the same
+    /// §7.3.10.5 per-CP-MV order the dispatcher emits.
+    fn round_trip_affine(
+        init_type: u8,
+        affine_gate: &NonMergeInterAffineGate,
+        mvp_gate: &NonMergeMvpSyntaxGate,
+        decision: &NonMergeInterPreResidualAffineDecision,
+    ) -> AffineReaderSnapshot {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_non_merge_inter_pre_residual_affine(
+            &mut enc,
+            &mut enc_ctxs,
+            affine_gate,
+            mvp_gate,
+            decision,
+        )
+        .expect("encode_non_merge_inter_pre_residual_affine succeeds");
+        enc.encode_terminate(1).expect("terminator");
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 64]);
+        let mut dec = ArithDecoder::new(&padded).expect("decoder accepts the encoded stream");
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+
+        // Step 1 — affine syntax.
+        let affine = reader
+            .read_non_merge_inter_affine(affine_gate)
+            .expect("reader reads affine syntax");
+        let num_cp = affine.motion_model.num_cp_mv();
+
+        // Step 2 — inter_pred_idc.
+        let inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
+            reader
+                .read_inter_pred_idc(mvp_gate.cb_width, mvp_gate.cb_height)
+                .expect("reader reads inter_pred_idc")
+        } else {
+            InterPredDir::PredL0
+        };
+
+        // Step 3 — sym_mvd_flag.
+        let sym_mvd_flag = if mvp_gate.sym_mvd_signalled(inter_pred_idc) {
+            reader
+                .read_sym_mvd_flag()
+                .expect("reader reads sym_mvd_flag")
+        } else {
+            false
+        };
+
+        let l0_active = matches!(inter_pred_idc, InterPredDir::PredL0 | InterPredDir::PredBi);
+        let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);
+
+        // Step 4 — ref_idx_l0.
+        let ref_idx_l0 = if mvp_gate.ref_idx_l0_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader
+                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l0)
+                .expect("reader reads ref_idx_l0")
+        } else {
+            0
+        };
+
+        // Step 5 — ref_idx_l1.
+        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader
+                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
+                .expect("reader reads ref_idx_l1")
+        } else {
+            0
+        };
+
+        // Step 6 — per-CP mvd_coding L0.
+        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        if l0_active {
+            for i in 0..num_cp {
+                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
+            }
+        }
+
+        // Step 7 — per-CP mvd_coding L1.
+        let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        if l1_active {
+            if !sym_mvd_flag {
+                mvd_cp_l1[0] = reader.read_mvd_coding().expect("reader reads mvd L1 cp0");
+            }
+            for i in 1..num_cp {
+                mvd_cp_l1[i] = reader.read_mvd_coding().expect("reader reads mvd L1 cp");
+            }
+        }
+
+        // Step 8 — mvp_l0_flag.
+        let mvp_l0_flag = if l0_active {
+            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
+        } else {
+            0
+        };
+
+        // Step 9 — mvp_l1_flag.
+        let mvp_l1_flag = if l1_active {
+            reader.read_mvp_lx_flag().expect("reader reads mvp_l1_flag")
+        } else {
+            0
+        };
+
+        AffineReaderSnapshot {
+            affine,
+            inter_pred_idc,
+            sym_mvd_flag,
+            ref_idx_l0,
+            ref_idx_l1,
+            mvd_cp_l0,
+            mvd_cp_l1,
+            mvp_l0_flag,
+            mvp_l1_flag,
+        }
+    }
+
+    fn affine_gate_on() -> NonMergeInterAffineGate {
+        NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: true,
+            cb_width: 16,
+            cb_height: 16,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn round207_translational_degenerates_to_round190() {
+        // numCpMv == 1: the per-CP cascade reduces to one mvd_coding
+        // per active list — bit-identical to the translational
+        // dispatcher.
+        let affine_gate = affine_gate_off();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 5, y: -3 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 1);
+        for init_type in [1u8, 2u8] {
+            let snap = round_trip_affine(init_type, &affine_gate, &mvp_gate, &decision);
+            assert_eq!(snap.affine.motion_model, MotionModel::Translational);
+            assert_eq!(snap.mvd_cp_l0[0], MotionVector { x: 5, y: -3 });
+            assert_eq!(snap.mvd_cp_l1[0], MotionVector { x: 0, y: 0 });
+            assert_eq!(snap.ref_idx_l0, 1);
+            assert_eq!(snap.mvp_l0_flag, 1);
+        }
+    }
+
+    #[test]
+    fn round207_affine4param_p_slice_l0_three_cps_round_trip() {
+        // 4-param affine ⇒ numCpMv == 2. P-slice ⇒ L0-only.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        assert_eq!(affine.motion_model, MotionModel::Affine4Param);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 1, 0);
+        // Two CP MVDs on L0, CP[2] unused (kept zero).
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: -1 },
+            MotionVector { x: -2, y: 7 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 2);
+        let snap = round_trip_affine(1, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(snap.affine.motion_model, MotionModel::Affine4Param);
+        assert_eq!(snap.mvd_cp_l0[0], MotionVector { x: 4, y: -1 });
+        assert_eq!(snap.mvd_cp_l0[1], MotionVector { x: -2, y: 7 });
+        // CP[2] not read on the wire under numCpMv == 2.
+        assert_eq!(snap.mvd_cp_l0[2], MotionVector { x: 0, y: 0 });
+        assert_eq!(snap.ref_idx_l0, 1);
+        assert_eq!(snap.mvp_l0_flag, 1);
+    }
+
+    #[test]
+    fn round207_affine6param_p_slice_l0_three_cps_round_trip() {
+        // 6-param affine ⇒ numCpMv == 3. P-slice ⇒ L0-only.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, true);
+        assert_eq!(affine.motion_model, MotionModel::Affine6Param);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: -1 },
+            MotionVector { x: -2, y: 7 },
+            MotionVector { x: 11, y: -9 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 3);
+        let snap = round_trip_affine(1, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(snap.affine.motion_model, MotionModel::Affine6Param);
+        assert_eq!(snap.mvd_cp_l0[0], MotionVector { x: 4, y: -1 });
+        assert_eq!(snap.mvd_cp_l0[1], MotionVector { x: -2, y: 7 });
+        assert_eq!(snap.mvd_cp_l0[2], MotionVector { x: 11, y: -9 });
+    }
+
+    #[test]
+    fn round207_affine4param_b_slice_pred_bi_round_trip() {
+        // 4-param affine bi-pred: two CPs per list.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 1, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: -1 },
+            MotionVector { x: -2, y: 7 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: 8, y: 2 },
+            MotionVector { x: -6, y: -3 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let snap = round_trip_affine(1, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(snap.affine.motion_model, MotionModel::Affine4Param);
+        assert_eq!(snap.inter_pred_idc, InterPredDir::PredBi);
+        assert_eq!(snap.mvd_cp_l0[0], MotionVector { x: 4, y: -1 });
+        assert_eq!(snap.mvd_cp_l0[1], MotionVector { x: -2, y: 7 });
+        assert_eq!(snap.mvd_cp_l1[0], MotionVector { x: 8, y: 2 });
+        assert_eq!(snap.mvd_cp_l1[1], MotionVector { x: -6, y: -3 });
+        assert_eq!(snap.ref_idx_l0, 1);
+        assert_eq!(snap.ref_idx_l1, 1);
+        assert_eq!(snap.mvp_l0_flag, 1);
+        assert_eq!(snap.mvp_l1_flag, 0);
+    }
+
+    #[test]
+    fn round207_affine6param_b_slice_pred_bi_round_trip() {
+        // 6-param affine bi-pred: three CPs per list.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, true);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 0, 0, 0, 1);
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: -1 },
+            MotionVector { x: -2, y: 7 },
+            MotionVector { x: 11, y: -9 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: 8, y: 2 },
+            MotionVector { x: -6, y: -3 },
+            MotionVector { x: 0, y: 5 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let snap = round_trip_affine(1, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(snap.affine.motion_model, MotionModel::Affine6Param);
+        for i in 0..3 {
+            assert_eq!(snap.mvd_cp_l0[i], mvd_cp_l0[i], "L0 cp{}", i);
+            assert_eq!(snap.mvd_cp_l1[i], mvd_cp_l1[i], "L1 cp{}", i);
+        }
+        assert_eq!(snap.mvp_l1_flag, 1);
+    }
+
+    #[test]
+    fn round207_new_clamps_inactive_l1_per_cp_mvds() {
+        // Constructor contract: PRED_L0 ⇒ every L1 per-CP MVD is
+        // forced to zero regardless of caller-stale state.
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [MotionVector { x: 1, y: 2 }; 3];
+        let mvd_cp_l1 = [MotionVector { x: 99, y: -99 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        for i in 0..3 {
+            assert_eq!(decision.mvd_cp_l1[i], MotionVector { x: 0, y: 0 });
+        }
+    }
+
+    #[test]
+    fn round207_new_clamps_unused_cp_slots() {
+        // Constructor contract: Affine4Param ⇒ numCpMv == 2 ⇒ cp[2]
+        // is forced to zero regardless of caller-stale state.
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 1, y: 1 },
+            MotionVector { x: 2, y: 2 },
+            MotionVector { x: 99, y: -99 }, // stale
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: 3, y: 3 },
+            MotionVector { x: 4, y: 4 },
+            MotionVector { x: -99, y: 99 }, // stale
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 2);
+        assert_eq!(decision.mvd_cp_l0[2], MotionVector { x: 0, y: 0 });
+        assert_eq!(decision.mvd_cp_l1[2], MotionVector { x: 0, y: 0 });
+        // Used slots survive.
+        assert_eq!(decision.mvd_cp_l0[0], MotionVector { x: 1, y: 1 });
+        assert_eq!(decision.mvd_cp_l1[1], MotionVector { x: 4, y: 4 });
+    }
+
+    #[test]
+    fn round207_translational_degenerate_b_slice_pred_bi() {
+        // Translational (numCpMv == 1) on B-slice PRED_BI: walks the
+        // same wire as the round-190 dispatcher with the same MVDs.
+        let affine_gate = affine_gate_off();
+        let mvp_gate = b_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 1, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: -10, y: 11 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: 12, y: -13 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let decision_aff =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let decision_trans =
+            NonMergeInterPreResidualDecision::new(affine, mvp, mvd_cp_l0[0], mvd_cp_l1[0]);
+
+        // Both dispatchers should produce the same bytes.
+        let mut enc_aff = ArithEncoder::new();
+        let mut ctxs_aff = LeafCuCtxs::init_with_init_type(26, 1);
+        encode_non_merge_inter_pre_residual_affine(
+            &mut enc_aff,
+            &mut ctxs_aff,
+            &affine_gate,
+            &mvp_gate,
+            &decision_aff,
+        )
+        .expect("affine dispatcher succeeds");
+        enc_aff.encode_terminate(1).expect("terminator");
+        let aff_bytes = enc_aff.finish();
+
+        let mut enc_trans = ArithEncoder::new();
+        let mut ctxs_trans = LeafCuCtxs::init_with_init_type(26, 1);
+        encode_non_merge_inter_pre_residual(
+            &mut enc_trans,
+            &mut ctxs_trans,
+            &affine_gate,
+            &mvp_gate,
+            &decision_trans,
+        )
+        .expect("translational dispatcher succeeds");
+        enc_trans.encode_terminate(1).expect("terminator");
+        let trans_bytes = enc_trans.finish();
+
+        assert_eq!(
+            aff_bytes, trans_bytes,
+            "translational wire layout must be bit-identical between round-190 and round-207 \
+             when numCpMv == 1"
+        );
+    }
+
+    #[test]
+    fn round207_affine4param_p_slice_per_cp_zero_mvds_round_trip() {
+        // 4-param affine with all per-CP MVDs zero: still emits one
+        // bin per zero greater0 flag per CP (= 4 bins per CP × 2 CPs
+        // = 8 zero greater0 bins on L0 plus the rest of the cascade).
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let snap = round_trip_affine(1, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(snap.affine.motion_model, MotionModel::Affine4Param);
+        for i in 0..2 {
+            assert_eq!(snap.mvd_cp_l0[i], MotionVector { x: 0, y: 0 });
+        }
     }
 }

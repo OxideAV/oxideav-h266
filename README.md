@@ -1341,8 +1341,44 @@ B-slice PRED_BI weighted-pred-closed round-trip, B-slice PRED_BI
 small-CU-closed round-trip, B-slice uni-pred BCW-closed round-trip,
 and an AMVR-open + BCW-open simultaneous round-trip exercising both
 gates emitting in sequence. Multi-CP-MV affine MVD emission
-(`numCpMv > 1`) remains the final follow-up for the full §7.3.11.7
-non-merge inter pre-residual CU encoder.
+(`numCpMv > 1`) is delivered in the following round.
+
+**Round-207 lands the encoder-side §7.3.10.5 multi-CP-MV affine MVD
+dispatcher** — the final follow-up for the §7.3.11.7 non-merge inter
+pre-residual CU encoder identified by rounds 190 / 195 / 201. The new
+public surface
+[`encode_non_merge_inter_pre_residual_affine`](src/non_merge_inter_pre_residual_enc.rs)
+generalises the round-190 translational dispatcher to emit `numCpMv`
+`mvd_coding()` invocations per active list in §7.3.10.5 spec order:
+`mvd_coding(L0, cpIdx = 0)` ⇒ `if MotionModelIdc > 0:
+mvd_coding(L0, 1)` ⇒ `if MotionModelIdc > 1: mvd_coding(L0, 2)` ⇒
+`mvp_l0_flag`, with the symmetric L1 cascade following (where the
+§8.5.2.5 SMVD shortcut applies only to `cpIdx == 0`; §7.3.11.7
+excludes SMVD on the affine path, debug-asserted in the dispatcher).
+The new `NonMergeInterPreResidualAffineDecision` data type carries per-
+CP `lMvdCpLX[cpIdx][c]` arrays whose `cpIdx >= numCpMv` slots are
+clamped to zero by the constructor (so stale state can't leak past
+the §7.3.10.5 per-CP gates); a `num_cp_mv()` accessor surfaces the
+§8.5.5.5 `numCpMv = MotionModelIdc + 1` derivation. 10 new round-trip
+lib tests pin the dispatcher: translational degenerate-case
+bit-identity with the round-190 dispatcher under `numCpMv == 1`
+(verified on both P-slice PRED_L0 and B-slice PRED_BI by comparing
+encoded bytes from both dispatchers), Affine4Param P-slice L0-only
+two-CP round-trip with the third CP slot suppressed, Affine6Param
+P-slice L0-only three-CP round-trip, Affine4Param B-slice PRED_BI
+bi-pred per-CP round-trip across both lists, Affine6Param B-slice
+PRED_BI bi-pred three-CP round-trip across both lists, constructor
+clamps on inactive L1 per-CP MVDs, constructor clamps on unused CP
+slots (`cpIdx == 2` under Affine4Param), and Affine4Param P-slice
+all-zero per-CP MVDs (covering the zero-greater0-flag cascade
+through the per-CP loop). The composite dispatchers
+`encode_non_merge_inter_pre_residual_with_amvr` and
+`encode_non_merge_inter_pre_residual_with_amvr_and_bcw` stay on the
+translational scope of round-195 / round-201; folding them with the
+new affine cascade is a small follow-up (AMVR and BCW themselves
+already accept the per-CP MVD non-zero state via
+`amvr_gate.any_mvd_cp_l0_l1_nonzero` and the §7.4.12.5 BCW gates,
+respectively).
 
 ## Usage
 
