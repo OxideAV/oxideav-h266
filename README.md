@@ -1310,6 +1310,40 @@ Multi-CP-MV affine MVD emission (`numCpMv > 1`) and the
 encoder-side `bcw_idx` mirror remain the final follow-ups for the
 full §7.3.11.7 non-merge inter pre-residual CU encoder.
 
+**Round-201 lands the encoder-side §7.3.10.5 `bcw_idx[x0][y0]`
+mirror** and wires it into the round-195 non-merge inter pre-residual
+composite walker. The new public `bcw_idx_enc` module lifts the
+round-126 `#[cfg(test)]` helper in `leaf_cu.rs` into a real encoder
+surface: `encode_bcw_idx` emits the TR `cMax = NoBackwardPredFlag ?
+4 : 2`, `cRiceParam = 0` cascade (bin 0 ctx-coded against Table 91
+slot `init_type - 1` with `ctxInc = 0` per Table 132; bins 1..cMax
+bypass-coded). The dispatcher `encode_bcw_idx_gated` walks the same
+§7.3.10.5 conditional the round-126 reader walks, applying the
+§7.4.12.5 inference (gate closed ⇒ no bin on the wire, reader
+recovers `bcw_idx = 0`). The composite walker
+`encode_non_merge_inter_pre_residual_with_amvr_and_bcw` chains the
+round-195 steps 1–10 with the new round-201 step 11 in §7.3.11.7 /
+§7.3.10.5 spec order (after the AMVR cascade, before the deferred
+residual / `cu_coded_flag` / `transform_tree()` / `cu_qp_delta`
+tail). The new `bcw_idx_c_max` helper surfaces the cMax derivation
+(`NoBackwardPredFlag ? 4 : 2`) for spec traceability. 12 new lib
+tests pin the dispatcher: `bcw_idx_c_max` Table 132 branches, raw
+exhaustive round-trip across both cMax arms (`cMax = 2` ⇒ {0, 1, 2},
+`cMax = 4` ⇒ {0, 1, 2, 3, 4} including the value-4 truncation point)
+× both non-I initTypes, value-zero single-ctx-bin sanity, and gated
+closed-gate inference paths covering every §7.3.10.5 close condition
+(default-closed, `sps_bcw_enabled = false`, uni-pred / `None`
+`inter_pred_idc`, each of the four luma/chroma weighted-pred flags,
+small CU `cb_w * cb_h < 256`). 7 new composite-walker tests pin the
+spec ordering: P-slice BCW-closed round-trip, B-slice PRED_BI
+exhaustive round-trips across both cMax arms × both non-I initTypes,
+B-slice PRED_BI weighted-pred-closed round-trip, B-slice PRED_BI
+small-CU-closed round-trip, B-slice uni-pred BCW-closed round-trip,
+and an AMVR-open + BCW-open simultaneous round-trip exercising both
+gates emitting in sequence. Multi-CP-MV affine MVD emission
+(`numCpMv > 1`) remains the final follow-up for the full §7.3.11.7
+non-merge inter pre-residual CU encoder.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

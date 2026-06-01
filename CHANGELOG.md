@@ -6,6 +6,7 @@ All notable changes to this crate are recorded here.
 
 ### Other
 
+- round 201: encoder-side §7.3.10.5 bcw_idx dispatcher (`bcw_idx_enc` module) wired into the non-merge inter pre-residual composite walker as step 11 (after AMVR)
 - round 195: encoder-side §7.3.10.10 amvr_flag + amvr_precision_idx dispatcher (`amvr_enc` module) wired into the non-merge inter pre-residual composite walker
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-h266/compare/v0.0.6...v0.0.7) - 2026-05-30
