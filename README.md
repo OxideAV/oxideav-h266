@@ -1462,6 +1462,56 @@ on each side. The matching reader-side `_with_amvr` and
 `_with_amvr_and_bcw` composites for symmetry with the encoder
 family remain the next follow-up.
 
+**Round-224 lands those reader-side composites.** Two new public
+entry points in the `non_merge_inter_pre_residual_dec` module —
+[`read_non_merge_inter_pre_residual_with_amvr`](src/non_merge_inter_pre_residual_dec.rs)
+and
+[`read_non_merge_inter_pre_residual_with_amvr_and_bcw`](src/non_merge_inter_pre_residual_dec.rs)
+— extend the round-219 reader twin from steps 1–9 to steps 1–10 and
+1–11 respectively in §7.3.11.7 spec order, fully mirroring the
+round-195 `encode_non_merge_inter_pre_residual_with_amvr` and the
+round-201 `encode_non_merge_inter_pre_residual_with_amvr_and_bcw`
+encoder dispatchers. The `_with_amvr` variant chains the round-219
+pre-residual cascade with the round-193 reader-side
+`read_amvr_inter_gated` (§7.3.10.10 outer-gate walk + per-cascade-arm
+`amvr_flag` / `amvr_precision_idx` reads + Table 16 `AmvrShift`
+fold), returning the pair `(NonMergeInterPreResidualDecision,
+AmvrDecision)` where `AmvrDecision` mirrors the round-195
+encoder-side input shape (the `(amvr_flag, amvr_precision_idx,
+shift)` triple already produced by the reader, repackaged so
+encoder→decoder symmetry holds at the type level too). The
+`_with_amvr_and_bcw` variant chains that with the round-126
+reader-side `read_bcw_idx_gated` (§7.3.10.5 conditional + TR `cMax =
+NoBackwardPredFlag ? 4 : 2` walk + §7.4.12.5 inference for the
+gate-closed default), returning the triple `(decision, amvr,
+bcw_idx)`. Both composites debug-assert the same caller-conformance
+contracts the encoder-side dispatchers enforce
+(`amvr_gate.inter_affine_flag` must agree with the round-219
+dispatcher's decoded affine flag; `bcw_gate.cb_width /
+bcw_gate.cb_height` must match the affine gate's; and
+`bcw_gate.inter_pred_idc` must match the MVP-side resolved
+`inter_pred_idc` per §7.4.12.7 / §7.3.10.5). 11 new lib tests pin
+the dispatchers end-to-end against the encoder-side dispatchers:
+P-slice AMVR-closed-gate round-trip (no AMVR bins, AmvrShift = 2
+inferred), P-slice AMVR-open regular `prec = 2` round-trip
+(AmvrShift = 6 / 4-luma), B-slice PRED_BI AMVR-open `prec = 1`
+round-trip (AmvrShift = 4 / 1-luma), SMVD path AMVR-closed
+round-trip (sym_mvd_flag = 1, §8.5.2.5 `mvd_l1 = -mvd_l0` inferred
+and the AMVR cascade emits amvr_flag = 0 on a non-zero MVD), P-slice
+BCW-closed-by-PRED_L0 round-trip, B-slice PRED_BI BCW-open
+exhaustive over `cMax = 2` × both non-I initTypes, B-slice PRED_BI
+BCW-open with `NoBackwardPredFlag = 1` exhaustive over `cMax = 4`
+(bcw_idx ∈ {0, 1, 2, 3, 4}), simultaneous AMVR-open + BCW-open
+round-trip (both gates emit bins in §7.3.11.7 spec order),
+BCW-closed-by-`luma_weight_l0_flag` weighted-pred path, and
+BCW-closed-by-small-CU (8 × 8 < 256) with AMVR open. With this round
+the reader and encoder dispatcher families are complete mirrors of
+each other across the full §7.3.11.7 non-merge inter pre-residual
+cascade (steps 1–11 — pre-residual + AMVR + BCW); the residual tree
+/ `cu_coded_flag` / `transform_tree()` / `cu_qp_delta` tail remains
+the next milestone (the encoder side still needs to ship before the
+reader-side composite can land).
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
