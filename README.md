@@ -1380,6 +1380,43 @@ already accept the per-CP MVD non-zero state via
 `amvr_gate.any_mvd_cp_l0_l1_nonzero` and the §7.4.12.5 BCW gates,
 respectively).
 
+**Round-213 lands that follow-up** — two new public composite
+dispatchers,
+[`encode_non_merge_inter_pre_residual_affine_with_amvr`](src/non_merge_inter_pre_residual_enc.rs)
+and
+[`encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw`](src/non_merge_inter_pre_residual_enc.rs),
+which compose the round-207 per-CP affine cascade with the round-195
+§7.3.10.10 AMVR step and the round-201 §7.3.10.5 BCW step in §7.3.11.7
+spec order (steps 1–9 affine cascade ⇒ step 10 AMVR ⇒ step 11 BCW).
+The AMVR cascade's affine arm is now reachable from the encoder side:
+`amvr_gate.any_mvd_cp_l0_l1_nonzero` is computed by the caller over
+the active per-CP MVDs (`{0, 1}` for `Affine4Param`, `{0, 1, 2}` for
+`Affine6Param`; CPs beyond `numCpMv` are already clamped to zero by
+[`NonMergeInterPreResidualAffineDecision::new`]). The BCW cascade
+remains gated on the §7.3.10.5 conditions verbatim — `inter_pred_idc
+== PRED_BI`, `cb_w * cb_h >= 256`, no luma/chroma weighted-pred flags
+— and the affine path's translational degenerate (`numCpMv == 1`)
+collapses to the round-201 wire layout exactly. 8 new round-trip lib
+tests pin the two dispatchers: (1) translational-degenerate
+bit-identity with the round-195 affine+AMVR sibling (P-slice
+PRED_L0, regular AMVR open with prec = 2 → AmvrShift = 6, byte-exact
+diff over both non-I initTypes); (2) Affine4Param closed-gate
+inferred-default AmvrShift = 2 round-trip; (3) Affine4Param
+open-gate exhaustive round-trip across the affine arm's `cMax = 1`
+precision space (prec ∈ {0, 1} → AmvrShift ∈ {0, 4}); (4)
+Affine6Param B-slice PRED_BI three-CP-per-list round-trip with
+prec = 1 → AmvrShift = 4; (5) translational-degenerate bit-identity
+with the round-201 affine+AMVR+BCW sibling exhaustive over bcw_idx ∈
+{0, 1, 2} × both non-I initTypes; (6) Affine4Param B-slice PRED_BI
+open-everything round-trip exhaustive over bcw_idx values × both
+initTypes; (7) Affine6Param BCW-closed-by-chroma_weight_l0 round-trip
+on the affine path; (8) P-slice BCW-closed-by-PRED_L0 round-trip with
+the affine AMVR cascade firing. The composite dispatchers complete
+the §7.3.11.7 non-merge inter pre-residual CU encoder up to the
+residual tree on the full translational + affine grid; the residual
+tree / `cu_coded_flag` / `transform_tree()` / `cu_qp_delta` tail
+remains the next encoder-side milestone.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
