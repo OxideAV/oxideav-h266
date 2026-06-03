@@ -6,6 +6,7 @@ All notable changes to this crate are recorded here.
 
 ### Other
 
+- round 219: reader-side composite walker for §7.3.11.7 non-merge inter pre-residual (`non_merge_inter_pre_residual_dec::read_non_merge_inter_pre_residual`) — mirrors the round-190 encoder-side dispatcher bin-for-bin, walking the per-element reader helpers in §7.3.11.7 spec order and applying the §7.4.12.7 inferences for every gate-closed branch; returns the same `NonMergeInterPreResidualDecision` the encoder consumes so end-to-end round-trips collapse to a single function call on each side
 - round 213: encoder-side affine + AMVR / affine + AMVR + BCW composite dispatchers (`encode_non_merge_inter_pre_residual_affine_with_amvr` / `_and_bcw`) — folds the round-207 per-CP affine cascade with the round-195 §7.3.10.10 AMVR step and the round-201 §7.3.10.5 BCW step in §7.3.11.7 spec order; bit-identical to rounds 195 / 201 under `MotionModel::Translational`
 - round 207: encoder-side §7.3.10.5 multi-CP-MV affine MVD dispatcher (`encode_non_merge_inter_pre_residual_affine`) — emits `numCpMv` `mvd_coding()` invocations per active list per §7.3.10.5 listing
 - round 201: encoder-side §7.3.10.5 bcw_idx dispatcher (`bcw_idx_enc` module) wired into the non-merge inter pre-residual composite walker as step 11 (after AMVR)

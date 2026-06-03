@@ -1417,6 +1417,51 @@ residual tree on the full translational + affine grid; the residual
 tree / `cu_coded_flag` / `transform_tree()` / `cu_qp_delta` tail
 remains the next encoder-side milestone.
 
+**Round-219 lands the reader-side composite walker for the §7.3.11.7
+non-merge inter pre-residual cascade** — the long-standing
+asymmetry between the round-190 encoder-side dispatcher
+(`encode_non_merge_inter_pre_residual`) and its absent reader twin.
+The new `non_merge_inter_pre_residual_dec` module exposes
+`read_non_merge_inter_pre_residual(reader, &affine_gate, &mvp_gate)`
+which walks the per-element reader helpers
+(`read_non_merge_inter_affine` → `read_inter_pred_idc` →
+`read_sym_mvd_flag` → per-list `read_ref_idx_lx` → per-list
+`read_mvd_coding` → per-list `read_mvp_lx_flag`) in §7.3.11.7 spec
+order — exactly the sequence the encoder-side dispatcher emits — and
+folds the §7.4.12.7 inferences for every gate-closed branch into the
+returned `NonMergeInterPreResidualDecision`. P-slice ⇒
+`inter_pred_idc = PRED_L0` with zero bins consumed; the §7.3.11.7
+SMVD gate fills `mvd_l1 = -mvd_l0` per §8.5.2.5; inactive lists
+yield `MotionVector { x: 0, y: 0 }` and zero `ref_idx_lX` /
+`mvp_lX_flag` per §7.4.12.7. Scope matches round 190 verbatim:
+translational only (one `mvd_coding` per active list,
+`numCpMv == 1`); multi-CP-MV affine MVD parsing (round 207 encoder
+follow-up), `amvr_flag` / `amvr_precision_idx` (round 195 encoder
+follow-up — reader-side `read_amvr_inter_gated` already exists from
+round 193), and `bcw_idx` (round 201 encoder follow-up — reader-side
+`read_bcw_idx_gated` already exists from round 126) sit after the
+pre-residual cascade and are addressable by composing this
+dispatcher with those existing per-element reader helpers in spec
+order. 13 new lib tests drive every reachable §7.4.12.7-inference
+path end-to-end through the encoder dispatcher and back: P-slice
+zero-mvd / nonzero-mvd round-trips on both non-I initTypes; B-slice
+`PRED_L0` / `PRED_L1` / `PRED_BI` round-trips; the SMVD path with
+`mvd_l1 = -mvd_l0` recovery; the outer affine gate closed by SPS
+and by `cbWidth < 16` block-size both yielding `Translational`; the
+4-param affine gate open but decision `Translational` (one
+`inter_affine_flag = 0` bin); `num_ref_idx_active_l1 = 1`
+`ref_idx_l1` suppression; the `(cbWidth + cbHeight) == 12` one-bin
+`inter_pred_idc` form; `num_ref_idx_active_l0 = 1` `ref_idx_l0`
+suppression in P-slice; and the §7.4.10.10 max-magnitude
+`±(2^17 − 1)` per-component MVD round-trip on both lists exercising
+the §9.3.3.6 limited-EGk cap-escape path. With the round-190 / 195 /
+201 / 207 / 213 encoder dispatcher family and now the round-219
+reader twin, an end-to-end CU walk (encoder ↔ decoder) over the full
+§7.3.11.7 pre-residual cascade collapses to a single function call
+on each side. The matching reader-side `_with_amvr` and
+`_with_amvr_and_bcw` composites for symmetry with the encoder
+family remain the next follow-up.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
