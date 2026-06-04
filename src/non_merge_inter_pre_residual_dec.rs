@@ -53,7 +53,9 @@ use oxideav_core::Result;
 
 use crate::inter::MotionVector;
 use crate::leaf_cu::{InterPredDir, LeafCuReader, NonMergeInterAffineGate};
-use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualDecision;
+use crate::non_merge_inter_pre_residual_enc::{
+    NonMergeInterPreResidualAffineDecision, NonMergeInterPreResidualDecision,
+};
 use crate::non_merge_mvp_syntax_enc::{NonMergeMvpSyntaxDecision, NonMergeMvpSyntaxGate};
 
 /// Decode the entire §7.3.11.7 non-merge inter CU pre-residual syntax
@@ -407,6 +409,403 @@ pub fn read_non_merge_inter_pre_residual_with_amvr_and_bcw(
     // `_with_amvr` composite above.
     let (decision, amvr) =
         read_non_merge_inter_pre_residual_with_amvr(reader, affine_gate, mvp_gate, amvr_gate)?;
+
+    // The §7.3.11.7 outer gate resolves inter_pred_idc to PRED_L0 in
+    // P-slices (§7.4.12.7 inference) and to the decoded value in
+    // B-slices; bcw_gate.inter_pred_idc MUST match that resolved
+    // value or the §7.3.10.5 gate evaluation diverges from the
+    // encoder's.
+    let effective_inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
+        decision.mvp.inter_pred_idc
+    } else {
+        InterPredDir::PredL0
+    };
+    debug_assert_eq!(
+        bcw_gate.inter_pred_idc,
+        Some(effective_inter_pred_idc),
+        "bcw_gate.inter_pred_idc must match the MVP-side resolved inter_pred_idc \
+         (got bcw_gate = {:?}, effective = {:?})",
+        bcw_gate.inter_pred_idc,
+        effective_inter_pred_idc,
+    );
+
+    // Step 11 — the §7.3.10.5 BCW cascade.
+    let bcw_idx = reader.read_bcw_idx_gated(*bcw_gate)?;
+    Ok((decision, amvr, bcw_idx))
+}
+
+// =====================================================================
+// Round-230 — reader-side composite walker variants for the §7.3.10.5
+// multi-CP-MV affine MVD path. Reader twins of the encoder-side
+// `encode_non_merge_inter_pre_residual_affine` (round 207),
+// `encode_non_merge_inter_pre_residual_affine_with_amvr` (round 213),
+// and `encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw`
+// (round 213) dispatchers.
+//
+// Round 219 / 224 lifted the translational reader composites
+// (one `mvd_coding` per active list, `numCpMv == 1`). This round
+// generalises them across the full §7.3.10.5 non-merge inter affine
+// case (`numCpMv` `mvd_coding` invocations per active list, in
+// `cpIdx = 0, 1, 2` order). When the affine pair decodes to
+// `MotionModel::Translational` (`numCpMv == 1`) the wire layout is
+// bit-identical to the round-219 / round-224 dispatcher and the
+// recovered `NonMergeInterPreResidualAffineDecision` is exactly the
+// translational decision with `mvd_cp_l0[0]` / `mvd_cp_l1[0]` carrying
+// the per-list MVDs.
+// =====================================================================
+
+/// Round-230 — reader-side composite walker that consumes the entire
+/// §7.3.11.7 non-merge inter CU pre-residual syntax in one call WITH
+/// per-CP affine MVD support. Reader twin of
+/// [`crate::non_merge_inter_pre_residual_enc::encode_non_merge_inter_pre_residual_affine`]
+/// (round 207).
+///
+/// Generalises [`read_non_merge_inter_pre_residual`] from the
+/// translational case (one `mvd_coding` per active list) to the full
+/// §7.3.10.5 non-merge inter affine case (`numCpMv` `mvd_coding`
+/// invocations per active list, in `cpIdx = 0, 1, 2` order). When the
+/// affine pair decodes to `MotionModel::Translational` (`numCpMv == 1`)
+/// the wire layout is bit-identical to [`read_non_merge_inter_pre_residual`].
+///
+/// The dispatcher walks the per-element reader helpers in §7.3.10.5
+/// spec order, applying the §7.4.12.7 inference rules whenever a gate
+/// is closed so no bin is consumed for a syntax element whose gate is
+/// closed.
+///
+/// # Spec ordering — bin-for-bin with the encoder-side dispatcher
+///
+/// The reader walks the exact sequence the encoder-side dispatcher
+/// emits in
+/// [`crate::non_merge_inter_pre_residual_enc::encode_non_merge_inter_pre_residual_affine`]:
+///
+/// 1. Affine syntax (`inter_affine_flag` / `cu_affine_type_flag`) via
+///    [`LeafCuReader::read_non_merge_inter_affine`] — drives the
+///    §8.5.5.2 eq. 160 `MotionModelIdc` and the §8.5.5.5
+///    `numCpMv = MotionModelIdc + 1` derivation.
+/// 2. `inter_pred_idc` via [`LeafCuReader::read_inter_pred_idc`]
+///    (only when the §7.3.11.7 outer gate opens — B-slice).
+/// 3. `sym_mvd_flag` via [`LeafCuReader::read_sym_mvd_flag`]
+///    (only when the §7.3.11.7 SMVD gate opens — gate is closed on
+///    the affine path per §7.3.11.7).
+/// 4. `ref_idx_l0` via [`LeafCuReader::read_ref_idx_lx`]
+///    (only when L0 is active AND `cMax > 0` AND `sym_mvd_flag == 0`).
+/// 5. `ref_idx_l1` (mirror of step 4 for L1).
+/// 6. **`mvd_coding(L0, cpIdx)` for `cpIdx ∈ 0..numCpMv`**
+///    (gated on `MotionModelIdc > 0` / `MotionModelIdc > 1` for the
+///    higher CPs per §7.3.10.5). Per-CP slot `cpIdx >= numCpMv` is
+///    returned as zero (no bins consumed).
+/// 7. **Same per-CP cascade for L1, with `cpIdx == 0` suppressed
+///    under `sym_mvd_flag == 1` per §8.5.2.5** (the §8.5.2.5
+///    derivation infers `MvdL1[0] = -MvdL0[0]`; the higher per-CP
+///    L1 MVDs are read verbatim per the §7.3.10.5 listing — in
+///    practice the affine path excludes SMVD so `cpIdx >= 1` only
+///    fires under `sym_mvd_flag == 0`).
+/// 8. `mvp_l0_flag` via [`LeafCuReader::read_mvp_lx_flag`]
+///    (only when L0 is active).
+/// 9. `mvp_l1_flag` (only when L1 is active).
+///
+/// # Returns
+///
+/// A [`NonMergeInterPreResidualAffineDecision`] whose fields carry the
+/// decoded values OR their §7.4.12.7 inferred defaults. The constructor
+/// [`NonMergeInterPreResidualAffineDecision::new`] is NOT called here
+/// because the dispatcher already populates the per-CP slots in spec
+/// order (with `cpIdx >= numCpMv` left at zero) and emits the
+/// §8.5.2.5 SMVD-L1 derivation for the L1 cpIdx-0 slot when applicable.
+///
+/// # Preconditions
+///
+/// Identical to [`read_non_merge_inter_pre_residual`]. The dispatcher
+/// does NOT consume `cu_skip_flag`, `pred_mode_flag`, or
+/// `general_merge_flag` — those belong to the broader leaf CU walker.
+///
+/// No third-party VVC decoder source was consulted; the implementation
+/// is spec-only and composes the existing per-element reader-side
+/// helpers already shipped in this crate.
+pub fn read_non_merge_inter_pre_residual_affine(
+    reader: &mut LeafCuReader<'_, '_>,
+    affine_gate: &NonMergeInterAffineGate,
+    mvp_gate: &NonMergeMvpSyntaxGate,
+) -> Result<NonMergeInterPreResidualAffineDecision> {
+    // ------------------------------------------------------------------
+    // Step 1 — affine syntax (round-164 dispatcher) drives numCpMv.
+    // ------------------------------------------------------------------
+    let affine = reader.read_non_merge_inter_affine(affine_gate)?;
+    let num_cp = affine.motion_model.num_cp_mv();
+
+    // ------------------------------------------------------------------
+    // Step 2 — inter_pred_idc (§7.3.11.7 B-slice only).
+    // ------------------------------------------------------------------
+    let inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
+        reader.read_inter_pred_idc(mvp_gate.cb_width, mvp_gate.cb_height)?
+    } else {
+        InterPredDir::PredL0
+    };
+
+    // ------------------------------------------------------------------
+    // Step 3 — sym_mvd_flag (§7.3.11.7 SMVD gate). §7.3.11.7 gates SMVD
+    // on `inter_affine_flag == 0`; on the affine path the gate is
+    // closed by construction and the encoder emits no bin.
+    // ------------------------------------------------------------------
+    let sym_mvd_flag = if mvp_gate.sym_mvd_signalled(inter_pred_idc) {
+        reader.read_sym_mvd_flag()?
+    } else {
+        false
+    };
+
+    let l0_active = matches!(inter_pred_idc, InterPredDir::PredL0 | InterPredDir::PredBi);
+    let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);
+
+    // ------------------------------------------------------------------
+    // Step 4 — ref_idx_l0 (§7.3.11.7 per-list).
+    // ------------------------------------------------------------------
+    let ref_idx_l0 = if mvp_gate.ref_idx_l0_signalled(inter_pred_idc, sym_mvd_flag) {
+        reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l0)?
+    } else {
+        0
+    };
+
+    // ------------------------------------------------------------------
+    // Step 5 — ref_idx_l1 (§7.3.11.7 per-list).
+    // ------------------------------------------------------------------
+    let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+        reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)?
+    } else {
+        0
+    };
+
+    // ------------------------------------------------------------------
+    // Step 6 — per-CP mvd_coding for L0.
+    //
+    // §7.3.10.5 listing:
+    //   mvd_coding(x0, y0, 0, 0)
+    //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 0, 1)
+    //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 0, 2)
+    //
+    // Iterates 0..numCpMv on the L0 path when L0 is active. Slots
+    // beyond numCpMv stay at the zero default.
+    // ------------------------------------------------------------------
+    let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+    if l0_active {
+        for slot in mvd_cp_l0.iter_mut().take(num_cp) {
+            *slot = reader.read_mvd_coding()?;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7 — per-CP mvd_coding for L1.
+    //
+    // §7.3.10.5 listing (paraphrased per the spec's pseudocode):
+    //   if (sym_mvd_flag) { MvdL1[0] = -MvdL0[0]; }   // no bin
+    //   else mvd_coding(x0, y0, 1, 0)
+    //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 1, 1)
+    //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 1, 2)
+    //
+    // The spec ONLY suppresses the `cpIdx == 0` L1 MVD under
+    // sym_mvd_flag; the higher-CP L1 MVDs are read verbatim. In
+    // practice the affine path excludes SMVD so `cpIdx >= 1` only
+    // fires under `sym_mvd_flag == 0`. The translational degenerate
+    // (`numCpMv == 1`) with `sym_mvd_flag == 1` carries the §8.5.2.5
+    // -MvdL0 derivation in `mvd_cp_l1[0]` for symmetry with the
+    // round-219 dispatcher (both inferred forms round-trip bit-
+    // identically through the encoder).
+    // ------------------------------------------------------------------
+    let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+    if l1_active {
+        if sym_mvd_flag {
+            // §8.5.2.5 — MvdL1[0] = -MvdL0[0]. The L1 magnitude bounds
+            // match L0 bin-for-bin so the negation is safe at the
+            // spec's signed-18-bit range.
+            mvd_cp_l1[0] = MotionVector {
+                x: -mvd_cp_l0[0].x,
+                y: -mvd_cp_l0[0].y,
+            };
+        } else {
+            mvd_cp_l1[0] = reader.read_mvd_coding()?;
+        }
+        for slot in mvd_cp_l1.iter_mut().take(num_cp).skip(1) {
+            *slot = reader.read_mvd_coding()?;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Step 8 — mvp_l0_flag (§7.3.11.7 per-list).
+    // ------------------------------------------------------------------
+    let mvp_l0_flag = if l0_active {
+        reader.read_mvp_lx_flag()?
+    } else {
+        0
+    };
+
+    // ------------------------------------------------------------------
+    // Step 9 — mvp_l1_flag (§7.3.11.7 per-list).
+    // ------------------------------------------------------------------
+    let mvp_l1_flag = if l1_active {
+        reader.read_mvp_lx_flag()?
+    } else {
+        0
+    };
+
+    let mvp = NonMergeMvpSyntaxDecision {
+        inter_pred_idc,
+        sym_mvd_flag,
+        ref_idx_l0,
+        ref_idx_l1,
+        mvp_l0_flag,
+        mvp_l1_flag,
+    };
+
+    Ok(NonMergeInterPreResidualAffineDecision {
+        affine,
+        mvp,
+        mvd_cp_l0,
+        mvd_cp_l1,
+    })
+}
+
+/// Round-230 — reader-side composite walker variant that ALSO consumes
+/// the §7.3.10.10 AMVR cascade after the §7.3.11.7 affine pre-residual
+/// cascade. Reader twin of
+/// [`crate::non_merge_inter_pre_residual_enc::encode_non_merge_inter_pre_residual_affine_with_amvr`]
+/// (round 213).
+///
+/// Generalises [`read_non_merge_inter_pre_residual_with_amvr`] from the
+/// translational case (one `mvd_coding` per active list) to the full
+/// §7.3.10.5 non-merge inter affine case (`numCpMv` `mvd_coding`
+/// invocations per active list). When the affine pair decodes to
+/// `MotionModel::Translational` the wire layout is bit-identical to
+/// [`read_non_merge_inter_pre_residual_with_amvr`].
+///
+/// Walks the §7.3.11.7 spec listing through step 10:
+///
+/// 1. Steps 1–9 — the pre-AMVR affine cascade via
+///    [`read_non_merge_inter_pre_residual_affine`].
+/// 2. Step 10 — the §7.3.10.10 AMVR cascade via
+///    [`LeafCuReader::read_amvr_inter_gated`].
+///
+/// Returns the pair `(pre_residual, amvr)` where `pre_residual` is the
+/// affine decision (raw post-AMVR `lMvdCpLX[c]` per §7.4.10.10 — the
+/// AMVR shift is signalled separately by the AMVR cascade and applied
+/// to the parsed MVDs externally) and `amvr` packages the recovered
+/// `(amvr_flag, amvr_precision_idx, AmvrShift)` triple as a
+/// [`crate::amvr_enc::AmvrDecision`] for symmetry with the encoder-side
+/// `amvr_decision` parameter.
+///
+/// # Preconditions
+///
+/// * All preconditions of [`read_non_merge_inter_pre_residual_affine`]
+///   apply unchanged.
+/// * `amvr_gate.inter_affine_flag` MUST agree with the
+///   `decision.affine.inter_affine_flag` returned by the pre-residual
+///   dispatcher — the AMVR arm follows the affine flag. The caller
+///   typically builds `amvr_gate` from the same per-CB state the
+///   pre-residual dispatcher recovers.
+/// * Under the affine arm `amvr_gate.any_mvd_cp_l0_l1_nonzero` SHOULD
+///   reflect the non-zero state of the per-CP MVDs the dispatcher
+///   parses (over CPs `0..numCpMv` per list). The encoder's matching
+///   debug-assert pins this.
+pub fn read_non_merge_inter_pre_residual_affine_with_amvr(
+    reader: &mut LeafCuReader<'_, '_>,
+    affine_gate: &NonMergeInterAffineGate,
+    mvp_gate: &NonMergeMvpSyntaxGate,
+    amvr_gate: &crate::leaf_cu::AmvrGate,
+) -> Result<(
+    NonMergeInterPreResidualAffineDecision,
+    crate::amvr_enc::AmvrDecision,
+)> {
+    // Steps 1–9 — the pre-AMVR affine cascade. Identical to round-230.
+    let decision = read_non_merge_inter_pre_residual_affine(reader, affine_gate, mvp_gate)?;
+
+    // The AMVR gate's `inter_affine_flag` is per-CB state the caller
+    // already had at hand; the affine pre-residual dispatcher just
+    // decoded the matching `inter_affine_flag`, so debug-assert the
+    // two agree.
+    debug_assert_eq!(
+        amvr_gate.inter_affine_flag, decision.affine.inter_affine_flag,
+        "amvr_gate.inter_affine_flag must match decision.affine.inter_affine_flag \
+         (got amvr_gate = {}, decision = {})",
+        amvr_gate.inter_affine_flag, decision.affine.inter_affine_flag,
+    );
+
+    // Step 10 — the §7.3.10.10 AMVR cascade.
+    let (amvr_flag, amvr_precision_idx, shift) = reader.read_amvr_inter_gated(amvr_gate)?;
+    let amvr = crate::amvr_enc::AmvrDecision {
+        amvr_flag,
+        amvr_precision_idx,
+        shift,
+    };
+    Ok((decision, amvr))
+}
+
+/// Round-230 — reader-side composite walker variant that ALSO consumes
+/// the §7.3.10.5 `bcw_idx[x0][y0]` cascade after the §7.3.10.10 AMVR
+/// step on the affine path. Reader twin of
+/// [`crate::non_merge_inter_pre_residual_enc::encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw`]
+/// (round 213).
+///
+/// Generalises [`read_non_merge_inter_pre_residual_with_amvr_and_bcw`]
+/// from the translational case to the full §7.3.10.5 non-merge inter
+/// affine case (`numCpMv` `mvd_coding` invocations per active list).
+/// When the affine pair decodes to `MotionModel::Translational` the
+/// wire layout is bit-identical to
+/// [`read_non_merge_inter_pre_residual_with_amvr_and_bcw`].
+///
+/// Walks the §7.3.11.7 / §7.3.10.5 spec listing through step 11:
+///
+/// 1. Steps 1–9 — the pre-AMVR affine cascade via
+///    [`read_non_merge_inter_pre_residual_affine`].
+/// 2. Step 10 — the §7.3.10.10 AMVR cascade via
+///    [`LeafCuReader::read_amvr_inter_gated`].
+/// 3. Step 11 — the §7.3.10.5 BCW cascade via
+///    [`LeafCuReader::read_bcw_idx_gated`].
+///
+/// Returns the triple `(pre_residual, amvr, bcw_idx)`. The `bcw_idx`
+/// is the raw `bcw_idx[x0][y0]` value the encoder placed on the wire
+/// (when the gate was open) or the §7.4.12.5 inferred default `0`
+/// (when the gate was closed).
+///
+/// # Preconditions
+///
+/// All preconditions of
+/// [`read_non_merge_inter_pre_residual_affine_with_amvr`] apply
+/// unchanged. Additionally:
+///
+/// * `bcw_gate.cb_width` / `bcw_gate.cb_height` SHOULD match the
+///   `affine_gate.cb_width` / `affine_gate.cb_height` (same CU). The
+///   dispatcher debug-asserts this.
+/// * `bcw_gate.inter_pred_idc` MUST match the inter_pred_idc the
+///   affine pre-residual dispatcher resolved (i.e.
+///   `decision.mvp.inter_pred_idc` for B-slices, or the
+///   `PRED_L0` inferred default for P-slices). The dispatcher
+///   debug-asserts this.
+pub fn read_non_merge_inter_pre_residual_affine_with_amvr_and_bcw(
+    reader: &mut LeafCuReader<'_, '_>,
+    affine_gate: &NonMergeInterAffineGate,
+    mvp_gate: &NonMergeMvpSyntaxGate,
+    amvr_gate: &crate::leaf_cu::AmvrGate,
+    bcw_gate: &crate::leaf_cu::BcwIdxGate,
+) -> Result<(
+    NonMergeInterPreResidualAffineDecision,
+    crate::amvr_enc::AmvrDecision,
+    u32,
+)> {
+    debug_assert_eq!(
+        bcw_gate.cb_width, affine_gate.cb_width,
+        "bcw_gate.cb_width must match affine_gate.cb_width (same CU)"
+    );
+    debug_assert_eq!(
+        bcw_gate.cb_height, affine_gate.cb_height,
+        "bcw_gate.cb_height must match affine_gate.cb_height (same CU)"
+    );
+
+    // Steps 1–10 — the pre-BCW affine cascade. Identical to the
+    // `_with_amvr` composite above.
+    let (decision, amvr) = read_non_merge_inter_pre_residual_affine_with_amvr(
+        reader,
+        affine_gate,
+        mvp_gate,
+        amvr_gate,
+    )?;
 
     // The §7.3.11.7 outer gate resolves inter_pred_idc to PRED_L0 in
     // P-slices (§7.4.12.7 inference) and to the decoded value in
@@ -1472,6 +1871,692 @@ mod tests {
         assert!(rec_amvr.amvr_flag);
         assert_eq!(rec_amvr.amvr_precision_idx, 1);
         assert_eq!(rec_amvr.shift, AmvrShift(4));
+        assert_eq!(rec_bcw, 0);
+    }
+
+    // ==================================================================
+    // Round-230 — reader-side affine composite dispatcher tests.
+    //
+    // The encoder dispatchers
+    // `encode_non_merge_inter_pre_residual_affine`               (round 207),
+    // `encode_non_merge_inter_pre_residual_affine_with_amvr`     (round 213),
+    // `encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw`
+    //                                                            (round 213)
+    // drive the cascade end-to-end across multi-CP-MV affine MVDs and
+    // the round-230 reader composites recover the same `(decision,
+    // amvr, bcw_idx)` triples. Round-trip tests mirror the encoder-side
+    // test set on both affine arms (4-param numCpMv = 2; 6-param
+    // numCpMv = 3) and degenerate to the round 219 / 224 wire under
+    // `MotionModel::Translational`.
+    // ==================================================================
+
+    use crate::non_merge_inter_pre_residual_enc::{
+        encode_non_merge_inter_pre_residual_affine,
+        encode_non_merge_inter_pre_residual_affine_with_amvr,
+        encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw,
+        NonMergeInterPreResidualAffineDecision,
+    };
+
+    fn affine_gate_on() -> NonMergeInterAffineGate {
+        NonMergeInterAffineGate {
+            sps_affine_enabled: true,
+            sps_6param_affine_enabled: true,
+            cb_width: 16,
+            cb_height: 16,
+            ..Default::default()
+        }
+    }
+
+    /// Drive the round-207 encoder dispatcher and recover through the
+    /// round-230 reader composite. Returns the recovered affine
+    /// decision.
+    fn round_trip_affine_via_encoder(
+        init_type: u8,
+        affine_gate: &NonMergeInterAffineGate,
+        mvp_gate: &NonMergeMvpSyntaxGate,
+        decision: &NonMergeInterPreResidualAffineDecision,
+    ) -> NonMergeInterPreResidualAffineDecision {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_non_merge_inter_pre_residual_affine(
+            &mut enc,
+            &mut enc_ctxs,
+            affine_gate,
+            mvp_gate,
+            decision,
+        )
+        .expect("encoder affine dispatcher accepts a valid decision");
+        enc.encode_terminate(1).expect("terminator");
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 64]);
+        let mut dec = ArithDecoder::new(&padded).expect("decoder accepts the encoded stream");
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        read_non_merge_inter_pre_residual_affine(&mut reader, affine_gate, mvp_gate)
+            .expect("reader affine dispatcher accepts the encoded stream")
+    }
+
+    /// Drive the round-213 encoder dispatcher and recover through the
+    /// round-230 reader composite. Returns the `(decision, amvr)` pair
+    /// the reader produced.
+    fn round_trip_affine_via_encoder_with_amvr(
+        init_type: u8,
+        affine_gate: &NonMergeInterAffineGate,
+        mvp_gate: &NonMergeMvpSyntaxGate,
+        amvr_gate: &AmvrGate,
+        decision: &NonMergeInterPreResidualAffineDecision,
+        amvr_decision: &AmvrDecision,
+    ) -> (NonMergeInterPreResidualAffineDecision, AmvrDecision) {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_non_merge_inter_pre_residual_affine_with_amvr(
+            &mut enc,
+            &mut enc_ctxs,
+            affine_gate,
+            mvp_gate,
+            amvr_gate,
+            decision,
+            amvr_decision,
+        )
+        .expect("encoder affine _with_amvr dispatcher accepts a valid decision");
+        enc.encode_terminate(1).expect("terminator");
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 64]);
+        let mut dec = ArithDecoder::new(&padded).expect("decoder accepts the encoded stream");
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        read_non_merge_inter_pre_residual_affine_with_amvr(
+            &mut reader,
+            affine_gate,
+            mvp_gate,
+            amvr_gate,
+        )
+        .expect("reader affine _with_amvr dispatcher accepts the encoded stream")
+    }
+
+    /// Drive the round-213 encoder dispatcher and recover through the
+    /// round-230 reader composite. Returns the `(decision, amvr,
+    /// bcw_idx)` triple the reader produced.
+    #[allow(clippy::too_many_arguments)]
+    fn round_trip_affine_via_encoder_with_amvr_and_bcw(
+        init_type: u8,
+        affine_gate: &NonMergeInterAffineGate,
+        mvp_gate: &NonMergeMvpSyntaxGate,
+        amvr_gate: &AmvrGate,
+        bcw_gate: &BcwIdxGate,
+        decision: &NonMergeInterPreResidualAffineDecision,
+        amvr_decision: &AmvrDecision,
+        bcw_idx_value: u32,
+    ) -> (NonMergeInterPreResidualAffineDecision, AmvrDecision, u32) {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw(
+            &mut enc,
+            &mut enc_ctxs,
+            affine_gate,
+            mvp_gate,
+            amvr_gate,
+            bcw_gate,
+            decision,
+            amvr_decision,
+            bcw_idx_value,
+        )
+        .expect("encoder affine _with_amvr_and_bcw dispatcher accepts a valid decision");
+        enc.encode_terminate(1).expect("terminator");
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 64]);
+        let mut dec = ArithDecoder::new(&padded).expect("decoder accepts the encoded stream");
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        read_non_merge_inter_pre_residual_affine_with_amvr_and_bcw(
+            &mut reader,
+            affine_gate,
+            mvp_gate,
+            amvr_gate,
+            bcw_gate,
+        )
+        .expect("reader affine _with_amvr_and_bcw dispatcher accepts the encoded stream")
+    }
+
+    // -------- Round-230: affine (no AMVR / BCW) round-trips -----------
+
+    #[test]
+    fn round230_affine_translational_degenerates_to_round219() {
+        // numCpMv == 1: the per-CP cascade reduces to one mvd_coding
+        // per active list — round-trip output matches the translational
+        // round-219 path.
+        let affine_gate = affine_gate_off();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 5, y: -3 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 1);
+        for init_type in [1u8, 2u8] {
+            let rec = round_trip_affine_via_encoder(init_type, &affine_gate, &mvp_gate, &decision);
+            assert_eq!(
+                rec.affine.motion_model,
+                crate::affine::MotionModel::Translational
+            );
+            assert_eq!(rec.mvd_cp_l0[0], MotionVector { x: 5, y: -3 });
+            assert_eq!(rec.mvd_cp_l0[1], MotionVector { x: 0, y: 0 });
+            assert_eq!(rec.mvd_cp_l0[2], MotionVector { x: 0, y: 0 });
+            assert_eq!(rec.mvd_cp_l1, [MotionVector { x: 0, y: 0 }; 3]);
+            assert_eq!(rec.mvp.ref_idx_l0, 1);
+            assert_eq!(rec.mvp.mvp_l0_flag, 1);
+        }
+    }
+
+    #[test]
+    fn round230_affine4param_p_slice_l0_round_trip() {
+        // 4-param affine ⇒ numCpMv == 2. P-slice ⇒ L0-only.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        assert_eq!(
+            affine.motion_model,
+            crate::affine::MotionModel::Affine4Param
+        );
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: -1 },
+            MotionVector { x: -2, y: 7 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 2);
+        for init_type in [1u8, 2u8] {
+            let rec = round_trip_affine_via_encoder(init_type, &affine_gate, &mvp_gate, &decision);
+            assert_eq!(
+                rec.affine.motion_model,
+                crate::affine::MotionModel::Affine4Param
+            );
+            assert!(rec.affine.inter_affine_flag);
+            assert!(!rec.affine.cu_affine_type_flag);
+            assert_eq!(rec.mvd_cp_l0[0], MotionVector { x: 4, y: -1 });
+            assert_eq!(rec.mvd_cp_l0[1], MotionVector { x: -2, y: 7 });
+            // CP[2] not read on the wire under numCpMv == 2.
+            assert_eq!(rec.mvd_cp_l0[2], MotionVector { x: 0, y: 0 });
+            assert_eq!(rec.mvp.ref_idx_l0, 1);
+            assert_eq!(rec.mvp.mvp_l0_flag, 1);
+        }
+    }
+
+    #[test]
+    fn round230_affine6param_p_slice_l0_round_trip() {
+        // 6-param affine ⇒ numCpMv == 3. P-slice ⇒ L0-only.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, true);
+        assert_eq!(
+            affine.motion_model,
+            crate::affine::MotionModel::Affine6Param
+        );
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 0, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: -1 },
+            MotionVector { x: -2, y: 7 },
+            MotionVector { x: 11, y: -11 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 3);
+        for init_type in [1u8, 2u8] {
+            let rec = round_trip_affine_via_encoder(init_type, &affine_gate, &mvp_gate, &decision);
+            assert_eq!(
+                rec.affine.motion_model,
+                crate::affine::MotionModel::Affine6Param
+            );
+            assert!(rec.affine.inter_affine_flag);
+            assert!(rec.affine.cu_affine_type_flag);
+            assert_eq!(rec.mvd_cp_l0, mvd_cp_l0);
+            assert_eq!(rec.mvp.ref_idx_l0, 1);
+        }
+    }
+
+    #[test]
+    fn round230_affine4param_b_slice_pred_bi_round_trip() {
+        // 4-param affine + B-slice PRED_BI ⇒ 2 CPs × 2 lists = 4
+        // mvd_coding invocations.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 1, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 3, y: -3 },
+            MotionVector { x: 1, y: 2 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: -8, y: 8 },
+            MotionVector { x: -1, y: -2 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 2);
+        for init_type in [1u8, 2u8] {
+            let rec = round_trip_affine_via_encoder(init_type, &affine_gate, &mvp_gate, &decision);
+            assert_eq!(
+                rec.affine.motion_model,
+                crate::affine::MotionModel::Affine4Param
+            );
+            assert_eq!(rec.mvp.inter_pred_idc, InterPredDir::PredBi);
+            assert!(!rec.mvp.sym_mvd_flag);
+            assert_eq!(rec.mvd_cp_l0[0], MotionVector { x: 3, y: -3 });
+            assert_eq!(rec.mvd_cp_l0[1], MotionVector { x: 1, y: 2 });
+            assert_eq!(rec.mvd_cp_l0[2], MotionVector { x: 0, y: 0 });
+            assert_eq!(rec.mvd_cp_l1[0], MotionVector { x: -8, y: 8 });
+            assert_eq!(rec.mvd_cp_l1[1], MotionVector { x: -1, y: -2 });
+            assert_eq!(rec.mvd_cp_l1[2], MotionVector { x: 0, y: 0 });
+            assert_eq!(rec.mvp.ref_idx_l0, 1);
+            assert_eq!(rec.mvp.ref_idx_l1, 1);
+            assert_eq!(rec.mvp.mvp_l0_flag, 1);
+            assert_eq!(rec.mvp.mvp_l1_flag, 0);
+        }
+    }
+
+    #[test]
+    fn round230_affine6param_b_slice_pred_l1_round_trip() {
+        // 6-param affine + B-slice PRED_L1 ⇒ 3 CPs × 1 list.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let affine = make_non_merge_inter_affine_decision(true, true);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL1, false, 0, 1, 0, 1);
+        let mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        let mvd_cp_l1 = [
+            MotionVector { x: 7, y: -2 },
+            MotionVector { x: 3, y: 5 },
+            MotionVector { x: -4, y: -6 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        assert_eq!(decision.num_cp_mv(), 3);
+        let rec = round_trip_affine_via_encoder(2, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(rec.mvp.inter_pred_idc, InterPredDir::PredL1);
+        assert_eq!(rec.mvd_cp_l0, [MotionVector { x: 0, y: 0 }; 3]);
+        assert_eq!(rec.mvd_cp_l1, mvd_cp_l1);
+        assert_eq!(rec.mvp.ref_idx_l1, 1);
+        assert_eq!(rec.mvp.mvp_l1_flag, 1);
+    }
+
+    #[test]
+    fn round230_affine_translational_smvd_round_trip_fills_inferred_l1_mvd() {
+        // Translational + SMVD: the L1 cpIdx-0 MVD is suppressed on the
+        // wire and the dispatcher fills it with the §8.5.2.5 derivation
+        // `-MvdL0[0]`. The higher CP slots stay at zero (numCpMv == 1).
+        let affine_gate = affine_gate_off();
+        let mvp_gate = b_slice_gate_smvd();
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, true, 0, 0, 1, 1);
+        let l0_cp0 = MotionVector { x: 9, y: -5 };
+        let mvd_cp_l0 = [
+            l0_cp0,
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        // The constructor clamps mvd_cp_l1[0] to zero on SMVD; the
+        // encoder's debug-assert accepts zero or `-mvd_cp_l0[0]`.
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        for init_type in [1u8, 2u8] {
+            let rec = round_trip_affine_via_encoder(init_type, &affine_gate, &mvp_gate, &decision);
+            assert!(rec.mvp.sym_mvd_flag);
+            assert_eq!(rec.mvd_cp_l0[0], l0_cp0);
+            assert_eq!(
+                rec.mvd_cp_l1[0],
+                MotionVector {
+                    x: -l0_cp0.x,
+                    y: -l0_cp0.y,
+                }
+            );
+            assert_eq!(rec.mvd_cp_l1[1], MotionVector { x: 0, y: 0 });
+            assert_eq!(rec.mvd_cp_l1[2], MotionVector { x: 0, y: 0 });
+        }
+    }
+
+    // -------- Round-230: affine + AMVR round-trips --------------------
+
+    #[test]
+    fn round230_affine_with_amvr_translational_degenerates_to_round224() {
+        // Translational + AMVR open (regular arm, prec = 2 → shift 6).
+        let affine_gate = affine_gate_off();
+        let mvp_gate = p_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: false,
+            inter_affine_flag: false,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 5, y: -3 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::new(true, 2, false);
+        for init_type in [1u8, 2u8] {
+            let (rec_dec, rec_amvr) = round_trip_affine_via_encoder_with_amvr(
+                init_type,
+                &affine_gate,
+                &mvp_gate,
+                &amvr_gate,
+                &decision,
+                &amvr_decision,
+            );
+            assert_eq!(
+                rec_dec.affine.motion_model,
+                crate::affine::MotionModel::Translational
+            );
+            assert_eq!(rec_dec.mvd_cp_l0[0], MotionVector { x: 5, y: -3 });
+            assert!(rec_amvr.amvr_flag);
+            assert_eq!(rec_amvr.amvr_precision_idx, 2);
+            assert_eq!(rec_amvr.shift, AmvrShift(6));
+        }
+    }
+
+    #[test]
+    fn round230_affine_with_amvr_4param_open_round_trip() {
+        // 4-param affine ⇒ AMVR follows the affine arm. prec = 1 →
+        // affine shift (1/16-luma steps per Table 16).
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: false,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: false,
+            any_mvd_cp_l0_l1_nonzero: true,
+        };
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 2, y: -1 },
+            MotionVector { x: 1, y: 1 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::new(true, 1, true);
+        for init_type in [1u8, 2u8] {
+            let (rec_dec, rec_amvr) = round_trip_affine_via_encoder_with_amvr(
+                init_type,
+                &affine_gate,
+                &mvp_gate,
+                &amvr_gate,
+                &decision,
+                &amvr_decision,
+            );
+            assert_eq!(
+                rec_dec.affine.motion_model,
+                crate::affine::MotionModel::Affine4Param
+            );
+            assert_eq!(rec_dec.mvd_cp_l0[0], MotionVector { x: 2, y: -1 });
+            assert_eq!(rec_dec.mvd_cp_l0[1], MotionVector { x: 1, y: 1 });
+            assert!(rec_amvr.amvr_flag);
+            assert_eq!(rec_amvr.amvr_precision_idx, 1);
+            assert_eq!(rec_amvr.shift, amvr_decision.shift);
+        }
+    }
+
+    #[test]
+    fn round230_affine_with_amvr_4param_amvr_closed_round_trip() {
+        // 4-param affine with all-zero MVDs ⇒ AMVR outer gate closed,
+        // §7.4.12.7 inference fires.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = p_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: false,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: false,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        assert!(!amvr_gate.is_open());
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::default_inferred();
+        for init_type in [1u8, 2u8] {
+            let (rec_dec, rec_amvr) = round_trip_affine_via_encoder_with_amvr(
+                init_type,
+                &affine_gate,
+                &mvp_gate,
+                &amvr_gate,
+                &decision,
+                &amvr_decision,
+            );
+            assert_eq!(
+                rec_dec.affine.motion_model,
+                crate::affine::MotionModel::Affine4Param
+            );
+            assert_eq!(rec_dec.mvd_cp_l0, [MotionVector { x: 0, y: 0 }; 3]);
+            assert!(!rec_amvr.amvr_flag);
+            assert_eq!(rec_amvr.amvr_precision_idx, 0);
+        }
+    }
+
+    #[test]
+    fn round230_affine_with_amvr_6param_b_slice_pred_bi_round_trip() {
+        // 6-param affine + B-slice PRED_BI + AMVR open (prec = 0).
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: false,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: false,
+            any_mvd_cp_l0_l1_nonzero: true,
+        };
+        let affine = make_non_merge_inter_affine_decision(true, true);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 1, 1, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 3, y: -3 },
+            MotionVector { x: 1, y: 2 },
+            MotionVector { x: 0, y: 1 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: -8, y: 8 },
+            MotionVector { x: -1, y: -2 },
+            MotionVector { x: -3, y: -4 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::new(true, 0, true);
+        let (rec_dec, rec_amvr) = round_trip_affine_via_encoder_with_amvr(
+            1,
+            &affine_gate,
+            &mvp_gate,
+            &amvr_gate,
+            &decision,
+            &amvr_decision,
+        );
+        assert_eq!(
+            rec_dec.affine.motion_model,
+            crate::affine::MotionModel::Affine6Param
+        );
+        assert_eq!(rec_dec.mvp.inter_pred_idc, InterPredDir::PredBi);
+        assert_eq!(rec_dec.mvd_cp_l0, mvd_cp_l0);
+        assert_eq!(rec_dec.mvd_cp_l1, mvd_cp_l1);
+        assert!(rec_amvr.amvr_flag);
+        assert_eq!(rec_amvr.amvr_precision_idx, 0);
+    }
+
+    // -------- Round-230: affine + AMVR + BCW round-trips --------------
+
+    #[test]
+    fn round230_affine_with_amvr_and_bcw_translational_degenerates_to_round224() {
+        // Translational + B-slice PRED_BI with both AMVR and BCW open.
+        // Bit-identical to the round-224 `_with_amvr_and_bcw` composite.
+        let affine_gate = affine_gate_off();
+        let mvp_gate = b_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: true,
+            sps_affine_amvr_enabled: false,
+            inter_affine_flag: false,
+            any_mvd_l0_l1_nonzero: true,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        let bcw_gate = open_bcw_gate_for_b_pred_bi();
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 1, 0, 1);
+        let mvd_cp_l0 = [
+            MotionVector { x: 4, y: 4 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: -4, y: -4 },
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::new(true, 2, false);
+        for init_type in [1u8, 2u8] {
+            let (rec_dec, rec_amvr, rec_bcw) = round_trip_affine_via_encoder_with_amvr_and_bcw(
+                init_type,
+                &affine_gate,
+                &mvp_gate,
+                &amvr_gate,
+                &bcw_gate,
+                &decision,
+                &amvr_decision,
+                1,
+            );
+            assert_eq!(
+                rec_dec.affine.motion_model,
+                crate::affine::MotionModel::Translational
+            );
+            assert_eq!(rec_dec.mvd_cp_l0[0], MotionVector { x: 4, y: 4 });
+            assert_eq!(rec_dec.mvd_cp_l1[0], MotionVector { x: -4, y: -4 });
+            assert!(rec_amvr.amvr_flag);
+            assert_eq!(rec_amvr.shift, AmvrShift(6));
+            assert_eq!(rec_bcw, 1);
+        }
+    }
+
+    #[test]
+    fn round230_affine_with_amvr_and_bcw_4param_b_slice_pred_bi_all_bcw_values_round_trip() {
+        // 4-param affine + B-slice PRED_BI + BCW open (cMax = 2). AMVR
+        // open via per-CP MVD non-zero with prec = 1.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: false,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: false,
+            any_mvd_cp_l0_l1_nonzero: true,
+        };
+        let bcw_gate = open_bcw_gate_for_b_pred_bi();
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [
+            MotionVector { x: 1, y: 1 },
+            MotionVector { x: 2, y: 2 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let mvd_cp_l1 = [
+            MotionVector { x: -1, y: -1 },
+            MotionVector { x: -2, y: -2 },
+            MotionVector { x: 0, y: 0 },
+        ];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::new(true, 1, true);
+        for bcw_idx_value in 0u32..=2u32 {
+            let (rec_dec, rec_amvr, rec_bcw) = round_trip_affine_via_encoder_with_amvr_and_bcw(
+                1,
+                &affine_gate,
+                &mvp_gate,
+                &amvr_gate,
+                &bcw_gate,
+                &decision,
+                &amvr_decision,
+                bcw_idx_value,
+            );
+            assert_eq!(
+                rec_dec.affine.motion_model,
+                crate::affine::MotionModel::Affine4Param
+            );
+            assert_eq!(rec_dec.mvd_cp_l0[0], MotionVector { x: 1, y: 1 });
+            assert_eq!(rec_dec.mvd_cp_l0[1], MotionVector { x: 2, y: 2 });
+            assert_eq!(rec_dec.mvd_cp_l1[0], MotionVector { x: -1, y: -1 });
+            assert_eq!(rec_dec.mvd_cp_l1[1], MotionVector { x: -2, y: -2 });
+            assert!(rec_amvr.amvr_flag);
+            assert_eq!(rec_amvr.amvr_precision_idx, 1);
+            assert_eq!(rec_bcw, bcw_idx_value);
+        }
+    }
+
+    #[test]
+    fn round230_affine_with_amvr_and_bcw_6param_b_slice_amvr_closed_bcw_closed_round_trip() {
+        // 6-param affine + B-slice PRED_BI but BCW gate closed by
+        // `luma_weight_l1_flag = true`. AMVR also closed via all-zero
+        // per-CP MVDs.
+        let affine_gate = affine_gate_on();
+        let mvp_gate = b_slice_gate();
+        let amvr_gate = AmvrGate {
+            sps_amvr_enabled: false,
+            sps_affine_amvr_enabled: true,
+            inter_affine_flag: true,
+            any_mvd_l0_l1_nonzero: false,
+            any_mvd_cp_l0_l1_nonzero: false,
+        };
+        let bcw_gate = BcwIdxGate {
+            sps_bcw_enabled: true,
+            inter_pred_idc: Some(InterPredDir::PredBi),
+            luma_weight_l1_flag: true,
+            cb_width: 16,
+            cb_height: 16,
+            ..Default::default()
+        };
+        assert!(!bcw_gate.is_open());
+        let affine = make_non_merge_inter_affine_decision(true, true);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 0, 0, 0, 0);
+        let mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        let mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+        let decision =
+            NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp_l0, mvd_cp_l1);
+        let amvr_decision = AmvrDecision::default_inferred();
+        let (rec_dec, rec_amvr, rec_bcw) = round_trip_affine_via_encoder_with_amvr_and_bcw(
+            1,
+            &affine_gate,
+            &mvp_gate,
+            &amvr_gate,
+            &bcw_gate,
+            &decision,
+            &amvr_decision,
+            0,
+        );
+        assert_eq!(
+            rec_dec.affine.motion_model,
+            crate::affine::MotionModel::Affine6Param
+        );
+        assert!(!rec_amvr.amvr_flag);
         assert_eq!(rec_bcw, 0);
     }
 }

@@ -1512,6 +1512,52 @@ cascade (steps 1–11 — pre-residual + AMVR + BCW); the residual tree
 the next milestone (the encoder side still needs to ship before the
 reader-side composite can land).
 
+**Round-230 mirrors the round-207 / round-213 affine encoder
+dispatchers on the reader side.** Three new public entry points in
+the `non_merge_inter_pre_residual_dec` module —
+[`read_non_merge_inter_pre_residual_affine`](src/non_merge_inter_pre_residual_dec.rs),
+[`read_non_merge_inter_pre_residual_affine_with_amvr`](src/non_merge_inter_pre_residual_dec.rs),
+and
+[`read_non_merge_inter_pre_residual_affine_with_amvr_and_bcw`](src/non_merge_inter_pre_residual_dec.rs)
+— generalise the round 219 / 224 reader twins from the translational
+case (one `mvd_coding` per active list, `numCpMv == 1`) to the full
+§7.3.10.5 non-merge inter affine case (`numCpMv` `mvd_coding`
+invocations per active list, in `cpIdx = 0, 1, 2` order). The
+dispatchers walk §7.3.11.7 + §7.3.10.5 spec order, fully mirroring
+the round-207 `encode_non_merge_inter_pre_residual_affine` /
+round-213 `encode_non_merge_inter_pre_residual_affine_with_amvr` /
+round-213 `encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw`
+encoder dispatchers. Step 1's affine syntax decode (the round-164
+composite reader) drives the §8.5.5.2 eq. 160 `MotionModelIdc`
+derivation; `numCpMv = MotionModelIdc + 1` per §8.5.5.5 then gates
+the per-CP cascade reads in step 6 (L0) and step 7 (L1). The
+§8.5.2.5 `MvdL1[0] = -MvdL0[0]` derivation is folded for the
+translational degenerate of the SMVD path (the affine path itself
+excludes SMVD per §7.3.11.7). The reader returns
+[`NonMergeInterPreResidualAffineDecision`](src/non_merge_inter_pre_residual_enc.rs)
+where the per-CP MVD arrays carry the decoded values in slots
+`[0..numCpMv]` and zero in slots `[numCpMv..3]`. The `_with_amvr`
+variant additionally returns the §7.3.10.10 `AmvrDecision` triple
+(`amvr_flag`, `amvr_precision_idx`, Table 16 `AmvrShift`); the
+`_with_amvr_and_bcw` variant returns the §7.3.10.5 `bcw_idx` value
+on top. 13 new lib tests pin the dispatchers end-to-end against the
+round 207 / 213 encoder dispatchers: translational degenerate
+(round-trip wire-identical to the round 219 path), 4-param affine
+(`numCpMv = 2`) on P-slice L0-only with both non-I initTypes,
+6-param affine (`numCpMv = 3`) on P-slice L0-only, 4-param affine on
+B-slice PRED_BI exhaustively across L0 + L1 CPs, 6-param affine on
+B-slice PRED_L1, translational SMVD path with the `-MvdL0[0]`
+inference for the L1 cpIdx-0 slot, the four `_with_amvr` variants
+(translational degenerate, 4-param affine-arm open, 4-param
+affine-arm AMVR-closed-via-zero-MVDs, 6-param affine-arm B-slice
+PRED_BI), and the three `_with_amvr_and_bcw` variants
+(translational degenerate, 4-param affine + BCW exhaustive across
+`cMax = 2` with AMVR open, 6-param affine with both AMVR and BCW
+gates closed). With this round the reader and encoder dispatcher
+families are complete mirrors of each other across the full
+§7.3.10.5 non-merge inter affine path (steps 1–11 — pre-residual +
+AMVR + BCW with per-CP MVD support).
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec
