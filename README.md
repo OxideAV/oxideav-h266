@@ -1558,6 +1558,38 @@ families are complete mirrors of each other across the full
 §7.3.10.5 non-merge inter affine path (steps 1–11 — pre-residual +
 AMVR + BCW with per-CP MVD support).
 
+**Round-233 lands a decomposed `mvd_coding()` body parser on top of
+the round-187 packed walker.** A new public
+[`MvdCodingDecision`](src/mvd_coding_enc.rs) struct exposes the
+eight raw §7.3.10.10 syntax elements — `abs_mvd_greater0_flag` × 2,
+`abs_mvd_greater1_flag` × 2, `abs_mvd_minus2` × 2, `mvd_sign_flag`
+× 2 — instead of the post-eq.-190 fold into a `MotionVector`. The
+[`from_motion_vector`](src/mvd_coding_enc.rs) constructor walks the
+encoder-side decomposition (`greater0 = lMvd != 0`, `greater1 =
+|lMvd| > 1`, `abs_mvd_minus2 = |lMvd| - 2` when meaningful, `sign =
+lMvd < 0`); [`to_motion_vector`](src/mvd_coding_enc.rs) re-folds via
+eq. 190 honouring the §7.4.10.10 inferred slots (greater1 == 0
+collapses the magnitude to 1; greater0 == 0 collapses everything to
+zero). Two new public walkers consume / produce the struct directly:
+[`encode_mvd_coding_decomposed`](src/mvd_coding_enc.rs) is the
+encoder mirror of the new
+[`LeafCuReader::read_mvd_coding_decomposed`](src/leaf_cu.rs)
+reader; both emit / consume the exact same bin sequence the
+round-187 packed `encode_mvd_coding`-on-`MotionVector` walker uses,
+so the per-bin layout is now inspectable by external consumers
+without re-implementing the §7.3.10.10 bin order. 12 new lib tests
+pin the body parser: zero-pair / unit / mixed-zero / large-magnitude
+round trips up to the §9.3.3.6 EGk cap at `|lMvd| = 2^17 - 1` for
+both non-I initTypes; a `parity_decomposed_and_packed_emit_identical_bitstreams`
+test asserts the two encoders produce byte-identical wires across a
+12-pair grid plus the EGk-boundary points; cross-path tests pin the
+encoder ↔ reader equivalences (packed encoder wire decodes through
+the decomposed reader, and decomposed encoder wire decodes through
+the packed reader, both back to the original `(x, y)` pair). The
+decomposed walker is the natural entry point for a trace-replay
+harness or a bin-level rate-distortion scan that holds an explicit
+per-bin candidate set rather than a packed `MotionVector`.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

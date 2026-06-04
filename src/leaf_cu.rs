@@ -1955,6 +1955,102 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         })
     }
 
+    /// Round-233 — decode one `mvd_coding(x0, y0, refList, cpIdx)`
+    /// structure (§7.3.10.10) and return the underlying syntax
+    /// elements explicitly as a
+    /// [`crate::mvd_coding_enc::MvdCodingDecision`].
+    ///
+    /// Functionally equivalent to [`Self::read_mvd_coding`]: the
+    /// reader walks the same bin sequence per §7.3.10.10, but the
+    /// returned struct carries the eight underlying syntax elements
+    /// directly (`abs_mvd_greater0_flag` × 2, `abs_mvd_greater1_flag`
+    /// × 2, `abs_mvd_minus2` × 2, `mvd_sign_flag` × 2) instead of the
+    /// post-eq.-190 fold into a `MotionVector`. The eq. 190 fold is
+    /// recoverable via
+    /// [`crate::mvd_coding_enc::MvdCodingDecision::to_motion_vector`].
+    ///
+    /// Mirror of
+    /// [`crate::mvd_coding_enc::encode_mvd_coding_decomposed`] — the
+    /// wire produced by that encoder round-trips through this reader
+    /// bit-identically, including the §7.4.10.10 inferred slots
+    /// (`abs_mvd_greater1_flag` / `mvd_sign_flag` left at `false` and
+    /// `abs_mvd_minus2` left at `0` when the corresponding `greater0`
+    /// flag is `false`, or when greater1 == 0 leaves `abs_mvd_minus2`
+    /// inferred).
+    ///
+    /// # Returns
+    ///
+    /// A [`crate::mvd_coding_enc::MvdCodingDecision`] populated per the
+    /// §7.3.10.10 bin order:
+    ///
+    ///   1. `abs_mvd_greater0_flag[0]`, `abs_mvd_greater0_flag[1]`
+    ///      — both ctx-coded against Table 110 slot `init_type`,
+    ///      `ctxInc = 0`.
+    ///   2. for each component with `greater0[c] == 1`:
+    ///      `abs_mvd_greater1_flag[c]` — ctx-coded against Table 111,
+    ///      ctxInc 0.
+    ///   3. for each component with `greater0[c] == 1`:
+    ///      `abs_mvd_minus2[c]` (only when `greater1[c] == 1`,
+    ///      §9.3.3.6 bypass limited-EGk) then `mvd_sign_flag[c]`
+    ///      (bypass FL `cMax = 1`).
+    ///
+    /// Components with `greater0[c] == 0` leave the corresponding
+    /// `abs_mvd_greater1_flag[c]` / `mvd_sign_flag[c]` slots `false`
+    /// and `abs_mvd_minus2[c]` slot `0` per §7.4.10.10 inference;
+    /// components with `greater0[c] == 1 && greater1[c] == 0` leave
+    /// `abs_mvd_minus2[c]` at `0` per the same inference (the eq. 190
+    /// fold collapses the magnitude to `1` in that case).
+    pub fn read_mvd_coding_decomposed(
+        &mut self,
+    ) -> Result<crate::mvd_coding_enc::MvdCodingDecision> {
+        let init_type = self.ctxs.init_type as usize;
+        let g0n = self.ctxs.abs_mvd_greater0_flag.len() - 1;
+        let g1n = self.ctxs.abs_mvd_greater1_flag.len() - 1;
+        let g0_slot = (init_type + ctx_inc_abs_mvd_greater0_flag() as usize).min(g0n);
+        let g1_slot = (init_type + ctx_inc_abs_mvd_greater1_flag() as usize).min(g1n);
+
+        // Step 1: both greater0 flags, components 0 then 1.
+        let greater0 = [
+            self.dec
+                .decode_decision(&mut self.ctxs.abs_mvd_greater0_flag[g0_slot])?
+                == 1,
+            self.dec
+                .decode_decision(&mut self.ctxs.abs_mvd_greater0_flag[g0_slot])?
+                == 1,
+        ];
+
+        // Step 2: greater1 flag per component that was non-zero.
+        let mut greater1 = [false; 2];
+        for c in 0..2 {
+            if greater0[c] {
+                greater1[c] = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.abs_mvd_greater1_flag[g1_slot])?
+                    == 1;
+            }
+        }
+
+        // Step 3: per non-zero component, the magnitude tail then sign.
+        let mut abs_mvd_minus2 = [0u32; 2];
+        let mut mvd_sign_flag = [false; 2];
+        for c in 0..2 {
+            if !greater0[c] {
+                continue;
+            }
+            if greater1[c] {
+                abs_mvd_minus2[c] = self.read_abs_mvd_minus2()?;
+            }
+            mvd_sign_flag[c] = self.dec.decode_bypass()? == 1;
+        }
+
+        Ok(crate::mvd_coding_enc::MvdCodingDecision {
+            abs_mvd_greater0_flag: greater0,
+            abs_mvd_greater1_flag: greater1,
+            abs_mvd_minus2,
+            mvd_sign_flag,
+        })
+    }
+
     /// Decode `inter_pred_idc[x0][y0]` per §9.3.3.9 / Table 131. The
     /// binarisation depends on `cbWidth + cbHeight`:
     ///

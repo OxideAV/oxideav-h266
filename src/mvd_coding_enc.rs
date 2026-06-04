@@ -294,6 +294,262 @@ pub fn encode_mvd_coding(
     Ok(())
 }
 
+// =====================================================================
+// Round-233 — decomposed §7.3.10.10 `mvd_coding()` body parser.
+//
+// The existing [`encode_mvd_coding`] / `read_mvd_coding` surface takes
+// or returns a [`MotionVector`] (the post-fold `lMvd[c]` pair per
+// eq. 190) and hides the eight underlying syntax elements behind the
+// fold. The body-parser variant in this section exposes the raw
+// syntax elements explicitly via [`MvdCodingDecision`], so external
+// callers can inspect the per-bin layout, replay arbitrary bin patterns
+// (including the §7.4.10.10 inferred-default cases where greater0 == 0
+// or greater1 == 0 leave abs_mvd_minus2 / mvd_sign_flag inferred), and
+// verify the eq. 190 fold without re-deriving it inline.
+//
+// Functionally equivalent to the existing per-element walker, but the
+// public surface area carries the structural layout of the eight
+// syntax elements alongside the resulting `(x, y)` pair.
+// =====================================================================
+
+/// Decomposed §7.3.10.10 `mvd_coding(x0, y0, refList, cpIdx)` syntax
+/// elements.
+///
+/// One instance carries the per-component bin layout the §7.3.10.10
+/// listing produces:
+///
+/// | Field                    | Per-component spec element          |
+/// | ------------------------ | ----------------------------------- |
+/// | `abs_mvd_greater0_flag`  | `abs_mvd_greater0_flag[c]`          |
+/// | `abs_mvd_greater1_flag`  | `abs_mvd_greater1_flag[c]`          |
+/// | `abs_mvd_minus2`         | `abs_mvd_minus2[c]`                 |
+/// | `mvd_sign_flag`          | `mvd_sign_flag[c]`                  |
+///
+/// Per §7.4.10.10 inference, when `abs_mvd_greater0_flag[c] == 0` both
+/// `abs_mvd_greater1_flag[c]` and `mvd_sign_flag[c]` are inferred 0
+/// and `abs_mvd_minus2[c]` is inferred −1 (which collapses the §eq.
+/// 190 magnitude to 0). When `abs_mvd_greater0_flag[c] == 1` but
+/// `abs_mvd_greater1_flag[c] == 0`, `abs_mvd_minus2[c]` is inferred −1
+/// (which collapses the §eq. 190 magnitude to 1).
+///
+/// The struct carries those inferred slots as ordinary fields (`false`
+/// / `0`) for the greater1 / sign cases, and as the sentinel `0`
+/// (rather than `−1`) for `abs_mvd_minus2` — the eq. 190 fold gates
+/// on the flag pair regardless of the slot's contents, so the
+/// inferred-out-of-band sentinel is only of cosmetic interest. The
+/// [`Self::to_motion_vector`] method honours the gates exactly per
+/// eq. 190.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MvdCodingDecision {
+    /// `abs_mvd_greater0_flag[c]` per §7.3.10.10 — true iff
+    /// `|lMvd[c]| >= 1`.
+    pub abs_mvd_greater0_flag: [bool; 2],
+    /// `abs_mvd_greater1_flag[c]` per §7.3.10.10 — true iff
+    /// `|lMvd[c]| >= 2`. Meaningful only when
+    /// `abs_mvd_greater0_flag[c] == true`; otherwise the slot is
+    /// `false` per §7.4.10.10 inference (no bin emitted).
+    pub abs_mvd_greater1_flag: [bool; 2],
+    /// `abs_mvd_minus2[c]` per §7.3.10.10 — the value carried by the
+    /// §9.3.3.6 limited-EGk bypass tail. Meaningful only when
+    /// `abs_mvd_greater0_flag[c] && abs_mvd_greater1_flag[c]`;
+    /// otherwise the slot is `0` (the §7.4.10.10 inference would
+    /// nominally assign `−1`, but the eq. 190 fold gates on the flag
+    /// pair so the stored value is only of cosmetic interest in the
+    /// inferred cases).
+    pub abs_mvd_minus2: [u32; 2],
+    /// `mvd_sign_flag[c]` per §7.3.10.10 — true iff `lMvd[c] < 0`.
+    /// Meaningful only when `abs_mvd_greater0_flag[c] == true`;
+    /// otherwise the slot is `false` per §7.4.10.10 inference (no
+    /// bin emitted).
+    pub mvd_sign_flag: [bool; 2],
+}
+
+impl MvdCodingDecision {
+    /// Inferred-zero decision: every flag is `false`, every
+    /// `abs_mvd_minus2` slot is `0`. The eq. 190 fold maps this to
+    /// `MotionVector { x: 0, y: 0 }`.
+    pub const fn zero() -> Self {
+        Self {
+            abs_mvd_greater0_flag: [false, false],
+            abs_mvd_greater1_flag: [false, false],
+            abs_mvd_minus2: [0, 0],
+            mvd_sign_flag: [false, false],
+        }
+    }
+
+    /// Derive the decomposed bin layout from a target `lMvd` pair, in
+    /// the way the encoder walks them per §7.3.10.10:
+    ///
+    /// * `abs_mvd_greater0_flag[c] = (lMvd[c] != 0)`
+    /// * `abs_mvd_greater1_flag[c] = (|lMvd[c]| > 1)` (only meaningful
+    ///   when `greater0[c]`)
+    /// * `abs_mvd_minus2[c] = |lMvd[c]| - 2` (only meaningful when
+    ///   `greater0[c] && greater1[c]`; otherwise stored as `0`)
+    /// * `mvd_sign_flag[c] = (lMvd[c] < 0)` (only meaningful when
+    ///   `greater0[c]`)
+    ///
+    /// `lmvd.x` / `lmvd.y` must lie in the §7.4.10.10 signed-18-bit
+    /// range; debug-asserts mirror [`encode_mvd_coding`].
+    pub fn from_motion_vector(lmvd: MotionVector) -> Self {
+        const LO: i32 = -(1 << 17);
+        const HI: i32 = (1 << 17) - 1;
+        debug_assert!(
+            (LO..=HI).contains(&lmvd.x),
+            "lMvd[0] = {} outside §7.4.10.10 range [{LO}, {HI}]",
+            lmvd.x
+        );
+        debug_assert!(
+            (LO..=HI).contains(&lmvd.y),
+            "lMvd[1] = {} outside §7.4.10.10 range [{LO}, {HI}]",
+            lmvd.y
+        );
+
+        let comp = [lmvd.x, lmvd.y];
+        let mut out = Self::zero();
+        for c in 0..2 {
+            let nz = comp[c] != 0;
+            out.abs_mvd_greater0_flag[c] = nz;
+            if !nz {
+                continue;
+            }
+            let abs = comp[c].unsigned_abs();
+            let gt1 = abs > 1;
+            out.abs_mvd_greater1_flag[c] = gt1;
+            if gt1 {
+                // `abs >= 2`, so `abs - 2` fits in u32 without underflow.
+                out.abs_mvd_minus2[c] = abs - 2;
+            }
+            out.mvd_sign_flag[c] = comp[c] < 0;
+        }
+        out
+    }
+
+    /// Fold the decomposed elements back into the `lMvd` pair per
+    /// §7.4.10.10 eq. 190:
+    ///
+    /// `lMvd[c] = greater0[c] ? (|magnitude|) * (1 − 2 * sign[c]) : 0`
+    ///
+    /// where the per-component magnitude is `abs_mvd_minus2[c] + 2`
+    /// when `greater1[c]`, otherwise `1` (the inferred fallback).
+    pub fn to_motion_vector(&self) -> MotionVector {
+        let mut lmvd = [0i32; 2];
+        for c in 0..2 {
+            if !self.abs_mvd_greater0_flag[c] {
+                continue;
+            }
+            let abs: i32 = if self.abs_mvd_greater1_flag[c] {
+                // Saturate against the §7.4.10.10 positive ceiling so
+                // a stale or out-of-range `abs_mvd_minus2` cannot
+                // overflow the signed-18-bit `lMvd[c]` range.
+                let sum = (self.abs_mvd_minus2[c] as i64) + 2;
+                sum.min(((1i64 << 17) - 1) + 1) as i32
+            } else {
+                1
+            };
+            lmvd[c] = if self.mvd_sign_flag[c] { -abs } else { abs };
+        }
+        MotionVector {
+            x: lmvd[0],
+            y: lmvd[1],
+        }
+    }
+}
+
+/// Encode one `mvd_coding(x0, y0, refList, cpIdx)` structure per
+/// §7.3.10.10 from the decomposed [`MvdCodingDecision`] form. Mirror
+/// of [`crate::leaf_cu::LeafCuReader::read_mvd_coding_decomposed`].
+///
+/// Functionally equivalent to driving [`encode_mvd_coding`] with
+/// `decision.to_motion_vector()`: the encoder walks the same bin
+/// sequence per §7.3.10.10, but inspects the flag pair / magnitude
+/// tail / sign directly rather than re-deriving them from a packed
+/// `(x, y)`. This is the natural mirror for an external caller that
+/// has already split a target lMvd into its underlying syntax
+/// elements (e.g. a trace-replay harness or a rate-distortion-aware
+/// scan that holds an explicit per-bin candidate set).
+///
+/// # Parameters
+///
+/// * `enc` — shared CABAC encoder state.
+/// * `ctxs` — slice-scope context bundle. The
+///   `abs_mvd_greater0_flag` / `abs_mvd_greater1_flag` slots and the
+///   `init_type` field are consulted; no other field is touched.
+/// * `decision` — the decomposed [`MvdCodingDecision`] to emit. The
+///   eq. 190 fold (the `(x, y)` round-trip equivalence) is the
+///   caller's contract: any inconsistency between the flag pair and
+///   the magnitude / sign slots is treated as the spec's
+///   §7.4.10.10 inferred behaviour (no bin emitted, slot value
+///   ignored).
+///
+/// # Bin sequence
+///
+/// Identical to [`encode_mvd_coding`]:
+///
+/// 1. `abs_mvd_greater0_flag[0]`, `abs_mvd_greater0_flag[1]`
+///    (both ctx-coded, Table 110 slot = `init_type`, ctxInc 0).
+/// 2. for each `c` with `greater0[c]`:
+///    `abs_mvd_greater1_flag[c]` (ctx-coded, Table 111).
+/// 3. for each `c` with `greater0[c]`:
+///    `abs_mvd_minus2[c]` via [`encode_abs_mvd_minus2`] (only when
+///    `greater1[c]`) then `mvd_sign_flag[c]` (bypass FL `cMax = 1`).
+pub fn encode_mvd_coding_decomposed(
+    enc: &mut ArithEncoder,
+    ctxs: &mut LeafCuCtxs,
+    decision: &MvdCodingDecision,
+) -> Result<()> {
+    // Spec-traceability: route through the ctx::* helpers even though
+    // both return deterministic 0 — keeps the encoder mirror robust
+    // against a future Table 132 amendment introducing a non-trivial
+    // derivation. Matches the round-187 [`encode_mvd_coding`] pattern.
+    let inc_g0 = ctx_inc_abs_mvd_greater0_flag() as usize;
+    let inc_g1 = ctx_inc_abs_mvd_greater1_flag() as usize;
+    debug_assert_eq!(
+        inc_g0, 0,
+        "Table 132 lists deterministic ctxInc = 0 for abs_mvd_greater0_flag"
+    );
+    debug_assert_eq!(
+        inc_g1, 0,
+        "Table 132 lists deterministic ctxInc = 0 for abs_mvd_greater1_flag"
+    );
+
+    let init_type = ctxs.init_type as usize;
+    let g0_slot = (init_type + inc_g0).min(ctxs.abs_mvd_greater0_flag.len() - 1);
+    let g1_slot = (init_type + inc_g1).min(ctxs.abs_mvd_greater1_flag.len() - 1);
+
+    // Step 1: both greater0 flags (both components, in spec's
+    // component-major order: c0 then c1).
+    for c in 0..2 {
+        enc.encode_decision(
+            &mut ctxs.abs_mvd_greater0_flag[g0_slot],
+            decision.abs_mvd_greater0_flag[c] as u32,
+        )?;
+    }
+    // Step 2: greater1 per non-zero component (component-major).
+    for c in 0..2 {
+        if decision.abs_mvd_greater0_flag[c] {
+            enc.encode_decision(
+                &mut ctxs.abs_mvd_greater1_flag[g1_slot],
+                decision.abs_mvd_greater1_flag[c] as u32,
+            )?;
+        }
+    }
+    // Step 3: magnitude tail + sign per non-zero component.
+    for c in 0..2 {
+        if decision.abs_mvd_greater0_flag[c] {
+            if decision.abs_mvd_greater1_flag[c] {
+                // |lMvd[c]| ≥ 2 → emit abs_mvd_minus2 from the
+                // decision's explicit slot (the §9.3.3.6 limited-EGk
+                // path).
+                encode_abs_mvd_minus2(enc, decision.abs_mvd_minus2[c])?;
+            }
+            // mvd_sign_flag[c] — bypass FL cMax = 1.
+            enc.encode_bypass(decision.mvd_sign_flag[c] as u32)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +811,266 @@ mod tests {
         let b2 = e2.finish();
 
         assert_eq!(b1, b2, "encoder is non-deterministic for (0, 0)");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-233 — decomposed `mvd_coding()` body parser tests.
+    // -----------------------------------------------------------------
+
+    /// Build a decomposed decision via `from_motion_vector`, push it
+    /// through [`encode_mvd_coding_decomposed`], decode through
+    /// [`crate::leaf_cu::LeafCuReader::read_mvd_coding_decomposed`],
+    /// and return the recovered decision. The wire layout MUST be
+    /// bit-identical to the `encode_mvd_coding`-on-the-same-`(x, y)`
+    /// path; both call sites are pinned by the parallel `parity_*`
+    /// tests below.
+    fn decomposed_round_trip(lmvd: MotionVector, init_type: u8) -> MvdCodingDecision {
+        let decision = MvdCodingDecision::from_motion_vector(lmvd);
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        encode_mvd_coding_decomposed(&mut enc, &mut enc_ctxs, &decision)
+            .expect("encode_mvd_coding_decomposed succeeds for in-range lMvd");
+        enc.encode_terminate(1).expect("terminator");
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        let mut dec = ArithDecoder::new(&padded).expect("decoder accepts encoded stream");
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .read_mvd_coding_decomposed()
+            .expect("reader reconstructs the mvd_coding() body")
+    }
+
+    #[test]
+    fn decision_zero_is_all_inferred_defaults() {
+        let zero = MvdCodingDecision::zero();
+        assert_eq!(zero.abs_mvd_greater0_flag, [false, false]);
+        assert_eq!(zero.abs_mvd_greater1_flag, [false, false]);
+        assert_eq!(zero.abs_mvd_minus2, [0, 0]);
+        assert_eq!(zero.mvd_sign_flag, [false, false]);
+        assert_eq!(zero.to_motion_vector(), MotionVector { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn from_motion_vector_zero_pair_leaves_every_slot_default() {
+        let d = MvdCodingDecision::from_motion_vector(MotionVector { x: 0, y: 0 });
+        assert_eq!(d, MvdCodingDecision::zero());
+    }
+
+    #[test]
+    fn from_motion_vector_unit_magnitude_skips_minus2_slot() {
+        // |lMvd| == 1 ⇒ greater0 == 1, greater1 == 0, abs_mvd_minus2
+        // stays at 0 per §7.4.10.10 inference; sign carries the
+        // component-wise sign bit.
+        let d = MvdCodingDecision::from_motion_vector(MotionVector { x: 1, y: -1 });
+        assert_eq!(d.abs_mvd_greater0_flag, [true, true]);
+        assert_eq!(d.abs_mvd_greater1_flag, [false, false]);
+        assert_eq!(d.abs_mvd_minus2, [0, 0]);
+        assert_eq!(d.mvd_sign_flag, [false, true]);
+        assert_eq!(d.to_motion_vector(), MotionVector { x: 1, y: -1 });
+    }
+
+    #[test]
+    fn from_motion_vector_two_or_higher_populates_minus2_slot() {
+        // |lMvd| >= 2 ⇒ greater1 == 1, abs_mvd_minus2 carries the
+        // §9.3.3.6 tail.
+        let d = MvdCodingDecision::from_motion_vector(MotionVector { x: 9, y: -9 });
+        assert_eq!(d.abs_mvd_greater0_flag, [true, true]);
+        assert_eq!(d.abs_mvd_greater1_flag, [true, true]);
+        assert_eq!(d.abs_mvd_minus2, [7, 7]);
+        assert_eq!(d.mvd_sign_flag, [false, true]);
+        assert_eq!(d.to_motion_vector(), MotionVector { x: 9, y: -9 });
+    }
+
+    #[test]
+    fn from_motion_vector_mixed_zero_and_nonzero() {
+        // c0 == 0 ⇒ greater0 == 0 ⇒ every other c0 slot inferred.
+        // c1 != 0 ⇒ the full c1 cascade is populated.
+        let d = MvdCodingDecision::from_motion_vector(MotionVector { x: 0, y: 5 });
+        assert_eq!(d.abs_mvd_greater0_flag, [false, true]);
+        assert_eq!(d.abs_mvd_greater1_flag, [false, true]);
+        assert_eq!(d.abs_mvd_minus2, [0, 3]);
+        assert_eq!(d.mvd_sign_flag, [false, false]);
+        assert_eq!(d.to_motion_vector(), MotionVector { x: 0, y: 5 });
+    }
+
+    #[test]
+    fn decomposed_round_trip_zero_pair() {
+        for init_type in [1u8, 2] {
+            let mv = MotionVector { x: 0, y: 0 };
+            let recovered = decomposed_round_trip(mv, init_type);
+            assert_eq!(recovered, MvdCodingDecision::from_motion_vector(mv));
+            assert_eq!(recovered.to_motion_vector(), mv);
+        }
+    }
+
+    #[test]
+    fn decomposed_round_trip_unit_magnitudes_across_signs() {
+        for init_type in [1u8, 2] {
+            for &(x, y) in &[(1i32, 1i32), (-1, 1), (1, -1), (-1, -1)] {
+                let mv = MotionVector { x, y };
+                let recovered = decomposed_round_trip(mv, init_type);
+                assert_eq!(
+                    recovered,
+                    MvdCodingDecision::from_motion_vector(mv),
+                    "unit magnitude decomposed round trip failed at ({x},{y}) \
+                     init_type={init_type}"
+                );
+                assert_eq!(recovered.to_motion_vector(), mv);
+            }
+        }
+    }
+
+    #[test]
+    fn decomposed_round_trip_mixed_zero_and_nonzero() {
+        for &(x, y) in &[(0, 5), (-7, 0), (0, -3), (12, 0)] {
+            let mv = MotionVector { x, y };
+            let recovered = decomposed_round_trip(mv, 1);
+            assert_eq!(
+                recovered,
+                MvdCodingDecision::from_motion_vector(mv),
+                "mixed zero / non-zero decomposed round trip failed at ({x},{y})"
+            );
+            assert_eq!(recovered.to_motion_vector(), mv);
+        }
+    }
+
+    #[test]
+    fn decomposed_round_trip_large_magnitudes_up_to_egk_cap() {
+        // Mirrors the round-187 `large_magnitudes_exercise_egk_prefix_growth_up_to_cap`
+        // sweep so the decomposed walker is pinned at the §9.3.3.6
+        // prefix-growth and `maxPreExtLen` boundary.
+        for &(x, y) in &[
+            (2i32, 2i32),
+            (-2, 3),
+            (16, -16),
+            (255, -255),
+            (1000, -1234),
+            (65535, -65535),
+            (131_070, -131_070), // 2^17 − 2
+            (131_071, -131_071), // 2^17 − 1 — exact max magnitude
+        ] {
+            let mv = MotionVector { x, y };
+            let recovered = decomposed_round_trip(mv, 1);
+            assert_eq!(
+                recovered,
+                MvdCodingDecision::from_motion_vector(mv),
+                "large magnitude decomposed round trip failed at ({x},{y})"
+            );
+            assert_eq!(recovered.to_motion_vector(), mv);
+        }
+    }
+
+    #[test]
+    fn parity_decomposed_and_packed_emit_identical_bitstreams() {
+        // The decomposed walker MUST emit the exact same wire as the
+        // packed `encode_mvd_coding`-on-`MotionVector` walker. Compare
+        // the raw byte payload across an exhaustive small grid plus
+        // the boundary magnitudes from the sweep above.
+        let mut cases = Vec::new();
+        for &(x, y) in &[
+            (0i32, 0i32),
+            (1, 0),
+            (0, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (2, 3),
+            (-3, 2),
+            (9, -9),
+            (255, -255),
+            (131_071, -131_071),
+            (131_071, 131_071),
+        ] {
+            cases.push(MotionVector { x, y });
+        }
+        for init_type in [1u8, 2] {
+            for mv in &cases {
+                let mut packed_enc = ArithEncoder::new();
+                let mut packed_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+                encode_mvd_coding(&mut packed_enc, &mut packed_ctxs, *mv).unwrap();
+                packed_enc.encode_terminate(1).unwrap();
+                let packed_bytes = packed_enc.finish();
+
+                let mut decomp_enc = ArithEncoder::new();
+                let mut decomp_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+                let decision = MvdCodingDecision::from_motion_vector(*mv);
+                encode_mvd_coding_decomposed(&mut decomp_enc, &mut decomp_ctxs, &decision).unwrap();
+                decomp_enc.encode_terminate(1).unwrap();
+                let decomp_bytes = decomp_enc.finish();
+
+                assert_eq!(
+                    packed_bytes, decomp_bytes,
+                    "decomposed encoder must emit the same wire as the packed encoder \
+                     at lmvd = {:?}, init_type = {init_type}",
+                    mv
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_path_packed_wire_decodes_through_decomposed_reader() {
+        // The wire produced by the packed `encode_mvd_coding` walker
+        // must decode through the decomposed reader to a decision
+        // equal to `from_motion_vector`-on-the-same-pair. Pins the
+        // reader-side equivalence (the reader's bin order is anchored
+        // to the encoder's, not derived independently).
+        for &(x, y) in &[(0, 0), (1, -2), (-3, 4), (255, -255), (131_071, 1)] {
+            let mv = MotionVector { x, y };
+            let mut enc = ArithEncoder::new();
+            let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+            encode_mvd_coding(&mut enc, &mut enc_ctxs, mv).unwrap();
+            enc.encode_terminate(1).unwrap();
+            let mut padded = enc.finish();
+            padded.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&padded).unwrap();
+            let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+            let tools = CuToolFlags::default();
+            let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+            let decomposed = reader.read_mvd_coding_decomposed().unwrap();
+            assert_eq!(decomposed, MvdCodingDecision::from_motion_vector(mv));
+            assert_eq!(decomposed.to_motion_vector(), mv);
+        }
+    }
+
+    #[test]
+    fn cross_path_decomposed_wire_decodes_through_packed_reader() {
+        // Inverse of the test above: the wire produced by the
+        // decomposed encoder must decode through the packed
+        // `read_mvd_coding` reader back to the original `(x, y)`
+        // pair. Pins the encoder-side equivalence end-to-end.
+        for &(x, y) in &[(0, 0), (1, -2), (-3, 4), (255, -255), (131_071, 1)] {
+            let mv = MotionVector { x, y };
+            let decision = MvdCodingDecision::from_motion_vector(mv);
+            let mut enc = ArithEncoder::new();
+            let mut enc_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+            encode_mvd_coding_decomposed(&mut enc, &mut enc_ctxs, &decision).unwrap();
+            enc.encode_terminate(1).unwrap();
+            let mut padded = enc.finish();
+            padded.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&padded).unwrap();
+            let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, 1);
+            let tools = CuToolFlags::default();
+            let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+            let recovered = reader.read_mvd_coding().unwrap();
+            assert_eq!(recovered, mv);
+        }
+    }
+
+    #[test]
+    fn eq_190_fold_matches_unit_magnitude_inferred_minus2_slot() {
+        // |lMvd[c]| = 1 ⇒ greater1 == 0 ⇒ §7.4.10.10 infers
+        // `abs_mvd_minus2 = -1` so eq. 190 gives magnitude 1 from the
+        // decision struct's stored `0` (the to_motion_vector method
+        // honours the gate on greater1).
+        let d = MvdCodingDecision {
+            abs_mvd_greater0_flag: [true, false],
+            abs_mvd_greater1_flag: [false, false],
+            abs_mvd_minus2: [0, 0],
+            mvd_sign_flag: [true, false],
+        };
+        assert_eq!(d.to_motion_vector(), MotionVector { x: -1, y: 0 });
     }
 }
