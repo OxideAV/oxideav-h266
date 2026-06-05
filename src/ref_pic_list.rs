@@ -640,6 +640,7 @@ mod tests {
             sps_extension_flag: false,
             sps_range_extension_flag: false,
             sps_extension_7bits: 0,
+            range_extension: None,
         };
         sps.tool_flags.num_ref_pic_lists = [2, 1];
         sps.tool_flags.ref_pic_lists[0] = vec![

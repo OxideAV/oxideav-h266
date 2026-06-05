@@ -97,6 +97,60 @@ pub struct SeqParameterSet {
     pub sps_range_extension_flag: bool,
     /// `sps_extension_7bits` (§7.4.3.4).
     pub sps_extension_7bits: u8,
+    /// `sps_range_extension()` block (§7.3.2.22). `Some` exactly when
+    /// `sps_range_extension_flag == 1`. Fields default to the
+    /// §7.4.3.22 "When not present" inferences when absent.
+    pub range_extension: Option<SpsRangeExtension>,
+}
+
+/// `sps_range_extension()` payload (§7.3.2.22 + §7.4.3.22).
+///
+/// The five flags here control transform-coefficient dynamic range,
+/// alternate Rice-parameter derivation, persistent Rice adaptation
+/// across TUs, and the `sh_reverse_last_sig_coeff_flag` plumbing in
+/// the slice header. The block is only present when
+/// `sps_range_extension_flag == 1` (§7.4.3.4), which in turn requires
+/// `BitDepth > 10` (§7.4.3.4 constraint).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangeExtension {
+    /// `sps_extended_precision_flag` — selects the §7.4.3.22 eq. 106
+    /// `Log2TransformRange = Max( 15, Min( 20, BitDepth + 6 ) )`
+    /// extended-precision branch. When `0`, `Log2TransformRange = 15`.
+    pub sps_extended_precision_flag: bool,
+    /// `sps_ts_residual_coding_rice_present_in_sh_flag` — gates
+    /// `sh_ts_residual_coding_rice_idx_minus1` in slice headers. Only
+    /// transmitted when `sps_transform_skip_enabled_flag == 1`;
+    /// inferred to `0` otherwise (§7.4.3.22).
+    pub sps_ts_residual_coding_rice_present_in_sh_flag: bool,
+    /// `sps_rrc_rice_extension_flag` — selects the alternative Rice
+    /// parameter derivation for `abs_remaining[]` / `dec_abs_level[]`
+    /// (§9.3.3.10 `baseLevel` branch — `baseLevel = 4` when `0`,
+    /// `baseLevel ∈ {0, 2, 4}` per the eq. block when `1`).
+    pub sps_rrc_rice_extension_flag: bool,
+    /// `sps_persistent_rice_adaptation_enabled_flag` — when `1`, the
+    /// per-component `StatCoeff[]` accumulator is carried across TUs
+    /// and seeds the Rice parameter at TU start (§9.3.3.10 eqs. 1521 /
+    /// HistValue / updateHist).
+    pub sps_persistent_rice_adaptation_enabled_flag: bool,
+    /// `sps_reverse_last_sig_coeff_enabled_flag` — gates
+    /// `sh_reverse_last_sig_coeff_flag` in slice headers (§7.3.7).
+    pub sps_reverse_last_sig_coeff_enabled_flag: bool,
+}
+
+impl SpsRangeExtension {
+    /// §7.4.3.22 eq. 106 `Log2TransformRange` derivation.
+    ///
+    /// When `sps_extended_precision_flag == 1`, returns
+    /// `Max( 15, Min( 20, BitDepth + 6 ) )`; otherwise `15`.
+    pub fn log2_transform_range(&self, bit_depth: u32) -> u32 {
+        if self.sps_extended_precision_flag {
+            // §7.4.3.22 eq. 106: Max( 15, Min( 20, BitDepth + 6 ) ).
+            // Equivalent to clamping into the inclusive range [15, 20].
+            (bit_depth + 6).clamp(15, 20)
+        } else {
+            15
+        }
+    }
 }
 
 /// Subpicture info block (§7.4.3.4, gated by
@@ -644,16 +698,42 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     let sps_extension_flag = br.u1()? == 1;
     let mut sps_range_extension_flag = false;
     let mut sps_extension_7bits: u8 = 0;
+    let mut range_extension: Option<SpsRangeExtension> = None;
     if sps_extension_flag {
         sps_range_extension_flag = br.u1()? == 1;
         sps_extension_7bits = br.u(7)? as u8;
         if sps_range_extension_flag {
-            // §7.3.2.5 defines `sps_range_extension()`. The foundation
-            // pass does not implement it — surface an Unsupported error
-            // so callers can detect the condition.
-            return Err(Error::unsupported(
-                "h266 SPS: sps_range_extension() not yet implemented",
-            ));
+            // §7.4.3.4 constraint: "When BitDepth is less than or
+            // equal to 10, the value of sps_range_extension_flag
+            // shall be equal to 0." The block is only meaningful at
+            // > 10-bit depth; flag a malformed bitstream up front.
+            let bit_depth = sps_bitdepth_minus8 + 8;
+            if bit_depth <= 10 {
+                return Err(Error::invalid(format!(
+                    "h266 SPS: sps_range_extension_flag = 1 disallowed at BitDepth = {bit_depth} (§7.4.3.4 requires BitDepth > 10)"
+                )));
+            }
+            // §7.3.2.22 `sps_range_extension()` body.
+            let sps_extended_precision_flag = br.u1()? == 1;
+            // The `sps_ts_residual_coding_rice_present_in_sh_flag`
+            // bin is only present when `sps_transform_skip_enabled_flag
+            // == 1`; the §7.4.3.22 inference rule gives `0` otherwise.
+            let sps_ts_residual_coding_rice_present_in_sh_flag =
+                if tool_flags.transform_skip_enabled_flag {
+                    br.u1()? == 1
+                } else {
+                    false
+                };
+            let sps_rrc_rice_extension_flag = br.u1()? == 1;
+            let sps_persistent_rice_adaptation_enabled_flag = br.u1()? == 1;
+            let sps_reverse_last_sig_coeff_enabled_flag = br.u1()? == 1;
+            range_extension = Some(SpsRangeExtension {
+                sps_extended_precision_flag,
+                sps_ts_residual_coding_rice_present_in_sh_flag,
+                sps_rrc_rice_extension_flag,
+                sps_persistent_rice_adaptation_enabled_flag,
+                sps_reverse_last_sig_coeff_enabled_flag,
+            });
         }
     }
     // `if (sps_extension_7bits) while(more_rbsp_data()) u(1)` — consume
@@ -704,6 +784,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         sps_extension_flag,
         sps_range_extension_flag,
         sps_extension_7bits,
+        range_extension,
     })
 }
 
@@ -2200,5 +2281,254 @@ mod tests {
         // Clamp: out-of-range values still produce a legal 1..=6 result.
         s.tool_flags.six_minus_max_num_merge_cand = 10;
         assert_eq!(s.max_num_merge_cand(), 1);
+    }
+
+    /// Configurable knobs for [`build_range_extension_sps_bits`].
+    ///
+    /// `bitdepth_minus8` controls the §7.4.3.4 `BitDepth > 10`
+    /// constraint check (set `>= 3` for legal range-extension cases).
+    /// `transform_skip_enabled` switches the §7.3.2.22 conditional
+    /// `sps_ts_residual_coding_rice_present_in_sh_flag` bin in/out.
+    #[derive(Clone, Copy)]
+    struct RangeExtCfg {
+        bitdepth_minus8: u32,
+        transform_skip_enabled: bool,
+        ext_precision: bool,
+        ts_rrc_in_sh: bool,
+        rrc_rice_ext: bool,
+        persistent_rice: bool,
+        reverse_last_sig: bool,
+    }
+
+    /// Build a minimal SPS whose `sps_range_extension_flag = 1` and
+    /// whose §7.3.2.22 payload bins are driven by `cfg`. Used to pin
+    /// the five-flag range-extension parser at both the all-zero and
+    /// all-one extremes, plus the transform-skip-gated conditional
+    /// bin.
+    fn build_range_extension_sps_bits(cfg: RangeExtCfg) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 4); // vps_id
+        push_u(&mut bits, 0, 3); // max_sublayers_minus1
+        push_u(&mut bits, 1, 2); // chroma = 4:2:0
+        push_u(&mut bits, 2, 2); // log2_ctu - 5 = 2 → CTB=128
+        push_u(&mut bits, 0, 1); // ptl_dpb_hrd_present = 0
+        push_u(&mut bits, 0, 1); // gdr_enabled
+        push_u(&mut bits, 0, 1); // ref_pic_resampling
+        push_ue(&mut bits, 320);
+        push_ue(&mut bits, 240);
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // subpic_info_present
+        push_ue(&mut bits, cfg.bitdepth_minus8); // bitdepth_minus8
+        push_u(&mut bits, 0, 1); // entropy_coding_sync
+        push_u(&mut bits, 0, 1); // entry_point_offsets
+        push_u(&mut bits, 4, 4); // log2_max_poc_lsb_minus4
+        push_u(&mut bits, 0, 1); // poc_msb_cycle_flag
+        push_u(&mut bits, 0, 2); // num_extra_ph_bytes
+        push_u(&mut bits, 0, 2); // num_extra_sh_bytes
+
+        // ---- partition constraints (§7.3.2.4 tail) ----
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // partition_constraints_override_enabled
+        push_ue(&mut bits, 0); // log2_diff_min_qt_min_cb_intra_luma
+        push_ue(&mut bits, 0); // max_mtt_depth_intra_luma
+        push_u(&mut bits, 0, 1); // qtbtt_dual_tree_intra_flag
+        push_ue(&mut bits, 0); // log2_diff_min_qt_min_cb_inter
+        push_ue(&mut bits, 0); // max_mtt_depth_inter
+        push_u(&mut bits, 0, 1); // max_luma_transform_size_64_flag
+
+        // ---- tool flags (§7.3.2.4 tail) ----
+        push_u(&mut bits, cfg.transform_skip_enabled as u64, 1); // transform_skip_enabled
+        if cfg.transform_skip_enabled {
+            push_ue(&mut bits, 0); // log2_transform_skip_max_size_minus2
+            push_u(&mut bits, 0, 1); // bdpcm_enabled_flag
+        }
+        push_u(&mut bits, 0, 1); // mts_enabled
+        push_u(&mut bits, 0, 1); // lfnst_enabled
+        push_u(&mut bits, 0, 1); // joint_cbcr_enabled
+        push_u(&mut bits, 1, 1); // same_qp_table_for_chroma
+        push_se(&mut bits, 0); // qp_table_start_minus26
+        push_ue(&mut bits, 0); // num_points_minus1 = 0
+        push_ue(&mut bits, 0); // delta_qp_in_val_minus1[0][0]
+        push_ue(&mut bits, 0); // delta_qp_diff_val[0][0]
+        push_u(&mut bits, 0, 1); // sao_enabled
+        push_u(&mut bits, 0, 1); // alf_enabled
+        push_u(&mut bits, 0, 1); // lmcs_enabled
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // long_term_ref_pics
+        push_u(&mut bits, 0, 1); // idr_rpl_present
+        push_u(&mut bits, 0, 1); // rpl1_same_as_rpl0 = 0
+        push_ue(&mut bits, 0); // num_ref_pic_lists[0]
+        push_ue(&mut bits, 0); // num_ref_pic_lists[1]
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_u(&mut bits, 0, 1); // temporal_mvp
+        push_u(&mut bits, 0, 1); // amvr
+        push_u(&mut bits, 0, 1); // bdof
+        push_u(&mut bits, 0, 1); // smvd
+        push_u(&mut bits, 0, 1); // dmvr
+        push_u(&mut bits, 0, 1); // mmvd
+        push_ue(&mut bits, 0); // six_minus_max_num_merge_cand
+        push_u(&mut bits, 0, 1); // sbt
+        push_u(&mut bits, 0, 1); // affine
+        push_u(&mut bits, 0, 1); // bcw
+        push_u(&mut bits, 0, 1); // ciip
+        push_u(&mut bits, 0, 1); // gpm_enabled
+        push_ue(&mut bits, 0); // log2_parallel_merge_level_minus2
+        push_u(&mut bits, 0, 1); // isp
+        push_u(&mut bits, 0, 1); // mrl
+        push_u(&mut bits, 0, 1); // mip
+        push_u(&mut bits, 0, 1); // cclm
+        push_u(&mut bits, 0, 1); // chroma_horizontal_collocated
+        push_u(&mut bits, 0, 1); // chroma_vertical_collocated
+        push_u(&mut bits, 0, 1); // palette
+                                 // transform_skip || palette → min_qp_prime_ts
+        if cfg.transform_skip_enabled {
+            push_ue(&mut bits, 0); // min_qp_prime_ts
+        }
+        push_u(&mut bits, 0, 1); // ibc
+        push_u(&mut bits, 0, 1); // ladf
+        push_u(&mut bits, 0, 1); // explicit_scaling_list
+        push_u(&mut bits, 0, 1); // dep_quant
+        push_u(&mut bits, 0, 1); // sign_data_hiding
+        push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
+        push_u(&mut bits, 0, 1); // sps_field_seq_flag
+        push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
+
+        // ---- extension block (§7.3.2.4 tail) ----
+        push_u(&mut bits, 1, 1); // sps_extension_flag = 1
+        push_u(&mut bits, 1, 1); // sps_range_extension_flag = 1
+        push_u(&mut bits, 0, 7); // sps_extension_7bits = 0
+
+        // ---- sps_range_extension() body (§7.3.2.22) ----
+        push_u(&mut bits, cfg.ext_precision as u64, 1);
+        if cfg.transform_skip_enabled {
+            push_u(&mut bits, cfg.ts_rrc_in_sh as u64, 1);
+        }
+        push_u(&mut bits, cfg.rrc_rice_ext as u64, 1);
+        push_u(&mut bits, cfg.persistent_rice as u64, 1);
+        push_u(&mut bits, cfg.reverse_last_sig as u64, 1);
+        bits
+    }
+
+    /// `sps_range_extension()` payload reads back as all-zeros when
+    /// every bin is emitted as `0`. Also pins the §7.4.3.22 eq. 106
+    /// `Log2TransformRange = 15` (non-extended-precision) branch.
+    #[test]
+    fn sps_range_extension_all_zero_round_trip() {
+        let cfg = RangeExtCfg {
+            bitdepth_minus8: 4, // BitDepth = 12 (> 10 ⇒ range_ext legal)
+            transform_skip_enabled: false,
+            ext_precision: false,
+            ts_rrc_in_sh: false,
+            rrc_rice_ext: false,
+            persistent_rice: false,
+            reverse_last_sig: false,
+        };
+        let bytes = pack(&build_range_extension_sps_bits(cfg));
+        let sps = parse_sps(&bytes).expect("range-ext SPS parses");
+
+        assert!(sps.sps_extension_flag);
+        assert!(sps.sps_range_extension_flag);
+        assert_eq!(sps.sps_extension_7bits, 0);
+
+        let re = sps.range_extension.expect("range extension populated");
+        assert!(!re.sps_extended_precision_flag);
+        assert!(!re.sps_ts_residual_coding_rice_present_in_sh_flag);
+        assert!(!re.sps_rrc_rice_extension_flag);
+        assert!(!re.sps_persistent_rice_adaptation_enabled_flag);
+        assert!(!re.sps_reverse_last_sig_coeff_enabled_flag);
+
+        // §7.4.3.22 eq. 106: Log2TransformRange = 15 when ext_prec = 0.
+        assert_eq!(re.log2_transform_range(sps.bit_depth_y()), 15);
+    }
+
+    /// `sps_range_extension()` payload reads back as all-ones when
+    /// every bin is emitted as `1`, including the `transform_skip`-
+    /// gated `sps_ts_residual_coding_rice_present_in_sh_flag` bin.
+    /// Also pins the §7.4.3.22 eq. 106 extended-precision branch for
+    /// `BitDepth = 12 → Log2TransformRange = Max(15, Min(20, 18)) = 18`.
+    #[test]
+    fn sps_range_extension_all_one_with_ts_round_trip() {
+        let cfg = RangeExtCfg {
+            bitdepth_minus8: 4, // BitDepth = 12
+            transform_skip_enabled: true,
+            ext_precision: true,
+            ts_rrc_in_sh: true,
+            rrc_rice_ext: true,
+            persistent_rice: true,
+            reverse_last_sig: true,
+        };
+        let bytes = pack(&build_range_extension_sps_bits(cfg));
+        let sps = parse_sps(&bytes).expect("range-ext SPS parses");
+
+        let re = sps.range_extension.expect("range extension populated");
+        assert!(re.sps_extended_precision_flag);
+        assert!(re.sps_ts_residual_coding_rice_present_in_sh_flag);
+        assert!(re.sps_rrc_rice_extension_flag);
+        assert!(re.sps_persistent_rice_adaptation_enabled_flag);
+        assert!(re.sps_reverse_last_sig_coeff_enabled_flag);
+
+        // BitDepth = 12 ⇒ Max(15, Min(20, 18)) = 18.
+        assert_eq!(re.log2_transform_range(sps.bit_depth_y()), 18);
+        // BitDepth = 16 ⇒ Max(15, Min(20, 22)) = 20 (clamped).
+        assert_eq!(re.log2_transform_range(16), 20);
+        // BitDepth = 8 ⇒ Max(15, Min(20, 14)) = 15 (clamped).
+        assert_eq!(re.log2_transform_range(8), 15);
+    }
+
+    /// When `sps_transform_skip_enabled_flag == 0`, the
+    /// `sps_ts_residual_coding_rice_present_in_sh_flag` bin is NOT
+    /// transmitted in the §7.3.2.22 body and §7.4.3.22 infers it to
+    /// 0. The bit-position math is sensitive to this — getting the
+    /// gate wrong corrupts the next-emitted bin
+    /// (`sps_rrc_rice_extension_flag`). Pins both: TS-disabled SPS
+    /// with `sps_rrc_rice_extension_flag = 1` and the inferred 0.
+    #[test]
+    fn sps_range_extension_ts_disabled_skips_rrc_bin() {
+        let cfg = RangeExtCfg {
+            bitdepth_minus8: 4,
+            transform_skip_enabled: false, // ⇒ skip ts_rrc bin
+            ext_precision: false,
+            ts_rrc_in_sh: true, // value ignored — bin not emitted
+            rrc_rice_ext: true,
+            persistent_rice: false,
+            reverse_last_sig: true,
+        };
+        let bytes = pack(&build_range_extension_sps_bits(cfg));
+        let sps = parse_sps(&bytes).expect("range-ext SPS parses");
+
+        let re = sps.range_extension.expect("range extension populated");
+        assert!(!re.sps_extended_precision_flag);
+        // Bin was NOT emitted ⇒ §7.4.3.22 inference = 0.
+        assert!(!re.sps_ts_residual_coding_rice_present_in_sh_flag);
+        // The following three bins must align with the cfg values —
+        // a misaligned reader would put `rrc_rice = false` here.
+        assert!(re.sps_rrc_rice_extension_flag);
+        assert!(!re.sps_persistent_rice_adaptation_enabled_flag);
+        assert!(re.sps_reverse_last_sig_coeff_enabled_flag);
+    }
+
+    /// §7.4.3.4 constraint: `sps_range_extension_flag` shall be 0
+    /// when `BitDepth <= 10`. The parser rejects a malformed
+    /// bitstream that flips it at 10-bit.
+    #[test]
+    fn sps_range_extension_flag_at_10bit_rejected() {
+        let cfg = RangeExtCfg {
+            bitdepth_minus8: 2, // BitDepth = 10
+            transform_skip_enabled: false,
+            ext_precision: false,
+            ts_rrc_in_sh: false,
+            rrc_rice_ext: false,
+            persistent_rice: false,
+            reverse_last_sig: false,
+        };
+        let bytes = pack(&build_range_extension_sps_bits(cfg));
+        let err = parse_sps(&bytes).expect_err("BitDepth = 10 disallows range-ext flag");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sps_range_extension_flag") && msg.contains("BitDepth"),
+            "unexpected error message: {msg}"
+        );
     }
 }

@@ -1590,6 +1590,39 @@ decomposed walker is the natural entry point for a trace-replay
 harness or a bin-level rate-distortion scan that holds an explicit
 per-bin candidate set rather than a packed `MotionVector`.
 
+**Round-239 wires up the §7.3.2.22 `sps_range_extension()` typed
+decoder.** Where the prior parser short-circuited with
+`Error::unsupported` the moment `sps_range_extension_flag = 1`, the
+SPS walker now folds the §7.3.2.22 five-flag body into a public
+[`SpsRangeExtension`](src/sps.rs) struct hung off the new
+`SeqParameterSet::range_extension: Option<SpsRangeExtension>` field.
+The five members map 1:1 to the §7.3.2.22 listing:
+`sps_extended_precision_flag` (selects §7.4.3.22 eq. 106 extended
+`Log2TransformRange`), `sps_ts_residual_coding_rice_present_in_sh_flag`
+(only transmitted when `sps_transform_skip_enabled_flag = 1`, inferred
+to `0` per §7.4.3.22 otherwise — the gate keeps bit-position alignment
+exact for the next three bins),
+`sps_rrc_rice_extension_flag` (selects the §9.3.3.10 alternative Rice
+`baseLevel` derivation for `abs_remaining[]` / `dec_abs_level[]`),
+`sps_persistent_rice_adaptation_enabled_flag` (carries the per-cIdx
+`StatCoeff[]` accumulator across TUs per §9.3.3.10 eqs. 1521 /
+HistValue / updateHist), and `sps_reverse_last_sig_coeff_enabled_flag`
+(gates `sh_reverse_last_sig_coeff_flag` in slice headers per §7.3.7).
+The parser also enforces the §7.4.3.4 constraint that
+`sps_range_extension_flag = 1` is malformed at `BitDepth ≤ 10`,
+returning `Error::invalid` instead of silently consuming the body.
+[`SpsRangeExtension::log2_transform_range(bit_depth)`](src/sps.rs)
+exposes §7.4.3.22 eq. 106 directly: `Max(15, Min(20, BitDepth + 6))`
+when ext-precision is on (BitDepth ∈ {12, 14, 16} → 18 / 20 / 20),
+`15` otherwise. Four new lib tests pin the wire layout: all-zero body
+round-trip (`Log2TransformRange = 15`), all-one body round-trip with
+`transform_skip_enabled = 1` so the gated bin is present
+(`BitDepth = 12 → Log2TransformRange = 18`), TS-disabled body that
+proves the §7.4.3.22 inference path keeps the following three bins
+aligned (a misaligned reader would read
+`sps_rrc_rice_extension_flag = 0` instead of `1`), and the
+`BitDepth = 10` rejection.
+
 ## Usage
 
 Registering the codec wires the parser into `oxideav`'s codec

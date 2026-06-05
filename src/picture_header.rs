@@ -1003,6 +1003,7 @@ mod tests {
             sps_extension_flag: false,
             sps_range_extension_flag: false,
             sps_extension_7bits: 0,
+            range_extension: None,
         };
         let pps = PicParameterSet {
             pps_pic_parameter_set_id: 0,

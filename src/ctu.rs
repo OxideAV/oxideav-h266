@@ -3270,6 +3270,7 @@ mod tests {
             sps_extension_flag: false,
             sps_range_extension_flag: false,
             sps_extension_7bits: 0,
+            range_extension: None,
         }
     }
 

@@ -60,6 +60,7 @@ fn dummy_sps(ctb_log2_minus5: u8, pic_w: u32, pic_h: u32) -> SeqParameterSet {
         sps_extension_flag: false,
         sps_range_extension_flag: false,
         sps_extension_7bits: 0,
+        range_extension: None,
     }
 }
 
