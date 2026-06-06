@@ -76,6 +76,7 @@ fn dummy_pps(pic_w: u32, pic_h: u32) -> PicParameterSet {
         pps_output_flag_present_flag: false,
         pps_no_pic_partition_flag: true,
         pps_subpic_id_mapping_present_flag: false,
+        subpic_id_mapping: None,
         pps_rect_slice_flag: true,
         pps_single_slice_per_subpic_flag: true,
         pps_loop_filter_across_slices_enabled_flag: false,

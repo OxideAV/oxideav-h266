@@ -68,6 +68,52 @@ pub struct ScalingWindow {
     pub bottom_offset: i32,
 }
 
+/// PPS-carried subpicture-ID mapping block (§7.3.2.5, gated by
+/// `pps_subpic_id_mapping_present_flag == 1`).
+///
+/// Semantics follow §7.4.3.5:
+///
+/// * `pps_num_subpics_minus1` is read **only** when
+///   `pps_no_pic_partition_flag == 0`; otherwise it is inferred to 0.
+/// * `pps_subpic_id_len_minus1` is constrained by §7.4.3.5 to equal
+///   the active SPS's `sps_subpic_id_len_minus1`; the parser bounds it
+///   to the `u(v)` field-width limit (`<= 15`).
+/// * Each `pps_subpic_id[i]` is a u(v) of length
+///   `pps_subpic_id_len_minus1 + 1` bits.
+///
+/// §7.4.3.5 also defines the eq. 75 derivation:
+///
+/// ```text
+/// SubpicIdVal[i] = pps_subpic_id_mapping_present_flag
+///                ? pps_subpic_id[i]
+///                : sps_subpic_id[i]      (when sps_subpic_id_mapping_explicitly_signalled_flag == 1)
+///                                        (else SubpicIdVal[i] = i)
+/// ```
+///
+/// The cross-PS resolution (consulting the SPS, validating
+/// uniqueness) is owned by a higher-level coordinator; this struct
+/// carries the raw PPS-side payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsSubpicIdMapping {
+    /// `pps_num_subpics_minus1`. Inferred to 0 when the field is
+    /// skipped because `pps_no_pic_partition_flag == 1`.
+    pub pps_num_subpics_minus1: u32,
+    /// `pps_subpic_id_len_minus1`. Bounded to `<= 15` so the
+    /// per-id `u(v)` width fits a `u32`.
+    pub pps_subpic_id_len_minus1: u32,
+    /// Per-subpicture IDs as transmitted. Length is
+    /// `pps_num_subpics_minus1 + 1`.
+    pub pps_subpic_id: Vec<u32>,
+}
+
+impl PpsSubpicIdMapping {
+    /// `pps_subpic_id_len_minus1 + 1` — the §7.3.2.5 `u(v)` width
+    /// used for each `pps_subpic_id[i]`.
+    pub fn id_bit_width(&self) -> u32 {
+        self.pps_subpic_id_len_minus1 + 1
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PicParameterSet {
     pub pps_pic_parameter_set_id: u8,
@@ -80,6 +126,9 @@ pub struct PicParameterSet {
     pub pps_output_flag_present_flag: bool,
     pub pps_no_pic_partition_flag: bool,
     pub pps_subpic_id_mapping_present_flag: bool,
+    /// Parsed §7.3.2.5 `pps_subpic_id_mapping()` block. `Some` exactly
+    /// when `pps_subpic_id_mapping_present_flag == 1`.
+    pub subpic_id_mapping: Option<PpsSubpicIdMapping>,
     /// `pps_rect_slice_flag` — inferred to `true` when the partitioning
     /// block is skipped (§7.4.3.5 inference: defaults to 1 when not
     /// transmitted). `pps_no_pic_partition_flag == 1` also forces
@@ -167,11 +216,14 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
     let pps_output_flag_present_flag = br.u1()? == 1;
     let pps_no_pic_partition_flag = br.u1()? == 1;
     let pps_subpic_id_mapping_present_flag = br.u1()? == 1;
-    if pps_subpic_id_mapping_present_flag {
-        return Err(Error::unsupported(
-            "h266 PPS: pps_subpic_id_mapping_present_flag = 1 (subpicture streams not yet supported)",
-        ));
-    }
+    let subpic_id_mapping = if pps_subpic_id_mapping_present_flag {
+        Some(parse_pps_subpic_id_mapping(
+            &mut br,
+            pps_no_pic_partition_flag,
+        )?)
+    } else {
+        None
+    };
 
     // Partition-block state. `pps_rect_slice_flag` and
     // `pps_single_slice_per_subpic_flag` default to "1" when the block
@@ -477,6 +529,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         pps_output_flag_present_flag,
         pps_no_pic_partition_flag,
         pps_subpic_id_mapping_present_flag,
+        subpic_id_mapping,
         pps_rect_slice_flag,
         pps_single_slice_per_subpic_flag,
         pps_loop_filter_across_slices_enabled_flag,
@@ -509,6 +562,59 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         pps_slice_header_extension_present_flag,
         pps_extension_flag,
         partition,
+    })
+}
+
+/// §7.3.2.5 `pps_subpic_id_mapping()` body parser, called only when
+/// the outer `pps_subpic_id_mapping_present_flag == 1`.
+///
+/// Inference rules (§7.4.3.5):
+///
+/// * `pps_num_subpics_minus1` is signalled iff
+///   `pps_no_pic_partition_flag == 0`; otherwise it is inferred to 0.
+/// * `pps_subpic_id_len_minus1` is read directly; §7.4.3.5 constrains
+///   it to equal the active SPS's `sps_subpic_id_len_minus1`. The
+///   bound here only enforces the `u(v)` field-width sanity limit
+///   (`<= 15`); cross-PS validation is left to the coordinator that
+///   actually owns both parameter sets.
+/// * `pps_subpic_id[i]` is a `u(pps_subpic_id_len_minus1 + 1)` field
+///   read for each `i` in `0..=pps_num_subpics_minus1`.
+fn parse_pps_subpic_id_mapping(
+    br: &mut BitReader<'_>,
+    pps_no_pic_partition_flag: bool,
+) -> Result<PpsSubpicIdMapping> {
+    // §7.4.3.5: `pps_num_subpics_minus1` is only present in the
+    // bitstream when there is more than the implicit single subpicture
+    // partition; otherwise it is inferred to 0.
+    let pps_num_subpics_minus1 = if !pps_no_pic_partition_flag {
+        let v = br.ue()?;
+        // §A.4.2 caps the picture-wide subpicture count by the CTB
+        // grid (`<= 600`); we accept the conservative spec-wide
+        // upper bound here and let the SPS-side check refine it.
+        if v > 1023 {
+            return Err(Error::invalid(format!(
+                "h266 PPS: pps_num_subpics_minus1 out of range ({v})"
+            )));
+        }
+        v
+    } else {
+        0
+    };
+    let pps_subpic_id_len_minus1 = br.ue()?;
+    if pps_subpic_id_len_minus1 > 15 {
+        return Err(Error::invalid(format!(
+            "h266 PPS: pps_subpic_id_len_minus1 out of range ({pps_subpic_id_len_minus1})"
+        )));
+    }
+    let id_bit_width = pps_subpic_id_len_minus1 + 1;
+    let mut pps_subpic_id: Vec<u32> = Vec::with_capacity((pps_num_subpics_minus1 + 1) as usize);
+    for _ in 0..=pps_num_subpics_minus1 {
+        pps_subpic_id.push(br.u(id_bit_width)?);
+    }
+    Ok(PpsSubpicIdMapping {
+        pps_num_subpics_minus1,
+        pps_subpic_id_len_minus1,
+        pps_subpic_id,
     })
 }
 
@@ -718,5 +824,136 @@ mod tests {
         // Tail that doesn't fit a full uniform: [2, 3], pic = 8 → [2, 3, 3].
         let v = derive_tile_sizes(&[2, 3], 8);
         assert_eq!(v, vec![2, 3, 3]);
+    }
+
+    /// §7.3.2.5 `pps_subpic_id_mapping()` with
+    /// `pps_no_pic_partition_flag == 1`:
+    /// `pps_num_subpics_minus1` is **not** read (§7.4.3.5 infers 0), so
+    /// exactly one `pps_subpic_id[0]` follows the length field.
+    #[test]
+    fn pps_subpic_id_mapping_no_partition_infers_num_subpics_zero() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 6); // pps_id
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 1); // mixed_nalu_types
+        push_ue(&mut bits, 320);
+        push_ue(&mut bits, 240);
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // scaling_window
+        push_u(&mut bits, 0, 1); // output_flag_present
+        push_u(&mut bits, 1, 1); // no_pic_partition = 1
+        push_u(&mut bits, 1, 1); // subpic_id_mapping_present = 1
+                                 // pps_num_subpics_minus1 NOT read — inferred to 0.
+        push_ue(&mut bits, 7); // pps_subpic_id_len_minus1 = 7 → u(8)
+        push_u(&mut bits, 0xA5, 8); // pps_subpic_id[0]
+                                    // Trailing tail (CABAC init etc).
+        push_u(&mut bits, 0, 1); // cabac_init_present
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // rpl1_idx_present
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_se(&mut bits, 0); // init_qp_minus26
+        push_u(&mut bits, 0, 1); // cu_qp_delta_enabled
+        push_u(&mut bits, 0, 1); // chroma_tool_offsets_present
+        push_u(&mut bits, 0, 1); // deblocking_filter_control_present
+        push_u(&mut bits, 0, 1); // picture_header_ext_present
+        push_u(&mut bits, 0, 1); // slice_header_ext_present
+        push_u(&mut bits, 0, 1); // pps_extension_flag
+        let bytes = pack_bits(&bits);
+        let pps = parse_pps(&bytes).unwrap();
+        assert!(pps.pps_subpic_id_mapping_present_flag);
+        let map = pps.subpic_id_mapping.as_ref().unwrap();
+        assert_eq!(map.pps_num_subpics_minus1, 0);
+        assert_eq!(map.pps_subpic_id_len_minus1, 7);
+        assert_eq!(map.id_bit_width(), 8);
+        assert_eq!(map.pps_subpic_id, vec![0xA5]);
+    }
+
+    /// §7.3.2.5 `pps_subpic_id_mapping()` with `pps_no_pic_partition_flag
+    /// == 0`: `pps_num_subpics_minus1` is signalled and N+1 IDs follow.
+    #[test]
+    fn pps_subpic_id_mapping_with_partition_reads_explicit_num_subpics() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 6); // pps_id
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 1); // mixed_nalu_types
+        push_ue(&mut bits, 256);
+        push_ue(&mut bits, 128);
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // scaling_window
+        push_u(&mut bits, 0, 1); // output_flag_present
+        push_u(&mut bits, 0, 1); // no_pic_partition = 0
+        push_u(&mut bits, 1, 1); // subpic_id_mapping_present = 1
+        push_ue(&mut bits, 2); // pps_num_subpics_minus1 = 2 → three IDs
+        push_ue(&mut bits, 3); // pps_subpic_id_len_minus1 = 3 → u(4)
+        push_u(&mut bits, 0x1, 4); // pps_subpic_id[0]
+        push_u(&mut bits, 0x9, 4); // pps_subpic_id[1]
+        push_u(&mut bits, 0x5, 4); // pps_subpic_id[2]
+                                   // --- Partition block ---
+        push_u(&mut bits, 2, 2); // pps_log2_ctu_size_minus5
+        push_ue(&mut bits, 1); // pps_num_exp_tile_columns_minus1
+        push_ue(&mut bits, 0); // pps_num_exp_tile_rows_minus1
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 1, 1); // pps_loop_filter_across_tiles
+        push_u(&mut bits, 1, 1); // pps_rect_slice_flag
+        push_u(&mut bits, 1, 1); // pps_single_slice_per_subpic_flag
+        push_u(&mut bits, 0, 1); // pps_loop_filter_across_slices
+                                 // --- End partition ---
+        push_u(&mut bits, 0, 1); // cabac_init
+        push_ue(&mut bits, 0);
+        push_ue(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // rpl1_idx_present
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_se(&mut bits, 0);
+        push_u(&mut bits, 0, 1); // cu_qp_delta
+        push_u(&mut bits, 0, 1); // chroma_tool_offsets
+        push_u(&mut bits, 0, 1); // deblocking_filter_control
+        push_u(&mut bits, 1, 1); // pps_rpl_info_in_ph
+        push_u(&mut bits, 1, 1); // pps_sao_info_in_ph
+        push_u(&mut bits, 1, 1); // pps_alf_info_in_ph
+        push_u(&mut bits, 1, 1); // pps_qp_delta_info_in_ph
+        push_u(&mut bits, 0, 1); // picture_header_ext_present
+        push_u(&mut bits, 0, 1); // slice_header_ext_present
+        push_u(&mut bits, 0, 1); // pps_extension_flag
+        let bytes = pack_bits(&bits);
+        let pps = parse_pps(&bytes).unwrap();
+        assert!(pps.pps_subpic_id_mapping_present_flag);
+        let map = pps.subpic_id_mapping.as_ref().unwrap();
+        assert_eq!(map.pps_num_subpics_minus1, 2);
+        assert_eq!(map.pps_subpic_id_len_minus1, 3);
+        assert_eq!(map.id_bit_width(), 4);
+        assert_eq!(map.pps_subpic_id, vec![0x1, 0x9, 0x5]);
+    }
+
+    /// §7.4.3.5 caps `pps_subpic_id_len_minus1` at 15 (so the
+    /// `u(pps_subpic_id_len_minus1 + 1)` width never exceeds 16 bits).
+    /// The parser rejects values above that as malformed.
+    #[test]
+    fn pps_subpic_id_len_minus1_above_15_rejected() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 6); // pps_id
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 1); // mixed_nalu_types
+        push_ue(&mut bits, 320);
+        push_ue(&mut bits, 240);
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // scaling_window
+        push_u(&mut bits, 0, 1); // output_flag_present
+        push_u(&mut bits, 1, 1); // no_pic_partition = 1
+        push_u(&mut bits, 1, 1); // subpic_id_mapping_present = 1
+        push_ue(&mut bits, 16); // pps_subpic_id_len_minus1 = 16 — out of range
+        let bytes = pack_bits(&bits);
+        let err = parse_pps(&bytes).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("pps_subpic_id_len_minus1"),
+            "unexpected error: {msg}"
+        );
     }
 }
