@@ -156,6 +156,7 @@ pub mod amvr;
 pub mod amvr_enc;
 pub mod aps;
 pub mod aps_enc;
+pub mod aud;
 pub mod bcw_idx_enc;
 pub mod bdof;
 pub mod bitreader;

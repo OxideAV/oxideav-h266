@@ -36,6 +36,16 @@ oxideav-h266 = "0.0"
   * **PPS** (§7.3.2.4) — picture parameter set.
   * **APS** (§7.3.2.5) — adaptation parameter set (ALF / LMCS /
     scaling-list type, parameters walked).
+* **Auxiliary NAL units**
+  * **AUD** (§7.3.2.10) — access-unit delimiter. Round-250 adds
+    `aud::parse_access_unit_delimiter` returning an
+    `AccessUnitDelimiter { aud_irap_or_gdr_flag, aud_pic_type }`; the
+    3-bit `aud_pic_type` field maps onto an `AudPicType` enum that
+    covers the §7.4.3.10 Table 7 conforming triple
+    (`IOnly` / `PorI` / `BPorI`) and preserves the reserved range
+    `3..=7` as `Reserved(raw)` per the spec's "decoders shall ignore
+    reserved values" rule, with `is_conforming()` flagging the
+    distinction.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named
