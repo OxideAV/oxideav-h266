@@ -36,6 +36,15 @@ oxideav-h266 = "0.0"
   * **PPS** (§7.3.2.4) — picture parameter set.
   * **APS** (§7.3.2.5) — adaptation parameter set (ALF / LMCS /
     scaling-list type, parameters walked).
+* **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
+  walked end-to-end including the V4 (01/2026) §7.3.3.2
+  `general_constraints_info()` body. Round-245 surfaces every named
+  GCI flag (66 baseline syntax elements across the general /
+  picture-format / NAL-unit-type / partitioning / CTU-block / intra /
+  inter / transform-quant-residual / loop-filter bands) plus the V4
+  additional-bit block (`gci_num_additional_bits` and the six
+  §7.4.4.2 conditional flags) on a typed `GeneralConstraintsInfo`
+  struct attached to `ProfileTierLevel::gci`.
 * **Picture / slice header** (§7.3.2.7-8) — coarse walk through
   syntax, enough to keep the bit position aligned across NAL
   boundaries during decoder bring-up.
