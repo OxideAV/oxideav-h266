@@ -174,6 +174,8 @@ pub mod dmvr;
 pub mod encoder;
 pub mod encoder_inter;
 pub mod encoder_pipeline;
+pub mod end_of_bitstream;
+pub mod end_of_seq;
 pub mod filler_data;
 pub mod gpm;
 pub mod hrd;

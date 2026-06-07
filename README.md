@@ -57,6 +57,23 @@ oxideav-h266 = "0.0"
     `0xFF` runs are both accepted; any non-`0xFF` body byte or
     non-`0x80` trailing byte is rejected as a framing bug rather
     than silently swallowed.
+  * **End of Sequence** (§7.3.2.11 / §7.4.3.11) and **End of
+    Bitstream** (§7.3.2.12 / §7.4.3.12) — round-255 adds
+    `end_of_seq::parse_end_of_seq` and
+    `end_of_bitstream::parse_end_of_bitstream`, each returning a
+    distinct marker struct (`EndOfSeq` / `EndOfBitstream`). Both
+    RBSPs are syntactically empty: §7.3.2.11 / §7.3.2.12 have
+    zero-element syntax tables with no `rbsp_trailing_bits()`
+    invocation at the tail (in contrast with AUD / Filler Data
+    above), and §7.4.3.11 / §7.4.3.12 confirm "The syntax content
+    of the SODB and RBSP for the EOS / EOB RBSP are empty". The
+    parsers validate `rbsp.is_empty()` and reject any byte —
+    including a stray `0x80` trailing-bits byte — as a framing bug.
+    The two markers carry the §7.4.3.11 next-PU-must-be-IRAP-or-GDR
+    rule and the §7.4.3.12 no-further-NAL-units sentinel
+    respectively; keeping them as distinct types stops downstream
+    pipelines accidentally collapsing one consequence into the
+    other.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named
