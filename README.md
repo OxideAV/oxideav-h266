@@ -46,6 +46,17 @@ oxideav-h266 = "0.0"
     `3..=7` as `Reserved(raw)` per the spec's "decoders shall ignore
     reserved values" rule, with `is_conforming()` flagging the
     distinction.
+  * **Filler Data** (§7.3.2.13 / §7.4.3.13) — round-253 adds
+    `filler_data::parse_filler_data` returning a `FillerData {
+    num_ff_bytes }`. The parser walks the §7.3.2.13 `while(
+    next_bits(8) == 0xFF )` loop, counts each `fd_ff_byte` consumed,
+    and verifies the trailing byte is the canonical `0x80`
+    encoding of `rbsp_trailing_bits()` from a byte-aligned position
+    (stop bit `1` plus seven zero pad bits). Empty-payload (`[0x80]`
+    only — the `while` loop never entered) and arbitrarily large
+    `0xFF` runs are both accepted; any non-`0xFF` body byte or
+    non-`0x80` trailing byte is rejected as a framing bug rather
+    than silently swallowed.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named
