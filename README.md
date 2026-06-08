@@ -74,6 +74,19 @@ oxideav-h266 = "0.0"
     respectively; keeping them as distinct types stops downstream
     pipelines accidentally collapsing one consequence into the
     other.
+  * **rbsp_trailing_bits() / byte_alignment()** (§7.3.2.16 /
+    §7.3.2.17) — round-259 adds `rbsp_trailing::validate_rbsp_trailing_bits`
+    and `rbsp_trailing::validate_byte_alignment`, the reader-side
+    duals of the encoder-side `BitWriter::rbsp_trailing_bits()` /
+    `byte_alignment()` already in `crate::encoder`. The two grammars
+    are textually identical (one `1` stop bit followed by `0` bits
+    to the next byte boundary); the §7.4.3.16 / §7.4.3.17 semantics
+    give the same two `shall be equal` constraints, which the
+    validators surface as typed errors instead of silently
+    tolerating an upstream framing bug. Both functions consume
+    between 1 and 8 bits — exactly the size of the trailing pad
+    from the current `BitReader` position — and report the count
+    back so callers can pin the post-validate position.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named

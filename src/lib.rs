@@ -15,6 +15,13 @@
 //!   (§9.2).
 //! * [`nal`] — start-code scanner, length-prefix iterator, 2-byte NAL
 //!   header parsing (§7.3.1.2), emulation-prevention byte stripping.
+//! * [`rbsp_trailing`] — `rbsp_trailing_bits()` (§7.3.2.16) and
+//!   `byte_alignment()` (§7.3.2.17) reader-side validators. The two
+//!   grammars are textually identical (a `1` stop bit followed by `0`
+//!   bits to the next byte boundary); the §7.4.3.16 / §7.4.3.17
+//!   semantics give the same two `shall be equal` constraints, which
+//!   the validators surface as typed errors instead of silently
+//!   tolerating framing bugs.
 //! * [`decoder`] — registry factory; returns `Error::Unsupported` for any
 //!   packet that would require pixel output. The
 //!   [`ctu::CtuWalker::reconstruct_leaf_cu`] / [`ctu::CtuWalker::decode_picture_into`]
@@ -194,6 +201,7 @@ pub mod opi;
 pub mod picture_header;
 pub mod pps;
 pub mod ptl;
+pub mod rbsp_trailing;
 pub mod reconstruct;
 pub mod ref_pic_list;
 pub mod residual;
