@@ -87,6 +87,19 @@ oxideav-h266 = "0.0"
     between 1 and 8 bits — exactly the size of the trailing pad
     from the current `BitReader` position — and report the count
     back so callers can pin the post-validate position.
+  * **rbsp_slice_trailing_bits()** (§7.3.2.15 / §7.4.3.15) — round-264
+    adds `rbsp_trailing::validate_rbsp_slice_trailing_bits`, the
+    slice-layer wrapper used by §7.3.7.1 `slice_layer_rbsp()`. It
+    delegates the stop-bit + zero-pad block to
+    `validate_rbsp_trailing_bits`, then while
+    `more_rbsp_trailing_data()` is true consumes one or more 16-bit
+    `rbsp_cabac_zero_word` values. Per §7.4.3.15 each such word
+    "is a byte-aligned sequence of two bytes equal to 0x0000"; the
+    validator rejects any non-`0x0000` 16-bit word and any partial
+    (odd) trailing byte that cannot fit a 16-bit word. Returns
+    `(trailing_bits_consumed, num_cabac_zero_words)` so callers can
+    pin the slice tail position and surface cabac-zero-word counts
+    in conformance reports.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named
