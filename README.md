@@ -100,6 +100,26 @@ oxideav-h266 = "0.0"
     `(trailing_bits_consumed, num_cabac_zero_words)` so callers can
     pin the slice tail position and surface cabac-zero-word counts
     in conformance reports.
+  * **sei_message()** (§7.3.6 / §7.4.6) — round-271 adds
+    `sei_message::parse_sei_message` returning a borrowing
+    `SeiMessage { payload_type, payload_size, payload, consumed_bytes }`.
+    It is the single-message header walker the future §7.3.2.9
+    `sei_rbsp()` `do { sei_message() } while( more_rbsp_data() )` loop
+    will invoke: the two §7.3.6 `do/while` byte-accumulation loops sum
+    every `payload_type_byte` / `payload_size_byte` while the byte is
+    `0xFF` (terminating on the first non-`0xFF` byte) to recover
+    `payloadType` / `payloadSize`, then the `payloadSize` payload bytes
+    are borrowed verbatim without interpretation (the per-type
+    `sei_payload()` body in Annex D is a later increment). Per §7.4.6
+    `payloadSize` is in RBSP bytes and "shall be equal to the number of
+    RBSP bytes in the SEI message payload", so a `payloadSize` larger
+    than the bytes remaining after the size loop, a truncated
+    type/size run, an empty RBSP, and a `u32`-overflowing accumulation
+    are all rejected. `consumed_bytes` (type-byte run + size-byte run +
+    payload) lets a caller advance to the next message in the
+    §7.3.2.9 loop. Both loops are byte-granular and an SEI message
+    begins byte-aligned within `sei_rbsp()`, so the parser walks the
+    RBSP byte slice directly (no `BitReader`).
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named
