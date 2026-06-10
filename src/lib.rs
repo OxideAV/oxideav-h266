@@ -212,6 +212,7 @@ pub mod sao_syntax;
 pub mod sbtmvp;
 pub mod scan;
 pub mod sei_message;
+pub mod sei_rbsp;
 pub mod slice_header;
 pub mod sps;
 pub mod syntax_enc;

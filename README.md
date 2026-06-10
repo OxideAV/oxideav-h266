@@ -120,6 +120,24 @@ oxideav-h266 = "0.0"
     §7.3.2.9 loop. Both loops are byte-granular and an SEI message
     begins byte-aligned within `sei_rbsp()`, so the parser walks the
     RBSP byte slice directly (no `BitReader`).
+  * **sei_rbsp()** (§7.3.2.9 / §7.4.3.9) — round-274 adds
+    `sei_rbsp::parse_sei_rbsp` returning a `SeiRbsp { messages }` that
+    drives `parse_sei_message` through the `do { sei_message() } while(
+    more_rbsp_data() )` loop and validates the terminating
+    `rbsp_trailing_bits()` byte. Because every `sei_message()` is
+    byte-aligned and byte-granular, §7.4.3.9's `more_rbsp_data()`
+    (locate the last `1` bit — the `rbsp_stop_one_bit` of
+    `rbsp_trailing_bits()` — and return TRUE while data precedes it)
+    reduces to "strictly more than the single `0x80` trailing byte
+    remains". The walker therefore consumes messages until one byte is
+    left, restricting each message's view to everything before that
+    byte so a `payloadSize` that would swallow the `0x80` tail is
+    rejected as an overrun, then requires the lone remaining byte to be
+    the canonical `0x80` `rbsp_trailing_bits()` encoding (§7.3.2.16);
+    each returned message's payload is re-borrowed against the caller's
+    buffer. Rejects the empty RBSP, a non-`0x80` tail, a missing
+    trailing byte, a trailing-swallowing `payloadSize`, and a truncated
+    type/size run inside the loop.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()`
   walked end-to-end including the V4 (01/2026) §7.3.3.2
   `general_constraints_info()` body. Round-245 surfaces every named
