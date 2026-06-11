@@ -36,6 +36,28 @@ oxideav-h266 = "0.0"
   * **PPS** (§7.3.2.4) — picture parameter set.
   * **APS** (§7.3.2.5) — adaptation parameter set (ALF / LMCS /
     scaling-list type, parameters walked).
+    * **LMCS data** (§7.3.2.19 / §7.4.3.19) — round-278 replaces the
+      previously-opaque LMCS APS payload with a typed
+      `lmcs::LmcsData` produced by `lmcs::parse_lmcs_data` and
+      attached to `AdaptationParameterSet::lmcs_data`. The parser
+      walks `lmcs_min_bin_idx` / `lmcs_delta_max_bin_idx` /
+      `lmcs_delta_cw_prec_minus1`, the per-bin
+      `lmcs_delta_abs_cw[ i ]` (`u(prec_minus1 + 1)`) + conditional
+      `lmcs_delta_sign_cw_flag[ i ]` loop over
+      `lmcs_min_bin_idx ..= LmcsMaxBinIdx`, and the
+      `aps_chroma_present_flag`-gated `lmcs_delta_abs_crs` /
+      `lmcs_delta_sign_crs_flag` tail, enforcing the §7.4.3.19
+      parse-time ranges (`lmcs_min_bin_idx <= 15`,
+      `lmcs_delta_max_bin_idx <= 15`,
+      `LmcsMaxBinIdx >= lmcs_min_bin_idx`,
+      `lmcs_delta_cw_prec_minus1 <= 14`) and the not-present
+      inferences (sign flags / crs default 0). The two pure-data
+      sign folds eq. 94 (`lmcsDeltaCW[ i ]`) and eq. 99
+      (`lmcsDeltaCrs`) are exposed as accessors; the
+      BitDepth-dependent eq. 93 / 95 – 98 / 100 derivations
+      (`OrgCW`, `lmcsCW` bands, pivots, scale coefficients) and the
+      §8.7 reshaping processes are the follow-up picture-level fuse
+      that binds an LMCS APS to an active SPS.
 * **Auxiliary NAL units**
   * **AUD** (§7.3.2.10) — access-unit delimiter. Round-250 adds
     `aud::parse_access_unit_delimiter` returning an

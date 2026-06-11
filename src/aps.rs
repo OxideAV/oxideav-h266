@@ -7,12 +7,15 @@
 //! and turn it into the spec's [`AlfApsData`] arrays
 //! (`AlfCoeffL[]`, `AlfClipL[]`, `AlfCoeffC[]`, `AlfClipC[]`,
 //! `CcAlfApsCoeffCb[]`, `CcAlfApsCoeffCr[]`) so the §8.8.5 ALF apply
-//! pass can index into them by APS id. LMCS / scaling-list payloads
-//! remain opaque (still kept around verbatim).
+//! pass can index into them by APS id. For LMCS APSes we walk the
+//! §7.3.2.19 `lmcs_data()` payload into a typed
+//! [`crate::lmcs::LmcsData`] (round 278). Scaling-list payloads remain
+//! opaque (still kept around verbatim).
 
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::lmcs::{parse_lmcs_data, LmcsData};
 
 /// Number of ALF luma classes per APS — §7.4.3.18 sets `NumAlfFilters = 25`.
 pub const NUM_ALF_FILTERS: usize = 25;
@@ -106,9 +109,12 @@ pub struct AdaptationParameterSet {
     /// Decoded ALF payload — `Some` iff `aps_params_type == Alf` and the
     /// payload was parsed successfully.
     pub alf_data: Option<AlfApsData>,
+    /// Decoded LMCS payload — `Some` iff `aps_params_type == Lmcs` and
+    /// the §7.3.2.19 `lmcs_data()` payload was parsed successfully.
+    pub lmcs_data: Option<LmcsData>,
     /// Raw APS payload bytes (full RBSP, including the 9-bit header).
-    /// Useful for LMCS / scaling-list APSes that this round does not
-    /// dispatch into a typed structure.
+    /// Useful for scaling-list APSes that this round does not dispatch
+    /// into a typed structure.
     pub payload: Vec<u8>,
 }
 
@@ -149,11 +155,17 @@ pub fn parse_aps(rbsp: &[u8]) -> Result<AdaptationParameterSet> {
     } else {
         None
     };
+    let lmcs_data = if matches!(aps_params_type, ApsParamsType::Lmcs) {
+        Some(parse_lmcs_data(&mut br, aps_chroma_present_flag)?)
+    } else {
+        None
+    };
     Ok(AdaptationParameterSet {
         aps_params_type,
         aps_adaptation_parameter_set_id,
         aps_chroma_present_flag,
         alf_data,
+        lmcs_data,
         payload: rbsp.to_vec(),
     })
 }
@@ -390,6 +402,64 @@ mod tests {
         // All filter coefficients are zero (every alf_luma_coeff_abs = 0,
         // sign skipped per spec).
         assert!(alf.luma_coeff.iter().all(|row| row.iter().all(|&v| v == 0)));
+    }
+
+    #[test]
+    fn lmcs_aps_dispatches_into_typed_lmcs_data() {
+        // type=1 (LMCS), id=2, chroma_present=1, then a §7.3.2.19
+        // lmcs_data() payload assembled with the crate BitWriter:
+        //   lmcs_min_bin_idx = 1, lmcs_delta_max_bin_idx = 13
+        //   (LmcsMaxBinIdx = 2 → bins 1..=2), prec_minus1 = 1 (2-bit abs),
+        //   abs[1] = 2 sign 1, abs[2] = 0, crs abs = 5 sign 0.
+        use crate::encoder::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bits(1, 3); // aps_params_type = LMCS
+        bw.write_bits(2, 5); // aps_adaptation_parameter_set_id
+        bw.write_bit(1); // aps_chroma_present_flag
+        bw.write_ue(1); // lmcs_min_bin_idx
+        bw.write_ue(13); // lmcs_delta_max_bin_idx
+        bw.write_ue(1); // lmcs_delta_cw_prec_minus1
+        bw.write_bits(2, 2); // lmcs_delta_abs_cw[1]
+        bw.write_bit(1); // lmcs_delta_sign_cw_flag[1]
+        bw.write_bits(0, 2); // lmcs_delta_abs_cw[2] (sign absent)
+        bw.write_bits(5, 3); // lmcs_delta_abs_crs
+        bw.write_bit(0); // lmcs_delta_sign_crs_flag
+        bw.rbsp_trailing_bits();
+        let aps = parse_aps(&bw.into_bytes()).unwrap();
+        assert_eq!(aps.aps_params_type, ApsParamsType::Lmcs);
+        assert_eq!(aps.aps_adaptation_parameter_set_id, 2);
+        assert!(aps.alf_data.is_none());
+        let lmcs = aps.lmcs_data.as_ref().unwrap();
+        assert_eq!(lmcs.lmcs_min_bin_idx, 1);
+        assert_eq!(lmcs.lmcs_max_bin_idx(), 2);
+        assert_eq!(lmcs.lmcs_delta_cw(1), -2);
+        assert_eq!(lmcs.lmcs_delta_cw(2), 0);
+        assert_eq!(lmcs.lmcs_delta_crs(), 5);
+    }
+
+    #[test]
+    fn alf_aps_has_no_lmcs_data() {
+        // Reuse the alf_aps_header fixture shape: ALF APSes must not
+        // populate the LMCS payload slot.
+        let header_byte = 0b0000_0011u8;
+        let mut bits = String::from("1100001");
+        for _ in 0..12 {
+            bits.push('1');
+        }
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let mut data = vec![header_byte];
+        for chunk in bits.as_bytes().chunks(8) {
+            let mut b = 0u8;
+            for &c in chunk {
+                b = (b << 1) | (c - b'0');
+            }
+            data.push(b);
+        }
+        let aps = parse_aps(&data).unwrap();
+        assert_eq!(aps.aps_params_type, ApsParamsType::Alf);
+        assert!(aps.lmcs_data.is_none());
     }
 
     #[test]

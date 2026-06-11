@@ -190,6 +190,7 @@ pub mod inter;
 pub mod intra;
 pub mod isp;
 pub mod leaf_cu;
+pub mod lmcs;
 pub mod mip;
 pub mod mip_tables;
 pub mod mvd_coding_enc;
