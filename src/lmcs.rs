@@ -6,17 +6,20 @@
 //! plus the two pure-data sign folds that need no SPS context:
 //! eq. 94 (`lmcsDeltaCW[ i ]`) and eq. 99 (`lmcsDeltaCrs`).
 //!
-//! Deliberately **not** here yet (BitDepth-dependent §7.4.3.19
-//! derivations + the §8.7.4.2 / §8.7.5.2 reshaping processes; follow-up
-//! rounds): eq. 93 `OrgCW`, eq. 95 `lmcsCW[ i ]` + its
-//! `OrgCW >> 3 ..= (OrgCW << 3) − 1` conformance band, the eq. 96
-//! `Σ lmcsCW[ i ] <= (1 << BitDepth) − 1` budget, eqs. 97 / 98
-//! `InputPivot` / `LmcsPivot` / `ScaleCoeff` / `InvScaleCoeff`, the
-//! `LmcsPivot` bin-crossing conformance clause, the
+//! Round 281 adds the **BitDepth-dependent §7.4.3.19 derivations** as
+//! [`LmcsDerived`] / [`derive_lmcs`] — the picture-level fuse that binds
+//! an LMCS APS to an active SPS' `BitDepth` (eq. 38): eq. 93 `OrgCW`,
+//! eq. 95 `lmcsCW[ i ]` + its `OrgCW >> 3 ..= (OrgCW << 3) − 1`
+//! conformance band, the eq. 96 `Σ lmcsCW[ i ] <= (1 << BitDepth) − 1`
+//! budget, eq. 97 `InputPivot`, eq. 98 `LmcsPivot` / `ScaleCoeff` /
+//! `InvScaleCoeff`, the `LmcsPivot` bin-crossing conformance clause, the
 //! `lmcsCW[ i ] + lmcsDeltaCrs` joint band, and eq. 100
-//! `ChromaScaleCoeff`. Those all need `BitDepth` (an SPS-side quantity
-//! the APS cannot see), so they belong to the picture-level fuse that
-//! binds an LMCS APS to an active SPS.
+//! `ChromaScaleCoeff`.
+//!
+//! Deliberately **not** here yet (follow-up rounds): the §8.7.4.2
+//! picture-sample forward mapping, the §8.7.4.3 inverse mapping, and the
+//! §8.7.5.3 chroma-residual scaling processes that consume these derived
+//! arrays.
 
 use oxideav_core::{Error, Result};
 
@@ -92,6 +95,173 @@ impl LmcsData {
         let sign = if self.lmcs_delta_sign_crs_flag { -1 } else { 1 };
         sign * i32::from(self.lmcs_delta_abs_crs)
     }
+
+    /// Run the BitDepth-dependent §7.4.3.19 derivations against an
+    /// active SPS' `BitDepth` (eq. 38). See [`derive_lmcs`].
+    pub fn derive(&self, bit_depth: u32) -> Result<LmcsDerived> {
+        derive_lmcs(self, bit_depth)
+    }
+}
+
+/// BitDepth-dependent §7.4.3.19 derived variables for one LMCS APS
+/// bound to an active SPS — the inputs of the §8.7.4 luma mapping and
+/// §8.7.5.3 chroma-residual scaling processes.
+///
+/// Produced by [`derive_lmcs`] / [`LmcsData::derive`]; every conformance
+/// constraint the §7.4.3.19 semantics attach to these variables is
+/// checked at derivation time, so a successfully constructed value
+/// carries spec-conforming arrays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LmcsDerived {
+    /// `BitDepth` the derivation ran against (eq. 38; 8..=16).
+    pub bit_depth: u32,
+    /// Eq. 93: `OrgCW = ( 1 << BitDepth ) / 16`.
+    pub org_cw: u32,
+    /// Eq. 95 (and its two "set equal 0" arms): per-bin codeword count.
+    /// `lmcsCW[ i ] = OrgCW + lmcsDeltaCW[ i ]` inside the signalled
+    /// window, 0 outside.
+    pub lmcs_cw: [u32; LMCS_NUM_BINS],
+    /// Eq. 97: `InputPivot[ i ] = i * OrgCW`, `i = 0..15`.
+    pub input_pivot: [u32; LMCS_NUM_BINS],
+    /// Eq. 98: `LmcsPivot[ 0 ] = 0`;
+    /// `LmcsPivot[ i + 1 ] = LmcsPivot[ i ] + lmcsCW[ i ]`, `i = 0..15`.
+    pub lmcs_pivot: [u32; LMCS_NUM_BINS + 1],
+    /// Eq. 98: `ScaleCoeff[ i ] = ( lmcsCW[ i ] * ( 1 << 11 ) +
+    /// ( 1 << ( Log2( OrgCW ) − 1 ) ) ) >> Log2( OrgCW )`.
+    pub scale_coeff: [u32; LMCS_NUM_BINS],
+    /// Eq. 98: `InvScaleCoeff[ i ] = OrgCW * ( 1 << 11 ) / lmcsCW[ i ]`
+    /// when `lmcsCW[ i ] != 0`, else 0.
+    pub inv_scale_coeff: [u32; LMCS_NUM_BINS],
+    /// Eq. 99 fold carried over from the parsed payload.
+    pub lmcs_delta_crs: i32,
+    /// Eq. 100: `ChromaScaleCoeff[ i ] = OrgCW * ( 1 << 11 ) /
+    /// ( lmcsCW[ i ] + lmcsDeltaCrs )` when `lmcsCW[ i ] != 0`, else
+    /// `1 << 11`.
+    pub chroma_scale_coeff: [u32; LMCS_NUM_BINS],
+}
+
+/// Run the BitDepth-dependent §7.4.3.19 derivations (eqs. 93 / 95 – 98 /
+/// 100) for a parsed [`LmcsData`] payload bound to an active SPS'
+/// `BitDepth` (eq. 38: `8 + sps_bitdepth_minus8`, so 8..=16 given the
+/// §7.4.3.4 `sps_bitdepth_minus8` 0..=8 range).
+///
+/// The §7.4.3.19 bitstream-conformance constraints that only become
+/// checkable once `BitDepth` is known are enforced here and surface as
+/// `Error::invalid`:
+/// * eq. 95 band — `lmcsCW[ i ]` shall be in
+///   `OrgCW >> 3 ..= ( OrgCW << 3 ) − 1` for every signalled bin;
+/// * eq. 96 budget — `Σ lmcsCW[ i ] <= ( 1 << BitDepth ) − 1`;
+/// * the eq. 98 follow-on clause — for `i =
+///   lmcs_min_bin_idx..LmcsMaxBinIdx`, when `LmcsPivot[ i ]` is not a
+///   multiple of `1 << ( BitDepth − 5 )`, `LmcsPivot[ i ] >>
+///   ( BitDepth − 5 )` shall differ from `LmcsPivot[ i + 1 ] >>
+///   ( BitDepth − 5 )`;
+/// * the eq. 99 follow-on joint band — when `lmcsCW[ i ] != 0`,
+///   `lmcsCW[ i ] + lmcsDeltaCrs` shall be in
+///   `OrgCW >> 3 ..= ( OrgCW << 3 ) − 1` (this also keeps the eq. 100
+///   divisor strictly positive).
+pub fn derive_lmcs(data: &LmcsData, bit_depth: u32) -> Result<LmcsDerived> {
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "h266 LMCS: BitDepth out of range (expected 8..=16, got {bit_depth})"
+        )));
+    }
+
+    // Eq. 93. (1 << BitDepth) is a power of two >= 256, so the /16 is
+    // exact: OrgCW = 1 << (BitDepth - 4) and Log2(OrgCW) = BitDepth - 4.
+    let org_cw = (1u32 << bit_depth) / 16;
+    let log2_org_cw = bit_depth - 4;
+    let band_lo = org_cw >> 3;
+    let band_hi = (org_cw << 3) - 1;
+
+    let min = usize::from(data.lmcs_min_bin_idx);
+    let max = usize::from(data.lmcs_max_bin_idx());
+
+    // Eq. 95 with its two "set equal 0" arms + the per-bin band check.
+    let mut lmcs_cw = [0u32; LMCS_NUM_BINS];
+    for (i, cw) in lmcs_cw.iter_mut().enumerate().take(max + 1).skip(min) {
+        let v = org_cw as i64 + i64::from(data.lmcs_delta_cw(i));
+        if v < i64::from(band_lo) || v > i64::from(band_hi) {
+            return Err(Error::invalid(format!(
+                "h266 LMCS: lmcsCW[{i}] = {v} outside OrgCW >> 3 ..= (OrgCW << 3) - 1 \
+                 ({band_lo}..={band_hi}) at BitDepth {bit_depth}"
+            )));
+        }
+        *cw = v as u32;
+    }
+
+    // Eq. 96 codeword budget.
+    let total: u32 = lmcs_cw.iter().sum();
+    if total > (1u32 << bit_depth) - 1 {
+        return Err(Error::invalid(format!(
+            "h266 LMCS: sum of lmcsCW ({total}) exceeds (1 << BitDepth) - 1 ({})",
+            (1u32 << bit_depth) - 1
+        )));
+    }
+
+    // Eq. 97.
+    let mut input_pivot = [0u32; LMCS_NUM_BINS];
+    for (i, p) in input_pivot.iter_mut().enumerate() {
+        *p = i as u32 * org_cw;
+    }
+
+    // Eq. 98 loop: pivots + forward/inverse luma scale coefficients.
+    let mut lmcs_pivot = [0u32; LMCS_NUM_BINS + 1];
+    let mut scale_coeff = [0u32; LMCS_NUM_BINS];
+    let mut inv_scale_coeff = [0u32; LMCS_NUM_BINS];
+    for i in 0..LMCS_NUM_BINS {
+        lmcs_pivot[i + 1] = lmcs_pivot[i] + lmcs_cw[i];
+        scale_coeff[i] = (lmcs_cw[i] * (1 << 11) + (1 << (log2_org_cw - 1))) >> log2_org_cw;
+        // The checked_div zero arm is exactly the eq. 98
+        // `if( lmcsCW[ i ] == 0 ) InvScaleCoeff[ i ] = 0` branch.
+        inv_scale_coeff[i] = (org_cw * (1 << 11)).checked_div(lmcs_cw[i]).unwrap_or(0);
+    }
+
+    // Eq. 98 follow-on bin-crossing conformance clause.
+    let shift = bit_depth - 5;
+    for i in min..=max {
+        if lmcs_pivot[i] % (1u32 << shift) != 0
+            && (lmcs_pivot[i] >> shift) == (lmcs_pivot[i + 1] >> shift)
+        {
+            return Err(Error::invalid(format!(
+                "h266 LMCS: LmcsPivot[{i}] = {} is not a multiple of 1 << (BitDepth - 5) and \
+                 LmcsPivot[{i}] >> (BitDepth - 5) == LmcsPivot[{}] >> (BitDepth - 5) ({})",
+                lmcs_pivot[i],
+                i + 1,
+                lmcs_pivot[i] >> shift
+            )));
+        }
+    }
+
+    // Eq. 99 follow-on joint band + eq. 100 chroma scale coefficients.
+    let lmcs_delta_crs = data.lmcs_delta_crs();
+    let mut chroma_scale_coeff = [0u32; LMCS_NUM_BINS];
+    for i in 0..LMCS_NUM_BINS {
+        chroma_scale_coeff[i] = if lmcs_cw[i] == 0 {
+            1 << 11
+        } else {
+            let joint = i64::from(lmcs_cw[i]) + i64::from(lmcs_delta_crs);
+            if joint < i64::from(band_lo) || joint > i64::from(band_hi) {
+                return Err(Error::invalid(format!(
+                    "h266 LMCS: lmcsCW[{i}] + lmcsDeltaCrs = {joint} outside \
+                     OrgCW >> 3 ..= (OrgCW << 3) - 1 ({band_lo}..={band_hi}) at BitDepth {bit_depth}"
+                )));
+            }
+            org_cw * (1 << 11) / joint as u32
+        };
+    }
+
+    Ok(LmcsDerived {
+        bit_depth,
+        org_cw,
+        lmcs_cw,
+        input_pivot,
+        lmcs_pivot,
+        scale_coeff,
+        inv_scale_coeff,
+        lmcs_delta_crs,
+        chroma_scale_coeff,
+    })
 }
 
 /// Parse a §7.3.2.19 `lmcs_data()` payload from the bit position the
@@ -403,6 +573,285 @@ mod tests {
         assert_eq!(got, d);
         assert!(!got.lmcs_delta_sign_cw_flag[0]);
         assert_eq!(got.lmcs_delta_cw(1), -2);
+    }
+
+    /// Test-fixture payload: full window at BitDepth 8 with a single
+    /// −1 delta on bin 0 so the eq. 96 budget (255) is met exactly.
+    fn near_identity_bd8() -> LmcsData {
+        let mut d = LmcsData {
+            lmcs_delta_cw_prec_minus1: 0,
+            ..Default::default()
+        };
+        d.lmcs_delta_abs_cw[0] = 1;
+        d.lmcs_delta_sign_cw_flag[0] = true;
+        d
+    }
+
+    #[test]
+    fn derive_org_cw_across_bit_depths() {
+        // Eq. 93 at every legal BitDepth (§7.4.3.4: 8..=16), using a
+        // single-bin window with a zero delta (sum = OrgCW <= budget).
+        let d = LmcsData {
+            lmcs_delta_max_bin_idx: 15, // window = bin 0 only
+            ..Default::default()
+        };
+        for (bd, want) in [
+            (8u32, 16u32),
+            (9, 32),
+            (10, 64),
+            (11, 128),
+            (12, 256),
+            (13, 512),
+            (14, 1024),
+            (15, 2048),
+            (16, 4096),
+        ] {
+            let got = derive_lmcs(&d, bd).unwrap();
+            assert_eq!(got.org_cw, want, "OrgCW at BitDepth {bd}");
+            assert_eq!(got.lmcs_cw[0], want);
+            assert_eq!(
+                got.scale_coeff[0],
+                1 << 11,
+                "identity bin scales to 1 << 11"
+            );
+            assert_eq!(got.inv_scale_coeff[0], 1 << 11);
+        }
+    }
+
+    #[test]
+    fn derive_rejects_bit_depth_out_of_range() {
+        let d = near_identity_bd8();
+        assert!(derive_lmcs(&d, 7).is_err());
+        assert!(derive_lmcs(&d, 17).is_err());
+    }
+
+    #[test]
+    fn derive_near_identity_full_window_bd8() {
+        // OrgCW = 16; lmcsCW = [15, 16, 16, ...]; budget 255 met exactly.
+        let got = near_identity_bd8().derive(8).unwrap();
+        assert_eq!(got.org_cw, 16);
+        assert_eq!(got.lmcs_cw[0], 15);
+        for i in 1..LMCS_NUM_BINS {
+            assert_eq!(got.lmcs_cw[i], 16);
+        }
+        assert_eq!(got.lmcs_cw.iter().sum::<u32>(), 255);
+        // Eq. 97: InputPivot[ i ] = i * OrgCW.
+        for i in 0..LMCS_NUM_BINS {
+            assert_eq!(got.input_pivot[i], i as u32 * 16);
+        }
+        // Eq. 98 pivots: 0, 15, 31, ..., 255.
+        assert_eq!(got.lmcs_pivot[0], 0);
+        for i in 1..=LMCS_NUM_BINS {
+            assert_eq!(got.lmcs_pivot[i], 15 + 16 * (i as u32 - 1));
+        }
+        // Eq. 98 scale coefficients, worked by hand at Log2(OrgCW) = 4:
+        // bin 0: (15 * 2048 + 8) >> 4 = 1920; inv = 32768 / 15 = 2184.
+        assert_eq!(got.scale_coeff[0], 1920);
+        assert_eq!(got.inv_scale_coeff[0], 2184);
+        for i in 1..LMCS_NUM_BINS {
+            assert_eq!(got.scale_coeff[i], 2048);
+            assert_eq!(got.inv_scale_coeff[i], 2048);
+        }
+        // Eq. 100 with lmcsDeltaCrs = 0 mirrors InvScaleCoeff here.
+        assert_eq!(got.lmcs_delta_crs, 0);
+        assert_eq!(got.chroma_scale_coeff[0], 2184);
+        for i in 1..LMCS_NUM_BINS {
+            assert_eq!(got.chroma_scale_coeff[i], 2048);
+        }
+    }
+
+    #[test]
+    fn derive_rejects_full_window_identity_budget() {
+        // All-zero deltas over the full window put Σ lmcsCW at exactly
+        // 1 << BitDepth — one codeword past the eq. 96 budget — at every
+        // bit depth, so the all-default payload is non-conforming.
+        let d = LmcsData::default();
+        for bd in 8..=16 {
+            let err = derive_lmcs(&d, bd).unwrap_err();
+            assert!(
+                err.to_string().contains("sum of lmcsCW"),
+                "BitDepth {bd}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_narrowed_window_zero_bins_bd10() {
+        // BitDepth 10 (OrgCW = 64), window bins 1..=14, all deltas zero:
+        // outside bins take the eq. 95 "set equal 0" arms.
+        let d = LmcsData {
+            lmcs_min_bin_idx: 1,
+            lmcs_delta_max_bin_idx: 1,
+            ..Default::default()
+        };
+        let got = d.derive(10).unwrap();
+        assert_eq!(got.lmcs_cw[0], 0);
+        assert_eq!(got.lmcs_cw[15], 0);
+        for i in 1..=14 {
+            assert_eq!(got.lmcs_cw[i], 64);
+            assert_eq!(got.scale_coeff[i], 2048);
+            assert_eq!(got.inv_scale_coeff[i], 2048);
+            assert_eq!(got.chroma_scale_coeff[i], 2048);
+        }
+        // Zero bins: ScaleCoeff rounds (0 + 32) >> 6 to 0; InvScaleCoeff
+        // takes the eq. 98 zero arm; ChromaScaleCoeff the eq. 100
+        // 1 << 11 arm.
+        for i in [0usize, 15] {
+            assert_eq!(got.scale_coeff[i], 0);
+            assert_eq!(got.inv_scale_coeff[i], 0);
+            assert_eq!(got.chroma_scale_coeff[i], 1 << 11);
+        }
+        // Pivot stays flat across zero bins: 0, 0, 64, ..., 896, 896.
+        assert_eq!(got.lmcs_pivot[1], 0);
+        assert_eq!(got.lmcs_pivot[15], 896);
+        assert_eq!(got.lmcs_pivot[16], 896);
+    }
+
+    #[test]
+    fn derive_lmcs_cw_band_boundaries_bd8() {
+        // Band at BitDepth 8 is OrgCW >> 3 ..= (OrgCW << 3) − 1 = 2..=127.
+        let mut d = LmcsData {
+            lmcs_delta_max_bin_idx: 15, // single-bin window
+            lmcs_delta_cw_prec_minus1: 6,
+            ..Default::default()
+        };
+        // lmcsCW = 16 − 14 = 2: lower boundary accepted.
+        d.lmcs_delta_abs_cw[0] = 14;
+        d.lmcs_delta_sign_cw_flag[0] = true;
+        let got = d.derive(8).unwrap();
+        assert_eq!(got.lmcs_cw[0], 2);
+        assert_eq!(got.scale_coeff[0], 256); // (2 * 2048 + 8) >> 4
+        assert_eq!(got.inv_scale_coeff[0], 16384); // 32768 / 2
+                                                   // lmcsCW = 16 − 15 = 1 < 2: rejected.
+        d.lmcs_delta_abs_cw[0] = 15;
+        assert!(d.derive(8).is_err());
+        // lmcsCW = 16 + 111 = 127: upper boundary accepted.
+        d.lmcs_delta_abs_cw[0] = 111;
+        d.lmcs_delta_sign_cw_flag[0] = false;
+        let got = d.derive(8).unwrap();
+        assert_eq!(got.lmcs_cw[0], 127);
+        assert_eq!(got.scale_coeff[0], 16256); // (127 * 2048 + 8) >> 4
+        assert_eq!(got.inv_scale_coeff[0], 258); // 32768 / 127
+                                                 // lmcsCW = 16 + 112 = 128 > 127: rejected.
+        d.lmcs_delta_abs_cw[0] = 112;
+        assert!(d.derive(8).is_err());
+    }
+
+    #[test]
+    fn derive_band_upper_boundary_bd16() {
+        // BitDepth 16: OrgCW = 4096, band 512..=32767, budget 65535.
+        let mut d = LmcsData {
+            lmcs_delta_max_bin_idx: 15,
+            lmcs_delta_cw_prec_minus1: 14,
+            ..Default::default()
+        };
+        d.lmcs_delta_abs_cw[0] = 28671; // lmcsCW = 32767 = band max
+        let got = d.derive(16).unwrap();
+        assert_eq!(got.lmcs_cw[0], 32767);
+        // (32767 * 2048 + 2048) >> 12 = 2^26 >> 12 = 16384.
+        assert_eq!(got.scale_coeff[0], 16384);
+        assert_eq!(got.inv_scale_coeff[0], 256); // 8388608 / 32767
+        d.lmcs_delta_abs_cw[0] = 28672; // 32768: one past the band
+        assert!(d.derive(16).is_err());
+    }
+
+    #[test]
+    fn derive_pivot_bin_crossing_clause_bd8() {
+        // Window bins 0..=1 with lmcsCW = [2, 2]: LmcsPivot[1] = 2 is not
+        // a multiple of 1 << (BitDepth − 5) = 8 and LmcsPivot[1] >> 3 ==
+        // LmcsPivot[2] >> 3 (both 0) → non-conforming per the eq. 98
+        // follow-on clause.
+        let mut d = LmcsData {
+            lmcs_delta_max_bin_idx: 14,
+            lmcs_delta_cw_prec_minus1: 6,
+            ..Default::default()
+        };
+        d.lmcs_delta_abs_cw[0] = 14;
+        d.lmcs_delta_sign_cw_flag[0] = true;
+        d.lmcs_delta_abs_cw[1] = 14;
+        d.lmcs_delta_sign_cw_flag[1] = true;
+        let err = d.derive(8).unwrap_err();
+        assert!(err.to_string().contains("LmcsPivot"), "{err}");
+        // Same LmcsPivot[1] = 2 but lmcsCW[1] = 127 pushes LmcsPivot[2]
+        // to 129 → the two >> 3 values differ (0 vs 16) → conforming.
+        d.lmcs_delta_abs_cw[1] = 111;
+        d.lmcs_delta_sign_cw_flag[1] = false;
+        let got = d.derive(8).unwrap();
+        assert_eq!(got.lmcs_pivot[1], 2);
+        assert_eq!(got.lmcs_pivot[2], 129);
+    }
+
+    #[test]
+    fn derive_chroma_joint_band_and_eq100_bd8() {
+        // lmcsDeltaCrs = −7 on the near-identity payload: joint values
+        // 15 − 7 = 8 and 16 − 7 = 9 stay inside 2..=127.
+        let mut d = near_identity_bd8();
+        d.lmcs_delta_abs_crs = 7;
+        d.lmcs_delta_sign_crs_flag = true;
+        let got = d.derive(8).unwrap();
+        assert_eq!(got.lmcs_delta_crs, -7);
+        assert_eq!(got.chroma_scale_coeff[0], 4096); // 32768 / 8
+        for i in 1..LMCS_NUM_BINS {
+            assert_eq!(got.chroma_scale_coeff[i], 3640); // 32768 / 9
+        }
+        // Luma arrays are unaffected by lmcsDeltaCrs.
+        assert_eq!(got.inv_scale_coeff[1], 2048);
+    }
+
+    #[test]
+    fn derive_rejects_joint_band_violations_bd8() {
+        // lmcsCW = 2 (band floor) + lmcsDeltaCrs = −1 → joint 1 < 2.
+        let mut d = LmcsData {
+            lmcs_delta_max_bin_idx: 15,
+            lmcs_delta_cw_prec_minus1: 6,
+            ..Default::default()
+        };
+        d.lmcs_delta_abs_cw[0] = 14;
+        d.lmcs_delta_sign_cw_flag[0] = true;
+        d.lmcs_delta_abs_crs = 1;
+        d.lmcs_delta_sign_crs_flag = true;
+        let err = d.derive(8).unwrap_err();
+        assert!(err.to_string().contains("lmcsDeltaCrs"), "{err}");
+        // lmcsCW = 127 (band ceiling) + lmcsDeltaCrs = +1 → joint 128.
+        d.lmcs_delta_abs_cw[0] = 111;
+        d.lmcs_delta_sign_cw_flag[0] = false;
+        d.lmcs_delta_sign_crs_flag = false;
+        assert!(d.derive(8).is_err());
+    }
+
+    #[test]
+    fn derive_joint_band_skips_zero_bins() {
+        // A non-zero lmcsDeltaCrs must not trip the joint band on bins
+        // where lmcsCW = 0 (the constraint is gated on lmcsCW != 0); the
+        // zero bins still take the eq. 100 1 << 11 arm.
+        let mut d = LmcsData {
+            lmcs_min_bin_idx: 4,
+            lmcs_delta_max_bin_idx: 11, // window = bin 4 only
+            ..Default::default()
+        };
+        d.lmcs_delta_abs_crs = 7;
+        d.lmcs_delta_sign_crs_flag = true;
+        let got = d.derive(8).unwrap();
+        assert_eq!(got.chroma_scale_coeff[4], 3640); // 32768 / (16 − 7)
+        for i in (0..LMCS_NUM_BINS).filter(|&i| i != 4) {
+            assert_eq!(got.chroma_scale_coeff[i], 1 << 11);
+        }
+    }
+
+    #[test]
+    fn parse_then_derive_integration() {
+        // Wire-level §7.3.2.19 payload → parse_lmcs_data → derive_lmcs,
+        // matching a direct derive on the equivalent struct.
+        let d = near_identity_bd8();
+        let mut bw = BitWriter::new();
+        write_lmcs_data(&mut bw, &d, false);
+        bw.rbsp_trailing_bits();
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_lmcs_data(&mut br, false).unwrap();
+        let got = parsed.derive(8).unwrap();
+        assert_eq!(got, derive_lmcs(&d, 8).unwrap());
+        assert_eq!(got.lmcs_pivot[16], 255);
     }
 
     #[test]

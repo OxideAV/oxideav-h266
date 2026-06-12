@@ -53,11 +53,34 @@ oxideav-h266 = "0.0"
       `lmcs_delta_cw_prec_minus1 <= 14`) and the not-present
       inferences (sign flags / crs default 0). The two pure-data
       sign folds eq. 94 (`lmcsDeltaCW[ i ]`) and eq. 99
-      (`lmcsDeltaCrs`) are exposed as accessors; the
-      BitDepth-dependent eq. 93 / 95 – 98 / 100 derivations
-      (`OrgCW`, `lmcsCW` bands, pivots, scale coefficients) and the
-      §8.7 reshaping processes are the follow-up picture-level fuse
-      that binds an LMCS APS to an active SPS.
+      (`lmcsDeltaCrs`) are exposed as accessors. Round-281 lands
+      the **BitDepth-dependent §7.4.3.19 derivations** —
+      `lmcs::LmcsDerived` produced by `lmcs::derive_lmcs` /
+      `LmcsData::derive(bit_depth)`, the picture-level fuse that
+      binds an LMCS APS to an active SPS' `BitDepth` (eq. 38,
+      8..=16): eq. 93 `OrgCW = (1 << BitDepth) / 16`, eq. 95
+      `lmcsCW[ i ]` with its two "set equal 0" arms, eq. 97
+      `InputPivot`, and the eq. 98 loop (`LmcsPivot[ 0..=16 ]`,
+      `ScaleCoeff`, `InvScaleCoeff` with the `lmcsCW == 0` zero
+      arm), plus eq. 100 `ChromaScaleCoeff` (the `1 << 11` zero-bin
+      arm and the `OrgCW * 2048 / (lmcsCW + lmcsDeltaCrs)`
+      divisor). Every §7.4.3.19 conformance constraint that only
+      becomes checkable once `BitDepth` is known is enforced at
+      derivation time and surfaces as a typed error: the eq. 95
+      `OrgCW >> 3 ..= (OrgCW << 3) − 1` per-bin band, the eq. 96
+      `Σ lmcsCW <= (1 << BitDepth) − 1` budget (which notably
+      rejects the all-default full-window payload at every bit
+      depth — the identity mapping over 16 bins sums to
+      `1 << BitDepth`, one codeword past the budget), the eq. 98
+      follow-on `LmcsPivot` bin-crossing clause
+      (`LmcsPivot[ i ]` not a multiple of `1 << (BitDepth − 5)` ⇒
+      its `>> (BitDepth − 5)` must differ from
+      `LmcsPivot[ i + 1 ]`'s), and the eq. 99 follow-on joint band
+      on `lmcsCW[ i ] + lmcsDeltaCrs` (which also keeps the
+      eq. 100 divisor strictly positive). The §8.7.4.2 / §8.7.4.3
+      forward / inverse luma mapping and the §8.7.5.3
+      chroma-residual scaling processes that consume these derived
+      arrays are the follow-up.
 * **Auxiliary NAL units**
   * **AUD** (§7.3.2.10) — access-unit delimiter. Round-250 adds
     `aud::parse_access_unit_delimiter` returning an
