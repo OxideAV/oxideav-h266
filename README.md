@@ -77,10 +77,29 @@ oxideav-h266 = "0.0"
       its `>> (BitDepth − 5)` must differ from
       `LmcsPivot[ i + 1 ]`'s), and the eq. 99 follow-on joint band
       on `lmcsCW[ i ] + lmcsDeltaCrs` (which also keeps the
-      eq. 100 divisor strictly positive). The §8.7.4.2 / §8.7.4.3
-      forward / inverse luma mapping and the §8.7.5.3
-      chroma-residual scaling processes that consume these derived
-      arrays are the follow-up.
+      eq. 100 divisor strictly positive). Round-290 lands the
+      **sample-domain LMCS processes** that consume these derived
+      arrays, as pure per-sample folds on `LmcsDerived`: the §8.7.5.2
+      forward luma mapping (`forward_map_luma_sample` eq. 1213 `idxY =
+      predSample >> Log2(OrgCW)` + `LmcsPivot[idxY] + ((ScaleCoeff[idxY]
+      * (predSample − InputPivot[idxY]) + 2^10) >> 11)`, returned as the
+      unclamped `predMapSamples` intermediate, plus
+      `reconstruct_mapped_luma_sample` eq. 1214 `Clip1(predMap + res)`),
+      the §8.8.2.3 piecewise-function-index identification (`idx_y_inv`
+      eq. 1224 — scan `lmcs_min_bin_idx ..= LmcsMaxBinIdx` for the first
+      `LmcsPivot[idx+1]` strictly above the sample, then `Min(idx, 15)`),
+      the §8.8.2.2 inverse luma mapping (`inverse_map_luma_sample`
+      eqs. 1222 / 1223 `Clip1(InputPivot[idxYInv] + ((InvScaleCoeff[
+      idxYInv] * (luma − LmcsPivot[idxYInv]) + 2^10) >> 11))` — the
+      §8.8.2.1 in-loop pre-filter pass), and the §8.7.5.3 chroma residual
+      scaling (`chroma_var_scale` eq. 1218 `varScale =
+      ChromaScaleCoeff[idxYInv]` + `scale_chroma_residual_sample`
+      eq. 1219 `Clip3(−(1<<BitDepth), (1<<BitDepth)−1, res)` then eq. 1220
+      `Clip1(pred + Sign(res) * ((Abs(res) * varScale + 2^10) >> 11))`).
+      The picture-level orchestration — the §8.7.5.1 `sh_lmcs_used_flag`
+      / `CuPredMode` / `ciip_flag` gating, the §8.7.5.3 step-1
+      `invAvgLuma` neighbour averaging, and the §8.8.2.1 whole-picture
+      inverse pass — is the CTU-walker follow-up.
 * **Auxiliary NAL units**
   * **AUD** (§7.3.2.10) — access-unit delimiter. Round-250 adds
     `aud::parse_access_unit_delimiter` returning an

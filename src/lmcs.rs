@@ -16,10 +16,22 @@
 //! `lmcsCW[ i ] + lmcsDeltaCrs` joint band, and eq. 100
 //! `ChromaScaleCoeff`.
 //!
-//! Deliberately **not** here yet (follow-up rounds): the §8.7.4.2
-//! picture-sample forward mapping, the §8.7.4.3 inverse mapping, and the
-//! §8.7.5.3 chroma-residual scaling processes that consume these derived
-//! arrays.
+//! Round 290 lands the **sample-domain LMCS processes** that consume the
+//! [`LmcsDerived`] arrays, as pure per-sample folds on [`LmcsDerived`]:
+//! the §8.7.5.2 forward luma mapping (eq. 1213 `idxY` /
+//! `predMapSamples`), the §8.8.2.3 piecewise-function-index
+//! identification (eq. 1224 `idxYInv`), the §8.8.2.2 inverse luma
+//! mapping (eqs. 1222 / 1223 `invSample` / `invLumaSample`), the
+//! §8.7.5.3 chroma residual scaling (eq. 1218 `varScale` lookup +
+//! eqs. 1219 / 1220 `Clip3` clamp + `Sign`/`Abs` scale fold).
+//!
+//! Deliberately **not** here yet (follow-up rounds): the picture-level
+//! orchestration — the §8.7.5.1 `sh_lmcs_used_flag` / `CuPredMode` /
+//! `ciip_flag` gating, the §8.7.5.3 step-1 `invAvgLuma` neighbour
+//! averaging (which needs §6.4.4 availability + the partially-
+//! reconstructed luma plane), and the §8.8.2.1 whole-picture inverse
+//! pass — all of which the CTU walker drives once it wires these
+//! per-sample folds in.
 
 use oxideav_core::{Error, Result};
 
@@ -138,6 +150,133 @@ pub struct LmcsDerived {
     /// ( lmcsCW[ i ] + lmcsDeltaCrs )` when `lmcsCW[ i ] != 0`, else
     /// `1 << 11`.
     pub chroma_scale_coeff: [u32; LMCS_NUM_BINS],
+}
+
+impl LmcsDerived {
+    /// `Clip1( x ) = Clip3( 0, ( 1 << BitDepth ) − 1, x )` (eq. 3) for
+    /// the `BitDepth` this derivation was built against.
+    fn clip1(&self, x: i64) -> u32 {
+        let hi = (1i64 << self.bit_depth) - 1;
+        x.clamp(0, hi) as u32
+    }
+
+    /// `Log2( OrgCW ) = BitDepth − 4` (eq. 93 gives `OrgCW =
+    /// ( 1 << BitDepth ) / 16`, a power of two, so its log2 is exact).
+    fn log2_org_cw(&self) -> u32 {
+        self.bit_depth - 4
+    }
+
+    /// §8.7.5.2 eq. 1213 — forward-map one predicted luma sample for an
+    /// inter CU that uses LMCS (`MODE_INTER`, `ciip_flag == 0`).
+    ///
+    /// `predSample` is the prediction-domain luma sample (range
+    /// `0..=( 1 << BitDepth ) − 1`); the returned value is the mapped
+    /// predicted sample `predMapSamples[ i ][ j ]`. For the four
+    /// §8.7.5.2 carry-through modes (`MODE_INTRA` / `MODE_IBC` /
+    /// `MODE_PLT`, and CIIP inter) the caller passes the prediction
+    /// through unchanged instead of calling this fold.
+    ///
+    /// `idxY = predSample >> Log2( OrgCW )` is in `0..=15` for any
+    /// in-range sample because `OrgCW = ( 1 << BitDepth ) / 16`, so no
+    /// clamp on the index is needed.
+    ///
+    /// Returns the *unclamped* `predMapSamples` intermediate — eq. 1213
+    /// applies no `Clip1`; that happens only at eq. 1214 once the
+    /// residual is added (see [`Self::reconstruct_mapped_luma_sample`]).
+    pub fn forward_map_luma_sample(&self, pred_sample: u32) -> i64 {
+        let idx_y = (pred_sample >> self.log2_org_cw()) as usize;
+        // eq. 1213. ScaleCoeff <= 16384 and (predSample − InputPivot) is
+        // bounded by OrgCW << 3, so the product fits comfortably in i64.
+        let prod = i64::from(self.scale_coeff[idx_y])
+            * (i64::from(pred_sample) - i64::from(self.input_pivot[idx_y]))
+            + (1 << 10);
+        i64::from(self.lmcs_pivot[idx_y]) + (prod >> 11)
+    }
+
+    /// §8.7.5.2 eq. 1214 — combine a mapped predicted luma sample with
+    /// its residual to produce a reconstructed luma sample:
+    /// `Clip1( predMapSample + resSample )`.
+    pub fn reconstruct_mapped_luma_sample(&self, pred_map_sample: i64, res_sample: i64) -> u32 {
+        self.clip1(pred_map_sample + res_sample)
+    }
+
+    /// §8.8.2.3 eq. 1224 — identify the piece-wise function index
+    /// `idxYInv` a (reconstructed-domain) luma sample belongs to.
+    ///
+    /// Scans `lmcs_min_bin_idx ..= LmcsMaxBinIdx` for the first
+    /// `LmcsPivot[ idxYInv + 1 ]` strictly greater than `lumaSample`,
+    /// then clamps the result to 15.
+    pub fn idx_y_inv(&self, luma_sample: u32, lmcs_min_bin_idx: u8, lmcs_max_bin_idx: u8) -> usize {
+        let min = usize::from(lmcs_min_bin_idx);
+        let max = usize::from(lmcs_max_bin_idx);
+        let mut idx = min;
+        while idx <= max {
+            if luma_sample < self.lmcs_pivot[idx + 1] {
+                break;
+            }
+            idx += 1;
+        }
+        idx.min(15)
+    }
+
+    /// §8.8.2.2 eqs. 1222 / 1223 — inverse-map one reconstructed luma
+    /// sample (the in-loop pre-filter pass of §8.8.2.1).
+    ///
+    /// `idxYInv` is the §8.8.2.3 piece index for `lumaSample` (obtain it
+    /// via [`Self::idx_y_inv`]). Returns
+    /// `Clip1( InputPivot[ idxYInv ] +
+    ///   ( ( InvScaleCoeff[ idxYInv ] *
+    ///     ( lumaSample − LmcsPivot[ idxYInv ] ) + ( 1 << 10 ) ) >> 11 ) )`.
+    pub fn inverse_map_luma_sample(&self, luma_sample: u32, idx_y_inv: usize) -> u32 {
+        // eq. 1222.
+        let prod = i64::from(self.inv_scale_coeff[idx_y_inv])
+            * (i64::from(luma_sample) - i64::from(self.lmcs_pivot[idx_y_inv]))
+            + (1 << 10);
+        let inv_sample = i64::from(self.input_pivot[idx_y_inv]) + (prod >> 11);
+        // eq. 1223.
+        self.clip1(inv_sample)
+    }
+
+    /// §8.7.5.3 eq. 1218 — `varScale = ChromaScaleCoeff[ idxYInv ]`,
+    /// the chroma-residual scale for a chroma block whose collocated
+    /// average reconstructed luma falls in piece `idxYInv`.
+    pub fn chroma_var_scale(&self, idx_y_inv: usize) -> u32 {
+        self.chroma_scale_coeff[idx_y_inv]
+    }
+
+    /// §8.7.5.3 eqs. 1219 / 1220 — reconstruct one chroma sample when
+    /// chroma residual scaling applies (the `tuCbfChroma == 1 ||
+    /// cu_act_enabled_flag == 1` branch).
+    ///
+    /// `varScale` is [`Self::chroma_var_scale`] for the block.
+    /// The residual is first clamped to `Clip3( −( 1 << BitDepth ),
+    /// ( 1 << BitDepth ) − 1, resSample )` (eq. 1219), then the scaled
+    /// residual `Sign( res ) * ( ( Abs( res ) * varScale +
+    /// ( 1 << 10 ) ) >> 11 )` is added to the prediction and `Clip1`'d
+    /// (eq. 1220).
+    pub fn scale_chroma_residual_sample(
+        &self,
+        pred_sample: i64,
+        res_sample: i64,
+        var_scale: u32,
+    ) -> u32 {
+        // eq. 1219.
+        let lo = -(1i64 << self.bit_depth);
+        let hi = (1i64 << self.bit_depth) - 1;
+        let res = res_sample.clamp(lo, hi);
+        // eq. 1220: Sign( res ) * ( ( Abs( res ) * varScale + 2^10 ) >> 11 ).
+        let scaled = if res == 0 {
+            0
+        } else {
+            let mag = (res.unsigned_abs() * u64::from(var_scale) + (1 << 10)) >> 11;
+            if res < 0 {
+                -(mag as i64)
+            } else {
+                mag as i64
+            }
+        };
+        self.clip1(pred_sample + scaled)
+    }
 }
 
 /// Run the BitDepth-dependent §7.4.3.19 derivations (eqs. 93 / 95 – 98 /
@@ -873,6 +1012,122 @@ mod tests {
                 let got = round_trip(&d, (min + delta_max) % 2 == 0);
                 assert_eq!(got, d, "window min={min} delta_max={delta_max}");
             }
+        }
+    }
+
+    #[test]
+    fn forward_map_identity_pivot_bins_bd8() {
+        // near-identity payload at BitDepth 8: every bin except bin 0 has
+        // lmcsCW = 16 = OrgCW, so ScaleCoeff = 2048 and InputPivot ==
+        // LmcsPivot is offset by the single −1 on bin 0. Pick a sample in
+        // bin 5: idxY = 80 >> 4 = 5; InputPivot[5] = 80; LmcsPivot[5] =
+        // 15 + 16*4 = 79; ScaleCoeff[5] = 2048.
+        let d = near_identity_bd8().derive(8).unwrap();
+        // eq. 1213: 79 + ((2048 * (80 − 80) + 1024) >> 11) = 79 + 0 = 79.
+        assert_eq!(d.forward_map_luma_sample(80), 79);
+        // sample 85 in bin 5: 79 + ((2048 * 5 + 1024) >> 11) = 79 + 5 = 84.
+        assert_eq!(d.forward_map_luma_sample(85), 84);
+        // bin 0 (sample 8): ScaleCoeff[0] = 1920, InputPivot[0] = 0,
+        // LmcsPivot[0] = 0 → ((1920 * 8 + 1024) >> 11) = (16384 >> 11) = 8.
+        assert_eq!(d.forward_map_luma_sample(8), 8);
+    }
+
+    #[test]
+    fn idx_y_inv_piecewise_lookup_bd8() {
+        // near-identity payload: pivots are 0, 15, 31, 47, ..., 255.
+        let d = near_identity_bd8().derive(8).unwrap();
+        // sample 0 < LmcsPivot[1] = 15 → idx 0.
+        assert_eq!(d.idx_y_inv(0, 0, 15), 0);
+        // sample 15 not < 15; < LmcsPivot[2] = 31 → idx 1.
+        assert_eq!(d.idx_y_inv(15, 0, 15), 1);
+        assert_eq!(d.idx_y_inv(30, 0, 15), 1);
+        assert_eq!(d.idx_y_inv(31, 0, 15), 2);
+        // sample 255 runs off the loop → Min(idx, 15) = 15.
+        assert_eq!(d.idx_y_inv(255, 0, 15), 15);
+        assert_eq!(d.idx_y_inv(1000, 0, 15), 15);
+    }
+
+    #[test]
+    fn forward_inverse_luma_round_trip_bd8() {
+        // Forward-map then identify-and-inverse-map must recover the
+        // original prediction-domain sample to within the piecewise
+        // quantisation. On the near-identity payload (every bin scale is
+        // a strict 1:1 except the single shortened bin 0) the inverse is
+        // exact for samples that map cleanly across the pivots.
+        let d = near_identity_bd8().derive(8).unwrap();
+        for s in 16u32..=255 {
+            let mapped = d.forward_map_luma_sample(s) as u32;
+            let idx = d.idx_y_inv(mapped, 0, 15);
+            let back = d.inverse_map_luma_sample(mapped, idx);
+            // Bins 1..=15 are 1:1 (ScaleCoeff == InvScaleCoeff == 2048),
+            // so the recovered sample equals the input exactly.
+            assert_eq!(back, s, "sample {s} mapped to {mapped} idx {idx}");
+        }
+    }
+
+    #[test]
+    fn inverse_map_clamps_to_bit_depth() {
+        // A reconstructed sample beyond the top pivot still inverse-maps
+        // through the idx-15 piece and Clip1's to (1 << BitDepth) − 1.
+        let d = near_identity_bd8().derive(8).unwrap();
+        let back = d.inverse_map_luma_sample(255, 15);
+        assert!(back <= 255);
+    }
+
+    #[test]
+    fn chroma_residual_scale_sign_and_abs_bd8() {
+        // lmcsDeltaCrs = −7 payload: ChromaScaleCoeff[5] = 32768 / 9 =
+        // 3640 (bin 5, lmcsCW = 16). varScale = 3640.
+        let mut d = near_identity_bd8();
+        d.lmcs_delta_abs_crs = 7;
+        d.lmcs_delta_sign_crs_flag = true;
+        let der = d.derive(8).unwrap();
+        let var_scale = der.chroma_var_scale(5);
+        assert_eq!(var_scale, 3640);
+        // eq. 1220 with res = +16: (16 * 3640 + 1024) >> 11 =
+        // (58240 + 1024) >> 11 = 59264 >> 11 = 28. pred 100 → 128.
+        assert_eq!(der.scale_chroma_residual_sample(100, 16, var_scale), 128);
+        // res = −16: Sign folds to −28 → pred 100 → 72.
+        assert_eq!(der.scale_chroma_residual_sample(100, -16, var_scale), 72);
+        // res = 0 → no change.
+        assert_eq!(der.scale_chroma_residual_sample(100, 0, var_scale), 100);
+    }
+
+    #[test]
+    fn chroma_residual_scale_clip3_residual_bd8() {
+        // eq. 1219 clamps the residual to ±(1 << BitDepth) before the
+        // scale fold; eq. 1220 Clip1's the sum to 0..=255.
+        let der = near_identity_bd8().derive(8).unwrap();
+        let var_scale = der.chroma_var_scale(5); // 2048 (lmcsDeltaCrs 0)
+        assert_eq!(var_scale, 2048);
+        // varScale 2048 ⇒ scale fold is identity: (Abs * 2048 + 1024)
+        // >> 11 = Abs. A huge positive residual clamps to 255 (Clip1).
+        assert_eq!(der.scale_chroma_residual_sample(200, 1000, var_scale), 255);
+        // A huge negative residual clamps to 0.
+        assert_eq!(der.scale_chroma_residual_sample(50, -1000, var_scale), 0);
+        // The eq. 1219 residual clamp itself: res = 300 > (1 << 8) − 1 =
+        // 255 is clamped to 255 before scaling; pred 0 + 255 → 255.
+        assert_eq!(der.scale_chroma_residual_sample(0, 300, var_scale), 255);
+    }
+
+    #[test]
+    fn forward_inverse_round_trip_bd10_narrowed_window() {
+        // BitDepth 10, window bins 1..=14 (OrgCW = 64): the active bins
+        // are 1:1 so forward∘inverse is exact for samples inside them.
+        let d = LmcsData {
+            lmcs_min_bin_idx: 1,
+            lmcs_delta_max_bin_idx: 1,
+            ..Default::default()
+        }
+        .derive(10)
+        .unwrap();
+        // Bins 1..=14 cover samples 64..=959 (LmcsPivot[1]=0,
+        // [15]=896). Pick samples inside an active, 1:1 bin.
+        for s in [64u32, 100, 500, 895] {
+            let mapped = d.forward_map_luma_sample(s) as u32;
+            let idx = d.idx_y_inv(mapped, 1, 14);
+            let back = d.inverse_map_luma_sample(mapped, idx);
+            assert_eq!(back, s, "sample {s} mapped {mapped} idx {idx}");
         }
     }
 }
