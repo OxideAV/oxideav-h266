@@ -645,6 +645,78 @@ pub fn inverse_transform_2d(
     Ok(res)
 }
 
+/// §8.7.4.6 — residual modification process for blocks using colour
+/// space conversion (the inverse adaptive colour transform, ACT).
+///
+/// Invoked from the §8.4.5.1 general decoding process for intra blocks
+/// (and the corresponding inter path) when
+/// `cu_act_enabled_flag[ xCb ][ yCb ] == 1`. The three residual planes
+/// `rY` / `rCb` / `rCr` — produced by the per-component inverse
+/// transform at `controlPara == 1`, all `nTbW × nTbH` and (because ACT
+/// requires a 4:4:4 single tree) co-sited — are converted in place from
+/// the residual colour space back to the reconstruction colour space.
+///
+/// The transform is the reversible YCgCo-R inverse, applied per sample
+/// after each plane is first clipped to the §7.4.3.4 residual range
+/// `[ −2^(BitDepth+1), 2^(BitDepth+1) − 1 ]` (eqs. 1199–1201). Then,
+/// per eqs. 1202–1205:
+///
+/// ```text
+///   tmp      = rY  − ( rCb >> 1 )      (1202)
+///   rY'      = tmp + rCb              (1203)
+///   rCb'     = tmp − ( rCr >> 1 )     (1204)
+///   rCr'     = rCr + rCb'             (1205)
+/// ```
+///
+/// where eq. 1205's `rCr += rCb` reads the *already-updated* `rCb` from
+/// eq. 1204 (the spec mutates the arrays in sequence). `>>` is the
+/// arithmetic right shift of §5 applied to the (possibly negative,
+/// already-clipped) residual operands.
+///
+/// Inputs:
+/// * `n_tb_w`, `n_tb_h` — block dimensions; each plane is row-major of
+///   length `n_tb_w * n_tb_h`.
+/// * `r_y`, `r_cb`, `r_cr` — the three residual planes, modified in
+///   place.
+/// * `bit_depth` — the component `BitDepth` (§7.4.3.4). ACT requires
+///   `BitDepthY == BitDepthC`, so a single value governs the clip.
+pub fn act_residual_modification(
+    n_tb_w: usize,
+    n_tb_h: usize,
+    r_y: &mut [i32],
+    r_cb: &mut [i32],
+    r_cr: &mut [i32],
+    bit_depth: u32,
+) -> Result<()> {
+    let n = n_tb_w * n_tb_h;
+    for (name, plane) in [("rY", &*r_y), ("rCb", &*r_cb), ("rCr", &*r_cr)] {
+        if plane.len() != n {
+            return Err(Error::invalid(format!(
+                "h266 ACT: {name} length {} != {n_tb_w}x{n_tb_h}",
+                plane.len()
+            )));
+        }
+    }
+    // §7.4.3.4 residual clip bound, eqs. 1199–1201.
+    let lo = -(1i32 << (bit_depth + 1));
+    let hi = (1i32 << (bit_depth + 1)) - 1;
+    for i in 0..n {
+        // Eqs. 1199–1201 — clip each plane independently first.
+        let r_y_i = r_y[i].clamp(lo, hi);
+        let r_cb_i = r_cb[i].clamp(lo, hi);
+        let r_cr_i = r_cr[i].clamp(lo, hi);
+        // Eqs. 1202–1205 — sequential in-place YCgCo-R inverse.
+        let tmp = r_y_i - (r_cb_i >> 1); // 1202
+        let new_y = tmp + r_cb_i; // 1203
+        let new_cb = tmp - (r_cr_i >> 1); // 1204
+        let new_cr = r_cr_i + new_cb; // 1205 (reads updated rCb)
+        r_y[i] = new_y;
+        r_cb[i] = new_cb;
+        r_cr[i] = new_cr;
+    }
+    Ok(())
+}
+
 /// Apply the 32-point DST-VII using the two 16-column sub-tables
 /// (eqs. 1188 / 1190: rows 0..15 from COL_0_15, rows 16..31 from
 /// COL_16_31, both indexed by `[row][n]` with n=0..15 — i.e. the
@@ -1037,5 +1109,116 @@ mod tests {
         assert!(
             inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 10, 15).is_err()
         );
+    }
+
+    /// §8.7.4.6 — the inverse ACT (eqs. 1202–1205) is the lossless
+    /// reverse of the encoder-side forward transform.
+    ///
+    /// The forward direction inverts each spec step exactly (it is the
+    /// algebraic inverse of eqs. 1202–1205):
+    ///
+    /// ```text
+    ///   rCb_in = rCb_out + ( rCr_out − rCb_out >> ... )   // reversed
+    /// ```
+    ///
+    /// Rather than re-derive symbolically, the test takes arbitrary
+    /// ACT-domain residuals `(a, b, c)`, runs them through the inverse to
+    /// get `(Y, Cb, Cr)`, then reverses the four assignments step-by-step
+    /// — `rCr_orig = Cr − Cb`, `tmp = Cb + (rCr_orig >> 1)`,
+    /// `rCb_orig = Cr_pre? …` — to recover `(a, b, c)` bit-exactly. The
+    /// four-step inverse is itself invertible, so recovering the inputs
+    /// confirms the implementation realises the documented sequence.
+    ///
+    /// All operands stay inside `[−2^(BitDepth+1), 2^(BitDepth+1)−1]` so
+    /// the eqs. 1199–1201 clamps are no-ops.
+    #[test]
+    fn act_inverse_is_invertible() {
+        let bit_depth = 10u32;
+        let samples: [(i32, i32, i32); 5] = [
+            (0, 0, 0),
+            (100, -40, 73),
+            (-300, 200, -150),
+            (7, -7, 13),
+            (-1, 1, -2),
+        ];
+        for &(a, b, c) in &samples {
+            let mut r_y = vec![a];
+            let mut r_cb = vec![b];
+            let mut r_cr = vec![c];
+            act_residual_modification(1, 1, &mut r_y, &mut r_cb, &mut r_cr, bit_depth).unwrap();
+            let (yy, cb, cr) = (r_y[0], r_cb[0], r_cr[0]);
+            // Reverse the spec steps:
+            //   1205: rCr_orig = cr − cb
+            //   1204: tmp      = cb + (rCr_orig >> 1)
+            //   1203: rCb_orig = yy − tmp
+            //   1202: rY_orig  = tmp + (rCb_orig >> 1)
+            let rcr_orig = cr - cb;
+            let tmp = cb + (rcr_orig >> 1);
+            let rcb_orig = yy - tmp;
+            let ry_orig = tmp + (rcb_orig >> 1);
+            assert_eq!(
+                (ry_orig, rcb_orig, rcr_orig),
+                (a, b, c),
+                "ACT inverse not invertible for ({a}, {b}, {c})"
+            );
+        }
+    }
+
+    /// Eqs. 1202–1205 worked by hand for a single sample.
+    #[test]
+    fn act_single_sample_matches_hand_derivation() {
+        // rY=120, rCb=40, rCr=-30, all inside the BitDepth=8 clip
+        // window [-512, 511].
+        let mut r_y = vec![120];
+        let mut r_cb = vec![40];
+        let mut r_cr = vec![-30];
+        act_residual_modification(1, 1, &mut r_y, &mut r_cb, &mut r_cr, 8).unwrap();
+        // tmp = 120 - (40 >> 1) = 120 - 20 = 100      (1202)
+        // rY  = 100 + 40 = 140                         (1203)
+        // rCb = 100 - (-30 >> 1) = 100 - (-15) = 115   (1204)
+        // rCr = -30 + 115 = 85                         (1205)
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (140, 115, 85));
+    }
+
+    /// Eqs. 1199–1201 clamp each plane to ±2^(BitDepth+1) BEFORE the
+    /// transform. At BitDepth=8 the window is [-512, 511]; an input of
+    /// 10_000 in rY clamps to 511 first.
+    #[test]
+    fn act_clips_residuals_before_transform() {
+        let mut r_y = vec![10_000];
+        let mut r_cb = vec![0];
+        let mut r_cr = vec![0];
+        act_residual_modification(1, 1, &mut r_y, &mut r_cb, &mut r_cr, 8).unwrap();
+        // rY clamps to 511, rCb=rCr=0:
+        //   tmp = 511 - 0 = 511; rY = 511; rCb = 511; rCr = 511.
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (511, 511, 511));
+
+        // Negative overflow clamps to -512.
+        let mut r_y = vec![-99_999];
+        let mut r_cb = vec![0];
+        let mut r_cr = vec![0];
+        act_residual_modification(1, 1, &mut r_y, &mut r_cb, &mut r_cr, 8).unwrap();
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (-512, -512, -512));
+    }
+
+    /// Right shift is arithmetic on negative operands (eqs. 1202 / 1204).
+    #[test]
+    fn act_uses_arithmetic_right_shift() {
+        // rCb = -3 → (-3 >> 1) = -2 (floor), not -1.
+        let mut r_y = vec![0];
+        let mut r_cb = vec![-3];
+        let mut r_cr = vec![0];
+        act_residual_modification(1, 1, &mut r_y, &mut r_cb, &mut r_cr, 10).unwrap();
+        // tmp = 0 - (-3 >> 1) = 0 - (-2) = 2; rY = 2 + (-3) = -1;
+        // rCb = 2 - (0 >> 1) = 2; rCr = 0 + 2 = 2.
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (-1, 2, 2));
+    }
+
+    #[test]
+    fn act_rejects_mismatched_plane_lengths() {
+        let mut r_y = vec![0; 16];
+        let mut r_cb = vec![0; 16];
+        let mut r_cr = vec![0; 8]; // wrong
+        assert!(act_residual_modification(4, 4, &mut r_y, &mut r_cb, &mut r_cr, 10).is_err());
     }
 }

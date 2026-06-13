@@ -378,7 +378,20 @@ the **intra-only single-tile single-slice subset** plus the round-28
   cc_cr_idc)` per-CTB record is now captured for the future
   bitstream-emit round.
 * **Transforms**: DCT-II inverse for sizes 2 / 4 / 8 / 16 / 32 / 64;
-  DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant.
+  DST-VII / DCT-VIII for 4 / 8 / 16; flat-list dequant. **Round-293**
+  adds the §8.7.4.6 residual modification process for blocks using
+  colour space conversion — the inverse adaptive colour transform
+  (`transform::act_residual_modification`). When
+  `cu_act_enabled_flag == 1` (a 4:4:4 single tree), the three co-sited
+  `nTbW × nTbH` residual planes are converted from the residual colour
+  space back to the reconstruction colour space: each plane is first
+  clipped to the §7.4.3.4 range `[ −2^(BitDepth+1), 2^(BitDepth+1) − 1 ]`
+  (eqs. 1199–1201) then run through the sequential in-place YCgCo-R
+  inverse (eqs. 1202–1205, `tmp = rY − (rCb >> 1)`; `rY = tmp + rCb`;
+  `rCb = tmp − (rCr >> 1)`; `rCr += rCb`, with eq. 1205 reading the
+  already-updated `rCb`). The per-CU gating + the three
+  `controlPara == 1` component inverse-transform feeds are the
+  CTU-walker follow-up.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
   / shiftIdx tables for everything currently parsed (cu_skip /
   general_merge / regular_merge / merge_idx + round-27 mmvd_merge_flag
