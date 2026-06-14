@@ -4,6 +4,36 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h266/compare/v0.0.7...v0.0.8) - 2026-06-14
+
+### Other
+
+- round 299: §8.7.2 scaling and transformation process — codedCIdx + TuCResMode joint Cb-Cr residual derivation (eqs. 1129–1132)
+- round 293: §8.7.4.6 inverse ACT (residual modification for colour-space conversion) — eqs. 1199–1205 YCgCo-R inverse
+- round 290: sample-domain LMCS processes — §8.7.5.2 forward + §8.8.2.2/8.8.2.3 inverse luma mapping + §8.7.5.3 chroma residual scaling
+- round 281: BitDepth-dependent §7.4.3.19 LMCS derivations (eqs. 93 / 95 – 98 / 100)
+- round 278: §7.3.2.19 lmcs_data() typed parser + APS dispatch
+- round 274: §7.3.2.9 sei_rbsp() multi-message walker + rbsp_trailing_bits() tail validation
+- round 271: §7.3.6 sei_message() header parser (payloadType/payloadSize accumulation)
+- round 264: §7.3.2.15 rbsp_slice_trailing_bits() reader-side validator
+- round 259: §7.3.2.16 rbsp_trailing_bits() + §7.3.2.17 byte_alignment() typed reader-side validators
+- round 255: §7.3.2.11 end_of_seq_rbsp() + §7.3.2.12 end_of_bitstream_rbsp() typed decoders
+- round 253: §7.3.2.13 filler_data_rbsp() typed decoder
+- round 250: §7.3.2.10 access_unit_delimiter_rbsp() typed decoder
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 245: §7.3.3.2 general_constraints_info() typed decoder
+- round 242: §7.3.2.5 pps_subpic_id_mapping() typed decoder
+- round 239: §7.3.2.22 sps_range_extension() typed decoder
+- round 233: decomposed §7.3.10.10 mvd_coding() body parser
+- round 230: reader-side affine + AMVR / affine + AMVR + BCW composite walkers for §7.3.10.5 non-merge inter pre-residual
+- round 224: reader-side _with_amvr and _with_amvr_and_bcw composite walkers for §7.3.11.7 non-merge inter pre-residual + §7.3.10.10 AMVR + §7.3.10.5 BCW
+- round 219: reader-side composite walker for §7.3.11.7 non-merge inter pre-residual
+- round 213: encoder-side affine + AMVR / affine + AMVR + BCW composite dispatchers
+- round 207: encoder-side §7.3.10.5 multi-CP-MV affine MVD dispatcher
+- round 201: encoder-side §7.3.10.5 bcw_idx dispatcher (`bcw_idx_enc`) wired into composite walker
+- round 195: encoder-side §7.3.10.10 amvr_flag + amvr_precision_idx dispatcher wired into non-merge inter walker
+- round 193: §7.3.10.10 amvr_flag + amvr_precision_idx CABAC reader
+
 ### Other
 
 - round 299: §8.7.2 "Scaling and transformation process" orchestrator — adds `transform::scaling_and_transformation(c_idx, tu_c_res_mode, ph_joint_cbcr_sign_flag, n_tb_w, n_tb_h, &d, coded, bit_depth, log2_transform_range) -> resSamples`, the §8.7.2 process that turns the §8.7.3 scaled transform coefficients of the *coded* component into the residual-sample array `resSamples` of the *requested* component `cIdx`; step 1 (the §8.7.3 scaling, which derives `qP` / `bdShift` / `levelScale`) is composed by the caller via `crate::dequant` with `cIdx` set to `derive_coded_c_idx(cIdx, TuCResMode)`, so this routine implements the genuinely new §8.7.2 logic — step 2 dispatches transform-skip (eq. 1129 `res = d` passthrough) vs the §8.7.4.1 separable inverse transform through the new `CodedTransform` descriptor (`Skip` | `Transform { non_zero_w, non_zero_h, tr_type_hor, tr_type_ver }`), and step 3 derives `resSamples` per the joint Cb-Cr rule `cSign = 1 − 2 * ph_joint_cbcr_sign_flag`: the coded component is `res` (eq. 1130), a `TuCResMode == 2` (`CbCrCoded`) derived sibling is `cSign * res` (eq. 1131, no shift), and any other derived chroma sibling is `(cSign * res) >> 1` (eq. 1132, §5 arithmetic right shift); also adds the `TuCResMode` enum (`None` / `CbCoded` / `CbCrCoded` / `CrCoded` ↔ raw 0..=3 with `from_raw` / `raw`) and `transform::derive_coded_c_idx(c_idx, tu_c_res_mode)` reproducing the §8.7.2 `codedCIdx` derivation verbatim (`cIdx == 0 || TuCResMode == 0 → cIdx`; modes 1/2 → Cb = 1; mode 3 → Cr = 2) so a derived chroma component reuses its coded sibling's scaled coefficients; the CTU-walker fuse that resolves `TuCResMode` / `ph_joint_cbcr_sign_flag` / per-TU `transform_skip_flag` from the live `transform_tree()` and invokes §8.7.3 once per coded component is the follow-up; nine new lib tests pin the `TuCResMode::from_raw` round-trip + out-of-range rejection, the full `codedCIdx` table (cIdx 0 self for every mode, mode-0 self, modes 1/2 → Cb, mode 3 → Cr), the eq. 1129/1130 transform-skip passthrough, the eq. 1132 `>> 1` derived-Cr halving (with the coded Cb returning `res`), the eq. 1131 `cSign * res` shared-residual derivation under `ph_joint_cbcr_sign_flag = true` (cSign = −1), the mode-3 Cr-coded / Cb-derived path, a transform-path equality against a direct `inverse_transform_2d` call (eq. 1130), a derived-chroma transform-path `>> 1`, and the bad-length rejection
