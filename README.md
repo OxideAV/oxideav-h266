@@ -218,10 +218,27 @@ oxideav-h266 = "0.0"
   walked when carried in the PH (round-29; `pps_wp_info_in_ph_flag
   == 1` path); produces `PredWeightTable` with per-record
   `(delta_luma_weight, luma_offset)` plus paired Cb/Cr chroma deltas
-  for both L0 and L1. `derive_luma_weight` / `derive_luma_offset`
-  implement the §7.4.7 inferences. The reconstruction pipeline does
-  not yet apply the parsed weights — the §8.5.6.6.3 explicit
-  weighted sample prediction process is a future round.
+  for both L0 and L1. `derive_luma_weight` / `derive_luma_offset` /
+  `derive_chroma_weight` / `derive_chroma_offset` implement the
+  §7.4.7 inferences — the chroma pair reconstructs
+  `ChromaWeightLN[i][j] = (1 << ChromaLog2WeightDenom) +
+  delta_chroma_weight` and the eq. 144 `ChromaOffsetLN[i][j] =
+  Clip3(-128, 127, 128 + delta_chroma_offset -
+  ((128 * ChromaWeightLN[i][j]) >> ChromaLog2WeightDenom))`, inferring
+  `2^ChromaLog2WeightDenom` / `0` when the per-i flag is absent
+  (round-305). The sample-domain **§8.5.6.6.3 explicit weighted
+  sample prediction process** now applies these parameters:
+  `explicit_weighted_sample_pred` composes the unclamped MC
+  prediction-sample arrays for one CB at arbitrary `bitDepth` with
+  `log2Wd = log2_weight_denom + Max(2, 14 − bitDepth)` — uni-pred L0
+  (eq. 992) `Clip1(((s0·w0 + 2^(log2Wd−1)) >> log2Wd) + o0)`, uni-pred
+  L1 (eq. 993), and bi-pred (eq. 994)
+  `Clip1((s0·w0 + s1·w1 + ((o0+o1+1) << log2Wd)) >> (log2Wd+1))`, with
+  the `predFlagL0/L1` list-gating and `Clip1` saturation from
+  §8.5.6.6.1's `weightedPredFlag && bcwIdx == 0` dispatch arm. The
+  per-CU wiring (selecting this path over the §8.5.6.6.2 default-
+  weighted / BCW composite based on `pps_weighted_pred_flag` /
+  `pps_weighted_bipred_flag`) remains the next-step follow-up.
 
 ## Decode support
 

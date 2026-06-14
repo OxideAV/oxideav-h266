@@ -2574,6 +2574,161 @@ pub fn predict_chroma_block_bipred_bcw(
     Ok(())
 }
 
+// =====================================================================
+// §8.5.6.6.3 — Explicit weighted sample prediction process
+// =====================================================================
+//
+// When `weightedPredFlag == 1 && bcwIdx == 0` the §8.5.6.6.1 dispatch
+// routes bi-/uni-pred composition to this process instead of the
+// §8.5.6.6.2 default-weighted path. The per-reference weighting
+// factors and additive offsets come from `pred_weight_table()`
+// (parsed in `picture_header.rs`); the §7.4.7 derivations
+// (`derive_luma_weight` / `derive_luma_offset` / `derive_chroma_weight`
+// / `derive_chroma_offset`) reconstruct `wN` / `oN`. The inputs
+// `predSamplesL0` / `predSamplesL1` are the unclamped MC outputs at the
+// process's internal precision; outputs are clamped to `[0, 2^bd - 1]`.
+//
+// shift1 = Max(2, 14 − bitDepth)
+// log2Wd = log2_weight_denom + shift1   (luma_log2_weight_denom for
+//          cIdx == 0, ChromaLog2WeightDenom otherwise)
+//
+// Uni L0  (eq. 992):
+//   pb = Clip1(((predL0 * w0 + 2^(log2Wd-1)) >> log2Wd) + o0)
+// Uni L1  (eq. 993):  symmetric with w1 / o1
+// Bi      (eq. 994):
+//   pb = Clip1((predL0*w0 + predL1*w1 + ((o0+o1+1) << log2Wd))
+//              >> (log2Wd + 1))
+//
+// Per the spec, when log2Wd >= 1 the eq.992/993 rounding term is
+// `2^(log2Wd - 1)`; when log2Wd == 0 there is no rounding term and no
+// shift. The implementation folds both cases via the explicit
+// `log2_wd >= 1` branch so a degenerate `log2Wd == 0` (only reachable
+// at BitDepth > 12 with luma_log2_weight_denom == 0) stays exact.
+
+/// One list's derived explicit-WP parameters: the weighting factor
+/// `w` and additive offset `o` for the active reference index. The
+/// offset `o` is the spec's already-`<<(bitDepth − 8)`-scaled value
+/// (eqs. 984 / 986 / 989 / 991) — callers scale `luma_offset` /
+/// `ChromaOffset` before constructing this.
+#[derive(Clone, Copy, Debug)]
+pub struct ExplicitWpParams {
+    /// Weighting factor `wN` (`LumaWeightLN` / `ChromaWeightLN[·][j]`).
+    pub weight: i32,
+    /// Additive offset `oN`, already left-shifted by `bitDepth − 8`.
+    pub offset: i32,
+}
+
+/// §8.5.6.6.3 single-sample explicit weighted prediction.
+///
+/// `log2_wd` is `log2_weight_denom + Max(2, 14 − bit_depth)`.
+/// `bit_depth` clamps the output to `[0, (1 << bit_depth) − 1]`.
+/// Exactly one of `p0` / `p1` is `Some` for uni-pred; both `Some` for
+/// bi-pred. Both `None` is rejected by the caller, not here — the
+/// function returns 0 in that degenerate case.
+fn explicit_wp_sample(
+    p0: Option<(i32, ExplicitWpParams)>,
+    p1: Option<(i32, ExplicitWpParams)>,
+    log2_wd: u32,
+    bit_depth: u32,
+) -> i32 {
+    let max = (1i32 << bit_depth) - 1;
+    let clip1 = |v: i32| v.clamp(0, max);
+    match (p0, p1) {
+        // Bi-pred (eq. 994).
+        (Some((s0, wp0)), Some((s1, wp1))) => {
+            let acc =
+                s0 * wp0.weight + s1 * wp1.weight + ((wp0.offset + wp1.offset + 1) << log2_wd);
+            clip1(acc >> (log2_wd + 1))
+        }
+        // Uni-pred L0 (eq. 992).
+        (Some((s0, wp0)), None) => {
+            let scaled = if log2_wd >= 1 {
+                (s0 * wp0.weight + (1 << (log2_wd - 1))) >> log2_wd
+            } else {
+                s0 * wp0.weight
+            };
+            clip1(scaled + wp0.offset)
+        }
+        // Uni-pred L1 (eq. 993).
+        (None, Some((s1, wp1))) => {
+            let scaled = if log2_wd >= 1 {
+                (s1 * wp1.weight + (1 << (log2_wd - 1))) >> log2_wd
+            } else {
+                s1 * wp1.weight
+            };
+            clip1(scaled + wp1.offset)
+        }
+        (None, None) => 0,
+    }
+}
+
+/// §8.5.6.6.3 explicit weighted sample prediction over an
+/// `(n_cb_w)x(n_cb_h)` block. `pred_l0` / `pred_l1` are the unclamped
+/// MC prediction-sample arrays in row-major order (length
+/// `n_cb_w * n_cb_h`), present per `pred_flag_l0` / `pred_flag_l1`.
+///
+/// `log2_weight_denom` is `luma_log2_weight_denom` for `cIdx == 0` or
+/// `ChromaLog2WeightDenom` for chroma; `shift1 = Max(2, 14 − bit_depth)`
+/// is added internally to form `log2Wd` (eqs. 982 / 987). `wp_l0` /
+/// `wp_l1` carry the §7.4.7-derived `(wN, oN)` for the active
+/// reference index (offsets already `<<(bit_depth − 8)`).
+///
+/// Returns the `(n_cb_w)x(n_cb_h)` `pbSamples` array (row-major,
+/// clamped to `[0, (1 << bit_depth) − 1]`).
+#[allow(clippy::too_many_arguments)]
+pub fn explicit_weighted_sample_pred(
+    n_cb_w: usize,
+    n_cb_h: usize,
+    pred_l0: Option<&[i32]>,
+    pred_l1: Option<&[i32]>,
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    log2_weight_denom: u32,
+    wp_l0: ExplicitWpParams,
+    wp_l1: ExplicitWpParams,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    let count = n_cb_w * n_cb_h;
+    let l0 = if pred_flag_l0 { pred_l0 } else { None };
+    let l1 = if pred_flag_l1 { pred_l1 } else { None };
+    if let Some(arr) = l0 {
+        if arr.len() < count {
+            return Err(Error::invalid(format!(
+                "h266 explicit WP: pred_l0 len {} < block {}x{} = {}",
+                arr.len(),
+                n_cb_w,
+                n_cb_h,
+                count
+            )));
+        }
+    }
+    if let Some(arr) = l1 {
+        if arr.len() < count {
+            return Err(Error::invalid(format!(
+                "h266 explicit WP: pred_l1 len {} < block {}x{} = {}",
+                arr.len(),
+                n_cb_w,
+                n_cb_h,
+                count
+            )));
+        }
+    }
+    if l0.is_none() && l1.is_none() {
+        return Err(Error::invalid(
+            "h266 explicit WP: both predFlagL0 and predFlagL1 are 0".to_string(),
+        ));
+    }
+    let shift1 = 14u32.saturating_sub(bit_depth).max(2);
+    let log2_wd = log2_weight_denom + shift1;
+    let mut out = vec![0i32; count];
+    for idx in 0..count {
+        let p0 = l0.map(|a| (a[idx], wp_l0));
+        let p1 = l1.map(|a| (a[idx], wp_l1));
+        out[idx] = explicit_wp_sample(p0, p1, log2_wd, bit_depth);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4936,5 +5091,290 @@ mod tests {
         assert!(
             predict_luma_block_high_precision_u16(0, 0, 8, 8, &src, MotionVector::ZERO, 8).is_err()
         );
+    }
+
+    // ---- §8.5.6.6.3 explicit weighted sample prediction ----------------
+
+    /// Default unit weight (`w0 = 1 << luma_log2_weight_denom`, `o0 = 0`)
+    /// in eq. 992 reduces to the precision-lowering shift that maps a
+    /// 14-bit MC sample (`v << shift1`) back to an 8-bit output.
+    /// BitDepth 8 → shift1 = 6, log2Wd = 6 + 6 = 12. For
+    /// `s0 = 128 << 6 = 8192`:
+    ///   (8192 * 64 + 2^11) >> 12 = (524288 + 2048) >> 12 = 128.
+    #[test]
+    fn explicit_wp_uni_l0_unit_weight_is_identity() {
+        let wp = ExplicitWpParams {
+            weight: 1 << 6,
+            offset: 0,
+        };
+        let l0 = [8192i32; 4];
+        let out = explicit_weighted_sample_pred(
+            2,
+            2,
+            Some(&l0),
+            None,
+            true,
+            false,
+            6,
+            wp,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0,
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec![128, 128, 128, 128]);
+    }
+
+    /// eq. 992 with a non-unit weight and additive offset. shift1 = 6,
+    /// log2Wd = 12, w0 = 96 (1.5× at denom 6), o0 = 10.
+    /// s0 = 8192 → (8192 * 96 + 2048) >> 12 + 10
+    ///           = (786432 + 2048) >> 12 + 10 = 192 + 10 = 202.
+    #[test]
+    fn explicit_wp_uni_l0_weight_and_offset() {
+        let wp = ExplicitWpParams {
+            weight: 96,
+            offset: 10,
+        };
+        let l0 = [8192i32];
+        let out = explicit_weighted_sample_pred(
+            1,
+            1,
+            Some(&l0),
+            None,
+            true,
+            false,
+            6,
+            wp,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0,
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec![202]);
+    }
+
+    /// eq. 993 uni-pred L1 mirrors L0.
+    #[test]
+    fn explicit_wp_uni_l1_weight_and_offset() {
+        let wp = ExplicitWpParams {
+            weight: 96,
+            offset: 10,
+        };
+        let l1 = [8192i32];
+        let out = explicit_weighted_sample_pred(
+            1,
+            1,
+            None,
+            Some(&l1),
+            false,
+            true,
+            6,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0,
+            },
+            wp,
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec![202]);
+    }
+
+    /// eq. 994 bi-pred. shift1 = 6, log2Wd = 12, w0 = w1 = 64,
+    /// o0 = o1 = 0, s0 = s1 = 8192:
+    ///   (8192*64 + 8192*64 + ((0+0+1) << 12)) >> 13
+    ///   = (524288 + 524288 + 4096) >> 13 = 1052672 >> 13 = 128.
+    #[test]
+    fn explicit_wp_bi_unit_weights_average() {
+        let wp = ExplicitWpParams {
+            weight: 64,
+            offset: 0,
+        };
+        let l0 = [8192i32];
+        let l1 = [8192i32];
+        let out =
+            explicit_weighted_sample_pred(1, 1, Some(&l0), Some(&l1), true, true, 6, wp, wp, 8)
+                .unwrap();
+        assert_eq!(out, vec![128]);
+    }
+
+    /// eq. 994 bi-pred with asymmetric weights + offsets.
+    /// w0 = 80, w1 = 48, o0 = 5, o1 = -3, s0 = 8192, s1 = 4096:
+    ///   num = 8192*80 + 4096*48 + ((5 + (-3) + 1) << 12)
+    ///       = 655360 + 196608 + 12288 = 864256
+    ///   pb = 864256 >> 13 = 105.
+    #[test]
+    fn explicit_wp_bi_asymmetric() {
+        let wp0 = ExplicitWpParams {
+            weight: 80,
+            offset: 5,
+        };
+        let wp1 = ExplicitWpParams {
+            weight: 48,
+            offset: -3,
+        };
+        let l0 = [8192i32];
+        let l1 = [4096i32];
+        let out =
+            explicit_weighted_sample_pred(1, 1, Some(&l0), Some(&l1), true, true, 6, wp0, wp1, 8)
+                .unwrap();
+        assert_eq!(out, vec![105]);
+    }
+
+    /// Output is clamped to [0, (1 << bitDepth) − 1]. A large positive
+    /// offset saturates to 255 at BitDepth 8.
+    #[test]
+    fn explicit_wp_output_clamps_high() {
+        let wp = ExplicitWpParams {
+            weight: 1 << 6,
+            offset: 1000,
+        };
+        let l0 = [8192i32];
+        let out = explicit_weighted_sample_pred(
+            1,
+            1,
+            Some(&l0),
+            None,
+            true,
+            false,
+            6,
+            wp,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0,
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec![255]);
+    }
+
+    /// A negative weighted result clamps to 0.
+    #[test]
+    fn explicit_wp_output_clamps_low() {
+        let wp = ExplicitWpParams {
+            weight: -64,
+            offset: 0,
+        };
+        let l0 = [8192i32];
+        let out = explicit_weighted_sample_pred(
+            1,
+            1,
+            Some(&l0),
+            None,
+            true,
+            false,
+            6,
+            wp,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0,
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec![0]);
+    }
+
+    /// BitDepth 10 → shift1 = Max(2, 14−10) = 4, log2Wd = 6 + 4 = 10,
+    /// clip ceiling 1023. Unit weight 64, s0 = 128 << 4 = 2048:
+    ///   (2048 * 64 + 2^9) >> 10 = (131072 + 512) >> 10 = 128.
+    #[test]
+    fn explicit_wp_bit_depth_10_shift1() {
+        let wp = ExplicitWpParams {
+            weight: 1 << 6,
+            offset: 0,
+        };
+        let l0 = [2048i32];
+        let out = explicit_weighted_sample_pred(
+            1,
+            1,
+            Some(&l0),
+            None,
+            true,
+            false,
+            6,
+            wp,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0,
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(out, vec![128]);
+    }
+
+    /// predFlag gating: passing a present array but predFlag == 0 omits
+    /// that list — here only L1 is active so eq. 993 governs.
+    #[test]
+    fn explicit_wp_pred_flag_gates_list() {
+        let wp0 = ExplicitWpParams {
+            weight: 999,
+            offset: 999,
+        };
+        let wp1 = ExplicitWpParams {
+            weight: 64,
+            offset: 0,
+        };
+        let l0 = [0i32];
+        let l1 = [8192i32];
+        let out = explicit_weighted_sample_pred(
+            1,
+            1,
+            Some(&l0),
+            Some(&l1),
+            false, // L0 gated off despite array present
+            true,
+            6,
+            wp0,
+            wp1,
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec![128]);
+    }
+
+    /// Both predFlags off is rejected.
+    #[test]
+    fn explicit_wp_both_flags_off_errors() {
+        let zero = ExplicitWpParams {
+            weight: 0,
+            offset: 0,
+        };
+        assert!(
+            explicit_weighted_sample_pred(1, 1, None, None, false, false, 6, zero, zero, 8)
+                .is_err()
+        );
+    }
+
+    /// Too-short input array is rejected.
+    #[test]
+    fn explicit_wp_short_array_errors() {
+        let wp = ExplicitWpParams {
+            weight: 64,
+            offset: 0,
+        };
+        let l0 = [8192i32; 3];
+        assert!(explicit_weighted_sample_pred(
+            2,
+            2,
+            Some(&l0),
+            None,
+            true,
+            false,
+            6,
+            wp,
+            ExplicitWpParams {
+                weight: 0,
+                offset: 0
+            },
+            8
+        )
+        .is_err());
     }
 }

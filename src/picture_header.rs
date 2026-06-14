@@ -893,6 +893,55 @@ pub fn derive_luma_offset(table: &PredWeightTableList, i: u32) -> i32 {
         .unwrap_or(0)
 }
 
+/// §7.4.7 — derive `ChromaWeightLN[i][j]` for record `i`, component
+/// `j ∈ {0 (Cb), 1 (Cr)}`. When the per-i `chroma_weight_lN_flag == 1`,
+/// returns `(1 << chroma_log2_weight_denom) + delta_chroma_weight_lN[i][j]`;
+/// otherwise the spec-inferred `2^ChromaLog2WeightDenom`. `j` outside
+/// `{0, 1}` returns the inferred base.
+pub fn derive_chroma_weight(
+    table: &PredWeightTableList,
+    chroma_log2_weight_denom: u32,
+    i: u32,
+    j: u32,
+) -> i32 {
+    let base = 1i32 << chroma_log2_weight_denom;
+    match table.chroma.iter().find(|c| c.ref_idx == i) {
+        Some(rec) if j == 0 => base + rec.delta_chroma_weight_cb,
+        Some(rec) if j == 1 => base + rec.delta_chroma_weight_cr,
+        _ => base,
+    }
+}
+
+/// §7.4.7 eq. 144 — derive `ChromaOffsetLN[i][j]` for record `i`,
+/// component `j ∈ {0 (Cb), 1 (Cr)}`:
+///
+/// ```text
+/// ChromaOffsetLN[i][j] = Clip3(-128, 127,
+///     128 + delta_chroma_offset_lN[i][j]
+///     - ((128 * ChromaWeightLN[i][j]) >> ChromaLog2WeightDenom))
+/// ```
+///
+/// When the per-i `chroma_weight_lN_flag == 0` (no record), the
+/// spec infers `ChromaOffsetLN[i][j] = 0`.
+pub fn derive_chroma_offset(
+    table: &PredWeightTableList,
+    chroma_log2_weight_denom: u32,
+    i: u32,
+    j: u32,
+) -> i32 {
+    let Some(rec) = table.chroma.iter().find(|c| c.ref_idx == i) else {
+        return 0;
+    };
+    let delta_offset = match j {
+        0 => rec.delta_chroma_offset_cb,
+        1 => rec.delta_chroma_offset_cr,
+        _ => return 0,
+    };
+    let chroma_weight = derive_chroma_weight(table, chroma_log2_weight_denom, i, j);
+    let raw = 128 + delta_offset - ((128 * chroma_weight) >> chroma_log2_weight_denom);
+    raw.clamp(-128, 127)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1310,5 +1359,85 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let err = parse_pred_weight_table(&mut br, true, false, true, 0).unwrap_err();
         assert!(format!("{err:?}").contains("num_l0_weights"));
+    }
+
+    // ---- §7.4.7 chroma weight / offset (eq. 144) derivations ----------
+
+    /// Absent record → inferred `ChromaWeightLN = 2^ChromaLog2WeightDenom`
+    /// and `ChromaOffsetLN = 0` for both Cb (j=0) and Cr (j=1).
+    #[test]
+    fn chroma_weight_offset_inferred_when_absent() {
+        let table = PredWeightTableList::default();
+        for j in 0..2 {
+            assert_eq!(derive_chroma_weight(&table, 6, 0, j), 1 << 6);
+            assert_eq!(derive_chroma_offset(&table, 6, 0, j), 0);
+        }
+    }
+
+    /// Present record: ChromaWeightLN[i][j] = (1 << denom) + delta.
+    /// denom = 6 → base 64. Cb delta +12 → 76; Cr delta −8 → 56.
+    #[test]
+    fn chroma_weight_present_record() {
+        let mut table = PredWeightTableList::default();
+        table.chroma.push(ChromaWeight {
+            ref_idx: 0,
+            delta_chroma_weight_cb: 12,
+            delta_chroma_offset_cb: 0,
+            delta_chroma_weight_cr: -8,
+            delta_chroma_offset_cr: 0,
+        });
+        assert_eq!(derive_chroma_weight(&table, 6, 0, 0), 76);
+        assert_eq!(derive_chroma_weight(&table, 6, 0, 1), 56);
+    }
+
+    /// eq. 144 for Cb: denom = 6, ChromaWeight = 64 (delta 0),
+    /// delta_chroma_offset = 10:
+    ///   Clip3(-128, 127, 128 + 10 - ((128 * 64) >> 6))
+    ///   = Clip3(-128, 127, 138 - 128) = 10.
+    #[test]
+    fn chroma_offset_eq144_neutral_weight() {
+        let mut table = PredWeightTableList::default();
+        table.chroma.push(ChromaWeight {
+            ref_idx: 0,
+            delta_chroma_weight_cb: 0,
+            delta_chroma_offset_cb: 10,
+            delta_chroma_weight_cr: 0,
+            delta_chroma_offset_cr: -10,
+        });
+        assert_eq!(derive_chroma_offset(&table, 6, 0, 0), 10);
+        assert_eq!(derive_chroma_offset(&table, 6, 0, 1), -10);
+    }
+
+    /// eq. 144 with a non-neutral weight. denom = 6, Cb delta_weight
+    /// = 32 → ChromaWeight = 96, delta_offset = 0:
+    ///   Clip3(-128, 127, 128 + 0 - ((128 * 96) >> 6))
+    ///   = Clip3(-128, 127, 128 - 192) = -64.
+    #[test]
+    fn chroma_offset_eq144_with_weight() {
+        let mut table = PredWeightTableList::default();
+        table.chroma.push(ChromaWeight {
+            ref_idx: 0,
+            delta_chroma_weight_cb: 32,
+            delta_chroma_offset_cb: 0,
+            delta_chroma_weight_cr: 0,
+            delta_chroma_offset_cr: 0,
+        });
+        assert_eq!(derive_chroma_offset(&table, 6, 0, 0), -64);
+    }
+
+    /// eq. 144 saturates to the [-128, 127] range. A large positive
+    /// delta_offset clamps to 127.
+    #[test]
+    fn chroma_offset_eq144_clamps() {
+        let mut table = PredWeightTableList::default();
+        table.chroma.push(ChromaWeight {
+            ref_idx: 0,
+            delta_chroma_weight_cb: 0,
+            delta_chroma_offset_cb: 4 * 127,
+            delta_chroma_weight_cr: 0,
+            delta_chroma_offset_cr: 0,
+        });
+        // 128 + 508 - 128 = 508 → clamp 127.
+        assert_eq!(derive_chroma_offset(&table, 6, 0, 0), 127);
     }
 }
