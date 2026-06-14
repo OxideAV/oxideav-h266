@@ -391,7 +391,24 @@ the **intra-only single-tile single-slice subset** plus the round-28
   `rCb = tmp − (rCr >> 1)`; `rCr += rCb`, with eq. 1205 reading the
   already-updated `rCb`). The per-CU gating + the three
   `controlPara == 1` component inverse-transform feeds are the
-  CTU-walker follow-up.
+  CTU-walker follow-up. **Round-299** lands the §8.7.2 "Scaling and
+  transformation process" orchestrator
+  (`transform::scaling_and_transformation`) plus the joint Cb-Cr
+  `TuCResMode` enum + `transform::derive_coded_c_idx` codedCIdx
+  derivation. Given the §8.7.3 scaled coefficients of the *coded*
+  component, step 2 dispatches transform-skip (eq. 1129 passthrough)
+  vs the §8.7.4.1 separable inverse transform (via `CodedTransform`),
+  and step 3 produces the requested component's `resSamples` per the
+  joint Cb-Cr derivation: `cSign = 1 − 2·ph_joint_cbcr_sign_flag`;
+  the coded component is `res` (eq. 1130), a `TuCResMode == 2`
+  sibling is `cSign·res` (eq. 1131), and any other derived chroma
+  sibling is `(cSign·res) >> 1` (eq. 1132). `codedCIdx` follows the
+  §8.7.2 table (`cIdx == 0 || TuCResMode == 0 → cIdx`; modes 1/2 →
+  Cb; mode 3 → Cr) so a derived chroma component reuses its coded
+  sibling's scaled coefficients. The CTU-walker fuse that resolves
+  `TuCResMode` / `ph_joint_cbcr_sign_flag` / per-TU
+  `transform_skip_flag` from the live transform_tree and runs §8.7.3
+  per coded component is the follow-up.
 * **CABAC**: full §9.3 arithmetic engine + per-syntax-element initValue
   / shiftIdx tables for everything currently parsed (cu_skip /
   general_merge / regular_merge / merge_idx + round-27 mmvd_merge_flag

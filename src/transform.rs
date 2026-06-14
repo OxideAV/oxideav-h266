@@ -717,6 +717,182 @@ pub fn act_residual_modification(
     Ok(())
 }
 
+/// §8.7.2 `TuCResMode[ xTbY ][ yTbY ]` — the per-TU joint Cb-Cr
+/// residual mode that selects which chroma component is coded and how
+/// the other is derived from it (eqs. 1130–1132 / eqs. 1135–1140).
+///
+/// The four modes follow the §7.4.12.11 `tu_joint_cbcr_residual_flag`
+/// + `transform_skip_flag` / cbf derivation (the value is the index of
+/// the §7.3.11.x derivation, not a bitstream field directly):
+///
+/// * `None` (0) — no joint coding; Cb and Cr each carry their own
+///   residual. The current component is coded independently.
+/// * `CbCoded` (1) — Cb is the coded component; Cr is derived as
+///   `(cSign * res) >> 1` (eq. 1132).
+/// * `CbCrCoded` (2) — a single residual is shared; the coded
+///   component is Cb and Cr is `cSign * res` (eq. 1131).
+/// * `CrCoded` (3) — Cr is the coded component; Cb is derived as
+///   `(cSign * res) >> 1` (eq. 1132).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TuCResMode {
+    /// 0 — independent Cb / Cr residuals.
+    None = 0,
+    /// 1 — Cb coded, Cr derived (`>> 1`).
+    CbCoded = 1,
+    /// 2 — single shared residual, both derived (`cSign *`).
+    CbCrCoded = 2,
+    /// 3 — Cr coded, Cb derived (`>> 1`).
+    CrCoded = 3,
+}
+
+impl TuCResMode {
+    /// Map the raw §7.4.12.11 `TuCResMode` value (0..=3) onto the enum.
+    pub fn from_raw(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(TuCResMode::None),
+            1 => Ok(TuCResMode::CbCoded),
+            2 => Ok(TuCResMode::CbCrCoded),
+            3 => Ok(TuCResMode::CrCoded),
+            other => Err(Error::invalid(format!(
+                "h266 8.7.2: TuCResMode value {other} out of range 0..=3"
+            ))),
+        }
+    }
+
+    /// Raw 0..=3 value.
+    #[inline]
+    pub fn raw(self) -> u8 {
+        self as u8
+    }
+}
+
+/// §8.7.2 `codedCIdx` derivation — the colour component that actually
+/// carries the coded residual for the current `(cIdx, TuCResMode)`
+/// pair. The scaling process (§8.7.3) is invoked with `cIdx` set to
+/// `codedCIdx`, so a derived chroma component reuses the scaled
+/// coefficients of its coded sibling.
+///
+/// Spec text (§8.7.2):
+/// * If `cIdx == 0` OR `TuCResMode == 0`, `codedCIdx = cIdx`.
+/// * Otherwise if `TuCResMode == 1` or `2`, `codedCIdx = 1` (Cb).
+/// * Otherwise (`TuCResMode == 3`), `codedCIdx = 2` (Cr).
+pub fn derive_coded_c_idx(c_idx: u32, tu_c_res_mode: TuCResMode) -> u32 {
+    if c_idx == 0 || tu_c_res_mode == TuCResMode::None {
+        c_idx
+    } else if matches!(tu_c_res_mode, TuCResMode::CbCoded | TuCResMode::CbCrCoded) {
+        1
+    } else {
+        2
+    }
+}
+
+/// The transform-domain choice for §8.7.2 step 2: either transform-skip
+/// (`res[x][y] = d[x][y]`, eq. 1129) or the §8.7.4.1 separable inverse
+/// transform.
+#[derive(Clone, Copy, Debug)]
+pub enum CodedTransform {
+    /// `transform_skip_flag == 1` — the scaled coefficients are the
+    /// residual directly (eq. 1129).
+    Skip,
+    /// `transform_skip_flag == 0` — invoke §8.7.4.1 with these kernel
+    /// selectors and non-zero coefficient ranges.
+    Transform {
+        /// `non_zero_w` / `non_zero_h` (eqs. 1171 / 1172).
+        non_zero_w: usize,
+        non_zero_h: usize,
+        /// Horizontal / vertical kernel selectors (Table 39 / implicit).
+        tr_type_hor: TrType,
+        tr_type_ver: TrType,
+    },
+}
+
+/// §8.7.2 "Scaling and transformation process" — the orchestrator that
+/// turns the §8.7.3 scaled transform coefficients of the **coded**
+/// component into the `(nTbW)x(nTbH)` residual sample array
+/// `resSamples` for the **requested** component `cIdx`, applying the
+/// joint Cb-Cr (eqs. 1130–1132) residual derivation.
+///
+/// Composition: the caller first runs §8.7.3 (`crate::dequant`) with
+/// `cIdx` set to `derive_coded_c_idx(cIdx, TuCResMode)` to obtain the
+/// scaled coefficients `d`, then passes them here. Step 1 (scaling)
+/// therefore happens outside this routine — this function implements
+/// the new §8.7.2 logic: step 2 (transform-skip vs §8.7.4.1 dispatch,
+/// eq. 1129) and step 3 (the JCCR `resSamples` derivation,
+/// eqs. 1130–1132).
+///
+/// Inputs:
+/// * `c_idx` — the requested colour component (0 = Y, 1 = Cb, 2 = Cr).
+/// * `tu_c_res_mode` — `TuCResMode[ xTbY ][ yTbY ]`.
+/// * `ph_joint_cbcr_sign_flag` — `ph_joint_cbcr_sign_flag`; `cSign =
+///   1 − 2 * flag`.
+/// * `n_tb_w` / `n_tb_h` — transform block dimensions.
+/// * `d` — the §8.7.3 scaled transform coefficients of the **coded**
+///   component, row-major length `n_tb_w * n_tb_h`.
+/// * `coded` — the §8.7.2 step-2 transform choice (skip vs transform)
+///   for the coded component.
+/// * `bit_depth` — component `BitDepth` (only used on the transform
+///   path, §8.7.4.1 step 6).
+/// * `log2_transform_range` — `Log2TransformRange` (default 15).
+///
+/// Output: `resSamples[x][y]`, row-major `n_tb_w * n_tb_h`.
+#[allow(clippy::too_many_arguments)]
+pub fn scaling_and_transformation(
+    c_idx: u32,
+    tu_c_res_mode: TuCResMode,
+    ph_joint_cbcr_sign_flag: bool,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    d: &[i32],
+    coded: CodedTransform,
+    bit_depth: u32,
+    log2_transform_range: u32,
+) -> Result<Vec<i32>> {
+    let n = n_tb_w * n_tb_h;
+    if d.len() != n {
+        return Err(Error::invalid(format!(
+            "h266 8.7.2: scaled-coeff length {} != {n_tb_w}x{n_tb_h}",
+            d.len()
+        )));
+    }
+    let coded_c_idx = derive_coded_c_idx(c_idx, tu_c_res_mode);
+    // §8.7.2 — cSign = 1 − 2 * ph_joint_cbcr_sign_flag.
+    let c_sign: i32 = 1 - 2 * (ph_joint_cbcr_sign_flag as i32);
+
+    // Step 2 — res of the coded component (eq. 1129 or §8.7.4.1).
+    let res = match coded {
+        CodedTransform::Skip => d.to_vec(),
+        CodedTransform::Transform {
+            non_zero_w,
+            non_zero_h,
+            tr_type_hor,
+            tr_type_ver,
+        } => inverse_transform_2d(
+            n_tb_w,
+            n_tb_h,
+            non_zero_w,
+            non_zero_h,
+            tr_type_hor,
+            tr_type_ver,
+            d,
+            bit_depth,
+            log2_transform_range,
+        )?,
+    };
+
+    // Step 3 — resSamples of the requested component (eqs. 1130–1132).
+    if c_idx == coded_c_idx {
+        // eq. 1130 — the coded component itself.
+        Ok(res)
+    } else if tu_c_res_mode == TuCResMode::CbCrCoded {
+        // eq. 1131 — both derived from the shared residual, no shift.
+        Ok(res.iter().map(|&r| c_sign * r).collect())
+    } else {
+        // eq. 1132 — derived component, halved.
+        Ok(res.iter().map(|&r| (c_sign * r) >> 1).collect())
+    }
+}
+
 /// Apply the 32-point DST-VII using the two 16-column sub-tables
 /// (eqs. 1188 / 1190: rows 0..15 from COL_0_15, rows 16..31 from
 /// COL_16_31, both indexed by `[row][n]` with n=0..15 — i.e. the
@@ -1220,5 +1396,234 @@ mod tests {
         let mut r_cb = vec![0; 16];
         let mut r_cr = vec![0; 8]; // wrong
         assert!(act_residual_modification(4, 4, &mut r_y, &mut r_cb, &mut r_cr, 10).is_err());
+    }
+
+    // ---- §8.7.2 scaling and transformation process ----
+
+    #[test]
+    fn tu_c_res_mode_from_raw_round_trip() {
+        for v in 0u8..=3 {
+            assert_eq!(TuCResMode::from_raw(v).unwrap().raw(), v);
+        }
+        assert!(TuCResMode::from_raw(4).is_err());
+    }
+
+    #[test]
+    fn coded_c_idx_matches_spec_table() {
+        // cIdx == 0 → always self regardless of mode.
+        for m in [
+            TuCResMode::None,
+            TuCResMode::CbCoded,
+            TuCResMode::CbCrCoded,
+            TuCResMode::CrCoded,
+        ] {
+            assert_eq!(derive_coded_c_idx(0, m), 0);
+        }
+        // TuCResMode == 0 → self.
+        assert_eq!(derive_coded_c_idx(1, TuCResMode::None), 1);
+        assert_eq!(derive_coded_c_idx(2, TuCResMode::None), 2);
+        // Modes 1 / 2 → Cb is coded.
+        assert_eq!(derive_coded_c_idx(1, TuCResMode::CbCoded), 1);
+        assert_eq!(derive_coded_c_idx(2, TuCResMode::CbCoded), 1);
+        assert_eq!(derive_coded_c_idx(1, TuCResMode::CbCrCoded), 1);
+        assert_eq!(derive_coded_c_idx(2, TuCResMode::CbCrCoded), 1);
+        // Mode 3 → Cr is coded.
+        assert_eq!(derive_coded_c_idx(1, TuCResMode::CrCoded), 2);
+        assert_eq!(derive_coded_c_idx(2, TuCResMode::CrCoded), 2);
+    }
+
+    #[test]
+    fn scaling_xfm_transform_skip_passthrough_eq_1129_1130() {
+        // cIdx == codedCIdx with transform-skip: res == d, resSamples == res.
+        let d = vec![1, -2, 3, -4];
+        let out = scaling_and_transformation(
+            0,
+            TuCResMode::None,
+            false,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        assert_eq!(out, d);
+    }
+
+    #[test]
+    fn scaling_xfm_derived_cr_is_halved_eq_1132() {
+        // Mode 1 (Cb coded). Request Cr (cIdx 2 != codedCIdx 1).
+        // resSamples = (cSign * res) >> 1, cSign = +1 (flag false).
+        let d = vec![10, -7, 4, -5];
+        let cr = scaling_and_transformation(
+            2,
+            TuCResMode::CbCoded,
+            false,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        // (1 * res) >> 1 (arithmetic).
+        let expect: Vec<i32> = d.iter().map(|&r| r >> 1).collect();
+        assert_eq!(cr, expect);
+        // The coded component (Cb) returns res directly (eq. 1130).
+        let cb = scaling_and_transformation(
+            1,
+            TuCResMode::CbCoded,
+            false,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        assert_eq!(cb, d);
+    }
+
+    #[test]
+    fn scaling_xfm_shared_residual_csign_eq_1131() {
+        // Mode 2 (CbCrCoded). Cb coded; Cr derived with cSign, no shift.
+        // ph_joint_cbcr_sign_flag = true → cSign = -1.
+        let d = vec![6, -3, 8, -1];
+        let cr = scaling_and_transformation(
+            2,
+            TuCResMode::CbCrCoded,
+            true,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        let expect: Vec<i32> = d.iter().map(|&r| -r).collect();
+        assert_eq!(cr, expect);
+        // Cb (the coded component) is unmodified res (eq. 1130).
+        let cb = scaling_and_transformation(
+            1,
+            TuCResMode::CbCrCoded,
+            true,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        assert_eq!(cb, d);
+    }
+
+    #[test]
+    fn scaling_xfm_mode3_cr_coded_cb_derived() {
+        // Mode 3 (CrCoded). Cr coded; request Cb → (cSign*res)>>1.
+        let d = vec![9, -8, 5, -3];
+        let cb = scaling_and_transformation(
+            1,
+            TuCResMode::CrCoded,
+            false,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        let expect: Vec<i32> = d.iter().map(|&r| r >> 1).collect();
+        assert_eq!(cb, expect);
+        // Cr is the coded component.
+        let cr = scaling_and_transformation(
+            2,
+            TuCResMode::CrCoded,
+            false,
+            2,
+            2,
+            &d,
+            CodedTransform::Skip,
+            10,
+            15,
+        )
+        .unwrap();
+        assert_eq!(cr, d);
+    }
+
+    #[test]
+    fn scaling_xfm_transform_path_matches_inverse_transform_2d() {
+        // cIdx == codedCIdx, transform path: must equal a direct
+        // inverse_transform_2d call (eq. 1130 passthrough of step 2).
+        let d = vec![64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let direct =
+            inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+        let via = scaling_and_transformation(
+            0,
+            TuCResMode::None,
+            false,
+            4,
+            4,
+            &d,
+            CodedTransform::Transform {
+                non_zero_w: 4,
+                non_zero_h: 4,
+                tr_type_hor: TrType::DctII,
+                tr_type_ver: TrType::DctII,
+            },
+            8,
+            15,
+        )
+        .unwrap();
+        assert_eq!(via, direct);
+    }
+
+    #[test]
+    fn scaling_xfm_derived_chroma_uses_transform_path() {
+        // Mode 1, request Cr, transform path: resSamples = transform(d) >> 1.
+        let d = vec![128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let res =
+            inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+        let expect: Vec<i32> = res.iter().map(|&r| r >> 1).collect();
+        let cr = scaling_and_transformation(
+            2,
+            TuCResMode::CbCoded,
+            false,
+            4,
+            4,
+            &d,
+            CodedTransform::Transform {
+                non_zero_w: 4,
+                non_zero_h: 4,
+                tr_type_hor: TrType::DctII,
+                tr_type_ver: TrType::DctII,
+            },
+            8,
+            15,
+        )
+        .unwrap();
+        assert_eq!(cr, expect);
+    }
+
+    #[test]
+    fn scaling_xfm_rejects_bad_length() {
+        let d = vec![0; 8];
+        assert!(scaling_and_transformation(
+            0,
+            TuCResMode::None,
+            false,
+            4,
+            4,
+            &d,
+            CodedTransform::Skip,
+            8,
+            15,
+        )
+        .is_err());
     }
 }
