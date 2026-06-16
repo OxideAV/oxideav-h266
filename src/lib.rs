@@ -218,6 +218,7 @@ pub mod sei_prefix_indication;
 pub mod sei_rbsp;
 pub mod slice_header;
 pub mod sps;
+pub mod subpic_level_info;
 pub mod syntax_enc;
 pub mod tables;
 pub mod transform;

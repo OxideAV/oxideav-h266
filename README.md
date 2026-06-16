@@ -43,15 +43,18 @@ oxideav-h266 = "0.0"
 * **Auxiliary NAL units** — AUD (§7.3.2.10), Filler Data (§7.3.2.13),
   End of Sequence / End of Bitstream (§7.3.2.11 / §7.3.2.12),
   `rbsp_trailing_bits()` / `byte_alignment()` / `rbsp_slice_trailing_bits()`
-  validators, and the SEI message + `sei_rbsp()` walkers. The first
-  per-type `sei_payload()` Annex D body is decoded — the SEI manifest
-  SEI message (§D.8.1, `payloadType == 200`) into a typed
-  `sei_manifest::SeiManifest` and the SEI prefix indication SEI message
-  (§D.9.1, `payloadType == 201`) into a typed
-  `sei_prefix_indication::SeiPrefixIndication`, with the per-indication
-  `byte_alignment_bit_equal_to_one` padding verified per §D.9.2; the
-  remaining payload bodies (most deferred to Rec. ITU-T H.274) are still
-  uninterpreted.
+  validators, and the SEI message + `sei_rbsp()` walkers. The
+  `sei_payload()` Annex D bodies specified directly in this Specification
+  are decoded into typed structures — the SEI manifest SEI message
+  (§D.8.1, `payloadType == 200`) into `sei_manifest::SeiManifest`, the SEI
+  prefix indication SEI message (§D.9.1, `payloadType == 201`) into
+  `sei_prefix_indication::SeiPrefixIndication` (with the per-indication
+  `byte_alignment_bit_equal_to_one` padding verified per §D.9.2), and the
+  subpicture level information SEI message (§D.7.1, `payloadType == 203`)
+  into `subpic_level_info::SubpicLevelInfo` (the `sli_*` reference-level /
+  fraction syntax across sublayers, with `sli_alignment_zero_bit`
+  verified per §D.7.2); the remaining payload bodies (most deferred to
+  Rec. ITU-T H.274) are still uninterpreted.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()` walked
   end-to-end including the §7.3.3.2 `general_constraints_info()` body
   with every named GCI flag surfaced.
