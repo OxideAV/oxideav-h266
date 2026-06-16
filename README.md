@@ -53,8 +53,13 @@ oxideav-h266 = "0.0"
   subpicture level information SEI message (§D.7.1, `payloadType == 203`)
   into `subpic_level_info::SubpicLevelInfo` (the `sli_*` reference-level /
   fraction syntax across sublayers, with `sli_alignment_zero_bit`
-  verified per §D.7.2); the remaining payload bodies (most deferred to
-  Rec. ITU-T H.274) are still uninterpreted.
+  verified per §D.7.2), and the DU information SEI message (§D.5.1,
+  `payloadType == 130`) into `decoding_unit_info::DecodingUnitInfo` (the
+  `dui_*` CPB-removal-delay / DPB-output-delay syntax, driven by a
+  `decoding_unit_info::DuiContext` carrying the §D.3.2 BP-derived gating
+  flags and `u(v)` lengths plus the SEI NAL unit `TemporalId`, with the
+  §D.2.1 `sei_payload()` trailing bits verified); the remaining payload
+  bodies (most deferred to Rec. ITU-T H.274) are still uninterpreted.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()` walked
   end-to-end including the §7.3.3.2 `general_constraints_info()` body
   with every named GCI flag surfaced.

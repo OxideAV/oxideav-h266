@@ -176,6 +176,7 @@ pub mod ctx;
 pub mod dci;
 pub mod deblock;
 pub mod decoder;
+pub mod decoding_unit_info;
 pub mod dequant;
 pub mod dmvr;
 pub mod encoder;
