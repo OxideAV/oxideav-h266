@@ -58,8 +58,14 @@ oxideav-h266 = "0.0"
   `dui_*` CPB-removal-delay / DPB-output-delay syntax, driven by a
   `decoding_unit_info::DuiContext` carrying the §D.3.2 BP-derived gating
   flags and `u(v)` lengths plus the SEI NAL unit `TemporalId`, with the
-  §D.2.1 `sei_payload()` trailing bits verified); the remaining payload
-  bodies (most deferred to Rec. ITU-T H.274) are still uninterpreted.
+  §D.2.1 `sei_payload()` trailing bits verified), and the constrained RASL
+  encoding indication SEI message (§D.10.1, `payloadType == 207`) into
+  `constrained_rasl_encoding_indication::ConstrainedRaslEncodingIndication`
+  (an empty-body marker whose presence asserts the four §D.10.2 RASL
+  encoding constraints, surfaced via `constraints()`; the §D.2.1
+  `sei_payload()` framing is validated against `more_data_in_payload()`);
+  the remaining payload bodies (most deferred to Rec. ITU-T H.274) are
+  still uninterpreted.
 * **Profile / Tier / Level** (§7.3.3.1) — `profile_tier_level()` walked
   end-to-end including the §7.3.3.2 `general_constraints_info()` body
   with every named GCI flag surfaced.

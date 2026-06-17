@@ -171,6 +171,7 @@ pub mod cabac;
 pub mod cabac_enc;
 pub mod cclm;
 pub mod coding_tree;
+pub mod constrained_rasl_encoding_indication;
 pub mod ctu;
 pub mod ctx;
 pub mod dci;
