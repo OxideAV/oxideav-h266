@@ -1530,17 +1530,18 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // inference.
             let merge_subblock_idx = self.read_merge_subblock_idx(max_sb_merge)?;
             info.inter.merge_data.merge_subblock_idx = merge_subblock_idx;
-            // Subblock-merge CUs carry no residual on the regular /
-            // skip path: cu_skip_flag may be 0 or 1, but the rest of
-            // merge_data() (regular_merge_flag, MMVD, CIIP, GPM, the
-            // merge_idx parse) is bypassed because §7.4.12.7 infers
+            // Subblock-merge CUs (SbTMVP / affine merge) bypass the rest
+            // of merge_data() (regular_merge_flag, MMVD, CIIP, GPM, the
+            // merge_idx parse) because §7.4.12.7 infers
             // `regular_merge_flag = general_merge_flag && !merge_subblock_flag`
-            // = 0. The cu_coded_flag handling at the end of decode_inter
-            // still runs for non-skip CUs.
+            // = 0. They may still carry a residual: for a non-skip CU
+            // the `cu_coded_flag` at the end of §7.3.11.5 gates the
+            // §7.3.11.9 `transform_tree()` body, which is the same
+            // MODE_INTER `transform_unit()` syntax as the regular-merge
+            // path (round-338).
             info.tu_y_coded_flag = false;
             info.tu_cb_coded_flag = false;
             info.tu_cr_coded_flag = false;
-            let _ = residual;
             if !cu_skip {
                 let n = self.ctxs.cu_coded_flag.len() - 1;
                 let slot = (self.ctxs.init_type as usize).min(n);
@@ -1549,12 +1550,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     .decode_decision(&mut self.ctxs.cu_coded_flag[slot])?
                     == 1;
                 if cu_coded {
-                    return Err(Error::unsupported(
-                        "h266 leaf CU inter: subblock-merge CU with cu_coded_flag == 1 (residual \
-                         transform_tree) not yet supported (round-146 only handles \
-                         cu_coded_flag == 0)",
-                    ));
+                    self.decode_inter_transform_unit(info, residual)?;
                 }
+            } else {
+                let _ = residual;
             }
             return Ok(());
         }
@@ -5804,6 +5803,70 @@ mod tests {
         padded
     }
 
+    /// Round-338: like [`build_subblock_merge_payload`] but with
+    /// `cu_coded_flag(1)` followed by the MODE_INTER `transform_unit()`
+    /// residual: `tu_cb_coded_flag(0)`, `tu_cr_coded_flag(0)` (so the
+    /// luma CBF is inferred to 1 with no bin), then a `cbW × cbH`
+    /// luma `residual_coding()` carrying `levels`. `cu_qp_delta` is
+    /// not enabled in `tools_for_subblock_merge`, so no QP-delta bins
+    /// are emitted.
+    fn build_subblock_merge_payload_with_residual(
+        slice_qp: i32,
+        init_type: u8,
+        cb_w: usize,
+        cb_h: usize,
+        levels: &[i32],
+    ) -> Vec<u8> {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_merge_subblock_flag,
+        };
+        use crate::residual_enc::{
+            encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+        };
+
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+
+        let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        let skip_slot = (init_type as usize) * 3 + skip_inc;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
+            .unwrap();
+
+        let gm_inc = ctx_inc_general_merge_flag() as usize;
+        let gm_n = ctxs.general_merge_flag.len() - 1;
+        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
+            .unwrap();
+
+        // merge_subblock_flag(1) → short-circuits the regular tree.
+        let inc = ctx_inc_merge_subblock_flag(false, false, false, false, false, false) as usize;
+        let init_off = (init_type as usize).saturating_sub(1) * 3;
+        let n = ctxs.merge_subblock_flag.len() - 1;
+        let sb_slot = (init_off + inc).min(n);
+        enc.encode_decision(&mut ctxs.merge_subblock_flag[sb_slot], 1)
+            .unwrap();
+        // merge_subblock_idx(0) with max_cand = 5.
+        encode_merge_subblock_idx(&mut enc, &mut ctxs, 0, 5);
+
+        // cu_coded_flag(1).
+        let cu_n = ctxs.cu_coded_flag.len() - 1;
+        let cu_slot = (init_type as usize).min(cu_n);
+        enc.encode_decision(&mut ctxs.cu_coded_flag[cu_slot], 1)
+            .unwrap();
+
+        // transform_unit(): tu_cb_coded(0), tu_cr_coded(0) → luma CBF
+        // inferred 1 (no bin), then the luma residual_coding TB.
+        write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();
+        write_tu_cr_coded_flag(&mut enc, &mut ctxs.residual, false, false, false).unwrap();
+        encode_tb_coefficients(&mut enc, &mut ctxs.residual, cb_w, cb_h, 0, levels).unwrap();
+
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 32]);
+        padded
+    }
+
     fn tools_for_subblock_merge(max_num_subblock_merge_cand: u32) -> CuToolFlags {
         CuToolFlags {
             chroma_format_idc: 1,
@@ -6000,6 +6063,49 @@ mod tests {
             .expect("subblock-merge path with merge_subblock_idx=3 must decode clean");
         assert!(info.inter.merge_data.merge_subblock_flag);
         assert_eq!(info.inter.merge_data.merge_subblock_idx, 3);
+    }
+
+    /// Round-338: a subblock-merge inter CU with `cu_coded_flag == 1`
+    /// now decodes its MODE_INTER `transform_unit()` residual instead
+    /// of surfacing `Error::Unsupported`. With both chroma CBFs 0 the
+    /// luma CBF is inferred to 1 (no bin), and a luma `residual_coding`
+    /// TB carrying a single DC level round-trips into
+    /// `residual.luma_levels`.
+    #[test]
+    fn merge_subblock_cu_coded_one_decodes_inter_residual() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let cb_w = 16usize;
+        let cb_h = 16usize;
+        let mut levels = vec![0i32; cb_w * cb_h];
+        levels[0] = 5; // DC.
+        let payload =
+            build_subblock_merge_payload_with_residual(slice_qp, init_type, cb_w, cb_h, &levels);
+
+        let tools = tools_for_subblock_merge(5);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: cb_w as u32,
+            cb_height: cb_h as u32,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("subblock-merge CU with cu_coded=1 must decode its inter residual");
+        assert!(info.inter.merge_data.merge_subblock_flag);
+        // Luma CBF inferred 1; chroma CBFs read as 0.
+        assert!(info.tu_y_coded_flag);
+        assert!(!info.tu_cb_coded_flag);
+        assert!(!info.tu_cr_coded_flag);
+        // Residual coefficients round-tripped.
+        assert_eq!(residual.luma_levels.len(), cb_w * cb_h);
+        assert_eq!(residual.luma_levels[0], 5);
+        assert!(residual.cb_levels.is_empty());
+        assert!(residual.cr_levels.is_empty());
     }
 
     /// Round-146: gate OPEN, `merge_subblock_flag = 1`, and
