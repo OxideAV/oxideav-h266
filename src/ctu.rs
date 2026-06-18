@@ -92,7 +92,7 @@ use crate::leaf_cu::{
 };
 use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
-use crate::reconstruct::{reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
+use crate::reconstruct::{clip_pixel, reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
 use crate::sao::{apply_sao, SaoConfig, SaoPicture};
 use crate::sao_syntax::{decode_sao_ctb, SaoCtxs, SaoSyntaxConfig};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
@@ -1570,7 +1570,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // motion field is updated so subsequent CUs can read this CU
         // as an A/B neighbour during their own merge derivation.
         if matches!(info.pred_mode, CuPredMode::Inter) {
-            return self.reconstruct_leaf_cu_inter(cu, info, out);
+            return self.reconstruct_leaf_cu_inter(cu, info, residual, out);
         }
 
         // MIP (§8.4.5.2.2) is wired below through [`crate::mip`]; the
@@ -1882,6 +1882,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         &mut self,
         cu: &CtuCu,
         info: &LeafCuInfo,
+        residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         let max_merge = self.cu_tool_flags().max_num_merge_cand;
@@ -2384,6 +2385,69 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
         }
 
+        // ---- Inter residual add (§8.5.8 + §8.7.5.1) -----------------------
+        //
+        // When `cu_coded_flag == 1` the parser populated `residual`
+        // with the §7.3.11.10 transform-unit coefficient levels. The
+        // §8.5.8 residual-signal process dequantises (§8.7.3) and
+        // inverse-transforms (§8.7.4) each coded TB with
+        // `predMode == MODE_INTER`, and §8.7.5.1 forms the
+        // reconstructed sample `recSamples = Clip1(predSamples +
+        // resSamples)`. The motion-compensated `predSamples` already
+        // live in `out`, so we add the residual in place. SBT / multi-
+        // TB tiling are out of scope (the parser surfaces Unsupported
+        // for CB > MaxTbSizeY before reaching here), so the CU is a
+        // single transform block per component.
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let cu_qp_delta = info.cu_qp_delta_val;
+        if info.tu_y_coded_flag && !residual.luma_levels.is_empty() {
+            let n_tb_w = cu.cu.w as usize;
+            let n_tb_h = cu.cu.h as usize;
+            self.add_inter_residual_plane(
+                /*c_idx=*/ 0,
+                cu.cu.x as usize,
+                cu.cu.y as usize,
+                n_tb_w,
+                n_tb_h,
+                &residual.luma_levels,
+                cu_qp_delta,
+                bit_depth,
+                out,
+            )?;
+        }
+        if self.sps.sps_chroma_format_idc == 1 {
+            let c_w = (cu.cu.w as usize) / 2;
+            let c_h = (cu.cu.h as usize) / 2;
+            let c_x = (cu.cu.x as usize) / 2;
+            let c_y = (cu.cu.y as usize) / 2;
+            if info.tu_cb_coded_flag && !residual.cb_levels.is_empty() {
+                self.add_inter_residual_plane(
+                    /*c_idx=*/ 1,
+                    c_x,
+                    c_y,
+                    c_w,
+                    c_h,
+                    &residual.cb_levels,
+                    cu_qp_delta,
+                    bit_depth,
+                    out,
+                )?;
+            }
+            if info.tu_cr_coded_flag && !residual.cr_levels.is_empty() {
+                self.add_inter_residual_plane(
+                    /*c_idx=*/ 2,
+                    c_x,
+                    c_y,
+                    c_w,
+                    c_h,
+                    &residual.cr_levels,
+                    cu_qp_delta,
+                    bit_depth,
+                    out,
+                )?;
+            }
+        }
+
         // Broadcast the chosen MvField across every 4x4 block of the
         // CU. The cu_skip_flag flag is propagated so the next CU's
         // §9.3.4.2.2 cu_skip_flag context picks it up correctly.
@@ -2422,19 +2486,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // regular-merge inter CUs so we hit it here.
         self.hmvp.update_with(mvf);
 
-        // Record this CU for the deblocker. Inter CUs with cu_skip = 1
-        // carry no residual, so all CBFs are 0.
-        let qp_y = self.cabac.slice_qp_y.0;
+        // Record this CU for the deblocker. Skip CUs carry no residual
+        // (all CBFs 0); non-skip merge CUs with `cu_coded_flag == 1`
+        // carry the §7.3.11.10 CBFs so the §8.8.3 boundary-strength
+        // derivation sees a coded transform block (bS = 1 path).
+        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
         self.deblock_cus.push(DeblockCu {
             x: cu.cu.x,
             y: cu.cu.y,
             w: cu.cu.w,
             h: cu.cu.h,
-            qp_y: qp_y.clamp(0, 63),
+            qp_y,
             intra: false,
-            tu_y_coded: false,
-            tu_cb_coded: false,
-            tu_cr_coded: false,
+            tu_y_coded: info.tu_y_coded_flag,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
         });
@@ -2449,6 +2515,97 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §9.3.4.2.2 / Table 133 ctxInc reads it back as 0 for the
         // next CU's merge-side neighbour query.
         self.commit_subblock_neighbour_state(cu, info);
+        Ok(())
+    }
+
+    /// §8.5.8 + §8.7.5.1 — add the inverse-transformed inter residual
+    /// of one component's single transform block to the motion-
+    /// compensated prediction already present in `out`.
+    ///
+    /// `levels` is the §7.3.11.10 coefficient-level array (scan-order
+    /// already de-scanned into a row-major `n_tb_w × n_tb_h` grid by
+    /// the residual reader). The dequant (§8.7.3) + inverse 2-D DCT-II
+    /// (§8.7.4, the `mts_idx == 0` regular path — explicit MTS / SBT /
+    /// transform-skip are out of scope for this single-TB inter path)
+    /// produce `resSamples`, and §8.7.5.1 forms `recSamples =
+    /// Clip1(predSamples + resSamples)` in place. Chroma uses the same
+    /// flat-list dequant; `c_idx ∈ {1, 2}` selects the destination
+    /// plane and applies the chroma QP mapping (§8.7.3 — identity-plus-
+    /// offset clamp here, matching the intra chroma path).
+    #[allow(clippy::too_many_arguments)]
+    fn add_inter_residual_plane(
+        &self,
+        c_idx: u32,
+        x0: usize,
+        y0: usize,
+        n_tb_w: usize,
+        n_tb_h: usize,
+        levels: &[i32],
+        cu_qp_delta: i32,
+        bit_depth: u32,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        if n_tb_w == 0 || n_tb_h == 0 || levels.len() != n_tb_w * n_tb_h {
+            return Ok(());
+        }
+        // §8.7.3 — QP for this component. Luma is slice QP + cu_qp_delta;
+        // chroma maps through `chroma_qp_identity` (QpC = QpY + offset,
+        // clamped) mirroring the intra chroma reconstruction path.
+        let qp_y = (self.cabac.slice_qp_y.0 + cu_qp_delta).clamp(0, 63);
+        let qp = if c_idx == 0 {
+            qp_y
+        } else {
+            chroma_qp_identity(qp_y, 0)
+        };
+        let params = DequantParams {
+            bit_depth,
+            log2_transform_range: 15,
+            n_tb_w: n_tb_w as u32,
+            n_tb_h: n_tb_h as u32,
+            qp,
+            dep_quant: false,
+            transform_skip: false,
+            bdpcm: false,
+            bdpcm_dir: false,
+        };
+        let d = dequantize_tb_flat(levels, &params)?;
+        let (tr_h, tr_v) = (TrType::DctII, TrType::DctII);
+        let _ = implicit_mts_tr_types(n_tb_w as u32, n_tb_h as u32);
+        let res = inverse_transform_2d(
+            n_tb_w, n_tb_h, n_tb_w, n_tb_h, tr_h, tr_v, &d, bit_depth, 15,
+        )?;
+        // §8.7.5.1 — recSamples = Clip1(predSamples + resSamples). The
+        // plane already holds predSamples; read each sample as pred,
+        // add residual, clip. The 8-bit `PictureBuffer` stores narrowed
+        // samples, so lift to `bit_depth` scale before the add when
+        // bit_depth > 8 and narrow back afterwards (byte-identical to
+        // the intra `reconstruct_tb_into` convention at bit_depth == 8).
+        let plane = match c_idx {
+            0 => &mut out.luma,
+            1 => &mut out.cb,
+            2 => &mut out.cr,
+            _ => return Ok(()),
+        };
+        let stride = plane.stride;
+        let height = plane.height;
+        if x0 + n_tb_w > stride || y0 + n_tb_h > height {
+            return Err(Error::invalid(
+                "h266 inter residual: TB does not fit in destination plane",
+            ));
+        }
+        let up = bit_depth.saturating_sub(8);
+        for row in 0..n_tb_h {
+            for col in 0..n_tb_w {
+                let idx = (y0 + row) * stride + (x0 + col);
+                let pred = (plane.samples[idx] as i32) << up;
+                let v = clip_pixel(pred + res[row * n_tb_w + col], bit_depth);
+                plane.samples[idx] = if bit_depth > 8 {
+                    (v >> up) as u8
+                } else {
+                    v as u8
+                };
+            }
+        }
         Ok(())
     }
 
@@ -3497,6 +3654,106 @@ mod tests {
         // RefPicList0 + RefPicList1 to be populated by the caller before
         // `decode_picture_into`.
         assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh_b, 0, &data).is_ok());
+    }
+
+    /// §8.5.8 + §8.7.5.1 — a non-skip merge inter CU whose
+    /// `tu_y_coded_flag == 1` must add its inverse-transformed luma
+    /// residual to the motion-compensated prediction. With a constant
+    /// reference frame the zero-MV uni-pred merge candidate produces a
+    /// constant prediction; a single positive luma DC coefficient must
+    /// lift every reconstructed luma sample uniformly above that
+    /// constant. Chroma carries no residual, so it stays at the
+    /// prediction value.
+    #[test]
+    fn reconstruct_leaf_cu_inter_adds_luma_residual() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h); // 64x64 CTU.
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // Constant-100 reference frame for the single L0 entry.
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+        // Inter CU, 16x16, merge with merge_idx 0 → zero-MV uni-pred
+        // L0 candidate (empty motion field pads zero-MV for P-slices).
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        // Coded luma TB carrying a single positive DC coefficient.
+        info.tu_y_coded_flag = true;
+        let mut residual = LeafCuResidual::default();
+        residual.luma_levels = vec![0i32; 16 * 16];
+        residual.luma_levels[0] = 8; // DC.
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("inter residual path should reconstruct");
+
+        // Every luma sample in the 16x16 CU must exceed the constant
+        // prediction (100) by the DC residual.
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let v = out.luma.samples[y * out.luma.stride + x];
+                assert!(
+                    v > 100,
+                    "luma sample at ({x},{y}) = {v} must exceed the constant prediction 100 \
+                     after a positive DC residual"
+                );
+            }
+        }
+        // Uniform DC lift: all reconstructed luma samples are equal.
+        let first = out.luma.samples[0];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    first,
+                    "DC-only residual must lift the whole TB uniformly"
+                );
+            }
+        }
+        // Chroma carries no residual → stays at the prediction value.
+        // `PictureBuffer::yuv420_filled` seeds chroma planes to 128
+        // (mid-grey) regardless of the luma seed, so the constant
+        // reference's chroma is 128 and the MC prediction reproduces it.
+        for cy in 0..8usize {
+            for cx in 0..8usize {
+                assert_eq!(
+                    out.cb.samples[cy * out.cb.stride + cx],
+                    128,
+                    "Cb must remain at the prediction value (no chroma residual)"
+                );
+            }
+        }
     }
 
     #[test]

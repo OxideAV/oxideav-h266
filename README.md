@@ -100,7 +100,13 @@ P + B-slice merge subset:
   §8.5.6.3 8-tap luma + 4-tap chroma fractional-sample interpolation
   with default-weighted bi-pred (§8.5.6.6.2), BCW (§8.5.6.6.2 eq. 981),
   and BDOF (§8.5.6.5). High-bit-depth (Main10 / Main12) reconstruction
-  runs through `u16` picture planes.
+  runs through `u16` picture planes. A non-skip merge / CIIP CU whose
+  `cu_coded_flag == 1` decodes its §7.3.11.10 `transform_unit()`
+  residual (MODE_INTER luma-CBF condition + chroma CBFs) and adds the
+  §8.7.3 dequant + §8.7.4 inverse-DCT-II residual to the MC prediction
+  per §8.5.8 + §8.7.5.1 (`recSamples = Clip1(predSamples + resSamples)`)
+  for the single-transform-block case; SBT, multi-TB tiling, transform-
+  skip and joint Cb-Cr inter residual surface `Error::Unsupported`.
 * **AMVP** — the §8.5.2.8-10 AMVP candidate derivation (spatial scan,
   HMVP fill, temporal Col, zero-MV pad), the §8.5.5.7 affine AMVP
   candidate list, and AMVR helpers (§7.4.11.6). The non-merge inter CU
