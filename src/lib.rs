@@ -167,6 +167,7 @@ pub mod aud;
 pub mod bcw_idx_enc;
 pub mod bdof;
 pub mod bitreader;
+pub mod buffering_period;
 pub mod cabac;
 pub mod cabac_enc;
 pub mod cclm;

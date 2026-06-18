@@ -45,7 +45,16 @@ oxideav-h266 = "0.0"
   `rbsp_trailing_bits()` / `byte_alignment()` / `rbsp_slice_trailing_bits()`
   validators, and the SEI message + `sei_rbsp()` walkers. The
   `sei_payload()` Annex D bodies specified directly in this Specification
-  are decoded into typed structures — the SEI manifest SEI message
+  are decoded into typed structures — the buffering period SEI message
+  (§D.3.1, `payloadType == 0`) into `buffering_period::BufferingPeriod`
+  (the full §D.3.1 HRD initialisation syntax: NAL / VCL / DU HRD presence,
+  the three `bp_*_length_minus1` `u(v)` length fields, concatenation +
+  CPB-removal-delay-delta lists, and the per-sublayer per-CPB initial
+  CPB removal delay / offset + alt pairs, with the §D.3.2 `u(v)` lengths,
+  range checks on `bp_cpb_cnt_minus1` / `bp_num_cpb_removal_delay_deltas_minus1`,
+  and the absent-field inferences; `BufferingPeriod::dui_context()` surfaces
+  the §D.3.2-derived `DuiContext` a companion DU information message needs),
+  the SEI manifest SEI message
   (§D.8.1, `payloadType == 200`) into `sei_manifest::SeiManifest`, the SEI
   prefix indication SEI message (§D.9.1, `payloadType == 201`) into
   `sei_prefix_indication::SeiPrefixIndication` (with the per-indication
