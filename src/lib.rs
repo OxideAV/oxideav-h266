@@ -203,6 +203,7 @@ pub mod non_merge_inter_pre_residual_enc;
 pub mod non_merge_mvp_syntax_enc;
 pub mod opi;
 pub mod picture_header;
+pub mod picture_timing;
 pub mod pps;
 pub mod ptl;
 pub mod rbsp_trailing;

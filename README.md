@@ -45,7 +45,17 @@ oxideav-h266 = "0.0"
   `rbsp_trailing_bits()` / `byte_alignment()` / `rbsp_slice_trailing_bits()`
   validators, and the SEI message + `sei_rbsp()` walkers. The
   `sei_payload()` Annex D bodies specified directly in this Specification
-  are decoded into typed structures — the buffering period SEI message
+  are decoded into typed structures — the picture timing SEI message
+  (§D.4.1, `payloadType == 1`) into `picture_timing::PictureTiming` (the
+  full §D.4.1 syntax — the per-sublayer CPB-removal-delay loop with the
+  delta / explicit-`minus1` branch, `pt_dpb_output_delay`, the
+  `bp_alt_cpb_params_present_flag`-gated NAL / VCL alt-CPB timing block,
+  the `bp_du_*_in_pic_timing_sei_flag`-gated DU DPB / CPB blocks with the
+  per-DU NAL-count + increment loops, the concatenation flag, and the
+  trailing `pt_display_elemental_periods_minus1`; every `u(v)` length and
+  branch is driven by a `picture_timing::PtContext` carried from the BP
+  message via `BufferingPeriod::pt_context()`), the buffering period SEI
+  message
   (§D.3.1, `payloadType == 0`) into `buffering_period::BufferingPeriod`
   (the full §D.3.1 HRD initialisation syntax: NAL / VCL / DU HRD presence,
   the three `bp_*_length_minus1` `u(v)` length fields, concatenation +

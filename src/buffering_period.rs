@@ -126,6 +126,7 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::decoding_unit_info::DuiContext;
+use crate::picture_timing::PtContext;
 
 /// `payloadType` value that selects the buffering period body in the §D.2
 /// `sei_payload()` dispatch.
@@ -251,6 +252,43 @@ impl BufferingPeriod {
             bp_du_cpb_removal_delay_increment_length_minus1: self
                 .du_cpb_removal_delay_increment_length_minus1,
             bp_dpb_output_delay_du_length_minus1: self.dpb_output_delay_du_length_minus1,
+        }
+    }
+
+    /// Build the [`PtContext`] a companion picture timing SEI message
+    /// (`payloadType == 1`) needs, given the `TemporalId` of the SEI NAL
+    /// unit carrying that PT message (§D.3.2 / §D.4.2).
+    ///
+    /// Every field is a §D.3.1 / §D.3.2 derivation carried by this BP
+    /// message; only the PT message's own NAL unit `TemporalId` is
+    /// supplied externally. `bp_num_cpb_removal_delay_deltas_minus1` is
+    /// recovered from the length of the parsed delta-value list (empty →
+    /// `0`, matching the syntax where the list runs `0 ..= minus1`).
+    pub fn pt_context(&self, temporal_id: u8) -> PtContext {
+        let num_deltas_minus1 = self.cpb_removal_delay_delta_vals.len().saturating_sub(1) as u32;
+        PtContext {
+            temporal_id,
+            bp_max_sublayers_minus1: self.max_sublayers_minus1,
+            bp_cpb_removal_delay_length_minus1: self.cpb_removal_delay_length_minus1,
+            bp_dpb_output_delay_length_minus1: self.dpb_output_delay_length_minus1,
+            bp_cpb_initial_removal_delay_length_minus1: self
+                .cpb_initial_removal_delay_length_minus1,
+            bp_cpb_removal_delay_deltas_present_flag: self.cpb_removal_delay_deltas_present_flag,
+            bp_num_cpb_removal_delay_deltas_minus1: num_deltas_minus1,
+            bp_alt_cpb_params_present_flag: self.alt_cpb_params_present_flag,
+            bp_nal_hrd_params_present_flag: self.nal_hrd_params_present_flag,
+            bp_vcl_hrd_params_present_flag: self.vcl_hrd_params_present_flag,
+            bp_sublayer_initial_cpb_removal_delay_present_flag: self
+                .sublayer_initial_cpb_removal_delay_present_flag,
+            bp_cpb_cnt_minus1: self.cpb_cnt_minus1,
+            bp_du_hrd_params_present_flag: self.du_hrd_params_present_flag,
+            bp_du_dpb_params_in_pic_timing_sei_flag: self.du_dpb_params_in_pic_timing_sei_flag,
+            bp_du_cpb_params_in_pic_timing_sei_flag: self.du_cpb_params_in_pic_timing_sei_flag,
+            bp_du_cpb_removal_delay_increment_length_minus1: self
+                .du_cpb_removal_delay_increment_length_minus1,
+            bp_dpb_output_delay_du_length_minus1: self.dpb_output_delay_du_length_minus1,
+            bp_additional_concatenation_info_present_flag: self
+                .additional_concatenation_info_present_flag,
         }
     }
 }
@@ -495,6 +533,53 @@ pub fn parse_buffering_period(payload: &[u8]) -> Result<BufferingPeriod> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pt_context()` maps the §D.3.1 / §D.3.2 BP fields a companion
+    /// picture timing SEI message needs, and recovers
+    /// `bp_num_cpb_removal_delay_deltas_minus1` from the delta-value list
+    /// length (empty list → `0`).
+    #[test]
+    fn pt_context_maps_bp_fields() {
+        let bp = BufferingPeriod {
+            max_sublayers_minus1: 2,
+            cpb_removal_delay_length_minus1: 9,
+            dpb_output_delay_length_minus1: 11,
+            cpb_initial_removal_delay_length_minus1: 7,
+            cpb_removal_delay_deltas_present_flag: true,
+            cpb_removal_delay_delta_vals: vec![1, 2, 3], // minus1 = 2
+            alt_cpb_params_present_flag: true,
+            nal_hrd_params_present_flag: true,
+            vcl_hrd_params_present_flag: false,
+            sublayer_initial_cpb_removal_delay_present_flag: true,
+            cpb_cnt_minus1: 4,
+            du_hrd_params_present_flag: true,
+            du_dpb_params_in_pic_timing_sei_flag: true,
+            du_cpb_params_in_pic_timing_sei_flag: false,
+            du_cpb_removal_delay_increment_length_minus1: 5,
+            dpb_output_delay_du_length_minus1: 6,
+            additional_concatenation_info_present_flag: true,
+            ..BufferingPeriod::default()
+        };
+        let ctx = bp.pt_context(1);
+        assert_eq!(ctx.temporal_id, 1);
+        assert_eq!(ctx.bp_max_sublayers_minus1, 2);
+        assert_eq!(ctx.bp_cpb_removal_delay_length_minus1, 9);
+        assert_eq!(ctx.bp_dpb_output_delay_length_minus1, 11);
+        assert_eq!(ctx.bp_cpb_initial_removal_delay_length_minus1, 7);
+        assert!(ctx.bp_cpb_removal_delay_deltas_present_flag);
+        assert_eq!(ctx.bp_num_cpb_removal_delay_deltas_minus1, 2);
+        assert!(ctx.bp_alt_cpb_params_present_flag);
+        assert!(ctx.bp_nal_hrd_params_present_flag);
+        assert!(!ctx.bp_vcl_hrd_params_present_flag);
+        assert!(ctx.bp_sublayer_initial_cpb_removal_delay_present_flag);
+        assert_eq!(ctx.bp_cpb_cnt_minus1, 4);
+        assert!(ctx.bp_du_hrd_params_present_flag);
+        assert!(ctx.bp_du_dpb_params_in_pic_timing_sei_flag);
+        assert!(!ctx.bp_du_cpb_params_in_pic_timing_sei_flag);
+        assert_eq!(ctx.bp_du_cpb_removal_delay_increment_length_minus1, 5);
+        assert_eq!(ctx.bp_dpb_output_delay_du_length_minus1, 6);
+        assert!(ctx.bp_additional_concatenation_info_present_flag);
+    }
 
     /// A small bit packer for building BP test payloads.
     struct BitWriter {
