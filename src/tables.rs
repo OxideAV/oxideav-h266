@@ -99,6 +99,13 @@ pub enum SyntaxCtx {
     CuQpDeltaAbs,
     CuChromaQpOffsetFlag,
     CuChromaQpOffsetIdx,
+    /// Table 119 — `tu_joint_cbcr_residual_flag` (9 ctxIdx, 3 per
+    /// initType). The ctxInc within an initType is
+    /// `2 * tu_cb_coded_flag + tu_cr_coded_flag − 1` (Table 132).
+    TuJointCbCrResidualFlag,
+    /// Table 118 — `transform_skip_flag` (6 ctxIdx, 2 per initType).
+    /// The ctxInc within an initType is `cIdx == 0 ? 0 : 1` (Table 132).
+    TransformSkipFlag,
     ParLevelFlag,
     /// Table 57 — `sao_merge_left_flag` and `sao_merge_up_flag` share the
     /// same 3-entry table (one ctxIdx per initType).
@@ -350,6 +357,14 @@ pub const CU_CHROMA_QP_OFFSET_FLAG_SHIFT: &[u8] = &[8, 8, 8];
 /// Table 117 — `cu_chroma_qp_offset_idx` (3 ctxIdx).
 pub const CU_CHROMA_QP_OFFSET_IDX_INIT: &[u8] = &[35, 35, 35];
 pub const CU_CHROMA_QP_OFFSET_IDX_SHIFT: &[u8] = &[8, 8, 8];
+
+/// Table 118 — `transform_skip_flag` (6 ctxIdx, 2 per initType).
+pub const TRANSFORM_SKIP_FLAG_INIT: &[u8] = &[25, 9, 25, 9, 25, 17];
+pub const TRANSFORM_SKIP_FLAG_SHIFT: &[u8] = &[1, 1, 1, 1, 1, 1];
+
+/// Table 119 — `tu_joint_cbcr_residual_flag` (9 ctxIdx, 3 per initType).
+pub const TU_JOINT_CBCR_RESIDUAL_FLAG_INIT: &[u8] = &[12, 21, 35, 27, 36, 45, 42, 43, 52];
+pub const TU_JOINT_CBCR_RESIDUAL_FLAG_SHIFT: &[u8] = &[1, 1, 0, 1, 1, 0, 1, 1, 0];
 
 /// Table 120 — `last_sig_coeff_x_prefix` (69 ctxIdx).
 pub const LAST_SIG_X_PREFIX_INIT: &[u8] = &[
@@ -787,6 +802,11 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::CuChromaQpOffsetIdx => {
             (CU_CHROMA_QP_OFFSET_IDX_INIT, CU_CHROMA_QP_OFFSET_IDX_SHIFT)
         }
+        SyntaxCtx::TuJointCbCrResidualFlag => (
+            TU_JOINT_CBCR_RESIDUAL_FLAG_INIT,
+            TU_JOINT_CBCR_RESIDUAL_FLAG_SHIFT,
+        ),
+        SyntaxCtx::TransformSkipFlag => (TRANSFORM_SKIP_FLAG_INIT, TRANSFORM_SKIP_FLAG_SHIFT),
         SyntaxCtx::ParLevelFlag => (PAR_LEVEL_FLAG_INIT, PAR_LEVEL_FLAG_SHIFT),
         SyntaxCtx::SaoMergeFlag => (SAO_MERGE_FLAG_INIT, SAO_MERGE_FLAG_SHIFT),
         SyntaxCtx::SaoTypeIdx => (SAO_TYPE_IDX_INIT, SAO_TYPE_IDX_SHIFT),

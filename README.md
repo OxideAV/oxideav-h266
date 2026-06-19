@@ -121,8 +121,14 @@ P + B-slice merge subset:
   TU keeps the MC prediction. **Multi-TB tiling** (§7.3.11.4): a CU
   larger than `MaxTbSizeY` (64) splits its luma residual into ≤64×64
   transform blocks (`transform_tree_tiles`, spec recursion order) and
-  reconstructs each at its offset. Transform-skip and joint Cb-Cr inter
-  residual still surface `Error::Unsupported`.
+  reconstructs each at its offset. **Joint Cb-Cr** (§7.4.12.11 /
+  §8.7.2): when `tu_joint_cbcr_residual_flag == 1` the inter CU's two
+  chroma residuals share one coded transform block; the §7.4.12.11
+  `TuCResMode` derivation selects the coded component (Cb for modes 1/2,
+  Cr for mode 3) and the §8.7.2 `resSamples` derivation (eqs. 1130–1132,
+  `cSign = 1 − 2·ph_joint_cbcr_sign_flag`) reconstructs the sibling
+  component. Transform-skip inter residual (`residual_ts_coding`,
+  §7.3.11.11) still surfaces `Error::Unsupported`.
 * **AMVP** — the §8.5.2.8-10 AMVP candidate derivation (spatial scan,
   HMVP fill, temporal Col, zero-MV pad), the §8.5.5.7 affine AMVP
   candidate list, and AMVR helpers (§7.4.11.6). The §8.5.2.1 non-merge

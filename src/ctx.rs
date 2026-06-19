@@ -585,6 +585,23 @@ pub fn ctx_inc_cu_chroma_qp_offset_idx() -> u32 {
     0
 }
 
+/// ctxInc for `tu_joint_cbcr_residual_flag` per Table 132:
+/// `2 * tu_cb_coded_flag + tu_cr_coded_flag − 1`. The element is only
+/// signalled when at least one chroma CBF is set, so the result lies in
+/// `0..=2`.
+pub fn ctx_inc_tu_joint_cbcr_residual_flag(tu_cb_coded_flag: bool, tu_cr_coded_flag: bool) -> u32 {
+    (2 * tu_cb_coded_flag as u32 + tu_cr_coded_flag as u32).saturating_sub(1)
+}
+
+/// ctxInc for `transform_skip_flag` per Table 132: `cIdx == 0 ? 0 : 1`.
+pub fn ctx_inc_transform_skip_flag(c_idx: u32) -> u32 {
+    if c_idx == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 /// ctxInc for `last_sig_coeff_x_prefix` / `last_sig_coeff_y_prefix`
 /// per §9.3.4.2.4 eqs. 1555 / 1556.
 ///

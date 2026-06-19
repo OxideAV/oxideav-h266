@@ -63,9 +63,37 @@ use crate::ctx::{
 use crate::inter::{InterCuInfo, MergeData, MotionVector, MvField};
 use crate::residual::{
     decode_tb_coefficients, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
-    read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
+    read_tu_cr_coded_flag, read_tu_joint_cbcr_residual_flag, read_tu_y_coded_flag, ResidualCtxs,
 };
 use crate::tables::{init_contexts, SyntaxCtx};
+
+/// §7.4.12.11 `TuCResMode[ x0 ][ y0 ]` derivation from the joint Cb-Cr
+/// residual flag and the Cb coded flag:
+///
+/// * `tu_joint_cbcr_residual_flag == 0` → `TuCResMode = 0`.
+/// * Else if `tu_cb_coded_flag == 1 && tu_cr_coded_flag == 0` →
+///   `TuCResMode = 1`. (The joint flag is only signalled when both
+///   chroma CBFs are set, so this arm is unreachable for an inter CU;
+///   it is kept for the §7.3.11.10 intra path where the flag may be
+///   read with a single chroma CBF set.)
+/// * Else if `tu_cb_coded_flag == 1` → `TuCResMode = 2`.
+/// * Else → `TuCResMode = 3`.
+///
+pub fn derive_tu_c_res_mode(
+    tu_joint_cbcr_residual_flag: bool,
+    tu_cb_coded_flag: bool,
+    tu_cr_coded_flag: bool,
+) -> u8 {
+    if !tu_joint_cbcr_residual_flag {
+        0
+    } else if tu_cb_coded_flag && !tu_cr_coded_flag {
+        1
+    } else if tu_cb_coded_flag {
+        2
+    } else {
+        3
+    }
+}
 
 /// CU prediction mode (§7.4.12.2 — `MODE_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,6 +595,13 @@ pub struct LeafCuInfo {
     pub cu_sbt_horizontal_flag: bool,
     /// `cu_sbt_pos_flag` — selects which TU carries the residual.
     pub cu_sbt_pos_flag: bool,
+    /// `tu_joint_cbcr_residual_flag[x0][y0]` (§7.4.12.11). When `true`
+    /// the two chroma residuals share a single coded transform block;
+    /// the §8.7.2 derivation reconstructs the non-coded sibling from
+    /// the coded one. Inferred 0 when not present.
+    pub tu_joint_cbcr_residual_flag: bool,
+    /// `TuCResMode[x0][y0]` (0..=3, §7.4.12.11). 0 when JCCR is off.
+    pub tu_c_res_mode: u8,
 }
 
 impl Default for LeafCuInfo {
@@ -625,6 +660,8 @@ impl Default for LeafCuInfo {
             cu_sbt_quad_flag: false,
             cu_sbt_horizontal_flag: false,
             cu_sbt_pos_flag: false,
+            tu_joint_cbcr_residual_flag: false,
+            tu_c_res_mode: 0,
         }
     }
 }
@@ -2867,18 +2904,26 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.cu_chroma_qp_offset_idx = idx;
         }
         // tu_joint_cbcr_residual_flag — for MODE_INTER it is read when
-        // both chroma CBFs are set. That binarisation/dequant is not
-        // plumbed; surface Unsupported when it would fire (matches the
-        // intra-path guard).
+        // both chroma CBFs are set (§7.3.11.10). The §7.4.12.11
+        // TuCResMode derivation then selects which single chroma
+        // component carries the coded residual.
         if self.tools.joint_cbcr_enabled
             && chroma_available
             && info.tu_cb_coded_flag
             && info.tu_cr_coded_flag
         {
-            return Err(Error::unsupported(
-                "h266 leaf CU inter: tu_joint_cbcr_residual_flag parsing not plumbed yet",
-            ));
+            info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+            )?;
         }
+        info.tu_c_res_mode = derive_tu_c_res_mode(
+            info.tu_joint_cbcr_residual_flag,
+            info.tu_cb_coded_flag,
+            info.tu_cr_coded_flag,
+        );
 
         // Residual coefficient walk per plane (transform_skip is not
         // signalled for the inter regular path here — sps_transform_skip
@@ -2901,21 +2946,54 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.last_sig_y = ly;
             residual.luma_levels = levels;
         }
-        if info.tu_cb_coded_flag && chroma_available {
-            let cw = cb_w / sub_w;
-            let ch = cb_h / sub_h;
-            if cw >= 2 && ch >= 2 {
-                residual.cb_levels =
-                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
-            }
+        self.read_inter_chroma_residual(
+            info,
+            residual,
+            cb_w,
+            cb_h,
+            sub_w,
+            sub_h,
+            chroma_available,
+        )?;
+        Ok(())
+    }
+
+    /// Decode the chroma residual coefficient blocks for an inter CU,
+    /// honouring §7.4.12.11 joint Cb-Cr coding. When
+    /// `tu_joint_cbcr_residual_flag == 1` only the coded component's
+    /// residual (Cb for `TuCResMode` 1 / 2, Cr for mode 3) is present in
+    /// the bitstream, mirroring the §7.3.11.10 `transform_unit()` gate
+    /// `!( tu_cb_coded_flag && tu_joint_cbcr_residual_flag )` on the Cr
+    /// `residual_coding()` invocation.
+    #[allow(clippy::too_many_arguments)]
+    fn read_inter_chroma_residual(
+        &mut self,
+        info: &LeafCuInfo,
+        residual: &mut LeafCuResidual,
+        cb_w: usize,
+        cb_h: usize,
+        sub_w: usize,
+        sub_h: usize,
+        chroma_available: bool,
+    ) -> Result<()> {
+        if !chroma_available {
+            return Ok(());
         }
-        if info.tu_cr_coded_flag && chroma_available {
-            let cw = cb_w / sub_w;
-            let ch = cb_h / sub_h;
-            if cw >= 2 && ch >= 2 {
-                residual.cr_levels =
-                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
-            }
+        let cw = cb_w / sub_w;
+        let ch = cb_h / sub_h;
+        if cw < 2 || ch < 2 {
+            return Ok(());
+        }
+        if info.tu_cb_coded_flag {
+            residual.cb_levels =
+                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
+        }
+        // §7.3.11.10 — Cr residual_coding() is skipped when the joint
+        // flag is set and Cb is the coded component (TuCResMode 1 / 2).
+        let skip_cr = info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag;
+        if info.tu_cr_coded_flag && !skip_cr {
+            residual.cr_levels =
+                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
         }
         Ok(())
     }

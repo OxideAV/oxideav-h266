@@ -52,9 +52,9 @@ use crate::ctx::{
     csbf_ctx_regular, ctx_inc_abs_level_gt_1_flag, ctx_inc_abs_level_gt_3_flag,
     ctx_inc_cu_chroma_qp_offset_flag, ctx_inc_cu_chroma_qp_offset_idx, ctx_inc_cu_qp_delta_abs,
     ctx_inc_last_sig_coeff_prefix, ctx_inc_par_level_flag, ctx_inc_sb_coded_flag_regular,
-    ctx_inc_sig_coeff_flag, ctx_inc_tu_cb_coded_flag, ctx_inc_tu_cr_coded_flag,
-    ctx_inc_tu_y_coded_flag, loc_num_sig_and_sum_abs_pass1, loc_sum_abs_rice,
-    rice_param_from_loc_sum_abs,
+    ctx_inc_sig_coeff_flag, ctx_inc_transform_skip_flag, ctx_inc_tu_cb_coded_flag,
+    ctx_inc_tu_cr_coded_flag, ctx_inc_tu_joint_cbcr_residual_flag, ctx_inc_tu_y_coded_flag,
+    loc_num_sig_and_sum_abs_pass1, loc_sum_abs_rice, rice_param_from_loc_sum_abs,
 };
 use crate::scan::{coeff_scan_positions, sb_grid};
 use crate::tables::{init_contexts, SyntaxCtx};
@@ -74,6 +74,10 @@ pub struct ResidualCtxs {
     pub cu_qp_delta_abs: Vec<ContextModel>,
     pub cu_chroma_qp_offset_flag: Vec<ContextModel>,
     pub cu_chroma_qp_offset_idx: Vec<ContextModel>,
+    /// Table 119 — `tu_joint_cbcr_residual_flag`.
+    pub tu_joint_cbcr_residual_flag: Vec<ContextModel>,
+    /// Table 118 — `transform_skip_flag`.
+    pub transform_skip_flag: Vec<ContextModel>,
 }
 
 impl ResidualCtxs {
@@ -91,8 +95,40 @@ impl ResidualCtxs {
             cu_qp_delta_abs: init_contexts(SyntaxCtx::CuQpDeltaAbs, slice_qp_y),
             cu_chroma_qp_offset_flag: init_contexts(SyntaxCtx::CuChromaQpOffsetFlag, slice_qp_y),
             cu_chroma_qp_offset_idx: init_contexts(SyntaxCtx::CuChromaQpOffsetIdx, slice_qp_y),
+            tu_joint_cbcr_residual_flag: init_contexts(
+                SyntaxCtx::TuJointCbCrResidualFlag,
+                slice_qp_y,
+            ),
+            transform_skip_flag: init_contexts(SyntaxCtx::TransformSkipFlag, slice_qp_y),
         }
     }
+}
+
+/// Read `tu_joint_cbcr_residual_flag` per §7.3.11.10 + Table 132.
+/// `ctxInc = 2 * tu_cb_coded_flag + tu_cr_coded_flag − 1`.
+pub fn read_tu_joint_cbcr_residual_flag(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut ResidualCtxs,
+    tu_cb_coded: bool,
+    tu_cr_coded: bool,
+) -> Result<bool> {
+    let inc = ctx_inc_tu_joint_cbcr_residual_flag(tu_cb_coded, tu_cr_coded) as usize;
+    let n = ctxs.tu_joint_cbcr_residual_flag.len() - 1;
+    let bit = dec.decode_decision(&mut ctxs.tu_joint_cbcr_residual_flag[inc.min(n)])?;
+    Ok(bit == 1)
+}
+
+/// Read `transform_skip_flag[ x0 ][ y0 ][ cIdx ]` per §7.3.11.10 +
+/// Table 132. `ctxInc = cIdx == 0 ? 0 : 1`.
+pub fn read_transform_skip_flag(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut ResidualCtxs,
+    c_idx: u32,
+) -> Result<bool> {
+    let inc = ctx_inc_transform_skip_flag(c_idx) as usize;
+    let n = ctxs.transform_skip_flag.len() - 1;
+    let bit = dec.decode_decision(&mut ctxs.transform_skip_flag[inc.min(n)])?;
+    Ok(bit == 1)
 }
 
 /// Read `tu_y_coded_flag` per §7.3.11.10 / §9.3.4.2.5.

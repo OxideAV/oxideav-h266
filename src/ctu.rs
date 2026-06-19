@@ -632,6 +632,11 @@ pub struct CtuWalker<'a, 'b> {
     /// `bi_pred_avg_8bit` byte-for-byte. Set via
     /// [`Self::set_ph_bdof_disabled`].
     ph_bdof_disabled: bool,
+    /// §7.4.3.7 `ph_joint_cbcr_sign_flag` — drives the §8.7.2 joint
+    /// Cb-Cr `cSign = 1 − 2 * flag` used when deriving the non-coded
+    /// chroma residual from the coded one. Defaults to `false`; set via
+    /// [`Self::set_ph_joint_cbcr_sign`].
+    ph_joint_cbcr_sign: bool,
     /// Round-28 §8.5.6.7 — per-picture intra-coded grid sampled at 4x4
     /// luma granularity. The §8.5.6.7 weight ladder reads
     /// `CuPredMode[0][xNbX][yNbX]` for X being the A / B neighbour
@@ -834,6 +839,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             collocated_from_l0: true,
             ph_mmvd_fullpel_only: false,
             ph_bdof_disabled: true,
+            ph_joint_cbcr_sign: false,
             intra_grid,
             intra_grid_w,
             intra_grid_h,
@@ -1031,6 +1037,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// not wired the bit keep the round-23 byte-for-byte pipeline.
     pub fn set_ph_bdof_disabled(&mut self, disabled: bool) {
         self.ph_bdof_disabled = disabled;
+    }
+
+    /// Set `ph_joint_cbcr_sign_flag` (§7.4.3.7). Drives the §8.7.2
+    /// `cSign = 1 − 2 * flag` factor when reconstructing the non-coded
+    /// chroma residual from the joint Cb-Cr coded block. Takes effect
+    /// for subsequent leaf-CU reconstructions in the picture.
+    pub fn set_ph_joint_cbcr_sign(&mut self, sign: bool) {
+        self.ph_joint_cbcr_sign = sign;
     }
 
     /// §8.5.2.11 derivation harness for one CU. Returns the Col
@@ -2520,31 +2534,47 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let c_h = (cu.cu.h as usize) / 2;
             let c_x = (cu.cu.x as usize) / 2;
             let c_y = (cu.cu.y as usize) / 2;
-            if info.tu_cb_coded_flag && !residual.cb_levels.is_empty() {
-                self.add_inter_residual_plane(
-                    /*c_idx=*/ 1,
+            if info.tu_c_res_mode != 0 {
+                // §8.7.2 joint Cb-Cr — a single coded block reconstructs
+                // both chroma residuals.
+                self.add_inter_joint_cbcr_residual(
                     c_x,
                     c_y,
                     c_w,
                     c_h,
-                    &residual.cb_levels,
+                    info.tu_c_res_mode,
+                    residual,
                     cu_qp_delta,
                     bit_depth,
                     out,
                 )?;
-            }
-            if info.tu_cr_coded_flag && !residual.cr_levels.is_empty() {
-                self.add_inter_residual_plane(
-                    /*c_idx=*/ 2,
-                    c_x,
-                    c_y,
-                    c_w,
-                    c_h,
-                    &residual.cr_levels,
-                    cu_qp_delta,
-                    bit_depth,
-                    out,
-                )?;
+            } else {
+                if info.tu_cb_coded_flag && !residual.cb_levels.is_empty() {
+                    self.add_inter_residual_plane(
+                        /*c_idx=*/ 1,
+                        c_x,
+                        c_y,
+                        c_w,
+                        c_h,
+                        &residual.cb_levels,
+                        cu_qp_delta,
+                        bit_depth,
+                        out,
+                    )?;
+                }
+                if info.tu_cr_coded_flag && !residual.cr_levels.is_empty() {
+                    self.add_inter_residual_plane(
+                        /*c_idx=*/ 2,
+                        c_x,
+                        c_y,
+                        c_w,
+                        c_h,
+                        &residual.cr_levels,
+                        cu_qp_delta,
+                        bit_depth,
+                        out,
+                    )?;
+                }
             }
         }
 
@@ -2956,6 +2986,112 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 } else {
                     v as u8
                 };
+            }
+        }
+        Ok(())
+    }
+
+    /// §8.7.2 joint Cb-Cr inter residual reconstruction. The single
+    /// coded chroma transform block (`codedCIdx = TuCResMode∈{1,2} ?
+    /// Cb : Cr`) is dequantised once; the §8.7.2 orchestrator then
+    /// derives `resSamples` for both Cb (`cIdx = 1`) and Cr
+    /// (`cIdx = 2`) via the eqs. 1130 – 1132 sign / shift rules. Each
+    /// component's residual is added to its plane with the §8.7.5.1
+    /// clip.
+    #[allow(clippy::too_many_arguments)]
+    fn add_inter_joint_cbcr_residual(
+        &self,
+        c_x: usize,
+        c_y: usize,
+        c_w: usize,
+        c_h: usize,
+        tu_c_res_mode: u8,
+        residual: &LeafCuResidual,
+        cu_qp_delta: i32,
+        bit_depth: u32,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
+        if c_w == 0 || c_h == 0 {
+            return Ok(());
+        }
+        let mode = TuCResMode::from_raw(tu_c_res_mode)?;
+        // The coded component supplies the levels: Cb for modes 1 / 2,
+        // Cr for mode 3 (§8.7.2 codedCIdx).
+        let coded_levels = match mode {
+            TuCResMode::CrCoded => &residual.cr_levels,
+            _ => &residual.cb_levels,
+        };
+        if coded_levels.len() != c_w * c_h {
+            // No coded coefficients captured (e.g. all-zero CBF edge);
+            // nothing to add.
+            return Ok(());
+        }
+        // §8.7.3 dequant — chroma QP via the crate's identity scaffold.
+        let qp_y = (self.cabac.slice_qp_y.0 + cu_qp_delta).clamp(0, 63);
+        let qp = chroma_qp_identity(qp_y, 0);
+        let params = DequantParams {
+            bit_depth,
+            log2_transform_range: 15,
+            n_tb_w: c_w as u32,
+            n_tb_h: c_h as u32,
+            qp,
+            dep_quant: false,
+            transform_skip: false,
+            bdpcm: false,
+            bdpcm_dir: false,
+        };
+        let d = dequantize_tb_flat(coded_levels, &params)?;
+        let non_zero_w = c_w.min(32);
+        let non_zero_h = c_h.min(32);
+        let coded = CodedTransform::Transform {
+            non_zero_w,
+            non_zero_h,
+            tr_type_hor: TrType::DctII,
+            tr_type_ver: TrType::DctII,
+        };
+        // Derive and add each chroma component's residual.
+        for c_idx in [1u32, 2u32] {
+            let res = scaling_and_transformation(
+                c_idx,
+                mode,
+                self.ph_joint_cbcr_sign,
+                c_w,
+                c_h,
+                &d,
+                coded,
+                bit_depth,
+                15,
+            )?;
+            eprintln!(
+                "DBG c_idx={} res={:?} sign={}",
+                c_idx,
+                &res[..8.min(res.len())],
+                self.ph_joint_cbcr_sign
+            );
+            let plane = match c_idx {
+                1 => &mut out.cb,
+                _ => &mut out.cr,
+            };
+            let stride = plane.stride;
+            let height = plane.height;
+            if c_x + c_w > stride || c_y + c_h > height {
+                return Err(Error::invalid(
+                    "h266 inter JCCR residual: chroma TB does not fit in destination plane",
+                ));
+            }
+            let up = bit_depth.saturating_sub(8);
+            for row in 0..c_h {
+                for col in 0..c_w {
+                    let idx = (c_y + row) * stride + (c_x + col);
+                    let pred = (plane.samples[idx] as i32) << up;
+                    let v = clip_pixel(pred + res[row * c_w + col], bit_depth);
+                    plane.samples[idx] = if bit_depth > 8 {
+                        (v >> up) as u8
+                    } else {
+                        v as u8
+                    };
+                }
             }
         }
         Ok(())
@@ -4402,6 +4538,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §8.7.2 joint Cb-Cr inter residual — an inter merge CU with
+    /// `TuCResMode == 2` (both chroma CBFs set, joint flag set, Cb is
+    /// the coded component) reconstructs Cr from the Cb coefficients:
+    /// with `ph_joint_cbcr_sign_flag == 0` (`cSign = +1`) eq. 1131
+    /// gives `resCr = cSign * resCb`, so the Cb and Cr residuals are
+    /// identical. With a constant-100 chroma reference the two planes
+    /// must end up equal to each other and different from the
+    /// prediction. This proves the JCCR inter path no longer surfaces
+    /// Unsupported and derives both chroma planes from one coded block.
+    #[test]
+    fn reconstruct_leaf_cu_inter_joint_cbcr_mode2() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // ph_joint_cbcr_sign_flag == 0 → cSign = +1.
+        walker.set_ph_joint_cbcr_sign(false);
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        // 16x16 merge CU at (0, 0) — zero-MV uni-pred → constant-100
+        // prediction over luma + both chroma planes.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        // No luma residual; both chroma CBFs set with JCCR mode 2.
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = true;
+        info.tu_cr_coded_flag = true;
+        info.tu_joint_cbcr_residual_flag = true;
+        info.tu_c_res_mode = 2;
+        // Coded chroma block is Cb (8x8 for the 16x16 4:2:0 CU); single
+        // positive DC coefficient.
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8;
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("JCCR inter residual path should reconstruct");
+
+        // The zero-MV chroma prediction is the constant neutral 128
+        // (yuv420_filled always seeds chroma at 128). Both chroma planes
+        // must be modified from that prediction, and (cSign = +1, mode 2)
+        // be identical to each other.
+        let mut any_cb_changed = false;
+        for cy in 0..8usize {
+            for cx in 0..8usize {
+                let idx = cy * out.cb.stride + cx;
+                if out.cb.samples[idx] != 128 {
+                    any_cb_changed = true;
+                }
+                assert_eq!(
+                    out.cb.samples[idx], out.cr.samples[idx],
+                    "JCCR mode 2 with cSign=+1 must give identical Cb / Cr residuals at ({cx},{cy})"
+                );
+            }
+        }
+        assert!(
+            any_cb_changed,
+            "the JCCR coded block must apply a non-zero residual to both chroma planes"
+        );
+    }
+
+    /// §8.7.2 joint Cb-Cr inter residual, mode 2 with
+    /// `ph_joint_cbcr_sign_flag == 1` (`cSign = −1`): eq. 1131 gives
+    /// `resCr = −resCb`, so the Cb and Cr residuals are negatives of
+    /// each other relative to the shared prediction. Cb lifts above
+    /// the 100 prediction at the DC, Cr drops below it (or vice versa).
+    #[test]
+    fn reconstruct_leaf_cu_inter_joint_cbcr_sign_negates() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // ph_joint_cbcr_sign_flag == 1 → cSign = -1.
+        walker.set_ph_joint_cbcr_sign(true);
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = true;
+        info.tu_cr_coded_flag = true;
+        info.tu_joint_cbcr_residual_flag = true;
+        info.tu_c_res_mode = 2;
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8;
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("JCCR inter residual path should reconstruct");
+
+        // For every chroma sample, (Cb − 128) must equal −(Cr − 128):
+        // cSign = −1 makes the Cr residual the negation of the Cb one
+        // (the chroma prediction is the neutral 128 baseline).
+        let mut any_changed = false;
+        for cy in 0..8usize {
+            for cx in 0..8usize {
+                let idx = cy * out.cb.stride + cx;
+                let cb_delta = out.cb.samples[idx] as i32 - 128;
+                let cr_delta = out.cr.samples[idx] as i32 - 128;
+                if cb_delta != 0 {
+                    any_changed = true;
+                }
+                assert_eq!(
+                    cb_delta, -cr_delta,
+                    "JCCR mode 2 with cSign=-1: Cr residual must negate Cb at ({cx},{cy})"
+                );
+            }
+        }
+        assert!(
+            any_changed,
+            "JCCR sign-negate test must apply a non-zero residual"
+        );
     }
 
     /// §7.3.11.4 multi-TB tiling — a 128×128 inter CU (> MaxTbSizeY)
