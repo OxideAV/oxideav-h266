@@ -2472,17 +2472,48 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         } else if info.tu_y_coded_flag && !residual.luma_levels.is_empty() {
             let n_tb_w = cu.cu.w as usize;
             let n_tb_h = cu.cu.h as usize;
-            self.add_inter_residual_plane(
-                /*c_idx=*/ 0,
-                cu.cu.x as usize,
-                cu.cu.y as usize,
-                n_tb_w,
-                n_tb_h,
-                &residual.luma_levels,
-                cu_qp_delta,
-                bit_depth,
-                out,
-            )?;
+            if n_tb_w > 64 || n_tb_h > 64 {
+                // §7.3.11.4 multi-TB tiling — the CU exceeds MaxTbSizeY,
+                // so the residual is split into ≤64×64 transform blocks
+                // (raster recursion order). `residual.luma_levels` is the
+                // per-tile coefficient blocks concatenated in the same
+                // [`crate::transform::transform_tree_tiles`] order; each
+                // tile's DCT-II inverse residual is added at its CU-
+                // relative offset.
+                let tiles = crate::transform::transform_tree_tiles(cu.cu.w, cu.cu.h, 64);
+                let mut offset = 0usize;
+                for t in &tiles {
+                    let tlen = (t.w * t.h) as usize;
+                    let end = (offset + tlen).min(residual.luma_levels.len());
+                    let tile_levels = &residual.luma_levels[offset..end];
+                    if tile_levels.len() == tlen {
+                        self.add_inter_residual_plane(
+                            /*c_idx=*/ 0,
+                            (cu.cu.x + t.x) as usize,
+                            (cu.cu.y + t.y) as usize,
+                            t.w as usize,
+                            t.h as usize,
+                            tile_levels,
+                            cu_qp_delta,
+                            bit_depth,
+                            out,
+                        )?;
+                    }
+                    offset += tlen;
+                }
+            } else {
+                self.add_inter_residual_plane(
+                    /*c_idx=*/ 0,
+                    cu.cu.x as usize,
+                    cu.cu.y as usize,
+                    n_tb_w,
+                    n_tb_h,
+                    &residual.luma_levels,
+                    cu_qp_delta,
+                    bit_depth,
+                    out,
+                )?;
+            }
         }
         if self.sps.sps_chroma_format_idc == 1 {
             let c_w = (cu.cu.w as usize) / 2;
@@ -4371,6 +4402,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §7.3.11.4 multi-TB tiling — a 128×128 inter CU (> MaxTbSizeY)
+    /// reconstructs by tiling its residual into four 64×64 transform
+    /// blocks. With a constant-100 reference and zero-MV merge, each
+    /// tile carrying a positive DC coefficient lifts its own 64×64
+    /// quadrant uniformly; a tile with no coefficients stays at the
+    /// prediction. This proves both that the > MaxTbSizeY CU no longer
+    /// surfaces Unsupported and that each tile's residual lands at its
+    /// own offset.
+    #[test]
+    fn reconstruct_leaf_cu_inter_multi_tb_tiling() {
+        let pic_w = 128u32;
+        let pic_h = 128u32;
+        let sps = dummy_sps(2, pic_w, pic_h); // 128x128 CTU.
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 128,
+                h: 128,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 128,
+            cb_height: 128,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = true;
+
+        // Four 64×64 tiles in transform_tree_tiles order: TL, BL, TR, BR.
+        // Give the FIRST tile (top-left) a positive DC; leave the others
+        // zero so only the TL quadrant is lifted.
+        let mut residual = LeafCuResidual::default();
+        let tile_len = 64 * 64;
+        residual.luma_levels = vec![0i32; tile_len * 4];
+        residual.luma_levels[0] = 8; // DC of the top-left tile.
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("multi-TB inter CU should reconstruct without Unsupported");
+
+        // Top-left 64×64 quadrant: lifted uniformly above 100.
+        let tl = out.luma.samples[0];
+        assert!(tl > 100, "top-left tile must be lifted above 100, got {tl}");
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    tl,
+                    "top-left tile must lift uniformly (DC residual)"
+                );
+            }
+        }
+        // The other three quadrants stay at the constant prediction 100.
+        // Bottom-left:
+        assert_eq!(out.luma.samples[64 * out.luma.stride], 100);
+        // Top-right:
+        assert_eq!(out.luma.samples[64], 100);
+        // Bottom-right:
+        assert_eq!(out.luma.samples[64 * out.luma.stride + 64], 100);
     }
 
     /// §8.5.8 + §8.7.5.1 — a non-skip merge inter CU whose

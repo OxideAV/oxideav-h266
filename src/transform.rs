@@ -506,6 +506,59 @@ pub fn implicit_mts_tr_types(n_tb_w: u32, n_tb_h: u32) -> (TrType, TrType) {
     (tr_h, tr_v)
 }
 
+/// One transform block of a multi-TB-per-CU tiling, as a sub-rectangle
+/// (offset + size, in luma samples, relative to the CU top-left).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TbTile {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// §7.3.11.4 `transform_tree()` implicit split — tile a `cb_w × cb_h`
+/// coding block that exceeds `MaxTbSizeY` into transform blocks each
+/// `≤ MaxTbSizeY` in both dimensions, in spec recursion (raster) order.
+///
+/// The spec recursion (the `IntraSubPartitionsSplitType == ISP_NO_SPLIT
+/// && !cu_sbt_flag` branch) halves the larger over-size dimension first:
+///
+/// ```text
+/// verSplitFirst = (tbWidth > MaxTbSizeY && tbWidth > tbHeight) ? 1 : 0
+/// trafoWidth  = verSplitFirst ? tbWidth / 2  : tbWidth
+/// trafoHeight = !verSplitFirst ? tbHeight / 2 : tbHeight
+/// transform_tree(x0, y0, trafoWidth, trafoHeight, …)            // first
+/// transform_tree(x0 + trafoWidth | y0 + trafoHeight, …)         // second
+/// ```
+///
+/// Because `cb_w` / `cb_h` are powers of two and `MaxTbSizeY` is 64, the
+/// recursion bottoms out at a uniform grid of `MaxTbSizeY`-sized tiles
+/// (e.g. a 128×128 CU → four 64×64 tiles; a 128×64 CU → two 64×64 tiles
+/// laid out left-to-right). The tiles are returned in the same order the
+/// recursion visits them (first half before second half at every level
+/// — for a square over-size CU this is top-left, bottom-left, top-right,
+/// bottom-right because the vertical split is taken first).
+pub fn transform_tree_tiles(cb_w: u32, cb_h: u32, max_tb_size_y: u32) -> Vec<TbTile> {
+    let mut tiles = Vec::new();
+    fn recurse(x0: u32, y0: u32, w: u32, h: u32, max: u32, out: &mut Vec<TbTile>) {
+        if w > max || h > max {
+            let ver_split_first = w > max && w > h;
+            let trafo_w = if ver_split_first { w / 2 } else { w };
+            let trafo_h = if !ver_split_first { h / 2 } else { h };
+            recurse(x0, y0, trafo_w, trafo_h, max, out);
+            if ver_split_first {
+                recurse(x0 + trafo_w, y0, trafo_w, trafo_h, max, out);
+            } else {
+                recurse(x0, y0 + trafo_h, trafo_w, trafo_h, max, out);
+            }
+        } else {
+            out.push(TbTile { x: x0, y: y0, w, h });
+        }
+    }
+    recurse(0, 0, cb_w, cb_h, max_tb_size_y, &mut tiles);
+    tiles
+}
+
 /// §7.4.12.5 eqs. 177 / 178 — `SbtNumFourthsTb0` (the size, in fourths
 /// of the CU, of the *first* of the two SBT transform units).
 ///
@@ -1063,6 +1116,110 @@ fn apply_dct_viii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §7.3.11.4 — a 128×128 CU tiles into four 64×64 TBs. For a square
+    /// over-size CU `verSplitFirst == 0` (`w > h` is false), so the
+    /// recursion splits *horizontally* first: the top 128×64 row (then
+    /// split vertically into TL, TR) precedes the bottom row (BL, BR).
+    #[test]
+    fn transform_tree_tiles_128x128_four_64_tiles() {
+        let tiles = transform_tree_tiles(128, 128, 64);
+        assert_eq!(tiles.len(), 4);
+        assert_eq!(
+            tiles[0],
+            TbTile {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64
+            }
+        );
+        assert_eq!(
+            tiles[1],
+            TbTile {
+                x: 64,
+                y: 0,
+                w: 64,
+                h: 64
+            }
+        );
+        assert_eq!(
+            tiles[2],
+            TbTile {
+                x: 0,
+                y: 64,
+                w: 64,
+                h: 64
+            }
+        );
+        assert_eq!(
+            tiles[3],
+            TbTile {
+                x: 64,
+                y: 64,
+                w: 64,
+                h: 64
+            }
+        );
+    }
+
+    /// §7.3.11.4 — non-square + already-small cases.
+    #[test]
+    fn transform_tree_tiles_rect_and_small() {
+        // 128×64 → two 64×64 laid left-to-right (vertical split first).
+        let tiles = transform_tree_tiles(128, 64, 64);
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(
+            tiles[0],
+            TbTile {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64
+            }
+        );
+        assert_eq!(
+            tiles[1],
+            TbTile {
+                x: 64,
+                y: 0,
+                w: 64,
+                h: 64
+            }
+        );
+        // 64×128 → two 64×64 top-to-bottom (horizontal split).
+        let tiles = transform_tree_tiles(64, 128, 64);
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(
+            tiles[0],
+            TbTile {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64
+            }
+        );
+        assert_eq!(
+            tiles[1],
+            TbTile {
+                x: 0,
+                y: 64,
+                w: 64,
+                h: 64
+            }
+        );
+        // ≤ MaxTbSizeY → a single tile spanning the whole CU.
+        let tiles = transform_tree_tiles(32, 16, 64);
+        assert_eq!(
+            tiles,
+            vec![TbTile {
+                x: 0,
+                y: 0,
+                w: 32,
+                h: 16
+            }]
+        );
+    }
 
     /// §7.4.12.5 eqs. 177 / 178 — SbtNumFourthsTb0 over the four
     /// (cu_sbt_quad_flag, cu_sbt_pos_flag) combinations.
