@@ -114,15 +114,25 @@ P + B-slice merge subset:
   `cu_coded_flag == 1` decodes its §7.3.11.10 `transform_unit()`
   residual (MODE_INTER luma-CBF condition + chroma CBFs) and adds the
   §8.7.3 dequant + §8.7.4 inverse-DCT-II residual to the MC prediction
-  per §8.5.8 + §8.7.5.1 (`recSamples = Clip1(predSamples + resSamples)`)
-  for the single-transform-block case; SBT, multi-TB tiling, transform-
-  skip and joint Cb-Cr inter residual surface `Error::Unsupported`.
+  per §8.5.8 + §8.7.5.1 (`recSamples = Clip1(predSamples + resSamples)`).
+  **SBT** (§7.4.12.5 / §8.7.4.1): when `cu_sbt_flag == 1` the CU's luma
+  residual lives in a single sub-region TU (`sbt_geometry`) and inverse-
+  transforms through the Table-40 DST-VII / DCT-VIII kernels; the other
+  TU keeps the MC prediction. **Multi-TB tiling** (§7.3.11.4): a CU
+  larger than `MaxTbSizeY` (64) splits its luma residual into ≤64×64
+  transform blocks (`transform_tree_tiles`, spec recursion order) and
+  reconstructs each at its offset. Transform-skip and joint Cb-Cr inter
+  residual still surface `Error::Unsupported`.
 * **AMVP** — the §8.5.2.8-10 AMVP candidate derivation (spatial scan,
   HMVP fill, temporal Col, zero-MV pad), the §8.5.5.7 affine AMVP
-  candidate list, and AMVR helpers (§7.4.11.6). The non-merge inter CU
-  reconstruction (residual `transform_tree`) and the CTU-walker fuse
-  that drives these from the live inter path are still being wired and
-  currently surface `Error::Unsupported`.
+  candidate list, and AMVR helpers (§7.4.11.6). The §8.5.2.1 non-merge
+  inter CU reconstruction is **live**: `reconstruct_leaf_cu_inter_amvp`
+  derives the per-list MVP from the candidate list, selects via
+  `mvp_lX_flag`, folds the raw `MvdLX` with the per-CU `AmvrShift`
+  (`mvLX = mvpLX + (mvdLX << AmvrShift)`), and feeds the shared §8.5.6 /
+  §8.5.8 MC + residual tail — driving P/B non-merge CUs to output
+  pixels. Multi-CP affine AMVP reconstruction and BCW on the AMVP path
+  remain follow-ups.
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, and the §8.7.4.6 inverse
