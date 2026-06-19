@@ -137,8 +137,16 @@ P + B-slice merge subset:
   `mvp_lX_flag`, folds the raw `MvdLX` with the per-CU `AmvrShift`
   (`mvLX = mvpLX + (mvdLX << AmvrShift)`), and feeds the shared §8.5.6 /
   §8.5.8 MC + residual tail — driving P/B non-merge CUs to output
-  pixels. Multi-CP affine AMVP reconstruction and BCW on the AMVP path
-  remain follow-ups.
+  pixels. **Affine MC to pixels** (§8.5.5.3 / §8.5.6):
+  `reconstruct_affine_inter_uni` takes a control-point MV set, derives
+  the §8.5.5.9 per-4×4-sub-block luma MV grid (eqs. 872 – 875), runs the
+  §8.5.6.3.2 affine 6-tap interpolation per sub-block with §8.5.5.8 PROF
+  (`predict_luma_block_affine_prof`), and reconstructs 4:2:0 chroma by
+  averaging the §8.5.5.3 top-left + bottom-right luma sub-block MVs
+  (eqs. 876 – 879) into each chroma 4×4 sub-block before the §8.5.6.3.4
+  4-tap chroma MC. Wiring this into the parser-side §7.3.11.7 affine-CPMV
+  fuse (multi-CP `MvdLX` parsing + the §8.5.5.7 affine AMVP candidate
+  list → final CPMVs) and BCW on the AMVP path remain follow-ups.
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, and the §8.7.4.6 inverse

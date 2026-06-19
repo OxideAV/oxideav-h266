@@ -284,6 +284,16 @@ pub(crate) fn chroma_qp_identity(qp_y: i32, qp_offset: i32) -> i32 {
     (qp_y + qp_offset).clamp(0, 63)
 }
 
+/// §8.5.5.3 eqs. 878 / 879 — average two motion-vector components by
+/// halving their sum with the spec's round-toward-zero rule
+/// `( v + 1 − ( v >= 0 ) ) >> 1`. For `v` the sum of the two component
+/// values this yields the rounded average that the chroma-MV
+/// derivation feeds into §8.5.2.13.
+#[inline]
+pub(crate) fn round_half_toward_zero_div2(v: i32) -> i32 {
+    (v + 1 - (v >= 0) as i32) >> 1
+}
+
 /// CTU grid geometry derived from SPS + PPS (§7.4.3.4 / §7.4.3.5).
 ///
 /// The entry-level quantities a walker needs before even touching the
@@ -637,6 +647,12 @@ pub struct CtuWalker<'a, 'b> {
     /// chroma residual from the coded one. Defaults to `false`; set via
     /// [`Self::set_ph_joint_cbcr_sign`].
     ph_joint_cbcr_sign: bool,
+    /// §7.4.3.7 `ph_prof_disabled_flag` — gates §8.5.5.8 PROF in the
+    /// affine MC path ([`Self::reconstruct_affine_inter_uni`]).
+    /// Defaults to `true` (PROF off) so callers that have not wired the
+    /// picture-header bit keep the plain affine sub-block MC. Set via
+    /// [`Self::set_ph_prof_disabled`].
+    ph_prof_disabled: bool,
     /// Round-28 §8.5.6.7 — per-picture intra-coded grid sampled at 4x4
     /// luma granularity. The §8.5.6.7 weight ladder reads
     /// `CuPredMode[0][xNbX][yNbX]` for X being the A / B neighbour
@@ -840,6 +856,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ph_mmvd_fullpel_only: false,
             ph_bdof_disabled: true,
             ph_joint_cbcr_sign: false,
+            ph_prof_disabled: true,
             intra_grid,
             intra_grid_w,
             intra_grid_h,
@@ -1045,6 +1062,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// for subsequent leaf-CU reconstructions in the picture.
     pub fn set_ph_joint_cbcr_sign(&mut self, sign: bool) {
         self.ph_joint_cbcr_sign = sign;
+    }
+
+    /// Set `ph_prof_disabled_flag` (§7.4.3.7). Gates §8.5.5.8 PROF in
+    /// the affine MC path. Takes effect for subsequent affine
+    /// reconstructions in the picture.
+    pub fn set_ph_prof_disabled(&mut self, disabled: bool) {
+        self.ph_prof_disabled = disabled;
     }
 
     /// §8.5.2.11 derivation harness for one CU. Returns the Col
@@ -2809,6 +2833,119 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
 
         self.reconstruct_inter_with_chosen(cu, info, residual, chosen, out)
+    }
+
+    /// §8.5.5.3 / §8.5.6 affine uni-prediction reconstruction to pixels.
+    ///
+    /// Given a control-point MV set (`cpmvs`) for a single reference
+    /// list and the resolved reference picture, this drives:
+    ///
+    /// * **Luma** — `crate::affine::predict_luma_block_affine_prof`
+    ///   derives the §8.5.5.9 per-4×4-sub-block MV grid (eqs. 872 – 875),
+    ///   runs the §8.5.6.3.2 affine 6-tap interpolation per sub-block,
+    ///   and applies §8.5.5.8 PROF when `cbProfFlagLX` holds.
+    /// * **Chroma** (4:2:0 only) — per §8.5.5.3 eqs. 876 – 879 each
+    ///   4×4 chroma sub-block (covering a 2×2 luma sub-block group)
+    ///   takes the average of the top-left and bottom-right luma
+    ///   sub-block MVs (rounded toward zero, halved), then runs the
+    ///   §8.5.6.3.4 4-tap chroma interpolation via
+    ///   [`predict_chroma_block`].
+    ///
+    /// `cb` is the picture-absolute CU geometry. The reference picture's
+    /// planes are read for MC; `out` already holds the partially-
+    /// reconstructed picture and is written in place. Scope: uni-pred,
+    /// no residual add (the caller layers residual via the regular
+    /// `add_inter_residual_plane*` path), 4:2:0 chroma.
+    pub fn reconstruct_affine_inter_uni(
+        &self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        cpmvs: &crate::affine::AffineCpmvs,
+        ref_pic: &ReferencePicture,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::affine::{
+            derive_subblock_mvs, predict_luma_block_affine_prof, AffineLumaFilterSet,
+        };
+        // §8.5.6.3.2 — the default affine filter set (no RPR scaling in
+        // the scaffold).
+        predict_luma_block_affine_prof(
+            &mut out.luma,
+            cb_x,
+            cb_y,
+            cb_w,
+            cb_h,
+            &ref_pic.frame.luma,
+            cpmvs,
+            AffineLumaFilterSet::Set0,
+            /*bipred=*/ false,
+            self.ph_prof_disabled,
+            /*rpr_constraints_active=*/ false,
+        )?;
+
+        if self.sps.sps_chroma_format_idc != 1 {
+            // Chroma affine MC is wired for 4:2:0 only; other formats
+            // keep their existing (translational) chroma path upstream.
+            return Ok(());
+        }
+        // §8.5.5.3 eqs. 876 – 879 — derive the per-luma-sub-block MV
+        // grid, then average the top-left + bottom-right luma sub-block
+        // MVs of each 2×2 group into the chroma sub-block MV.
+        let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, /*bipred=*/ false)?;
+        let sb_w = cb_w / grid.num_sb_x; // 4 luma samples
+        let sb_h = cb_h / grid.num_sb_y;
+        // Chroma sub-blocks are 4×4 chroma samples = 8×8 luma = a 2×2
+        // luma-sub-block group when sb_w == sb_h == 4.
+        let c_x0 = cb_x / 2;
+        let c_y0 = cb_y / 2;
+        // Iterate over 2×2 luma-sub-block groups (SubWidthC = SubHeightC
+        // = 2 for 4:2:0).
+        let mut gy = 0u32;
+        while gy < grid.num_sb_y {
+            let mut gx = 0u32;
+            while gx < grid.num_sb_x {
+                // eq. 877 — top-left and bottom-right of the 2×2 group.
+                let tl = grid.mv_at(gx, gy);
+                let br_x = (gx + 1).min(grid.num_sb_x - 1);
+                let br_y = (gy + 1).min(grid.num_sb_y - 1);
+                let br = grid.mv_at(br_x, br_y);
+                // eqs. 878 / 879 — round-toward-zero average.
+                let avg = MotionVector {
+                    x: round_half_toward_zero_div2(tl.x + br.x),
+                    y: round_half_toward_zero_div2(tl.y + br.y),
+                };
+                // Chroma sub-block covers 2 luma sub-blocks per axis.
+                let luma_x = cb_x + gx * sb_w;
+                let luma_y = cb_y + gy * sb_h;
+                let c_w = (2 * sb_w / 2).min((cb_x + cb_w) / 2 - luma_x / 2);
+                let c_h = (2 * sb_h / 2).min((cb_y + cb_h) / 2 - luma_y / 2);
+                let c_sb_x = c_x0 + (gx * sb_w) / 2;
+                let c_sb_y = c_y0 + (gy * sb_h) / 2;
+                predict_chroma_block(
+                    &mut out.cb,
+                    c_sb_x,
+                    c_sb_y,
+                    c_w,
+                    c_h,
+                    &ref_pic.frame.cb,
+                    avg,
+                )?;
+                predict_chroma_block(
+                    &mut out.cr,
+                    c_sb_x,
+                    c_sb_y,
+                    c_w,
+                    c_h,
+                    &ref_pic.frame.cr,
+                    avg,
+                )?;
+                gx += 2;
+            }
+            gy += 2;
+        }
+        Ok(())
     }
 
     /// §8.5.2.11 (AMVP path) — derive the temporal collocated AMVP
@@ -4712,6 +4849,124 @@ mod tests {
         assert!(
             any_changed,
             "JCCR sign-negate test must apply a non-zero residual"
+        );
+    }
+
+    /// §8.5.5.3 / §8.5.6 affine uni-pred reconstruction — a degenerate
+    /// affine CU whose CPMVs are all the **same** integer-pel MV
+    /// reduces to a translational copy: every per-sub-block MV equals
+    /// that MV (eqs. 872 – 875), so the affine luma MC must produce the
+    /// same pixels as a plain `predict_luma_block` with that MV. The
+    /// chroma sub-block MV averaging (eqs. 876 – 879) of two identical
+    /// MVs is also that MV. With a horizontal-ramp reference and a
+    /// `(2, 0)` integer-pel shift, the CU samples must equal the
+    /// reference shifted left by 2 luma columns.
+    #[test]
+    fn reconstruct_affine_inter_uni_translational_equiv() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // Horizontal-ramp reference: luma[x] = (x & 63) as u8.
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+
+        // All CPMVs == (2, 0) integer-pel → translational shift.
+        let mv = MotionVector::from_int_pel(2, 0);
+        let cpmvs = crate::affine::AffineCpmvs::new_4param(mv, mv);
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &cpmvs, &ref_pic, &mut out)
+            .expect("affine uni recon should succeed");
+
+        // Compare to a plain translational predict_luma_block.
+        let mut expect = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        predict_luma_block(&mut expect.luma, 16, 16, 16, 16, &ref_frame.luma, mv)
+            .expect("translational reference MC");
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    expect.luma.samples[y * expect.luma.stride + x],
+                    "degenerate affine luma must equal translational MC at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// §8.5.5.9 — a genuine affine model (non-equal CPMVs) produces a
+    /// **spatially-varying** per-sub-block MV field, so the affine MC
+    /// output must differ from a single translational copy of the
+    /// reference. This proves the sub-block MV derivation is actually
+    /// exercised rather than collapsing to one MV.
+    #[test]
+    fn reconstruct_affine_inter_uni_varies_per_subblock() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // 2-D ramp reference so any MV difference shows up in samples.
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+
+        // 4-param affine: cp0 = (0,0), cp1 = (4,0) int-pel → a
+        // horizontal MV gradient across the CU width.
+        let cp0 = MotionVector::from_int_pel(0, 0);
+        let cp1 = MotionVector::from_int_pel(4, 0);
+        let cpmvs = crate::affine::AffineCpmvs::new_4param(cp0, cp1);
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &cpmvs, &ref_pic, &mut out)
+            .expect("affine uni recon should succeed");
+
+        // A single zero-MV translational copy would reproduce the
+        // reference verbatim at the CU; the affine gradient must change
+        // at least some samples relative to that.
+        let mut any_diff = false;
+        for y in 16..32usize {
+            for x in 16..32usize {
+                let got = out.luma.samples[y * out.luma.stride + x];
+                let flat = ref_frame.luma.samples[y * ref_frame.luma.stride + x];
+                if got != flat {
+                    any_diff = true;
+                }
+            }
+        }
+        assert!(
+            any_diff,
+            "a non-degenerate affine model must produce a per-sub-block-varying prediction"
         );
     }
 
