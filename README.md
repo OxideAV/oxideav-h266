@@ -144,9 +144,12 @@ P + B-slice merge subset:
   (`predict_luma_block_affine_prof`), and reconstructs 4:2:0 chroma by
   averaging the §8.5.5.3 top-left + bottom-right luma sub-block MVs
   (eqs. 876 – 879) into each chroma 4×4 sub-block before the §8.5.6.3.4
-  4-tap chroma MC. Wiring this into the parser-side §7.3.11.7 affine-CPMV
-  fuse (multi-CP `MvdLX` parsing + the §8.5.5.7 affine AMVP candidate
-  list → final CPMVs) and BCW on the AMVP path remain follow-ups.
+  4-tap chroma MC. `reconstruct_affine_inter_bi` predicts each list's
+  affine MC into a CU-sized scratch then forms the §8.5.6.6.2 eq. 980
+  default-weighted average over luma + chroma. Wiring these into the
+  parser-side §7.3.11.7 affine-CPMV fuse (multi-CP `MvdLX` parsing + the
+  §8.5.5.7 affine AMVP candidate list → final CPMVs) and BCW / BDOF on
+  the affine path remain follow-ups.
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, and the §8.7.4.6 inverse

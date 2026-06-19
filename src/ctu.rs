@@ -2866,81 +2866,220 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ref_pic: &ReferencePicture,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        // Uni-pred: affine MC for the single list writes straight into
+        // the output picture at the CU's picture-absolute offset.
+        self.predict_affine_one_list(
+            cb_w,
+            cb_h,
+            cpmvs,
+            ref_pic,
+            /*bipred=*/ false,
+            &mut out.luma,
+            cb_x,
+            cb_y,
+            &mut out.cb,
+            &mut out.cr,
+            cb_x / 2,
+            cb_y / 2,
+        )
+    }
+
+    /// §8.5.5.3 / §8.5.6 affine bi-prediction reconstruction to pixels.
+    ///
+    /// Predicts each reference list's affine MC into a CU-sized scratch
+    /// plane (luma + 4:2:0 chroma), then forms the §8.5.6.6.2 eq. 980
+    /// default-weighted average `(pred_l0 + pred_l1 + 1) >> 1` into the
+    /// output picture. Mirrors the translational bi-pred path's two-
+    /// scratch-plane composition; BCW / BDOF on the affine bi-pred path
+    /// is a follow-up (the default-weighted average is the
+    /// `bcw_idx == 0` case).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_affine_inter_bi(
+        &self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        cpmvs_l0: &crate::affine::AffineCpmvs,
+        ref_pic_l0: &ReferencePicture,
+        cpmvs_l1: &crate::affine::AffineCpmvs,
+        ref_pic_l1: &ReferencePicture,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::reconstruct::PicturePlane;
+        let chroma = self.sps.sps_chroma_format_idc == 1;
+        let cw = (cb_w / 2) as usize;
+        let ch = (cb_h / 2) as usize;
+        // The §8.5.6.3 affine MC couples the destination position with
+        // the reference-sample read position (`sb_x = dst_x + ...`), so
+        // each list is predicted into a full-picture-sized scratch
+        // plane at the CU's picture-absolute offset, then the CU
+        // rectangle is averaged out of it.
+        let pw = out.luma.width;
+        let ph = out.luma.height;
+        let cpw = out.cb.width;
+        let cph = out.cb.height;
+        let mut l0_luma = PicturePlane::filled(pw, ph, 0);
+        let mut l1_luma = PicturePlane::filled(pw, ph, 0);
+        let mut l0_cb = PicturePlane::filled(cpw, cph, 0);
+        let mut l0_cr = PicturePlane::filled(cpw, cph, 0);
+        let mut l1_cb = PicturePlane::filled(cpw, cph, 0);
+        let mut l1_cr = PicturePlane::filled(cpw, cph, 0);
+
+        self.predict_affine_one_list(
+            cb_w,
+            cb_h,
+            cpmvs_l0,
+            ref_pic_l0,
+            /*bipred=*/ true,
+            &mut l0_luma,
+            cb_x,
+            cb_y,
+            &mut l0_cb,
+            &mut l0_cr,
+            cb_x / 2,
+            cb_y / 2,
+        )?;
+        self.predict_affine_one_list(
+            cb_w,
+            cb_h,
+            cpmvs_l1,
+            ref_pic_l1,
+            /*bipred=*/ true,
+            &mut l1_luma,
+            cb_x,
+            cb_y,
+            &mut l1_cb,
+            &mut l1_cr,
+            cb_x / 2,
+            cb_y / 2,
+        )?;
+
+        // §8.5.6.6.2 eq. 980 default-weighted average into the picture.
+        // The scratch planes carry the prediction at the CU's picture-
+        // absolute offset, so the average reads them at that same
+        // offset.
+        self.bi_avg_plane_region(&mut out.luma, cb_x, cb_y, cb_w, cb_h, &l0_luma, &l1_luma);
+        if chroma {
+            self.bi_avg_plane_region(
+                &mut out.cb,
+                cb_x / 2,
+                cb_y / 2,
+                cw as u32,
+                ch as u32,
+                &l0_cb,
+                &l1_cb,
+            );
+            self.bi_avg_plane_region(
+                &mut out.cr,
+                cb_x / 2,
+                cb_y / 2,
+                cw as u32,
+                ch as u32,
+                &l0_cr,
+                &l1_cr,
+            );
+        }
+        Ok(())
+    }
+
+    /// §8.5.6.6.2 eq. 980 default-weighted average of two co-located
+    /// plane regions: `out[x][y] = (a[x][y] + b[x][y] + 1) >> 1` over
+    /// the `(w × h)` rectangle at `(dx, dy)`, where `a` / `b` are read
+    /// at the **same** offset (not anchored at (0,0) like
+    /// [`crate::inter::bi_pred_avg_8bit`]).
+    #[allow(clippy::too_many_arguments)]
+    fn bi_avg_plane_region(
+        &self,
+        out: &mut crate::reconstruct::PicturePlane,
+        dx: u32,
+        dy: u32,
+        w: u32,
+        h: u32,
+        a: &crate::reconstruct::PicturePlane,
+        b: &crate::reconstruct::PicturePlane,
+    ) {
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                let idx = (dy as usize + r) * out.stride + (dx as usize + c);
+                let ai = (dy as usize + r) * a.stride + (dx as usize + c);
+                let bi = (dy as usize + r) * b.stride + (dx as usize + c);
+                let v = (a.samples[ai] as u32 + b.samples[bi] as u32 + 1) >> 1;
+                out.samples[idx] = v as u8;
+            }
+        }
+    }
+
+    /// Predict ONE reference list's affine MC (luma + 4:2:0 chroma)
+    /// into caller-supplied planes. The luma plane is written at
+    /// `(luma_dst_x, luma_dst_y)`; the chroma planes at
+    /// `(c_dst_x, c_dst_y)`. The §8.5.5.9 sub-block MV derivation is
+    /// anchored at the CU origin and the CPMVs encode the absolute
+    /// motion, so only the CU dimensions `(cb_w, cb_h)` are needed.
+    /// Shared by the uni- and bi-pred entry points.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_affine_one_list(
+        &self,
+        cb_w: u32,
+        cb_h: u32,
+        cpmvs: &crate::affine::AffineCpmvs,
+        ref_pic: &ReferencePicture,
+        bipred: bool,
+        luma_dst: &mut crate::reconstruct::PicturePlane,
+        luma_dst_x: u32,
+        luma_dst_y: u32,
+        cb_dst: &mut crate::reconstruct::PicturePlane,
+        cr_dst: &mut crate::reconstruct::PicturePlane,
+        c_dst_x: u32,
+        c_dst_y: u32,
+    ) -> Result<()> {
         use crate::affine::{
             derive_subblock_mvs, predict_luma_block_affine_prof, AffineLumaFilterSet,
         };
         // §8.5.6.3.2 — the default affine filter set (no RPR scaling in
-        // the scaffold).
+        // the scaffold). The sub-block MV grid is anchored at the
+        // CU's picture-absolute (cb_x, cb_y) but the samples land at the
+        // destination offset.
         predict_luma_block_affine_prof(
-            &mut out.luma,
-            cb_x,
-            cb_y,
+            luma_dst,
+            luma_dst_x,
+            luma_dst_y,
             cb_w,
             cb_h,
             &ref_pic.frame.luma,
             cpmvs,
             AffineLumaFilterSet::Set0,
-            /*bipred=*/ false,
+            bipred,
             self.ph_prof_disabled,
             /*rpr_constraints_active=*/ false,
         )?;
 
         if self.sps.sps_chroma_format_idc != 1 {
-            // Chroma affine MC is wired for 4:2:0 only; other formats
-            // keep their existing (translational) chroma path upstream.
             return Ok(());
         }
-        // §8.5.5.3 eqs. 876 – 879 — derive the per-luma-sub-block MV
-        // grid, then average the top-left + bottom-right luma sub-block
-        // MVs of each 2×2 group into the chroma sub-block MV.
-        let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, /*bipred=*/ false)?;
-        let sb_w = cb_w / grid.num_sb_x; // 4 luma samples
+        // §8.5.5.3 eqs. 876 – 879 — average the top-left + bottom-right
+        // luma sub-block MVs of each 2×2 group into the chroma MV.
+        let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, bipred)?;
+        let sb_w = cb_w / grid.num_sb_x;
         let sb_h = cb_h / grid.num_sb_y;
-        // Chroma sub-blocks are 4×4 chroma samples = 8×8 luma = a 2×2
-        // luma-sub-block group when sb_w == sb_h == 4.
-        let c_x0 = cb_x / 2;
-        let c_y0 = cb_y / 2;
-        // Iterate over 2×2 luma-sub-block groups (SubWidthC = SubHeightC
-        // = 2 for 4:2:0).
         let mut gy = 0u32;
         while gy < grid.num_sb_y {
             let mut gx = 0u32;
             while gx < grid.num_sb_x {
-                // eq. 877 — top-left and bottom-right of the 2×2 group.
                 let tl = grid.mv_at(gx, gy);
                 let br_x = (gx + 1).min(grid.num_sb_x - 1);
                 let br_y = (gy + 1).min(grid.num_sb_y - 1);
                 let br = grid.mv_at(br_x, br_y);
-                // eqs. 878 / 879 — round-toward-zero average.
                 let avg = MotionVector {
                     x: round_half_toward_zero_div2(tl.x + br.x),
                     y: round_half_toward_zero_div2(tl.y + br.y),
                 };
-                // Chroma sub-block covers 2 luma sub-blocks per axis.
-                let luma_x = cb_x + gx * sb_w;
-                let luma_y = cb_y + gy * sb_h;
-                let c_w = (2 * sb_w / 2).min((cb_x + cb_w) / 2 - luma_x / 2);
-                let c_h = (2 * sb_h / 2).min((cb_y + cb_h) / 2 - luma_y / 2);
-                let c_sb_x = c_x0 + (gx * sb_w) / 2;
-                let c_sb_y = c_y0 + (gy * sb_h) / 2;
-                predict_chroma_block(
-                    &mut out.cb,
-                    c_sb_x,
-                    c_sb_y,
-                    c_w,
-                    c_h,
-                    &ref_pic.frame.cb,
-                    avg,
-                )?;
-                predict_chroma_block(
-                    &mut out.cr,
-                    c_sb_x,
-                    c_sb_y,
-                    c_w,
-                    c_h,
-                    &ref_pic.frame.cr,
-                    avg,
-                )?;
+                let c_w = sb_w; // 2 luma sub-blocks (8 luma) → 4 chroma
+                let c_h = sb_h;
+                let c_sb_x = c_dst_x + (gx * sb_w) / 2;
+                let c_sb_y = c_dst_y + (gy * sb_h) / 2;
+                predict_chroma_block(cb_dst, c_sb_x, c_sb_y, c_w, c_h, &ref_pic.frame.cb, avg)?;
+                predict_chroma_block(cr_dst, c_sb_x, c_sb_y, c_w, c_h, &ref_pic.frame.cr, avg)?;
                 gx += 2;
             }
             gy += 2;
@@ -4968,6 +5107,109 @@ mod tests {
             any_diff,
             "a non-degenerate affine model must produce a per-sub-block-varying prediction"
         );
+    }
+
+    /// §8.5.6.6.2 affine bi-pred — averaging two **identical**
+    /// predictions (`(a + a + 1) >> 1 == a`) is the identity, so the
+    /// bi-pred reconstruction of the same CPMVs / same reference on
+    /// both lists must equal that single per-list affine prediction.
+    /// The per-list reference is computed directly with the public
+    /// `affine::predict_luma_block_affine_prof(bipred = true)` so the
+    /// test pins both the two-scratch-plane composition and the
+    /// default-weighted average, for luma (the bi-pred PROF/rounding
+    /// flag differs from the uni path, which is why this compares
+    /// against the bi-pred per-list prediction, not the uni result).
+    #[test]
+    fn reconstruct_affine_inter_bi_equals_uni_for_identical_lists() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // 2-D ramp reference (luma + a distinct chroma ramp).
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+            }
+        }
+        for cy in 0..(pic_h / 2) as usize {
+            for cx in 0..(pic_w / 2) as usize {
+                ref_frame.cb.samples[cy * ref_frame.cb.stride + cx] = ((cx * 2) & 63) as u8;
+                ref_frame.cr.samples[cy * ref_frame.cr.stride + cx] = ((cy * 2) & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        let ref_pic2 = ref_pic.clone();
+
+        let cp0 = MotionVector::from_int_pel(0, 0);
+        let cp1 = MotionVector::from_int_pel(4, 0);
+        let cpmvs = crate::affine::AffineCpmvs::new_4param(cp0, cp1);
+
+        // Per-list bi-pred affine luma prediction (reference).
+        let mut ref_list = crate::reconstruct::PicturePlane::filled(64, 64, 0);
+        crate::affine::predict_luma_block_affine_prof(
+            &mut ref_list,
+            16,
+            16,
+            16,
+            16,
+            &ref_frame.luma,
+            &cpmvs,
+            crate::affine::AffineLumaFilterSet::Set0,
+            /*bipred=*/ true,
+            /*ph_prof_disabled=*/ true,
+            /*rpr_constraints_active=*/ false,
+        )
+        .expect("per-list affine prediction");
+
+        let mut bi = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_bi(
+                16, 16, 16, 16, &cpmvs, &ref_pic, &cpmvs, &ref_pic2, &mut bi,
+            )
+            .expect("bi affine recon");
+
+        // Averaging two identical per-list predictions is the identity.
+        let mut any = false;
+        for y in 16..32usize {
+            for x in 16..32usize {
+                let got = bi.luma.samples[y * bi.luma.stride + x];
+                let expect = ref_list.samples[y * ref_list.stride + x];
+                assert_eq!(
+                    got, expect,
+                    "affine bi-pred luma of identical lists must equal the per-list prediction at ({x},{y})"
+                );
+                if got != ((x + y) & 63) as u8 {
+                    any = true;
+                }
+            }
+        }
+        assert!(
+            any,
+            "the affine bi-pred must produce a non-trivial prediction"
+        );
+        // Chroma: both lists identical → averaging is the identity, so
+        // the bi-pred chroma must be a valid (in-range) non-constant
+        // reconstruction.
+        let mut cb_any = false;
+        for cy in 8..16usize {
+            for cx in 8..16usize {
+                if bi.cb.samples[cy * bi.cb.stride + cx] != 0 {
+                    cb_any = true;
+                }
+            }
+        }
+        assert!(cb_any, "affine bi-pred Cb must be populated");
     }
 
     /// §7.3.11.4 multi-TB tiling — a 128×128 inter CU (> MaxTbSizeY)
