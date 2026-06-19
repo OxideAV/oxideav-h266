@@ -556,6 +556,17 @@ pub struct LeafCuInfo {
     /// Inter-coding side state populated by the P/B-slice parse path
     /// (round-21). Empty/default when the CU is intra.
     pub inter: InterCuInfo,
+    /// `cu_sbt_flag[x0][y0]` (§7.3.11.5) — sub-block transform active.
+    /// When `true` the CU's residual lives in a single sub-region TU
+    /// (the other TU has no residual); the §8.7.4.1 Table-40 transform
+    /// kernels apply to the residual TU.
+    pub cu_sbt_flag: bool,
+    /// `cu_sbt_quad_flag` — TU0 is 1/4 (vs 1/2) of the CU.
+    pub cu_sbt_quad_flag: bool,
+    /// `cu_sbt_horizontal_flag` — split axis (true = horizontal).
+    pub cu_sbt_horizontal_flag: bool,
+    /// `cu_sbt_pos_flag` — selects which TU carries the residual.
+    pub cu_sbt_pos_flag: bool,
 }
 
 impl Default for LeafCuInfo {
@@ -610,6 +621,10 @@ impl Default for LeafCuInfo {
                 },
                 non_merge: crate::inter::NonMergeInterData::default(),
             },
+            cu_sbt_flag: false,
+            cu_sbt_quad_flag: false,
+            cu_sbt_horizontal_flag: false,
+            cu_sbt_pos_flag: false,
         }
     }
 }

@@ -2431,13 +2431,45 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `predMode == MODE_INTER`, and §8.7.5.1 forms the
         // reconstructed sample `recSamples = Clip1(predSamples +
         // resSamples)`. The motion-compensated `predSamples` already
-        // live in `out`, so we add the residual in place. SBT / multi-
-        // TB tiling are out of scope (the parser surfaces Unsupported
-        // for CB > MaxTbSizeY before reaching here), so the CU is a
-        // single transform block per component.
+        // live in `out`, so we add the residual in place.
+        //
+        // §7.4.12.5 SBT: when `cu_sbt_flag == 1` the CU is split into two
+        // TUs; one carries residual, the other has none. The residual TU
+        // occupies the [`crate::transform::sbt_geometry`] sub-region and
+        // uses the §8.7.4.1 Table-40 transform kernels
+        // ([`crate::transform::sbt_tr_types`]) instead of DCT-II. The
+        // non-residual sub-region is left at the MC prediction (eq. 1426
+        // residual implicitly zero).
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let cu_qp_delta = info.cu_qp_delta_val;
-        if info.tu_y_coded_flag && !residual.luma_levels.is_empty() {
+        if info.cu_sbt_flag {
+            if info.tu_y_coded_flag && !residual.luma_levels.is_empty() {
+                let geo = crate::transform::sbt_geometry(
+                    cu.cu.w,
+                    cu.cu.h,
+                    info.cu_sbt_quad_flag,
+                    info.cu_sbt_horizontal_flag,
+                    info.cu_sbt_pos_flag,
+                );
+                let (tr_h, tr_v) = crate::transform::sbt_tr_types(
+                    info.cu_sbt_horizontal_flag,
+                    info.cu_sbt_pos_flag,
+                );
+                self.add_inter_residual_plane_tr(
+                    /*c_idx=*/ 0,
+                    (cu.cu.x + geo.res_x) as usize,
+                    (cu.cu.y + geo.res_y) as usize,
+                    geo.res_w as usize,
+                    geo.res_h as usize,
+                    &residual.luma_levels,
+                    cu_qp_delta,
+                    bit_depth,
+                    tr_h,
+                    tr_v,
+                    out,
+                )?;
+            }
+        } else if info.tu_y_coded_flag && !residual.luma_levels.is_empty() {
             let n_tb_w = cu.cu.w as usize;
             let n_tb_h = cu.cu.h as usize;
             self.add_inter_residual_plane(
@@ -2788,6 +2820,42 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         bit_depth: u32,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        // The regular (`cu_sbt_flag == 0`) inter residual path uses the
+        // §8.7.4.1 `mts_idx == 0` DCT-II × DCT-II kernel.
+        self.add_inter_residual_plane_tr(
+            c_idx,
+            x0,
+            y0,
+            n_tb_w,
+            n_tb_h,
+            levels,
+            cu_qp_delta,
+            bit_depth,
+            TrType::DctII,
+            TrType::DctII,
+            out,
+        )
+    }
+
+    /// As [`Self::add_inter_residual_plane`] but with caller-selected
+    /// horizontal / vertical inverse-transform kernels. The SBT path
+    /// (§8.7.4.1 Table 40) passes DST-VII / DCT-VIII; the regular path
+    /// passes DCT-II × DCT-II.
+    #[allow(clippy::too_many_arguments)]
+    fn add_inter_residual_plane_tr(
+        &self,
+        c_idx: u32,
+        x0: usize,
+        y0: usize,
+        n_tb_w: usize,
+        n_tb_h: usize,
+        levels: &[i32],
+        cu_qp_delta: i32,
+        bit_depth: u32,
+        tr_h: TrType,
+        tr_v: TrType,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
         if n_tb_w == 0 || n_tb_h == 0 || levels.len() != n_tb_w * n_tb_h {
             return Ok(());
         }
@@ -2812,10 +2880,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm_dir: false,
         };
         let d = dequantize_tb_flat(levels, &params)?;
-        let (tr_h, tr_v) = (TrType::DctII, TrType::DctII);
-        let _ = implicit_mts_tr_types(n_tb_w as u32, n_tb_h as u32);
+        // §8.7.4.1 eqs. 1171 / 1172 — non-zero coefficient ranges depend
+        // on the kernel (DST-VII / DCT-VIII cap at 16, DCT-II at 32).
+        let non_zero_w = n_tb_w.min(if matches!(tr_h, TrType::DctII) {
+            32
+        } else {
+            16
+        });
+        let non_zero_h = n_tb_h.min(if matches!(tr_v, TrType::DctII) {
+            32
+        } else {
+            16
+        });
         let res = inverse_transform_2d(
-            n_tb_w, n_tb_h, n_tb_w, n_tb_h, tr_h, tr_v, &d, bit_depth, 15,
+            n_tb_w, n_tb_h, non_zero_w, non_zero_h, tr_h, tr_v, &d, bit_depth, 15,
         )?;
         // §8.7.5.1 — recSamples = Clip1(predSamples + resSamples). The
         // plane already holds predSamples; read each sample as pred,
@@ -4197,6 +4275,99 @@ mod tests {
                     out.luma.samples[y * out.luma.stride + xi],
                     ref_frame.luma.samples[y * ref_frame.luma.stride + xi],
                     "zero-MV-pad AMVP recon must copy the reference verbatim"
+                );
+            }
+        }
+    }
+
+    /// §7.4.12.5 + §8.7.4.1 — an inter CU with `cu_sbt_flag == 1`
+    /// (vertical half-split, residual in TU0 / left half) adds its
+    /// inverse-transformed residual ONLY to the residual sub-region; the
+    /// non-residual TU stays at the MC prediction (constant 100). The
+    /// residual array is sized to the residual TU (16×16), not the whole
+    /// 32×16 CU.
+    #[test]
+    fn reconstruct_leaf_cu_inter_sbt_residual_only_in_res_tu() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        // 32x16 merge CU at (0, 0) — zero-MV uni-pred → constant-100
+        // prediction over the whole CU.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 32,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 32,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = true;
+        // Vertical half-split, residual in TU0 (left 16 cols).
+        info.cu_sbt_flag = true;
+        info.cu_sbt_quad_flag = false;
+        info.cu_sbt_horizontal_flag = false;
+        info.cu_sbt_pos_flag = false;
+        // Residual TU is 16x16; single positive DC coefficient.
+        let mut residual = LeafCuResidual::default();
+        residual.luma_levels = vec![0i32; 16 * 16];
+        residual.luma_levels[0] = 8;
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("SBT inter residual path should reconstruct");
+
+        // Left half (residual TU, cols 0..16): the §8.7.4.1 Table-40
+        // DCT-VIII × DST-VII kernels produce a spatially-varying
+        // residual (not a flat DC lift), so the residual TU must differ
+        // from the constant-100 prediction in at least some samples.
+        let mut any_changed = false;
+        for y in 0..16usize {
+            for x in 0..16usize {
+                if out.luma.samples[y * out.luma.stride + x] != 100 {
+                    any_changed = true;
+                }
+            }
+        }
+        assert!(
+            any_changed,
+            "the SBT residual TU must apply a non-zero residual to the prediction"
+        );
+        // Right half (non-residual TU, cols 16..32): stays exactly at
+        // the prediction — this is the defining SBT property (one TU has
+        // no residual).
+        for y in 0..16usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    100,
+                    "non-residual TU sample at ({x},{y}) must stay at the prediction"
                 );
             }
         }

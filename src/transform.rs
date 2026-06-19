@@ -506,6 +506,123 @@ pub fn implicit_mts_tr_types(n_tb_w: u32, n_tb_h: u32) -> (TrType, TrType) {
     (tr_h, tr_v)
 }
 
+/// §7.4.12.5 eqs. 177 / 178 — `SbtNumFourthsTb0` (the size, in fourths
+/// of the CU, of the *first* of the two SBT transform units).
+///
+/// ```text
+/// sbtMinNumFourths = cu_sbt_quad_flag ? 1 : 2
+/// SbtNumFourthsTb0 = cu_sbt_pos_flag ? (4 − sbtMinNumFourths) : sbtMinNumFourths
+/// ```
+pub fn sbt_num_fourths_tb0(cu_sbt_quad_flag: bool, cu_sbt_pos_flag: bool) -> u32 {
+    let sbt_min_num_fourths = if cu_sbt_quad_flag { 1 } else { 2 };
+    if cu_sbt_pos_flag {
+        4 - sbt_min_num_fourths
+    } else {
+        sbt_min_num_fourths
+    }
+}
+
+/// Geometry of a sub-block-transform (SBT) CU: which of the two
+/// transform units carries the residual, and the residual TU's offset +
+/// size inside the CU.
+///
+/// Per §7.4.12.5 the CU is split into two TUs (TU0 + TU1) along the
+/// horizontal (`cu_sbt_horizontal_flag == 1`) or vertical axis. `TU0`
+/// spans `SbtNumFourthsTb0 / 4` of the CU dimension; `TU1` spans the
+/// remainder. `cu_sbt_pos_flag` selects which TU is the *residual* TU:
+/// per the §7.4.12.5 `cu_sbt_pos_flag` semantics, when
+/// `cu_sbt_pos_flag == 1` the **first** TU's coded flags are absent
+/// (so the residual lives in TU1), and when `cu_sbt_pos_flag == 0` the
+/// **second** TU's coded flags are absent (residual lives in TU0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SbtGeometry {
+    /// Residual TU x offset inside the CU (luma samples).
+    pub res_x: u32,
+    /// Residual TU y offset inside the CU (luma samples).
+    pub res_y: u32,
+    /// Residual TU width (luma samples).
+    pub res_w: u32,
+    /// Residual TU height (luma samples).
+    pub res_h: u32,
+}
+
+/// Derive the [`SbtGeometry`] for a `cb_w × cb_h` SBT CU from the parsed
+/// `cu_sbt_quad_flag` / `cu_sbt_horizontal_flag` / `cu_sbt_pos_flag`
+/// (§7.3.11.5 + §7.4.12.5).
+pub fn sbt_geometry(
+    cb_w: u32,
+    cb_h: u32,
+    cu_sbt_quad_flag: bool,
+    cu_sbt_horizontal_flag: bool,
+    cu_sbt_pos_flag: bool,
+) -> SbtGeometry {
+    let fourths = sbt_num_fourths_tb0(cu_sbt_quad_flag, cu_sbt_pos_flag);
+    if cu_sbt_horizontal_flag {
+        // §7.3.11.10 split: TU0 = (x0, y0, cb_w, trafoHeight),
+        // TU1 = (x0, y0 + trafoHeight, cb_w, cb_h − trafoHeight).
+        let trafo_h = cb_h * fourths / 4;
+        if cu_sbt_pos_flag {
+            // Residual in TU1 (below the split).
+            SbtGeometry {
+                res_x: 0,
+                res_y: trafo_h,
+                res_w: cb_w,
+                res_h: cb_h - trafo_h,
+            }
+        } else {
+            // Residual in TU0 (above the split).
+            SbtGeometry {
+                res_x: 0,
+                res_y: 0,
+                res_w: cb_w,
+                res_h: trafo_h,
+            }
+        }
+    } else {
+        let trafo_w = cb_w * fourths / 4;
+        if cu_sbt_pos_flag {
+            SbtGeometry {
+                res_x: trafo_w,
+                res_y: 0,
+                res_w: cb_w - trafo_w,
+                res_h: cb_h,
+            }
+        } else {
+            SbtGeometry {
+                res_x: 0,
+                res_y: 0,
+                res_w: trafo_w,
+                res_h: cb_h,
+            }
+        }
+    }
+}
+
+/// Table 40 — `(trTypeHor, trTypeVer)` for an SBT residual TU, selected
+/// by `cu_sbt_horizontal_flag` and `cu_sbt_pos_flag` (§8.7.4.1, the
+/// `implicitMtsEnabled == 1 && cu_sbt_flag == 1` branch).
+///
+/// ```text
+/// cu_sbt_horizontal_flag  cu_sbt_pos_flag  trTypeHor  trTypeVer
+///          0                    0              2 (DCT8)   1 (DST7)
+///          0                    1              1 (DST7)   1 (DST7)
+///          1                    0              1 (DST7)   2 (DCT8)
+///          1                    1              1 (DST7)   1 (DST7)
+/// ```
+///
+/// Per the §8.7.4.1 first bullet `trTypeHor = trTypeVer = 0` (DCT-II)
+/// for chroma (`cIdx > 0`) and whenever `Max(nTbW, nTbH) > 32` (the
+/// `implicitMtsEnabled` gate is false), so this table is consulted only
+/// for the luma residual TU of an SBT CU with `Max(nTbW, nTbH) <= 32`.
+pub fn sbt_tr_types(cu_sbt_horizontal_flag: bool, cu_sbt_pos_flag: bool) -> (TrType, TrType) {
+    match (cu_sbt_horizontal_flag, cu_sbt_pos_flag) {
+        (false, false) => (TrType::DctVIII, TrType::DstVII),
+        (false, true) => (TrType::DstVII, TrType::DstVII),
+        (true, false) => (TrType::DstVII, TrType::DctVIII),
+        (true, true) => (TrType::DstVII, TrType::DstVII),
+    }
+}
+
 /// Spec-exact clamp helper — CoeffMin / CoeffMax per §7.4.11.9
 /// (Log2TransformRange = 15 with default config, giving
 /// `[-(1<<15), (1<<15)-1]`).
@@ -946,6 +1063,51 @@ fn apply_dct_viii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §7.4.12.5 eqs. 177 / 178 — SbtNumFourthsTb0 over the four
+    /// (cu_sbt_quad_flag, cu_sbt_pos_flag) combinations.
+    #[test]
+    fn sbt_num_fourths_tb0_matches_eqs_177_178() {
+        // half-size (quad=0): pos=0 → 2, pos=1 → 2.
+        assert_eq!(sbt_num_fourths_tb0(false, false), 2);
+        assert_eq!(sbt_num_fourths_tb0(false, true), 2);
+        // quarter-size (quad=1): pos=0 → 1, pos=1 → 3.
+        assert_eq!(sbt_num_fourths_tb0(true, false), 1);
+        assert_eq!(sbt_num_fourths_tb0(true, true), 3);
+    }
+
+    /// §7.4.12.5 / §7.3.11.10 — the residual TU occupies the sub-region
+    /// selected by `cu_sbt_pos_flag` and the split axis.
+    #[test]
+    fn sbt_geometry_places_residual_tu() {
+        // Vertical half-split (quad=0, horiz=0): trafoWidth = 32 * 2/4 =
+        // 16. pos=0 → residual in TU0 (left half).
+        let g = sbt_geometry(32, 16, false, false, false);
+        assert_eq!((g.res_x, g.res_y, g.res_w, g.res_h), (0, 0, 16, 16));
+        // pos=1 → residual in TU1 (right half).
+        let g = sbt_geometry(32, 16, false, false, true);
+        assert_eq!((g.res_x, g.res_y, g.res_w, g.res_h), (16, 0, 16, 16));
+        // Horizontal quarter-split (quad=1, horiz=1): pos=0 →
+        // trafoHeight = 16 * 1/4 = 4, residual in TU0 (top quarter).
+        let g = sbt_geometry(32, 16, true, true, false);
+        assert_eq!((g.res_x, g.res_y, g.res_w, g.res_h), (0, 0, 32, 4));
+        // pos=1 → SbtNumFourthsTb0 = 3, trafoHeight = 12, residual in
+        // TU1 (bottom 4 rows).
+        let g = sbt_geometry(32, 16, true, true, true);
+        assert_eq!((g.res_x, g.res_y, g.res_w, g.res_h), (0, 12, 32, 4));
+    }
+
+    /// Table 40 — SBT residual-TU transform kernels.
+    #[test]
+    fn sbt_tr_types_match_table_40() {
+        assert_eq!(
+            sbt_tr_types(false, false),
+            (TrType::DctVIII, TrType::DstVII)
+        );
+        assert_eq!(sbt_tr_types(false, true), (TrType::DstVII, TrType::DstVII));
+        assert_eq!(sbt_tr_types(true, false), (TrType::DstVII, TrType::DctVIII));
+        assert_eq!(sbt_tr_types(true, true), (TrType::DstVII, TrType::DstVII));
+    }
 
     /// A DC-only input (`x[0]` non-zero, others zero) through DST-VII
     /// extracts the first column of the matrix, scaled by `x[0]`.
