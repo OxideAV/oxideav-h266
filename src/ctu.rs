@@ -1984,6 +1984,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             );
         }
 
+        self.reconstruct_inter_with_chosen(cu, info, residual, chosen, out)
+    }
+
+    /// Shared §8.5.6 + §8.5.8 motion-compensated reconstruction tail for
+    /// a leaf inter CU whose final per-list MVs have already been
+    /// resolved into `chosen` (an [`MvField`]).
+    ///
+    /// Both the §8.5.2.2 merge / skip path
+    /// ([`Self::reconstruct_leaf_cu_inter`]) and the §8.5.2.1 non-merge
+    /// AMVP path ([`Self::reconstruct_leaf_cu_inter_amvp`]) converge
+    /// here once `chosen` is known: the per-list reference lookup,
+    /// §8.5.6.3 fractional-sample luma + chroma MC (with §8.5.6.6.2
+    /// default-weighted / BCW bi-pred and §8.5.6.5 BDOF), the optional
+    /// §8.5.6.7 CIIP combine (merge-only — derived from
+    /// `info.inter.merge_data.ciip_flag`, so the AMVP path's
+    /// `ciip_flag == 0` makes it a no-op), the §8.5.8 + §8.7.5.1
+    /// inter-residual add, and the motion-field / HMVP / deblock
+    /// bookkeeping are all identical regardless of how `chosen` was
+    /// derived.
+    fn reconstruct_inter_with_chosen(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        chosen: MvField,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
         if !chosen.pred_flag_l0 && !chosen.pred_flag_l1 {
             return Err(Error::invalid(
                 "h266 inter: chosen merge candidate has both predFlags == 0; \
