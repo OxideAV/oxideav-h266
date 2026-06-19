@@ -608,6 +608,7 @@ impl Default for LeafCuInfo {
                     merge_subblock_flag: false,
                     merge_subblock_idx: 0,
                 },
+                non_merge: crate::inter::NonMergeInterData::default(),
             },
         }
     }

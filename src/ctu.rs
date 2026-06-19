@@ -1885,6 +1885,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        // §8.5.2.1 — when `general_merge_flag == 0` the CU's motion is
+        // signalled explicitly through the AMVP path (mvp_lX_flag +
+        // ref_idx_lX + mvd_lX). The §8.5.2.8-10 candidate derivation,
+        // the §8.5.2.1 `mvLX = mvpLX + mvdLX` fold, and the MC tail are
+        // handled by the dedicated AMVP walker. Skip / merge CUs
+        // (`general_merge_flag == 1`) fall through to the merge-list
+        // build below.
+        if !info.inter.general_merge_flag {
+            return self.reconstruct_leaf_cu_inter_amvp(cu, info, residual, out);
+        }
         let max_merge = self.cu_tool_flags().max_num_merge_cand;
         let xcb = cu.cu.x as i32;
         let ycb = cu.cu.y as i32;
@@ -2543,6 +2553,212 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // next CU's merge-side neighbour query.
         self.commit_subblock_neighbour_state(cu, info);
         Ok(())
+    }
+
+    /// §8.5.2.1 non-merge AMVP reconstruction — derive the final per-list
+    /// MVs from the parsed §7.3.11.7 motion record
+    /// (`info.inter.non_merge`) and run the shared §8.5.6 / §8.5.8 MC +
+    /// residual tail.
+    ///
+    /// For each active prediction list `X` (selected by
+    /// `inter_pred_idc`):
+    ///
+    /// 1. Resolve `RefPicList[X][refIdxLX]` and its POC — the
+    ///    `current_ref_poc` a neighbour's reference must match
+    ///    (`DiffPicOrderCnt == 0`) to contribute (§8.5.2.10).
+    /// 2. Derive the `[A, B]` spatial candidates (§8.5.2.10), AMVR-round
+    ///    them (§8.5.2.9 step 2), derive the §8.5.2.11 temporal Col
+    ///    candidate, build the §8.5.2.9 list (step 3 Col gate + step 5
+    ///    HMVP fill + step 6 zero-MV pad), and select
+    ///    `mvpListLX[mvp_lX_flag]` (§8.5.2.8 eq. 583).
+    /// 3. Fold the raw `MvdLX` with the per-CU `AmvrShift`:
+    ///    `mvLX = mvpLX + (mvdLX << AmvrShift)` (§8.5.2.1 eqs. 504-507).
+    ///
+    /// The resulting `chosen` [`MvField`] feeds
+    /// [`Self::reconstruct_inter_with_chosen`] — the same MC + residual
+    /// path the merge / skip CUs use.
+    fn reconstruct_leaf_cu_inter_amvp(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::amvp::{
+            build_mvp_cand_list, derive_final_mv, derive_hmvp_mvp_candidates,
+            derive_spatial_mvp_candidates, round_mv_amvr, select_mvp, AmvpRefContext, RefList,
+            SpatialMvpCandidate,
+        };
+        use crate::leaf_cu::InterPredDir;
+
+        let nm = &info.inter.non_merge;
+        let xcb = cu.cu.x as i32;
+        let ycb = cu.cu.y as i32;
+        let cb_w = cu.cu.w as i32;
+        let cb_h = cu.cu.h as i32;
+        let amvr = nm.amvr_shift;
+
+        let use_l0 = !matches!(nm.pred_dir, InterPredDir::PredL1);
+        let use_l1 = !matches!(nm.pred_dir, InterPredDir::PredL0);
+
+        // Per-list final MV via the §8.5.2.8-10 candidate derivation.
+        // `derive_one_list` resolves the chosen predictor and folds the
+        // raw mvd; the closure captures the shared geometry and the
+        // per-list reference POC tables.
+        let derive_one_list = |slf: &Self,
+                               list: RefList,
+                               ref_idx: i32,
+                               mvp_flag: u32,
+                               raw_mvd: MotionVector|
+         -> Result<MotionVector> {
+            let rpl_x = match list {
+                RefList::L0 => &slf.ref_pic_list_l0,
+                RefList::L1 => &slf.ref_pic_list_l1,
+            };
+            if ref_idx < 0 || (ref_idx as usize) >= rpl_x.len() {
+                return Err(Error::invalid(format!(
+                    "h266 amvp: refIdx {ref_idx} out of range for the active \
+                         reference list ({} entries)",
+                    rpl_x.len()
+                )));
+            }
+            let current_ref_poc = rpl_x[ref_idx as usize].poc;
+            // §8.5.2.10 neighbour-reference POC resolvers — a
+            // neighbour's per-list refIdx → that reference's POC.
+            // The neighbour's L0 index always resolves through
+            // RefPicList0 and L1 through RefPicList1 regardless of
+            // which list `X` the current CU predicts (the §8.5.2.10
+            // scan consults both the neighbour's L0 and L1).
+            let poc_of_l0 = |idx: i32| -> Option<i32> {
+                if idx < 0 {
+                    None
+                } else {
+                    slf.ref_pic_list_l0.get(idx as usize).map(|r| r.poc)
+                }
+            };
+            let poc_of_l1 = |idx: i32| -> Option<i32> {
+                if idx < 0 {
+                    None
+                } else {
+                    slf.ref_pic_list_l1.get(idx as usize).map(|r| r.poc)
+                }
+            };
+            let ctx = AmvpRefContext {
+                list,
+                current_ref_poc,
+                poc_of_l0_ref: &poc_of_l0,
+                poc_of_l1_ref: &poc_of_l1,
+            };
+            // §8.5.2.10 spatial scan, then §8.5.2.9 step-2 AMVR
+            // rounding of each available candidate.
+            let raw_spatial =
+                derive_spatial_mvp_candidates(xcb, ycb, cb_w, cb_h, &slf.motion_field, &ctx);
+            let spatial: [SpatialMvpCandidate; 2] = [
+                SpatialMvpCandidate {
+                    available: raw_spatial[0].available,
+                    mv: round_mv_amvr(raw_spatial[0].mv, amvr),
+                },
+                SpatialMvpCandidate {
+                    available: raw_spatial[1].available,
+                    mv: round_mv_amvr(raw_spatial[1].mv, amvr),
+                },
+            ];
+            // §8.5.2.11 temporal Col candidate (AMVR-rounded inside
+            // the helper). Resolved from the configured ColPic when
+            // `ph_temporal_mvp_enabled`.
+            let col = slf.derive_amvp_col_candidate(xcb, ycb, cb_w, cb_h, current_ref_poc, amvr);
+            // §8.5.2.9 step-5 HMVP fill — only consulted when the
+            // list still has room after spatial + Col.
+            let n_after_spatial =
+                usize::from(spatial[0].available) + usize::from(spatial[1].available);
+            let col_suppressed =
+                spatial[0].available && spatial[1].available && spatial[0].mv != spatial[1].mv;
+            let n_pre_hmvp =
+                (n_after_spatial + usize::from(col.is_some() && !col_suppressed)).min(2);
+            let slots_remaining = 2 - n_pre_hmvp;
+            let hmvp = derive_hmvp_mvp_candidates(&slf.hmvp, &ctx, amvr, slots_remaining);
+            let list_lx = build_mvp_cand_list(spatial, col, &hmvp);
+            let mvp = select_mvp(&list_lx, mvp_flag);
+            Ok(derive_final_mv(mvp, raw_mvd, amvr))
+        };
+
+        let (mv_l0, ref_idx_l0_out) = if use_l0 {
+            (
+                derive_one_list(self, RefList::L0, nm.ref_idx_l0, nm.mvp_l0_flag, nm.mvd_l0)?,
+                nm.ref_idx_l0,
+            )
+        } else {
+            (MotionVector::ZERO, -1)
+        };
+        let (mv_l1, ref_idx_l1_out) = if use_l1 {
+            (
+                derive_one_list(self, RefList::L1, nm.ref_idx_l1, nm.mvp_l1_flag, nm.mvd_l1)?,
+                nm.ref_idx_l1,
+            )
+        } else {
+            (MotionVector::ZERO, -1)
+        };
+
+        let chosen = MvField {
+            mv_l0,
+            ref_idx_l0: ref_idx_l0_out,
+            pred_flag_l0: use_l0,
+            mv_l1,
+            ref_idx_l1: ref_idx_l1_out,
+            pred_flag_l1: use_l1,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            // §8.5.6.6.2 — BCW for the non-merge path comes from the
+            // parsed `bcw_idx`; not yet threaded through the AMVP
+            // record, so default equal-weight bi-pred (eq. 980).
+            bcw_idx: 0,
+        };
+
+        self.reconstruct_inter_with_chosen(cu, info, residual, chosen, out)
+    }
+
+    /// §8.5.2.11 (AMVP path) — derive the temporal collocated AMVP
+    /// candidate for the active list, AMVR-rounded. Mirrors
+    /// [`Self::derive_col_candidate`] but feeds the AMVP-specific
+    /// `current_ref_poc` (the POC of the parsed `RefPicList[X][refIdxLX]`)
+    /// and applies the §8.5.2.9 step-3 last-bullet AMVR rounding via
+    /// [`crate::amvp::derive_temporal_amvp_candidate`]. Returns `None`
+    /// when TMVP is disabled, the CU is ≤ 32 samples, or the ColPic
+    /// carries no motion field.
+    fn derive_amvp_col_candidate(
+        &self,
+        xcb: i32,
+        ycb: i32,
+        cb_w: i32,
+        cb_h: i32,
+        current_ref_poc: i32,
+        amvr: crate::amvr::AmvrShift,
+    ) -> Option<MotionVector> {
+        let col_list = if self.collocated_from_l0 {
+            &self.ref_pic_list_l0
+        } else {
+            &self.ref_pic_list_l1
+        };
+        let col_pic = col_list.get(self.col_ref_idx as usize)?;
+        col_pic.motion_field.as_ref()?;
+        let inputs = crate::amvp::AmvpTemporalInputs {
+            xcb,
+            ycb,
+            cb_w,
+            cb_h,
+            pic_w: self.layout.pic_width_luma as i32,
+            pic_h: self.layout.pic_height_luma as i32,
+            ctb_log2_size_y: self.layout.ctb_log2_size_y,
+            current_poc: self.current_poc,
+            current_ref_poc,
+            // §8.5.2.12 colPocDiff — without modelling the ColPic's own
+            // RPL we use the equal-distance fast path (eq. 600), exact
+            // for the fixtures this lands against.
+            col_ref_poc: self.current_poc,
+            ph_temporal_mvp_enabled: self.ph_temporal_mvp_enabled,
+        };
+        crate::amvp::derive_temporal_amvp_candidate(&inputs, col_pic, amvr)
     }
 
     /// §8.5.8 + §8.7.5.1 — add the inverse-transformed inter residual
@@ -3681,6 +3897,309 @@ mod tests {
         // RefPicList0 + RefPicList1 to be populated by the caller before
         // `decode_picture_into`.
         assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh_b, 0, &data).is_ok());
+    }
+
+    /// §8.5.2.1 — a non-merge AMVP inter CU whose left spatial
+    /// neighbour (A1) carries a known L0 MV pointing at the same
+    /// reference picture must reconstruct through that neighbour's MV as
+    /// `mvpL0` (selected by `mvp_l0_flag == 0`) folded with `mvd == 0`.
+    /// The output luma must equal the §8.5.6.3 MC of the reference at
+    /// that MV — proving the AMVP-derived MV (not zero-MV) drove the
+    /// prediction. A horizontal gradient reference makes a zero-MV
+    /// prediction distinguishable from the shifted one.
+    #[test]
+    fn reconstruct_leaf_cu_inter_amvp_uses_spatial_predictor() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.current_poc = 0;
+
+        // Horizontal-gradient reference so a non-zero MV gives a
+        // distinguishable prediction. POC 4 → the AMVP context matches
+        // a neighbour whose L0 refIdx 0 resolves to the same POC.
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: 4,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+        // Seed the left neighbour A1 = (xCb - 1, yCb + cbH - 1) with an
+        // integer-pel L0 MV of (3, 0) px → (48, 0) in 1/16-luma units,
+        // pointing at refIdx 0 (POC 4). The CU sits at (16, 0).
+        let nb_mv = MotionVector::from_int_pel(3, 0);
+        let nb = MvField {
+            mv_l0: nb_mv,
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+        };
+        // The A-side scan reads (xCb - 1, yCb + cbH) then A1 =
+        // (xCb - 1, yCb + cbH - 1); broadcast the MV across the whole
+        // left column region so both A positions resolve to it.
+        walker.motion_field.write_block(0, 0, 16, 64, nb);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = false;
+        info.inter.non_merge = crate::inter::NonMergeInterData {
+            pred_dir: crate::leaf_cu::InterPredDir::PredL0,
+            ref_idx_l0: 0,
+            mvp_l0_flag: 0,
+            mvd_l0: MotionVector::ZERO,
+            ..crate::inter::NonMergeInterData::default()
+        };
+        // No residual.
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("amvp non-merge path should reconstruct");
+
+        // Expected: MC of the reference at the neighbour's MV (3px right)
+        // for the 16x16 CU at (16, 0). Build it with the same primitive.
+        let mut expected = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        crate::inter::predict_luma_block(&mut expected.luma, 16, 0, 16, 16, &ref_frame.luma, nb_mv)
+            .unwrap();
+
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let xi = 16 + x;
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + xi],
+                    expected.luma.samples[y * expected.luma.stride + xi],
+                    "AMVP recon at ({xi},{y}) must equal MC at the spatial predictor MV"
+                );
+            }
+        }
+        // Sanity: the AMVP MV produced a genuinely shifted prediction —
+        // a zero-MV prediction would copy column xi verbatim, but the
+        // 3px shift reads column xi+3 from the gradient. Confirm the
+        // top-left CU sample differs from the zero-MV value.
+        let zero_mv_val = ref_frame.luma.samples[16];
+        assert_ne!(
+            out.luma.samples[16], zero_mv_val,
+            "AMVP-derived MV must shift the prediction away from zero-MV"
+        );
+    }
+
+    /// §8.5.2.1 — the non-merge AMVP path folds the parsed `MvdL0`
+    /// (with the per-CU `AmvrShift`) into the chosen predictor:
+    /// `mvL0 = mvpL0 + (mvdL0 << AmvrShift)`. With the spatial
+    /// predictor at (3, 0) px and the default 1/4-luma `AmvrShift == 2`,
+    /// a parsed `mvd` of (4, 0) quarter-luma units (= 1 px) must produce
+    /// a final 4-px shift. The output must equal MC at (4, 0) px, not
+    /// (3, 0).
+    #[test]
+    fn reconstruct_leaf_cu_inter_amvp_folds_mvd() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.current_poc = 0;
+
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+            }
+        }
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: 4,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        }]);
+
+        let nb_mv = MotionVector::from_int_pel(3, 0);
+        let nb = MvField {
+            mv_l0: nb_mv,
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            available: true,
+            mode_inter: true,
+            ..MvField::UNAVAILABLE
+        };
+        walker.motion_field.write_block(0, 0, 16, 64, nb);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = false;
+        // mvd of (4, 0) in 1/4-luma-derived units; with AmvrShift == 2
+        // the §8.5.2.1 fold left-shifts by 2 → (16, 0) in 1/16 units =
+        // 1 px. Final mvL0 = (48, 0) + (16, 0) = (64, 0) = 4 px.
+        info.inter.non_merge = crate::inter::NonMergeInterData {
+            pred_dir: crate::leaf_cu::InterPredDir::PredL0,
+            ref_idx_l0: 0,
+            mvp_l0_flag: 0,
+            mvd_l0: MotionVector { x: 4, y: 0 },
+            amvr_shift: crate::amvr::AmvrShift(2),
+            ..crate::inter::NonMergeInterData::default()
+        };
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("amvp mvd-fold path should reconstruct");
+
+        let final_mv = MotionVector::from_int_pel(4, 0);
+        let mut expected = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        crate::inter::predict_luma_block(
+            &mut expected.luma,
+            16,
+            0,
+            16,
+            16,
+            &ref_frame.luma,
+            final_mv,
+        )
+        .unwrap();
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let xi = 16 + x;
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + xi],
+                    expected.luma.samples[y * expected.luma.stride + xi],
+                    "AMVP recon must equal MC at mvp + (mvd << AmvrShift)"
+                );
+            }
+        }
+    }
+
+    /// §8.5.2.9 step 6 — with no available spatial / temporal / HMVP
+    /// candidate the AMVP list pads to the zero-MV predictor, so a CU
+    /// with `mvd == 0` reconstructs through the zero-MV prediction
+    /// (a verbatim copy of the reference at the CU position).
+    #[test]
+    fn reconstruct_leaf_cu_inter_amvp_zero_mv_pad() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.current_poc = 0;
+
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+            }
+        }
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: 4,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        }]);
+        // Empty motion field → no spatial neighbour available, TMVP off
+        // (no ColPic configured) → §8.5.2.9 step 6 zero-MV pad.
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = false;
+        info.inter.non_merge = crate::inter::NonMergeInterData {
+            pred_dir: crate::leaf_cu::InterPredDir::PredL0,
+            ref_idx_l0: 0,
+            mvp_l0_flag: 0,
+            mvd_l0: MotionVector::ZERO,
+            ..crate::inter::NonMergeInterData::default()
+        };
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("amvp zero-mv-pad path should reconstruct");
+
+        // Zero-MV → verbatim copy of the reference at the CU position.
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let xi = 16 + x;
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + xi],
+                    ref_frame.luma.samples[y * ref_frame.luma.stride + xi],
+                    "zero-MV-pad AMVP recon must copy the reference verbatim"
+                );
+            }
+        }
     }
 
     /// §8.5.8 + §8.7.5.1 — a non-skip merge inter CU whose

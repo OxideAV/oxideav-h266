@@ -1307,6 +1307,57 @@ pub fn combine_ciip_samples(
     out
 }
 
+/// §7.3.11.7 non-merge inter CU parsed motion record — the data the
+/// §8.5.2.1 AMVP reconstruction path consumes when
+/// `general_merge_flag == 0`.
+///
+/// The fields carry the per-list reference index, the chosen-predictor
+/// flag (`mvp_lX_flag`), and the **raw** parsed `MvdLX` (pre-AMVR, in
+/// the parser's `1/4`-luma-derived [`MotionVector`] magnitude). The
+/// §8.5.2.1 final-MV fold (`mvLX = mvpLX + (mvdLX << AmvrShift)`) is
+/// applied by the reconstruction path via
+/// [`crate::amvp::derive_final_mv`] using the captured [`AmvrShift`].
+///
+/// `pred_dir` is the §7.4.12.4 `inter_pred_idc` (PRED_L0 / PRED_L1 /
+/// PRED_BI). For a P-slice CU it is always PRED_L0. For PRED_L1 the L0
+/// fields are unused; for PRED_L0 the L1 fields are unused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NonMergeInterData {
+    /// §7.4.12.4 `inter_pred_idc` direction.
+    pub pred_dir: crate::leaf_cu::InterPredDir,
+    /// `ref_idx_l0[x0][y0]` (consulted when `pred_dir != PredL1`).
+    pub ref_idx_l0: i32,
+    /// `ref_idx_l1[x0][y0]` (consulted when `pred_dir != PredL0`).
+    pub ref_idx_l1: i32,
+    /// `mvp_l0_flag[x0][y0]` (0 or 1).
+    pub mvp_l0_flag: u32,
+    /// `mvp_l1_flag[x0][y0]` (0 or 1).
+    pub mvp_l1_flag: u32,
+    /// Raw parsed `MvdL0` (pre-AMVR magnitude).
+    pub mvd_l0: MotionVector,
+    /// Raw parsed `MvdL1` (pre-AMVR magnitude). Under
+    /// `sym_mvd_flag == 1` the parser sets `MvdL1 = -MvdL0` (§8.5.2.5).
+    pub mvd_l1: MotionVector,
+    /// Per-CU `AmvrShift` (§7.4.11.6, Table 16) applied to both MVDs.
+    pub amvr_shift: crate::amvr::AmvrShift,
+}
+
+impl Default for NonMergeInterData {
+    fn default() -> Self {
+        Self {
+            pred_dir: crate::leaf_cu::InterPredDir::PredL0,
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+            mvp_l0_flag: 0,
+            mvp_l1_flag: 0,
+            mvd_l0: MotionVector::ZERO,
+            mvd_l1: MotionVector::ZERO,
+            // §7.4.11.6 Table 16 default — 1/4-luma resolution.
+            amvr_shift: crate::amvr::AmvrShift(2),
+        }
+    }
+}
+
 /// Per-CU parsed inter-syntax record (round-21 P-slice subset).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InterCuInfo {
@@ -1316,6 +1367,10 @@ pub struct InterCuInfo {
     /// is 1 (§7.4.12.5).
     pub general_merge_flag: bool,
     pub merge_data: MergeData,
+    /// §7.3.11.7 non-merge AMVP motion record. Consulted only when
+    /// `general_merge_flag == 0`. Default (all-zero / PRED_L0) when the
+    /// CU is merge / skip.
+    pub non_merge: NonMergeInterData,
 }
 
 // =====================================================================
