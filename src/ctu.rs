@@ -1786,7 +1786,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 bdpcm: info.intra_bdpcm_luma,
                 bdpcm_dir: info.intra_bdpcm_luma_dir,
             };
-            let d = dequantize_tb_flat(&residual.luma_levels, &params)?;
+            let mut d = dequantize_tb_flat(&residual.luma_levels, &params)?;
+            // §8.7.4.1 inverse LFNST — when lfnst_idx > 0 the dequantised
+            // coefficients are passed through the secondary non-separable
+            // transform before the regular separable inverse transform.
+            // ApplyLfnstFlag[0] == (lfnst_idx > 0) on this luma path
+            // (§8.7.4.1 eq. 179); transform_skip is off here.
+            if info.lfnst_idx > 0 && !info.intra_bdpcm_luma {
+                if n_tb_w != n_tb_h {
+                    return Err(oxideav_core::Error::unsupported(
+                        "h266 LFNST: non-square intra TB needs §8.4.5.2.7 \
+                         wide-angle remap before set selection",
+                    ));
+                }
+                // CoeffMin / CoeffMax for the active Log2TransformRange.
+                let max_c = (1i32 << 15) - 1;
+                crate::lfnst::apply_inverse_lfnst(
+                    &mut d,
+                    n_tb_w,
+                    n_tb_h,
+                    info.intra_pred_mode_y as i32,
+                    info.lfnst_idx,
+                    -(max_c + 1),
+                    max_c,
+                )?;
+            }
             if info.intra_bdpcm_luma {
                 // Transform-skip + BDPCM: the dequantised d[] is the
                 // residual sample array directly (§8.7.4.6 — when

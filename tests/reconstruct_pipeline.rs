@@ -2487,3 +2487,140 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     assert!(!centre.pred_flag_l1);
     assert_eq!(centre.ref_idx_l0, 0);
 }
+
+/// Parse-to-pixels fixture for the §8.7.4.1 inverse LFNST path.
+///
+/// Drives [`CtuWalker::reconstruct_leaf_cu`] for a single 4x4 intra
+/// (PLANAR) CU twice — once with `lfnst_idx == 0` and once with
+/// `lfnst_idx == 1` — over an identical dequantised coefficient block.
+/// Because the intra prediction is identical between the two runs, the
+/// per-sample difference of the two reconstructed luma blocks must
+/// equal the difference of the two residual blocks produced by the
+/// public LFNST + inverse-transform pipeline. This is an end-to-end
+/// check that `lfnst_idx` actually changes the reconstructed pixels and
+/// does so consistently with [`oxideav_h266::lfnst::apply_inverse_lfnst`].
+#[test]
+fn reconstruct_leaf_cu_inverse_lfnst_changes_pixels() {
+    use oxideav_h266::coding_tree::Cu;
+    use oxideav_h266::ctu::CtuCu;
+    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
+    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
+    use oxideav_h266::lfnst::apply_inverse_lfnst;
+    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+
+    // SPS with sps_lfnst_enabled_flag = 1.
+    let mut sps = dummy_sps(0, 32, 32);
+    sps.tool_flags.lfnst_enabled_flag = true;
+    let pps = dummy_pps(32, 32);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+
+    // A small 4x4 luma coefficient block (row-major). Kept low-magnitude
+    // so the reconstruction stays inside [0, 255] and the clip is the
+    // identity for both runs.
+    let levels: Vec<i32> = vec![
+        3, -1, 0, 0, //
+        2, 1, 0, 0, //
+        0, 0, 0, 0, //
+        0, 0, 0, 0,
+    ];
+
+    let cu = CtuCu {
+        ctu_addr_rs: 0,
+        cu: Cu {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            cqt_depth: 0,
+            mtt_depth: 0,
+        },
+    };
+
+    let make_info = |lfnst_idx: u8| LeafCuInfo {
+        x0: 0,
+        y0: 0,
+        cb_width: 4,
+        cb_height: 4,
+        pred_mode: CuPredMode::Intra,
+        intra_pred_mode_y: INTRA_PLANAR,
+        tu_y_coded_flag: true,
+        lfnst_idx,
+        ..LeafCuInfo::default()
+    };
+    let residual = LeafCuResidual {
+        luma_levels: levels.clone(),
+        ..LeafCuResidual::default()
+    };
+
+    // Run 0: no LFNST.
+    let mut out0 = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(0), &residual, &mut out0)
+            .unwrap();
+    }
+    // Run 1: LFNST idx 1.
+    let mut out1 = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(1), &residual, &mut out1)
+            .unwrap();
+    }
+
+    // The two reconstructions must differ (LFNST changed the residual).
+    let stride = out0.luma.stride;
+    let mut differs = false;
+    for y in 0..4usize {
+        for x in 0..4usize {
+            if out0.luma.samples[y * stride + x] != out1.luma.samples[y * stride + x] {
+                differs = true;
+            }
+        }
+    }
+    assert!(
+        differs,
+        "inverse LFNST must change the reconstructed pixels"
+    );
+
+    // Golden cross-check: the pixel difference equals the residual
+    // difference from the public pipeline (prediction is identical).
+    let params = DequantParams {
+        bit_depth: 8,
+        log2_transform_range: 15,
+        n_tb_w: 4,
+        n_tb_h: 4,
+        // SliceQpY = 26 + pps_init_qp_minus26(0) + sh_qp_delta(0) +
+        // ph_qp_delta(0); cu_qp_delta_val == 0 in this fixture.
+        qp: 26,
+        dep_quant: false,
+        transform_skip: false,
+        bdpcm: false,
+        bdpcm_dir: false,
+    };
+    // Residual without LFNST.
+    let d_no = dequantize_tb_flat(&levels, &params).unwrap();
+    let res_no =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d_no, 8, 15).unwrap();
+    // Residual with LFNST idx 1.
+    let mut d_lf = dequantize_tb_flat(&levels, &params).unwrap();
+    let max_c = (1i32 << 15) - 1;
+    apply_inverse_lfnst(&mut d_lf, 4, 4, INTRA_PLANAR as i32, 1, -(max_c + 1), max_c).unwrap();
+    let res_lf =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d_lf, 8, 15).unwrap();
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let pix_diff =
+                out1.luma.samples[y * stride + x] as i32 - out0.luma.samples[y * stride + x] as i32;
+            let res_diff = res_lf[y * 4 + x] - res_no[y * 4 + x];
+            assert_eq!(
+                pix_diff, res_diff,
+                "pixel delta must equal residual delta at ({x},{y})"
+            );
+        }
+    }
+}
