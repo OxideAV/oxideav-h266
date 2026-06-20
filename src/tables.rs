@@ -107,6 +107,11 @@ pub enum SyntaxCtx {
     /// The ctxInc within an initType is `cIdx == 0 ? 0 : 1` (Table 132).
     TransformSkipFlag,
     ParLevelFlag,
+    /// Table 97 — `lfnst_idx` (9 ctxIdx, 3 per initType). The TR(cMax=2)
+    /// binarisation's two ctx-coded bins use ctxInc 0/1 (bin 0,
+    /// treeType-dependent) and 2 (bin 1) per Table 132; the per-slice
+    /// initType offset is `init_type * 3` applied at parse time.
+    LfnstIdx,
     /// Table 57 — `sao_merge_left_flag` and `sao_merge_up_flag` share the
     /// same 3-entry table (one ctxIdx per initType).
     SaoMergeFlag,
@@ -439,6 +444,13 @@ pub const PAR_LEVEL_FLAG_SHIFT: &[u8] = &[
     13, 8, 12, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 10, 13, 13, 13, 13, 13, 12, 13, 13, 13, 13,
     13, 13, 13, 13, 6,
 ];
+
+/// Table 97 — `lfnst_idx` (9 ctxIdx: 3 per initType). The TR(cMax=2)
+/// binarisation has two ctx-coded bins; bin 0 ctxInc = `treeType !=
+/// SINGLE_TREE ? 1 : 0`, bin 1 ctxInc = 2 (Table 132). The per-slice
+/// `ctxIdx = init_type * 3 + ctxInc` mapping happens at parse time.
+pub const LFNST_IDX_INIT: &[u8] = &[28, 52, 42, 37, 45, 27, 52, 37, 27];
+pub const LFNST_IDX_SHIFT: &[u8] = &[9, 9, 10, 9, 9, 10, 9, 9, 10];
 
 /// Table 125 — `abs_level_gtx_flag` (partial transcription; extended as
 /// walker exercises more contexts).
@@ -808,6 +820,7 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         ),
         SyntaxCtx::TransformSkipFlag => (TRANSFORM_SKIP_FLAG_INIT, TRANSFORM_SKIP_FLAG_SHIFT),
         SyntaxCtx::ParLevelFlag => (PAR_LEVEL_FLAG_INIT, PAR_LEVEL_FLAG_SHIFT),
+        SyntaxCtx::LfnstIdx => (LFNST_IDX_INIT, LFNST_IDX_SHIFT),
         SyntaxCtx::SaoMergeFlag => (SAO_MERGE_FLAG_INIT, SAO_MERGE_FLAG_SHIFT),
         SyntaxCtx::SaoTypeIdx => (SAO_TYPE_IDX_INIT, SAO_TYPE_IDX_SHIFT),
         SyntaxCtx::CuSkipFlag => (CU_SKIP_FLAG_INIT, CU_SKIP_FLAG_SHIFT),
@@ -896,6 +909,7 @@ mod tests {
             SyntaxCtx::CuChromaQpOffsetFlag,
             SyntaxCtx::CuChromaQpOffsetIdx,
             SyntaxCtx::ParLevelFlag,
+            SyntaxCtx::LfnstIdx,
             SyntaxCtx::SaoMergeFlag,
             SyntaxCtx::SaoTypeIdx,
             SyntaxCtx::CuSkipFlag,

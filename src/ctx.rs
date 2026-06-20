@@ -334,6 +334,26 @@ pub fn ctx_inc_ciip_flag() -> u32 {
     0
 }
 
+/// ctxInc for `lfnst_idx` per Table 132 (§7.3.11.5). The TR(cMax=2)
+/// binarisation has two ctx-coded bins:
+/// * bin 0 → `treeType != SINGLE_TREE ? 1 : 0`,
+/// * bin 1 → `2`.
+///
+/// `tree_single` is `treeType == SINGLE_TREE`. The per-slice initType
+/// offset (`init_type * 3`) is applied by the caller.
+pub fn ctx_inc_lfnst_idx(bin_idx: u32, tree_single: bool) -> u32 {
+    match bin_idx {
+        0 => {
+            if tree_single {
+                0
+            } else {
+                1
+            }
+        }
+        _ => 2,
+    }
+}
+
 /// ctxInc for `cu_coded_flag` per Table 132 — fixed 0. Single
 /// ctx-coded bin (FL `cMax = 1`); gates the `transform_tree()` body
 /// per §7.3.11.5.
@@ -939,6 +959,16 @@ mod tests {
     #[test]
     fn intra_luma_mpm_flag_has_single_context() {
         assert_eq!(ctx_inc_intra_luma_mpm_flag(), 0);
+    }
+
+    #[test]
+    fn lfnst_idx_ctx_inc_matches_table_132() {
+        // bin 0: treeType-dependent.
+        assert_eq!(ctx_inc_lfnst_idx(0, /*tree_single=*/ true), 0);
+        assert_eq!(ctx_inc_lfnst_idx(0, /*tree_single=*/ false), 1);
+        // bin 1: fixed 2.
+        assert_eq!(ctx_inc_lfnst_idx(1, true), 2);
+        assert_eq!(ctx_inc_lfnst_idx(1, false), 2);
     }
 
     #[test]

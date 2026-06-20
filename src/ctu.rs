@@ -1321,6 +1321,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mip: tf.mip_enabled_flag,
             mrl: tf.mrl_enabled_flag,
             isp: tf.isp_enabled_flag,
+            lfnst_enabled: tf.lfnst_enabled_flag,
             act: tf.act_enabled_flag,
             max_tb_size_y: 64,
             min_tb_size_y: 4,

@@ -417,6 +417,10 @@ pub struct CuToolFlags {
     pub mrl: bool,
     /// `sps_isp_enabled_flag`.
     pub isp: bool,
+    /// `sps_lfnst_enabled_flag` — gates the coding-unit-level
+    /// `lfnst_idx` parse (§7.3.11.5) and the §8.7.4.1 inverse-LFNST
+    /// reconstruction.
+    pub lfnst_enabled: bool,
     /// `sps_act_enabled_flag`.
     pub act: bool,
     /// `MaxTbSizeY` — max transform block size in luma samples.
@@ -602,6 +606,11 @@ pub struct LeafCuInfo {
     pub tu_joint_cbcr_residual_flag: bool,
     /// `TuCResMode[x0][y0]` (0..=3, §7.4.12.11). 0 when JCCR is off.
     pub tu_c_res_mode: u8,
+    /// `lfnst_idx[x0][y0]` (§7.3.11.5) — 0 = LFNST off, 1 / 2 select the
+    /// non-separable transform kernel within the mode-derived set.
+    /// Inferred 0 when not present. Drives `ApplyLfnstFlag` (§8.7.4.1
+    /// eqs. 179 / 180) for the intra residual reconstruction path.
+    pub lfnst_idx: u8,
 }
 
 impl Default for LeafCuInfo {
@@ -662,6 +671,7 @@ impl Default for LeafCuInfo {
             cu_sbt_pos_flag: false,
             tu_joint_cbcr_residual_flag: false,
             tu_c_res_mode: 0,
+            lfnst_idx: 0,
         }
     }
 }
@@ -870,6 +880,11 @@ pub struct LeafCuCtxs {
     /// branch's standalone `sps_amvr_enabled_flag && |MvdL0| != 0`
     /// gate.
     pub amvr_precision_idx: Vec<ContextModel>,
+    /// Table 97 — `lfnst_idx` (9 ctxIdx, 3 per initType). TR(cMax=2)
+    /// binarisation; both bins ctx-coded with ctxInc 0/1 (bin 0,
+    /// treeType-dependent) and 2 (bin 1) per Table 132. Indexed at parse
+    /// time as `init_type * 3 + ctxInc`.
+    pub lfnst_idx: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -967,6 +982,7 @@ impl LeafCuCtxs {
             cu_affine_type_flag: init_contexts(SyntaxCtx::CuAffineTypeFlag, slice_qp_y),
             amvr_flag: init_contexts(SyntaxCtx::AmvrFlag, slice_qp_y),
             amvr_precision_idx: init_contexts(SyntaxCtx::AmvrPrecisionIdx, slice_qp_y),
+            lfnst_idx: init_contexts(SyntaxCtx::LfnstIdx, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -3024,6 +3040,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if info.isp_split != IspSplitType::NoSplit {
             return self.decode_transform_unit_isp(info, residual);
         }
+        // §7.3.11.5 transform_unit() init: the LFNST / MTS gating flags
+        // accumulate across this CU's per-plane residual_coding() calls.
+        let mut res_flags = crate::residual::TbResidualFlags::default();
         let cb_w = info.cb_width as usize;
         let cb_h = info.cb_height as usize;
         let chroma = self.tools.chroma_format_idc != 0;
@@ -3097,7 +3116,14 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
 
         // Residual decode per plane.
         if info.tu_y_coded_flag {
-            let levels = decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cb_w, cb_h, 0)?;
+            let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                self.dec,
+                &mut self.ctxs.residual,
+                cb_w,
+                cb_h,
+                0,
+            )?;
+            res_flags.merge(flags);
             // Capture the last-sig position derived by the residual
             // reader by re-reading the info from the coefficient
             // array: the last non-zero in scan order is the last-sig.
@@ -3123,18 +3149,96 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             let cw = cb_w / sub_w;
             let ch = cb_h / sub_h;
             if cw >= 2 && ch >= 2 {
-                residual.cb_levels =
-                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
+                let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    1,
+                )?;
+                res_flags.merge(flags);
+                residual.cb_levels = levels;
             }
         }
         if info.tu_cr_coded_flag && chroma {
             let cw = cb_w / sub_w;
             let ch = cb_h / sub_h;
             if cw >= 2 && ch >= 2 {
-                residual.cr_levels =
-                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
+                let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    2,
+                )?;
+                res_flags.merge(flags);
+                residual.cr_levels = levels;
             }
         }
+
+        // §7.3.11.5 — `lfnst_idx` is read at the coding-unit level after
+        // `transform_tree()`, gated on the accumulated §7.3.11.11 flags.
+        self.read_lfnst_idx(info, &res_flags)?;
+        Ok(())
+    }
+
+    /// §7.3.11.5 `lfnst_idx` read. The element is present only for an
+    /// intra (`MODE_INTRA`) single-TB CU where `sps_lfnst_enabled_flag`
+    /// is set, both TB dims are >= 4 and the CB fits in `MaxTbSizeY`,
+    /// the luma TB is not transform-skipped (`lfnstNotTsFlag`), and the
+    /// MIP exception holds (non-MIP, or `Min(w, h) >= 16`). The
+    /// `LfnstDcOnly == 0 && LfnstZeroOutSigCoeffFlag == 1` gate (no ISP
+    /// here) decides whether the bin is coded. Inferred 0 when absent.
+    ///
+    /// Binarisation is TR(cMax=2): two ctx-coded bins (the second only
+    /// read when the first is 1), ctxInc via
+    /// [`crate::ctx::ctx_inc_lfnst_idx`], slotted by `init_type * 3`.
+    fn read_lfnst_idx(
+        &mut self,
+        info: &mut LeafCuInfo,
+        res_flags: &crate::residual::TbResidualFlags,
+    ) -> Result<()> {
+        info.lfnst_idx = 0;
+        if info.pred_mode != CuPredMode::Intra || !self.tools.lfnst_enabled {
+            return Ok(());
+        }
+        let cb_w = info.cb_width;
+        let cb_h = info.cb_height;
+        // lfnstWidth / lfnstHeight for SINGLE_TREE / ISP_NO_SPLIT equal
+        // the CB dims (the DUAL_TREE_CHROMA / ISP scaling does not apply
+        // on this single-tree intra-luma path).
+        let lfnst_min = cb_w.min(cb_h);
+        // lfnstNotTsFlag — transform_skip is off in this path, so the
+        // flag is always 1 here.
+        let lfnst_not_ts = true;
+        // MIP exception (§7.3.11.5): allowed when non-MIP or min dim >= 16.
+        let mip_ok = !info.intra_mip_flag || lfnst_min >= 16;
+        let size_ok = lfnst_min >= 4 && cb_w.max(cb_h) <= self.tools.max_tb_size_y;
+        if !(size_ok && lfnst_not_ts && mip_ok) {
+            return Ok(());
+        }
+        // No ISP on this path → the inner gate is
+        // `LfnstDcOnly == 0 && LfnstZeroOutSigCoeffFlag == 1`.
+        if res_flags.lfnst_dc_only || !res_flags.lfnst_zero_out_sig_coeff_flag {
+            return Ok(());
+        }
+        // TR(cMax=2): bin 0, then bin 1 only if bin 0 == 1. treeType is
+        // SINGLE_TREE on this path.
+        let off = (self.ctxs.init_type as usize) * 3;
+        let n = self.ctxs.lfnst_idx.len() - 1;
+        let inc0 = crate::ctx::ctx_inc_lfnst_idx(0, /*tree_single=*/ true) as usize;
+        let bin0 = self
+            .dec
+            .decode_decision(&mut self.ctxs.lfnst_idx[(off + inc0).min(n)])?;
+        if bin0 == 0 {
+            info.lfnst_idx = 0;
+            return Ok(());
+        }
+        let inc1 = crate::ctx::ctx_inc_lfnst_idx(1, true) as usize;
+        let bin1 = self
+            .dec
+            .decode_decision(&mut self.ctxs.lfnst_idx[(off + inc1).min(n)])?;
+        info.lfnst_idx = if bin1 == 1 { 2 } else { 1 };
         Ok(())
     }
 
@@ -3732,6 +3836,7 @@ mod tests {
             mip: false,
             mrl: false,
             isp: false,
+            lfnst_enabled: false,
             act: false,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
@@ -3771,6 +3876,117 @@ mod tests {
         // Legal luma mode range.
         assert!(info.intra_pred_mode_y <= 66);
         assert!(info.intra_pred_mode_c <= 83);
+    }
+
+    /// `read_lfnst_idx` round-trips a TR(cMax=2) value through the
+    /// CABAC engine when the §7.3.11.5 gate is open, and infers 0 when
+    /// `sps_lfnst_enabled_flag` is off or the DC-only gate is closed.
+    #[test]
+    fn lfnst_idx_parse_round_trip_and_gating() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::ctx_inc_lfnst_idx;
+        use crate::residual::TbResidualFlags;
+
+        let tools = CuToolFlags {
+            lfnst_enabled: true,
+            max_tb_size_y: 64,
+            chroma_format_idc: 1,
+            ..CuToolFlags::default()
+        };
+        // Open gate: LFNST is allowed only when LfnstDcOnly == 0 and
+        // LfnstZeroOutSigCoeffFlag == 1.
+        let open = TbResidualFlags {
+            lfnst_dc_only: false,
+            lfnst_zero_out_sig_coeff_flag: true,
+            ..TbResidualFlags::default()
+        };
+
+        for expected in [0u8, 1, 2] {
+            // Encode the TR(cMax=2) binarisation: bin0 = (val>0), bin1 =
+            // (val==2) only when bin0 == 1. init_type 0 → slot offset 0.
+            // A leading warmup decision bin (decoded but discarded) keeps
+            // the stream out of the degenerate single-bin init corner —
+            // `lfnst_idx` is never the first CABAC bin of a real slice.
+            let mut enc = ArithEncoder::new();
+            // Leading bypass 0 commits a clean high-zero bit so the
+            // decoder's 9-bit init (`ivlOffset < 510`, §9.3.2.5) never
+            // lands on the all-ones corner.
+            let warmup_bypass = [0u32, 0, 0];
+            for &b in &warmup_bypass {
+                enc.encode_bypass(b).unwrap();
+            }
+            let mut enc_ctx = init_contexts(SyntaxCtx::LfnstIdx, 26);
+            let inc0 = ctx_inc_lfnst_idx(0, true) as usize;
+            enc.encode_decision(&mut enc_ctx[inc0], (expected > 0) as u32)
+                .unwrap();
+            if expected > 0 {
+                let inc1 = ctx_inc_lfnst_idx(1, true) as usize;
+                enc.encode_decision(&mut enc_ctx[inc1], (expected == 2) as u32)
+                    .unwrap();
+            }
+            enc.encode_terminate(1).unwrap();
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 32]); // pad for decoder init
+
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            // Consume the warmup bin with a matching context.
+            for &b in &warmup_bypass {
+                assert_eq!(dec.decode_bypass().unwrap(), b);
+            }
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            reader.read_lfnst_idx(&mut info, &open).unwrap();
+            assert_eq!(info.lfnst_idx, expected, "round-trip lfnst_idx {expected}");
+        }
+
+        // Gate closed when sps_lfnst_enabled is off → inferred 0 with no
+        // bins consumed.
+        {
+            let off_tools = CuToolFlags {
+                lfnst_enabled: false,
+                max_tb_size_y: 64,
+                ..CuToolFlags::default()
+            };
+            let data = [0u8; 8];
+            let mut dec = ArithDecoder::new(&data).unwrap();
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, off_tools);
+            reader.read_lfnst_idx(&mut info, &open).unwrap();
+            assert_eq!(info.lfnst_idx, 0);
+        }
+
+        // Gate closed when LfnstDcOnly == 1 (DC-only TB) → inferred 0.
+        {
+            let closed = TbResidualFlags {
+                lfnst_dc_only: true,
+                lfnst_zero_out_sig_coeff_flag: true,
+                ..TbResidualFlags::default()
+            };
+            let data = [0u8; 8];
+            let mut dec = ArithDecoder::new(&data).unwrap();
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            reader.read_lfnst_idx(&mut info, &closed).unwrap();
+            assert_eq!(info.lfnst_idx, 0);
+        }
     }
 
     #[test]
