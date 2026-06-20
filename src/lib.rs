@@ -193,6 +193,8 @@ pub mod inter;
 pub mod intra;
 pub mod isp;
 pub mod leaf_cu;
+pub mod lfnst;
+pub mod lfnst_matrices;
 pub mod lmcs;
 pub mod mip;
 pub mod mip_tables;
