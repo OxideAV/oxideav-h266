@@ -776,6 +776,46 @@ pub fn derive_final_affine_cpmvs(
     AffineCpmvs { model, cpmvs: cps }
 }
 
+/// §8.5.5.5 eqs. 660 – 663 — the cumulative per-CP MVD fold.
+///
+/// The parser stores the on-wire per-CP differences `MvdCpLX[cpIdx]`
+/// (post-AMVR, eqs. 165 – 176 already applied) directly. The §8.5.5.5
+/// derivation then forms the *cumulative* `mvdCpLX[cpIdx]` the eq.
+/// 664 – 667 final-MV fold consumes:
+///
+/// ```text
+/// mvdCpLX[0]      = MvdCpLX[0]                          (eqs. 660 / 661)
+/// mvdCpLX[cpIdx]  = MvdCpLX[cpIdx] + mvdCpLX[0]   cpIdx ≥ 1  (eqs. 662 / 663)
+/// ```
+///
+/// i.e. every higher control point's parsed difference is *relative to*
+/// CP0's, so the stored stream is differential. This helper produces the
+/// absolute cumulative array, which is then ready for
+/// [`derive_final_affine_cpmvs`].
+///
+/// `mvd_cp_stored[i]` is `MvdCpLX[xCb][yCb][i]` as the parser captured it
+/// (`mvd_cp_l0` / `mvd_cp_l1` on
+/// [`crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision`]).
+/// Slots `i >= num_cp_mv` are ignored.
+pub fn cumulate_affine_mvd_cp(
+    mvd_cp_stored: &[MotionVector; MAX_NUM_CP_MV],
+    num_cp_mv: u32,
+) -> [MotionVector; MAX_NUM_CP_MV] {
+    debug_assert!((2..=3).contains(&num_cp_mv));
+    let num = num_cp_mv as usize;
+    let mut out = [MotionVector::ZERO; MAX_NUM_CP_MV];
+    // eqs. 660 / 661.
+    out[0] = mvd_cp_stored[0];
+    // eqs. 662 / 663 — add CP0's MVD to every higher control point.
+    for i in 1..num {
+        out[i] = MotionVector {
+            x: mvd_cp_stored[i].x.wrapping_add(out[0].x),
+            y: mvd_cp_stored[i].y.wrapping_add(out[0].y),
+        };
+    }
+    out
+}
+
 // =====================================================================
 // §8.5.2.14 helpers — copied here so the module stands on its own.
 // =====================================================================
@@ -1310,6 +1350,47 @@ mod tests {
         assert_eq!(out.cpmvs[0], MotionVector { x: 12, y: -6 });
         assert_eq!(out.cpmvs[1], MotionVector { x: 8, y: 5 });
         assert!(matches!(out.model, MotionModel::Affine4Param));
+    }
+
+    #[test]
+    fn cumulate_affine_mvd_cp_adds_cp0_to_higher_cps() {
+        // §8.5.5.5 eqs. 660 – 663 — CP0 is identity; CP1/CP2 are
+        // differential relative to CP0.
+        let stored = [
+            MotionVector { x: 5, y: -2 },
+            MotionVector { x: 3, y: 7 },
+            MotionVector { x: -1, y: 4 },
+        ];
+        let out6 = cumulate_affine_mvd_cp(&stored, 3);
+        assert_eq!(out6[0], MotionVector { x: 5, y: -2 });
+        assert_eq!(out6[1], MotionVector { x: 8, y: 5 });
+        assert_eq!(out6[2], MotionVector { x: 4, y: 2 });
+
+        // 4-param: only CP0 / CP1 are folded; CP2 stays zero.
+        let out4 = cumulate_affine_mvd_cp(&stored, 2);
+        assert_eq!(out4[0], MotionVector { x: 5, y: -2 });
+        assert_eq!(out4[1], MotionVector { x: 8, y: 5 });
+        assert_eq!(out4[2], MotionVector::ZERO);
+    }
+
+    #[test]
+    fn cumulate_then_final_fold_round_trips_translational_cpmvs() {
+        // When every stored MvdCp is zero the final CPMVs equal the
+        // predictor exactly (the affine model degenerates to the
+        // predictor's CPMVs).
+        let mvp = AffineMvpCandidate {
+            num_cp_mv: 2,
+            cp_mvs: [
+                MotionVector { x: 16, y: -16 },
+                MotionVector { x: 32, y: 0 },
+                MotionVector::ZERO,
+            ],
+        };
+        let stored = [MotionVector::ZERO; MAX_NUM_CP_MV];
+        let cumulative = cumulate_affine_mvd_cp(&stored, 2);
+        let out = derive_final_affine_cpmvs(&mvp, &cumulative);
+        assert_eq!(out.cpmvs[0], mvp.cp_mvs[0]);
+        assert_eq!(out.cpmvs[1], mvp.cp_mvs[1]);
     }
 
     #[test]
