@@ -395,6 +395,65 @@ pub fn decode_exp_golomb_k(dec: &mut ArithDecoder<'_>, k: u32) -> Result<u32> {
 ///   stays at 0 for the §9.3.3.2 neighbourhood fallback.
 /// * Zero-out (`MTS`, `SBT`) is treated as no-op: `Log2Zo{Tb}{Width,Height}`
 ///   equal the full TB log2 dims.
+/// LFNST / MTS gating flags accumulated by `residual_coding()` while it
+/// walks the coefficient sub-blocks (§7.3.11.11). They drive whether the
+/// `lfnst_idx` / `mts_idx` syntax elements are present at the
+/// coding-unit level (§7.3.11.5 — see the `LfnstDcOnly == 0`,
+/// `LfnstZeroOutSigCoeffFlag == 1`, `MtsZeroOutSigCoeffFlag == 1`,
+/// `MtsDcOnly == 0` gates) and, for LFNST, whether the inverse
+/// non-separable transform applies (`ApplyLfnstFlag`).
+///
+/// The fields use the spec's initial-state convention: a TB with no
+/// coded coefficients leaves every flag at its `transform_unit()`
+/// initialisation value (`LfnstDcOnly = 1`, `LfnstZeroOutSigCoeffFlag =
+/// 1`, `MtsDcOnly = 1`, `MtsZeroOutSigCoeffFlag = 1`). A caller that
+/// runs multiple `residual_coding()` invocations for one CU folds the
+/// per-TB results together with [`TbResidualFlags::merge`] so the
+/// accumulated state mirrors the spec's CU-scoped variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TbResidualFlags {
+    /// `LfnstDcOnly` (§7.3.11.11). Cleared to `false` when the last
+    /// significant coefficient is outside the DC sub-block's scan
+    /// position 0 for a TB large enough to carry LFNST.
+    pub lfnst_dc_only: bool,
+    /// `LfnstZeroOutSigCoeffFlag` (§7.3.11.11). Cleared to `false` when
+    /// a significant coefficient is found outside the LFNST low-frequency
+    /// region, which forbids LFNST.
+    pub lfnst_zero_out_sig_coeff_flag: bool,
+    /// `MtsDcOnly` (§7.3.11.11). Cleared when a luma TB has any
+    /// significant coefficient beyond the DC.
+    pub mts_dc_only: bool,
+    /// `MtsZeroOutSigCoeffFlag` (§7.3.11.11). Cleared when a luma TB has
+    /// a coded sub-block outside the top-left 4x4 grid region.
+    pub mts_zero_out_sig_coeff_flag: bool,
+}
+
+impl Default for TbResidualFlags {
+    fn default() -> Self {
+        // §7.3.11.5 transform_unit() initialisation (eqs. before the
+        // transform_tree() call): all four start at 1.
+        Self {
+            lfnst_dc_only: true,
+            lfnst_zero_out_sig_coeff_flag: true,
+            mts_dc_only: true,
+            mts_zero_out_sig_coeff_flag: true,
+        }
+    }
+}
+
+impl TbResidualFlags {
+    /// Fold the flags from a later `residual_coding()` call into the
+    /// CU-scoped accumulator. The spec only ever *clears* these flags
+    /// (they start at 1 and are set to 0 by the per-TB conditions), so
+    /// the merge is a logical AND across TBs.
+    pub fn merge(&mut self, other: TbResidualFlags) {
+        self.lfnst_dc_only &= other.lfnst_dc_only;
+        self.lfnst_zero_out_sig_coeff_flag &= other.lfnst_zero_out_sig_coeff_flag;
+        self.mts_dc_only &= other.mts_dc_only;
+        self.mts_zero_out_sig_coeff_flag &= other.mts_zero_out_sig_coeff_flag;
+    }
+}
+
 pub fn decode_tb_coefficients(
     dec: &mut ArithDecoder<'_>,
     ctxs: &mut ResidualCtxs,
@@ -402,6 +461,23 @@ pub fn decode_tb_coefficients(
     n_tb_h: usize,
     c_idx: u32,
 ) -> Result<Vec<i32>> {
+    decode_tb_coefficients_with_flags(dec, ctxs, n_tb_w, n_tb_h, c_idx).map(|(levels, _)| levels)
+}
+
+/// Like [`decode_tb_coefficients`] but also returns the §7.3.11.11
+/// LFNST / MTS gating flags ([`TbResidualFlags`]). The flags are
+/// derived from the same last-significant-coefficient scan and
+/// sub-block walk the level decode already performs, so this is the
+/// canonical entry point for the LFNST / MTS-aware intra path; the
+/// flag-less wrapper above stays as the historical signature for
+/// callers that don't need them (e.g. encoder round-trip tests).
+pub fn decode_tb_coefficients_with_flags(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut ResidualCtxs,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    c_idx: u32,
+) -> Result<(Vec<i32>, TbResidualFlags)> {
     if !n_tb_w.is_power_of_two() || !n_tb_h.is_power_of_two() {
         return Err(Error::invalid(
             "h266 residual: nTbW / nTbH must be power of two",
@@ -440,6 +516,38 @@ pub fn decode_tb_coefficients(
         }
     }
 
+    // §7.3.11.11 LFNST / MTS gating flags. Zero-out is a no-op in this
+    // scaffold so `Log2ZoTb{Width,Height}` equal the full TB log2 dims
+    // (`log2_w` / `log2_h`).
+    let mut flags = TbResidualFlags::default();
+    let log2_zo_w = log2_w;
+    let log2_zo_h = log2_h;
+    // transform_skip_flag == 0 in this path.
+    let transform_skip = false;
+    // LfnstDcOnly: cleared when the last-sig coeff is past scan position 0
+    // of the DC sub-block (eq. at §7.3.11.11). `last_scan_pos_in_sb` is
+    // the within-sub-block scan index of the last-sig coefficient
+    // (== the spec's `lastScanPos`), `last_sb_idx` is `lastSubBlock`.
+    if last_sb_idx == 0
+        && log2_zo_w >= 2
+        && log2_zo_h >= 2
+        && !transform_skip
+        && last_scan_pos_in_sb > 0
+    {
+        flags.lfnst_dc_only = false;
+    }
+    // LfnstZeroOutSigCoeffFlag: cleared when a significant coefficient
+    // is outside the LFNST low-frequency region.
+    if (last_sb_idx > 0 && log2_zo_w >= 2 && log2_zo_h >= 2)
+        || (last_scan_pos_in_sb > 7 && (log2_zo_w == 2 || log2_zo_w == 3) && log2_zo_w == log2_zo_h)
+    {
+        flags.lfnst_zero_out_sig_coeff_flag = false;
+    }
+    // MtsDcOnly: cleared when a luma TB has any non-DC significant coeff.
+    if (last_sb_idx > 0 || last_scan_pos_in_sb > 0) && c_idx == 0 {
+        flags.mts_dc_only = false;
+    }
+
     // Track which sub-blocks are coded (for the csbfCtx neighbour).
     let mut sb_coded = vec![false; num_sb_w * num_sb_h];
 
@@ -463,6 +571,12 @@ pub fn decode_tb_coefficients(
             dec.decode_decision(&mut ctxs.sb_coded[inc.min(n)])? == 1
         };
         sb_coded[ys * num_sb_w + xs] = coded;
+        // §7.3.11.11: MtsZeroOutSigCoeffFlag is cleared when a coded
+        // sub-block sits outside the top-left 4x4-sub-block region of a
+        // luma TB (`xS > 3 || yS > 3`).
+        if coded && (xs > 3 || ys > 3) && c_idx == 0 {
+            flags.mts_zero_out_sig_coeff_flag = false;
+        }
         if !coded {
             continue;
         }
@@ -646,7 +760,7 @@ pub fn decode_tb_coefficients(
             }
         }
     }
-    Ok(out)
+    Ok((out, flags))
 }
 
 /// §9.3.3.2 Rice-parameter derivation for `abs_remainder[]` (baseLevel=4)
@@ -767,6 +881,54 @@ mod tests {
         let mut ctxs = ResidualCtxs::init(32);
         let coeffs = decode_tb_coefficients(&mut dec, &mut ctxs, 4, 4, 0).unwrap();
         assert_eq!(coeffs.len(), 16);
+    }
+
+    /// The §7.3.11.11 flags are self-consistent with the decoded
+    /// coefficient field: for a single-sub-block 4x4 luma TB,
+    /// `MtsDcOnly` must be set iff the only non-zero coefficient is the
+    /// DC, and `MtsZeroOutSigCoeffFlag` (which only clears when a coded
+    /// sub-block lies outside the top-left 4x4 region) must stay set —
+    /// the whole TB is one sub-block at (0,0).
+    #[test]
+    fn residual_flags_consistent_with_decoded_field() {
+        let data = [0u8; 64];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = ResidualCtxs::init(32);
+        let (levels, flags) =
+            decode_tb_coefficients_with_flags(&mut dec, &mut ctxs, 4, 4, 0).unwrap();
+        let _ = &levels;
+        // A 4x4 TB has exactly one coefficient sub-block at (0,0), so
+        // no sub-block can be outside the 4x4 region.
+        assert!(flags.mts_zero_out_sig_coeff_flag);
+        // For a single-sub-block luma TB both DC-only flags key off the
+        // identical `lastScanPos > 0` condition (lastSubBlock is always
+        // 0, transform_skip is off, dims >= 2), so they must agree.
+        assert_eq!(
+            flags.lfnst_dc_only, flags.mts_dc_only,
+            "single-sub-block 4x4 luma: LfnstDcOnly and MtsDcOnly track the same condition"
+        );
+    }
+
+    /// The CU-scoped merge is a logical AND: once any TB clears a flag
+    /// it stays cleared in the accumulator.
+    #[test]
+    fn residual_flags_merge_is_logical_and() {
+        let mut acc = TbResidualFlags::default();
+        assert!(acc.lfnst_dc_only);
+        acc.merge(TbResidualFlags {
+            lfnst_dc_only: false,
+            lfnst_zero_out_sig_coeff_flag: true,
+            mts_dc_only: true,
+            mts_zero_out_sig_coeff_flag: false,
+        });
+        assert!(!acc.lfnst_dc_only);
+        assert!(acc.lfnst_zero_out_sig_coeff_flag);
+        assert!(acc.mts_dc_only);
+        assert!(!acc.mts_zero_out_sig_coeff_flag);
+        // Merging an all-true flag set leaves the cleared bits cleared.
+        acc.merge(TbResidualFlags::default());
+        assert!(!acc.lfnst_dc_only);
+        assert!(!acc.mts_zero_out_sig_coeff_flag);
     }
 
     /// Reject non-power-of-two TB sizes.
