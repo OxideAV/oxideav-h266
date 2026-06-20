@@ -2983,6 +2983,191 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         Ok(())
     }
 
+    /// §8.5.5.5 affine non-merge (AMVP) reconstruction — the
+    /// parse-to-pixels fuse.
+    ///
+    /// Takes the parser-side affine decision (the per-CP `MvdCpLX`
+    /// arrays the §7.3.11.7 affine branch produced, via
+    /// [`crate::non_merge_inter_pre_residual_dec::read_non_merge_inter_pre_residual_affine`])
+    /// plus the resolved per-CU `AmvrShift`, and drives the full
+    /// §8.5.5.5 ordered steps:
+    ///
+    /// 1. `numCpMv = MotionModelIdc + 1` (§8.5.5.5 / eq. 160).
+    /// 2. Per active list X: build the §8.5.5.7 affine CPMVP candidate
+    ///    list (`build_affine_mvp_cand_list`) and pick `mvp_lX_flag`
+    ///    via `select_affine_mvp` (eq. 840). Inherited / constructed
+    ///    affine neighbour candidates require a per-CB affine CPMV
+    ///    store not yet tracked in the `MotionField`, so they resolve
+    ///    to `None`; the list falls through to the §8.5.5.7 step-8
+    ///    temporal MV (replicated across CPs) and the step-9 zero-MV
+    ///    pad — exact for the common non-affine-neighbour case.
+    /// 3. Cumulate the per-CP MVDs (§8.5.5.5 eqs. 660 – 663 via
+    ///    `cumulate_affine_mvd_cp`).
+    /// 4. Fold predictor + cumulative MVD into the final CPMVs (eqs.
+    ///    664 – 667 via `derive_final_affine_cpmvs`).
+    /// 5. Drive [`Self::reconstruct_affine_inter_uni`] (uni-pred) or
+    ///    [`Self::reconstruct_affine_inter_bi`] (bi-pred, §8.5.6.6.2
+    ///    eq. 980 default-weighted average).
+    ///
+    /// Scope: 4:2:0 chroma, no residual add (the caller layers residual
+    /// via the regular tail), BCW / BDOF on the affine path deferred.
+    pub fn reconstruct_leaf_cu_inter_affine_amvp(
+        &self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        decision: &crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision,
+        amvr: crate::amvr::AmvrShift,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::affine_amvp::{
+            build_affine_mvp_cand_list, cumulate_affine_mvd_cp, derive_final_affine_cpmvs,
+            select_affine_mvp, AffineMvpListInputs, AffineMvpRefContext, RefList,
+        };
+        use crate::leaf_cu::InterPredDir;
+
+        let motion_model = decision.affine.motion_model;
+        let num_cp_mv = motion_model.num_cp_mv() as u32;
+        if num_cp_mv < 2 {
+            return Err(Error::invalid(
+                "h266 affine amvp: motion_model is translational (numCpMv < 2)",
+            ));
+        }
+
+        let xcb = cb_x as i32;
+        let ycb = cb_y as i32;
+        let cbw = cb_w as i32;
+        let cbh = cb_h as i32;
+
+        let pred = decision.mvp.inter_pred_idc;
+        let use_l0 = !matches!(pred, InterPredDir::PredL1);
+        let use_l1 = !matches!(pred, InterPredDir::PredL0);
+
+        // Per-list CPMV derivation: §8.5.5.5 step 4 (AMVP) + step 5
+        // (eqs. 664 – 667). The closure captures the shared geometry.
+        let derive_one_list = |slf: &Self,
+                               list: RefList,
+                               ref_idx: u32,
+                               mvp_flag: u32,
+                               mvd_cp_stored: &[MotionVector; 3]|
+         -> Result<(crate::affine::AffineCpmvs, ReferencePicture)> {
+            let rpl_x = match list {
+                RefList::L0 => &slf.ref_pic_list_l0,
+                RefList::L1 => &slf.ref_pic_list_l1,
+            };
+            if (ref_idx as usize) >= rpl_x.len() {
+                return Err(Error::invalid(format!(
+                    "h266 affine amvp: refIdx {ref_idx} out of range \
+                         (list has {} entries)",
+                    rpl_x.len()
+                )));
+            }
+            let ref_pic = rpl_x[ref_idx as usize].clone();
+            let current_ref_poc = ref_pic.poc;
+
+            // §8.5.5.7 step-8 temporal MV (replicated across CPs inside
+            // `build_affine_mvp_cand_list`). Reuses the regular-AMVP
+            // collocated walk.
+            let temporal_col =
+                slf.derive_amvp_col_candidate(xcb, ycb, cbw, cbh, current_ref_poc, amvr);
+
+            // §8.5.5.7 — inherited / constructed affine neighbour
+            // candidates need a per-CB affine CPMV store not yet kept in
+            // the MotionField, so they're `None`; the §8.5.5.7 step-8 /
+            // step-9 tail (temporal + zero pad) produces the predictor.
+            // The ref-context is built for completeness / future use.
+            let _ctx = AffineMvpRefContext {
+                list,
+                current_ref_poc,
+                poc_of_l0_ref: &|idx: i32| -> Option<i32> {
+                    if idx < 0 {
+                        None
+                    } else {
+                        slf.ref_pic_list_l0.get(idx as usize).map(|r| r.poc)
+                    }
+                },
+                poc_of_l1_ref: &|idx: i32| -> Option<i32> {
+                    if idx < 0 {
+                        None
+                    } else {
+                        slf.ref_pic_list_l1.get(idx as usize).map(|r| r.poc)
+                    }
+                },
+            };
+
+            let list_lx = build_affine_mvp_cand_list(AffineMvpListInputs {
+                num_cp_mv,
+                inherited_a: None,
+                inherited_b: None,
+                constructed_full: None,
+                constructed_corners: Default::default(),
+                temporal_col,
+                _phantom: core::marker::PhantomData,
+            });
+            let mvp = select_affine_mvp(&list_lx, mvp_flag);
+
+            // §8.5.5.5 eqs. 660 – 663 cumulative MVD, then eqs. 664 –
+            // 667 final fold.
+            let cumulative = cumulate_affine_mvd_cp(mvd_cp_stored, num_cp_mv);
+            let cpmvs = derive_final_affine_cpmvs(&mvp, &cumulative);
+            Ok((cpmvs, ref_pic))
+        };
+
+        match (use_l0, use_l1) {
+            (true, false) => {
+                let (cpmvs, ref_pic) = derive_one_list(
+                    self,
+                    RefList::L0,
+                    decision.mvp.ref_idx_l0,
+                    decision.mvp.mvp_l0_flag,
+                    &decision.mvd_cp_l0,
+                )?;
+                self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
+            }
+            (false, true) => {
+                let (cpmvs, ref_pic) = derive_one_list(
+                    self,
+                    RefList::L1,
+                    decision.mvp.ref_idx_l1,
+                    decision.mvp.mvp_l1_flag,
+                    &decision.mvd_cp_l1,
+                )?;
+                self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
+            }
+            (true, true) => {
+                let (cpmvs_l0, ref_pic_l0) = derive_one_list(
+                    self,
+                    RefList::L0,
+                    decision.mvp.ref_idx_l0,
+                    decision.mvp.mvp_l0_flag,
+                    &decision.mvd_cp_l0,
+                )?;
+                let (cpmvs_l1, ref_pic_l1) = derive_one_list(
+                    self,
+                    RefList::L1,
+                    decision.mvp.ref_idx_l1,
+                    decision.mvp.mvp_l1_flag,
+                    &decision.mvd_cp_l1,
+                )?;
+                self.reconstruct_affine_inter_bi(
+                    cb_x,
+                    cb_y,
+                    cb_w,
+                    cb_h,
+                    &cpmvs_l0,
+                    &ref_pic_l0,
+                    &cpmvs_l1,
+                    &ref_pic_l1,
+                    out,
+                )
+            }
+            (false, false) => Err(Error::invalid(
+                "h266 affine amvp: neither list active (inter_pred_idc invalid)",
+            )),
+        }
+    }
+
     /// §8.5.6.6.2 eq. 980 default-weighted average of two co-located
     /// plane regions: `out[x][y] = (a[x][y] + b[x][y] + 1) >> 1` over
     /// the `(w × h)` rectangle at `(dx, dy)`, where `a` / `b` are read
@@ -5107,6 +5292,124 @@ mod tests {
             any_diff,
             "a non-degenerate affine model must produce a per-sub-block-varying prediction"
         );
+    }
+
+    /// §8.5.5.5 affine non-merge (AMVP) parse-to-pixels fuse — drives a
+    /// parsed `NonMergeInterPreResidualAffineDecision` (per-CP MvdCpL0
+    /// arrays) through the §8.5.5.7 candidate list + eqs. 660 – 667
+    /// CPMV fold + §8.5.6 affine MC, and checks the result equals a
+    /// direct `reconstruct_affine_inter_uni` on the independently-folded
+    /// CPMVs.
+    ///
+    /// With `mvp_l0_flag == 0` and no temporal MF (`motion_field:
+    /// None`), the §8.5.5.7 list falls through to the step-9 zero-MV
+    /// pad, so the predictor is zero and the final CPMVs equal the
+    /// cumulative MVD (eqs. 660 – 663). The CP1 MVD is differential
+    /// relative to CP0, so the test pins the cumulative fold.
+    #[test]
+    fn reconstruct_leaf_cu_inter_affine_amvp_parse_to_pixels() {
+        use crate::affine_syntax_enc::make_non_merge_inter_affine_decision;
+        use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision;
+        use crate::non_merge_mvp_syntax_enc::make_non_merge_mvp_syntax_decision;
+
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // 2-D ramp reference so an affine MV gradient is visible.
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+            }
+        }
+        for cy in 0..(pic_h / 2) as usize {
+            for cx in 0..(pic_w / 2) as usize {
+                ref_frame.cb.samples[cy * ref_frame.cb.stride + cx] = ((cx * 2) & 63) as u8;
+                ref_frame.cr.samples[cy * ref_frame.cr.stride + cx] = ((cy * 2) & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
+
+        // 4-param affine, P-slice (L0 only). Per-CP stored MVDs: CP0 =
+        // (8,0) int-pel, CP1 = (8,0) differential (eq. 662 → cumulative
+        // CP1 = (16,0)) → a horizontal MV gradient.
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(
+            crate::leaf_cu::InterPredDir::PredL0,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        let mvd_cp_l0 = [
+            MotionVector::from_int_pel(8, 0),
+            MotionVector::from_int_pel(8, 0),
+            MotionVector::ZERO,
+        ];
+        let decision = NonMergeInterPreResidualAffineDecision::new(
+            affine,
+            mvp,
+            mvd_cp_l0,
+            [MotionVector::ZERO; 3],
+        );
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu_inter_affine_amvp(
+                16,
+                16,
+                16,
+                16,
+                &decision,
+                crate::amvr::AmvrShift(0),
+                &mut out,
+            )
+            .expect("affine amvp parse-to-pixels");
+
+        // Independent reference: predictor is zero (zero-MV pad), so the
+        // final CPMVs are the cumulative MVDs: CP0 = (8,0), CP1 = CP1 +
+        // CP0 = (16,0) int-pel.
+        let cpmvs = crate::affine::AffineCpmvs::new_4param(
+            MotionVector::from_int_pel(8, 0),
+            MotionVector::from_int_pel(16, 0),
+        );
+        let mut expect = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &cpmvs, &ref_pic, &mut expect)
+            .expect("direct affine uni recon");
+
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    expect.luma.samples[y * expect.luma.stride + x],
+                    "affine AMVP fuse luma must equal the folded-CPMV recon at ({x},{y})"
+                );
+            }
+        }
+        // Chroma must also match the independent recon.
+        for cy in 8..16usize {
+            for cx in 8..16usize {
+                assert_eq!(
+                    out.cb.samples[cy * out.cb.stride + cx],
+                    expect.cb.samples[cy * expect.cb.stride + cx],
+                    "affine AMVP fuse Cb must match at ({cx},{cy})"
+                );
+            }
+        }
     }
 
     /// §8.5.6.6.2 affine bi-pred — averaging two **identical**
