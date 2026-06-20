@@ -5412,6 +5412,116 @@ mod tests {
         }
     }
 
+    /// §8.5.5.5 affine non-merge (AMVP) bi-pred parse-to-pixels fuse —
+    /// a B-slice CU with `inter_pred_idc == PRED_BI` drives both lists'
+    /// per-CP MVD streams through the §8.5.5.7 candidate list + eqs.
+    /// 660 – 667 fold and into the §8.5.6.6.2 eq. 980 default-weighted
+    /// average. With identical L0 / L1 references and identical per-CP
+    /// MVDs, the bi-pred average must equal the per-list affine bi-pred
+    /// prediction (averaging identical predictions is the identity).
+    #[test]
+    fn reconstruct_leaf_cu_inter_affine_amvp_bipred_parse_to_pixels() {
+        use crate::affine_syntax_enc::make_non_merge_inter_affine_decision;
+        use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision;
+        use crate::non_merge_mvp_syntax_enc::make_non_merge_mvp_syntax_decision;
+
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
+        walker.set_ref_pic_list_l1(vec![ref_pic.clone()]);
+
+        // 4-param affine bi-pred; same per-CP MVDs on both lists →
+        // identical per-list predictions. Predictor is zero (zero-MV
+        // pad, no MF), so final CPMVs = cumulative MVD.
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(
+            crate::leaf_cu::InterPredDir::PredBi,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        let mvd_cp = [
+            MotionVector::from_int_pel(0, 0),
+            MotionVector::from_int_pel(4, 0),
+            MotionVector::ZERO,
+        ];
+        let decision = NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp, mvd_cp);
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu_inter_affine_amvp(
+                16,
+                16,
+                16,
+                16,
+                &decision,
+                crate::amvr::AmvrShift(0),
+                &mut out,
+            )
+            .expect("affine amvp bi-pred parse-to-pixels");
+
+        // Independent reference: cumulative CPMVs (CP0 = (0,0), CP1 =
+        // (4,0)) → bi-pred recon of identical lists.
+        let cpmvs = crate::affine::AffineCpmvs::new_4param(
+            MotionVector::from_int_pel(0, 0),
+            MotionVector::from_int_pel(4, 0),
+        );
+        let mut expect = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_bi(
+                16,
+                16,
+                16,
+                16,
+                &cpmvs,
+                &ref_pic,
+                &cpmvs,
+                &ref_pic,
+                &mut expect,
+            )
+            .expect("direct affine bi recon");
+
+        let mut any = false;
+        for y in 16..32usize {
+            for x in 16..32usize {
+                let got = out.luma.samples[y * out.luma.stride + x];
+                assert_eq!(
+                    got,
+                    expect.luma.samples[y * expect.luma.stride + x],
+                    "affine AMVP bi-pred fuse luma must match the folded-CPMV bi recon at ({x},{y})"
+                );
+                if got != ((x + y) & 63) as u8 {
+                    any = true;
+                }
+            }
+        }
+        assert!(
+            any,
+            "the affine bi-pred fuse must produce a non-trivial prediction"
+        );
+    }
+
     /// §8.5.6.6.2 affine bi-pred — averaging two **identical**
     /// predictions (`(a + a + 1) >> 1 == a`) is the identity, so the
     /// bi-pred reconstruction of the same CPMVs / same reference on

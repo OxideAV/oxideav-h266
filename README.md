@@ -146,10 +146,26 @@ P + B-slice merge subset:
   (eqs. 876 – 879) into each chroma 4×4 sub-block before the §8.5.6.3.4
   4-tap chroma MC. `reconstruct_affine_inter_bi` predicts each list's
   affine MC into a CU-sized scratch then forms the §8.5.6.6.2 eq. 980
-  default-weighted average over luma + chroma. Wiring these into the
-  parser-side §7.3.11.7 affine-CPMV fuse (multi-CP `MvdLX` parsing + the
-  §8.5.5.7 affine AMVP candidate list → final CPMVs) and BCW / BDOF on
-  the affine path remain follow-ups.
+  default-weighted average over luma + chroma. **Affine-CPMV parse-to-
+  pixels** (§8.5.5.5) is **live**: `reconstruct_leaf_cu_inter_affine_amvp`
+  takes the parsed affine non-merge decision
+  (`NonMergeInterPreResidualAffineDecision`, carrying the per-CP
+  `MvdCpLX` arrays the §7.3.11.7 affine branch parses via
+  `read_non_merge_inter_pre_residual_affine`), derives `numCpMv =
+  MotionModelIdc + 1`, builds the §8.5.5.7 affine CPMVP candidate list
+  per active list (`build_affine_mvp_cand_list` + `select_affine_mvp`
+  eq. 840), cumulates the per-CP MVDs (§8.5.5.5 eqs. 660 – 663,
+  `cumulate_affine_mvd_cp`), folds predictor + cumulative MVD into the
+  final CPMVs (eqs. 664 – 667, `derive_final_affine_cpmvs`), and drives
+  the uni / bi-pred affine MC — so affine inter CUs now decode from
+  parsed CPMV deltas end-to-end. The §8.5.5.7 inherited / constructed
+  affine-neighbour candidates need a per-CB affine CPMV store not yet
+  kept in the `MotionField`, so they currently resolve to `None` (the
+  list falls through to the §8.5.5.7 step-8 temporal MV + step-9 zero-MV
+  pad — exact for the common non-affine-neighbour case); threading the
+  per-CB affine CPMV store and BCW / BDOF on the affine path remain
+  follow-ups. Transform-skip inter residual (`residual_ts_coding`,
+  §7.3.11.12) still surfaces `Error::Unsupported`.
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, and the §8.7.4.6 inverse
