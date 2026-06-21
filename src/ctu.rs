@@ -1800,12 +1800,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // ApplyLfnstFlag[0] == (lfnst_idx > 0) on this luma path
             // (§8.7.4.1 eq. 179); transform_skip is off here.
             if info.lfnst_idx > 0 && !info.intra_bdpcm_luma {
-                if n_tb_w != n_tb_h {
-                    return Err(oxideav_core::Error::unsupported(
-                        "h266 LFNST: non-square intra TB needs §8.4.5.2.7 \
-                         wide-angle remap before set selection",
-                    ));
-                }
+                // The §8.4.5.2.7 wide-angle remap (for non-square TBs) is
+                // now applied inside `apply_inverse_lfnst` from the TB
+                // dimensions, so both square and non-square intra TBs run
+                // through the inverse LFNST.
                 // CoeffMin / CoeffMax for the active Log2TransformRange.
                 let max_c = (1i32 << 15) - 1;
                 crate::lfnst::apply_inverse_lfnst(
@@ -1840,13 +1838,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_w as u32,
                     n_tb_h as u32,
                 );
-                // §8.7.4.1 eqs. 1171 / 1172 — the high-frequency
-                // coefficients are zeroed out beyond nonZeroW / nonZeroH;
-                // a DST-VII / DCT-VIII direction caps the non-zero extent
-                // at 16, DCT-II at 32. (When LFNST is active the corner
-                // is already small, and lfnst_idx != 0 forces DCT-II.)
-                let non_zero_w = n_tb_w.min(if tr_h != TrType::DctII { 16 } else { 32 });
-                let non_zero_h = n_tb_h.min(if tr_v != TrType::DctII { 16 } else { 32 });
+                // §8.7.4.1 non-zero coefficient extent. When the inverse
+                // LFNST is active (ApplyLfnstFlag[0]) the secondary
+                // transform leaves only a small low-frequency corner, so
+                // eqs. 1169 / 1170 cap nonZeroW / nonZeroH at 4 (a 4-wide
+                // or 4-tall TB) or 8 otherwise. Otherwise eqs. 1171 / 1172
+                // apply: a DST-VII / DCT-VIII direction caps the non-zero
+                // extent at 16, DCT-II at 32.
+                let (non_zero_w, non_zero_h) = if info.lfnst_idx > 0 {
+                    let nz = if n_tb_w == 4 || n_tb_h == 4 { 4 } else { 8 };
+                    (n_tb_w.min(nz), n_tb_h.min(nz))
+                } else {
+                    (
+                        n_tb_w.min(if tr_h != TrType::DctII { 16 } else { 32 }),
+                        n_tb_h.min(if tr_v != TrType::DctII { 16 } else { 32 }),
+                    )
+                };
                 inverse_transform_2d(
                     n_tb_w, n_tb_h, non_zero_w, non_zero_h, tr_h, tr_v, &d, bit_depth, 15,
                 )?

@@ -25,14 +25,13 @@
 //!    eqs. 1165 / 1166 (the layout depends on whether the modified
 //!    `predModeIntra <= 34`).
 //!
-//! Scope of this drop: the inverse transform is exact for **square**
-//! transform blocks, where the §8.4.5.2.7 wide-angle remapping that
-//! feeds the LFNST set selection is the identity. `predModeIntra` is
-//! therefore taken already in `IntraPredModeY`/`IntraPredModeC` form
-//! (0..66, or the negative / >66 CCLM sentinels mapped by the caller).
-//! Non-square TBs would need the wide-angle remap applied to
-//! `predModeIntra` before [`lfnst_tr_set_idx`]; callers must not invoke
-//! this on non-square blocks until that lands.
+//! The §8.4.5.2.7 wide-angle remap that feeds the LFNST set selection is
+//! applied internally by [`apply_inverse_lfnst`] from the TB dimensions
+//! (single-tree non-ISP luma path: `nW == nTbW`, `nH == nTbH`), so both
+//! square and non-square transform blocks are handled. Callers pass
+//! `predModeIntra` in its pre-remap `IntraPredModeY` / `IntraPredModeC`
+//! form (0..66, or the negative / >66 CCLM sentinels mapped by the
+//! caller); the remap is the identity for square blocks.
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
@@ -43,6 +42,43 @@ use crate::scan::diag_scan_order;
 
 /// `INTRA_PLANAR` mode index (§8.4.5.2.11).
 pub const INTRA_PLANAR: i32 = 0;
+
+/// §8.4.5.2.7 wide-angle intra prediction mode mapping.
+///
+/// For a non-square block (`n_w != n_h`) the intra prediction mode is
+/// shifted into the wide-angle range so the §8.7.4.3 Table-41 set
+/// selection (and the angular prediction itself) account for the
+/// block's aspect ratio:
+///
+/// * `nW > nH`, `2 <= mode < ((whRatio > 1) ? 8 + 2*whRatio : 8)`
+///   → `mode + 65`;
+/// * `nH > nW`, `mode <= 66 && mode > ((whRatio > 1) ? 60 − 2*whRatio : 60)`
+///   → `mode − 67`,
+///
+/// where `whRatio = |log2(nW) − log2(nH)|`. Square blocks and modes
+/// outside those ranges are returned unchanged. `n_w` / `n_h` are the
+/// §8.4.5.2.7 `nW` / `nH` (for the single-tree non-ISP luma path these
+/// equal the transform-block dimensions).
+pub fn wide_angle_remap_mode(pred_mode_intra: i32, n_w: usize, n_h: usize) -> i32 {
+    if n_w == n_h {
+        return pred_mode_intra;
+    }
+    let log2 = |v: usize| (usize::BITS - 1 - v.leading_zeros()) as i32;
+    let wh_ratio = (log2(n_w) - log2(n_h)).abs();
+    if n_w > n_h {
+        let upper = if wh_ratio > 1 { 8 + 2 * wh_ratio } else { 8 };
+        if pred_mode_intra >= 2 && pred_mode_intra < upper {
+            return pred_mode_intra + 65;
+        }
+    } else {
+        // n_h > n_w (n_w == n_h handled above).
+        let lower = if wh_ratio > 1 { 60 - 2 * wh_ratio } else { 60 };
+        if pred_mode_intra <= 66 && pred_mode_intra > lower {
+            return pred_mode_intra - 67;
+        }
+    }
+    pred_mode_intra
+}
 
 /// §8.7.4.3 Table 41 — `lfnstTrSetIdx` selection from the (wide-angle
 /// remapped) intra prediction mode `predModeIntra`.
@@ -131,8 +167,10 @@ fn lfnst_1d(
 /// overwritten with the inverse non-separable transform output and all
 /// other positions are zeroed (the encoder zeroes them when LFNST is
 /// active — see `LfnstZeroOutSigCoeffFlag`). `pred_mode_intra` is the
-/// wide-angle-remapped intra mode used for set selection;
-/// `lfnst_idx` ∈ {1, 2}.
+/// intra mode **before** the §8.4.5.2.7 wide-angle remap; this function
+/// applies that remap internally from the TB dimensions (single-tree
+/// non-ISP luma path: `nW == nTbW`, `nH == nTbH`) so non-square TBs
+/// select the correct transform set and transpose. `lfnst_idx` ∈ {1, 2}.
 ///
 /// `coeff_min` / `coeff_max` are the `CoeffMin` / `CoeffMax` clip bounds
 /// (§7.4.11.11) for the active `Log2TransformRange`.
@@ -175,8 +213,13 @@ pub fn apply_inverse_lfnst(
         *slot = d[(yc as usize) * n_tb_w + (xc as usize)];
     }
 
+    // §8.4.5.2.7 wide-angle remap (nW == nTbW, nH == nTbH on the
+    // single-tree non-ISP luma path). The remapped mode drives both the
+    // Table-41 set selection and the eqs. 1165/1166 transpose decision.
+    let remapped_mode = wide_angle_remap_mode(pred_mode_intra, n_tb_w, n_tb_h);
+
     // §8.7.4.2 multiply.
-    let set_idx = lfnst_tr_set_idx(pred_mode_intra);
+    let set_idx = lfnst_tr_set_idx(remapped_mode);
     let matrix = lfnst_matrix(n_lfnst_out_size, set_idx, lfnst_idx)?;
     let v = lfnst_1d(&u, n_lfnst_out_size, matrix, coeff_min, coeff_max);
 
@@ -188,7 +231,7 @@ pub fn apply_inverse_lfnst(
 
     // eqs. 1165 / 1166: scatter v into the nLfnstSize x nLfnstSize
     // corner. The layout transposes when predModeIntra > 34.
-    let transpose = pred_mode_intra > 34;
+    let transpose = remapped_mode > 34;
     for y in 0..n_lfnst_size {
         for x in 0..n_lfnst_size {
             let val = lfnst_scatter_value(x, y, &v, log2_lfnst_size, transpose);
@@ -299,6 +342,80 @@ mod tests {
                           // set index is identical; mode 0 -> set 0, mode 66 -> set 1, so
                           // they differ. Just assert both produce output and differ.
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn wide_angle_remap_square_is_identity() {
+        for mode in [0, 1, 2, 18, 34, 50, 66] {
+            assert_eq!(wide_angle_remap_mode(mode, 8, 8), mode);
+        }
+    }
+
+    #[test]
+    fn wide_angle_remap_wide_block_shifts_low_modes() {
+        // nW > nH, whRatio = |log2(16) - log2(4)| = 2 -> upper = 8 + 4 = 12.
+        // Modes 2..11 remap to +65; mode 12 and above are unchanged.
+        assert_eq!(wide_angle_remap_mode(2, 16, 4), 67);
+        assert_eq!(wide_angle_remap_mode(11, 16, 4), 76);
+        assert_eq!(wide_angle_remap_mode(12, 16, 4), 12);
+        assert_eq!(wide_angle_remap_mode(34, 16, 4), 34);
+        // Mode 1 (DC) and 0 (PLANAR) are below the >= 2 threshold.
+        assert_eq!(wide_angle_remap_mode(1, 16, 4), 1);
+    }
+
+    #[test]
+    fn wide_angle_remap_tall_block_shifts_high_modes() {
+        // nH > nW, whRatio = 2 -> lower = 60 - 4 = 56. Modes 57..66
+        // remap to -67; mode 56 and below unchanged.
+        assert_eq!(wide_angle_remap_mode(66, 4, 16), -1);
+        assert_eq!(wide_angle_remap_mode(57, 4, 16), -10);
+        assert_eq!(wide_angle_remap_mode(56, 4, 16), 56);
+        assert_eq!(wide_angle_remap_mode(34, 4, 16), 34);
+    }
+
+    #[test]
+    fn wide_angle_remap_ratio_one_uses_default_bounds() {
+        // whRatio = 1 (e.g. 8x4) -> upper = 8, lower = 60.
+        assert_eq!(wide_angle_remap_mode(7, 8, 4), 72);
+        assert_eq!(wide_angle_remap_mode(8, 8, 4), 8);
+        assert_eq!(wide_angle_remap_mode(61, 4, 8), -6);
+        assert_eq!(wide_angle_remap_mode(60, 4, 8), 60);
+    }
+
+    /// A non-square TB now runs through `apply_inverse_lfnst` (the
+    /// wide-angle remap is applied internally) instead of being rejected.
+    #[test]
+    fn inverse_lfnst_non_square_tb_populates_corner() {
+        // 4x16: big = false (4 < 8) so nLfnstSize = 4, nonZeroSize = 16.
+        let mut d = vec![0i32; 4 * 16];
+        d[0] = 80;
+        d[1] = -30;
+        apply_inverse_lfnst(&mut d, 4, 16, /*mode=*/ 2, 1, -32768, 32767).unwrap();
+        // The 4x4 corner is populated; positions outside it are zero.
+        assert!(d.iter().take(4).any(|&c| c != 0));
+        // Row 5 onward (y >= 4) of the first column must be zero.
+        for y in 4..16 {
+            assert_eq!(d[y * 4], 0, "row {y} col 0 should be zeroed");
+        }
+    }
+
+    /// Mode 2 on a wide block (16x4) remaps to 67 (> 34) and therefore
+    /// transposes, producing a different corner than the same mode on a
+    /// square block (where it stays 2, <= 34, no transpose).
+    #[test]
+    fn inverse_lfnst_wide_block_transposes_via_remap() {
+        let mut wide = vec![0i32; 16 * 4];
+        wide[0] = 60;
+        wide[1] = 25;
+        apply_inverse_lfnst(&mut wide, 16, 4, 2, 2, -32768, 32767).unwrap();
+        let mut square = vec![0i32; 8 * 8];
+        square[0] = 60;
+        square[1] = 25;
+        apply_inverse_lfnst(&mut square, 8, 8, 2, 2, -32768, 32767).unwrap();
+        // Different geometry + remap -> the corners differ; both are
+        // populated.
+        assert!(wide.iter().any(|&c| c != 0));
+        assert!(square.iter().any(|&c| c != 0));
     }
 
     #[test]
