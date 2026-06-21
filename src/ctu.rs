@@ -97,7 +97,7 @@ use crate::sao::{apply_sao, SaoConfig, SaoPicture};
 use crate::sao_syntax::{decode_sao_ctb, SaoCtxs, SaoSyntaxConfig};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
-use crate::transform::{implicit_mts_tr_types, inverse_transform_2d, TrType};
+use crate::transform::{inverse_transform_2d, TrType};
 
 /// Snap an arbitrary VVC angular intra mode `m ∈ 2..=66` to the nearest
 /// of the cardinal/diagonal subset implemented by [`crate::intra::predict_angular`]
@@ -1358,6 +1358,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             max_num_subblock_merge_cand: self
                 .sps
                 .max_num_subblock_merge_cand(self.ph_temporal_mvp_enabled),
+            mts_enabled: tf.mts_enabled_flag,
+            explicit_mts_intra_enabled: tf.explicit_mts_intra_enabled_flag,
+            explicit_mts_inter_enabled: tf.explicit_mts_inter_enabled_flag,
         }
     }
 
@@ -1628,6 +1631,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // the dequant pipeline below.
 
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        // §8.7.4.1 MTS kernel selection consults the SPS tool flags; the
+        // snapshot is `Copy` so binding it once keeps the later
+        // `&mut self` reconstruction calls borrow-clean.
+        let tools = self.cu_tool_flags();
         let n_tb_w = cu.cu.w as usize;
         let n_tb_h = cu.cu.h as usize;
         let x0 = cu.cu.x as usize;
@@ -1817,20 +1824,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // transform_skip_flag is 1, res[x][y] = d[x][y] >> 0).
                 d
             } else {
-                // For the first cut we always pick DCT-II / DCT-II per
-                // §8.7.4.4 (the `mts_idx == 0` branch). Implicit MTS
-                // would substitute DST-VII for small intra TBs, but
-                // sticking with DCT-II keeps the path symmetrical with
-                // the encoder scaffold and matches the Common Test
-                // Conditions baseline. nTbS in {4, 8, 16, 32} are
-                // supported by inverse_transform_2d today.
-                // DCT-II / DCT-II for nTbS ∈ {4, 8, 16, 32, 64}. The size-64
-                // path is now wired through `apply_dct_ii` against the full
-                // 64×64 trMatrix (§8.7.4.2 eq. 1184).
-                let (tr_h, tr_v) = (TrType::DctII, TrType::DctII);
-                let _ = implicit_mts_tr_types(n_tb_w as u32, n_tb_h as u32);
+                // §8.7.4.1 horizontal / vertical transform kernel
+                // selection. Implicit MTS substitutes DST-VII for small
+                // (4..16) intra TBs when `sps_mts_enabled_flag == 1 &&
+                // sps_explicit_mts_intra_enabled_flag == 0 && lfnst_idx
+                // == 0 && !MIP`; explicit MTS picks the Table-39 pair from
+                // `mts_idx`. `lfnst_idx != 0` keeps the primary transform
+                // at DCT-II (mts_idx inferred 0).
+                let (tr_h, tr_v) = crate::transform::intra_luma_tr_types(
+                    tools.mts_enabled,
+                    tools.explicit_mts_intra_enabled,
+                    info.mts_idx,
+                    info.lfnst_idx,
+                    info.intra_mip_flag,
+                    n_tb_w as u32,
+                    n_tb_h as u32,
+                );
+                // §8.7.4.1 eqs. 1171 / 1172 — the high-frequency
+                // coefficients are zeroed out beyond nonZeroW / nonZeroH;
+                // a DST-VII / DCT-VIII direction caps the non-zero extent
+                // at 16, DCT-II at 32. (When LFNST is active the corner
+                // is already small, and lfnst_idx != 0 forces DCT-II.)
+                let non_zero_w = n_tb_w.min(if tr_h != TrType::DctII { 16 } else { 32 });
+                let non_zero_h = n_tb_h.min(if tr_v != TrType::DctII { 16 } else { 32 });
                 inverse_transform_2d(
-                    n_tb_w, n_tb_h, n_tb_w, n_tb_h, tr_h, tr_v, &d, bit_depth, 15,
+                    n_tb_w, n_tb_h, non_zero_w, non_zero_h, tr_h, tr_v, &d, bit_depth, 15,
                 )?
             }
         } else {

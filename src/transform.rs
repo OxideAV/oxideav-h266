@@ -506,6 +506,65 @@ pub fn implicit_mts_tr_types(n_tb_w: u32, n_tb_h: u32) -> (TrType, TrType) {
     (tr_h, tr_v)
 }
 
+/// §8.7.4.1 `implicitMtsEnabled` derivation for the regular (non-SBT)
+/// single-tree intra luma residual path.
+///
+/// `implicitMtsEnabled` is 1 when `sps_mts_enabled_flag == 1` and at
+/// least one of these holds:
+/// * `IntraSubPartitionsSplitType != ISP_NO_SPLIT` (`isp_split`),
+/// * `cu_sbt_flag == 1 && Max(nTbW, nTbH) <= 32` (`cu_sbt` path), or
+/// * `sps_explicit_mts_intra_enabled_flag == 0` for a `MODE_INTRA` CU
+///   with `lfnst_idx == 0` and `IntraMipFlag == 0`.
+///
+/// This helper covers the third (intra, non-SBT, non-ISP) condition,
+/// which is the branch the intra luma reconstruction path reaches with a
+/// single un-split TB. The caller passes the relevant flags directly.
+#[allow(clippy::too_many_arguments)]
+pub fn implicit_mts_enabled_intra(
+    mts_enabled: bool,
+    explicit_mts_intra_enabled: bool,
+    lfnst_idx: u8,
+    intra_mip_flag: bool,
+) -> bool {
+    mts_enabled && !explicit_mts_intra_enabled && lfnst_idx == 0 && !intra_mip_flag
+}
+
+/// §8.7.4.1 horizontal / vertical transform kernel selection for a
+/// regular (non-ISP, non-SBT) single-tree intra **luma** TB.
+///
+/// Resolves to:
+/// * implicit-MTS kernels (eqs. 1167 / 1168) when
+///   [`implicit_mts_enabled_intra`] holds, or
+/// * the explicit-MTS Table 39 pair keyed on `mts_idx` otherwise.
+///
+/// `lfnst_idx != 0` forces DCT-II/DCT-II: when the secondary transform
+/// is active the primary transform is always DCT-II on the luma path
+/// (the §8.7.4.1 "trTypeHor/trTypeVer set to 0" rule for the
+/// `mts_idx == 0` Table 39 row, which is what `mts_idx` is inferred to
+/// when LFNST is on).
+pub fn intra_luma_tr_types(
+    mts_enabled: bool,
+    explicit_mts_intra_enabled: bool,
+    mts_idx: u8,
+    lfnst_idx: u8,
+    intra_mip_flag: bool,
+    n_tb_w: u32,
+    n_tb_h: u32,
+) -> (TrType, TrType) {
+    if implicit_mts_enabled_intra(
+        mts_enabled,
+        explicit_mts_intra_enabled,
+        lfnst_idx,
+        intra_mip_flag,
+    ) {
+        implicit_mts_tr_types(n_tb_w, n_tb_h)
+    } else {
+        // Table 39 keyed on mts_idx (inferred 0 when not present, which
+        // covers lfnst_idx != 0 and the no-explicit-MTS cases).
+        mts_idx_to_tr_types(mts_idx).unwrap_or((TrType::DctII, TrType::DctII))
+    }
+}
+
 /// One transform block of a multi-TB-per-CU tiling, as a sub-rectangle
 /// (offset + size, in luma samples, relative to the CU top-left).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1944,5 +2003,51 @@ mod tests {
             15,
         )
         .is_err());
+    }
+
+    #[test]
+    fn intra_luma_implicit_mts_substitutes_dst_vii_for_small_tbs() {
+        // sps_mts_enabled && !explicit_intra && lfnst==0 && !MIP =>
+        // implicit MTS: DST-VII for 4..16, DCT-II otherwise (eqs.
+        // 1167 / 1168).
+        let t = |w, h| intra_luma_tr_types(true, false, 0, 0, false, w, h);
+        assert_eq!(t(4, 4), (TrType::DstVII, TrType::DstVII));
+        assert_eq!(t(16, 16), (TrType::DstVII, TrType::DstVII));
+        assert_eq!(t(8, 32), (TrType::DstVII, TrType::DctII));
+        assert_eq!(t(32, 32), (TrType::DctII, TrType::DctII));
+    }
+
+    #[test]
+    fn intra_luma_implicit_mts_disabled_without_master_flag() {
+        // sps_mts_enabled == 0 -> implicitMtsEnabled == 0; the Table 39
+        // mts_idx==0 row (DCT-II/DCT-II) applies.
+        let t = intra_luma_tr_types(false, false, 0, 0, false, 4, 4);
+        assert_eq!(t, (TrType::DctII, TrType::DctII));
+    }
+
+    #[test]
+    fn intra_luma_mip_or_lfnst_blocks_implicit_mts() {
+        // MIP -> implicitMtsEnabled == 0 -> Table 39 mts_idx==0.
+        assert_eq!(
+            intra_luma_tr_types(true, false, 0, 0, /*mip=*/ true, 4, 4),
+            (TrType::DctII, TrType::DctII)
+        );
+        // lfnst_idx != 0 -> implicitMtsEnabled == 0 -> DCT-II/DCT-II.
+        assert_eq!(
+            intra_luma_tr_types(true, false, 0, /*lfnst=*/ 1, false, 4, 4),
+            (TrType::DctII, TrType::DctII)
+        );
+    }
+
+    #[test]
+    fn intra_luma_explicit_mts_uses_table_39() {
+        // explicit_mts_intra == 1 -> implicitMtsEnabled == 0 -> Table 39
+        // keyed on mts_idx (DCT-II=0, DST-VII=1, DCT-VIII=2).
+        let t = |idx| intra_luma_tr_types(true, true, idx, 0, false, 8, 8);
+        assert_eq!(t(0), (TrType::DctII, TrType::DctII));
+        assert_eq!(t(1), (TrType::DstVII, TrType::DstVII));
+        assert_eq!(t(2), (TrType::DctVIII, TrType::DstVII));
+        assert_eq!(t(3), (TrType::DstVII, TrType::DctVIII));
+        assert_eq!(t(4), (TrType::DctVIII, TrType::DctVIII));
     }
 }

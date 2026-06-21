@@ -354,6 +354,14 @@ pub fn ctx_inc_lfnst_idx(bin_idx: u32, tree_single: bool) -> u32 {
     }
 }
 
+/// ctxInc for `mts_idx` per Table 132 — the ctxInc equals the bin
+/// index `binIdx` for the (up to four) ctx-coded bins of the TR(cMax=4)
+/// binarisation. The per-slice initType offset (`init_type * 4`) is
+/// applied separately at parse time.
+pub fn ctx_inc_mts_idx(bin_idx: u32) -> u32 {
+    bin_idx
+}
+
 /// ctxInc for `cu_coded_flag` per Table 132 — fixed 0. Single
 /// ctx-coded bin (FL `cMax = 1`); gates the `transform_tree()` body
 /// per §7.3.11.5.

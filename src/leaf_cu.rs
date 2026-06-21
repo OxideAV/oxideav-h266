@@ -504,6 +504,19 @@ pub struct CuToolFlags {
     /// re-routing the merge sub-tree through the regular / MMVD /
     /// CIIP / GPM path. Only meaningful when `slice_is_inter == true`.
     pub max_num_subblock_merge_cand: u32,
+    /// `sps_mts_enabled_flag` — master enable for multiple transform
+    /// selection. When `false` both the explicit `mts_idx` parse and the
+    /// implicit-MTS DST-VII substitution are suppressed (the §8.7.4.1
+    /// `implicitMtsEnabled` derivation requires this set).
+    pub mts_enabled: bool,
+    /// `sps_explicit_mts_intra_enabled_flag` — gates the `mts_idx` parse
+    /// for `MODE_INTRA` CUs (§7.3.11.5). When `false` (and the other
+    /// §8.7.4.1 conditions hold) the implicit-MTS branch derives the
+    /// kernels from the TB size instead.
+    pub explicit_mts_intra_enabled: bool,
+    /// `sps_explicit_mts_inter_enabled_flag` — gates the `mts_idx` parse
+    /// for `MODE_INTER` CUs (§7.3.11.5).
+    pub explicit_mts_inter_enabled: bool,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -611,6 +624,14 @@ pub struct LeafCuInfo {
     /// Inferred 0 when not present. Drives `ApplyLfnstFlag` (§8.7.4.1
     /// eqs. 179 / 180) for the intra residual reconstruction path.
     pub lfnst_idx: u8,
+    /// `mts_idx[x0][y0]` (§7.3.11.5) — selects the explicit multiple
+    /// transform selection kernel pair via Table 39: 0 = DCT-II/DCT-II,
+    /// 1 = DST-VII/DST-VII, 2 = DCT-VIII/DST-VII, 3 = DST-VII/DCT-VIII,
+    /// 4 = DCT-VIII/DCT-VIII. Inferred 0 when not present. Only read on
+    /// the explicit-MTS luma path (§8.7.4.1 Table 39 branch); the
+    /// implicit-MTS branch derives the kernels from the TB dimensions
+    /// instead and leaves this 0.
+    pub mts_idx: u8,
 }
 
 impl Default for LeafCuInfo {
@@ -672,6 +693,7 @@ impl Default for LeafCuInfo {
             tu_joint_cbcr_residual_flag: false,
             tu_c_res_mode: 0,
             lfnst_idx: 0,
+            mts_idx: 0,
         }
     }
 }
@@ -885,6 +907,11 @@ pub struct LeafCuCtxs {
     /// treeType-dependent) and 2 (bin 1) per Table 132. Indexed at parse
     /// time as `init_type * 3 + ctxInc`.
     pub lfnst_idx: Vec<ContextModel>,
+    /// Table 98 — `mts_idx` (12 ctxIdx, 4 per initType). TR(cMax=4)
+    /// binarisation; the up-to-four ctx-coded bins use ctxInc = binIdx
+    /// (0..3) per Table 132. Indexed at parse time as
+    /// `init_type * 4 + ctxInc`.
+    pub mts_idx: Vec<ContextModel>,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -983,6 +1010,7 @@ impl LeafCuCtxs {
             amvr_flag: init_contexts(SyntaxCtx::AmvrFlag, slice_qp_y),
             amvr_precision_idx: init_contexts(SyntaxCtx::AmvrPrecisionIdx, slice_qp_y),
             lfnst_idx: init_contexts(SyntaxCtx::LfnstIdx, slice_qp_y),
+            mts_idx: init_contexts(SyntaxCtx::MtsIdx, slice_qp_y),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }
@@ -3179,6 +3207,78 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // §7.3.11.5 — `lfnst_idx` is read at the coding-unit level after
         // `transform_tree()`, gated on the accumulated §7.3.11.11 flags.
         self.read_lfnst_idx(info, &res_flags)?;
+        // §7.3.11.5 — `mts_idx` follows `lfnst_idx`, gated on
+        // `lfnst_idx == 0` plus the §7.3.11.11 MTS flags.
+        self.read_mts_idx(info, &res_flags)?;
+        Ok(())
+    }
+
+    /// §7.3.11.5 `mts_idx` read. Present only when:
+    ///
+    /// * `lfnst_idx == 0`,
+    /// * the luma TB is **not** transform-skipped (this single-TB intra
+    ///   path never transform-skips, so the flag is always 0 here),
+    /// * `Max(cbWidth, cbHeight) <= 32`,
+    /// * `IntraSubPartitionsSplitType == ISP_NO_SPLIT`,
+    /// * `cu_sbt_flag == 0`,
+    /// * `MtsZeroOutSigCoeffFlag == 1 && MtsDcOnly == 0`, and
+    /// * the explicit-MTS enable for the CU's prediction mode is set
+    ///   (`sps_explicit_mts_intra_enabled_flag` for `MODE_INTRA`,
+    ///   `sps_explicit_mts_inter_enabled_flag` for `MODE_INTER`).
+    ///
+    /// Inferred 0 when absent. Binarisation is TR(`cMax = 4`,
+    /// `cRiceParam = 0`): up to four ctx-coded bins, each with
+    /// ctxInc = binIdx ([`crate::ctx::ctx_inc_mts_idx`]), slotted by
+    /// `init_type * 4` against the Table 98 contexts.
+    fn read_mts_idx(
+        &mut self,
+        info: &mut LeafCuInfo,
+        res_flags: &crate::residual::TbResidualFlags,
+    ) -> Result<()> {
+        info.mts_idx = 0;
+        // The §8.7.4.1 explicit-MTS Table-39 branch requires the master
+        // enable; without it `mts_idx` is never coded.
+        if !self.tools.mts_enabled {
+            return Ok(());
+        }
+        if info.lfnst_idx != 0
+            || info.isp_split != IspSplitType::NoSplit
+            || info.cu_sbt_flag
+            || info.cb_width.max(info.cb_height) > 32
+        {
+            return Ok(());
+        }
+        // MtsZeroOutSigCoeffFlag == 1 && MtsDcOnly == 0.
+        if !res_flags.mts_zero_out_sig_coeff_flag || res_flags.mts_dc_only {
+            return Ok(());
+        }
+        let explicit_for_mode = match info.pred_mode {
+            CuPredMode::Intra => self.tools.explicit_mts_intra_enabled,
+            CuPredMode::Inter => self.tools.explicit_mts_inter_enabled,
+            // IBC / palette never reach the explicit-MTS branch.
+            _ => false,
+        };
+        if !explicit_for_mode {
+            return Ok(());
+        }
+        // TR(cMax=4): up to four ctx-coded bins. The unary prefix stops
+        // at the first 0 bin or after cMax bins; since cMax == cRiceParam
+        // boundary == cMax here the whole value is the truncated-unary
+        // prefix (no suffix when cMax is a power-of-two-minus boundary).
+        let off = (self.ctxs.init_type as usize) * 4;
+        let n = self.ctxs.mts_idx.len() - 1;
+        let mut value: u8 = 0;
+        for bin_idx in 0..4u32 {
+            let inc = crate::ctx::ctx_inc_mts_idx(bin_idx) as usize;
+            let bin = self
+                .dec
+                .decode_decision(&mut self.ctxs.mts_idx[(off + inc).min(n)])?;
+            if bin == 0 {
+                break;
+            }
+            value += 1;
+        }
+        info.mts_idx = value;
         Ok(())
     }
 
@@ -3857,6 +3957,9 @@ mod tests {
             max_num_gpm_merge_cand: 0,
             slice_is_b: false,
             max_num_subblock_merge_cand: 0,
+            mts_enabled: false,
+            explicit_mts_intra_enabled: false,
+            explicit_mts_inter_enabled: false,
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();
@@ -3986,6 +4089,144 @@ mod tests {
             let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
             reader.read_lfnst_idx(&mut info, &closed).unwrap();
             assert_eq!(info.lfnst_idx, 0);
+        }
+    }
+
+    /// `read_mts_idx` round-trips the TR(cMax=4) prefix through the CABAC
+    /// engine when the §7.3.11.5 explicit-MTS gate is open, and infers 0
+    /// when the gate is closed (`sps_mts_enabled_flag == 0`,
+    /// `sps_explicit_mts_intra_enabled_flag == 0`, or the MTS DC-only /
+    /// zero-out flags forbid it).
+    #[test]
+    fn mts_idx_parse_round_trip_and_gating() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::ctx_inc_mts_idx;
+        use crate::residual::TbResidualFlags;
+
+        let tools = CuToolFlags {
+            mts_enabled: true,
+            explicit_mts_intra_enabled: true,
+            chroma_format_idc: 1,
+            ..CuToolFlags::default()
+        };
+        // Open gate: MtsZeroOutSigCoeffFlag == 1 && MtsDcOnly == 0.
+        let open = TbResidualFlags {
+            mts_dc_only: false,
+            mts_zero_out_sig_coeff_flag: true,
+            ..TbResidualFlags::default()
+        };
+
+        for expected in [0u8, 1, 2, 3, 4] {
+            // TR(cMax=4): truncated-unary prefix — `expected` ones
+            // followed by a terminating zero (omitted at cMax). init_type
+            // 0 → slot offset 0. The warmup bypass keeps the decoder out
+            // of the all-ones init corner (see lfnst test).
+            let mut enc = ArithEncoder::new();
+            let warmup_bypass = [0u32, 0, 0];
+            for &b in &warmup_bypass {
+                enc.encode_bypass(b).unwrap();
+            }
+            let mut enc_ctx = init_contexts(SyntaxCtx::MtsIdx, 26);
+            for bin_idx in 0..4u32 {
+                let inc = ctx_inc_mts_idx(bin_idx) as usize;
+                let bit = if (bin_idx as u8) < expected { 1 } else { 0 };
+                enc.encode_decision(&mut enc_ctx[inc], bit).unwrap();
+                if bit == 0 {
+                    break;
+                }
+            }
+            enc.encode_terminate(1).unwrap();
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 32]);
+
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            for &b in &warmup_bypass {
+                assert_eq!(dec.decode_bypass().unwrap(), b);
+            }
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            reader.read_mts_idx(&mut info, &open).unwrap();
+            assert_eq!(info.mts_idx, expected, "round-trip mts_idx {expected}");
+        }
+
+        // Gate closed: sps_mts_enabled == 0 → inferred 0, no bins.
+        {
+            let off_tools = CuToolFlags {
+                mts_enabled: false,
+                ..CuToolFlags::default()
+            };
+            let data = [0u8; 8];
+            let mut dec = ArithDecoder::new(&data).unwrap();
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, off_tools);
+            reader.read_mts_idx(&mut info, &open).unwrap();
+            assert_eq!(info.mts_idx, 0);
+        }
+
+        // Gate closed: lfnst_idx != 0 → mts_idx inferred 0.
+        {
+            let data = [0u8; 8];
+            let mut dec = ArithDecoder::new(&data).unwrap();
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                lfnst_idx: 1,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            reader.read_mts_idx(&mut info, &open).unwrap();
+            assert_eq!(info.mts_idx, 0);
+        }
+
+        // Gate closed: cbWidth > 32 → mts_idx inferred 0.
+        {
+            let data = [0u8; 8];
+            let mut dec = ArithDecoder::new(&data).unwrap();
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 64,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            reader.read_mts_idx(&mut info, &open).unwrap();
+            assert_eq!(info.mts_idx, 0);
+        }
+
+        // Gate closed: MtsDcOnly == 1 → inferred 0.
+        {
+            let closed = TbResidualFlags {
+                mts_dc_only: true,
+                mts_zero_out_sig_coeff_flag: true,
+                ..TbResidualFlags::default()
+            };
+            let data = [0u8; 8];
+            let mut dec = ArithDecoder::new(&data).unwrap();
+            let mut ctxs = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Intra,
+                ..LeafCuInfo::default()
+            };
+            let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
+            reader.read_mts_idx(&mut info, &closed).unwrap();
+            assert_eq!(info.mts_idx, 0);
         }
     }
 
