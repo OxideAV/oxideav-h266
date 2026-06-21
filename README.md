@@ -169,11 +169,16 @@ P + B-slice merge subset:
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, the §8.7.4.6 inverse
-  adaptive colour transform, and the §8.7.4.1 – §8.7.4.3 **inverse
+  adaptive colour transform, the §8.7.4.1 – §8.7.4.3 **inverse
   LFNST** (low-frequency non-separable secondary transform) — all 16
-  `lowFreqTransMatrix` tables, the Table-41 set selection, and the
+  `lowFreqTransMatrix` tables, the Table-41 set selection, the
   intra-path `lfnst_idx` (§7.3.11.5) parse → §8.7.4.1 corner fold →
-  pixels (square TBs; non-square awaits the §8.4.5.2.7 wide-angle remap).
+  pixels for **both square and non-square** TBs (the §8.4.5.2.7
+  wide-angle remap is applied internally), and §8.7.4.1 **multiple
+  transform selection (MTS)** on the intra luma path — implicit MTS
+  (DST-VII for 4..16, eqs. 1167/1168) plus explicit MTS (`mts_idx`
+  §7.3.11.5 parse → Table-39 kernel pair), with the eqs. 1169–1172
+  non-zero-coefficient extents.
 * **CABAC** — full §9.3 arithmetic engine plus per-syntax-element
   initValue / shiftIdx tables for every element currently parsed.
 * **In-loop filters** — §8.8.3 deblocking, §8.8.4 SAO (edge + band),

@@ -2624,3 +2624,118 @@ fn reconstruct_leaf_cu_inverse_lfnst_changes_pixels() {
         }
     }
 }
+
+/// §8.7.4.1 explicit MTS: reconstructing a luma TB with `mts_idx == 1`
+/// (DST-VII/DST-VII) produces different pixels than `mts_idx == 0`
+/// (DCT-II/DCT-II), and the pixel delta equals the public-pipeline
+/// transform delta (prediction is identical between the two runs).
+#[test]
+fn reconstruct_leaf_cu_explicit_mts_changes_pixels() {
+    use oxideav_h266::coding_tree::Cu;
+    use oxideav_h266::ctu::CtuCu;
+    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
+    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
+    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+
+    // SPS with sps_mts_enabled_flag + sps_explicit_mts_intra_enabled_flag.
+    let mut sps = dummy_sps(0, 32, 32);
+    sps.tool_flags.mts_enabled_flag = true;
+    sps.tool_flags.explicit_mts_intra_enabled_flag = true;
+    let pps = dummy_pps(32, 32);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+
+    let levels: Vec<i32> = vec![
+        3, -1, 0, 0, //
+        2, 1, 0, 0, //
+        0, 0, 0, 0, //
+        0, 0, 0, 0,
+    ];
+
+    let cu = CtuCu {
+        ctu_addr_rs: 0,
+        cu: Cu {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            cqt_depth: 0,
+            mtt_depth: 0,
+        },
+    };
+
+    let make_info = |mts_idx: u8| LeafCuInfo {
+        x0: 0,
+        y0: 0,
+        cb_width: 4,
+        cb_height: 4,
+        pred_mode: CuPredMode::Intra,
+        intra_pred_mode_y: INTRA_PLANAR,
+        tu_y_coded_flag: true,
+        mts_idx,
+        ..LeafCuInfo::default()
+    };
+    let residual = LeafCuResidual {
+        luma_levels: levels.clone(),
+        ..LeafCuResidual::default()
+    };
+
+    // Run 0: mts_idx == 0 (DCT-II/DCT-II).
+    let mut out0 = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(0), &residual, &mut out0)
+            .unwrap();
+    }
+    // Run 1: mts_idx == 1 (DST-VII/DST-VII).
+    let mut out1 = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(1), &residual, &mut out1)
+            .unwrap();
+    }
+
+    let stride = out0.luma.stride;
+    let mut differs = false;
+    for y in 0..4usize {
+        for x in 0..4usize {
+            if out0.luma.samples[y * stride + x] != out1.luma.samples[y * stride + x] {
+                differs = true;
+            }
+        }
+    }
+    assert!(differs, "explicit MTS must change the reconstructed pixels");
+
+    // Golden cross-check against the public transform pipeline.
+    let params = DequantParams {
+        bit_depth: 8,
+        log2_transform_range: 15,
+        n_tb_w: 4,
+        n_tb_h: 4,
+        qp: 26,
+        dep_quant: false,
+        transform_skip: false,
+        bdpcm: false,
+        bdpcm_dir: false,
+    };
+    let d = dequantize_tb_flat(&levels, &params).unwrap();
+    let res_dct =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+    let res_dst =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DstVII, TrType::DstVII, &d, 8, 15).unwrap();
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let pix_diff =
+                out1.luma.samples[y * stride + x] as i32 - out0.luma.samples[y * stride + x] as i32;
+            let res_diff = res_dst[y * 4 + x] - res_dct[y * 4 + x];
+            assert_eq!(
+                pix_diff, res_diff,
+                "pixel delta must equal MTS residual delta at ({x},{y})"
+            );
+        }
+    }
+}
