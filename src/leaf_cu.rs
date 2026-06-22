@@ -649,6 +649,12 @@ pub struct LeafCuInfo {
     /// `intra_bdpcm_luma`, which also forces transform-skip but adds the
     /// §8.7.4 BDPCM accumulation pass.
     pub transform_skip_luma: bool,
+    /// `transform_skip_flag[xC][yC][1]` (§7.3.11.5) for the Cb TB —
+    /// routes the Cb residual through `residual_ts_coding()` and bypasses
+    /// the chroma inverse transform at reconstruction.
+    pub transform_skip_cb: bool,
+    /// `transform_skip_flag[xC][yC][2]` (§7.3.11.5) for the Cr TB.
+    pub transform_skip_cr: bool,
 }
 
 impl Default for LeafCuInfo {
@@ -712,6 +718,8 @@ impl Default for LeafCuInfo {
             lfnst_idx: 0,
             mts_idx: 0,
             transform_skip_luma: false,
+            transform_skip_cb: false,
+            transform_skip_cr: false,
         }
     }
 }
@@ -3229,14 +3237,39 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             let cw = cb_w / sub_w;
             let ch = cb_h / sub_h;
             if cw >= 2 && ch >= 2 {
-                let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
-                    self.dec,
-                    &mut self.ctxs.residual,
-                    cw,
-                    ch,
-                    1,
-                )?;
-                res_flags.merge(flags);
+                // §7.3.11.5 transform_skip_flag[xC][yC][1] parse gate.
+                let ts_present = self.tools.transform_skip_enabled
+                    && !info.intra_bdpcm_chroma
+                    && (cw as u32) <= self.tools.max_ts_size
+                    && (ch as u32) <= self.tools.max_ts_size
+                    && !info.cu_sbt_flag;
+                let ts = if ts_present {
+                    crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 1)?
+                } else {
+                    false
+                };
+                info.transform_skip_cb = ts;
+                let levels = if ts && !self.tools.ts_residual_coding_disabled {
+                    crate::residual::decode_ts_tb_coefficients(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        cw,
+                        ch,
+                        1,
+                        self.tools.ts_residual_coding_rice_idx,
+                        false,
+                    )?
+                } else {
+                    let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        cw,
+                        ch,
+                        1,
+                    )?;
+                    res_flags.merge(flags);
+                    levels
+                };
                 residual.cb_levels = levels;
             }
         }
@@ -3244,14 +3277,39 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             let cw = cb_w / sub_w;
             let ch = cb_h / sub_h;
             if cw >= 2 && ch >= 2 {
-                let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
-                    self.dec,
-                    &mut self.ctxs.residual,
-                    cw,
-                    ch,
-                    2,
-                )?;
-                res_flags.merge(flags);
+                // §7.3.11.5 transform_skip_flag[xC][yC][2] parse gate.
+                let ts_present = self.tools.transform_skip_enabled
+                    && !info.intra_bdpcm_chroma
+                    && (cw as u32) <= self.tools.max_ts_size
+                    && (ch as u32) <= self.tools.max_ts_size
+                    && !info.cu_sbt_flag;
+                let ts = if ts_present {
+                    crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 2)?
+                } else {
+                    false
+                };
+                info.transform_skip_cr = ts;
+                let levels = if ts && !self.tools.ts_residual_coding_disabled {
+                    crate::residual::decode_ts_tb_coefficients(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        cw,
+                        ch,
+                        2,
+                        self.tools.ts_residual_coding_rice_idx,
+                        false,
+                    )?
+                } else {
+                    let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        cw,
+                        ch,
+                        2,
+                    )?;
+                    res_flags.merge(flags);
+                    levels
+                };
                 residual.cr_levels = levels;
             }
         }

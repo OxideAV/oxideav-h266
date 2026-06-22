@@ -4229,6 +4229,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     0
                 };
                 let qp = chroma_qp_identity(self.cabac.slice_qp_y.0, pps_offset + cu_offset);
+                // Per-plane transform-skip: BDPCM-chroma forces it on both
+                // planes; a plain transform_skip_flag is per-component.
+                let plane_ts = match c_idx {
+                    1 => info.transform_skip_cb,
+                    2 => info.transform_skip_cr,
+                    _ => false,
+                };
+                let transform_skip = info.intra_bdpcm_chroma || plane_ts;
                 let params = DequantParams {
                     bit_depth,
                     log2_transform_range: 15,
@@ -4236,14 +4244,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_h: n_tb_h as u32,
                     qp,
                     dep_quant: false,
-                    transform_skip: info.intra_bdpcm_chroma,
+                    transform_skip,
                     bdpcm: info.intra_bdpcm_chroma,
                     bdpcm_dir: info.intra_bdpcm_chroma_dir,
                 };
                 let d = dequantize_tb_flat(levels, &params)?;
-                if info.intra_bdpcm_chroma {
-                    // Transform-skip + BDPCM: bypass the inverse
-                    // transform; d[] is the chroma residual directly.
+                if transform_skip {
+                    // Transform-skip (BDPCM-chroma or plain
+                    // transform_skip_flag): bypass the inverse transform;
+                    // d[] is the chroma residual directly (§8.7.4.6).
                     d
                 } else {
                     // DCT-II both axes — chroma never picks an MTS kernel

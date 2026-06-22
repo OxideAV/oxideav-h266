@@ -179,10 +179,11 @@ P + B-slice merge subset:
   (DST-VII for 4..16, eqs. 1167/1168) plus explicit MTS (`mts_idx`
   §7.3.11.5 parse → Table-39 kernel pair), with the eqs. 1169–1172
   non-zero-coefficient extents. **Transform-skip residual coding**
-  (§7.3.11.12 `residual_ts_coding()`) is live on the intra luma path:
-  the §7.3.11.5 `transform_skip_flag` parse gate (`sps_transform_skip_
-  enabled_flag`, `tbW/tbH <= MaxTsSize`, ISP NoSplit, `!cu_sbt_flag`,
-  BDPCM off) routes a TS TB through the three-pass TS coefficient walker
+  (§7.3.11.12 `residual_ts_coding()`) is live on the intra luma **and
+  chroma** paths: the §7.3.11.5 `transform_skip_flag` parse gate
+  (`sps_transform_skip_enabled_flag`, `tbW/tbH <= MaxTsSize`, ISP
+  NoSplit for luma, `!cu_sbt_flag`, BDPCM off) routes a TS TB through
+  the three-pass TS coefficient walker
   (sb_coded_flag / sig / context-coded coeff_sign / gt1 / par in pass 1,
   the 5-flag gtX pass, the bypass `abs_remainder` + level-prediction
   tail) with the §9.3.4.2.6/.7/.8/.9/.10 TS ctxInc derivations (causal

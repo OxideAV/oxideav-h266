@@ -2866,3 +2866,124 @@ fn reconstruct_leaf_cu_transform_skip_bypasses_transform() {
         }
     }
 }
+
+/// Round-360 — `transform_skip_flag == 1` on an intra **chroma** Cb TB
+/// bypasses the chroma inverse transform (§8.7.4.6). Reconstructs an
+/// 8×8 CU (4×4 chroma TB at 4:2:0) twice with the same Cb coefficient
+/// field — once TS, once DCT-II — and asserts the Cb plane fields
+/// differ and the TS-vs-DCT pixel delta matches the residual delta.
+#[test]
+fn reconstruct_leaf_cu_chroma_transform_skip_bypasses_transform() {
+    use oxideav_h266::coding_tree::Cu;
+    use oxideav_h266::ctu::CtuCu;
+    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
+    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_DC, INTRA_PLANAR};
+    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+
+    let mut sps = dummy_sps(0, 32, 32);
+    sps.tool_flags.transform_skip_enabled_flag = true;
+    let pps = dummy_pps(32, 32);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+
+    // 4×4 chroma Cb coefficient field with off-DC energy.
+    let cb_levels: Vec<i32> = vec![
+        5, 0, -1, 0, //
+        0, 2, 0, 0, //
+        0, 0, 0, 0, //
+        0, 0, 0, 0,
+    ];
+
+    let cu = CtuCu {
+        ctu_addr_rs: 0,
+        cu: Cu {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+            cqt_depth: 0,
+            mtt_depth: 0,
+        },
+    };
+
+    let make_info = |ts: bool| LeafCuInfo {
+        x0: 0,
+        y0: 0,
+        cb_width: 8,
+        cb_height: 8,
+        pred_mode: CuPredMode::Intra,
+        intra_pred_mode_y: INTRA_PLANAR,
+        intra_pred_mode_c: INTRA_DC,
+        tu_cb_coded_flag: true,
+        transform_skip_cb: ts,
+        ..LeafCuInfo::default()
+    };
+    let residual = LeafCuResidual {
+        cb_levels: cb_levels.clone(),
+        ..LeafCuResidual::default()
+    };
+
+    let mut out_dct = PictureBuffer::yuv420_filled(32, 32, 40);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(false), &residual, &mut out_dct)
+            .unwrap();
+    }
+    let mut out_ts = PictureBuffer::yuv420_filled(32, 32, 40);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(true), &residual, &mut out_ts)
+            .unwrap();
+    }
+
+    let stride = out_dct.cb.stride;
+    let mut differs = false;
+    for y in 0..4usize {
+        for x in 0..4usize {
+            if out_dct.cb.samples[y * stride + x] != out_ts.cb.samples[y * stride + x] {
+                differs = true;
+            }
+        }
+    }
+    assert!(
+        differs,
+        "chroma transform-skip must reconstruct differently from DCT-II"
+    );
+
+    // §8.7.1 chroma QP identity at slice QP 26 with zero PPS offsets.
+    let qp = 26;
+    let params_ts = DequantParams {
+        bit_depth: 8,
+        log2_transform_range: 15,
+        n_tb_w: 4,
+        n_tb_h: 4,
+        qp,
+        dep_quant: false,
+        transform_skip: true,
+        bdpcm: false,
+        bdpcm_dir: false,
+    };
+    let res_ts = dequantize_tb_flat(&cb_levels, &params_ts).unwrap();
+    let params_dct = DequantParams {
+        transform_skip: false,
+        ..params_ts
+    };
+    let d = dequantize_tb_flat(&cb_levels, &params_dct).unwrap();
+    let res_dct =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let pix_diff = out_ts.cb.samples[y * stride + x] as i32
+                - out_dct.cb.samples[y * stride + x] as i32;
+            let res_diff = res_ts[y * 4 + x] - res_dct[y * 4 + x];
+            assert_eq!(
+                pix_diff, res_diff,
+                "chroma TS pixel delta must equal residual delta at ({x},{y})"
+            );
+        }
+    }
+}
