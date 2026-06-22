@@ -1325,7 +1325,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             act: tf.act_enabled_flag,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: tf.transform_skip_enabled_flag,
             max_ts_size: max_ts,
+            ts_residual_coding_rice_idx: self.sh.sh_ts_residual_coding_rice_idx_minus1 as u32 + 1,
             ctb_size_y: self.layout.ctb_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
             cu_qp_delta_enabled: self.pps.pps_cu_qp_delta_enabled_flag,
@@ -1781,7 +1783,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let qp = qp.clamp(0, 63);
             // BDPCM forces transform-skip and the eq. 1153 / 1154
             // accumulation pass; the inverse transform is bypassed
-            // (the dz post-accumulation IS the residual).
+            // (the dz post-accumulation IS the residual). A plain
+            // (non-BDPCM) transform_skip_flag == 1 also skips the inverse
+            // transform (§8.7.4.6: res[x][y] = d[x][y]) but without the
+            // BDPCM accumulation pass.
+            let transform_skip = info.intra_bdpcm_luma || info.transform_skip_luma;
             let params = DequantParams {
                 bit_depth,
                 log2_transform_range: 15,
@@ -1789,7 +1795,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 n_tb_h: n_tb_h as u32,
                 qp,
                 dep_quant: false,
-                transform_skip: info.intra_bdpcm_luma,
+                transform_skip,
                 bdpcm: info.intra_bdpcm_luma,
                 bdpcm_dir: info.intra_bdpcm_luma_dir,
             };
@@ -1798,8 +1804,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // coefficients are passed through the secondary non-separable
             // transform before the regular separable inverse transform.
             // ApplyLfnstFlag[0] == (lfnst_idx > 0) on this luma path
-            // (§8.7.4.1 eq. 179); transform_skip is off here.
-            if info.lfnst_idx > 0 && !info.intra_bdpcm_luma {
+            // (§8.7.4.1 eq. 179). LFNST is mutually exclusive with
+            // transform-skip (the lfnst_idx parse is gated on
+            // transform_skip_flag == 0), so it never fires when
+            // `transform_skip` is set.
+            if info.lfnst_idx > 0 && !transform_skip {
                 // The §8.4.5.2.7 wide-angle remap (for non-square TBs) is
                 // now applied inside `apply_inverse_lfnst` from the TB
                 // dimensions, so both square and non-square intra TBs run
@@ -1816,10 +1825,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     max_c,
                 )?;
             }
-            if info.intra_bdpcm_luma {
-                // Transform-skip + BDPCM: the dequantised d[] is the
-                // residual sample array directly (§8.7.4.6 — when
-                // transform_skip_flag is 1, res[x][y] = d[x][y] >> 0).
+            if transform_skip {
+                // Transform-skip (BDPCM or plain transform_skip_flag):
+                // the dequantised d[] is the residual sample array
+                // directly (§8.7.4.6 — when transform_skip_flag is 1,
+                // res[x][y] = d[x][y] >> 0). The BDPCM accumulation pass
+                // (eq. 1153/1154) is folded inside `dequantize_tb_flat`
+                // when `bdpcm` is set.
                 d
             } else {
                 // §8.7.4.1 horizontal / vertical transform kernel

@@ -892,6 +892,94 @@ pub fn ctx_inc_coeff_sign_flag_ts(left_sign: i32, above_sign: i32, bdpcm: bool) 
     }
 }
 
+/// csbfCtx derivation fragment for `sb_coded_flag` in transform-skip
+/// residual coding — §9.3.4.2.6 eqs. 1564 / 1565. Unlike the regular
+/// path (which sums the *right* + *below* neighbours, eqs. 1566 / 1567),
+/// the TS path sums the *left* + *above* neighbours.
+///
+/// * `left_sb_coded` — `sb_coded_flag[xS-1][yS]` (0 if `xS == 0`).
+/// * `above_sb_coded` — `sb_coded_flag[xS][yS-1]` (0 if `yS == 0`).
+pub fn csbf_ctx_ts(left_sb_coded: bool, above_sb_coded: bool) -> u32 {
+    left_sb_coded as u32 + above_sb_coded as u32
+}
+
+/// ctxInc for `sb_coded_flag` in transform-skip residual coding —
+/// §9.3.4.2.6 eq. 1568 (`ctxInc = 4 + csbfCtx`).
+pub fn ctx_inc_sb_coded_flag_ts(csbf_ctx: u32) -> u32 {
+    4 + csbf_ctx
+}
+
+/// §9.3.4.2.7 derivation of `(locNumSig, locSumAbsPass1)` for the
+/// transform-skip residual-coding path. The TS branch reads the *left*
+/// and *above* causal neighbours (`(xC-1,yC)` and `(xC,yC-1)`), in
+/// contrast to the forward-diagonal neighbourhood of the regular path.
+///
+/// Returns `(locNumSig, locSumAbsPass1)` from the `AbsLevelPass1[]` and
+/// `sig_coeff_flag[]` arrays in row-major `(n_tb_w * n_tb_h)` layout.
+pub fn loc_num_sig_and_sum_abs_pass1_ts(
+    x_c: u32,
+    y_c: u32,
+    abs_level_pass1: &[u32],
+    sig_coeff_flag: &[bool],
+    n_tb_w: u32,
+) -> (u32, u32) {
+    let mut loc_num_sig = 0u32;
+    let mut loc_sum = 0u32;
+    let at = |xc: u32, yc: u32| -> usize { (yc as usize) * (n_tb_w as usize) + (xc as usize) };
+    if x_c > 0 {
+        loc_num_sig += sig_coeff_flag[at(x_c - 1, y_c)] as u32;
+        loc_sum += abs_level_pass1[at(x_c - 1, y_c)];
+    }
+    if y_c > 0 {
+        loc_num_sig += sig_coeff_flag[at(x_c, y_c - 1)] as u32;
+        loc_sum += abs_level_pass1[at(x_c, y_c - 1)];
+    }
+    (loc_num_sig, loc_sum)
+}
+
+/// ctxInc for `par_level_flag[n]` in transform-skip mode —
+/// §9.3.4.2.9 eq. 1575 (fixed `ctxInc = 32`).
+pub fn ctx_inc_par_level_flag_ts() -> u32 {
+    32
+}
+
+/// ctxInc for `abs_level_gtx_flag[n][j]` in transform-skip mode —
+/// §9.3.4.2.9 eqs. 1576 – 1581.
+///
+/// * For `j == 0` (a.k.a. gt1): eqs. 1576 – 1580 — `64` plus the causal
+///   `sig_coeff_flag` neighbours, or `67` when BDPCM is active.
+/// * For `j > 0`: eq. 1581 — `67 + j`.
+///
+/// `sig_left` / `sig_above` are `sig_coeff_flag` at `(xC-1,yC)` /
+/// `(xC,yC-1)` (caller passes `false` when off-edge).
+pub fn ctx_inc_abs_level_gtx_flag_ts(
+    j: u32,
+    x_c: u32,
+    y_c: u32,
+    sig_left: bool,
+    sig_above: bool,
+    bdpcm: bool,
+) -> u32 {
+    if j > 0 {
+        // eq. 1581
+        return 67 + j;
+    }
+    if bdpcm {
+        // eq. 1576
+        return 67;
+    }
+    // eqs. 1577 – 1580
+    if x_c > 0 && y_c > 0 {
+        64 + sig_left as u32 + sig_above as u32
+    } else if x_c > 0 {
+        64 + sig_left as u32
+    } else if y_c > 0 {
+        64 + sig_above as u32
+    } else {
+        64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,5 +1456,89 @@ mod tests {
     #[test]
     fn cu_affine_type_flag_ctx_inc_is_zero() {
         assert_eq!(ctx_inc_cu_affine_type_flag(), 0);
+    }
+
+    /// Round-360 — transform-skip residual ctxInc derivations
+    /// (§9.3.4.2.6 / .7 / .9). `sb_coded_flag` TS branch sums the *left*
+    /// + *above* neighbours (eqs. 1564/1565) and offsets by 4 (eq. 1568).
+    #[test]
+    fn ts_sb_coded_flag_ctx_inc() {
+        assert_eq!(csbf_ctx_ts(false, false), 0);
+        assert_eq!(csbf_ctx_ts(true, false), 1);
+        assert_eq!(csbf_ctx_ts(true, true), 2);
+        assert_eq!(ctx_inc_sb_coded_flag_ts(0), 4);
+        assert_eq!(ctx_inc_sb_coded_flag_ts(2), 6);
+    }
+
+    /// `sig_coeff_flag` TS ctxInc = 60 + locNumSig (eq. 1572).
+    #[test]
+    fn ts_sig_coeff_flag_ctx_inc() {
+        assert_eq!(ctx_inc_sig_coeff_flag_ts(0), 60);
+        assert_eq!(ctx_inc_sig_coeff_flag_ts(2), 62);
+    }
+
+    /// `par_level_flag` TS ctxInc is the constant 32 (eq. 1575);
+    /// `abs_level_gtx_flag` TS ctxInc follows eqs. 1576 – 1581.
+    #[test]
+    fn ts_par_and_gtx_ctx_inc() {
+        assert_eq!(ctx_inc_par_level_flag_ts(), 32);
+        // gt1 (j=0), BDPCM on → 67 (eq. 1576).
+        assert_eq!(ctx_inc_abs_level_gtx_flag_ts(0, 1, 1, true, true, true), 67);
+        // gt1, BDPCM off, both neighbours present + significant → 64+1+1.
+        assert_eq!(
+            ctx_inc_abs_level_gtx_flag_ts(0, 1, 1, true, true, false),
+            66
+        );
+        // gt1, top-left corner (no neighbours) → 64 (eq. 1580).
+        assert_eq!(
+            ctx_inc_abs_level_gtx_flag_ts(0, 0, 0, false, false, false),
+            64
+        );
+        // gt1, only left present + significant → 64+1 (eq. 1578).
+        assert_eq!(
+            ctx_inc_abs_level_gtx_flag_ts(0, 1, 0, true, false, false),
+            65
+        );
+        // j>0 → 67 + j (eq. 1581).
+        assert_eq!(
+            ctx_inc_abs_level_gtx_flag_ts(1, 2, 2, false, false, false),
+            68
+        );
+        assert_eq!(
+            ctx_inc_abs_level_gtx_flag_ts(4, 2, 2, false, false, false),
+            71
+        );
+    }
+
+    /// §9.3.4.2.7 TS neighbourhood: locNumSig / locSumAbsPass1 sum the
+    /// causal *left* + *above* neighbours only.
+    #[test]
+    fn ts_loc_num_sig_left_above() {
+        // 4×4 layout: set (0,0)=sig with absLevel 3, (1,0) reads left.
+        let mut sig = vec![false; 16];
+        let mut a1 = vec![0u32; 16];
+        sig[0] = true; // (0,0)
+        a1[0] = 3;
+        let (num, sum) = loc_num_sig_and_sum_abs_pass1_ts(1, 0, &a1, &sig, 4);
+        assert_eq!((num, sum), (1, 3));
+        // Position (0,0) has no causal neighbours.
+        let (num0, sum0) = loc_num_sig_and_sum_abs_pass1_ts(0, 0, &a1, &sig, 4);
+        assert_eq!((num0, sum0), (0, 0));
+    }
+
+    /// §9.3.4.2.10 `coeff_sign_flag` TS ctxInc (eqs. 1588–1590).
+    #[test]
+    fn ts_coeff_sign_flag_ctx_inc() {
+        // Both signs zero → ctxInc 0 (BDPCM off) / 3 (BDPCM on).
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(0, 0, false), 0);
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(0, 0, true), 3);
+        // Opposite signs (left == -above) → ctxInc 0.
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(1, -1, false), 0);
+        // Both >= 0 (and not both zero) → ctxInc 1 / 4.
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(1, 0, false), 1);
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(1, 0, true), 4);
+        // Otherwise → ctxInc 2 / 5.
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(-1, 0, false), 2);
+        assert_eq!(ctx_inc_coeff_sign_flag_ts(-1, 0, true), 5);
     }
 }

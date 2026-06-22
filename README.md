@@ -178,7 +178,18 @@ P + B-slice merge subset:
   transform selection (MTS)** on the intra luma path — implicit MTS
   (DST-VII for 4..16, eqs. 1167/1168) plus explicit MTS (`mts_idx`
   §7.3.11.5 parse → Table-39 kernel pair), with the eqs. 1169–1172
-  non-zero-coefficient extents.
+  non-zero-coefficient extents. **Transform-skip residual coding**
+  (§7.3.11.12 `residual_ts_coding()`) is live on the intra luma path:
+  the §7.3.11.5 `transform_skip_flag` parse gate (`sps_transform_skip_
+  enabled_flag`, `tbW/tbH <= MaxTsSize`, ISP NoSplit, `!cu_sbt_flag`,
+  BDPCM off) routes a TS TB through the three-pass TS coefficient walker
+  (sb_coded_flag / sig / context-coded coeff_sign / gt1 / par in pass 1,
+  the 5-flag gtX pass, the bypass `abs_remainder` + level-prediction
+  tail) with the §9.3.4.2.6/.7/.8/.9/.10 TS ctxInc derivations (causal
+  left/above neighbourhood, sig 60+, gtx 64+, par 32, sb 4+, `RemCcbs`
+  bin budget) and the BDPCM-off level-prediction fold; reconstruction
+  bypasses the inverse transform (§8.7.4.6 `res = d`) and LFNST is
+  disabled on the TS TB (`lfnstNotTsFlag`).
 * **CABAC** — full §9.3 arithmetic engine plus per-syntax-element
   initValue / shiftIdx tables for every element currently parsed.
 * **In-loop filters** — §8.8.3 deblocking, §8.8.4 SAO (edge + band),

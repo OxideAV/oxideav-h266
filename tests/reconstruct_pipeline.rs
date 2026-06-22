@@ -2739,3 +2739,130 @@ fn reconstruct_leaf_cu_explicit_mts_changes_pixels() {
         }
     }
 }
+
+/// Round-360 — `transform_skip_flag == 1` on an intra luma TB bypasses
+/// the inverse transform: the reconstructed residual is the dequantised
+/// coefficient array directly (§8.7.4.6), not the DCT-II output. The
+/// test reconstructs the same coefficient field twice — once with
+/// `transform_skip_luma == true` (TS bypass) and once with `== false`
+/// (regular DCT-II) — and asserts (a) the pixel fields differ and (b)
+/// the TS reconstruction equals `prediction + dequant(coeffs)`.
+#[test]
+fn reconstruct_leaf_cu_transform_skip_bypasses_transform() {
+    use oxideav_h266::coding_tree::Cu;
+    use oxideav_h266::ctu::CtuCu;
+    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
+    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
+    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+
+    let mut sps = dummy_sps(0, 32, 32);
+    sps.tool_flags.transform_skip_enabled_flag = true;
+    let pps = dummy_pps(32, 32);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+
+    // A coefficient field with off-DC energy so DCT-II and pure
+    // transform-skip diverge.
+    let levels: Vec<i32> = vec![
+        4, 0, -2, 0, //
+        0, 3, 0, 0, //
+        1, 0, 0, 0, //
+        0, 0, 0, 0,
+    ];
+
+    let cu = CtuCu {
+        ctu_addr_rs: 0,
+        cu: Cu {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            cqt_depth: 0,
+            mtt_depth: 0,
+        },
+    };
+
+    let make_info = |ts: bool| LeafCuInfo {
+        x0: 0,
+        y0: 0,
+        cb_width: 4,
+        cb_height: 4,
+        pred_mode: CuPredMode::Intra,
+        intra_pred_mode_y: INTRA_PLANAR,
+        tu_y_coded_flag: true,
+        transform_skip_luma: ts,
+        ..LeafCuInfo::default()
+    };
+    let residual = LeafCuResidual {
+        luma_levels: levels.clone(),
+        ..LeafCuResidual::default()
+    };
+
+    // Regular (DCT-II) reconstruction.
+    let mut out_dct = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(false), &residual, &mut out_dct)
+            .unwrap();
+    }
+    // Transform-skip reconstruction (inverse transform bypassed).
+    let mut out_ts = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &make_info(true), &residual, &mut out_ts)
+            .unwrap();
+    }
+
+    let stride = out_dct.luma.stride;
+    let mut differs = false;
+    for y in 0..4usize {
+        for x in 0..4usize {
+            if out_dct.luma.samples[y * stride + x] != out_ts.luma.samples[y * stride + x] {
+                differs = true;
+            }
+        }
+    }
+    assert!(
+        differs,
+        "transform-skip must reconstruct differently from DCT-II"
+    );
+
+    // Golden cross-check: the TS reconstruction residual == dequant(coeffs)
+    // with transform-skip, and the DCT residual == inverse DCT-II of the
+    // dequantised coefficients. Both share the same Planar prediction, so
+    // pixel(TS) - pixel(DCT) == res_ts - res_dct at every sample.
+    let params = DequantParams {
+        bit_depth: 8,
+        log2_transform_range: 15,
+        n_tb_w: 4,
+        n_tb_h: 4,
+        qp: 26,
+        dep_quant: false,
+        transform_skip: true,
+        bdpcm: false,
+        bdpcm_dir: false,
+    };
+    let res_ts = dequantize_tb_flat(&levels, &params).unwrap();
+    let params_dct = DequantParams {
+        transform_skip: false,
+        ..params
+    };
+    let d = dequantize_tb_flat(&levels, &params_dct).unwrap();
+    let res_dct =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d, 8, 15).unwrap();
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let pix_diff = out_ts.luma.samples[y * stride + x] as i32
+                - out_dct.luma.samples[y * stride + x] as i32;
+            let res_diff = res_ts[y * 4 + x] - res_dct[y * 4 + x];
+            assert_eq!(
+                pix_diff, res_diff,
+                "TS pixel delta must equal (TS residual − DCT residual) at ({x},{y})"
+            );
+        }
+    }
+}

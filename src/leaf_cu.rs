@@ -427,9 +427,19 @@ pub struct CuToolFlags {
     pub max_tb_size_y: u32,
     /// `MinTbSizeY` — min transform block size in luma samples.
     pub min_tb_size_y: u32,
+    /// `sps_transform_skip_enabled_flag` — gates the
+    /// `transform_skip_flag` parse in `transform_unit()` (§7.3.11.5) and,
+    /// when set on a TB, routes residual decoding through
+    /// `residual_ts_coding()` (§7.3.11.12).
+    pub transform_skip_enabled: bool,
     /// `MaxTsSize` — max transform-skip block size in luma samples
     /// (§7.4.3.4 via `sps_transform_skip_enabled_flag`).
     pub max_ts_size: u32,
+    /// `sh_ts_residual_coding_rice_idx_minus1 + 1` — the fixed Rice
+    /// parameter for the `abs_remainder` binarisation in
+    /// `residual_ts_coding()` (§9.3.3.11). Defaults to 1 when the rice
+    /// idx is not present in the slice header.
+    pub ts_residual_coding_rice_idx: u32,
     /// `CtbSizeY`.
     pub ctb_size_y: u32,
     /// `sps_chroma_format_idc` (0 = monochrome).
@@ -632,6 +642,13 @@ pub struct LeafCuInfo {
     /// implicit-MTS branch derives the kernels from the TB dimensions
     /// instead and leaves this 0.
     pub mts_idx: u8,
+    /// `transform_skip_flag[x0][y0][0]` (§7.3.11.5) for the luma TB.
+    /// When set, the luma residual was parsed with `residual_ts_coding()`
+    /// (§7.3.11.12) and the inverse transform is bypassed at
+    /// reconstruction (§8.7.4.6: `res[x][y] = d[x][y]`). Distinct from
+    /// `intra_bdpcm_luma`, which also forces transform-skip but adds the
+    /// §8.7.4 BDPCM accumulation pass.
+    pub transform_skip_luma: bool,
 }
 
 impl Default for LeafCuInfo {
@@ -694,6 +711,7 @@ impl Default for LeafCuInfo {
             tu_c_res_mode: 0,
             lfnst_idx: 0,
             mts_idx: 0,
+            transform_skip_luma: false,
         }
     }
 }
@@ -3144,21 +3162,55 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
 
         // Residual decode per plane.
         if info.tu_y_coded_flag {
-            let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
-                self.dec,
-                &mut self.ctxs.residual,
-                cb_w,
-                cb_h,
-                0,
-            )?;
-            res_flags.merge(flags);
-            // Capture the last-sig position derived by the residual
-            // reader by re-reading the info from the coefficient
-            // array: the last non-zero in scan order is the last-sig.
-            // (The residual reader already reads last_sig_coeff_*; we
-            // expose a simplified record here.)
+            // §7.3.11.5 transform_skip_flag[x0][y0][0] parse gate:
+            // sps_transform_skip_enabled && !BdpcmFlag[..][0] &&
+            // tbW <= MaxTsSize && tbH <= MaxTsSize && ISP NoSplit &&
+            // !cu_sbt_flag. BDPCM already forces transform-skip via its
+            // own path (transform_skip_flag is inferred 1, not parsed),
+            // so the explicit read is gated on !intra_bdpcm_luma.
+            let ts_flag_present = self.tools.transform_skip_enabled
+                && !info.intra_bdpcm_luma
+                && (cb_w as u32) <= self.tools.max_ts_size
+                && (cb_h as u32) <= self.tools.max_ts_size
+                && info.isp_split == IspSplitType::NoSplit
+                && !info.cu_sbt_flag;
+            let transform_skip = if ts_flag_present {
+                crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 0)?
+            } else {
+                false
+            };
+            info.transform_skip_luma = transform_skip;
+
+            // §7.3.11.5: residual_ts_coding() is used when
+            // transform_skip_flag is set AND TS residual coding is not
+            // disabled for the slice; otherwise the regular
+            // residual_coding() path runs (which still carries the LFNST /
+            // MTS gating flags).
+            let levels = if transform_skip && !self.tools.ts_residual_coding_disabled {
+                crate::residual::decode_ts_tb_coefficients(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cb_w,
+                    cb_h,
+                    0,
+                    self.tools.ts_residual_coding_rice_idx,
+                    /*bdpcm=*/ false,
+                )?
+            } else {
+                let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cb_w,
+                    cb_h,
+                    0,
+                )?;
+                res_flags.merge(flags);
+                levels
+            };
             // Find max (x, y) with non-zero level as a best-effort
-            // proxy for LastSignificantCoeffX/Y.
+            // proxy for LastSignificantCoeffX/Y. (The TS path has no
+            // last-sig signalling; this proxy is only used by downstream
+            // bookkeeping that does not affect the TS reconstruction.)
             let mut lx = 0u32;
             let mut ly = 0u32;
             for y in 0..cb_h {
@@ -3308,9 +3360,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // the CB dims (the DUAL_TREE_CHROMA / ISP scaling does not apply
         // on this single-tree intra-luma path).
         let lfnst_min = cb_w.min(cb_h);
-        // lfnstNotTsFlag — transform_skip is off in this path, so the
-        // flag is always 1 here.
-        let lfnst_not_ts = true;
+        // lfnstNotTsFlag (§7.3.11.5): cleared when any coded TB of the CU
+        // used transform-skip. On this single-tree intra-luma path the
+        // luma transform_skip_flag is the relevant signal; a TS luma TB
+        // forbids LFNST.
+        let lfnst_not_ts = !info.transform_skip_luma;
         // MIP exception (§7.3.11.5): allowed when non-MIP or min dim >= 16.
         let mip_ok = !info.intra_mip_flag || lfnst_min >= 16;
         let size_ok = lfnst_min >= 4 && cb_w.max(cb_h) <= self.tools.max_tb_size_y;
@@ -3940,7 +3994,9 @@ mod tests {
             act: false,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             ctb_size_y: 128,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
@@ -4238,7 +4294,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             ..CuToolFlags::default()
         };
         let data = [0u8; 128];
@@ -4279,7 +4337,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             ..CuToolFlags::default()
         };
         let data = [0u8; 64];
@@ -4332,7 +4392,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             ..CuToolFlags::default()
         };
         let data = [0u8; 64];
@@ -4396,7 +4458,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             ibc: true,
             ..CuToolFlags::default()
         };
@@ -4437,7 +4501,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             ..CuToolFlags::default()
         };
         let data = [0u8; 256];
@@ -4483,7 +4549,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             cu_qp_delta_enabled: true,
             ..CuToolFlags::default()
         };
@@ -6424,7 +6492,9 @@ mod tests {
             ctb_size_y: 128,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
+            transform_skip_enabled: false,
             max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
             slice_is_inter: true,
             max_num_merge_cand: 6,
             max_num_subblock_merge_cand,
