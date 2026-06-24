@@ -1596,6 +1596,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.cabac.slice_qp_y
     }
 
+    /// §7.4.3.22 eq. 106 `Log2TransformRange` for this stream's bit depth.
+    ///
+    /// `15` for the common path; when the optional `sps_range_extension()`
+    /// block sets `sps_extended_precision_flag`, the extended-precision
+    /// range `Max(15, Min(20, BitDepth + 6))` applies (only reachable
+    /// when `BitDepth > 10`). Drives the dequant clip + the inverse-
+    /// transform intermediate clamp at every coded-TB call site.
+    pub fn log2_transform_range(&self) -> u32 {
+        let bit_depth = self.sps.sps_bitdepth_minus8 + 8;
+        match &self.sps.range_extension {
+            Some(rx) => rx.log2_transform_range(bit_depth),
+            None => 15,
+        }
+    }
+
     /// Whether the slice header signalled the alternative CABAC init
     /// table for P/B. Always `false` in the intra-only scaffold.
     pub fn sh_cabac_init_flag(&self) -> bool {
@@ -1862,9 +1877,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // transform (§8.7.4.6: res[x][y] = d[x][y]) but without the
             // BDPCM accumulation pass.
             let transform_skip = info.intra_bdpcm_luma || info.transform_skip_luma;
+            let log2_tr_range = self.log2_transform_range();
             let params = DequantParams {
                 bit_depth,
-                log2_transform_range: 15,
+                log2_transform_range: log2_tr_range,
                 n_tb_w: n_tb_w as u32,
                 n_tb_h: n_tb_h as u32,
                 qp,
@@ -1888,7 +1904,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // dimensions, so both square and non-square intra TBs run
                 // through the inverse LFNST.
                 // CoeffMin / CoeffMax for the active Log2TransformRange.
-                let max_c = (1i32 << 15) - 1;
+                let max_c = (1i32 << log2_tr_range) - 1;
                 crate::lfnst::apply_inverse_lfnst(
                     &mut d,
                     n_tb_w,
@@ -1941,7 +1957,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     )
                 };
                 inverse_transform_2d(
-                    n_tb_w, n_tb_h, non_zero_w, non_zero_h, tr_h, tr_v, &d, bit_depth, 15,
+                    n_tb_w,
+                    n_tb_h,
+                    non_zero_w,
+                    non_zero_h,
+                    tr_h,
+                    tr_v,
+                    &d,
+                    bit_depth,
+                    log2_tr_range,
                 )?
             }
         } else {
@@ -3736,9 +3760,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             );
             chroma_qp_identity(qp_y, qp_offset)
         };
+        let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
             bit_depth,
-            log2_transform_range: 15,
+            log2_transform_range: log2_tr_range,
             n_tb_w: n_tb_w as u32,
             n_tb_h: n_tb_h as u32,
             qp,
@@ -3761,7 +3786,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             16
         });
         let res = inverse_transform_2d(
-            n_tb_w, n_tb_h, non_zero_w, non_zero_h, tr_h, tr_v, &d, bit_depth, 15,
+            n_tb_w,
+            n_tb_h,
+            non_zero_w,
+            non_zero_h,
+            tr_h,
+            tr_v,
+            &d,
+            bit_depth,
+            log2_tr_range,
         )?;
         // §8.7.5.1 — recSamples = Clip1(predSamples + resSamples). The
         // plane already holds predSamples; read each sample as pred,
@@ -3842,9 +3875,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let joint_offset =
             self.pps.pps_joint_cbcr_qp_offset_value + self.sh.sh_joint_cbcr_qp_offset;
         let qp = chroma_qp_identity(qp_y, joint_offset);
+        let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
             bit_depth,
-            log2_transform_range: 15,
+            log2_transform_range: log2_tr_range,
             n_tb_w: c_w as u32,
             n_tb_h: c_h as u32,
             qp,
@@ -3873,14 +3907,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 &d,
                 coded,
                 bit_depth,
-                15,
+                log2_tr_range,
             )?;
-            eprintln!(
-                "DBG c_idx={} res={:?} sign={}",
-                c_idx,
-                &res[..8.min(res.len())],
-                self.ph_joint_cbcr_sign
-            );
             let plane = match c_idx {
                 1 => &mut out.cb,
                 _ => &mut out.cr,
@@ -4295,9 +4323,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let residual_samples: Vec<i32> = if sub.tu_y_coded_flag && !sub.levels.is_empty() {
                 let qp = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
                 let qp = qp.clamp(0, 63);
+                let log2_tr_range = self.log2_transform_range();
                 let params = DequantParams {
                     bit_depth,
-                    log2_transform_range: 15,
+                    log2_transform_range: log2_tr_range,
                     n_tb_w: p.n_w,
                     n_tb_h: p.n_h,
                     qp,
@@ -4316,7 +4345,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     TrType::DctII,
                     &d,
                     bit_depth,
-                    15,
+                    log2_tr_range,
                 )?
             } else {
                 vec![0i32; n_w * n_h]
@@ -4534,9 +4563,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     _ => false,
                 };
                 let transform_skip = info.intra_bdpcm_chroma || plane_ts;
+                let log2_tr_range = self.log2_transform_range();
                 let params = DequantParams {
                     bit_depth,
-                    log2_transform_range: 15,
+                    log2_transform_range: log2_tr_range,
                     n_tb_w: n_tb_w as u32,
                     n_tb_h: n_tb_h as u32,
                     qp,
@@ -4564,7 +4594,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         TrType::DctII,
                         &d,
                         bit_depth,
-                        15,
+                        log2_tr_range,
                     )?
                 }
             } else {
@@ -6777,6 +6807,47 @@ mod tests {
         assert_eq!(cu_chroma_qp_offset(1, true, 9, &cb, &cr), 0);
         // Empty list → 0.
         assert_eq!(cu_chroma_qp_offset(1, true, 0, &[], &[]), 0);
+    }
+
+    /// §7.4.3.22 eq. 106 — the walker's `log2_transform_range()` returns
+    /// 15 for an SPS with no range-extension block, and the extended
+    /// `Max(15, Min(20, BitDepth + 6))` when `sps_extended_precision_flag`
+    /// is set on a high-bit-depth SPS.
+    #[test]
+    fn walker_log2_transform_range_honours_extended_precision() {
+        use crate::sps::SpsRangeExtension;
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let sh = intra_slice_header();
+        let data = [0u8; 32];
+
+        // No range-extension block → 15 regardless of bit depth.
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        assert_eq!(w.log2_transform_range(), 15);
+
+        // Extended precision at BitDepth 12 → Max(15, Min(20, 18)) = 18.
+        let mut sps12 = dummy_sps(1, pic_w, pic_h);
+        sps12.sps_bitdepth_minus8 = 4; // BitDepth = 12
+        sps12.sps_range_extension_flag = true;
+        sps12.range_extension = Some(SpsRangeExtension {
+            sps_extended_precision_flag: true,
+            ..Default::default()
+        });
+        let layout12 = CtuLayout::from_sps_pps(&sps12, &pps);
+        let w12 = CtuWalker::begin_slice(&layout12, &sps12, &pps, &sh, 0, &data).unwrap();
+        assert_eq!(w12.log2_transform_range(), 18);
+
+        // Extended precision flag off → 15 even with the block present.
+        let mut sps_off = dummy_sps(1, pic_w, pic_h);
+        sps_off.sps_bitdepth_minus8 = 4;
+        sps_off.sps_range_extension_flag = true;
+        sps_off.range_extension = Some(SpsRangeExtension::default());
+        let layout_off = CtuLayout::from_sps_pps(&sps_off, &pps);
+        let w_off = CtuWalker::begin_slice(&layout_off, &sps_off, &pps, &sh, 0, &data).unwrap();
+        assert_eq!(w_off.log2_transform_range(), 15);
     }
 
     /// MIP-flagged CU now flows through the §8.4.5.2.2 matrix-based
