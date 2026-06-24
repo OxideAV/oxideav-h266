@@ -457,11 +457,11 @@ pub fn parse_slice_header_stateful(
 
     // sh_dep_quant_used_flag, sh_sign_data_hiding_used_flag,
     // sh_ts_residual_coding_disabled_flag, sh_ts_residual_coding_rice_idx_minus1,
-    // sh_reverse_last_sig_coeff_flag — §7.3.7 tail. The SPS range-extension
+    // sh_reverse_last_sig_coeff_flag — §7.3.7 tail. The two range-extension
     // gates (`sps_ts_residual_coding_rice_present_in_sh_flag`,
-    // `sps_reverse_last_sig_coeff_enabled_flag`) are not yet parsed by
-    // our SPS, so both are treated as 0 (the inference when
-    // `sps_range_extension_flag == 0`, §7.4.3.22).
+    // `sps_reverse_last_sig_coeff_enabled_flag`) live in the optional
+    // `sps_range_extension()` block (§7.3.2.22); when the block is absent
+    // both infer to 0 (§7.4.3.22) and the two reads below are skipped.
     if sps.tool_flags.dep_quant_enabled_flag {
         out.sh_dep_quant_used_flag = br.u1()? == 1;
     }
@@ -474,8 +474,26 @@ pub fn parse_slice_header_stateful(
     {
         out.sh_ts_residual_coding_disabled_flag = br.u1()? == 1;
     }
-    // sh_ts_residual_coding_rice_idx_minus1 / sh_reverse_last_sig_coeff_flag
-    // are gated by range-extension SPS flags that default to 0; left unset.
+    // §7.3.7: `sh_ts_residual_coding_rice_idx_minus1` is present iff
+    // `!sh_ts_residual_coding_disabled_flag &&
+    //  sps_ts_residual_coding_rice_present_in_sh_flag`. When absent it
+    // infers to 0 (§7.4.8). `sh_reverse_last_sig_coeff_flag` is present
+    // iff `sps_reverse_last_sig_coeff_enabled_flag`; absent → 0 (§7.4.8).
+    // Both range-extension gates come from the `sps_range_extension()`
+    // payload, which is `None` unless `sps_range_extension_flag == 1`.
+    let (rice_present_in_sh, reverse_last_sig_enabled) = match &sps.range_extension {
+        Some(rx) => (
+            rx.sps_ts_residual_coding_rice_present_in_sh_flag,
+            rx.sps_reverse_last_sig_coeff_enabled_flag,
+        ),
+        None => (false, false),
+    };
+    if !out.sh_ts_residual_coding_disabled_flag && rice_present_in_sh {
+        out.sh_ts_residual_coding_rice_idx_minus1 = br.u(3)? as u8;
+    }
+    if reverse_last_sig_enabled {
+        out.sh_reverse_last_sig_coeff_flag = br.u1()? == 1;
+    }
 
     // Slice-header extension: length + data bytes.
     if pps.pps_slice_header_extension_present_flag {
@@ -886,6 +904,85 @@ mod tests {
         assert!(sh.sh_dep_quant_used_flag);
         assert!(!sh.sh_sign_data_hiding_used_flag);
         assert!(!sh.sh_ts_residual_coding_disabled_flag);
+    }
+
+    /// §7.3.7 range-extension tail: with `sps_range_extension()` present
+    /// and both gates set, the parser must consume the `u(3)`
+    /// `sh_ts_residual_coding_rice_idx_minus1` (only when TS residual
+    /// coding is *not* disabled) and the `u(1)`
+    /// `sh_reverse_last_sig_coeff_flag`.
+    #[test]
+    fn stateful_tail_reads_range_extension_gates() {
+        use crate::sps::SpsRangeExtension;
+        let (mut sps, pps) = synthetic_sps_pps();
+        sps.tool_flags.transform_skip_enabled_flag = true;
+        sps.sps_range_extension_flag = true;
+        sps.range_extension = Some(SpsRangeExtension {
+            sps_extended_precision_flag: false,
+            sps_ts_residual_coding_rice_present_in_sh_flag: true,
+            sps_rrc_rice_extension_flag: false,
+            sps_persistent_rice_adaptation_enabled_flag: false,
+            sps_reverse_last_sig_coeff_enabled_flag: true,
+        });
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_u(&mut bits, 0, 1); // sh_ts_residual_coding_disabled_flag = 0
+        push_u(&mut bits, 5, 3); // sh_ts_residual_coding_rice_idx_minus1 = 5
+        push_u(&mut bits, 1, 1); // sh_reverse_last_sig_coeff_flag = 1
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(!sh.sh_ts_residual_coding_disabled_flag);
+        assert_eq!(sh.sh_ts_residual_coding_rice_idx_minus1, 5);
+        assert!(sh.sh_reverse_last_sig_coeff_flag);
+    }
+
+    /// §7.3.7 range-extension tail, disabled-TS branch: when
+    /// `sh_ts_residual_coding_disabled_flag == 1` the `u(3)` rice idx is
+    /// *not* present even though the SPS gate is set; only the reverse-
+    /// last-sig flag (its own independent gate) is read.
+    #[test]
+    fn stateful_tail_skips_rice_idx_when_ts_disabled() {
+        use crate::sps::SpsRangeExtension;
+        let (mut sps, pps) = synthetic_sps_pps();
+        sps.tool_flags.transform_skip_enabled_flag = true;
+        sps.sps_range_extension_flag = true;
+        sps.range_extension = Some(SpsRangeExtension {
+            sps_extended_precision_flag: false,
+            sps_ts_residual_coding_rice_present_in_sh_flag: true,
+            sps_rrc_rice_extension_flag: false,
+            sps_persistent_rice_adaptation_enabled_flag: false,
+            sps_reverse_last_sig_coeff_enabled_flag: true,
+        });
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_u(&mut bits, 1, 1); // sh_ts_residual_coding_disabled_flag = 1
+                                 // rice idx suppressed (TS coding disabled)
+        push_u(&mut bits, 1, 1); // sh_reverse_last_sig_coeff_flag = 1
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(sh.sh_ts_residual_coding_disabled_flag);
+        assert_eq!(sh.sh_ts_residual_coding_rice_idx_minus1, 0);
+        assert!(sh.sh_reverse_last_sig_coeff_flag);
     }
 
     /// Multi-tile partitioned PPS: when NumTilesInPic > 1 under
