@@ -226,6 +226,113 @@ impl MotionField {
     }
 }
 
+/// Per-CB affine motion record — the data §8.5.5.7 step 4 / step 5 and
+/// §8.5.5.5 read from a neighbouring affine-coded CB: its origin, its
+/// dimensions, its `MotionModelIdc`, and its per-list CPMV set +
+/// prediction flags + reference indices.
+///
+/// The spec keeps these as per-position picture-wide arrays
+/// (`CbPosX[0][x][y]`, `CbWidth[0][x][y]`, `MotionModelIdc[x][y]`,
+/// `MvCpLX`, `PredFlagLX[x][y]`, `RefIdxLX[x][y]`). We capture the
+/// per-CB tuple once and broadcast it across every 4x4 block the CB
+/// covers in an [`AffineCpmvField`], so a later CU's §8.5.5.7
+/// inherited-CPMVP scan can sample a neighbour position and recover the
+/// covering CB's `(xNb, yNb, nbW, nbH, model, cpmvs)` exactly as the
+/// spec's per-position array lookups would.
+#[derive(Clone, Copy, Debug)]
+pub struct AffineCbRecord {
+    /// `CbPosX[0][·]` — top-left luma X of the covering CB.
+    pub xnb: i32,
+    /// `CbPosY[0][·]` — top-left luma Y of the covering CB.
+    pub ynb: i32,
+    /// `CbWidth[0][·]` — width of the covering CB in luma samples.
+    pub nb_w: u32,
+    /// `CbHeight[0][·]` — height of the covering CB in luma samples.
+    pub nb_h: u32,
+    /// `MotionModelIdc[·]` — 4- or 6-parameter affine. Never
+    /// `Translational` for a record stored here (a translational CB
+    /// leaves the cell `None`).
+    pub model: crate::affine::MotionModel,
+    /// `PredFlagL0[·]`.
+    pub pred_flag_l0: bool,
+    /// `PredFlagL1[·]`.
+    pub pred_flag_l1: bool,
+    /// `RefIdxL0[·]` — `-1` when `!pred_flag_l0`.
+    pub ref_idx_l0: i32,
+    /// `RefIdxL1[·]` — `-1` when `!pred_flag_l1`.
+    pub ref_idx_l1: i32,
+    /// The CB's L0 control-point MV record (`MvCpL0`). Only meaningful
+    /// when `pred_flag_l0`.
+    pub cpmvs_l0: crate::affine::AffineCpmvs,
+    /// The CB's L1 control-point MV record (`MvCpL1`).
+    pub cpmvs_l1: crate::affine::AffineCpmvs,
+}
+
+/// Per-picture per-CB affine CPMV store, sampled at 4x4 luma
+/// granularity (the same grid [`MotionField`] uses). A cell is `None`
+/// until an affine-coded CB broadcasts its [`AffineCbRecord`] across
+/// the 4x4 blocks it covers; translational and intra CBs leave their
+/// cells `None`.
+///
+/// This is the storage the round-364 §8.5.5.7 inherited-affine-CPMVP
+/// scan needs: a later CU samples the A0/A1/B0/B1/B2 neighbour
+/// positions, recovers the covering CB's affine record, and feeds it
+/// into [`crate::affine_amvp::derive_inherited_affine_mvp_candidate`].
+#[derive(Clone, Debug)]
+pub struct AffineCpmvField {
+    /// Width in 4x4 blocks.
+    pub blocks_w: u32,
+    /// Height in 4x4 blocks.
+    pub blocks_h: u32,
+    /// Row-major storage; `field[y * blocks_w + x]`. `None` == the
+    /// covering CB is not affine (the §8.5.5.7 `MotionModelIdc > 0`
+    /// gate fails for a sample landing here).
+    pub field: Vec<Option<AffineCbRecord>>,
+}
+
+impl AffineCpmvField {
+    pub fn new(pic_w_luma: u32, pic_h_luma: u32) -> Self {
+        let bw = pic_w_luma.div_ceil(4);
+        let bh = pic_h_luma.div_ceil(4);
+        Self {
+            blocks_w: bw,
+            blocks_h: bh,
+            field: vec![None; (bw * bh) as usize],
+        }
+    }
+
+    /// Sample at picture-absolute luma `(x, y)` — returns the
+    /// [`AffineCbRecord`] of the 4x4 block containing that sample, or
+    /// `None` when out of bounds or the covering CB is not affine.
+    pub fn get_at_luma(&self, x: i32, y: i32) -> Option<AffineCbRecord> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.blocks_w || by >= self.blocks_h {
+            return None;
+        }
+        self.field[(by * self.blocks_w + bx) as usize]
+    }
+
+    /// Broadcast `rec` (or `None`) into every 4x4 block touched by the
+    /// rectangle `[x, x+w) x [y, y+h)` (luma units). Out-of-bounds
+    /// writes are clipped silently. Writing `None` (a translational /
+    /// intra CB) clears any prior affine record on the covered cells.
+    pub fn write_block(&mut self, x: u32, y: u32, w: u32, h: u32, rec: Option<AffineCbRecord>) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.blocks_w);
+        let by1 = (y + h).div_ceil(4).min(self.blocks_h);
+        for by in by0..by1 {
+            for bx in bx0..bx1 {
+                self.field[(by * self.blocks_w + bx) as usize] = rec;
+            }
+        }
+    }
+}
+
 /// Reference picture used by the inter-prediction MC. A 4:2:0 frame
 /// snapshot, the picture's POC, and (round-25) the per-block MotionField
 /// captured at the time the picture was decoded — needed by §8.5.2.11

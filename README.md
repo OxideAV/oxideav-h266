@@ -158,14 +158,24 @@ P + B-slice merge subset:
   `cumulate_affine_mvd_cp`), folds predictor + cumulative MVD into the
   final CPMVs (eqs. 664 – 667, `derive_final_affine_cpmvs`), and drives
   the uni / bi-pred affine MC — so affine inter CUs now decode from
-  parsed CPMV deltas end-to-end. The §8.5.5.7 inherited / constructed
-  affine-neighbour candidates need a per-CB affine CPMV store not yet
-  kept in the `MotionField`, so they currently resolve to `None` (the
-  list falls through to the §8.5.5.7 step-8 temporal MV + step-9 zero-MV
-  pad — exact for the common non-affine-neighbour case); threading the
-  per-CB affine CPMV store and BCW / BDOF on the affine path remain
-  follow-ups. Transform-skip inter residual (`residual_ts_coding`,
-  §7.3.11.12) still surfaces `Error::Unsupported`.
+  parsed CPMV deltas end-to-end. **Inherited affine CPMVP** (§8.5.5.7
+  steps 4 / 5) is now **live**: a per-CB affine CPMV store
+  (`inter::AffineCpmvField`, a 4×4-granularity grid of
+  `inter::AffineCbRecord` mirroring `CbPosX/Y[0][·]`, `CbWidth/Height[0][·]`,
+  `MotionModelIdc[·]`, `MvCpLX`, `PredFlagLX[·]`, `RefIdxLX[·]`) is
+  broadcast by every affine AMVP CB across the blocks it covers and
+  cleared (to `None`) by translational-inter and intra CBs. The
+  §8.5.5.7 A-scan (eqs. 819 / 820 — A0, A1) and B-scan (eqs. 821 – 823
+  — B0, B1, B2) sample those neighbour positions, gate them on the
+  parallel-merge suppression (eq. 60) + the `DiffPicOrderCnt == 0`
+  cross-list test, and feed the §8.5.5.5 inherited-CPMVP derivation
+  (with the eqs. 736 – 739 `isCTUboundary` bottom-row path computed from
+  `(yNb + nNbH) % CtbSizeY`), so a CU with an affine neighbour now picks
+  the inherited predictor (eqs. 824 / 826 / 828 / 830 / 840) instead of
+  the step-9 zero-MV pad. The §8.5.5.8 **constructed** CPMVP candidate,
+  the affine-merge path's contribution to the store, and BCW / BDOF on
+  the affine path remain follow-ups. Transform-skip inter residual
+  (`residual_ts_coding`, §7.3.11.12) still surfaces `Error::Unsupported`.
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, the §8.7.4.6 inverse

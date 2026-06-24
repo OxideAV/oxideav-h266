@@ -696,6 +696,15 @@ pub struct CtuWalker<'a, 'b> {
     /// InterAffineFlag[...]` ctxInc only needs a one-line drop-in
     /// when the affine-inter walker arrives.
     inter_affine_grid: Vec<bool>,
+    /// Round-364 — per-CB affine CPMV store sampled at 4x4 luma
+    /// granularity (§8.5.5.7 / §8.5.5.5). Every affine-coded CB
+    /// broadcasts its [`crate::inter::AffineCbRecord`] (origin, dims,
+    /// `MotionModelIdc`, per-list CPMV set + pred flags + ref indices)
+    /// across the 4x4 blocks it covers; later CUs sample the
+    /// A0/A1/B0/B1/B2 neighbour positions during the §8.5.5.7
+    /// inherited-CPMVP scan. Translational / intra CBs clear their
+    /// covered cells to `None`.
+    affine_cpmv_field: crate::inter::AffineCpmvField,
     /// Round-56 — picture-wide CU neighbour map used by the
     /// [`TreeWalker`] to derive the §9.3.4.2 ctxInc. Populated as each
     /// CTU's leaf CUs commit; `decode_ctu_partitions` hands a `&mut`
@@ -827,6 +836,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // unavailable neighbour.
         let subblock_merge_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let inter_affine_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        // Round-364 — per-CB affine CPMV store (§8.5.5.7 / §8.5.5.5).
+        // Same 4x4 grid geometry as the motion field; every cell starts
+        // `None` (covering CB not affine).
+        let affine_cpmv_field =
+            crate::inter::AffineCpmvField::new(layout.pic_width_luma, layout.pic_height_luma);
         // §7.4.3.5 — Log2ParMrgLevel = pps_log2_parallel_merge_level_minus2
         // + 2. Our PPS parser does not yet surface that field, so we
         // default to the spec minimum (2 → ParMrgLevel = 4) which is
@@ -862,6 +876,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             intra_grid_h,
             subblock_merge_grid,
             inter_affine_grid,
+            affine_cpmv_field,
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
         })
     }
@@ -922,6 +937,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             for bx in bx0..bx1 {
                 self.intra_grid[row_off + bx as usize] = is_intra;
             }
+        }
+        // Round-364 — an intra CB is never affine; clear any stale
+        // per-CB affine record on its cells so a later §8.5.5.7 scan
+        // reads this region as non-affine (`MotionModelIdc == 0`).
+        if is_intra {
+            self.affine_cpmv_field.write_block(x, y, w, h, None);
         }
     }
 
@@ -2692,6 +2713,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
         self.motion_field
             .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, mvf);
+        // Round-364 — this merge / skip / non-affine inter CU is
+        // translational (`MotionModelIdc == 0`), so clear any stale
+        // affine record on the cells it covers. A later CU's §8.5.5.7
+        // scan must see this region as non-affine (the `MotionModelIdc
+        // > 0` gate fails ⇒ no inherited candidate from here).
+        self.affine_cpmv_field
+            .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, None);
 
         // Round-24 §8.5.2.16 — push the just-decoded inter CU's
         // motion field into the per-slice HMVP table. Subsequent
@@ -3071,10 +3099,119 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ///    [`Self::reconstruct_affine_inter_bi`] (bi-pred, §8.5.6.6.2
     ///    eq. 980 default-weighted average).
     ///
+    /// §8.5.5.7 step-4 / step-5 neighbour query — sample the per-CB
+    /// affine CPMV store at `(xnb, ynb)` and assemble a
+    /// [`crate::affine_amvp::NeighbourAffineQuery`].
+    ///
+    /// Returns `None` when the sample is out of bounds or the covering
+    /// CB is not affine (`MotionModelIdc == 0` ⇒ the §8.5.5.7 gate
+    /// fails). The §6.4.4 availability is satisfied by construction: the
+    /// store only carries CBs already decoded in slice raster order, so
+    /// any non-`None` cell is causally available to the current CU. The
+    /// §8.5.5.7 parallel-merge suppression (eq. 60) is folded in by the
+    /// caller via `available`.
+    fn affine_neighbour_query(
+        &self,
+        xnb: i32,
+        ynb: i32,
+        xcb: i32,
+        ycb: i32,
+    ) -> Option<crate::affine_amvp::NeighbourAffineQuery> {
+        let rec = self.affine_cpmv_field.get_at_luma(xnb, ynb)?;
+        // §8.5.5.7 parallel-merge suppression (eq. 60): a neighbour in
+        // the same Log2ParMrgLevel region as the current CU is
+        // unavailable. ParMrgLevel masks the low bits of the position.
+        let par = self.log2_par_mrg_level;
+        let same_par = (xcb >> par) == (xnb >> par) && (ycb >> par) == (ynb >> par);
+        Some(crate::affine_amvp::NeighbourAffineQuery {
+            available: !same_par,
+            pred_flag_l0: rec.pred_flag_l0,
+            pred_flag_l1: rec.pred_flag_l1,
+            ref_idx_l0: rec.ref_idx_l0,
+            ref_idx_l1: rec.ref_idx_l1,
+            xnb: rec.xnb,
+            ynb: rec.ynb,
+            nb_w: rec.nb_w,
+            nb_h: rec.nb_h,
+            motion_model: rec.model,
+            cpmvs_l0: rec.cpmvs_l0,
+            cpmvs_l1: rec.cpmvs_l1,
+        })
+    }
+
+    /// §8.5.5.5 `isCTUboundary` for a neighbour CB whose covering
+    /// origin/dims are `(xnb, ynb, _, nb_h)` relative to the current
+    /// CU top `ycb`. TRUE iff `(yNb + nNbH) % CtbSizeY == 0` AND
+    /// `yNb + nNbH == yCb` (eqs. above 734).
+    fn affine_is_ctu_boundary_above(&self, ynb: i32, nb_h: u32, ycb: i32) -> bool {
+        let ctb = self.layout.ctb_size_y as i32;
+        let bottom = ynb + nb_h as i32;
+        bottom % ctb == 0 && bottom == ycb
+    }
+
+    /// §8.5.5.7 inherited scan over one side's ordered positions (A-side
+    /// = {A0, A1}, B-side = {B0, B1, B2}). Returns the first
+    /// effectively-available affine neighbour's inherited CPMVP
+    /// candidate (already AMVR-rounded), or `None` when no position
+    /// yields one. `ctx` carries the §8.5.5.7 `DiffPicOrderCnt == 0`
+    /// cross-list gate.
+    #[allow(clippy::too_many_arguments)]
+    fn derive_inherited_affine_side(
+        &self,
+        positions: &[(i32, i32)],
+        xcb: i32,
+        ycb: i32,
+        cb_w: u32,
+        cb_h: u32,
+        ctx: &crate::affine_amvp::AffineMvpRefContext<'_>,
+        amvr: crate::amvr::AmvrShift,
+        num_cp_mv: u32,
+    ) -> Option<crate::affine_amvp::AffineMvpCandidate> {
+        for &(xnb, ynb) in positions {
+            let Some(nb) = self.affine_neighbour_query(xnb, ynb, xcb, ycb) else {
+                continue;
+            };
+            let is_boundary = self.affine_is_ctu_boundary_above(nb.ynb, nb.nb_h, ycb);
+            if let Some(cand) = crate::affine_amvp::derive_inherited_affine_mvp_candidate(
+                xcb,
+                ycb,
+                cb_w,
+                cb_h,
+                &nb,
+                ctx,
+                amvr,
+                num_cp_mv,
+                is_boundary,
+            ) {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    /// Broadcast the final-decided affine CB record into the per-CB
+    /// affine CPMV store (§8.5.5.7 / §8.5.5.5 source for later CUs).
+    /// `model` is the CU's `MotionModelIdc`; the per-list CPMVs / pred
+    /// flags / ref indices are the post-fold (`derive_final_affine_cpmvs`)
+    /// values. Translational / non-affine CBs should not call this; the
+    /// motion-field write path leaves their cells `None`.
+    #[allow(clippy::too_many_arguments)]
+    fn store_affine_cb(
+        &mut self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        rec: crate::inter::AffineCbRecord,
+    ) {
+        self.affine_cpmv_field
+            .write_block(cb_x, cb_y, cb_w, cb_h, Some(rec));
+    }
+
     /// Scope: 4:2:0 chroma, no residual add (the caller layers residual
     /// via the regular tail), BCW / BDOF on the affine path deferred.
     pub fn reconstruct_leaf_cu_inter_affine_amvp(
-        &self,
+        &mut self,
         cb_x: u32,
         cb_y: u32,
         cb_w: u32,
@@ -3134,12 +3271,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let temporal_col =
                 slf.derive_amvp_col_candidate(xcb, ycb, cbw, cbh, current_ref_poc, amvr);
 
-            // §8.5.5.7 — inherited / constructed affine neighbour
-            // candidates need a per-CB affine CPMV store not yet kept in
-            // the MotionField, so they're `None`; the §8.5.5.7 step-8 /
-            // step-9 tail (temporal + zero pad) produces the predictor.
-            // The ref-context is built for completeness / future use.
-            let _ctx = AffineMvpRefContext {
+            // §8.5.5.7 steps 4 / 5 — inherited affine CPMVP candidates,
+            // recovered from the per-CB affine CPMV store. The store
+            // carries every previously-decoded affine CB's CPMV record;
+            // the A-scan {A0, A1} and B-scan {B0, B1, B2} sample the
+            // §8.5.5.7 eq. 819 – 823 neighbour positions and feed the
+            // §8.5.5.5 inherited derivation. Constructed CPMVP
+            // (§8.5.5.8) remains deferred; when neither inherited side
+            // hits, the list falls through to the step-8 temporal MV +
+            // step-9 zero-MV pad.
+            let ctx = AffineMvpRefContext {
                 list,
                 current_ref_poc,
                 poc_of_l0_ref: &|idx: i32| -> Option<i32> {
@@ -3158,10 +3299,41 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 },
             };
 
+            // §8.5.5.7 eqs. 819 – 823 neighbour positions.
+            let a_positions = [
+                (xcb - 1, ycb + cbh),     // A0 (eq. 819)
+                (xcb - 1, ycb + cbh - 1), // A1 (eq. 820)
+            ];
+            let b_positions = [
+                (xcb + cbw, ycb - 1),     // B0 (eq. 821)
+                (xcb + cbw - 1, ycb - 1), // B1 (eq. 822)
+                (xcb - 1, ycb - 1),       // B2 (eq. 823)
+            ];
+            let inherited_a = slf.derive_inherited_affine_side(
+                &a_positions,
+                xcb,
+                ycb,
+                cb_w,
+                cb_h,
+                &ctx,
+                amvr,
+                num_cp_mv,
+            );
+            let inherited_b = slf.derive_inherited_affine_side(
+                &b_positions,
+                xcb,
+                ycb,
+                cb_w,
+                cb_h,
+                &ctx,
+                amvr,
+                num_cp_mv,
+            );
+
             let list_lx = build_affine_mvp_cand_list(AffineMvpListInputs {
                 num_cp_mv,
-                inherited_a: None,
-                inherited_b: None,
+                inherited_a,
+                inherited_b,
                 constructed_full: None,
                 constructed_corners: Default::default(),
                 temporal_col,
@@ -3176,7 +3348,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             Ok((cpmvs, ref_pic))
         };
 
-        match (use_l0, use_l1) {
+        // Capture per-list final CPMVs so the affine CB record can be
+        // broadcast into the per-CB store after reconstruction (§8.5.5.7
+        // source for later CUs). `None` for an inactive list.
+        let mut store_cpmvs_l0: Option<crate::affine::AffineCpmvs> = None;
+        let mut store_cpmvs_l1: Option<crate::affine::AffineCpmvs> = None;
+
+        let recon_result = match (use_l0, use_l1) {
             (true, false) => {
                 let (cpmvs, ref_pic) = derive_one_list(
                     self,
@@ -3185,6 +3363,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     decision.mvp.mvp_l0_flag,
                     &decision.mvd_cp_l0,
                 )?;
+                store_cpmvs_l0 = Some(cpmvs);
                 self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
             }
             (false, true) => {
@@ -3195,6 +3374,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     decision.mvp.mvp_l1_flag,
                     &decision.mvd_cp_l1,
                 )?;
+                store_cpmvs_l1 = Some(cpmvs);
                 self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
             }
             (true, true) => {
@@ -3212,6 +3392,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     decision.mvp.mvp_l1_flag,
                     &decision.mvd_cp_l1,
                 )?;
+                store_cpmvs_l0 = Some(cpmvs_l0);
+                store_cpmvs_l1 = Some(cpmvs_l1);
                 self.reconstruct_affine_inter_bi(
                     cb_x,
                     cb_y,
@@ -3227,7 +3409,41 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             (false, false) => Err(Error::invalid(
                 "h266 affine amvp: neither list active (inter_pred_idc invalid)",
             )),
-        }
+        };
+        recon_result?;
+
+        // Broadcast the affine CB record into the per-CB CPMV store so
+        // later CUs' §8.5.5.7 inherited scan can recover this block's
+        // CPMVs (§8.5.5.5). The zero-CPMV record kept for an inactive
+        // list is harmless — its pred-flag is `false`, so the §8.5.5.7
+        // `PredFlagLX == 1` gate skips it.
+        let zero_cpmvs = crate::affine::AffineCpmvs {
+            model: motion_model,
+            cpmvs: [crate::inter::MotionVector::ZERO; 3],
+        };
+        let rec = crate::inter::AffineCbRecord {
+            xnb: xcb,
+            ynb: ycb,
+            nb_w: cb_w,
+            nb_h: cb_h,
+            model: motion_model,
+            pred_flag_l0: use_l0,
+            pred_flag_l1: use_l1,
+            ref_idx_l0: if use_l0 {
+                decision.mvp.ref_idx_l0 as i32
+            } else {
+                -1
+            },
+            ref_idx_l1: if use_l1 {
+                decision.mvp.ref_idx_l1 as i32
+            } else {
+                -1
+            },
+            cpmvs_l0: store_cpmvs_l0.unwrap_or(zero_cpmvs),
+            cpmvs_l1: store_cpmvs_l1.unwrap_or(zero_cpmvs),
+        };
+        self.store_affine_cb(cb_x, cb_y, cb_w, cb_h, rec);
+        Ok(())
     }
 
     /// §8.5.6.6.2 eq. 980 default-weighted average of two co-located
@@ -5591,6 +5807,193 @@ mod tests {
             any,
             "the affine bi-pred fuse must produce a non-trivial prediction"
         );
+    }
+
+    /// §8.5.5.7 inherited affine CPMVP — round-364 per-CB affine CPMV
+    /// store. A first affine CB at the left-neighbour position writes
+    /// its CPMV record into the store; a second affine CB then samples
+    /// that neighbour (position A1 = (xCb − 1, yCb + cbHeight − 1)) in
+    /// the §8.5.5.7 step-4 A-scan, so its `mvp_l0_flag == 0` predictor
+    /// is the **inherited** candidate (eqs. 824 / 840) rather than the
+    /// step-9 zero-MV pad. The inherited predictor must change the
+    /// second CU's output relative to a zero-pad-only baseline, and the
+    /// store must report the first CB's record at the queried position.
+    #[test]
+    fn affine_amvp_inherited_cpmvp_from_per_cb_store() {
+        use crate::affine_syntax_enc::make_non_merge_inter_affine_decision;
+        use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision;
+        use crate::non_merge_mvp_syntax_enc::make_non_merge_mvp_syntax_decision;
+
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
+
+        // ---- First affine CB at (0, 16) size 16x16 -------------------
+        // Its covered region x∈[0,16) y∈[16,32) includes the A1 sample
+        // (15, 31) of a CU at (16, 16, 16, 16). 4-param, L0, a strong
+        // horizontal MV gradient so the inherited predictor is clearly
+        // non-zero. mvp_l0_flag == 0, no MF ⇒ predictor zero ⇒ final
+        // CPMVs = cumulative MVD: CP0 = (12,0), CP1 = (24,0).
+        let affine0 = make_non_merge_inter_affine_decision(true, false);
+        let mvp0 = make_non_merge_mvp_syntax_decision(
+            crate::leaf_cu::InterPredDir::PredL0,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        let mvd_cp0 = [
+            MotionVector::from_int_pel(12, 0),
+            MotionVector::from_int_pel(12, 0),
+            MotionVector::ZERO,
+        ];
+        let decision0 = NonMergeInterPreResidualAffineDecision::new(
+            affine0,
+            mvp0,
+            mvd_cp0,
+            [MotionVector::ZERO; 3],
+        );
+        let mut out0 = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu_inter_affine_amvp(
+                0,
+                16,
+                16,
+                16,
+                &decision0,
+                crate::amvr::AmvrShift(0),
+                &mut out0,
+            )
+            .expect("first affine CB recon");
+
+        // The store must now carry the first CB's record at A1 (15, 31).
+        let nb = walker.affine_cpmv_field.get_at_luma(15, 31);
+        assert!(
+            nb.is_some(),
+            "store must hold the first affine CB at (15,31)"
+        );
+        let nb = nb.unwrap();
+        assert_eq!((nb.xnb, nb.ynb, nb.nb_w, nb.nb_h), (0, 16, 16, 16));
+        assert!(nb.pred_flag_l0 && !nb.pred_flag_l1);
+        assert_eq!(nb.cpmvs_l0.cpmvs[0], MotionVector::from_int_pel(12, 0));
+        assert_eq!(nb.cpmvs_l0.cpmvs[1], MotionVector::from_int_pel(24, 0));
+
+        // ---- Second affine CB at (16, 16) size 16x16 ----------------
+        // mvp_l0_flag == 0, zero MVDs. The §8.5.5.7 A-scan picks the
+        // inherited candidate from the left neighbour, so the predictor
+        // is NOT zero. Output must therefore differ from a zero-CPMV
+        // recon (the result a pre-store decoder would have produced).
+        let affine1 = make_non_merge_inter_affine_decision(true, false);
+        let mvp1 = make_non_merge_mvp_syntax_decision(
+            crate::leaf_cu::InterPredDir::PredL0,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        let mvd_cp1 = [MotionVector::ZERO; 3];
+        let decision1 = NonMergeInterPreResidualAffineDecision::new(
+            affine1,
+            mvp1,
+            mvd_cp1,
+            [MotionVector::ZERO; 3],
+        );
+        let mut out1 = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu_inter_affine_amvp(
+                16,
+                16,
+                16,
+                16,
+                &decision1,
+                crate::amvr::AmvrShift(0),
+                &mut out1,
+            )
+            .expect("second affine CB recon");
+
+        // Zero-CPMV baseline (the pre-store fall-through result).
+        let zero_cpmvs = crate::affine::AffineCpmvs::new_4param(
+            MotionVector::from_int_pel(0, 0),
+            MotionVector::from_int_pel(0, 0),
+        );
+        let mut baseline = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &zero_cpmvs, &ref_pic, &mut baseline)
+            .expect("zero-CPMV baseline recon");
+
+        let mut differs = false;
+        for y in 16..32usize {
+            for x in 16..32usize {
+                if out1.luma.samples[y * out1.luma.stride + x]
+                    != baseline.luma.samples[y * baseline.luma.stride + x]
+                {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "inherited affine CPMVP from the per-CB store must change the second \
+             CU's prediction vs. the zero-MV-pad baseline"
+        );
+
+        // Independent reference: the inherited derivation projects the
+        // neighbour's CPMVs onto the current CU's corners. Re-derive it
+        // through the public §8.5.5.7 path and confirm the fuse matches.
+        let ctx = crate::affine_amvp::AffineMvpRefContext {
+            list: crate::affine_amvp::RefList::L0,
+            current_ref_poc: -1,
+            poc_of_l0_ref: &|idx: i32| if idx == 0 { Some(-1) } else { None },
+            poc_of_l1_ref: &|_idx: i32| None,
+        };
+        let inherited = walker
+            .derive_inherited_affine_side(
+                &[(15, 32), (15, 31)],
+                16,
+                16,
+                16,
+                16,
+                &ctx,
+                crate::amvr::AmvrShift(0),
+                2,
+            )
+            .expect("A-scan must yield an inherited candidate");
+        let inherited_cpmvs =
+            crate::affine::AffineCpmvs::new_4param(inherited.cp_mvs[0], inherited.cp_mvs[1]);
+        let mut expect = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &inherited_cpmvs, &ref_pic, &mut expect)
+            .expect("inherited-CPMV recon");
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out1.luma.samples[y * out1.luma.stride + x],
+                    expect.luma.samples[y * expect.luma.stride + x],
+                    "second CU fuse must equal the inherited-CPMV recon at ({x},{y})"
+                );
+            }
+        }
     }
 
     /// §8.5.6.6.2 affine bi-pred — averaging two **identical**
