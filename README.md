@@ -33,7 +33,16 @@ oxideav-h266 = "0.0"
 * **Parameter sets**
   * **VPS** (§7.3.2.2), **SPS** (§7.3.2.3 — profile/tier/level, chroma
     format, picture size, CTU size, transform sizes, tools-enable
-    flags), **PPS** (§7.3.2.4).
+    flags), **PPS** (§7.3.2.4). SPS derivations now include the §7.4.3.4
+    eq. 41 `NumExtraPhBits` / `NumExtraShBits` counts (from the
+    `sps_extra_{ph,sh}_bit_present_flag[i]` runs), the §7.4.3.22 eq. 106
+    `Log2TransformRange` (extended-precision `Max(15, Min(20, BitDepth +
+    6))` when `sps_extended_precision_flag` is set, threaded through every
+    coded-TB dequant + inverse-transform clip), and the §7.4.3.4 eqs.
+    54 – 57 `ChromaQpTable[k]` mapping derivation (`ChromaQpTable::build`
+    / `map_qp`). The PPS retains the §7.4.10.6 `cu_chroma_qp_offset_list`
+    triples; the §7.3.7 slice-header tail consumes the range-extension
+    `sh_ts_residual_coding_rice_idx_minus1` / `sh_reverse_last_sig_coeff_flag`.
   * **APS** (§7.3.2.5) — ALF / LMCS / scaling-list type. The LMCS APS
     payload (§7.3.2.19) is decoded into a typed `lmcs::LmcsData`, with
     the BitDepth-dependent §7.4.3.19 derivations (`OrgCW`, `lmcsCW`,
