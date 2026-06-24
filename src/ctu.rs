@@ -284,6 +284,32 @@ pub(crate) fn chroma_qp_identity(qp_y: i32, qp_offset: i32) -> i32 {
     (qp_y + qp_offset).clamp(0, 63)
 }
 
+/// §8.7.1 eqs. 1147 / 1148 additive chroma-QP offset term for a single
+/// component: `pps_c?_qp_offset + sh_c?_qp_offset + CuQpOffsetC?`.
+///
+/// `c_idx` selects Cb (1) or Cr (2); any other value yields 0 (luma has
+/// no chroma offset). The slice-level term is inferred to 0 (§7.4.9.1)
+/// when `pps_slice_chroma_qp_offsets_present_flag == 0`, which the
+/// slice-header parser leaves at its default, so the caller can pass the
+/// stored value unconditionally. `cu_offset` is the §7.4.10.6 CU-level
+/// `CuQpOffsetC?` term (0 until the PPS chroma-offset list is plumbed).
+#[inline]
+pub(crate) fn chroma_qp_offset_sum(
+    c_idx: u32,
+    pps_cb_qp_offset: i32,
+    pps_cr_qp_offset: i32,
+    sh_cb_qp_offset: i32,
+    sh_cr_qp_offset: i32,
+    cu_offset: i32,
+) -> i32 {
+    let (pps_offset, sh_offset) = match c_idx {
+        1 => (pps_cb_qp_offset, sh_cb_qp_offset),
+        2 => (pps_cr_qp_offset, sh_cr_qp_offset),
+        _ => (0, 0),
+    };
+    pps_offset + sh_offset + cu_offset
+}
+
 /// §8.5.5.3 eqs. 878 / 879 — average two motion-vector components by
 /// halving their sum with the spec's round-toward-zero rule
 /// `( v + 1 − ( v >= 0 ) ) >> 1`. For `v` the sum of the two component
@@ -3668,7 +3694,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let qp = if c_idx == 0 {
             qp_y
         } else {
-            chroma_qp_identity(qp_y, 0)
+            // §8.7.1 eqs. 1147 / 1148 — add the PPS + slice chroma offset
+            // for this component. CU-level `CuQpOffsetC?` stays 0 until the
+            // §7.4.10.6 chroma-offset list is plumbed.
+            let qp_offset = chroma_qp_offset_sum(
+                c_idx,
+                self.pps.pps_cb_qp_offset,
+                self.pps.pps_cr_qp_offset,
+                self.sh.sh_cb_qp_offset,
+                self.sh.sh_cr_qp_offset,
+                0,
+            );
+            chroma_qp_identity(qp_y, qp_offset)
         };
         let params = DequantParams {
             bit_depth,
@@ -3768,9 +3805,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // nothing to add.
             return Ok(());
         }
-        // §8.7.3 dequant — chroma QP via the crate's identity scaffold.
+        // §8.7.3 dequant — joint Cb-Cr QP (eq. 1149): the additive term is
+        // `pps_joint_cbcr_qp_offset_value + sh_joint_cbcr_qp_offset +
+        // CuQpOffsetCbCr` rather than the per-component Cb/Cr offsets.
+        // `CuQpOffsetCbCr` stays 0 until the §7.4.10.6 list is plumbed.
         let qp_y = (self.cabac.slice_qp_y.0 + cu_qp_delta).clamp(0, 63);
-        let qp = chroma_qp_identity(qp_y, 0);
+        let joint_offset =
+            self.pps.pps_joint_cbcr_qp_offset_value + self.sh.sh_joint_cbcr_qp_offset;
+        let qp = chroma_qp_identity(qp_y, joint_offset);
         let params = DequantParams {
             bit_depth,
             log2_transform_range: 15,
@@ -4427,16 +4469,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // alongside the 4+ sizes.
         let residual_samples: Vec<i32> =
             if coded_flag && !levels.is_empty() && n_tb_w >= 2 && n_tb_h >= 2 {
-                // §8.7.1 chroma QP: identity mapping qPi → QpC, plus the
-                // additive PPS / slice / CU offsets. Slice-level chroma
-                // offsets (`sh_cb_qp_offset` / `sh_cr_qp_offset`) are
-                // captured in the slice header but not yet plumbed to this
-                // call site; only the PPS + CU offsets contribute today.
-                let pps_offset = match c_idx {
-                    1 => self.pps.pps_cb_qp_offset,
-                    2 => self.pps.pps_cr_qp_offset,
-                    _ => 0,
-                };
+                // §8.7.1 chroma QP (eqs. 1147 / 1148): identity mapping
+                // qPi → QpC, plus the additive
+                // `pps_c?_qp_offset + sh_c?_qp_offset + CuQpOffsetC?` term.
+                // The slice-level offset is only present when the PPS gate
+                // `pps_slice_chroma_qp_offsets_present_flag` is set; when
+                // absent §7.4.9.1 infers `sh_c?_qp_offset = 0`, which the
+                // slice-header parser already leaves at the default, so the
+                // unconditional add is safe.
                 let cu_offset = if info.cu_chroma_qp_offset_flag {
                     // Per §7.4.10.6 the CU offset value is read from the
                     // PPS chroma-offset list; the list itself is not yet
@@ -4446,7 +4486,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 } else {
                     0
                 };
-                let qp = chroma_qp_identity(self.cabac.slice_qp_y.0, pps_offset + cu_offset);
+                let qp_offset = chroma_qp_offset_sum(
+                    c_idx,
+                    self.pps.pps_cb_qp_offset,
+                    self.pps.pps_cr_qp_offset,
+                    self.sh.sh_cb_qp_offset,
+                    self.sh.sh_cr_qp_offset,
+                    cu_offset,
+                );
+                let qp = chroma_qp_identity(self.cabac.slice_qp_y.0, qp_offset);
                 // Per-plane transform-skip: BDPCM-chroma forces it on both
                 // planes; a plain transform_skip_flag is per-component.
                 let plane_ts = match c_idx {
@@ -6658,6 +6706,22 @@ mod tests {
         assert_eq!(chroma_qp_identity(20, 5), 25);
         assert_eq!(chroma_qp_identity(60, 5), 63); // saturates
         assert_eq!(chroma_qp_identity(0, -3), 0); // clamps from below
+    }
+
+    /// §8.7.1 eqs. 1147 / 1148 — `chroma_qp_offset_sum` adds the
+    /// per-component PPS + slice + CU offsets, picking the Cb or Cr
+    /// column by `c_idx`.
+    #[test]
+    fn chroma_qp_offset_sum_threads_slice_level_offsets() {
+        // Cb column (c_idx == 1): pps_cb (3) + sh_cb (-2) + cu (1) = 2;
+        // the Cr-side values must not leak in.
+        assert_eq!(chroma_qp_offset_sum(1, 3, 9, -2, 7, 1), 2);
+        // Cr column (c_idx == 2): pps_cr (9) + sh_cr (7) + cu (0) = 16.
+        assert_eq!(chroma_qp_offset_sum(2, 3, 9, -2, 7, 0), 16);
+        // Luma (c_idx == 0): no chroma offset, only the CU term survives.
+        assert_eq!(chroma_qp_offset_sum(0, 3, 9, -2, 7, 4), 4);
+        // Default zero offsets give a pure identity passthrough.
+        assert_eq!(chroma_qp_offset_sum(1, 0, 0, 0, 0, 0), 0);
     }
 
     /// MIP-flagged CU now flows through the §8.4.5.2.2 matrix-based
