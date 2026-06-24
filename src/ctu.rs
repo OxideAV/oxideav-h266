@@ -3085,12 +3085,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// 1. `numCpMv = MotionModelIdc + 1` (§8.5.5.5 / eq. 160).
     /// 2. Per active list X: build the §8.5.5.7 affine CPMVP candidate
     ///    list (`build_affine_mvp_cand_list`) and pick `mvp_lX_flag`
-    ///    via `select_affine_mvp` (eq. 840). Inherited / constructed
-    ///    affine neighbour candidates require a per-CB affine CPMV
-    ///    store not yet tracked in the `MotionField`, so they resolve
-    ///    to `None`; the list falls through to the §8.5.5.7 step-8
-    ///    temporal MV (replicated across CPs) and the step-9 zero-MV
-    ///    pad — exact for the common non-affine-neighbour case.
+    ///    via `select_affine_mvp` (eq. 840). The §8.5.5.7 step-4 A-scan
+    ///    ({A0, A1}) and step-5 B-scan ({B0, B1, B2}) now read the
+    ///    per-CB affine CPMV store ([`Self::affine_neighbour_query`] +
+    ///    [`Self::derive_inherited_affine_side`]) and feed real
+    ///    inherited candidates; when no affine neighbour hits, the list
+    ///    falls through to the §8.5.5.7 step-8 temporal MV (replicated
+    ///    across CPs) and the step-9 zero-MV pad. The §8.5.5.8
+    ///    constructed candidate is still deferred.
     /// 3. Cumulate the per-CP MVDs (§8.5.5.5 eqs. 660 – 663 via
     ///    `cumulate_affine_mvd_cp`).
     /// 4. Fold predictor + cumulative MVD into the final CPMVs (eqs.
