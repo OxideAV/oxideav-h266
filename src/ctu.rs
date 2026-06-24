@@ -310,6 +310,33 @@ pub(crate) fn chroma_qp_offset_sum(
     pps_offset + sh_offset + cu_offset
 }
 
+/// §7.4.10.6 eqs. 193 / 194 — the CU-level `CuQpOffsetCb` / `CuQpOffsetCr`
+/// term for a single chroma component.
+///
+/// When `cu_chroma_qp_offset_flag == 1` the value is
+/// `pps_c?_qp_offset_list[cu_chroma_qp_offset_idx]`; otherwise (or for
+/// luma `c_idx == 0`, or when the index is out of range) it is 0. `c_idx`
+/// selects Cb (1) / Cr (2); the lists carry one entry per
+/// `pps_chroma_qp_offset_list_len_minus1 + 1`.
+#[inline]
+pub(crate) fn cu_chroma_qp_offset(
+    c_idx: u32,
+    flag: bool,
+    idx: u32,
+    cb_list: &[i32],
+    cr_list: &[i32],
+) -> i32 {
+    if !flag {
+        return 0;
+    }
+    let list = match c_idx {
+        1 => cb_list,
+        2 => cr_list,
+        _ => return 0,
+    };
+    list.get(idx as usize).copied().unwrap_or(0)
+}
+
 /// §8.5.5.3 eqs. 878 / 879 — average two motion-vector components by
 /// halving their sum with the spec's round-toward-zero rule
 /// `( v + 1 − ( v >= 0 ) ) >> 1`. For `v` the sum of the two component
@@ -3695,8 +3722,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             qp_y
         } else {
             // §8.7.1 eqs. 1147 / 1148 — add the PPS + slice chroma offset
-            // for this component. CU-level `CuQpOffsetC?` stays 0 until the
-            // §7.4.10.6 chroma-offset list is plumbed.
+            // for this component. The inter residual reconstruction does
+            // not carry the per-CU `cu_chroma_qp_offset_idx` at this call
+            // site, so `CuQpOffsetC?` stays 0 (it is wired through the
+            // intra path, which holds the LeafCuInfo).
             let qp_offset = chroma_qp_offset_sum(
                 c_idx,
                 self.pps.pps_cb_qp_offset,
@@ -4477,15 +4506,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // absent §7.4.9.1 infers `sh_c?_qp_offset = 0`, which the
                 // slice-header parser already leaves at the default, so the
                 // unconditional add is safe.
-                let cu_offset = if info.cu_chroma_qp_offset_flag {
-                    // Per §7.4.10.6 the CU offset value is read from the
-                    // PPS chroma-offset list; the list itself is not yet
-                    // plumbed (round-10 surfaces the flag + index only).
-                    // Identity value 0 is the safe default.
-                    0
-                } else {
-                    0
-                };
+                //
+                // §7.4.10.6 eqs. 193 / 194 — the CU-level `CuQpOffsetC?`
+                // term indexes the parsed PPS `pps_c?_qp_offset_list`
+                // by `cu_chroma_qp_offset_idx` when the flag is set.
+                let cu_offset = cu_chroma_qp_offset(
+                    c_idx,
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                    &self.pps.pps_cb_qp_offset_list,
+                    &self.pps.pps_cr_qp_offset_list,
+                );
                 let qp_offset = chroma_qp_offset_sum(
                     c_idx,
                     self.pps.pps_cb_qp_offset,
@@ -4749,6 +4780,9 @@ mod tests {
             pps_joint_cbcr_qp_offset_value: 0,
             pps_slice_chroma_qp_offsets_present_flag: false,
             pps_cu_chroma_qp_offset_list_enabled_flag: false,
+            pps_cb_qp_offset_list: Vec::new(),
+            pps_cr_qp_offset_list: Vec::new(),
+            pps_joint_cbcr_qp_offset_list: Vec::new(),
             pps_deblocking_filter_control_present_flag: false,
             pps_deblocking_filter_override_enabled_flag: false,
             pps_deblocking_filter_disabled_flag: false,
@@ -6722,6 +6756,27 @@ mod tests {
         assert_eq!(chroma_qp_offset_sum(0, 3, 9, -2, 7, 4), 4);
         // Default zero offsets give a pure identity passthrough.
         assert_eq!(chroma_qp_offset_sum(1, 0, 0, 0, 0, 0), 0);
+    }
+
+    /// §7.4.10.6 eqs. 193 / 194 — `cu_chroma_qp_offset` indexes the
+    /// PPS `pps_c?_qp_offset_list` by `cu_chroma_qp_offset_idx` when the
+    /// flag is set, and yields 0 when the flag is clear, the index is out
+    /// of range, or the component is luma.
+    #[test]
+    fn cu_chroma_qp_offset_indexes_pps_list() {
+        let cb = [1, -3, 5];
+        let cr = [2, 4, -6];
+        // Flag set, idx 1: Cb → -3, Cr → 4.
+        assert_eq!(cu_chroma_qp_offset(1, true, 1, &cb, &cr), -3);
+        assert_eq!(cu_chroma_qp_offset(2, true, 1, &cb, &cr), 4);
+        // Flag clear → 0 regardless of idx.
+        assert_eq!(cu_chroma_qp_offset(1, false, 2, &cb, &cr), 0);
+        // Luma component → 0.
+        assert_eq!(cu_chroma_qp_offset(0, true, 0, &cb, &cr), 0);
+        // Out-of-range idx → 0 (defensive; bitstream constrains idx).
+        assert_eq!(cu_chroma_qp_offset(1, true, 9, &cb, &cr), 0);
+        // Empty list → 0.
+        assert_eq!(cu_chroma_qp_offset(1, true, 0, &[], &[]), 0);
     }
 
     /// MIP-flagged CU now flows through the §8.4.5.2.2 matrix-based

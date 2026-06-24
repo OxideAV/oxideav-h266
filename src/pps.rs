@@ -152,6 +152,17 @@ pub struct PicParameterSet {
     pub pps_joint_cbcr_qp_offset_value: i32,
     pub pps_slice_chroma_qp_offsets_present_flag: bool,
     pub pps_cu_chroma_qp_offset_list_enabled_flag: bool,
+    /// §7.3.2.5 `pps_cb_qp_offset_list[i]` (§7.4.3.5). One entry per
+    /// `i ∈ [0, pps_chroma_qp_offset_list_len_minus1]`; the §8.7.1
+    /// `CuQpOffsetCb` term selects entry `cu_chroma_qp_offset_idx`.
+    /// Empty when `pps_cu_chroma_qp_offset_list_enabled_flag == 0`.
+    pub pps_cb_qp_offset_list: Vec<i32>,
+    /// §7.3.2.5 `pps_cr_qp_offset_list[i]` — the `CuQpOffsetCr` source.
+    pub pps_cr_qp_offset_list: Vec<i32>,
+    /// §7.3.2.5 `pps_joint_cbcr_qp_offset_list[i]` — the `CuQpOffsetCbCr`
+    /// source. Present only when `pps_joint_cbcr_qp_offset_present_flag`;
+    /// empty otherwise.
+    pub pps_joint_cbcr_qp_offset_list: Vec<i32>,
     pub pps_deblocking_filter_control_present_flag: bool,
     pub pps_deblocking_filter_override_enabled_flag: bool,
     pub pps_deblocking_filter_disabled_flag: bool,
@@ -434,6 +445,9 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
     let mut pps_joint_cbcr_qp_offset_value: i32 = 0;
     let mut pps_slice_chroma_qp_offsets_present_flag = false;
     let mut pps_cu_chroma_qp_offset_list_enabled_flag = false;
+    let mut pps_cb_qp_offset_list: Vec<i32> = Vec::new();
+    let mut pps_cr_qp_offset_list: Vec<i32> = Vec::new();
+    let mut pps_joint_cbcr_qp_offset_list: Vec<i32> = Vec::new();
     if pps_chroma_tool_offsets_present_flag {
         pps_cb_qp_offset = br.se()?;
         pps_cr_qp_offset = br.se()?;
@@ -445,18 +459,18 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         pps_cu_chroma_qp_offset_list_enabled_flag = br.u1()? == 1;
         if pps_cu_chroma_qp_offset_list_enabled_flag {
             let len_minus1 = br.ue()?;
-            // Walk the pairs / triples — we don't retain them in this
-            // pass (only the gate matters for slice-header decoding).
-            if len_minus1 > 64 {
+            // §7.4.3.5: pps_chroma_qp_offset_list_len_minus1 ∈ [0, 5].
+            if len_minus1 > 5 {
                 return Err(Error::invalid(format!(
                     "h266 PPS: pps_chroma_qp_offset_list_len_minus1 out of range ({len_minus1})"
                 )));
             }
             for _ in 0..=len_minus1 {
-                let _ = br.se()?; // pps_cb_qp_offset_list[i]
-                let _ = br.se()?; // pps_cr_qp_offset_list[i]
+                pps_cb_qp_offset_list.push(br.se()?); // pps_cb_qp_offset_list[i]
+                pps_cr_qp_offset_list.push(br.se()?); // pps_cr_qp_offset_list[i]
                 if pps_joint_cbcr_qp_offset_present_flag {
-                    let _ = br.se()?; // pps_joint_cbcr_qp_offset_list[i]
+                    // pps_joint_cbcr_qp_offset_list[i]
+                    pps_joint_cbcr_qp_offset_list.push(br.se()?);
                 }
             }
         }
@@ -549,6 +563,9 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         pps_joint_cbcr_qp_offset_value,
         pps_slice_chroma_qp_offsets_present_flag,
         pps_cu_chroma_qp_offset_list_enabled_flag,
+        pps_cb_qp_offset_list,
+        pps_cr_qp_offset_list,
+        pps_joint_cbcr_qp_offset_list,
         pps_deblocking_filter_control_present_flag,
         pps_deblocking_filter_override_enabled_flag,
         pps_deblocking_filter_disabled_flag,
@@ -737,6 +754,62 @@ mod tests {
         assert!(pps.pps_alf_info_in_ph_flag);
         assert!(pps.pps_qp_delta_info_in_ph_flag);
         assert_eq!(pps.pps_init_qp_minus26, 0);
+    }
+
+    /// §7.3.2.5 chroma-tool-offsets block with the CU chroma-QP-offset
+    /// list enabled: the parser must retain `pps_cb_qp_offset_list[]` /
+    /// `pps_cr_qp_offset_list[]` / `pps_joint_cbcr_qp_offset_list[]` for
+    /// the §8.7.1 `CuQpOffsetC?` derivation, not just walk past them.
+    #[test]
+    fn pps_retains_cu_chroma_qp_offset_list() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 6); // pps_id
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 1); // mixed_nalu_types
+        push_ue(&mut bits, 320);
+        push_ue(&mut bits, 240);
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // scaling_window
+        push_u(&mut bits, 0, 1); // output_flag_present
+        push_u(&mut bits, 1, 1); // no_pic_partition = 1
+        push_u(&mut bits, 0, 1); // subpic_id_mapping_present = 0
+        push_u(&mut bits, 0, 1); // cabac_init_present
+        push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[0]
+        push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[1]
+        push_u(&mut bits, 0, 1); // rpl1_idx_present
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_se(&mut bits, 0); // init_qp_minus26
+        push_u(&mut bits, 0, 1); // cu_qp_delta_enabled
+        push_u(&mut bits, 1, 1); // chroma_tool_offsets_present = 1
+        push_se(&mut bits, 2); // pps_cb_qp_offset = 2
+        push_se(&mut bits, -1); // pps_cr_qp_offset = -1
+        push_u(&mut bits, 1, 1); // pps_joint_cbcr_qp_offset_present = 1
+        push_se(&mut bits, 3); // pps_joint_cbcr_qp_offset_value = 3
+        push_u(&mut bits, 0, 1); // pps_slice_chroma_qp_offsets_present = 0
+        push_u(&mut bits, 1, 1); // pps_cu_chroma_qp_offset_list_enabled = 1
+        push_ue(&mut bits, 1); // list_len_minus1 = 1 → 2 entries
+        push_se(&mut bits, 4); // pps_cb_qp_offset_list[0]
+        push_se(&mut bits, -2); // pps_cr_qp_offset_list[0]
+        push_se(&mut bits, 6); // pps_joint_cbcr_qp_offset_list[0]
+        push_se(&mut bits, -5); // pps_cb_qp_offset_list[1]
+        push_se(&mut bits, 1); // pps_cr_qp_offset_list[1]
+        push_se(&mut bits, 0); // pps_joint_cbcr_qp_offset_list[1]
+        push_u(&mut bits, 0, 1); // deblocking_filter_control_present
+        push_u(&mut bits, 0, 1); // picture_header_ext_present
+        push_u(&mut bits, 0, 1); // slice_header_ext_present
+        push_u(&mut bits, 0, 1); // pps_extension_flag
+        let bytes = pack_bits(&bits);
+        let pps = parse_pps(&bytes).unwrap();
+        assert_eq!(pps.pps_cb_qp_offset, 2);
+        assert_eq!(pps.pps_cr_qp_offset, -1);
+        assert!(pps.pps_joint_cbcr_qp_offset_present_flag);
+        assert_eq!(pps.pps_joint_cbcr_qp_offset_value, 3);
+        assert!(pps.pps_cu_chroma_qp_offset_list_enabled_flag);
+        assert_eq!(pps.pps_cb_qp_offset_list, vec![4, -5]);
+        assert_eq!(pps.pps_cr_qp_offset_list, vec![-2, 1]);
+        assert_eq!(pps.pps_joint_cbcr_qp_offset_list, vec![6, 0]);
     }
 
     /// 256x128 picture (2 tile cols x 1 tile row of 128x128 CTBs),
