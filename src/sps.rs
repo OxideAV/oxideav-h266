@@ -225,6 +225,77 @@ pub struct ChromaQpTable {
     pub entries: Vec<(u32, u32)>,
 }
 
+impl ChromaQpTable {
+    /// §7.4.3.4 eqs. 54 – 57 — build the `ChromaQpTable[k]` mapping array
+    /// for `k ∈ [−QpBdOffset, 63]`. The returned vector is indexed by
+    /// `k + qp_bd_offset` (so `ChromaQpTable[k]` lives at index
+    /// `(k + qp_bd_offset) as usize`); use [`Self::map_qp`] for a
+    /// clamped lookup that mirrors §8.7.1.
+    ///
+    /// The default single-point all-zero-delta table this crate emits
+    /// (`same_qp_table_for_chroma`, `num_points = 1`) reduces to the
+    /// identity `ChromaQpTable[k] = Clip3(−QpBdOffset, 63, k)`, matching
+    /// the previous `chroma_qp_identity` behaviour.
+    pub fn build(&self, qp_bd_offset: i32) -> Vec<i32> {
+        let num_points = self.entries.len(); // sps_num_points_in_qp_table_minus1 + 1
+                                             // qpInVal / qpOutVal pivot arrays (length num_points + 1).
+        let mut qp_in = vec![0i32; num_points + 1];
+        let mut qp_out = vec![0i32; num_points + 1];
+        qp_in[0] = self.qp_table_start_minus26 + 26;
+        qp_out[0] = qp_in[0];
+        for (j, &(d_in_minus1, d_diff)) in self.entries.iter().enumerate() {
+            let d_in = d_in_minus1 as i32; // sps_delta_qp_in_val_minus1[j]
+            qp_in[j + 1] = qp_in[j] + d_in + 1;
+            // qpOutVal += (delta_qp_in_val_minus1 ^ delta_qp_diff_val).
+            qp_out[j + 1] = qp_out[j] + (d_in_minus1 ^ d_diff) as i32;
+        }
+
+        // ChromaQpTable index space is k ∈ [−QpBdOffset, 63].
+        let lo = -qp_bd_offset;
+        let len = (63 - lo + 1) as usize;
+        let mut table = vec![0i32; len];
+        let idx = |k: i32| (k - lo) as usize;
+
+        // Eq. 56: anchor at qpInVal[0].
+        table[idx(qp_in[0])] = qp_out[0];
+        // Eq. 57: fill below the anchor.
+        let mut k = qp_in[0] - 1;
+        while k >= lo {
+            table[idx(k)] = (table[idx(k + 1)] - 1).clamp(-qp_bd_offset, 63);
+            k -= 1;
+        }
+        // Linear interpolation between pivots.
+        for (j, &(d_in_minus1, _)) in self.entries.iter().enumerate() {
+            let denom = d_in_minus1 as i32 + 1; // sps_delta_qp_in_val_minus1 + 1
+            let sh = denom >> 1;
+            let mut m = 1i32;
+            let anchor = table[idx(qp_in[j])];
+            let out_delta = qp_out[j + 1] - qp_out[j];
+            let mut k = qp_in[j] + 1;
+            while k <= qp_in[j + 1] {
+                table[idx(k)] = anchor + (out_delta * m + sh) / denom;
+                m += 1;
+                k += 1;
+            }
+        }
+        // Fill above the last pivot.
+        let mut k = qp_in[num_points] + 1;
+        while k <= 63 {
+            table[idx(k)] = (table[idx(k - 1)] + 1).clamp(-qp_bd_offset, 63);
+            k += 1;
+        }
+        table
+    }
+
+    /// §8.7.1 chroma-QP lookup: clamp `qp_i` into `[−QpBdOffset, 63]`,
+    /// then read `ChromaQpTable[qp_i]`. `built` is the array from
+    /// [`Self::build`] (indexed by `k + qp_bd_offset`).
+    pub fn map_qp(built: &[i32], qp_i: i32, qp_bd_offset: i32) -> i32 {
+        let clamped = qp_i.clamp(-qp_bd_offset, 63);
+        built[(clamped + qp_bd_offset) as usize]
+    }
+}
+
 /// Luma-Adaptive Deblocking Filter parameters (§7.3.2.4).
 #[derive(Clone, Debug, Default)]
 pub struct LadfParameters {
@@ -1647,6 +1718,68 @@ mod tests {
         let sps0 = parse_sps(&pack(&bits0)).unwrap();
         assert_eq!(sps0.num_extra_ph_bits, 0);
         assert_eq!(sps0.num_extra_sh_bits, 0);
+    }
+
+    /// §7.4.3.4 eqs. 54 – 57 — the single-point all-zero-delta table
+    /// (`qpIn = [26, 27]`, `qpOut = [26, 26]`) is identity below the
+    /// start QP 26, plateaus at 26 across `k ∈ {26, 27}`, then increments
+    /// by 1 per step above. (Note: this is NOT the previous
+    /// `chroma_qp_identity` clamp — that approximation diverged from the
+    /// spec table at `k >= 27`.)
+    #[test]
+    fn chroma_qp_table_single_zero_point_matches_spec() {
+        use crate::sps::ChromaQpTable;
+        let t = ChromaQpTable {
+            qp_table_start_minus26: 0,
+            entries: vec![(0, 0)],
+        };
+        let qp_bd_offset = 0; // 8-bit
+        let built = t.build(qp_bd_offset);
+        // Identity below the start anchor.
+        for k in 0..=26 {
+            assert_eq!(ChromaQpTable::map_qp(&built, k, qp_bd_offset), k);
+        }
+        // Plateau: T[27] = 26, then +1 per step above.
+        assert_eq!(ChromaQpTable::map_qp(&built, 27, qp_bd_offset), 26);
+        assert_eq!(ChromaQpTable::map_qp(&built, 28, qp_bd_offset), 27);
+        assert_eq!(ChromaQpTable::map_qp(&built, 63, qp_bd_offset), 62);
+        // Clamp below / above the index range.
+        assert_eq!(ChromaQpTable::map_qp(&built, -5, qp_bd_offset), 0);
+        assert_eq!(ChromaQpTable::map_qp(&built, 99, qp_bd_offset), 62);
+    }
+
+    /// §7.4.3.4 eqs. 54 – 57 — a non-identity pivot table maps qpInVal to
+    /// the derived qpOutVal and interpolates between pivots. With start 26
+    /// and one point `(delta_in_minus1 = 3, delta_diff = 1)`:
+    ///   qpIn  = [26, 30], qpOut = [26, 26 + (3 ^ 1)] = [26, 28].
+    /// The anchor `ChromaQpTable[26] = 26`; interpolation over k=27..30
+    /// adds `(2 * m + sh) / 4` with `sh = (3 + 1) >> 1 = 2`.
+    #[test]
+    fn chroma_qp_table_interpolates_between_pivots() {
+        use crate::sps::ChromaQpTable;
+        let t = ChromaQpTable {
+            qp_table_start_minus26: 0, // start 26
+            entries: vec![(3, 1)],     // delta_in_minus1 = 3, delta_diff = 1
+        };
+        let built = t.build(0);
+        // Anchor.
+        assert_eq!(ChromaQpTable::map_qp(&built, 26, 0), 26);
+        // Interp: anchor + (out_delta * m + sh) / denom, out_delta = 2,
+        // denom = 4, sh = 2.
+        // k=27 m=1: 26 + (2*1 + 2)/4 = 26 + 1 = 27
+        // k=28 m=2: 26 + (2*2 + 2)/4 = 26 + 1 = 27
+        // k=29 m=3: 26 + (2*3 + 2)/4 = 26 + 2 = 28
+        // k=30 m=4: 26 + (2*4 + 2)/4 = 26 + 2 = 28 (= qpOut[1])
+        assert_eq!(ChromaQpTable::map_qp(&built, 27, 0), 27);
+        assert_eq!(ChromaQpTable::map_qp(&built, 28, 0), 27);
+        assert_eq!(ChromaQpTable::map_qp(&built, 29, 0), 28);
+        assert_eq!(ChromaQpTable::map_qp(&built, 30, 0), 28);
+        // Above the last pivot increments by 1 (clamped at 63).
+        assert_eq!(ChromaQpTable::map_qp(&built, 31, 0), 29);
+        assert_eq!(ChromaQpTable::map_qp(&built, 33, 0), 31);
+        // Below the start anchor decrements by 1 (clamped at 0).
+        assert_eq!(ChromaQpTable::map_qp(&built, 25, 0), 25);
+        assert_eq!(ChromaQpTable::map_qp(&built, 0, 0), 0);
     }
 
     #[test]
