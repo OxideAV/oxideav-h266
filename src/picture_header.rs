@@ -399,13 +399,12 @@ pub fn parse_picture_header_stateful(
         ph.ph_recovery_poc_cnt = br.ue()?;
     }
 
-    // NumExtraPhBits = count of sps_extra_ph_bit_present_flag[i] set.
-    // Our SPS parser retains `sps_num_extra_ph_bytes` but not the
-    // individual flag values, so we assume the "all present" upper
-    // bound of `sps_num_extra_ph_bytes * 8` bits. Consumers that need
-    // the exact count can override via the SPS fields when the parser
-    // grows per-bit retention.
-    let num_extra_ph_bits = (sps.sps_num_extra_ph_bytes as u32) * 8;
+    // §7.3.2.7: `ph_extra_bit[i]` is present for exactly `NumExtraPhBits`
+    // iterations — the count of `sps_extra_ph_bit_present_flag[i]` equal
+    // to 1 (§7.4.3.4 eq. 41), NOT the `sps_num_extra_ph_bytes * 8` upper
+    // bound. The SPS parser now derives the exact count, so consuming the
+    // upper bound would over-read whenever any present-flag is 0.
+    let num_extra_ph_bits = sps.num_extra_ph_bits as u32;
     ph.ph_extra_bits.reserve(num_extra_ph_bits as usize);
     for _ in 0..num_extra_ph_bits {
         ph.ph_extra_bits.push(br.u1()? as u8);
@@ -1037,6 +1036,8 @@ mod tests {
             sps_poc_msb_cycle_len_minus1: 0,
             sps_num_extra_ph_bytes: 0,
             sps_num_extra_sh_bytes: 0,
+            num_extra_ph_bits: 0,
+            num_extra_sh_bits: 0,
             sps_sublayer_dpb_params_flag: false,
             dpb_parameters: None,
             partition_constraints: PartitionConstraints::default(),

@@ -625,6 +625,8 @@ mod tests {
             sps_poc_msb_cycle_len_minus1: 0,
             sps_num_extra_ph_bytes: 0,
             sps_num_extra_sh_bytes: 0,
+            num_extra_ph_bits: 0,
+            num_extra_sh_bits: 0,
             sps_sublayer_dpb_params_flag: false,
             dpb_parameters: None,
             partition_constraints: PartitionConstraints::default(),

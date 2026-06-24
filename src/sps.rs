@@ -60,6 +60,14 @@ pub struct SeqParameterSet {
     pub sps_poc_msb_cycle_len_minus1: u32,
     pub sps_num_extra_ph_bytes: u8,
     pub sps_num_extra_sh_bytes: u8,
+    /// §7.4.3.4 eq. 41 `NumExtraPhBits` — the count of
+    /// `sps_extra_ph_bit_present_flag[i]` equal to 1. Drives the
+    /// `ph_extra_bit[i]` skip loop in the picture header.
+    pub num_extra_ph_bits: u8,
+    /// `NumExtraShBits` — the count of `sps_extra_sh_bit_present_flag[i]`
+    /// equal to 1. Drives the `sh_extra_bit[i]` skip loop in the slice
+    /// header (surfaced via `PhState::num_extra_sh_bits`).
+    pub num_extra_sh_bits: u8,
     pub sps_sublayer_dpb_params_flag: bool,
     pub dpb_parameters: Option<DpbParameters>,
     pub partition_constraints: PartitionConstraints,
@@ -605,12 +613,20 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     let sps_poc_msb_cycle_flag = br.u1()? == 1;
     let sps_poc_msb_cycle_len_minus1 = if sps_poc_msb_cycle_flag { br.ue()? } else { 0 };
     let sps_num_extra_ph_bytes = br.u(2)? as u8;
+    // §7.4.3.4 eq. 41 — NumExtraPhBits = Σ sps_extra_ph_bit_present_flag[i].
+    let mut num_extra_ph_bits = 0u8;
     for _ in 0..(sps_num_extra_ph_bytes as u32 * 8) {
-        br.skip(1)?;
+        if br.u1()? == 1 {
+            num_extra_ph_bits += 1;
+        }
     }
     let sps_num_extra_sh_bytes = br.u(2)? as u8;
+    // NumExtraShBits = Σ sps_extra_sh_bit_present_flag[i].
+    let mut num_extra_sh_bits = 0u8;
     for _ in 0..(sps_num_extra_sh_bytes as u32 * 8) {
-        br.skip(1)?;
+        if br.u1()? == 1 {
+            num_extra_sh_bits += 1;
+        }
     }
 
     // ---- dpb_parameters (§7.3.4) ----
@@ -769,6 +785,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         sps_poc_msb_cycle_len_minus1,
         sps_num_extra_ph_bytes,
         sps_num_extra_sh_bytes,
+        num_extra_ph_bits,
+        num_extra_sh_bits,
         sps_sublayer_dpb_params_flag,
         dpb_parameters,
         partition_constraints,
@@ -1511,6 +1529,124 @@ mod tests {
         push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
         push_u(&mut bits, 0, 1); // sps_extension_flag
         bits
+    }
+
+    /// Variant of [`build_minimal_sps_bits`] that injects
+    /// `sps_num_extra_ph_bytes` / `sps_num_extra_sh_bytes` (each 1 byte)
+    /// with the supplied present-flag bit patterns, so the §7.4.3.4
+    /// `NumExtra{Ph,Sh}Bits` derivation can be exercised.
+    fn build_sps_bits_with_extra_bits(ph_flags: &[u8], sh_flags: &[u8]) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 4); // vps_id
+        push_u(&mut bits, 0, 3); // max_sublayers_minus1
+        push_u(&mut bits, 1, 2); // chroma = 4:2:0
+        push_u(&mut bits, 2, 2); // log2_ctu - 5 = 2 → CTB=128
+        push_u(&mut bits, 0, 1); // ptl_dpb_hrd_present = 0
+        push_u(&mut bits, 0, 1); // gdr_enabled
+        push_u(&mut bits, 0, 1); // ref_pic_resampling
+        push_ue(&mut bits, 320); // pic_width
+        push_ue(&mut bits, 240); // pic_height
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // subpic_info_present
+        push_ue(&mut bits, 2); // bitdepth_minus8 = 2 → 10-bit
+        push_u(&mut bits, 0, 1); // entropy_coding_sync
+        push_u(&mut bits, 0, 1); // entry_point_offsets
+        push_u(&mut bits, 4, 4); // log2_max_poc_lsb_minus4
+        push_u(&mut bits, 0, 1); // poc_msb_cycle_flag
+        push_u(&mut bits, 1, 2); // num_extra_ph_bytes = 1 → 8 present flags
+        for &f in ph_flags {
+            push_u(&mut bits, f as u64, 1);
+        }
+        push_u(&mut bits, 1, 2); // num_extra_sh_bytes = 1 → 8 present flags
+        for &f in sh_flags {
+            push_u(&mut bits, f as u64, 1);
+        }
+        // Remaining body is identical to build_minimal_sps_bits from the
+        // partition-constraints block onward.
+        push_ue(&mut bits, 0); // log2_min_luma_cb_size_minus2
+        push_u(&mut bits, 0, 1); // partition_constraints_override_enabled
+        push_ue(&mut bits, 0); // log2_diff_min_qt_min_cb_intra_luma
+        push_ue(&mut bits, 0); // max_mtt_depth_intra_luma
+        push_u(&mut bits, 0, 1); // qtbtt_dual_tree_intra = 0
+        push_ue(&mut bits, 0); // log2_diff_min_qt_min_cb_inter
+        push_ue(&mut bits, 0); // max_mtt_depth_inter
+        push_u(&mut bits, 0, 1); // max_luma_transform_size_64_flag
+        push_u(&mut bits, 0, 1); // transform_skip_enabled
+        push_u(&mut bits, 0, 1); // mts_enabled
+        push_u(&mut bits, 0, 1); // lfnst_enabled
+        push_u(&mut bits, 0, 1); // joint_cbcr_enabled
+        push_u(&mut bits, 1, 1); // same_qp_table_for_chroma
+        push_se(&mut bits, 0); // qp_table_start_minus26
+        push_ue(&mut bits, 0); // num_points_minus1
+        push_ue(&mut bits, 0); // delta_qp_in_val_minus1[0][0]
+        push_ue(&mut bits, 0); // delta_qp_diff_val[0][0]
+        push_u(&mut bits, 0, 1); // sao_enabled
+        push_u(&mut bits, 0, 1); // alf_enabled
+        push_u(&mut bits, 0, 1); // lmcs_enabled
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // long_term_ref_pics
+        push_u(&mut bits, 0, 1); // idr_rpl_present
+        push_u(&mut bits, 0, 1); // rpl1_same_as_rpl0 = 0
+        push_ue(&mut bits, 0); // num_ref_pic_lists[0]
+        push_ue(&mut bits, 0); // num_ref_pic_lists[1]
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_u(&mut bits, 0, 1); // temporal_mvp
+        push_u(&mut bits, 0, 1); // amvr
+        push_u(&mut bits, 0, 1); // bdof
+        push_u(&mut bits, 0, 1); // smvd
+        push_u(&mut bits, 0, 1); // dmvr
+        push_u(&mut bits, 0, 1); // mmvd
+        push_ue(&mut bits, 0); // six_minus_max_num_merge_cand
+        push_u(&mut bits, 0, 1); // sbt
+        push_u(&mut bits, 0, 1); // affine
+        push_u(&mut bits, 0, 1); // bcw
+        push_u(&mut bits, 0, 1); // ciip
+        push_u(&mut bits, 0, 1); // gpm_enabled
+        push_ue(&mut bits, 0); // log2_parallel_merge_level_minus2
+        push_u(&mut bits, 0, 1); // isp
+        push_u(&mut bits, 0, 1); // mrl
+        push_u(&mut bits, 0, 1); // mip
+        push_u(&mut bits, 0, 1); // cclm
+        push_u(&mut bits, 0, 1); // chroma_horizontal_collocated
+        push_u(&mut bits, 0, 1); // chroma_vertical_collocated
+        push_u(&mut bits, 0, 1); // palette
+        push_u(&mut bits, 0, 1); // ibc
+        push_u(&mut bits, 0, 1); // ladf
+        push_u(&mut bits, 0, 1); // explicit_scaling_list
+        push_u(&mut bits, 0, 1); // dep_quant
+        push_u(&mut bits, 0, 1); // sign_data_hiding
+        push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
+        push_u(&mut bits, 0, 1); // sps_field_seq_flag
+        push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
+        push_u(&mut bits, 0, 1); // sps_extension_flag
+        bits
+    }
+
+    /// §7.4.3.4 eq. 41 — `NumExtraPhBits` / `NumExtraShBits` count the
+    /// `sps_extra_{ph,sh}_bit_present_flag[i]` equal to 1, not the
+    /// `sps_num_extra_{ph,sh}_bytes * 8` upper bound.
+    #[test]
+    fn sps_derives_num_extra_ph_sh_bits_from_present_flags() {
+        // 3 PH flags set (positions 0, 2, 5), 2 SH flags set (1, 7).
+        let ph = [1u8, 0, 1, 0, 0, 1, 0, 0];
+        let sh = [0u8, 1, 0, 0, 0, 0, 0, 1];
+        let bits = build_sps_bits_with_extra_bits(&ph, &sh);
+        let bytes = pack(&bits);
+        let sps = parse_sps(&bytes).unwrap();
+        assert_eq!(sps.sps_num_extra_ph_bytes, 1);
+        assert_eq!(sps.sps_num_extra_sh_bytes, 1);
+        assert_eq!(sps.num_extra_ph_bits, 3);
+        assert_eq!(sps.num_extra_sh_bits, 2);
+
+        // All-zero present flags → counts are 0 even though a byte each
+        // was signalled.
+        let zero = [0u8; 8];
+        let bits0 = build_sps_bits_with_extra_bits(&zero, &zero);
+        let sps0 = parse_sps(&pack(&bits0)).unwrap();
+        assert_eq!(sps0.num_extra_ph_bits, 0);
+        assert_eq!(sps0.num_extra_sh_bits, 0);
     }
 
     #[test]
