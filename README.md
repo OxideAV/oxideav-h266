@@ -192,8 +192,18 @@ P + B-slice merge subset:
   per-sample motion field** (`MvLX[xNb][yNb]`, eqs. 841 – 846), so
   translational neighbours contribute, with the §6.4.4 availability +
   `PredFlagLX == 1 ∧ DiffPicOrderCnt == 0` gate and the cross-list
-  fallback, AMVR-rounded. The affine-merge path's contribution to the
-  store and BCW / BDOF on the affine path remain follow-ups.
+  fallback, AMVR-rounded. **Affine sub-block MERGE to pixels** (§8.5.5.2)
+  is now **live**: a merge CU with `merge_subblock_flag == 1` routes
+  through `reconstruct_leaf_cu_inter_subblock_merge`, which builds the
+  §8.5.5.2 sub-block merge list (inherited A / B per §8.5.5.5 from the
+  affine CPMV store, constructed Const1..6 per §8.5.5.6 from the regular
+  motion field, zero-MV pad), picks the entry at `merge_subblock_idx`,
+  and drives the uni / bi-pred affine MC for the picked candidate's
+  per-list CPMVs. The §8.5.5.9 per-sub-block MV grid is broadcast into
+  the motion field and the affine CB record is stored, so a later CU's
+  §8.5.5.7 inherited scan can recover this merge block's CPMVs. The
+  §8.5.5.3 SbTMVP (`SbCol`) sub-block-temporal candidate and BCW / BDOF
+  on the affine path remain follow-ups.
   Transform-skip inter residual (`residual_ts_coding`, §7.3.11.12) is
   now **live** on the inter luma + chroma + joint-Cb-Cr paths
   (§7.3.11.5 parse gate → §8.7.4.6 inverse-transform bypass).
