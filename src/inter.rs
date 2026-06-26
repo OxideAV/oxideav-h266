@@ -266,6 +266,12 @@ pub struct AffineCbRecord {
     pub cpmvs_l0: crate::affine::AffineCpmvs,
     /// The CB's L1 control-point MV record (`MvCpL1`).
     pub cpmvs_l1: crate::affine::AffineCpmvs,
+    /// `BcwIdx[·]` — the CB's bi-prediction-with-CU-weights index
+    /// (§8.5.6.6.2). Carried so a later CU's §8.5.5.2 inherited
+    /// affine-merge candidate can recover `bcwIdxN` (eqs. 681 – 684).
+    /// `0` (default-weighted) for uni-pred CBs and for affine-AMVP CBs
+    /// whose parsed `bcw_idx` is not yet threaded.
+    pub bcw_idx: u8,
 }
 
 /// Per-picture per-CB affine CPMV store, sampled at 4x4 luma

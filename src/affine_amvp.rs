@@ -221,6 +221,11 @@ pub struct NeighbourAffineQuery {
     pub cpmvs_l0: AffineCpmvs,
     /// Neighbour's L1 CPMV record (B-slice neighbours).
     pub cpmvs_l1: AffineCpmvs,
+    /// `BcwIdx[xNb][yNb]` — the neighbour CB's bi-prediction weight
+    /// index. Surfaced for the §8.5.5.2 inherited affine-merge candidate
+    /// (`bcwIdxN`, eqs. 681 – 684). The §8.5.5.7 AMVP inherited scan
+    /// ignores it.
+    pub bcw_idx: u8,
 }
 
 impl NeighbourAffineQuery {
@@ -245,6 +250,7 @@ impl NeighbourAffineQuery {
             model: MotionModel::Translational,
             cpmvs: [MotionVector::ZERO; 3],
         },
+        bcw_idx: 0,
     };
 }
 
@@ -925,6 +931,7 @@ mod tests {
             motion_model: model,
             cpmvs_l0: cpmvs,
             cpmvs_l1: AffineCpmvs::new_4param(MotionVector::ZERO, MotionVector::ZERO),
+            bcw_idx: 0,
         }
     }
 

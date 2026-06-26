@@ -3314,6 +3314,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             motion_model: rec.model,
             cpmvs_l0: rec.cpmvs_l0,
             cpmvs_l1: rec.cpmvs_l1,
+            bcw_idx: rec.bcw_idx,
         })
     }
 
@@ -3592,14 +3593,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cpmvs_l0,
                     cpmvs_l1,
                     motion_model: nb.motion_model,
-                    // §8.5.5.2 — inherited candidates carry the
-                    // neighbour's BcwIdx only when the §8.5.5.5
-                    // BcwIdxN propagation conditions hold; the regular
-                    // affine bi-pred MC default-weights when bcwIdx==0.
-                    // The neighbour BcwIdx is not stored in the CPMV
-                    // record, so the inherited candidate surfaces 0
-                    // (default-weighted), matching the most common case.
-                    bcw_idx: 0,
+                    // §8.5.5.2 eqs. 681 – 684 — the inherited candidate
+                    // carries the neighbour CB's `bcwIdxN` only when the
+                    // neighbour is bi-pred (a uni-pred neighbour has no
+                    // meaningful weight index; the affine bi-pred MC
+                    // default-weights when bcwIdx == 0).
+                    bcw_idx: if nb.pred_flag_l0 && nb.pred_flag_l1 {
+                        nb.bcw_idx
+                    } else {
+                        0
+                    },
                 },
             };
         }
@@ -3866,6 +3869,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             },
             cpmvs_l0: store_cpmvs_l0.unwrap_or(zero_cpmvs),
             cpmvs_l1: store_cpmvs_l1.unwrap_or(zero_cpmvs),
+            // §8.5.6.6.2 — the parsed affine-AMVP `bcw_idx` is not yet
+            // threaded into this decision struct, so the stored record
+            // carries the default-weighted `0`.
+            bcw_idx: 0,
         };
         self.store_affine_cb(cb_x, cb_y, cb_w, cb_h, rec);
         Ok(())
@@ -4581,6 +4588,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ref_idx_l1: if use_l1 { cand.ref_idx_l1 } else { -1 },
             cpmvs_l0: if use_l0 { cand.cpmvs_l0 } else { zero_cpmvs },
             cpmvs_l1: if use_l1 { cand.cpmvs_l1 } else { zero_cpmvs },
+            // §8.5.6.6.2 — preserve the picked candidate's BcwIdx so a
+            // later CU's §8.5.5.2 inherited candidate recovers it.
+            bcw_idx: cand.bcw_idx,
         };
         self.store_affine_cb(cu.cu.x, cu.cu.y, cb_w, cb_h, rec);
 
@@ -7851,6 +7861,110 @@ mod tests {
         );
         let stored = stored.unwrap();
         assert!(stored.pred_flag_l0 && !stored.pred_flag_l1);
+    }
+
+    /// §8.5.5.2 eqs. 681 – 684 — an inherited affine-merge candidate
+    /// carries the neighbour CB's `bcwIdxN`. A bi-pred affine neighbour
+    /// record stored with `bcw_idx == 3` is inherited by a merge CU; the
+    /// reconstruction must apply the eq. 981 BCW weighting, so it differs
+    /// from the same setup with the neighbour record's `bcw_idx == 0`
+    /// (eq. 980 default-weighted).
+    #[test]
+    fn affine_subblock_merge_inherits_neighbour_bcw_idx() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.affine_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+
+        // Two distinct-constant references so a weight change is visible.
+        let ref_l0 = ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+            motion_field: None,
+        };
+        let ref_l1 = ReferencePicture {
+            poc: 1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+            motion_field: None,
+        };
+
+        // Build the merge CU at (16, 16).
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_subblock_flag = true;
+        info.inter.merge_data.merge_subblock_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        // Stored neighbour record helper — a bi-pred 4-param affine CB at
+        // (0, 16) covering the A1 sample (15, 31), zero CPMVs (so the
+        // inherited projection is zero-MV and the per-list MC is a
+        // verbatim copy of each constant reference).
+        let recon_with_bcw = |bcw: u8| -> u8 {
+            let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+            walker.set_ref_pic_list_l0(vec![ref_l0.clone()]);
+            walker.set_ref_pic_list_l1(vec![ref_l1.clone()]);
+            let zero =
+                crate::affine::AffineCpmvs::new_4param(MotionVector::ZERO, MotionVector::ZERO);
+            let rec = crate::inter::AffineCbRecord {
+                xnb: 0,
+                ynb: 16,
+                nb_w: 16,
+                nb_h: 16,
+                model: crate::affine::MotionModel::Affine4Param,
+                pred_flag_l0: true,
+                pred_flag_l1: true,
+                ref_idx_l0: 0,
+                ref_idx_l1: 0,
+                cpmvs_l0: zero,
+                cpmvs_l1: zero,
+                bcw_idx: bcw,
+            };
+            walker
+                .affine_cpmv_field
+                .write_block(0, 16, 16, 16, Some(rec));
+
+            let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+            walker
+                .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+                .expect("affine merge inherits neighbour bcw");
+            out.luma.samples[20 * out.luma.stride + 20]
+        };
+
+        // bcw == 0 → eq. 980 average (40 + 200 + 1) >> 1 = 120.
+        assert_eq!(
+            recon_with_bcw(0),
+            120,
+            "bcw==0 must take the eq. 980 average"
+        );
+        // bcw == 3 → eq. 981 (w0=−2, w1=10): (−2·40 + 10·200 + 4) >> 3 = 240.
+        assert_eq!(
+            recon_with_bcw(3),
+            240,
+            "inherited bcw==3 must apply the eq. 981 BCW weights"
+        );
     }
 
     /// §8.5.5.3 SbTMVP (`SbCol`) sub-block merge to pixels — a merge CU
