@@ -3915,6 +3915,49 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         AffineCpRecord::UNAVAILABLE
     }
 
+    /// §8.5.5.6 fourth corner — derive the temporal bottom-right corner
+    /// record (corner 3) for the constructed affine-merge candidates.
+    /// The §8.5.5.6 fourth-corner bullet pins `refIdxL0Corner[3] = 0`
+    /// (and `refIdxL1Corner[3] = 0` on B-slices) and reads the §8.5.2.11
+    /// collocated MV at the CU's bottom-right. `predFlagL1Corner[3]`
+    /// only becomes 1 on B-slices. The MVs are AMVR-rounded with the
+    /// default 1/4-luma `AmvrShift(2)` (the temporal candidate is not
+    /// AMVR-signalled — it inherits the slice default).
+    fn read_temporal_corner3(
+        &self,
+        xcb: i32,
+        ycb: i32,
+        cb_w: i32,
+        cb_h: i32,
+        is_b: bool,
+    ) -> crate::affine_merge::AffineCpRecord {
+        use crate::affine_merge::AffineCpRecord;
+        let amvr = crate::amvr::AmvrShift(2);
+        let poc_l0 = self.ref_pic_list_l0.first().map(|r| r.poc);
+        let poc_l1 = self.ref_pic_list_l1.first().map(|r| r.poc);
+        let mv_l0 =
+            poc_l0.and_then(|p| self.derive_amvp_col_candidate(xcb, ycb, cb_w, cb_h, p, amvr));
+        let mv_l1 = if is_b {
+            poc_l1.and_then(|p| self.derive_amvp_col_candidate(xcb, ycb, cb_w, cb_h, p, amvr))
+        } else {
+            None
+        };
+        if mv_l0.is_none() && mv_l1.is_none() {
+            return AffineCpRecord::UNAVAILABLE;
+        }
+        AffineCpRecord {
+            available: true,
+            pred_flag_l0: mv_l0.is_some(),
+            pred_flag_l1: mv_l1.is_some(),
+            ref_idx_l0: if mv_l0.is_some() { 0 } else { -1 },
+            ref_idx_l1: if mv_l1.is_some() { 0 } else { -1 },
+            mv_l0: mv_l0.unwrap_or(MotionVector::ZERO),
+            mv_l1: mv_l1.unwrap_or(MotionVector::ZERO),
+            // §8.5.5.6 — corners 2 / 3 surface bcwIdx == 0.
+            bcw_idx: 0,
+        }
+    }
+
     /// §8.5.2.1 — `NoBackwardPredFlag`: `1` when every active reference
     /// in both lists has POC ≤ the current picture POC. Drives the
     /// §8.5.2.12 sbFlag=1 cross-list (LY) fallback in the SbTMVP fuse.
@@ -4387,8 +4430,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ) -> Result<()> {
         use crate::affine_merge::{
             build_subblock_merge_cand_list, derive_constructed_affine_merge_candidates,
-            AffineCpRecord, ConstructedAffineFlags, SubblockMergeCandidateKind,
-            SubblockMergeListInputs,
+            ConstructedAffineFlags, SubblockMergeCandidateKind, SubblockMergeListInputs,
         };
 
         let xcb = cu.cu.x as i32;
@@ -4412,12 +4454,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let inherited_b =
             self.derive_inherited_affine_merge_side(&b_positions, xcb, ycb, cb_w, cb_h);
 
-        // §8.5.5.2 step 6 + §8.5.5.6 — constructed Const1..6. The four
-        // corner records read the regular per-list motion field at the
-        // cascade positions; corner 3 (bottom-right) is the §8.5.5.3
-        // temporal Col MV, which is not yet wired — it surfaces
-        // unavailable so only Const5 / Const6 (and the 6-param triples
-        // that avoid corner 3) can light up.
+        // §8.5.5.2 step 6 + §8.5.5.6 — constructed Const1..6. Corners
+        // 0 / 1 / 2 read the regular per-list motion field at the cascade
+        // positions; corner 3 (bottom-right) is the §8.5.5.6 fourth-corner
+        // temporal collocated MV (`read_temporal_corner3`), so the
+        // corner-3-dependent triples (Const2 / Const3 / Const4) can now
+        // light up alongside Const1 / Const5 / Const6.
         let tl_positions = [
             (xcb - 1, ycb - 1), // B2
             (xcb, ycb - 1),     // B3
@@ -4431,13 +4473,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             (xcb - 1, ycb + cb_h as i32 - 1), // A1
             (xcb - 1, ycb + cb_h as i32),     // A0
         ];
+        let is_b = self.sh.sh_slice_type == SliceType::B;
         let corner0 = self.read_constructed_merge_corner(&tl_positions, xcb, ycb);
         let corner1 = self.read_constructed_merge_corner(&tr_positions, xcb, ycb);
         let corner2 = self.read_constructed_merge_corner(&bl_positions, xcb, ycb);
-        let corner3 = AffineCpRecord::UNAVAILABLE; // §8.5.5.3 SbCol corner — follow-up.
+        // §8.5.5.6 fourth corner — the temporal bottom-right collocated
+        // MV with `refIdxLXCorner[3] = 0`, derived through the §8.5.2.11
+        // AMVP temporal path per active list. The L1 half is only OR-
+        // folded on B-slices (the fourth-corner bullet).
+        let corner3 = self.read_temporal_corner3(xcb, ycb, cb_w as i32, cb_h as i32, is_b);
         let corners = [corner0, corner1, corner2, corner3];
 
-        let is_b = self.sh.sh_slice_type == SliceType::B;
         let constructed = derive_constructed_affine_merge_candidates(
             cb_w,
             cb_h,
