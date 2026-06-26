@@ -3171,10 +3171,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ///    ({A0, A1}) and step-5 B-scan ({B0, B1, B2}) now read the
     ///    per-CB affine CPMV store ([`Self::affine_neighbour_query`] +
     ///    [`Self::derive_inherited_affine_side`]) and feed real
-    ///    inherited candidates; when no affine neighbour hits, the list
-    ///    falls through to the §8.5.5.7 step-8 temporal MV (replicated
-    ///    across CPs) and the step-9 zero-MV pad. The §8.5.5.8
-    ///    constructed candidate is still deferred.
+    ///    inherited candidates; the §8.5.5.8 constructed candidate
+    ///    (step 6) + step-7 single-corner fallback read the per-corner
+    ///    regular motion field. When nothing hits, the list falls through
+    ///    to the §8.5.5.7 step-8 temporal MV (replicated across CPs) and
+    ///    the step-9 zero-MV pad.
     /// 3. Cumulate the per-CP MVDs (§8.5.5.5 eqs. 660 – 663 via
     ///    `cumulate_affine_mvd_cp`).
     /// 4. Fold predictor + cumulative MVD into the final CPMVs (eqs.
@@ -3273,6 +3274,109 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         None
     }
 
+    /// §8.5.5.8 per-corner constructed-CPMVP pick over one corner's
+    /// ordered cascade of `MvLX` sample positions (TL = {B2, B3, A2},
+    /// TR = {B1, B0}, BL = {A1, A0}). Unlike the inherited scan this
+    /// reads the **regular per-sample motion field** (`MvLX[xNb][yNb]`),
+    /// not the affine CPMV store — so a translational neighbour
+    /// contributes its stored MV directly (eqs. 841 – 846).
+    ///
+    /// Each position is gated by §6.4.4 availability (`MvField::available`,
+    /// satisfied causally by slice-raster decode order) AND the
+    /// `PredFlagLX == 1 ∧ DiffPicOrderCnt(RefPicList[X][RefIdxLX[nb]],
+    /// RefPicList[X][refIdxLX]) == 0` test, with the cross-list
+    /// `Y = 1 − X` fallback. The first matching position wins; the picked
+    /// MV is AMVR-rounded so the corner carries the spec's already-rounded
+    /// `cpMvLX[cpIdx]`.
+    fn constructed_affine_corner(
+        &self,
+        positions: &[(i32, i32)],
+        ctx: &crate::affine_amvp::AffineMvpRefContext<'_>,
+        amvr: crate::amvr::AmvrShift,
+    ) -> crate::affine_amvp::ConstructedAffineMvpCorner {
+        use crate::affine_amvp::{
+            round_constructed_corner_amvr, ConstructedAffineMvpCorner, RefList,
+        };
+        let cur_list = ctx.list;
+        for &(xnb, ynb) in positions {
+            let nb = self.motion_field.get_at_luma(xnb, ynb);
+            if !nb.available {
+                continue;
+            }
+            // List X first, then list Y = 1 − X. Each requires
+            // PredFlagL? == 1 and a matching reference POC.
+            for which in [cur_list, cur_list.other()] {
+                let (pred_flag, ref_idx, mv) = match which {
+                    RefList::L0 => (nb.pred_flag_l0, nb.ref_idx_l0, nb.mv_l0),
+                    RefList::L1 => (nb.pred_flag_l1, nb.ref_idx_l1, nb.mv_l1),
+                };
+                if !pred_flag {
+                    continue;
+                }
+                let poc = match which {
+                    RefList::L0 => (ctx.poc_of_l0_ref)(ref_idx),
+                    RefList::L1 => (ctx.poc_of_l1_ref)(ref_idx),
+                };
+                if poc == Some(ctx.current_ref_poc) {
+                    return ConstructedAffineMvpCorner {
+                        available: true,
+                        mv: round_constructed_corner_amvr(mv, amvr),
+                    };
+                }
+            }
+        }
+        ConstructedAffineMvpCorner::default()
+    }
+
+    /// §8.5.5.8 — derive the three constructed-CPMVP corners (top-left,
+    /// top-right, bottom-left) at the spec's cascade positions, plus the
+    /// `numCpMv`-sized full constructed candidate (`availableConsFlagLX`).
+    /// Returns `(corners, constructed_full)` ready to stage into
+    /// [`crate::affine_amvp::AffineMvpListInputs`].
+    fn derive_constructed_affine_corners(
+        &self,
+        xcb: i32,
+        ycb: i32,
+        cbw: i32,
+        cbh: i32,
+        ctx: &crate::affine_amvp::AffineMvpRefContext<'_>,
+        amvr: crate::amvr::AmvrShift,
+        num_cp_mv: u32,
+    ) -> (
+        [crate::affine_amvp::ConstructedAffineMvpCorner; 3],
+        Option<crate::affine_amvp::AffineMvpCandidate>,
+    ) {
+        // §8.5.5.8 step-1 cascade positions per corner.
+        let tl_positions = [
+            (xcb - 1, ycb - 1), // B2
+            (xcb, ycb - 1),     // B3
+            (xcb - 1, ycb),     // A2
+        ];
+        let tr_positions = [
+            (xcb + cbw - 1, ycb - 1), // B1
+            (xcb + cbw, ycb - 1),     // B0
+        ];
+        let bl_positions = [
+            (xcb - 1, ycb + cbh - 1), // A1
+            (xcb - 1, ycb + cbh),     // A0
+        ];
+        let top_left = self.constructed_affine_corner(&tl_positions, ctx, amvr);
+        let top_right = self.constructed_affine_corner(&tr_positions, ctx, amvr);
+        let bottom_left = self.constructed_affine_corner(&bl_positions, ctx, amvr);
+        // The picks are already AMVR-rounded, so the §8.5.5.8 inner
+        // rounding bullet inside `derive_constructed_affine_mvp_candidate`
+        // is a no-op on them — passing them straight through keeps the
+        // `availableConsFlagLX` gating logic in one place.
+        let full = crate::affine_amvp::derive_constructed_affine_mvp_candidate(
+            top_left,
+            top_right,
+            bottom_left,
+            num_cp_mv,
+            amvr,
+        );
+        ([top_left, top_right, bottom_left], full)
+    }
+
     /// Broadcast the final-decided affine CB record into the per-CB
     /// affine CPMV store (§8.5.5.7 / §8.5.5.5 source for later CUs).
     /// `model` is the CU's `MotionModelIdc`; the per-list CPMVs / pred
@@ -3360,10 +3464,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // carries every previously-decoded affine CB's CPMV record;
             // the A-scan {A0, A1} and B-scan {B0, B1, B2} sample the
             // §8.5.5.7 eq. 819 – 823 neighbour positions and feed the
-            // §8.5.5.5 inherited derivation. Constructed CPMVP
-            // (§8.5.5.8) remains deferred; when neither inherited side
-            // hits, the list falls through to the step-8 temporal MV +
-            // step-9 zero-MV pad.
+            // §8.5.5.5 inherited derivation. §8.5.5.8 constructed CPMVP
+            // (step 6) + the step-7 single-corner fallback now read the
+            // per-corner regular motion field; when nothing hits, the
+            // list falls through to the step-8 temporal MV + step-9
+            // zero-MV pad.
             let ctx = AffineMvpRefContext {
                 list,
                 current_ref_poc,
@@ -3414,12 +3519,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 num_cp_mv,
             );
 
+            // §8.5.5.8 constructed CPMVP — read the per-corner regular
+            // motion field at the cascade positions and assemble the full
+            // candidate (`availableConsFlagLX`) plus the per-corner picks
+            // for the §8.5.5.7 step-7 single-corner fallback.
+            let (constructed_corners, constructed_full) =
+                slf.derive_constructed_affine_corners(xcb, ycb, cbw, cbh, &ctx, amvr, num_cp_mv);
+
             let list_lx = build_affine_mvp_cand_list(AffineMvpListInputs {
                 num_cp_mv,
                 inherited_a,
                 inherited_b,
-                constructed_full: None,
-                constructed_corners: Default::default(),
+                constructed_full,
+                constructed_corners,
                 temporal_col,
                 _phantom: core::marker::PhantomData,
             });
@@ -6210,6 +6322,140 @@ mod tests {
                     out1.luma.samples[y * out1.luma.stride + x],
                     expect.luma.samples[y * expect.luma.stride + x],
                     "second CU fuse must equal the inherited-CPMV recon at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// §8.5.5.8 constructed affine CPMVP — when the three corner
+    /// cascades (TL = {B2,B3,A2}, TR = {B1,B0}, BL = {A1,A0}) all read
+    /// a translational inter neighbour whose L0 reference POC matches the
+    /// current CU's, the `availableConsFlagLX` candidate is assembled
+    /// from the per-corner `MvLX[xNb][yNb]` (eqs. 841 – 846) — read from
+    /// the **regular** motion field, NOT the affine CPMV store (which
+    /// holds no translational neighbours). With no inherited affine
+    /// neighbour present, that constructed candidate becomes
+    /// `cpMvpListLX[0]`; selecting `mvp_l0_flag == 0` + zero MVD makes
+    /// the final CPMVs equal the neighbour MV at every CP, so the output
+    /// must differ from a zero-CPMV baseline and exactly match an affine
+    /// recon driven by that uniform-CPMV predictor.
+    #[test]
+    fn affine_amvp_constructed_cpmvp_from_motion_field() {
+        use crate::affine_syntax_enc::make_non_merge_inter_affine_decision;
+        use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision;
+        use crate::non_merge_mvp_syntax_enc::make_non_merge_mvp_syntax_decision;
+
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x * 3 + y) & 63) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
+
+        // A translational L0 neighbour with refIdx 0 (POC -1, matching).
+        // Strong MV so a uniform-CPMV affine recon is clearly non-zero.
+        let nb_mv = MotionVector::from_int_pel(6, -3);
+        let nb = MvField {
+            mv_l0: nb_mv,
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+        };
+        // CU at (16,16,16,16). Its TL cascade reads (15,15)/(16,15)/(15,16),
+        // TR reads (31,15)/(32,15), BL reads (15,31)/(15,32). Fill the top
+        // band (y < 16, x < 48) and the left column (x < 16, y < 48) so
+        // every corner position resolves to the neighbour.
+        walker.motion_field.write_block(0, 0, 48, 16, nb);
+        walker.motion_field.write_block(0, 0, 16, 48, nb);
+
+        let affine = make_non_merge_inter_affine_decision(true, false);
+        let mvp = make_non_merge_mvp_syntax_decision(
+            crate::leaf_cu::InterPredDir::PredL0,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        let decision = NonMergeInterPreResidualAffineDecision::new(
+            affine,
+            mvp,
+            [MotionVector::ZERO; 3],
+            [MotionVector::ZERO; 3],
+        );
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu_inter_affine_amvp(
+                16,
+                16,
+                16,
+                16,
+                &decision,
+                crate::amvr::AmvrShift(0),
+                &mut out,
+            )
+            .expect("constructed-CPMVP affine recon");
+
+        // Zero-CPMV baseline (what a pre-constructed-CPMVP decoder gave).
+        let zero_cpmvs = crate::affine::AffineCpmvs::new_4param(
+            MotionVector::from_int_pel(0, 0),
+            MotionVector::from_int_pel(0, 0),
+        );
+        let mut baseline = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &zero_cpmvs, &ref_pic, &mut baseline)
+            .expect("zero-CPMV baseline recon");
+        let mut differs = false;
+        for y in 16..32usize {
+            for x in 16..32usize {
+                if out.luma.samples[y * out.luma.stride + x]
+                    != baseline.luma.samples[y * baseline.luma.stride + x]
+                {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "constructed CPMVP must change the CU's prediction vs. the zero-MV-pad baseline"
+        );
+
+        // The constructed candidate replicates the neighbour MV across
+        // both CPs, so the final CPMVs (zero MVD) are uniform == nb_mv.
+        // An affine recon driven by that uniform CPMV must match exactly.
+        let uniform = crate::affine::AffineCpmvs::new_4param(nb_mv, nb_mv);
+        let mut expect = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_uni(16, 16, 16, 16, &uniform, &ref_pic, &mut expect)
+            .expect("uniform-CPMV recon");
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    expect.luma.samples[y * expect.luma.stride + x],
+                    "constructed-CPMVP fuse must equal the uniform-CPMV recon at ({x},{y})"
                 );
             }
         }

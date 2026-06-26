@@ -820,6 +820,20 @@ pub fn cumulate_affine_mvd_cp(
 // §8.5.2.14 helpers — copied here so the module stands on its own.
 // =====================================================================
 
+/// §8.5.2.14 AMVR rounding of a constructed-corner MV
+/// (`rightShift = leftShift = AmvrShift`), exposed for the CTU walker so
+/// the §8.5.5.8 corner picks it stages in
+/// [`AffineMvpListInputs::constructed_corners`] carry the same
+/// already-rounded `cpMvLX[cpIdx]` values that
+/// [`derive_constructed_affine_mvp_candidate`] produces for
+/// [`AffineMvpListInputs::constructed_full`]. The step-7 single-corner
+/// fallback in [`build_affine_mvp_cand_list`] then consumes those
+/// corner MVs verbatim (no second rounding), matching §8.5.5.7's reads
+/// of the already-rounded `cpMvLX[nbCpIdx]`.
+pub fn round_constructed_corner_amvr(mv: MotionVector, amvr: AmvrShift) -> MotionVector {
+    round_mv_amvr(mv, amvr)
+}
+
 /// §8.5.2.14 rounding (signed-magnitude) with
 /// `rightShift = leftShift = AmvrShift`.
 fn round_mv_amvr(mv: MotionVector, amvr: AmvrShift) -> MotionVector {
