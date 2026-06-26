@@ -2749,6 +2749,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu_qp_delta,
                     bit_depth,
                     cu_off_cbcr,
+                    info.transform_skip_cb,
+                    info.transform_skip_cr,
                     out,
                 )?;
             } else {
@@ -4021,6 +4023,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cu_qp_delta: i32,
         bit_depth: u32,
         cu_qp_offset_cbcr: i32,
+        coded_transform_skip_cb: bool,
+        coded_transform_skip_cr: bool,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
@@ -4029,10 +4033,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         let mode = TuCResMode::from_raw(tu_c_res_mode)?;
         // The coded component supplies the levels: Cb for modes 1 / 2,
-        // Cr for mode 3 (§8.7.2 codedCIdx).
-        let coded_levels = match mode {
-            TuCResMode::CrCoded => &residual.cr_levels,
-            _ => &residual.cb_levels,
+        // Cr for mode 3 (§8.7.2 codedCIdx). Its `transform_skip_flag`
+        // controls whether the single coded TB bypasses the inverse
+        // transform (§8.7.4.6) — read from the coded component's flag.
+        let (coded_levels, coded_ts) = match mode {
+            TuCResMode::CrCoded => (&residual.cr_levels, coded_transform_skip_cr),
+            _ => (&residual.cb_levels, coded_transform_skip_cb),
         };
         if coded_levels.len() != c_w * c_h {
             // No coded coefficients captured (e.g. all-zero CBF edge);
@@ -4057,18 +4063,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_h: c_h as u32,
             qp,
             dep_quant: false,
-            transform_skip: false,
+            transform_skip: coded_ts,
             bdpcm: false,
             bdpcm_dir: false,
         };
         let d = dequantize_tb_flat(coded_levels, &params)?;
-        let non_zero_w = c_w.min(32);
-        let non_zero_h = c_h.min(32);
-        let coded = CodedTransform::Transform {
-            non_zero_w,
-            non_zero_h,
-            tr_type_hor: TrType::DctII,
-            tr_type_ver: TrType::DctII,
+        // §8.7.4.6 — when the coded chroma TB carries transform_skip the
+        // single dequantised block is the residual directly (CodedTransform
+        // ::Skip); otherwise the §8.7.4.1 DCT-II × DCT-II inverse runs.
+        let coded = if coded_ts {
+            CodedTransform::Skip
+        } else {
+            let non_zero_w = c_w.min(32);
+            let non_zero_h = c_h.min(32);
+            CodedTransform::Transform {
+                non_zero_w,
+                non_zero_h,
+                tr_type_hor: TrType::DctII,
+                tr_type_ver: TrType::DctII,
+            }
         };
         // Derive and add each chroma component's residual.
         for c_idx in [1u32, 2u32] {
@@ -5839,6 +5852,92 @@ mod tests {
             any_cb_changed,
             "the JCCR coded block must apply a non-zero residual to both chroma planes"
         );
+    }
+
+    /// §8.7.2 + §8.7.4.6 — JCCR inter residual with the coded chroma TB
+    /// (Cb, mode 2) carrying `transform_skip_flag == 1`. The single coded
+    /// block bypasses the inverse transform, so the lone DC level lifts
+    /// only chroma sample (0,0) of BOTH planes (cSign = +1 → identical),
+    /// with no DCT spreading. Proves the JCCR inter path now honours the
+    /// coded component's transform-skip flag.
+    #[test]
+    fn reconstruct_leaf_cu_inter_joint_cbcr_transform_skip() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.set_ph_joint_cbcr_sign(false);
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = true;
+        info.tu_cr_coded_flag = true;
+        info.tu_joint_cbcr_residual_flag = true;
+        info.tu_c_res_mode = 2;
+        // Coded Cb block carries transform-skip; single DC level.
+        info.transform_skip_cb = true;
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8;
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("JCCR transform-skip inter residual should reconstruct");
+
+        // Chroma plane is seeded at neutral 128 by yuv420_filled. Only
+        // (0,0) of each plane may move; cSign = +1 → Cb == Cr everywhere.
+        assert_ne!(
+            out.cb.samples[0], 128,
+            "TS JCCR DC must lift chroma sample (0,0)"
+        );
+        for cy in 0..8usize {
+            for cx in 0..8usize {
+                let idx = cy * out.cb.stride + cx;
+                assert_eq!(
+                    out.cb.samples[idx], out.cr.samples[idx],
+                    "cSign=+1 JCCR must keep Cb == Cr at ({cx},{cy})"
+                );
+                if cx == 0 && cy == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    out.cb.samples[idx], 128,
+                    "TS JCCR residual must not spread to chroma ({cx},{cy})"
+                );
+            }
+        }
     }
 
     /// §8.7.2 joint Cb-Cr inter residual, mode 2 with
