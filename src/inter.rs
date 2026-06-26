@@ -1447,6 +1447,13 @@ pub struct NonMergeInterData {
     pub mvd_l1: MotionVector,
     /// Per-CU `AmvrShift` (§7.4.11.6, Table 16) applied to both MVDs.
     pub amvr_shift: crate::amvr::AmvrShift,
+    /// §7.3.10.5 `bcw_idx[x0][y0]` — the bi-prediction-with-CU-weights
+    /// index parsed for an explicit-bi (`PRED_BI`) non-merge CU. Range
+    /// `0..=4`; `0` selects the §8.5.6.6.2 eq. 980 default-weighted
+    /// average, `1..=4` index `BCW_W_LUT` for the eq. 981 weighted blend.
+    /// Inferred 0 when the §7.3.10.5 gate doesn't signal it (uni-pred,
+    /// small CU, weighted-pred active, etc.).
+    pub bcw_idx: u8,
 }
 
 impl Default for NonMergeInterData {
@@ -1461,6 +1468,7 @@ impl Default for NonMergeInterData {
             mvd_l1: MotionVector::ZERO,
             // §7.4.11.6 Table 16 default — 1/4-luma resolution.
             amvr_shift: crate::amvr::AmvrShift(2),
+            bcw_idx: 0,
         }
     }
 }

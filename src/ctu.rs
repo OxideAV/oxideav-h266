@@ -3035,10 +3035,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
-            // §8.5.6.6.2 — BCW for the non-merge path comes from the
-            // parsed `bcw_idx`; not yet threaded through the AMVP
-            // record, so default equal-weight bi-pred (eq. 980).
-            bcw_idx: 0,
+            // §8.5.6.6.2 — BCW for the non-merge path is the parsed
+            // `bcw_idx[x0][y0]`. `0` ⇒ eq. 980 default-weighted average;
+            // `1..=4` ⇒ eq. 981 `BCW_W_LUT` weighted blend in the bi-pred
+            // tail. Inferred 0 for uni-pred CUs (the gate never signals it).
+            bcw_idx: nm.bcw_idx,
         };
 
         self.reconstruct_inter_with_chosen(cu, info, residual, chosen, out)
@@ -5418,6 +5419,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §8.5.6.6.2 eq. 981 — a **non-merge** bi-pred CU carrying a parsed
+    /// `bcw_idx > 0` must blend its two predictions with the `BCW_W_LUT`
+    /// weights, not the eq. 980 equal-weight average. With L0 ≡ 80 and
+    /// L1 ≡ 200 the default (`bcw_idx == 0`) average is 140; `bcw_idx ==
+    /// 3` (w0 = −2, w1 = 10) gives `(−2·80 + 10·200 + 4) >> 3 = 230`. The
+    /// two reconstructions must differ, proving the parsed `bcw_idx` now
+    /// reaches the bi-pred tail through `NonMergeInterData::bcw_idx`
+    /// (previously hardcoded 0 on the AMVP record).
+    #[test]
+    fn reconstruct_leaf_cu_inter_amvp_bipred_bcw_weights() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.current_poc = 4;
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: 0,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 80),
+            motion_field: None,
+        }]);
+        walker.set_ref_pic_list_l1(vec![ReferencePicture {
+            poc: 8,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+            motion_field: None,
+        }]);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let make_info = |bcw: u8| {
+            let mut info = LeafCuInfo {
+                x0: 16,
+                y0: 0,
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Inter,
+                ..LeafCuInfo::default()
+            };
+            info.inter.general_merge_flag = false;
+            info.inter.non_merge = crate::inter::NonMergeInterData {
+                pred_dir: crate::leaf_cu::InterPredDir::PredBi,
+                ref_idx_l0: 0,
+                ref_idx_l1: 0,
+                mvp_l0_flag: 0,
+                mvp_l1_flag: 0,
+                mvd_l0: MotionVector::ZERO,
+                mvd_l1: MotionVector::ZERO,
+                bcw_idx: bcw,
+                ..crate::inter::NonMergeInterData::default()
+            };
+            info
+        };
+        let residual = LeafCuResidual::default();
+
+        // bcw_idx == 0 — eq. 980 equal-weight average (≈140).
+        let mut out_def = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &make_info(0), &residual, &mut out_def)
+            .expect("default bi-pred recon");
+        // bcw_idx == 3 — eq. 981 weighted blend (230).
+        let mut out_bcw = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &make_info(3), &residual, &mut out_bcw)
+            .expect("BCW bi-pred recon");
+
+        let def00 = out_def.luma.samples[16] as i32;
+        let bcw00 = out_bcw.luma.samples[16] as i32;
+        assert_eq!(def00, 140, "default-weighted bi-pred must average to 140");
+        assert_eq!(
+            bcw00, 230,
+            "bcw_idx=3 must apply the eq. 981 weighted blend"
+        );
     }
 
     /// §8.5.2.9 step 6 — with no available spatial / temporal / HMVP
