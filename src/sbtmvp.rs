@@ -674,6 +674,19 @@ impl SbColGrid {
 /// applied to `mvCol` before scaling, matching the round-25 temporal
 /// merge convention of integer-pel rounding (`mv >> 4 << 4`) which is
 /// sample-exact for the integer-pel test vectors.
+/// Public wrapper over [`derive_collocated_mv_subblock`] so the CTU
+/// walker can run the §8.5.2.12 (sbFlag = 1) collocated-MV derivation
+/// for the §8.5.5.4 CU-centre block read (eqs. 729 – 731) outside this
+/// module. `x` selects the list (0 or 1).
+pub fn derive_collocated_mv_subblock_pub(
+    col: ColBlockMotion,
+    x: i32,
+    curr_ref_poc: i32,
+    inputs: &SbTmvpFuseInputs<'_>,
+) -> (MotionVector, bool) {
+    derive_collocated_mv_subblock(col, x, curr_ref_poc, inputs)
+}
+
 fn derive_collocated_mv_subblock(
     col: ColBlockMotion,
     x: i32,

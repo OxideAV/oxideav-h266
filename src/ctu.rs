@@ -3908,6 +3908,453 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         AffineCpRecord::UNAVAILABLE
     }
 
+    /// §8.5.2.1 — `NoBackwardPredFlag`: `1` when every active reference
+    /// in both lists has POC ≤ the current picture POC. Drives the
+    /// §8.5.2.12 sbFlag=1 cross-list (LY) fallback in the SbTMVP fuse.
+    fn no_backward_pred_flag(&self) -> bool {
+        let all_le = |list: &[ReferencePicture]| list.iter().all(|r| r.poc <= self.current_poc);
+        all_le(&self.ref_pic_list_l0) && all_le(&self.ref_pic_list_l1)
+    }
+
+    /// §8.5.5.3 / §8.5.5.4 — build the SbTMVP record for the current CB:
+    /// gate on the §8.5.5.3 first bullet, derive `tempMv` from the A1
+    /// neighbour (§8.5.5.4), the centre / grid geometry (eqs. 711 – 718),
+    /// and read the collocated CU-centre block (§8.5.5.4 eqs. 729 – 731)
+    /// to populate `ctrMvLX` / `ctrPredFlagLX`. Returns `None` when the
+    /// gate is closed or no collocated picture is bound. The returned
+    /// record's [`SbTmvpRecord::is_sb_col_available`] reports the
+    /// §8.5.5.3 step-3 `availableFlagSbCol`.
+    fn build_sbtmvp_record(
+        &self,
+        xcb: i32,
+        ycb: i32,
+        cb_w: i32,
+        cb_h: i32,
+    ) -> Option<(crate::sbtmvp::SbTmvpRecord, ReferencePicture)> {
+        use crate::sbtmvp::{
+            derive_temp_mv, is_sbtmvp_available, ColBlockMotion, PictureBoundary,
+            SbTmvpAvailability, SbTmvpCenterLoc, SbTmvpFuseInputs, SbTmvpGrid, SbTmvpRecord,
+            SbTmvpTempMvInputs,
+        };
+
+        // §8.5.5.3 first-bullet gate.
+        let col_list = if self.collocated_from_l0 {
+            &self.ref_pic_list_l0
+        } else {
+            &self.ref_pic_list_l1
+        };
+        let col_idx = self.col_ref_idx as usize;
+        let col_pic = col_list.get(col_idx)?;
+        col_pic.motion_field.as_ref()?;
+        let gate = SbTmvpAvailability {
+            sps_sbtmvp_enabled: self.sps.tool_flags.sbtmvp_enabled_flag,
+            ph_temporal_mvp_enabled: self.ph_temporal_mvp_enabled,
+            cb_width: cb_w,
+            cb_height: cb_h,
+            col_pic_present: true,
+        };
+        if !is_sbtmvp_available(gate) {
+            return None;
+        }
+
+        let is_b = self.sh.sh_slice_type == SliceType::B;
+        let col_pic_poc = col_pic.poc;
+        let curr_ref_poc_l0 = self
+            .ref_pic_list_l0
+            .first()
+            .map(|r| r.poc)
+            .unwrap_or(self.current_poc);
+        let curr_ref_poc_l1 = self
+            .ref_pic_list_l1
+            .first()
+            .map(|r| r.poc)
+            .unwrap_or(self.current_poc);
+
+        // §8.5.5.4 A1 neighbour query (xCb − 1, yCb + cbHeight − 1).
+        let a1 = self.motion_field.get_at_luma(xcb - 1, ycb + cb_h - 1);
+        let temp_mv = derive_temp_mv(SbTmvpTempMvInputs {
+            available_a1: a1.available,
+            pred_flag_l0_a1: a1.pred_flag_l0,
+            pred_flag_l1_a1: a1.pred_flag_l1,
+            ref_idx_l0_a1: a1.ref_idx_l0,
+            ref_idx_l1_a1: a1.ref_idx_l1,
+            mv_l0_a1: a1.mv_l0,
+            mv_l1_a1: a1.mv_l1,
+            slice_type: self.sh.sh_slice_type,
+            col_pic_poc,
+            poc_of_l0_ref: &|idx: i32| {
+                if idx < 0 {
+                    None
+                } else {
+                    self.ref_pic_list_l0.get(idx as usize).map(|r| r.poc)
+                }
+            },
+            poc_of_l1_ref: &|idx: i32| {
+                if idx < 0 {
+                    None
+                } else {
+                    self.ref_pic_list_l1.get(idx as usize).map(|r| r.poc)
+                }
+            },
+        });
+
+        let ctb_log2 = self.layout.ctb_log2_size_y;
+        let centre = SbTmvpCenterLoc::derive(xcb, ycb, cb_w, cb_h, ctb_log2);
+        let grid = SbTmvpGrid::derive(cb_w, cb_h);
+        let boundary = PictureBoundary::Picture {
+            pic_width_luma: self.layout.pic_width_luma as i32,
+            pic_height_luma: self.layout.pic_height_luma as i32,
+        };
+
+        // §8.5.5.4 centre-block read — the collocated motion at the
+        // clipped CU-centre location (eqs. 729 – 731) seeds `ctrMvLX`.
+        let mf = col_pic.motion_field.as_ref().unwrap();
+        let col_sampler = |x: i32, y: i32| -> ColBlockMotion {
+            let m = mf.get_at_luma(x, y);
+            ColBlockMotion {
+                mode_inter: m.available && m.mode_inter,
+                pred_flag_l0: m.pred_flag_l0,
+                pred_flag_l1: m.pred_flag_l1,
+                mv_l0: m.mv_l0,
+                mv_l1: m.mv_l1,
+                ref_idx_l0: m.ref_idx_l0,
+                ref_idx_l1: m.ref_idx_l1,
+            }
+        };
+
+        let fuse_inputs = SbTmvpFuseInputs {
+            xcb,
+            ycb,
+            ctb_log2_size_y: ctb_log2,
+            boundary,
+            slice_type: self.sh.sh_slice_type,
+            no_backward_pred: self.no_backward_pred_flag(),
+            col_pic_poc,
+            curr_pic_poc: self.current_poc,
+            curr_ref_poc_l0,
+            curr_ref_poc_l1,
+            poc_of_col_ref: &|list_col: i32, ref_idx: i32| {
+                // The collocated picture's RPL is not modelled; the
+                // §8.5.2.12 fuse assumes the collocated MV's reference
+                // sits on the current axis (equal-distance fast path).
+                let _ = (list_col, ref_idx);
+                Some(self.current_poc)
+            },
+        };
+
+        // Centre-block collocated read (eqs. 729 – 731 clip + §8.5.2.12).
+        let (xc, yc) = crate::sbtmvp::clip_col_centre_location(
+            centre.x_ctb,
+            centre.y_ctb,
+            ctb_log2,
+            boundary,
+            centre.x_ctr_cb,
+            centre.y_ctr_cb,
+            temp_mv,
+        );
+        let ctr_col = col_sampler((xc >> 3) << 3, (yc >> 3) << 3);
+        let (ctr_mv_l0, ctr_pred_l0) = crate::sbtmvp::derive_collocated_mv_subblock_pub(
+            ctr_col,
+            0,
+            curr_ref_poc_l0,
+            &fuse_inputs,
+        );
+        let (ctr_mv_l1, ctr_pred_l1) = if is_b {
+            crate::sbtmvp::derive_collocated_mv_subblock_pub(
+                ctr_col,
+                1,
+                curr_ref_poc_l1,
+                &fuse_inputs,
+            )
+        } else {
+            (MotionVector::ZERO, false)
+        };
+
+        let record = SbTmvpRecord {
+            col_pic_poc,
+            centre,
+            grid,
+            ref_idx_l0_sb_col: 0,
+            ref_idx_l1_sb_col: 0,
+            temp_mv,
+            ctr_pred_flag_l0: ctr_pred_l0,
+            ctr_pred_flag_l1: ctr_pred_l1,
+            ctr_mv_l0,
+            ctr_mv_l1,
+        };
+        Some((record, col_pic.clone()))
+    }
+
+    /// §8.5.5.3 + §8.5.6 — reconstruct an SbTMVP (`SbCol`) sub-block
+    /// merge CU to pixels. Fills the §8.5.5.3 per-8×8-sub-block motion
+    /// grid (`fill_subblock_motion`) and runs translational MC for each
+    /// sub-block (uni- or default-weighted bi-pred), then layers residual
+    /// and writes the per-sub-block motion field. The collocated motion
+    /// for every reference list is read from `RefPicList[0]` /
+    /// `RefPicList[1]` at `refIdxLXSbCol = 0`.
+    fn reconstruct_leaf_cu_sbtmvp(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        record: &crate::sbtmvp::SbTmvpRecord,
+        col_pic: &ReferencePicture,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::sbtmvp::{
+            fill_subblock_motion, ColBlockMotion, PictureBoundary, SbTmvpFuseInputs,
+        };
+
+        let xcb = cu.cu.x as i32;
+        let ycb = cu.cu.y as i32;
+        let is_b = self.sh.sh_slice_type == SliceType::B;
+        let ctb_log2 = self.layout.ctb_log2_size_y;
+        let boundary = PictureBoundary::Picture {
+            pic_width_luma: self.layout.pic_width_luma as i32,
+            pic_height_luma: self.layout.pic_height_luma as i32,
+        };
+        let curr_ref_poc_l0 = self
+            .ref_pic_list_l0
+            .first()
+            .map(|r| r.poc)
+            .unwrap_or(self.current_poc);
+        let curr_ref_poc_l1 = self
+            .ref_pic_list_l1
+            .first()
+            .map(|r| r.poc)
+            .unwrap_or(self.current_poc);
+
+        let mf = col_pic.motion_field.as_ref().ok_or_else(|| {
+            Error::invalid("h266 sbtmvp: collocated picture lost its motion field")
+        })?;
+        let col_sampler = |x: i32, y: i32| -> ColBlockMotion {
+            let m = mf.get_at_luma(x, y);
+            ColBlockMotion {
+                mode_inter: m.available && m.mode_inter,
+                pred_flag_l0: m.pred_flag_l0,
+                pred_flag_l1: m.pred_flag_l1,
+                mv_l0: m.mv_l0,
+                mv_l1: m.mv_l1,
+                ref_idx_l0: m.ref_idx_l0,
+                ref_idx_l1: m.ref_idx_l1,
+            }
+        };
+        let fuse_inputs = SbTmvpFuseInputs {
+            xcb,
+            ycb,
+            ctb_log2_size_y: ctb_log2,
+            boundary,
+            slice_type: self.sh.sh_slice_type,
+            no_backward_pred: self.no_backward_pred_flag(),
+            col_pic_poc: record.col_pic_poc,
+            curr_pic_poc: self.current_poc,
+            curr_ref_poc_l0,
+            curr_ref_poc_l1,
+            poc_of_col_ref: &|_list_col: i32, _ref_idx: i32| Some(self.current_poc),
+        };
+
+        let sb_grid = fill_subblock_motion(record, &fuse_inputs, &col_sampler);
+        let sb_w = record.grid.sb_width as u32;
+        let sb_h = record.grid.sb_height as u32;
+
+        // Per-sub-block translational MC. refIdxLXSbCol == 0, so the
+        // reference picture is RefPicList[X][0].
+        let ref_l0 = self.ref_pic_list_l0.first().cloned();
+        let ref_l1 = self.ref_pic_list_l1.first().cloned();
+
+        for ys in 0..sb_grid.num_sb_y {
+            for xs in 0..sb_grid.num_sb_x {
+                let sb = sb_grid.at(xs, ys);
+                let bx = cu.cu.x + xs as u32 * sb_w;
+                let by = cu.cu.y + ys as u32 * sb_h;
+                let use_l0 = sb.pred_flag_l0 && ref_l0.is_some();
+                let use_l1 = is_b && sb.pred_flag_l1 && ref_l1.is_some();
+                match (use_l0, use_l1) {
+                    (true, false) => {
+                        let rp = ref_l0.as_ref().unwrap();
+                        crate::inter::predict_luma_block(
+                            &mut out.luma,
+                            bx,
+                            by,
+                            sb_w,
+                            sb_h,
+                            &rp.frame.luma,
+                            sb.mv_l0,
+                        )?;
+                        self.sbtmvp_chroma_mc(out, bx, by, sb_w, sb_h, &rp.frame, sb.mv_l0)?;
+                    }
+                    (false, true) => {
+                        let rp = ref_l1.as_ref().unwrap();
+                        crate::inter::predict_luma_block(
+                            &mut out.luma,
+                            bx,
+                            by,
+                            sb_w,
+                            sb_h,
+                            &rp.frame.luma,
+                            sb.mv_l1,
+                        )?;
+                        self.sbtmvp_chroma_mc(out, bx, by, sb_w, sb_h, &rp.frame, sb.mv_l1)?;
+                    }
+                    (true, true) => {
+                        let rp0 = ref_l0.as_ref().unwrap();
+                        let rp1 = ref_l1.as_ref().unwrap();
+                        // §8.5.6.6.2 eq. 980 default-weighted average.
+                        crate::inter::predict_luma_block_bipred(
+                            &mut out.luma,
+                            bx,
+                            by,
+                            sb_w,
+                            sb_h,
+                            &rp0.frame.luma,
+                            sb.mv_l0,
+                            &rp1.frame.luma,
+                            sb.mv_l1,
+                        )?;
+                        self.sbtmvp_chroma_mc_bi(
+                            out, bx, by, sb_w, sb_h, &rp0.frame, sb.mv_l0, &rp1.frame, sb.mv_l1,
+                        )?;
+                    }
+                    (false, false) => {
+                        return Err(Error::invalid(
+                            "h266 sbtmvp: sub-block has neither list active after centre fallback",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // §8.5.8 residual + bookkeeping.
+        self.add_inter_cu_residual(cu, info, residual, out)?;
+        // Broadcast a representative MV (the first sub-block's) onto the
+        // motion field cells; finer SbTMVP per-sub-block field writes
+        // follow the same grid.
+        for ys in 0..sb_grid.num_sb_y {
+            for xs in 0..sb_grid.num_sb_x {
+                let sb = sb_grid.at(xs, ys);
+                let mvf = MvField {
+                    mv_l0: sb.mv_l0,
+                    ref_idx_l0: sb.ref_idx_l0,
+                    pred_flag_l0: sb.pred_flag_l0,
+                    mv_l1: sb.mv_l1,
+                    ref_idx_l1: sb.ref_idx_l1,
+                    pred_flag_l1: sb.pred_flag_l1 && is_b,
+                    cu_skip_flag: false,
+                    mode_inter: true,
+                    available: true,
+                    bcw_idx: 0,
+                };
+                let bx = cu.cu.x + xs as u32 * sb_w;
+                let by = cu.cu.y + ys as u32 * sb_h;
+                self.motion_field.write_block(bx, by, sb_w, sb_h, mvf);
+            }
+        }
+        // SbTMVP CBs are translational at the sub-block granularity — no
+        // affine CPMV record; clear the affine store so later §8.5.5.7
+        // scans don't inherit a stale record.
+        self.affine_cpmv_field
+            .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, None);
+
+        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
+        self.deblock_cus.push(DeblockCu {
+            x: cu.cu.x,
+            y: cu.cu.y,
+            w: cu.cu.w,
+            h: cu.cu.h,
+            qp_y,
+            intra: false,
+            tu_y_coded: info.tu_y_coded_flag,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        });
+        self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
+        self.commit_subblock_neighbour_state(cu, info);
+        Ok(())
+    }
+
+    /// 4:2:0 chroma MC for one SbTMVP sub-block (uni-pred). The chroma
+    /// sub-block is `sb_w/2 × sb_h/2` at `(bx/2, by/2)`; the MV is the
+    /// luma sub-block MV (the §8.5.5.3 grid carries luma-precision MVs
+    /// that the §8.5.6.3.4 4-tap chroma filter consumes directly).
+    fn sbtmvp_chroma_mc(
+        &self,
+        out: &mut PictureBuffer,
+        bx: u32,
+        by: u32,
+        sb_w: u32,
+        sb_h: u32,
+        ref_frame: &PictureBuffer,
+        mv: MotionVector,
+    ) -> Result<()> {
+        if self.sps.sps_chroma_format_idc != 1 {
+            return Ok(());
+        }
+        crate::inter::predict_chroma_block(
+            &mut out.cb,
+            bx / 2,
+            by / 2,
+            sb_w / 2,
+            sb_h / 2,
+            &ref_frame.cb,
+            mv,
+        )?;
+        crate::inter::predict_chroma_block(
+            &mut out.cr,
+            bx / 2,
+            by / 2,
+            sb_w / 2,
+            sb_h / 2,
+            &ref_frame.cr,
+            mv,
+        )?;
+        Ok(())
+    }
+
+    /// 4:2:0 chroma bi-pred MC for one SbTMVP sub-block (§8.5.6.6.2 eq.
+    /// 980 default-weighted average).
+    #[allow(clippy::too_many_arguments)]
+    fn sbtmvp_chroma_mc_bi(
+        &self,
+        out: &mut PictureBuffer,
+        bx: u32,
+        by: u32,
+        sb_w: u32,
+        sb_h: u32,
+        ref_l0: &PictureBuffer,
+        mv_l0: MotionVector,
+        ref_l1: &PictureBuffer,
+        mv_l1: MotionVector,
+    ) -> Result<()> {
+        if self.sps.sps_chroma_format_idc != 1 {
+            return Ok(());
+        }
+        crate::inter::predict_chroma_block_bipred(
+            &mut out.cb,
+            bx / 2,
+            by / 2,
+            sb_w / 2,
+            sb_h / 2,
+            &ref_l0.cb,
+            mv_l0,
+            &ref_l1.cb,
+            mv_l1,
+        )?;
+        crate::inter::predict_chroma_block_bipred(
+            &mut out.cr,
+            bx / 2,
+            by / 2,
+            sb_w / 2,
+            sb_h / 2,
+            &ref_l0.cr,
+            mv_l0,
+            &ref_l1.cr,
+            mv_l1,
+        )?;
+        Ok(())
+    }
+
     /// §8.5.5.2 + §8.5.5.3 — sub-block (affine / SbTMVP) merge
     /// reconstruction to pixels.
     ///
@@ -3980,7 +4427,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let corner0 = self.read_constructed_merge_corner(&tl_positions, xcb, ycb);
         let corner1 = self.read_constructed_merge_corner(&tr_positions, xcb, ycb);
         let corner2 = self.read_constructed_merge_corner(&bl_positions, xcb, ycb);
-        let corner3 = AffineCpRecord::UNAVAILABLE; // §8.5.5.3 SbCol — follow-up.
+        let corner3 = AffineCpRecord::UNAVAILABLE; // §8.5.5.3 SbCol corner — follow-up.
         let corners = [corner0, corner1, corner2, corner3];
 
         let is_b = self.sh.sh_slice_type == SliceType::B;
@@ -3994,11 +4441,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             },
         );
 
+        // §8.5.5.3 — build the SbTMVP (`SbCol`) record. When the
+        // §8.5.5.3 step-3 `availableFlagSbCol` is true it occupies slot 0
+        // of the sub-block merge list (ahead of inherited A/B).
+        let sbtmvp = self.build_sbtmvp_record(xcb, ycb, cb_w as i32, cb_h as i32);
+        let sb_col_available = sbtmvp
+            .as_ref()
+            .map(|(rec, _)| rec.is_sb_col_available())
+            .unwrap_or(false);
+
         let max_num = self.cu_tool_flags().max_num_subblock_merge_cand;
         let list = build_subblock_merge_cand_list(SubblockMergeListInputs {
             max_num_cand: max_num,
             slice_type_b: is_b,
-            sb_col_available: false, // §8.5.5.3 SbCol — follow-up.
+            sb_col_available,
             inherited_a,
             inherited_b,
             constructed: &constructed,
@@ -4013,13 +4469,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             )));
         };
 
-        // The §8.5.5.3 SbCol kind is not yet reconstructed to pixels.
+        // §8.5.5.3 SbCol — reconstruct the SbTMVP sub-block grid to
+        // pixels through the dedicated walker.
         if matches!(kind, SubblockMergeCandidateKind::SbCol) {
-            return Err(Error::Unsupported(
-                "h266 subblock merge: §8.5.5.3 SbCol sub-block temporal \
-                 candidate reconstruction is not yet implemented"
-                    .into(),
-            ));
+            let (record, col_pic) = sbtmvp.ok_or_else(|| {
+                Error::invalid("h266 subblock merge: SbCol picked but no SbTMVP record was built")
+            })?;
+            return self.reconstruct_leaf_cu_sbtmvp(cu, info, residual, &record, &col_pic, out);
         }
 
         // Resolve the per-list reference pictures.
@@ -7395,6 +7851,104 @@ mod tests {
         );
         let stored = stored.unwrap();
         assert!(stored.pred_flag_l0 && !stored.pred_flag_l1);
+    }
+
+    /// §8.5.5.3 SbTMVP (`SbCol`) sub-block merge to pixels — a merge CU
+    /// with `merge_subblock_flag == 1` whose §8.5.5.2 list slot 0 is the
+    /// SbCol candidate (sbtmvp enabled, collocated picture bound, the
+    /// §8.5.5.3 step-3 `availableFlagSbCol` true) routes through the
+    /// SbTMVP walker. With a uniform zero-MV collocated motion field the
+    /// per-sub-block grid resolves to MV (0,0) on every 8×8 sub-block, so
+    /// the reconstruction is a verbatim copy of `RefPicList[0][0]`.
+    #[test]
+    fn reconstruct_leaf_cu_sbtmvp_to_pixels() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.affine_enabled_flag = true;
+        sps.tool_flags.sbtmvp_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // Reference picture (the collocated picture) with a 2-D ramp + a
+        // uniform zero-MV inter motion field.
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+            }
+        }
+        let mut mf = MotionField::new(pic_w, pic_h);
+        let cell = MvField {
+            mv_l0: MotionVector::ZERO,
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+        };
+        mf.write_block(0, 0, pic_w, pic_h, cell);
+        let ref_pic = ReferencePicture {
+            poc: 0,
+            frame: ref_frame.clone(),
+            motion_field: Some(mf),
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic]);
+        // ph_temporal_mvp on, current POC 2, collocated = RefPicList[0][0].
+        walker.set_temporal_mvp(2, true, true, 0);
+
+        // 16x16 merge CU at (16, 16): merge_subblock_flag == 1, idx 0.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_subblock_flag = true;
+        info.inter.merge_data.merge_subblock_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("SbTMVP sub-block merge recon to pixels");
+
+        // Zero-MV SbTMVP → verbatim copy of the reference at the CU.
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    ref_frame.luma.samples[y * ref_frame.luma.stride + x],
+                    "SbTMVP zero-MV grid must copy the reference verbatim at ({x},{y})"
+                );
+            }
+        }
+        // The motion field cells must report MODE_INTER so a later CU's
+        // neighbour scan sees this SbTMVP block.
+        let mvf = walker.motion_field.get_at_luma(20, 20);
+        assert!(mvf.available && mvf.mode_inter && mvf.pred_flag_l0);
     }
 
     /// §8.5.5.8 constructed affine CPMVP — when the three corner
