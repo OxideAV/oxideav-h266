@@ -136,8 +136,12 @@ P + B-slice merge subset:
   `TuCResMode` derivation selects the coded component (Cb for modes 1/2,
   Cr for mode 3) and the §8.7.2 `resSamples` derivation (eqs. 1130–1132,
   `cSign = 1 − 2·ph_joint_cbcr_sign_flag`) reconstructs the sibling
-  component. Transform-skip inter residual (`residual_ts_coding`,
-  §7.3.11.11) still surfaces `Error::Unsupported`.
+  component. **Transform-skip inter residual** (§7.3.11.5 parse gate →
+  `residual_ts_coding` → §8.7.4.6 inverse-transform bypass) is **live**
+  on the inter luma, Cb, Cr and joint-Cb-Cr paths. **CU-level chroma QP
+  offsets** (§7.4.10.6 `CuQpOffsetCb/Cr/CbCr`, indexed from the PPS
+  offset lists when `cu_chroma_qp_offset_flag == 1`) feed the §8.7.1
+  inter chroma dequant QP, matching the intra path.
 * **AMVP** — the §8.5.2.8-10 AMVP candidate derivation (spatial scan,
   HMVP fill, temporal Col, zero-MV pad), the §8.5.5.7 affine AMVP
   candidate list, and AMVR helpers (§7.4.11.6). The §8.5.2.1 non-merge
@@ -181,10 +185,18 @@ P + B-slice merge subset:
   (with the eqs. 736 – 739 `isCTUboundary` bottom-row path computed from
   `(yNb + nNbH) % CtbSizeY`), so a CU with an affine neighbour now picks
   the inherited predictor (eqs. 824 / 826 / 828 / 830 / 840) instead of
-  the step-9 zero-MV pad. The §8.5.5.8 **constructed** CPMVP candidate,
-  the affine-merge path's contribution to the store, and BCW / BDOF on
-  the affine path remain follow-ups. Transform-skip inter residual
-  (`residual_ts_coding`, §7.3.11.12) still surfaces `Error::Unsupported`.
+  the step-9 zero-MV pad. The §8.5.5.8 **constructed** CPMVP candidate
+  (step 6) + the §8.5.5.7 step-7 single-corner fallback are now **live**:
+  `derive_constructed_affine_corners` runs the three per-corner cascades
+  (TL = {B2, B3, A2}, TR = {B1, B0}, BL = {A1, A0}) over the **regular
+  per-sample motion field** (`MvLX[xNb][yNb]`, eqs. 841 – 846), so
+  translational neighbours contribute, with the §6.4.4 availability +
+  `PredFlagLX == 1 ∧ DiffPicOrderCnt == 0` gate and the cross-list
+  fallback, AMVR-rounded. The affine-merge path's contribution to the
+  store and BCW / BDOF on the affine path remain follow-ups.
+  Transform-skip inter residual (`residual_ts_coding`, §7.3.11.12) is
+  now **live** on the inter luma + chroma + joint-Cb-Cr paths
+  (§7.3.11.5 parse gate → §8.7.4.6 inverse-transform bypass).
 * **Transforms** — DCT-II inverse (sizes 2..=64), DST-VII / DCT-VIII
   (4 / 8 / 16), flat-list dequant, the §8.7.2 scaling-and-transformation
   orchestrator with joint Cb-Cr derivation, the §8.7.4.6 inverse
