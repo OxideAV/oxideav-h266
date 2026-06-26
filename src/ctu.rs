@@ -2665,6 +2665,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     tr_h,
                     tr_v,
                     /*transform_skip=*/ false,
+                    /*cu_chroma_qp_offset=*/ 0,
                     out,
                 )?;
             }
@@ -2696,6 +2697,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             cu_qp_delta,
                             bit_depth,
                             /*transform_skip=*/ false,
+                            /*cu_chroma_qp_offset=*/ 0,
                             out,
                         )?;
                     }
@@ -2712,6 +2714,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu_qp_delta,
                     bit_depth,
                     info.transform_skip_luma,
+                    /*cu_chroma_qp_offset=*/ 0,
                     out,
                 )?;
             }
@@ -2724,6 +2727,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             if info.tu_c_res_mode != 0 {
                 // §8.7.2 joint Cb-Cr — a single coded block reconstructs
                 // both chroma residuals.
+                // §7.4.10.6 `CuQpOffsetCbCr` — the joint chroma CU offset
+                // indexes `pps_joint_cbcr_qp_offset_list` (not the per-
+                // component lists) when `cu_chroma_qp_offset_flag == 1`.
+                let cu_off_cbcr = if info.cu_chroma_qp_offset_flag {
+                    self.pps
+                        .pps_joint_cbcr_qp_offset_list
+                        .get(info.cu_chroma_qp_offset_idx as usize)
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 self.add_inter_joint_cbcr_residual(
                     c_x,
                     c_y,
@@ -2733,9 +2748,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     residual,
                     cu_qp_delta,
                     bit_depth,
+                    cu_off_cbcr,
                     out,
                 )?;
             } else {
+                // §7.4.10.6 CU-level chroma QP offsets — index the PPS
+                // `pps_c?_qp_offset_list` by `cu_chroma_qp_offset_idx` when
+                // `cu_chroma_qp_offset_flag == 1`, matching the intra path.
+                let cu_off_cb = cu_chroma_qp_offset(
+                    1,
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                    &self.pps.pps_cb_qp_offset_list,
+                    &self.pps.pps_cr_qp_offset_list,
+                );
+                let cu_off_cr = cu_chroma_qp_offset(
+                    2,
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                    &self.pps.pps_cb_qp_offset_list,
+                    &self.pps.pps_cr_qp_offset_list,
+                );
                 if info.tu_cb_coded_flag && !residual.cb_levels.is_empty() {
                     self.add_inter_residual_plane(
                         /*c_idx=*/ 1,
@@ -2747,6 +2780,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cu_qp_delta,
                         bit_depth,
                         info.transform_skip_cb,
+                        cu_off_cb,
                         out,
                     )?;
                 }
@@ -2761,6 +2795,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cu_qp_delta,
                         bit_depth,
                         info.transform_skip_cr,
+                        cu_off_cr,
                         out,
                     )?;
                 }
@@ -3816,6 +3851,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cu_qp_delta: i32,
         bit_depth: u32,
         transform_skip: bool,
+        cu_chroma_qp_offset: i32,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         // The regular (`cu_sbt_flag == 0`) inter residual path uses the
@@ -3835,6 +3871,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             TrType::DctII,
             TrType::DctII,
             transform_skip,
+            cu_chroma_qp_offset,
             out,
         )
     }
@@ -3857,6 +3894,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         tr_h: TrType,
         tr_v: TrType,
         transform_skip: bool,
+        cu_chroma_qp_offset: i32,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         if n_tb_w == 0 || n_tb_h == 0 || levels.len() != n_tb_w * n_tb_h {
@@ -3869,18 +3907,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let qp = if c_idx == 0 {
             qp_y
         } else {
-            // §8.7.1 eqs. 1147 / 1148 — add the PPS + slice chroma offset
-            // for this component. The inter residual reconstruction does
-            // not carry the per-CU `cu_chroma_qp_offset_idx` at this call
-            // site, so `CuQpOffsetC?` stays 0 (it is wired through the
-            // intra path, which holds the LeafCuInfo).
+            // §8.7.1 eqs. 1147 / 1148 — PPS + slice chroma offset for this
+            // component, plus the §7.4.10.6 CU-level `CuQpOffsetC?` term
+            // (`cu_chroma_qp_offset`, indexed from the PPS offset list by
+            // the caller when `cu_chroma_qp_offset_flag == 1`; 0 otherwise),
+            // now matching the intra chroma reconstruction path.
             let qp_offset = chroma_qp_offset_sum(
                 c_idx,
                 self.pps.pps_cb_qp_offset,
                 self.pps.pps_cr_qp_offset,
                 self.sh.sh_cb_qp_offset,
                 self.sh.sh_cr_qp_offset,
-                0,
+                cu_chroma_qp_offset,
             );
             chroma_qp_identity(qp_y, qp_offset)
         };
@@ -3982,6 +4020,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         cu_qp_delta: i32,
         bit_depth: u32,
+        cu_qp_offset_cbcr: i32,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
@@ -4003,10 +4042,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.7.3 dequant — joint Cb-Cr QP (eq. 1149): the additive term is
         // `pps_joint_cbcr_qp_offset_value + sh_joint_cbcr_qp_offset +
         // CuQpOffsetCbCr` rather than the per-component Cb/Cr offsets.
-        // `CuQpOffsetCbCr` stays 0 until the §7.4.10.6 list is plumbed.
+        // `CuQpOffsetCbCr` is the §7.4.10.6 CU-level joint offset (indexed
+        // from `pps_joint_cbcr_qp_offset_list` by the caller).
         let qp_y = (self.cabac.slice_qp_y.0 + cu_qp_delta).clamp(0, 63);
-        let joint_offset =
-            self.pps.pps_joint_cbcr_qp_offset_value + self.sh.sh_joint_cbcr_qp_offset;
+        let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
+            + self.sh.sh_joint_cbcr_qp_offset
+            + cu_qp_offset_cbcr;
         let qp = chroma_qp_identity(qp_y, joint_offset);
         let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
@@ -5535,6 +5576,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §7.4.10.6 + §8.7.1 — an inter CU with `cu_chroma_qp_offset_flag
+    /// == 1` adds the per-component `CuQpOffsetC?` term (from the PPS
+    /// `pps_c?_qp_offset_list`) to the chroma QP. A non-zero offset
+    /// rescales the chroma dequant, so the reconstructed Cb residual must
+    /// differ from the no-offset reconstruction. Proves the inter chroma
+    /// QP path no longer drops `CuQpOffsetC?` (previously hardcoded 0).
+    #[test]
+    fn reconstruct_leaf_cu_inter_chroma_qp_offset_changes_recon() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let mut pps = dummy_pps(pic_w, pic_h, true);
+        // Populate the PPS Cb/Cr offset lists so index 0 carries a strong
+        // offset; the §8.7.1 chroma-QP add then shifts the dequant scale.
+        pps.pps_cb_qp_offset_list = vec![10];
+        pps.pps_cr_qp_offset_list = vec![10];
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        // 16x16 merge CU at (0,0) — zero-MV uni-pred → constant-100 chroma.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8; // single Cb DC coefficient.
+
+        let base_info = || {
+            let mut info = LeafCuInfo {
+                x0: 0,
+                y0: 0,
+                cb_width: 16,
+                cb_height: 16,
+                pred_mode: CuPredMode::Inter,
+                ..LeafCuInfo::default()
+            };
+            info.inter.general_merge_flag = true;
+            info.inter.merge_data.merge_idx = 0;
+            info.tu_y_coded_flag = false;
+            info.tu_cb_coded_flag = true;
+            info
+        };
+
+        // No CU chroma offset.
+        let info_off = base_info();
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info_off, &residual, &mut out_off)
+            .expect("recon without CU chroma offset");
+
+        // With CU chroma offset (flag = 1, idx = 0 → +10).
+        let mut info_on = base_info();
+        info_on.cu_chroma_qp_offset_flag = true;
+        info_on.cu_chroma_qp_offset_idx = 0;
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info_on, &residual, &mut out_on)
+            .expect("recon with CU chroma offset");
+
+        let mut differs = false;
+        for i in 0..out_off.cb.samples.len() {
+            if out_off.cb.samples[i] != out_on.cb.samples[i] {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "CuQpOffsetCb must change the inter chroma reconstruction vs. the no-offset path"
+        );
     }
 
     /// §8.7.4.6 — an inter merge CU with `transform_skip_luma == 1`
