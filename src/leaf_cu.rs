@@ -2995,13 +2995,40 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.tu_cr_coded_flag,
         );
 
-        // Residual coefficient walk per plane (transform_skip is not
-        // signalled for the inter regular path here — sps_transform_skip
-        // for inter CUs is rare; surface Unsupported if it would fire is
-        // unnecessary because we always take the residual_coding branch
-        // with DCT-II, matching the reconstruction path below).
+        // Residual coefficient walk per plane. §7.3.11.5 parses
+        // `transform_skip_flag[x0][y0][0]` before `residual_coding()` for
+        // the inter path on exactly the same gate as intra: the element
+        // is present when `sps_transform_skip_enabled_flag &&
+        // tbW <= MaxTsSize && tbH <= MaxTsSize && !cu_sbt_flag` (the
+        // BDPCM and ISP gates of the spec condition never fire for an
+        // inter CU — BDPCM is intra-only and ISP is intra-only). When the
+        // flag is 1 and TS residual coding is enabled, `residual_ts_coding()`
+        // replaces the regular `residual_coding()` walk (§8.7.4.6 then
+        // bypasses the inverse transform: res[x][y] = d[x][y]).
         if info.tu_y_coded_flag {
-            let levels = decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cb_w, cb_h, 0)?;
+            let ts_present = self.tools.transform_skip_enabled
+                && (cb_w as u32) <= self.tools.max_ts_size
+                && (cb_h as u32) <= self.tools.max_ts_size
+                && !info.cu_sbt_flag;
+            let transform_skip = if ts_present {
+                crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 0)?
+            } else {
+                false
+            };
+            info.transform_skip_luma = transform_skip;
+            let levels = if transform_skip && !self.tools.ts_residual_coding_disabled {
+                crate::residual::decode_ts_tb_coefficients(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cb_w,
+                    cb_h,
+                    0,
+                    self.tools.ts_residual_coding_rice_idx,
+                    /*bdpcm=*/ false,
+                )?
+            } else {
+                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cb_w, cb_h, 0)?
+            };
             let mut lx = 0u32;
             let mut ly = 0u32;
             for y in 0..cb_h {
@@ -3038,7 +3065,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     #[allow(clippy::too_many_arguments)]
     fn read_inter_chroma_residual(
         &mut self,
-        info: &LeafCuInfo,
+        info: &mut LeafCuInfo,
         residual: &mut LeafCuResidual,
         cb_w: usize,
         cb_h: usize,
@@ -3054,16 +3081,57 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if cw < 2 || ch < 2 {
             return Ok(());
         }
+        // §7.3.11.5 chroma transform_skip_flag parse gate (per component).
+        // BDPCM is intra-only so `BdpcmFlag[..][cIdx]` is always 0 here; the
+        // inter chroma TB has no ISP/SBT split contribution to the gate.
+        let ts_present_chroma = self.tools.transform_skip_enabled
+            && (cw as u32) <= self.tools.max_ts_size
+            && (ch as u32) <= self.tools.max_ts_size
+            && !info.cu_sbt_flag;
         if info.tu_cb_coded_flag {
-            residual.cb_levels =
-                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
+            let ts = if ts_present_chroma {
+                crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 1)?
+            } else {
+                false
+            };
+            info.transform_skip_cb = ts;
+            residual.cb_levels = if ts && !self.tools.ts_residual_coding_disabled {
+                crate::residual::decode_ts_tb_coefficients(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    1,
+                    self.tools.ts_residual_coding_rice_idx,
+                    /*bdpcm=*/ false,
+                )?
+            } else {
+                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?
+            };
         }
         // §7.3.11.10 — Cr residual_coding() is skipped when the joint
         // flag is set and Cb is the coded component (TuCResMode 1 / 2).
         let skip_cr = info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag;
         if info.tu_cr_coded_flag && !skip_cr {
-            residual.cr_levels =
-                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
+            let ts = if ts_present_chroma {
+                crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 2)?
+            } else {
+                false
+            };
+            info.transform_skip_cr = ts;
+            residual.cr_levels = if ts && !self.tools.ts_residual_coding_disabled {
+                crate::residual::decode_ts_tb_coefficients(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    2,
+                    self.tools.ts_residual_coding_rice_idx,
+                    /*bdpcm=*/ false,
+                )?
+            } else {
+                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?
+            };
         }
         Ok(())
     }

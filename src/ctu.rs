@@ -2664,6 +2664,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bit_depth,
                     tr_h,
                     tr_v,
+                    /*transform_skip=*/ false,
                     out,
                 )?;
             }
@@ -2694,6 +2695,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             tile_levels,
                             cu_qp_delta,
                             bit_depth,
+                            /*transform_skip=*/ false,
                             out,
                         )?;
                     }
@@ -2709,6 +2711,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     &residual.luma_levels,
                     cu_qp_delta,
                     bit_depth,
+                    info.transform_skip_luma,
                     out,
                 )?;
             }
@@ -2743,6 +2746,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         &residual.cb_levels,
                         cu_qp_delta,
                         bit_depth,
+                        info.transform_skip_cb,
                         out,
                     )?;
                 }
@@ -2756,6 +2760,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         &residual.cr_levels,
                         cu_qp_delta,
                         bit_depth,
+                        info.transform_skip_cr,
                         out,
                     )?;
                 }
@@ -3687,6 +3692,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// plane and applies the chroma QP mapping (§8.7.3 — identity-plus-
     /// offset clamp here, matching the intra chroma path).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn add_inter_residual_plane(
         &self,
         c_idx: u32,
@@ -3697,10 +3703,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         levels: &[i32],
         cu_qp_delta: i32,
         bit_depth: u32,
+        transform_skip: bool,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         // The regular (`cu_sbt_flag == 0`) inter residual path uses the
-        // §8.7.4.1 `mts_idx == 0` DCT-II × DCT-II kernel.
+        // §8.7.4.1 `mts_idx == 0` DCT-II × DCT-II kernel. When
+        // `transform_skip` is set the inverse transform is bypassed
+        // (§8.7.4.6) — `add_inter_residual_plane_tr` short-circuits on the
+        // flag before reaching the kernel selection.
         self.add_inter_residual_plane_tr(
             c_idx,
             x0,
@@ -3712,6 +3722,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bit_depth,
             TrType::DctII,
             TrType::DctII,
+            transform_skip,
             out,
         )
     }
@@ -3733,6 +3744,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         bit_depth: u32,
         tr_h: TrType,
         tr_v: TrType,
+        transform_skip: bool,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         if n_tb_w == 0 || n_tb_h == 0 || levels.len() != n_tb_w * n_tb_h {
@@ -3768,34 +3780,43 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_h: n_tb_h as u32,
             qp,
             dep_quant: false,
-            transform_skip: false,
+            transform_skip,
             bdpcm: false,
             bdpcm_dir: false,
         };
         let d = dequantize_tb_flat(levels, &params)?;
-        // §8.7.4.1 eqs. 1171 / 1172 — non-zero coefficient ranges depend
-        // on the kernel (DST-VII / DCT-VIII cap at 16, DCT-II at 32).
-        let non_zero_w = n_tb_w.min(if matches!(tr_h, TrType::DctII) {
-            32
+        // §8.7.4.6 — when transform_skip_flag is 1 the dequantised array is
+        // the residual sample array directly (res[x][y] = d[x][y]); the
+        // separable inverse transform is bypassed. Otherwise run the
+        // §8.7.4.1 kernel (DCT-II for the regular path, Table-40 DST-VII /
+        // DCT-VIII for SBT).
+        let res = if transform_skip {
+            d
         } else {
-            16
-        });
-        let non_zero_h = n_tb_h.min(if matches!(tr_v, TrType::DctII) {
-            32
-        } else {
-            16
-        });
-        let res = inverse_transform_2d(
-            n_tb_w,
-            n_tb_h,
-            non_zero_w,
-            non_zero_h,
-            tr_h,
-            tr_v,
-            &d,
-            bit_depth,
-            log2_tr_range,
-        )?;
+            // §8.7.4.1 eqs. 1171 / 1172 — non-zero coefficient ranges depend
+            // on the kernel (DST-VII / DCT-VIII cap at 16, DCT-II at 32).
+            let non_zero_w = n_tb_w.min(if matches!(tr_h, TrType::DctII) {
+                32
+            } else {
+                16
+            });
+            let non_zero_h = n_tb_h.min(if matches!(tr_v, TrType::DctII) {
+                32
+            } else {
+                16
+            });
+            inverse_transform_2d(
+                n_tb_w,
+                n_tb_h,
+                non_zero_w,
+                non_zero_h,
+                tr_h,
+                tr_v,
+                &d,
+                bit_depth,
+                log2_tr_range,
+            )?
+        };
         // §8.7.5.1 — recSamples = Clip1(predSamples + resSamples). The
         // plane already holds predSamples; read each sample as pred,
         // add residual, clip. The 8-bit `PictureBuffer` stores narrowed
@@ -5399,6 +5420,88 @@ mod tests {
                     out.luma.samples[y * out.luma.stride + x],
                     100,
                     "non-residual TU sample at ({x},{y}) must stay at the prediction"
+                );
+            }
+        }
+    }
+
+    /// §8.7.4.6 — an inter merge CU with `transform_skip_luma == 1`
+    /// bypasses the inverse transform: each dequantised coefficient maps
+    /// directly to the co-located residual sample (`res[x][y] = d[x][y]`).
+    /// A single non-zero level at index 0 therefore lifts **only** sample
+    /// (0,0) — the rest of the block stays exactly at the constant-100
+    /// prediction. This is the defining contrast with the DCT-II path,
+    /// where a lone DC coefficient spreads a flat lift across the whole
+    /// block. Proves the inter TS reconstruction is wired end-to-end.
+    #[test]
+    fn reconstruct_leaf_cu_inter_transform_skip_luma_no_spread() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        // 16x16 merge CU at (0, 0) — zero-MV uni-pred → constant-100
+        // prediction over the whole CU.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = true;
+        // Transform-skip on the luma TB — single positive level at (0,0).
+        info.transform_skip_luma = true;
+        let mut residual = LeafCuResidual::default();
+        residual.luma_levels = vec![0i32; 16 * 16];
+        residual.luma_levels[0] = 4;
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("inter transform-skip path should reconstruct");
+
+        // Sample (0,0) must change; every other luma sample of the CU
+        // stays at the constant-100 prediction (no DCT spreading).
+        let s00 = out.luma.samples[0] as i32;
+        assert!(
+            s00 > 100,
+            "TS DC lift must raise sample (0,0) above the prediction (got {s00})"
+        );
+        for y in 0..16usize {
+            for x in 0..16usize {
+                if x == 0 && y == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    100,
+                    "TS residual must not spread to sample ({x},{y})"
                 );
             }
         }
