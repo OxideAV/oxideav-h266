@@ -3114,15 +3114,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         )
     }
 
-    /// §8.5.5.3 / §8.5.6 affine bi-prediction reconstruction to pixels.
-    ///
-    /// Predicts each reference list's affine MC into a CU-sized scratch
-    /// plane (luma + 4:2:0 chroma), then forms the §8.5.6.6.2 eq. 980
-    /// default-weighted average `(pred_l0 + pred_l1 + 1) >> 1` into the
-    /// output picture. Mirrors the translational bi-pred path's two-
-    /// scratch-plane composition; BCW / BDOF on the affine bi-pred path
-    /// is a follow-up (the default-weighted average is the
-    /// `bcw_idx == 0` case).
+    /// §8.5.5.3 / §8.5.6 affine bi-prediction reconstruction to pixels
+    /// with eq. 980 default-weighted averaging (the `bcw_idx == 0`
+    /// case). Thin wrapper over [`Self::reconstruct_affine_inter_bi_bcw`].
     #[allow(clippy::too_many_arguments)]
     pub fn reconstruct_affine_inter_bi(
         &self,
@@ -3134,6 +3128,35 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ref_pic_l0: &ReferencePicture,
         cpmvs_l1: &crate::affine::AffineCpmvs,
         ref_pic_l1: &ReferencePicture,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        self.reconstruct_affine_inter_bi_bcw(
+            cb_x, cb_y, cb_w, cb_h, cpmvs_l0, ref_pic_l0, cpmvs_l1, ref_pic_l1, 0, out,
+        )
+    }
+
+    /// §8.5.5.3 / §8.5.6 affine bi-prediction reconstruction to pixels.
+    ///
+    /// Predicts each reference list's affine MC into a CU-sized scratch
+    /// plane (luma + 4:2:0 chroma), then forms the §8.5.6.6.2 composite
+    /// into the output picture: eq. 980 default-weighted average
+    /// `(pred_l0 + pred_l1 + 1) >> 1` when `bcw_idx == 0`, or the eq. 981
+    /// BCW-weighted blend `Clip1((w0·p0 + w1·p1 + 4) >> 3)` (weights from
+    /// `BCW_W_LUT`) when `bcw_idx ∈ 1..=4`. Mirrors the translational
+    /// bi-pred path's two-scratch-plane composition. BDOF on the affine
+    /// bi-pred path remains a follow-up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_affine_inter_bi_bcw(
+        &self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        cpmvs_l0: &crate::affine::AffineCpmvs,
+        ref_pic_l0: &ReferencePicture,
+        cpmvs_l1: &crate::affine::AffineCpmvs,
+        ref_pic_l1: &ReferencePicture,
+        bcw_idx: u8,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::reconstruct::PicturePlane;
@@ -3185,13 +3208,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cb_y / 2,
         )?;
 
-        // §8.5.6.6.2 eq. 980 default-weighted average into the picture.
-        // The scratch planes carry the prediction at the CU's picture-
-        // absolute offset, so the average reads them at that same
-        // offset.
-        self.bi_avg_plane_region(&mut out.luma, cb_x, cb_y, cb_w, cb_h, &l0_luma, &l1_luma);
+        // §8.5.6.6.2 composite into the picture. The scratch planes
+        // carry the prediction at the CU's picture-absolute offset, so
+        // the blend reads them at that same offset. eq. 980 average for
+        // `bcw_idx == 0`, eq. 981 BCW weighting otherwise. The chroma
+        // planes take the SAME `bcw_idx` (eq. 981 applies per-component).
+        self.bi_blend_plane_region_bcw(
+            &mut out.luma,
+            cb_x,
+            cb_y,
+            cb_w,
+            cb_h,
+            &l0_luma,
+            &l1_luma,
+            bcw_idx,
+        );
         if chroma {
-            self.bi_avg_plane_region(
+            self.bi_blend_plane_region_bcw(
                 &mut out.cb,
                 cb_x / 2,
                 cb_y / 2,
@@ -3199,8 +3232,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ch as u32,
                 &l0_cb,
                 &l1_cb,
+                bcw_idx,
             );
-            self.bi_avg_plane_region(
+            self.bi_blend_plane_region_bcw(
                 &mut out.cr,
                 cb_x / 2,
                 cb_y / 2,
@@ -3208,6 +3242,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ch as u32,
                 &l0_cr,
                 &l1_cr,
+                bcw_idx,
             );
         }
         Ok(())
@@ -4043,7 +4078,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 )?;
             }
             (Some(rp0), Some(rp1)) => {
-                self.reconstruct_affine_inter_bi(
+                // §8.5.6.6.2 — the sub-block (affine) merge candidate
+                // carries its inherited / constructed `bcwIdx`; thread
+                // it into the bi-pred blend.
+                self.reconstruct_affine_inter_bi_bcw(
                     cu.cu.x,
                     cu.cu.y,
                     cb_w,
@@ -4052,6 +4090,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     rp0,
                     &cand.cpmvs_l1,
                     rp1,
+                    cand.bcw_idx,
                     out,
                 )?;
             }
@@ -4197,6 +4236,44 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let bi = (dy as usize + r) * b.stride + (dx as usize + c);
                 let v = (a.samples[ai] as u32 + b.samples[bi] as u32 + 1) >> 1;
                 out.samples[idx] = v as u8;
+            }
+        }
+    }
+
+    /// §8.5.6.6.2 eq. 981 BCW-weighted blend of two co-located plane
+    /// regions: `out[x][y] = Clip1((w0·a + w1·b + 4) >> 3)` over the
+    /// `(w × h)` rectangle at `(dx, dy)`, with `w1 = BCW_W_LUT[bcw_idx]`
+    /// and `w0 = 8 − w1`. `a` / `b` are read at the **same** offset as
+    /// the destination (the affine scratch-plane convention). When
+    /// `bcw_idx == 0` this is identical to [`Self::bi_avg_plane_region`]
+    /// (the eq. 980 default-weighted average), so the caller routes
+    /// through here only when `bcw_idx ∈ 1..=4`.
+    #[allow(clippy::too_many_arguments)]
+    fn bi_blend_plane_region_bcw(
+        &self,
+        out: &mut crate::reconstruct::PicturePlane,
+        dx: u32,
+        dy: u32,
+        w: u32,
+        h: u32,
+        a: &crate::reconstruct::PicturePlane,
+        b: &crate::reconstruct::PicturePlane,
+        bcw_idx: u8,
+    ) {
+        let idx_w = bcw_idx as usize;
+        if idx_w == 0 || idx_w >= crate::inter::BCW_W_LUT.len() {
+            self.bi_avg_plane_region(out, dx, dy, w, h, a, b);
+            return;
+        }
+        let w1 = crate::inter::BCW_W_LUT[idx_w];
+        let w0 = 8 - w1;
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                let idx = (dy as usize + r) * out.stride + (dx as usize + c);
+                let ai = (dy as usize + r) * a.stride + (dx as usize + c);
+                let bi = (dy as usize + r) * b.stride + (dx as usize + c);
+                let blended = (w0 * a.samples[ai] as i32 + w1 * b.samples[bi] as i32 + 4) >> 3;
+                out.samples[idx] = blended.clamp(0, 255) as u8;
             }
         }
     }
@@ -7555,6 +7632,82 @@ mod tests {
             }
         }
         assert!(cb_any, "affine bi-pred Cb must be populated");
+    }
+
+    /// §8.5.6.6.2 eq. 981 — `reconstruct_affine_inter_bi_bcw` applies the
+    /// BCW weighting `Clip1((w0·p0 + w1·p1 + 4) >> 3)` on the affine
+    /// bi-pred path. With zero CPMVs (integer-pel ⇒ verbatim copy) and
+    /// two reference pictures of distinct constants A=40 (L0) and B=200
+    /// (L1), the `bcw_idx == 3` blend (w1=10, w0=−2) must yield
+    /// `(−2·40 + 10·200 + 4) >> 3 = (−80 + 2000 + 4) >> 3 = 240`, whereas
+    /// the default eq. 980 average (`bcw_idx == 0`) yields
+    /// `(40 + 200 + 1) >> 1 = 120`.
+    #[test]
+    fn reconstruct_affine_inter_bi_bcw_applies_eq981_weights() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let ref_a = ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+            motion_field: None,
+        };
+        let ref_b = ReferencePicture {
+            poc: 1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+            motion_field: None,
+        };
+        let zero = crate::affine::AffineCpmvs::new_4param(
+            MotionVector::from_int_pel(0, 0),
+            MotionVector::from_int_pel(0, 0),
+        );
+
+        // Default-weighted (bcw_idx == 0) → eq. 980 average = 120.
+        let mut avg = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_bi_bcw(
+                16, 16, 16, 16, &zero, &ref_a, &zero, &ref_b, 0, &mut avg,
+            )
+            .expect("default-weighted affine bi recon");
+        assert_eq!(
+            avg.luma.samples[16 * avg.luma.stride + 16],
+            120,
+            "bcw_idx==0 must take the eq. 980 average (40+200+1)>>1 = 120"
+        );
+
+        // BCW-weighted (bcw_idx == 3) → eq. 981 = 240.
+        let mut bcw = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_affine_inter_bi_bcw(
+                16, 16, 16, 16, &zero, &ref_a, &zero, &ref_b, 3, &mut bcw,
+            )
+            .expect("BCW-weighted affine bi recon");
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    bcw.luma.samples[y * bcw.luma.stride + x],
+                    240,
+                    "bcw_idx==3 must apply eq. 981 weights → 240 at ({x},{y})"
+                );
+            }
+        }
+        // Chroma takes the same eq. 981 weighting per component. Both
+        // references carry chroma == 128, and `w0 + w1 == 8`, so the
+        // weighted blend of two equal inputs is the identity (128) — the
+        // assertion confirms the BCW chroma path runs without corrupting
+        // the in-range result.
+        assert_eq!(
+            bcw.cb.samples[8 * bcw.cb.stride + 8],
+            128,
+            "BCW chroma blend of two equal inputs (w0+w1=8) must be the identity"
+        );
     }
 
     /// §7.3.11.4 multi-TB tiling — a 128×128 inter CU (> MaxTbSizeY)

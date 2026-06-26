@@ -202,8 +202,12 @@ P + B-slice merge subset:
   per-list CPMVs. The §8.5.5.9 per-sub-block MV grid is broadcast into
   the motion field and the affine CB record is stored, so a later CU's
   §8.5.5.7 inherited scan can recover this merge block's CPMVs. The
-  §8.5.5.3 SbTMVP (`SbCol`) sub-block-temporal candidate and BCW / BDOF
-  on the affine path remain follow-ups.
+  §8.5.5.3 SbTMVP (`SbCol`) sub-block-temporal candidate and BDOF on the
+  affine path remain follow-ups. **BCW on the affine bi-pred path**
+  (§8.5.6.6.2 eq. 981) is now **live**: `reconstruct_affine_inter_bi_bcw`
+  routes the luma + chroma composite through the eq. 981 weighted blend
+  `Clip1((w0·p0 + w1·p1 + 4) >> 3)` (weights from `BCW_W_LUT`) when the
+  picked candidate's `bcwIdx ∈ 1..=4`, and the eq. 980 average otherwise.
   Transform-skip inter residual (`residual_ts_coding`, §7.3.11.12) is
   now **live** on the inter luma + chroma + joint-Cb-Cr paths
   (§7.3.11.5 parse gate → §8.7.4.6 inverse-transform bypass).
