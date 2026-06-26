@@ -7909,6 +7909,78 @@ mod tests {
         assert!(stored.pred_flag_l0 && !stored.pred_flag_l1);
     }
 
+    /// §8.5.5.2 step 9 — when no inherited / constructed / SbCol
+    /// candidate is available, the sub-block merge list slot 0 is the
+    /// `zeroCandm` zero-MV pad (eqs. 686 – 695: predFlagL0 = 1, zero
+    /// CPMVs). The affine MC of zero CPMVs is a verbatim copy of
+    /// `RefPicList[0][0]` at the CU.
+    #[test]
+    fn reconstruct_leaf_cu_inter_affine_subblock_merge_zero_pad() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.affine_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x * 2 + y) & 63) as u8;
+            }
+        }
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        }]);
+
+        // 16x16 merge CU at (16, 16) — no neighbours, no collocated
+        // picture → all candidates unavailable → slot 0 is the zero pad.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_subblock_flag = true;
+        info.inter.merge_data.merge_subblock_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("zero-pad affine sub-block merge recon");
+
+        for y in 16..32usize {
+            for x in 16..32usize {
+                assert_eq!(
+                    out.luma.samples[y * out.luma.stride + x],
+                    ref_frame.luma.samples[y * ref_frame.luma.stride + x],
+                    "zero-pad affine merge must copy the reference verbatim at ({x},{y})"
+                );
+            }
+        }
+    }
+
     /// §8.5.5.2 eqs. 681 – 684 — an inherited affine-merge candidate
     /// carries the neighbour CB's `bcwIdxN`. A bi-pred affine neighbour
     /// record stored with `bcw_idx == 3` is inherited by a merge CU; the
