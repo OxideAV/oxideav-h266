@@ -221,9 +221,11 @@ P + B-slice merge subset:
   A1 `tempMv` + the CU-centre collocated read (eqs. 729–731 → §8.5.2.12),
   and when `availableFlagSbCol` holds `reconstruct_leaf_cu_sbtmvp` fills
   the §8.5.5.3 per-8×8-sub-block motion grid and runs translational MC
-  (uni- or eq. 980 bi-pred) per sub-block from `RefPicList[X][0]`. BDOF
-  on the affine path remains a follow-up. **BCW on the affine bi-pred
-  path**
+  (uni- or eq. 980 bi-pred) per sub-block from `RefPicList[X][0]`. (BDOF
+  is spec-prohibited on affine / sub-block-merge CUs — the §8.5.6.5
+  `bdofFlag` derivation requires `MotionModelIdc == 0` and
+  `merge_subblock_flag == 0` — so there is no affine-BDOF path to add.)
+  **BCW on the affine bi-pred path**
   (§8.5.6.6.2 eq. 981) is now **live**: `reconstruct_affine_inter_bi_bcw`
   routes the luma + chroma composite through the eq. 981 weighted blend
   `Clip1((w0·p0 + w1·p1 + 4) >> 3)` (weights from `BCW_W_LUT`) when the
