@@ -2288,6 +2288,84 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             None
         };
 
+        // ---- DMVR (decoder-side MV refinement, §8.5.1 / §8.5.3) ------------
+        //
+        // §8.5.1 derives `dmvrFlag`. When it holds, the per-list MVs are
+        // refined by the §8.5.3.1 bilateral-matching search *before*
+        // motion compensation (and BDOF, which then runs on the refined
+        // MVs). The §8.5.1 split divides the CU into 16×16 sub-blocks
+        // (eqs. 452 – 455) and refines each independently; this commit
+        // handles the single-sub-block case (`cbWidth <= 16 &&
+        // cbHeight <= 16`, i.e. `numSbX == numSbY == 1`) by refining
+        // `chosen.mv_l{0,1}` in place. Larger CUs fall through to the
+        // unrefined path until the per-sub-block split lands.
+        //
+        // `chosen` already holds the §8.5.2.1 fold's per-list MVs (merge
+        // candidate, possibly MMVD-corrected). DMVR is gated off when
+        // `mmvd_merge_flag == 1` or `ciip_flag == 1` per §8.5.1, so a
+        // surviving refinement only touches the plain bi-pred merge CU.
+        //
+        // §8.5.1 NOTE (above eq. 460): the *refined* `refMvLX` drives
+        // motion compensation (`chosen.mv_l{0,1}` here) and the collocated
+        // temporal derivation (`MvDmvrLX`), but the *unrefined* `MvLX` is
+        // what feeds the spatial-MVP and deblocking-boundary-strength
+        // processes. We therefore keep the pre-DMVR MVs in
+        // `unrefined_mv_l{0,1}` and write *those* into the per-picture
+        // motion field at the end, so a later CU's §8.5.2.3 spatial scan
+        // sees the unrefined neighbour motion. (The motion field also
+        // backs temporal derivation in this scaffold, which spec-wise
+        // should see the refined `MvDmvrLX`; modelling that split needs a
+        // second per-picture field and is a follow-up.)
+        let mut chosen = chosen;
+        let unrefined_mv_l0 = chosen.mv_l0;
+        let unrefined_mv_l1 = chosen.mv_l1;
+        if let (Some(rp0), Some(rp1)) = (ref_pic_l0, ref_pic_l1) {
+            let curr_poc = self.current_poc;
+            // §8.5.1 — `DiffPicOrderCnt(curr, ref0) == DiffPicOrderCnt(ref1, curr)`.
+            let bracketed_same_diff_poc =
+                curr_poc.wrapping_sub(rp0.poc) == rp1.poc.wrapping_sub(curr_poc);
+            let dmvr_runs = self.sps.tool_flags.dmvr_enabled_flag
+                && crate::dmvr::dmvr_used_flag(
+                    self.sps.tool_flags.dmvr_enabled_flag,
+                    self.ph_dmvr_disabled,
+                    info.inter.general_merge_flag,
+                    chosen.pred_flag_l0,
+                    chosen.pred_flag_l1,
+                    bracketed_same_diff_poc,
+                    /*is_strp_l0*/ true,
+                    /*is_strp_l1*/ true,
+                    /*motion_model_idc*/ 0,
+                    /*merge_subblock_flag*/ false,
+                    /*sym_mvd_flag*/ false,
+                    info.inter.merge_data.ciip_flag,
+                    chosen.bcw_idx,
+                    /*luma_weight_l0_flag*/ false,
+                    /*luma_weight_l1_flag*/ false,
+                    /*chroma_weight_l0_flag*/ false,
+                    /*chroma_weight_l1_flag*/ false,
+                    cu.cu.w,
+                    cu.cu.h,
+                    /*c_idx*/ 0,
+                )
+                && !info.inter.merge_data.mmvd_merge_flag
+                && cu.cu.w <= 16
+                && cu.cu.h <= 16;
+            if dmvr_runs {
+                let refined = crate::dmvr::apply_dmvr(
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    chosen.mv_l0,
+                    chosen.mv_l1,
+                    &rp0.frame.luma,
+                    &rp1.frame.luma,
+                )?;
+                chosen.mv_l0 = refined.mv_l0_refined;
+                chosen.mv_l1 = refined.mv_l1_refined;
+            }
+        }
+
         // ---- CIIP setup ----------------------------------------------------
         //
         // Round-28 §8.5.6.7. Build the planar intra prediction from the
@@ -2678,15 +2756,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // Broadcast the chosen MvField across every 4x4 block of the
         // CU. The cu_skip_flag flag is propagated so the next CU's
         // §9.3.4.2.2 cu_skip_flag context picks it up correctly.
+        //
+        // §8.5.1 NOTE — the spatial-MVP / deblocking processes read the
+        // *unrefined* `MvLX`, so the motion-field store uses the pre-DMVR
+        // MVs (identical to `chosen.mv_l{0,1}` when DMVR did not run).
         let mvf = MvField {
-            mv_l0: chosen.mv_l0,
+            mv_l0: unrefined_mv_l0,
             ref_idx_l0: if chosen.pred_flag_l0 {
                 chosen.ref_idx_l0
             } else {
                 -1
             },
             pred_flag_l0: chosen.pred_flag_l0,
-            mv_l1: chosen.mv_l1,
+            mv_l1: unrefined_mv_l1,
             ref_idx_l1: if chosen.pred_flag_l1 {
                 chosen.ref_idx_l1
             } else {
@@ -6694,6 +6776,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §8.5.1 / §8.5.3 — DMVR refines a single-sub-block (16×16) bi-pred
+    /// merge CU's per-list MVs before motion compensation, so enabling
+    /// DMVR changes the reconstructed pixels versus the unrefined path.
+    ///
+    /// The CU is a B-slice merge CU with an empty motion field / no TMVP
+    /// / no HMVP, so the §8.5.2.2 list pads with bi-pred zero-MV
+    /// candidates (`merge_idx == 0` ⇒ initial MVs `(0, 0)`). The two
+    /// references carry a horizontal ramp shifted by ±2 samples relative
+    /// to each other; the §8.5.3.1 bilateral search finds a non-zero
+    /// integer delta that aligns them, so the DMVR-on reconstruction
+    /// differs from the DMVR-off baseline.
+    #[test]
+    fn reconstruct_leaf_cu_inter_merge_dmvr_refines_to_pixels() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.dmvr_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+
+        // Build two reference frames whose luma is a horizontal ramp,
+        // ref_l1 shifted right by `shift` samples relative to ref_l0.
+        // With symmetric POC (curr=4, ref0=0, ref1=8) the §8.5.3.1
+        // opposite-direction search aligns them at a non-zero delta.
+        let shift = 2i32;
+        // Smooth band-limited 2D sinusoid (the dmvr-module test pattern):
+        // aperiodic over the plane, low-frequency, so the bilateral SAD
+        // has a strictly convex minimum at the spec-correct delta and
+        // the (0, 0) baseline SAD clears the §8.5.3.1 early-out
+        // threshold.
+        let ramp = |off: i32| {
+            let mut f = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+            for y in 0..pic_h as usize {
+                for x in 0..pic_w as usize {
+                    let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
+                    let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
+                    let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    f.luma.samples[y * f.luma.stride + x] = v;
+                }
+            }
+            f
+        };
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        // `general_merge_flag` defaults false on LeafCuInfo::default; set
+        // the merge path explicitly with merge_idx 0.
+        let mut info = info;
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let build_walker = |dmvr_disabled: bool| {
+            let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+            w.current_poc = 4;
+            w.set_ph_dmvr_disabled(dmvr_disabled);
+            w.set_ref_pic_list_l0(vec![ReferencePicture {
+                poc: 0,
+                frame: ramp(0),
+                motion_field: None,
+            }]);
+            w.set_ref_pic_list_l1(vec![ReferencePicture {
+                poc: 8,
+                frame: ramp(shift),
+                motion_field: None,
+            }]);
+            w
+        };
+
+        // DMVR off — plain eq. 980 average of the two unrefined refs.
+        let mut walker_off = build_walker(true);
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker_off
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_off)
+            .expect("dmvr-off merge recon");
+
+        // DMVR on — the refined MVs realign the two refs before MC.
+        let mut walker_on = build_walker(false);
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker_on
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_on)
+            .expect("dmvr-on merge recon");
+
+        // The two reconstructions must differ — DMVR moved the MVs.
+        let mut differ = false;
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let xi = 16 + x;
+                let yi = 16 + y;
+                if out_off.luma.samples[yi * out_off.luma.stride + xi]
+                    != out_on.luma.samples[yi * out_on.luma.stride + xi]
+                {
+                    differ = true;
+                }
+            }
+        }
+        assert!(
+            differ,
+            "DMVR-on reconstruction must differ from the unrefined baseline"
+        );
+
+        // §8.5.1 NOTE — the motion field that feeds the spatial-MVP and
+        // deblocking processes stores the *unrefined* MvLX (zero here),
+        // not the DMVR-refined MV that drove MC.
+        let stored = walker_on.motion_field.get_at_luma(20, 20);
+        assert!(stored.available, "CU motion field must be written");
+        assert_eq!(
+            stored.mv_l0,
+            MotionVector::ZERO,
+            "spatial-MVP store must keep the pre-DMVR (unrefined) L0 MV"
+        );
+        assert_eq!(
+            stored.mv_l1,
+            MotionVector::ZERO,
+            "spatial-MVP store must keep the pre-DMVR (unrefined) L1 MV"
+        );
     }
 
     /// §7.4.12.5 + §8.7.4.1 — an inter CU with `cu_sbt_flag == 1`
