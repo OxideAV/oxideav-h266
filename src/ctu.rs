@@ -2319,6 +2319,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let mut chosen = chosen;
         let unrefined_mv_l0 = chosen.mv_l0;
         let unrefined_mv_l1 = chosen.mv_l1;
+        // Set when the §8.5.1 multi-16×16-sub-block DMVR path has already
+        // written the per-sub-block bi-pred MC into `out`, so the shared
+        // CU-wide luma + chroma MC below must be skipped.
+        let mut dmvr_multi_done = false;
         if let (Some(rp0), Some(rp1)) = (ref_pic_l0, ref_pic_l1) {
             let curr_poc = self.current_poc;
             // §8.5.1 — `DiffPicOrderCnt(curr, ref0) == DiffPicOrderCnt(ref1, curr)`.
@@ -2347,22 +2351,98 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu.cu.h,
                     /*c_idx*/ 0,
                 )
-                && !info.inter.merge_data.mmvd_merge_flag
-                && cu.cu.w <= 16
-                && cu.cu.h <= 16;
+                && !info.inter.merge_data.mmvd_merge_flag;
             if dmvr_runs {
-                let refined = crate::dmvr::apply_dmvr(
-                    cu.cu.x,
-                    cu.cu.y,
-                    cu.cu.w,
-                    cu.cu.h,
-                    chosen.mv_l0,
-                    chosen.mv_l1,
-                    &rp0.frame.luma,
-                    &rp1.frame.luma,
-                )?;
-                chosen.mv_l0 = refined.mv_l0_refined;
-                chosen.mv_l1 = refined.mv_l1_refined;
+                // §8.5.1 eqs. 452 – 455 — split the CU into ≤16×16
+                // sub-blocks. `numSbX/numSbY > 1` only when a dimension
+                // exceeds 16.
+                let num_sb_x = if cu.cu.w > 16 { cu.cu.w >> 4 } else { 1 };
+                let num_sb_y = if cu.cu.h > 16 { cu.cu.h >> 4 } else { 1 };
+                if num_sb_x == 1 && num_sb_y == 1 {
+                    // Single sub-block: refine `chosen` in place and let
+                    // the shared CU-wide MC + BDOF tail consume it.
+                    let refined = crate::dmvr::apply_dmvr(
+                        cu.cu.x,
+                        cu.cu.y,
+                        cu.cu.w,
+                        cu.cu.h,
+                        chosen.mv_l0,
+                        chosen.mv_l1,
+                        &rp0.frame.luma,
+                        &rp1.frame.luma,
+                    )?;
+                    chosen.mv_l0 = refined.mv_l0_refined;
+                    chosen.mv_l1 = refined.mv_l1_refined;
+                } else {
+                    // Multi-sub-block split (§8.5.1 eqs. 456 – 459): each
+                    // 16×16 sub-block is refined independently and runs
+                    // its own §8.5.6 bi-pred MC (luma + 4:2:0 chroma) at
+                    // the sub-block origin. The §8.5.6.6.2 blend uses the
+                    // candidate's `bcwIdx` (always 0 on the DMVR gate, so
+                    // eq. 980 default-weighting). BDOF on the per-DMVR-
+                    // sub-block grid is a follow-up; the gate sets it off
+                    // for this path. The unrefined `MvLX` motion-field
+                    // store below still applies (the CU-wide MvField is
+                    // the pre-DMVR candidate).
+                    let sb_w = 16u32;
+                    let sb_h = 16u32;
+                    let chroma = self.sps.sps_chroma_format_idc == 1;
+                    for sby in 0..num_sb_y {
+                        for sbx in 0..num_sb_x {
+                            let x = cu.cu.x + sbx * sb_w;
+                            let y = cu.cu.y + sby * sb_h;
+                            let refined = crate::dmvr::apply_dmvr(
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                chosen.mv_l0,
+                                chosen.mv_l1,
+                                &rp0.frame.luma,
+                                &rp1.frame.luma,
+                            )?;
+                            predict_luma_block_bipred_bcw(
+                                &mut out.luma,
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                &rp0.frame.luma,
+                                refined.mv_l0_refined,
+                                &rp1.frame.luma,
+                                refined.mv_l1_refined,
+                                /*bcw_idx*/ 0,
+                            )?;
+                            if chroma {
+                                predict_chroma_block_bipred_bcw(
+                                    &mut out.cb,
+                                    x / 2,
+                                    y / 2,
+                                    sb_w / 2,
+                                    sb_h / 2,
+                                    &rp0.frame.cb,
+                                    refined.mv_l0_refined,
+                                    &rp1.frame.cb,
+                                    refined.mv_l1_refined,
+                                    0,
+                                )?;
+                                predict_chroma_block_bipred_bcw(
+                                    &mut out.cr,
+                                    x / 2,
+                                    y / 2,
+                                    sb_w / 2,
+                                    sb_h / 2,
+                                    &rp0.frame.cr,
+                                    refined.mv_l0_refined,
+                                    &rp1.frame.cr,
+                                    refined.mv_l1_refined,
+                                    0,
+                                )?;
+                            }
+                        }
+                    }
+                    dmvr_multi_done = true;
+                }
             }
         }
 
@@ -2427,7 +2507,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
 
         // ---- Luma MC -------------------------------------------------------
+        //
+        // Skipped when the §8.5.1 multi-sub-block DMVR path already wrote
+        // the per-sub-block bi-pred MC into `out` above.
         match (ref_pic_l0, ref_pic_l1) {
+            _ if dmvr_multi_done => {}
             (Some(rp0), None) => {
                 // Uni-pred L0 (P-slice path, or B-slice candidate with
                 // predFlagL1 == 0).
@@ -2630,6 +2714,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 (Vec::new(), Vec::new())
             };
             match (ref_pic_l0, ref_pic_l1) {
+                _ if dmvr_multi_done => {}
                 (Some(rp0), None) => {
                     predict_chroma_block(
                         &mut out.cb,
@@ -6914,6 +6999,121 @@ mod tests {
             stored.mv_l1,
             MotionVector::ZERO,
             "spatial-MVP store must keep the pre-DMVR (unrefined) L1 MV"
+        );
+    }
+
+    /// §8.5.1 eqs. 452 – 459 — a bi-pred merge CU wider than 16 luma
+    /// samples splits into `numSbX = cbWidth >> 4` 16×16 DMVR sub-blocks,
+    /// each refined independently before its own §8.5.6 bi-pred MC. A
+    /// 32×16 CU therefore decodes through the multi-sub-block path and
+    /// its pixels differ from the DMVR-off baseline.
+    #[test]
+    fn reconstruct_leaf_cu_inter_merge_dmvr_multi_subblock_to_pixels() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.dmvr_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+
+        // Per-sub-block-distinct horizontal shift: the left 16-wide
+        // sub-block sees ref_l1 shifted +2, the right one +3, so the two
+        // sub-blocks refine to different deltas and the multi-sub-block
+        // loop is exercised (a single CU-wide refine could not match
+        // both).
+        let ramp = |off_left: i32, off_right: i32| {
+            let mut f = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+            for y in 0..pic_h as usize {
+                for x in 0..pic_w as usize {
+                    let off = if x < 32 { off_left } else { off_right };
+                    let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
+                    let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
+                    let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    f.luma.samples[y * f.luma.stride + x] = v;
+                }
+            }
+            f
+        };
+
+        // CU at (16, 16), 32×16 → numSbX = 2, numSbY = 1.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 32,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 32,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let build_walker = |dmvr_disabled: bool| {
+            let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+            w.current_poc = 4;
+            w.set_ph_dmvr_disabled(dmvr_disabled);
+            w.set_ref_pic_list_l0(vec![ReferencePicture {
+                poc: 0,
+                frame: ramp(0, 0),
+                motion_field: None,
+            }]);
+            w.set_ref_pic_list_l1(vec![ReferencePicture {
+                poc: 8,
+                frame: ramp(2, 3),
+                motion_field: None,
+            }]);
+            w
+        };
+
+        let mut walker_off = build_walker(true);
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker_off
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_off)
+            .expect("dmvr-off 32x16 merge recon");
+
+        let mut walker_on = build_walker(false);
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker_on
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_on)
+            .expect("dmvr-on 32x16 merge recon");
+
+        // Both sub-blocks must show a difference from the baseline.
+        let region_differs = |x0: usize| {
+            for y in 0..16usize {
+                for x in 0..16usize {
+                    let xi = x0 + x;
+                    let yi = 16 + y;
+                    if out_off.luma.samples[yi * out_off.luma.stride + xi]
+                        != out_on.luma.samples[yi * out_on.luma.stride + xi]
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        assert!(
+            region_differs(16),
+            "left 16×16 DMVR sub-block must differ from the baseline"
+        );
+        assert!(
+            region_differs(32),
+            "right 16×16 DMVR sub-block must differ from the baseline"
         );
     }
 
