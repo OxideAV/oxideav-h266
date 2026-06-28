@@ -3823,6 +3823,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
     /// Scope: 4:2:0 chroma, no residual add (the caller layers residual
     /// via the regular tail), BCW / BDOF on the affine path deferred.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct_leaf_cu_inter_affine_amvp(
         &mut self,
         cb_x: u32,
@@ -3831,6 +3832,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cb_h: u32,
         decision: &crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision,
         amvr: crate::amvr::AmvrShift,
+        bcw_idx: u8,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::affine_amvp::{
@@ -4015,7 +4017,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 )?;
                 store_cpmvs_l0 = Some(cpmvs_l0);
                 store_cpmvs_l1 = Some(cpmvs_l1);
-                self.reconstruct_affine_inter_bi(
+                // §8.5.6.6.2 — apply the parsed `bcw_idx` so an explicit
+                // bi-pred affine CU with `bcwIdx ∈ 1..=4` takes the
+                // eq. 981 weighted blend (eq. 980 average for 0).
+                self.reconstruct_affine_inter_bi_bcw(
                     cb_x,
                     cb_y,
                     cb_w,
@@ -4024,6 +4029,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     &ref_pic_l0,
                     &cpmvs_l1,
                     &ref_pic_l1,
+                    bcw_idx,
                     out,
                 )
             }
@@ -4062,10 +4068,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             },
             cpmvs_l0: store_cpmvs_l0.unwrap_or(zero_cpmvs),
             cpmvs_l1: store_cpmvs_l1.unwrap_or(zero_cpmvs),
-            // §8.5.6.6.2 — the parsed affine-AMVP `bcw_idx` is not yet
-            // threaded into this decision struct, so the stored record
-            // carries the default-weighted `0`.
-            bcw_idx: 0,
+            // §8.5.6.6.2 — store the parsed affine-AMVP `bcw_idx` only
+            // when the CU is bi-pred (both lists active); a uni-pred CU
+            // has no meaningful weight index, so it stores the default
+            // `0`. A later CU's §8.5.5.2 inherited affine-merge scan
+            // (`derive_inherited_affine_merge_side`) then recovers this
+            // weight for an inherited bi-pred candidate.
+            bcw_idx: if use_l0 && use_l1 { bcw_idx } else { 0 },
         };
         self.store_affine_cb(cb_x, cb_y, cb_w, cb_h, rec);
         Ok(())
@@ -7841,6 +7850,7 @@ mod tests {
                 16,
                 &decision,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut out,
             )
             .expect("affine amvp parse-to-pixels");
@@ -7943,6 +7953,7 @@ mod tests {
                 16,
                 &decision,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut out,
             )
             .expect("affine amvp bi-pred parse-to-pixels");
@@ -7986,6 +7997,93 @@ mod tests {
             any,
             "the affine bi-pred fuse must produce a non-trivial prediction"
         );
+    }
+
+    /// §8.5.6.6.2 — the parsed `bcw_idx` is threaded into the affine
+    /// non-merge (AMVP) bi-pred reconstruction. With distinct constant
+    /// L0 / L1 references (40 / 200), `bcw_idx == 0` averages to 120
+    /// (eq. 980) while `bcw_idx == 3` (w0 = −2, w1 = 10) applies the
+    /// eq. 981 weighted blend `Clip1((−2·40 + 10·200 + 4) >> 3) = 240`.
+    /// The stored affine CB record also carries the weight so a later
+    /// inherited-affine-merge scan recovers it.
+    #[test]
+    fn reconstruct_leaf_cu_inter_affine_amvp_bipred_bcw_weights() {
+        use crate::affine_syntax_enc::make_non_merge_inter_affine_decision;
+        use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision;
+        use crate::non_merge_mvp_syntax_enc::make_non_merge_mvp_syntax_decision;
+
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+
+        // Distinct constant references so the per-list affine predictions
+        // are 40 (L0) and 200 (L1) everywhere → the blend is the only
+        // variable between bcw_idx 0 and 3.
+        let build = |bcw: u8| {
+            let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+            walker.set_ref_pic_list_l0(vec![ReferencePicture {
+                poc: -1,
+                frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+                motion_field: None,
+            }]);
+            walker.set_ref_pic_list_l1(vec![ReferencePicture {
+                poc: 1,
+                frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+                motion_field: None,
+            }]);
+            let affine = make_non_merge_inter_affine_decision(true, false);
+            let mvp = make_non_merge_mvp_syntax_decision(
+                crate::leaf_cu::InterPredDir::PredBi,
+                false,
+                0,
+                0,
+                0,
+                0,
+            );
+            // Zero per-CP MVDs → zero CPMVs → both lists read the
+            // reference verbatim (constant planes), so the predictions
+            // are exactly 40 / 200.
+            let mvd_cp = [MotionVector::ZERO; 3];
+            let decision = NonMergeInterPreResidualAffineDecision::new(affine, mvp, mvd_cp, mvd_cp);
+            let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+            walker
+                .reconstruct_leaf_cu_inter_affine_amvp(
+                    16,
+                    16,
+                    16,
+                    16,
+                    &decision,
+                    crate::amvr::AmvrShift(0),
+                    bcw,
+                    &mut out,
+                )
+                .expect("affine amvp bcw recon");
+            (walker, out)
+        };
+
+        let (_w0, out_def) = build(0);
+        let (walker3, out_bcw) = build(3);
+        assert_eq!(
+            out_def.luma.samples[16 * out_def.luma.stride + 16],
+            120,
+            "bcw_idx=0 must average 40/200 to 120"
+        );
+        assert_eq!(
+            out_bcw.luma.samples[16 * out_bcw.luma.stride + 16],
+            240,
+            "bcw_idx=3 must apply the eq. 981 weighted blend to 240"
+        );
+        // The stored affine CB record carries the weight.
+        let rec = walker3
+            .affine_cpmv_field
+            .get_at_luma(20, 20)
+            .expect("affine CB record stored");
+        assert_eq!(rec.bcw_idx, 3, "affine AMVP store must keep bcw_idx = 3");
     }
 
     /// §8.5.5.7 inherited affine CPMVP — round-364 per-CB affine CPMV
@@ -8061,6 +8159,7 @@ mod tests {
                 16,
                 &decision0,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut out0,
             )
             .expect("first affine CB recon");
@@ -8107,6 +8206,7 @@ mod tests {
                 16,
                 &decision1,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut out1,
             )
             .expect("second affine CB recon");
@@ -8249,6 +8349,7 @@ mod tests {
                 16,
                 &decision0,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut out0,
             )
             .expect("neighbour affine CB recon");
@@ -8281,6 +8382,7 @@ mod tests {
                 16,
                 &decision_ref,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut expect,
             )
             .expect("amvp inherited reference recon");
@@ -8717,6 +8819,7 @@ mod tests {
                 16,
                 &decision,
                 crate::amvr::AmvrShift(0),
+                0, // bcw_idx
                 &mut out,
             )
             .expect("constructed-CPMVP affine recon");

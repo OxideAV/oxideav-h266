@@ -118,7 +118,17 @@ P + B-slice merge subset:
   §8.5.6.7 CIIP; §8.5.4 / §8.5.7 GPM. Motion compensation uses the
   §8.5.6.3 8-tap luma + 4-tap chroma fractional-sample interpolation
   with default-weighted bi-pred (§8.5.6.6.2), BCW (§8.5.6.6.2 eq. 981),
-  and BDOF (§8.5.6.5). High-bit-depth (Main10 / Main12) reconstruction
+  and BDOF (§8.5.6.5). **DMVR** (§8.5.1 / §8.5.3) is **live** to pixels
+  on the plain bi-pred merge path: the §8.5.1 `dmvrFlag` gate
+  (`sps_dmvr_enabled_flag` / `ph_dmvr_disabled_flag`, symmetric STRP POC
+  bracket, `!mmvd`, `!ciip`, `bcwIdx == 0`, no weighted-pred,
+  `cbW >= 8 && cbH >= 8 && cbW*cbH >= 128`) splits the CU into ≤16×16
+  sub-blocks (eqs. 452 – 459), runs the §8.5.3.1 bilateral-matching
+  search (with the `minSad >= sbW*sbH` early-out) per sub-block, and
+  feeds the refined MVs to the §8.5.6 MC (and §8.5.6.5 BDOF on the
+  single-sub-block path); per the §8.5.1 NOTE the unrefined `MvLX` is
+  what the per-picture motion field stores for spatial-MVP / deblocking.
+  High-bit-depth (Main10 / Main12) reconstruction
   runs through `u16` picture planes. A non-skip merge / CIIP CU whose
   `cu_coded_flag == 1` decodes its §7.3.11.10 `transform_unit()`
   residual (MODE_INTER luma-CBF condition + chroma CBFs) and adds the
@@ -171,7 +181,11 @@ P + B-slice merge subset:
   `cumulate_affine_mvd_cp`), folds predictor + cumulative MVD into the
   final CPMVs (eqs. 664 – 667, `derive_final_affine_cpmvs`), and drives
   the uni / bi-pred affine MC — so affine inter CUs now decode from
-  parsed CPMV deltas end-to-end. **Inherited affine CPMVP** (§8.5.5.7
+  parsed CPMV deltas end-to-end. The parsed `bcw_idx` is threaded into
+  the bi-pred branch (§8.5.6.6.2 eq. 981 weighted blend for `bcwIdx ∈
+  1..=4`) and stored on the affine CB record so a later §8.5.5.2
+  inherited-affine-merge scan recovers the weight. **Inherited affine
+  CPMVP** (§8.5.5.7
   steps 4 / 5) is now **live**: a per-CB affine CPMV store
   (`inter::AffineCpmvField`, a 4×4-granularity grid of
   `inter::AffineCbRecord` mirroring `CbPosX/Y[0][·]`, `CbWidth/Height[0][·]`,
