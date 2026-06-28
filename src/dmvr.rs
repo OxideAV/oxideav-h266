@@ -285,12 +285,45 @@ pub fn refine_mv_pair<P: DmvrPredictor>(
     let span = (2 * range + 1) as usize;
     let mut sads = vec![u64::MAX; span * span];
 
-    let mut best_sad: u64 = u64::MAX;
     let mut best_dx: i32 = 0;
     let mut best_dy: i32 = 0;
 
+    // §8.5.3.1 — the (0, 0) baseline SAD (`minSad`) is computed first.
+    // The integer-pel search + half-pel parametric refinement only run
+    // when `minSad >= sbHeight * sbWidth` (the spec's "When minSad is
+    // greater than or equal to sbHeight * sbWidth" gate above eq. 616).
+    // Below that threshold the prediction pair already matches closely
+    // enough that the refinement is skipped and `dMvLX` stays zero.
+    let baseline_idx = (range as usize) * span + range as usize; // (0, 0)
+    {
+        let mv0_cand = mv_l0_init;
+        let mv1_cand = mv_l1_init;
+        predictor.predict(0, mv0_cand, &mut tmp_l0)?;
+        predictor.predict(1, mv1_cand, &mut tmp_l1)?;
+        let sad = bilateral_matching_sad(&tmp_l0, &tmp_l1, w, h)?;
+        sads[baseline_idx] = sad;
+    }
+    let baseline_sad = sads[baseline_idx];
+    let mut best_sad: u64 = baseline_sad;
+    let dmvr_threshold = (w as u64) * (h as u64);
+    if baseline_sad < dmvr_threshold {
+        // §8.5.3.1 early-out: keep `dMvLX == 0`, i.e. the initial MVs.
+        return Ok(DmvrRefineResult {
+            mv_l0_refined: mv_l0_init,
+            mv_l1_refined: mv_l1_init,
+            int_delta_x: 0,
+            int_delta_y: 0,
+            half_pel: HalfPelOffset::default(),
+            final_int_sad: baseline_sad,
+            baseline_sad,
+        });
+    }
+
     for dy in -range..=range {
         for dx in -range..=range {
+            if dx == 0 && dy == 0 {
+                continue; // baseline already probed above
+            }
             let mv0_cand = MotionVector {
                 x: mv_l0_init.x + dx * 16,
                 y: mv_l0_init.y + dy * 16,
@@ -311,9 +344,6 @@ pub fn refine_mv_pair<P: DmvrPredictor>(
             }
         }
     }
-
-    let baseline_idx = (range as usize) * span + range as usize; // (0, 0)
-    let baseline_sad = sads[baseline_idx];
 
     // Half-pel parabolic refinement — only when the integer-pel winner
     // is strictly inside the grid (the 1-cell margin lets us read
@@ -574,6 +604,30 @@ mod tests {
             res.final_int_sad,
             res.baseline_sad,
         );
+    }
+
+    #[test]
+    fn refine_mv_pair_early_out_when_baseline_sad_below_threshold() {
+        // §8.5.3.1 — when the (0, 0) baseline SAD is below
+        // `sbWidth * sbHeight`, the integer + parametric search is
+        // skipped and `dMvLX` stays zero. Two identical references give
+        // baseline SAD 0 < 256, so the refined MVs must equal the
+        // initial MVs and the integer deltas must be zero.
+        let w = 16u32;
+        let h = 16u32;
+        let r = stripe_plane(64, 64, 0);
+        let r2 = stripe_plane(64, 64, 0);
+        // Identical references + identical initial MVs → the two per-list
+        // predictions coincide so the (0, 0) baseline SAD is 0 < 256.
+        let init0 = MotionVector::ZERO;
+        let init1 = MotionVector::ZERO;
+        let res = apply_dmvr(16, 16, w, h, init0, init1, &r, &r2).unwrap();
+        assert_eq!(res.baseline_sad, 0, "identical predictions ⇒ SAD 0");
+        assert_eq!(res.int_delta_x, 0, "early-out must leave δx = 0");
+        assert_eq!(res.int_delta_y, 0, "early-out must leave δy = 0");
+        assert_eq!(res.half_pel, HalfPelOffset::default());
+        assert_eq!(res.mv_l0_refined, init0, "L0 MV unchanged on early-out");
+        assert_eq!(res.mv_l1_refined, init1, "L1 MV unchanged on early-out");
     }
 
     #[test]

@@ -695,6 +695,16 @@ pub struct CtuWalker<'a, 'b> {
     /// `bi_pred_avg_8bit` byte-for-byte. Set via
     /// [`Self::set_ph_bdof_disabled`].
     ph_bdof_disabled: bool,
+    /// §8.5.1 / §8.5.3.1 — `ph_dmvr_disabled_flag`. The DMVR
+    /// picture-level disable that, together with
+    /// `sps_dmvr_enabled_flag` (read directly from
+    /// [`Self::sps`]`.tool_flags.dmvr_enabled_flag`), drives the
+    /// §8.5.1 `dmvrFlag` derivation in
+    /// [`crate::dmvr::dmvr_used_flag`]. Defaults to `true` — i.e.
+    /// DMVR off — so callers that have not wired the picture-header
+    /// bit yet keep the round-31 plain bi-pred / BDOF path
+    /// byte-for-byte. Set via [`Self::set_ph_dmvr_disabled`].
+    ph_dmvr_disabled: bool,
     /// §7.4.3.7 `ph_joint_cbcr_sign_flag` — drives the §8.7.2 joint
     /// Cb-Cr `cSign = 1 − 2 * flag` used when deriving the non-coded
     /// chroma residual from the coded one. Defaults to `false`; set via
@@ -922,6 +932,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             collocated_from_l0: true,
             ph_mmvd_fullpel_only: false,
             ph_bdof_disabled: true,
+            ph_dmvr_disabled: true,
             ph_joint_cbcr_sign: false,
             ph_prof_disabled: true,
             intra_grid,
@@ -1128,6 +1139,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// not wired the bit keep the round-23 byte-for-byte pipeline.
     pub fn set_ph_bdof_disabled(&mut self, disabled: bool) {
         self.ph_bdof_disabled = disabled;
+    }
+
+    /// §8.5.1 / §8.5.3.1 — install the picture-header
+    /// `ph_dmvr_disabled_flag`. Takes effect for subsequent leaf-CU
+    /// merge dispatches: when this flag is `false` AND the SPS-level
+    /// `sps_dmvr_enabled_flag` (read from [`Self::sps`]) is `true` AND
+    /// every §8.5.1 `dmvrFlag` condition holds (general merge, bi-pred,
+    /// symmetric STRP POC distance, no MMVD / CIIP / sub-block /
+    /// sym-MVD / BCW / weighted-pred / RPR, `cbW >= 8`, `cbH >= 8`,
+    /// `cbW * cbH >= 128`), the bi-pred dispatch runs the §8.5.3 decoder-
+    /// side MV refinement per 16×16 sub-block before motion compensation.
+    /// Defaults to `true` (DMVR off) so callers that have not wired the
+    /// bit keep the round-31 byte-for-byte pipeline.
+    pub fn set_ph_dmvr_disabled(&mut self, disabled: bool) {
+        self.ph_dmvr_disabled = disabled;
     }
 
     /// Set `ph_joint_cbcr_sign_flag` (§7.4.3.7). Drives the §8.7.2
