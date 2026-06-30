@@ -4,6 +4,94 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h266/compare/v0.0.7...v0.0.8) - 2026-06-30
+
+### Other
+
+- §8.5.3 DMVR bilateral-matching search rebuilt spec-exact
+- h266 README: correct affine-BDOF note (spec-prohibited, not a follow-up)
+- thread parsed bcw_idx into affine non-merge (AMVP) bi-pred reconstruction
+- §8.5.1 DMVR multi-16x16-sub-block split reconstructed to pixels
+- §8.5.1 DMVR reconstructed to pixels on single-sub-block bi-pred merge
+- §8.5.3.1 DMVR minSad early-out + ph_dmvr_disabled plumbing
+- test affine sub-block merge zero-MV pad reconstruction
+- §8.5.5.6 fourth-corner temporal MV into constructed affine-merge cands
+- §8.5.5.2 inherited affine-merge candidate carries neighbour bcwIdxN
+- §8.5.5.3 SbTMVP (SbCol) sub-block-temporal merge to pixels
+- §8.5.6.6.2 BCW (eq. 981) on the affine bi-pred path
+- §8.5.5.2 affine sub-block merge reconstructed to pixels
+- thread parsed bcw_idx into non-merge bi-pred reconstruction
+- h266 README: r372 inter-prediction updates
+- §8.7.4.6 transform-skip in joint Cb-Cr inter residual
+- CU-level chroma QP offset in inter residual reconstruction
+- §8.5.5.8 constructed affine CPMVP wired into affine-AMVP recon
+- §8.7.4.6 transform-skip inter residual reconstruction
+- README — round 369 SPS derivations + slice-header tail
+- §7.4.3.4 ChromaQpTable derivation + clamped lookup helper
+- §7.4.3.4 NumExtraPhBits/NumExtraShBits + fix PH ph_extra_bit over-read
+- §7.4.3.22 Log2TransformRange from SPS range extension at all TB sites
+- §7.4.10.6 capture PPS CU-chroma-QP-offset list + wire CuQpOffsetC?
+- §8.7.1 chroma-QP slice-level offsets into reconstruction
+- §7.3.7 slice-header range-extension tail (ts rice idx + reverse-last-sig)
+- refresh reconstruct_leaf_cu_inter_affine_amvp doc for live inherited CPMVP
+- §8.5.5.7 inherited affine CPMVP via per-CB affine CPMV store
+- transform-skip residual coding on the intra chroma Cb/Cr paths
+- §7.3.11.12 transform-skip residual coding wired to intra luma pixels
+- §8.7.4.1 explicit-MTS parse-to-pixels fixture + README/CHANGELOG
+- §8.4.5.2.7 wide-angle remap lifts non-square restriction on inverse LFNST
+- §8.7.4.1 implicit + explicit MTS wired into intra luma reconstruction
+- §8.7.4.1 inverse LFNST into intra reconstruction + parse-to-pixels fixture
+- §7.3.11.5 lfnst_idx CABAC parse + gating wired into intra TU path
+- §8.7.4.1-.3 inverse LFNST — matrices + set selection + corner fold
+- §7.3.11.11 LFNST/MTS DC-only + zero-out gating flags from residual_coding()
+- affine AMVP bi-pred parse-to-pixels test + README/CHANGELOG
+- affine non-merge (AMVP) parse-to-pixels fuse (§8.5.5.5)
+- §8.5.5.5 affine MVD cumulative fold (eqs. 660-663)
+- §8.5.6.6.2 affine bi-prediction reconstruction to pixels
+- §8.5.5.3 / §8.5.6 affine uni-pred reconstruction to pixels
+- §7.4.12.11 / §8.7.2 joint Cb-Cr inter residual reconstruction
+- README + CHANGELOG — non-merge AMVP reconstruction + SBT + multi-TB tiling now live
+- §7.3.11.4 multi-TB tiling for inter CUs exceeding MaxTbSizeY
+- §7.4.12.5 SBT geometry + §8.7.4.1 Table-40 inverse transform in the inter residual path
+- wire §8.5.2.1 non-merge AMVP inter reconstruction to output pixels
+- extract shared inter MC+residual tail into reconstruct_inter_with_chosen
+- §D.4.1 picture timing (PT) SEI message (payloadType 1) parser
+- subblock-merge inter CUs decode their residual (§7.3.11.10)
+- inter residual reconstruction (§8.5.8 + §8.7.5.1)
+- round 334: §D.3.1 buffering period SEI message (payloadType 0) typed parser
+- round 329: §D.10.1 constrained RASL encoding indication SEI message (payloadType 207) typed parser
+- round 325: §D.5.1 DU information SEI message (payloadType 130) typed parser
+- round 321: §D.7.1 subpic_level_info SEI message (payloadType 203) typed parser
+- round 317: §D.9.1 SEI prefix indication SEI message (payloadType 201) typed parser
+- round 314: §D.8.1 SEI manifest SEI message (payloadType 200) typed parser
+- refresh to current status, drop per-round changelog cruft
+- round 305: §8.5.6.6.3 explicit weighted sample prediction + §7.4.7 chroma weight/offset (eq. 144) derivations
+- round 299: §8.7.2 scaling and transformation process — codedCIdx + TuCResMode joint Cb-Cr residual derivation (eqs. 1129–1132)
+- round 293: §8.7.4.6 inverse ACT (residual modification for colour-space conversion) — eqs. 1199–1205 YCgCo-R inverse
+- round 290: sample-domain LMCS processes — §8.7.5.2 forward + §8.8.2.2/8.8.2.3 inverse luma mapping + §8.7.5.3 chroma residual scaling
+- round 281: BitDepth-dependent §7.4.3.19 LMCS derivations (eqs. 93 / 95 – 98 / 100)
+- round 278: §7.3.2.19 lmcs_data() typed parser + APS dispatch
+- round 274: §7.3.2.9 sei_rbsp() multi-message walker + rbsp_trailing_bits() tail validation
+- round 271: §7.3.6 sei_message() header parser (payloadType/payloadSize accumulation)
+- round 264: §7.3.2.15 rbsp_slice_trailing_bits() reader-side validator
+- round 259: §7.3.2.16 rbsp_trailing_bits() + §7.3.2.17 byte_alignment() typed reader-side validators
+- round 255: §7.3.2.11 end_of_seq_rbsp() + §7.3.2.12 end_of_bitstream_rbsp() typed decoders
+- round 253: §7.3.2.13 filler_data_rbsp() typed decoder
+- round 250: §7.3.2.10 access_unit_delimiter_rbsp() typed decoder
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 245: §7.3.3.2 general_constraints_info() typed decoder
+- round 242: §7.3.2.5 pps_subpic_id_mapping() typed decoder
+- round 239: §7.3.2.22 sps_range_extension() typed decoder
+- round 233: decomposed §7.3.10.10 mvd_coding() body parser
+- round 230: reader-side affine + AMVR / affine + AMVR + BCW composite walkers for §7.3.10.5 non-merge inter pre-residual
+- round 224: reader-side _with_amvr and _with_amvr_and_bcw composite walkers for §7.3.11.7 non-merge inter pre-residual + §7.3.10.10 AMVR + §7.3.10.5 BCW
+- round 219: reader-side composite walker for §7.3.11.7 non-merge inter pre-residual
+- round 213: encoder-side affine + AMVR / affine + AMVR + BCW composite dispatchers
+- round 207: encoder-side §7.3.10.5 multi-CP-MV affine MVD dispatcher
+- round 201: encoder-side §7.3.10.5 bcw_idx dispatcher (`bcw_idx_enc`) wired into composite walker
+- round 195: encoder-side §7.3.10.10 amvr_flag + amvr_precision_idx dispatcher wired into non-merge inter walker
+- round 193: §7.3.10.10 amvr_flag + amvr_precision_idx CABAC reader
+
 ### Other
 
 - round 381: §8.5.3 **DMVR bilateral-matching search rebuilt spec-exact (bilinear interpolation + sub-sampled SAD + parametric refinement)**. The `dmvr` module's refinement core no longer approximates the search with the 8-tap MC filter + a floating-point parabola. It now implements the §8.5.3 process literally: (1) §8.5.3.2.1 / §8.5.3.2.2 builds ONE `(sbWidth + 2·srRange) × (sbHeight + 2·srRange)` bilinear prediction array per list using the 2-tap Table-26 `fbL` luma filter (`bilinear_sample` / `bilinear_pred_array`, with the eqs. 624 – 639 BitDepth shifts + eqs. 633 / 634 edge clamping); (2) §8.5.3.3 SADs over shifted windows of those arrays (`sad_at_offset`) with the eq. 640 even-row sub-sampling (`2·y`) and the eq. 641 `sad −= sad >> 2` bias on the `(0, 0)` candidate; (3) §8.5.3.4 array-entry selection in the spec scan order (`dY` outer, `dX` inner, strict `<`); (4) §8.5.3.5 parametric refinement via the exact §8.5.3.5.2 integer-division pseudo-code (`delta_mv_component`: bit-by-bit division, `denom == 0 → 0`, `sadMinus == sadCenter → −8`, `sadPlus == sadCenter → +8`, bounded to `[−8, +8]`), gated on the §8.5.3.1 `|intOffX| != 2 && |intOffY| != 2` subPelFlag; (5) eqs. 618 / 619 `dMvL1 = −dMvL0`. The `(0, 0)` baseline is computed once and the §8.5.3.1 `minSad >= sbWidth*sbHeight` early-out skips the integer + parametric passes. `apply_dmvr` (BitDepth-8 `u8`-plane wrapper) and `DmvrRefineResult` keep their signatures, so the CTU wiring (single + multi-16×16-sub-block paths) is unchanged. The approximate `refine_mv_pair` / `DmvrPredictor` / `PlanePairPredictor` / `parabolic_half_pel` surface is replaced by `refine_mv_pair_bd` (bit-depth-parameterised). New unit tests pin the bilinear integer/half-pel samples, the §8.5.3.5.2 edge equalities + bounds, and the eqs. 618 / 619 L1-negation invariant; the integer-shift recovery + early-out + bi-pred-SSE tests carry over.
