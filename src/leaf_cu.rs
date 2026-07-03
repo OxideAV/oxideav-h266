@@ -62,8 +62,9 @@ use crate::ctx::{
 };
 use crate::inter::{InterCuInfo, MergeData, MotionVector, MvField};
 use crate::residual::{
-    decode_tb_coefficients, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
-    read_tu_cr_coded_flag, read_tu_joint_cbcr_residual_flag, read_tu_y_coded_flag, ResidualCtxs,
+    decode_tb_coefficients_opts, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
+    read_tu_cr_coded_flag, read_tu_joint_cbcr_residual_flag, read_tu_y_coded_flag, RcOpts,
+    ResidualCtxs,
 };
 use crate::tables::{init_contexts, SyntaxCtx};
 
@@ -527,6 +528,11 @@ pub struct CuToolFlags {
     /// `sps_explicit_mts_inter_enabled_flag` — gates the `mts_idx` parse
     /// for `MODE_INTER` CUs (§7.3.11.5).
     pub explicit_mts_inter_enabled: bool,
+    /// §7.3.7 slice-level residual-coding switches —
+    /// `sh_dep_quant_used_flag` (§7.4.12.11 QState trellis) and
+    /// `sh_sign_data_hiding_used_flag` (`signHiddenFlag`), threaded
+    /// into every regular `residual_coding()` read.
+    pub rc_opts: RcOpts,
 }
 
 /// Parsed + derived per-CU state for an intra leaf CU.
@@ -3027,7 +3033,15 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     /*bdpcm=*/ false,
                 )?
             } else {
-                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cb_w, cb_h, 0)?
+                decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cb_w,
+                    cb_h,
+                    0,
+                    self.tools.rc_opts,
+                )?
+                .0
             };
             let mut lx = 0u32;
             let mut ly = 0u32;
@@ -3106,7 +3120,15 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     /*bdpcm=*/ false,
                 )?
             } else {
-                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?
+                decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    1,
+                    self.tools.rc_opts,
+                )?
+                .0
             };
         }
         // §7.3.11.10 — Cr residual_coding() is skipped when the joint
@@ -3130,7 +3152,15 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     /*bdpcm=*/ false,
                 )?
             } else {
-                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?
+                decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    2,
+                    self.tools.rc_opts,
+                )?
+                .0
             };
         }
         Ok(())
@@ -3273,12 +3303,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     /*bdpcm=*/ false,
                 )?
             } else {
-                let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                let (levels, flags) = decode_tb_coefficients_opts(
                     self.dec,
                     &mut self.ctxs.residual,
                     cb_w,
                     cb_h,
                     0,
+                    self.tools.rc_opts,
                 )?;
                 res_flags.merge(flags);
                 levels
@@ -3328,12 +3359,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         false,
                     )?
                 } else {
-                    let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                    let (levels, flags) = decode_tb_coefficients_opts(
                         self.dec,
                         &mut self.ctxs.residual,
                         cw,
                         ch,
                         1,
+                        self.tools.rc_opts,
                     )?;
                     res_flags.merge(flags);
                     levels
@@ -3368,12 +3400,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         false,
                     )?
                 } else {
-                    let (levels, flags) = crate::residual::decode_tb_coefficients_with_flags(
+                    let (levels, flags) = decode_tb_coefficients_opts(
                         self.dec,
                         &mut self.ctxs.residual,
                         cw,
                         ch,
                         2,
+                        self.tools.rc_opts,
                     )?;
                     res_flags.merge(flags);
                     levels
@@ -3635,7 +3668,15 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             let n_w = p.n_w as usize;
             let n_h = p.n_h as usize;
             let levels = if cbf_y {
-                decode_tb_coefficients(self.dec, &mut self.ctxs.residual, n_w, n_h, 0)?
+                decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    n_w,
+                    n_h,
+                    0,
+                    self.tools.rc_opts,
+                )?
+                .0
             } else {
                 Vec::new()
             };
@@ -3687,16 +3728,30 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             let cw = (cb_w / sub_w) as usize;
             let ch = (cb_h / sub_h) as usize;
             if cw >= 2 && ch >= 2 {
-                residual.cb_levels =
-                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 1)?;
+                residual.cb_levels = decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    1,
+                    self.tools.rc_opts,
+                )?
+                .0;
             }
         }
         if info.tu_cr_coded_flag && chroma {
             let cw = (cb_w / sub_w) as usize;
             let ch = (cb_h / sub_h) as usize;
             if cw >= 2 && ch >= 2 {
-                residual.cr_levels =
-                    decode_tb_coefficients(self.dec, &mut self.ctxs.residual, cw, ch, 2)?;
+                residual.cr_levels = decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    cw,
+                    ch,
+                    2,
+                    self.tools.rc_opts,
+                )?
+                .0;
             }
         }
 
@@ -4142,6 +4197,7 @@ mod tests {
             mts_enabled: false,
             explicit_mts_intra_enabled: false,
             explicit_mts_inter_enabled: false,
+            rc_opts: RcOpts::default(),
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();
@@ -7240,5 +7296,107 @@ mod tests {
         assert!(!flag);
         assert_eq!(idx, 0);
         assert_eq!(shift, crate::amvr::AmvrShift(2));
+    }
+
+    /// Round-387 — `CuToolFlags::rc_opts` threads the §7.3.7 slice-level
+    /// dependent-quantization switch into the regular
+    /// `residual_coding()` read of the leaf-CU walker.
+    ///
+    /// A minimal monochrome tools-off intra CU is hand-encoded
+    /// (`intra_luma_mpm_flag = 1`, `intra_luma_not_planar_flag = 0` →
+    /// PLANAR, `tu_y_coded_flag = 1`, then the §7.3.11.11 residual) with
+    /// dep_quant on / off, and the reader must recover the matching
+    /// `TransCoeffLevel` array for each mode — the two differ because
+    /// the trellis leaves state 0 on odd-parity levels.
+    #[test]
+    fn leaf_cu_reader_threads_rc_opts_into_residual_coding() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag};
+        use crate::residual::{q_state_advance, RcOpts};
+        use crate::residual_enc::{encode_tb_coefficients_opts, write_tu_y_coded_flag};
+        use crate::scan::coeff_scan_positions;
+
+        // AbsLevel pattern over the DC 4×4 sub-block of an 8×8 TB with
+        // odd parities (drives the trellis out of state 0).
+        let mut abs = vec![0u32; 64];
+        for (i, a) in [3u32, 1, 2, 1, 4, 1, 2, 5].iter().enumerate() {
+            abs[(i / 4) * 8 + (i % 4)] = *a;
+        }
+        let neg: Vec<bool> = (0..64).map(|i| i % 3 == 0).collect();
+
+        // Plain (dep_quant off) TransCoeffLevels.
+        let plain: Vec<i32> = abs
+            .iter()
+            .zip(&neg)
+            .map(|(&a, &n)| if n { -(a as i32) } else { a as i32 })
+            .collect();
+        // dep-quant TransCoeffLevels via the eq. 198 trellis walk.
+        let positions = coeff_scan_positions(8, 8);
+        let mut dq = vec![0i32; 64];
+        let mut q: i32 = 0;
+        for &(xc, yc) in positions.iter().rev() {
+            let idx = (yc as usize) * 8 + (xc as usize);
+            let a = abs[idx];
+            if a > 0 {
+                let mag = 2 * (a as i32) - i32::from(q > 1);
+                dq[idx] = if neg[idx] { -mag } else { mag };
+            }
+            q = q_state_advance(q, a);
+        }
+        assert_ne!(dq, plain, "trellis must move the magnitudes");
+
+        for dep_quant in [false, true] {
+            let opts = RcOpts {
+                dep_quant,
+                sign_data_hiding: false,
+            };
+            let levels = if dep_quant { &dq } else { &plain };
+
+            // ---- Encode the leaf-CU bin sequence --------------------
+            let mut enc = ArithEncoder::new();
+            let mut ectx = LeafCuCtxs::init(26);
+            let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+            enc.encode_decision(&mut ectx.intra_luma_mpm_flag[inc], 1)
+                .unwrap();
+            let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+            enc.encode_decision(&mut ectx.intra_luma_not_planar_flag[inc], 0)
+                .unwrap();
+            write_tu_y_coded_flag(&mut enc, &mut ectx.residual, true, false, false, false).unwrap();
+            encode_tb_coefficients_opts(&mut enc, &mut ectx.residual, 8, 8, 0, levels, opts)
+                .unwrap();
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 64]);
+
+            // ---- Decode through the leaf-CU reader ------------------
+            let tools = CuToolFlags {
+                chroma_format_idc: 0, // monochrome — no chroma bins
+                max_tb_size_y: 64,
+                min_tb_size_y: 4,
+                max_ts_size: 32,
+                ctb_size_y: 128,
+                rc_opts: opts,
+                ..CuToolFlags::default()
+            };
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            let mut dctx = LeafCuCtxs::init(26);
+            let mut info = LeafCuInfo {
+                x0: 0,
+                y0: 0,
+                cb_width: 8,
+                cb_height: 8,
+                ..LeafCuInfo::default()
+            };
+            let mut residual = LeafCuResidual::default();
+            let neigh = CuNeighbourhood::default();
+            let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+            reader.decode(&mut info, &mut residual, &neigh).unwrap();
+
+            assert!(info.tu_y_coded_flag, "dep_quant={dep_quant}");
+            assert_eq!(info.intra_pred_mode_y, INTRA_PLANAR);
+            assert_eq!(
+                residual.luma_levels, *levels,
+                "TransCoeffLevel mismatch with dep_quant={dep_quant}"
+            );
+        }
     }
 }

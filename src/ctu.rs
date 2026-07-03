@@ -894,11 +894,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // mapping run once a caller binds the `ph_lmcs_aps_id`-referenced
         // APS payload via [`Self::set_lmcs`]. `decode_picture_into`
         // fails fast when the slice uses LMCS but no binding exists.
-        if sh.sh_dep_quant_used_flag {
-            return Err(Error::unsupported(
-                "h266 CTU walker: dependent quantisation not supported yet",
-            ));
-        }
+        // Dependent quantization (`sh_dep_quant_used_flag`) and sign
+        // data hiding (`sh_sign_data_hiding_used_flag`) are accepted
+        // since round 387: [`crate::residual::RcOpts`] threads the
+        // switches into every regular `residual_coding()` read (via
+        // `CuToolFlags::rc_opts`) and the §8.7.3 dequant sites take the
+        // eq. 1143 `bdShift` +1 / eq. 1151 `(qP + 1)`-scaled levelScale
+        // arms from the slice flag.
         if sh.sh_explicit_scaling_list_used_flag {
             return Err(Error::unsupported(
                 "h266 CTU walker: explicit scaling lists not supported yet",
@@ -1681,6 +1683,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mts_enabled: tf.mts_enabled_flag,
             explicit_mts_intra_enabled: tf.explicit_mts_intra_enabled_flag,
             explicit_mts_inter_enabled: tf.explicit_mts_inter_enabled_flag,
+            rc_opts: self.rc_opts(),
+        }
+    }
+
+    /// §7.3.7 slice-level residual-coding switches for this slice —
+    /// `sh_dep_quant_used_flag` / `sh_sign_data_hiding_used_flag`
+    /// (mutually exclusive by syntax; the SH parser enforces the
+    /// `sps_sign_data_hiding_enabled_flag && !sh_dep_quant_used_flag`
+    /// presence condition).
+    fn rc_opts(&self) -> crate::residual::RcOpts {
+        crate::residual::RcOpts {
+            dep_quant: self.sh.sh_dep_quant_used_flag,
+            sign_data_hiding: self.sh.sh_sign_data_hiding_used_flag,
         }
     }
 
@@ -2128,7 +2143,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 n_tb_w: n_tb_w as u32,
                 n_tb_h: n_tb_h as u32,
                 qp,
-                dep_quant: false,
+                dep_quant: self.sh.sh_dep_quant_used_flag,
                 transform_skip,
                 bdpcm: info.intra_bdpcm_luma,
                 bdpcm_dir: info.intra_bdpcm_luma_dir,
@@ -5499,7 +5514,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_w: n_tb_w as u32,
             n_tb_h: n_tb_h as u32,
             qp,
-            dep_quant: false,
+            dep_quant: self.sh.sh_dep_quant_used_flag,
             transform_skip,
             bdpcm: false,
             bdpcm_dir: false,
@@ -5639,7 +5654,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_w: c_w as u32,
             n_tb_h: c_h as u32,
             qp,
-            dep_quant: false,
+            dep_quant: self.sh.sh_dep_quant_used_flag,
             transform_skip: coded_ts,
             bdpcm: false,
             bdpcm_dir: false,
@@ -6113,7 +6128,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_w: p.n_w,
                     n_tb_h: p.n_h,
                     qp,
-                    dep_quant: false,
+                    dep_quant: self.sh.sh_dep_quant_used_flag,
                     transform_skip: false,
                     bdpcm: false,
                     bdpcm_dir: false,
@@ -6363,7 +6378,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_w: n_tb_w as u32,
                     n_tb_h: n_tb_h as u32,
                     qp,
-                    dep_quant: false,
+                    dep_quant: self.sh.sh_dep_quant_used_flag,
                     transform_skip,
                     bdpcm: info.intra_bdpcm_chroma,
                     bdpcm_dir: info.intra_bdpcm_chroma_dir,
@@ -9601,7 +9616,7 @@ mod tests {
     }
 
     #[test]
-    fn walker_rejects_dep_quant_scaling_list_and_gates_lmcs() {
+    fn walker_accepts_dep_quant_sdh_rejects_scaling_list_and_gates_lmcs() {
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
@@ -9626,13 +9641,29 @@ mod tests {
             Error::Unsupported(_)
         ));
 
+        // Dependent quantization + sign data hiding are accepted since
+        // round 387 — the switches thread into every residual_coding()
+        // read (see the leaf_cu.rs rc_opts threading test for the
+        // level-exact coverage) and the decode of a whole picture
+        // succeeds. (32×32 picture: the payload leaves the CTU unsplit
+        // and a 32×32 CU fits inside MaxTbSizeY.)
+        let sps32 = dummy_sps(0, 32, 32);
+        let pps32 = dummy_pps(32, 32, true);
+        let layout32 = CtuLayout::from_sps_pps(&sps32, &pps32);
+        let data = [0u8; 4096];
         let mut sh = intra_slice_header();
         sh.sh_dep_quant_used_flag = true;
-        assert!(matches!(
-            CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err(),
-            Error::Unsupported(_)
-        ));
+        let mut w = CtuWalker::begin_slice(&layout32, &sps32, &pps32, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(32, 32, 128);
+        w.decode_picture_into(&mut out).unwrap();
 
+        let mut sh = intra_slice_header();
+        sh.sh_sign_data_hiding_used_flag = true;
+        let mut w = CtuWalker::begin_slice(&layout32, &sps32, &pps32, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(32, 32, 128);
+        w.decode_picture_into(&mut out).unwrap();
+
+        let data = [0u8; 8];
         let mut sh = intra_slice_header();
         sh.sh_explicit_scaling_list_used_flag = true;
         assert!(matches!(
