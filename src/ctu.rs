@@ -90,6 +90,7 @@ use crate::leaf_cu::{
     CuNeighbourhood, CuPredMode, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
     INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
 };
+use crate::lmcs::{LmcsData, LmcsDerived};
 use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
 use crate::reconstruct::{clip_pixel, reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
@@ -582,6 +583,22 @@ pub struct CtuCu {
     pub cu: Cu,
 }
 
+/// Resolved LMCS binding for the current slice — the §7.4.3.19 derived
+/// arrays plus the picture-header gates the §8.7.5.2 / §8.7.5.3 /
+/// §8.8.2 processes consume. Built by [`CtuWalker::set_lmcs`] from the
+/// `ph_lmcs_aps_id`-referenced LMCS APS payload; consulted only when
+/// the slice sets `sh_lmcs_used_flag`.
+struct LmcsBinding {
+    /// §7.4.3.19 BitDepth-bound derivation (`InputPivot` / `LmcsPivot` /
+    /// `ScaleCoeff` / `InvScaleCoeff` / `ChromaScaleCoeff`).
+    derived: LmcsDerived,
+    /// `lmcs_min_bin_idx` — lower bound of the §8.8.2.3 eq. 1224 scan.
+    min_bin_idx: u8,
+    /// `LmcsMaxBinIdx = 15 − lmcs_delta_max_bin_idx` — upper bound of
+    /// the §8.8.2.3 eq. 1224 scan.
+    max_bin_idx: u8,
+}
+
 /// Top-level CTU walker.
 ///
 /// A `CtuWalker` is constructed from a parsed SPS/PPS/slice-header
@@ -768,6 +785,13 @@ pub struct CtuWalker<'a, 'b> {
     /// inherited-CPMVP scan. Translational / intra CBs clear their
     /// covered cells to `None`.
     affine_cpmv_field: crate::inter::AffineCpmvField,
+    /// §7.4.3.19 / §8.7.5 — resolved LMCS binding for the slice. `None`
+    /// until a caller installs the `ph_lmcs_aps_id`-referenced APS
+    /// payload via [`Self::set_lmcs`]; every LMCS fold is additionally
+    /// gated on `sh_lmcs_used_flag`, so a bound-but-unused payload is
+    /// inert. [`Self::decode_picture_into`] fails fast when the slice
+    /// uses LMCS but no binding was installed.
+    lmcs: Option<LmcsBinding>,
     /// Round-56 — picture-wide CU neighbour map used by the
     /// [`TreeWalker`] to derive the §9.3.4.2 ctxInc. Populated as each
     /// CTU's leaf CUs commit; `decode_ctu_partitions` hands a `&mut`
@@ -837,11 +861,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // unless callers programmatically populate it. The per-CTB
         // §7.3.11.2 CABAC bins and the §8.8.5.3 classification will
         // come in later rounds.
-        if sh.sh_lmcs_used_flag {
-            return Err(Error::unsupported(
-                "h266 CTU walker: LMCS (luma mapping / chroma scaling) not supported yet",
-            ));
-        }
+        // LMCS (`sh_lmcs_used_flag`) is accepted since round 384: the
+        // §8.7.5.2 mapped-domain reconstruction + §8.8.2 picture inverse
+        // mapping run once a caller binds the `ph_lmcs_aps_id`-referenced
+        // APS payload via [`Self::set_lmcs`]. `decode_picture_into`
+        // fails fast when the slice uses LMCS but no binding exists.
         if sh.sh_dep_quant_used_flag {
             return Err(Error::unsupported(
                 "h266 CTU walker: dependent quantisation not supported yet",
@@ -941,8 +965,32 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             subblock_merge_grid,
             inter_affine_grid,
             affine_cpmv_field,
+            lmcs: None,
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
         })
+    }
+
+    /// Install the LMCS APS payload the picture header references via
+    /// `ph_lmcs_aps_id` (§7.4.3.7), running the §7.4.3.19 BitDepth-bound
+    /// derivations against the active SPS. Must be called before
+    /// [`Self::decode_picture_into`] / [`Self::apply_in_loop_filters`]
+    /// whenever the slice header sets `sh_lmcs_used_flag`.
+    pub fn set_lmcs(&mut self, data: &LmcsData) -> Result<()> {
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let derived = data.derive(bit_depth)?;
+        self.lmcs = Some(LmcsBinding {
+            derived,
+            min_bin_idx: data.lmcs_min_bin_idx,
+            max_bin_idx: data.lmcs_max_bin_idx(),
+        });
+        Ok(())
+    }
+
+    /// `true` when the slice both signals `sh_lmcs_used_flag` and has a
+    /// resolved [`LmcsBinding`] — the condition under which the
+    /// §8.7.5.2 / §8.7.5.3 / §8.8.2 folds run.
+    fn lmcs_active(&self) -> bool {
+        self.sh.sh_lmcs_used_flag && self.lmcs.is_some()
     }
 
     /// Install the per-slice reference-picture list 0. P-slice callers
@@ -6095,6 +6143,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// "decode an IDR" entry point — it ties together the partition
     /// walker, syntax reader, and reconstruction stages above.
     pub fn decode_picture_into(&mut self, out: &mut PictureBuffer) -> Result<()> {
+        // §8.7.5 — a slice that signals `sh_lmcs_used_flag` reconstructs
+        // its luma in the mapped domain; decoding it without the
+        // `ph_lmcs_aps_id`-referenced APS payload would silently produce
+        // wrong pixels, so fail fast instead.
+        if self.sh.sh_lmcs_used_flag && self.lmcs.is_none() {
+            return Err(Error::unsupported(
+                "h266 CTU walker: sh_lmcs_used_flag == 1 but no LMCS APS payload bound — \
+                 call set_lmcs() with the ph_lmcs_aps_id-referenced lmcs_data() first",
+            ));
+        }
         let ctus: Vec<CtuPos> = self.iter_ctus().collect();
         for ctu in &ctus {
             // §7.3.11.2: `sao(rx, ry)` is decoded at the start of every
@@ -6149,6 +6207,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // the picture header / PPS fall-backs already applied during
         // parse.
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        // §8.8.1 step 1 — the picture inverse mapping process for luma
+        // samples (§8.8.2.1) runs BEFORE deblocking. When the slice
+        // used LMCS the reconstructed luma is still in the mapped
+        // domain; every sample is inverse-mapped via the §8.8.2.2
+        // eqs. 1222 / 1223 fold (the §8.8.2.2 `sh_lmcs_used_flag == 0`
+        // arm makes the pass an identity, i.e. it is skipped).
+        if self.lmcs_active() {
+            let l = self.lmcs.as_ref().expect("lmcs_active checked is_some");
+            let up = bit_depth.saturating_sub(8);
+            let plane = &mut out.luma;
+            for row in 0..plane.height {
+                for col in 0..plane.width {
+                    let idx = row * plane.stride + col;
+                    let s = u32::from(plane.samples[idx]) << up;
+                    let iy = l.derived.idx_y_inv(s, l.min_bin_idx, l.max_bin_idx);
+                    let v = l.derived.inverse_map_luma_sample(s, iy);
+                    plane.samples[idx] = (v >> up) as u8;
+                }
+            }
+        }
         let disabled = self.pps.pps_deblocking_filter_disabled_flag
             || self.sh.sh_deblocking_filter_disabled_flag;
         let params = DeblockParams {
@@ -9242,7 +9320,7 @@ mod tests {
     }
 
     #[test]
-    fn walker_rejects_lmcs_dep_quant_scaling_list() {
+    fn walker_rejects_dep_quant_scaling_list_and_gates_lmcs() {
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
@@ -9255,10 +9333,15 @@ mod tests {
         sh.sh_alf_enabled_flag = true;
         assert!(CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).is_ok());
 
+        // LMCS is accepted at slice start (round 384); decoding a slice
+        // that uses LMCS without a bound APS payload fails fast instead
+        // of silently producing unmapped pixels.
         let mut sh = intra_slice_header();
         sh.sh_lmcs_used_flag = true;
+        let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 128);
         assert!(matches!(
-            CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err(),
+            w.decode_picture_into(&mut out).unwrap_err(),
             Error::Unsupported(_)
         ));
 
@@ -9275,6 +9358,104 @@ mod tests {
             CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err(),
             Error::Unsupported(_)
         ));
+    }
+
+    /// Non-identity BD-8 `lmcs_data()` payload used by the LMCS
+    /// integration tests: bin 0 is shrunk to 8 codewords (`lmcsCW[0] =
+    /// OrgCW − 8 = 8`), every other bin keeps `OrgCW = 16`. `Σ lmcsCW =
+    /// 248 <= 255` (eq. 96 budget), every `lmcsCW` inside the eq. 95
+    /// `[OrgCW >> 3, (OrgCW << 3) − 1]` band, and every `LmcsPivot` is
+    /// a multiple of `1 << (BitDepth − 5) = 8`, so the eq. 98 crossing
+    /// clause is vacuous.
+    fn lmcs_test_data() -> LmcsData {
+        let mut abs_cw = [0u32; crate::lmcs::LMCS_NUM_BINS];
+        let mut sign_cw = [false; crate::lmcs::LMCS_NUM_BINS];
+        abs_cw[0] = 8;
+        sign_cw[0] = true; // negative delta: lmcsCW[0] = 16 − 8 = 8.
+        LmcsData {
+            lmcs_min_bin_idx: 0,
+            lmcs_delta_max_bin_idx: 0,
+            lmcs_delta_cw_prec_minus1: 3,
+            lmcs_delta_abs_cw: abs_cw,
+            lmcs_delta_sign_cw_flag: sign_cw,
+            lmcs_delta_abs_crs: 0,
+            lmcs_delta_sign_crs_flag: false,
+        }
+    }
+
+    #[test]
+    fn lmcs_inverse_map_pass_runs_in_loop_filter_stack() {
+        // §8.8.1 step 1 — with `sh_lmcs_used_flag == 1` and a bound
+        // LMCS payload, `apply_in_loop_filters` inverse-maps every
+        // reconstructed luma sample (§8.8.2.1 / §8.8.2.2) before the
+        // (here no-op) deblock / SAO / ALF passes; chroma is untouched.
+        let sps = dummy_sps(2, 64, 64);
+        let pps = dummy_pps(64, 64, true);
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let mut sh = intra_slice_header();
+        sh.sh_lmcs_used_flag = true;
+        let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let lmcs = lmcs_test_data();
+        w.set_lmcs(&lmcs).unwrap();
+
+        let mut out = PictureBuffer::yuv420_filled(64, 64, 128);
+        for (i, s) in out.luma.samples.iter_mut().enumerate() {
+            *s = (i % 251) as u8;
+        }
+        let cb_before = out.cb.samples.clone();
+        let luma_before = out.luma.samples.clone();
+        w.apply_in_loop_filters(&mut out).unwrap();
+
+        let derived = lmcs.derive(8).unwrap();
+        let (min_bin, max_bin) = (lmcs.lmcs_min_bin_idx, lmcs.lmcs_max_bin_idx());
+        let mut changed = false;
+        for (idx, (&got, &before)) in out.luma.samples.iter().zip(luma_before.iter()).enumerate() {
+            let s = u32::from(before);
+            let iy = derived.idx_y_inv(s, min_bin, max_bin);
+            let expect = derived.inverse_map_luma_sample(s, iy) as u8;
+            assert_eq!(got, expect, "luma sample {idx}");
+            if got != before {
+                changed = true;
+            }
+        }
+        assert!(changed, "the test mapping must not be an identity");
+        assert_eq!(out.cb.samples, cb_before, "chroma must be untouched");
+    }
+
+    #[test]
+    fn lmcs_inverse_map_pass_skipped_when_slice_flag_off() {
+        // §8.8.2.2 `sh_lmcs_used_flag == 0` arm — a bound-but-unused
+        // payload must leave the picture alone.
+        let sps = dummy_sps(2, 64, 64);
+        let pps = dummy_pps(64, 64, true);
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let sh = intra_slice_header();
+        let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        w.set_lmcs(&lmcs_test_data()).unwrap();
+
+        let mut out = PictureBuffer::yuv420_filled(64, 64, 128);
+        for (i, s) in out.luma.samples.iter_mut().enumerate() {
+            *s = (i % 251) as u8;
+        }
+        let luma_before = out.luma.samples.clone();
+        w.apply_in_loop_filters(&mut out).unwrap();
+        assert_eq!(out.luma.samples, luma_before);
+    }
+
+    #[test]
+    fn set_lmcs_rejects_nonconforming_payload() {
+        // The all-defaults full-window payload derives `lmcsCW[i] =
+        // OrgCW` for all 16 bins, so `Σ lmcsCW = 1 << BitDepth` — one
+        // over the eq. 96 `(1 << BitDepth) − 1` budget.
+        let sps = dummy_sps(2, 64, 64);
+        let pps = dummy_pps(64, 64, true);
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let sh = intra_slice_header();
+        let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        assert!(w.set_lmcs(&LmcsData::default()).is_err());
     }
 
     #[test]
