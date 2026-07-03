@@ -73,7 +73,10 @@ use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, CuNeighbourMap, TreeCtxs, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
-use crate::dequant::{dequantize_tb_flat, DequantParams};
+use crate::dequant::{
+    dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, log2_matrix_size,
+    scaling_matrix_id, DequantParams, PredModeKind,
+};
 use crate::gpm::{
     blend_gpm_into_plane, derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motion,
     GpmContext,
@@ -813,6 +816,14 @@ pub struct CtuWalker<'a, 'b> {
     /// inert. [`Self::decode_picture_into`] fails fast when the slice
     /// uses LMCS but no binding was installed.
     lmcs: Option<LmcsBinding>,
+    /// §8.7.3 — the §7.4.3.20-derived scaling matrices the picture
+    /// header references via `ph_scaling_list_aps_id`. `None` until a
+    /// caller installs the payload via [`Self::set_scaling_list`];
+    /// every lookup is additionally gated on
+    /// `sh_explicit_scaling_list_used_flag`, so a bound-but-unused
+    /// payload is inert. [`Self::decode_picture_into`] fails fast when
+    /// the slice uses explicit scaling lists but no binding exists.
+    scaling_list: Option<crate::scaling_list::ScalingListData>,
     /// §8.7.5.3 — per-4x4-cell top-left luma origin of the coding unit
     /// covering the cell (shares the [`Self::intra_grid`] geometry).
     /// Written by [`Self::write_intra_block`] as each leaf CU commits;
@@ -901,11 +912,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `CuToolFlags::rc_opts`) and the §8.7.3 dequant sites take the
         // eq. 1143 `bdShift` +1 / eq. 1151 `(qP + 1)`-scaled levelScale
         // arms from the slice flag.
-        if sh.sh_explicit_scaling_list_used_flag {
-            return Err(Error::unsupported(
-                "h266 CTU walker: explicit scaling lists not supported yet",
-            ));
-        }
 
         let slice_qp = SliceQpY::derive(sps, pps, sh, ph_qp_delta);
         let cabac_state = SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag);
@@ -996,6 +1002,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             inter_affine_grid,
             affine_cpmv_field,
             lmcs: None,
+            scaling_list: None,
             cu_origin_grid: vec![(0, 0); (intra_grid_w * intra_grid_h) as usize],
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
         })
@@ -1018,6 +1025,89 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             chroma_residual_scale: ph_chroma_residual_scale_flag,
         });
         Ok(())
+    }
+
+    /// Install the §7.4.3.20-derived scaling matrices the picture
+    /// header references via `ph_scaling_list_aps_id` (§7.4.3.7). Must
+    /// be called before [`Self::decode_picture_into`] whenever the
+    /// slice header sets `sh_explicit_scaling_list_used_flag`.
+    pub fn set_scaling_list(&mut self, data: &crate::scaling_list::ScalingListData) {
+        self.scaling_list = Some(data.clone());
+    }
+
+    /// §8.7.3 — the intermediate scaling factor array `m[x][y]` for a
+    /// coded TB, or `None` when the flat `m = 16` arm applies:
+    /// `sh_explicit_scaling_list_used_flag == 0`, transform-skip TBs
+    /// (eq. condition 2), LFNST-coded TBs under
+    /// `sps_scaling_matrix_for_lfnst_disabled_flag`, the
+    /// alternative-colour-space arm (which with `cu_act_enabled_flag`
+    /// pinned 0 collapses to `sps_scaling_matrix_for_alternative_
+    /// colour_space_disabled_flag && !sps_scaling_matrix_designated_
+    /// colour_space_flag`), or a `(predMode, cIdx, size)` triple
+    /// outside Table 38.
+    fn scaling_m_for_tb(
+        &self,
+        pred_mode: PredModeKind,
+        c_idx: u32,
+        n_tb_w: u32,
+        n_tb_h: u32,
+        transform_skip: bool,
+        apply_lfnst: bool,
+    ) -> Result<Option<Vec<u32>>> {
+        if !self.sh.sh_explicit_scaling_list_used_flag || transform_skip {
+            return Ok(None);
+        }
+        let Some(data) = self.scaling_list.as_ref() else {
+            return Ok(None);
+        };
+        let tf = &self.sps.tool_flags;
+        if tf.scaling_matrix_for_lfnst_disabled_flag && apply_lfnst {
+            return Ok(None);
+        }
+        if tf.scaling_matrix_for_alternative_colour_space_disabled_flag
+            && !tf.scaling_matrix_designated_colour_space_flag
+        {
+            return Ok(None);
+        }
+        let Some(id) = scaling_matrix_id(pred_mode, c_idx, n_tb_w, n_tb_h) else {
+            return Ok(None);
+        };
+        let dc = if id > 13 {
+            Some(data.scaling_matrix_dc_rec[(id - 14) as usize])
+        } else {
+            None
+        };
+        let m = expand_scaling_matrix(
+            &data.scaling_matrix_rec[id as usize],
+            log2_matrix_size(id),
+            n_tb_w,
+            n_tb_h,
+            dc,
+        )?;
+        Ok(Some(m))
+    }
+
+    /// Dequantise one TB through either the explicit-scaling-list path
+    /// (eq. 1149 / 1150 `m[x][y]`) or the flat `m = 16` arm.
+    fn dequantize_tb(
+        &self,
+        levels: &[i32],
+        params: &DequantParams,
+        pred_mode: PredModeKind,
+        c_idx: u32,
+        apply_lfnst: bool,
+    ) -> Result<Vec<i32>> {
+        match self.scaling_m_for_tb(
+            pred_mode,
+            c_idx,
+            params.n_tb_w,
+            params.n_tb_h,
+            params.transform_skip,
+            apply_lfnst,
+        )? {
+            Some(m) => dequantize_tb_with_scaling_list(levels, &m, params),
+            None => dequantize_tb_flat(levels, params),
+        }
     }
 
     /// `true` when the slice both signals `sh_lmcs_used_flag` and has a
@@ -2148,7 +2238,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 bdpcm: info.intra_bdpcm_luma,
                 bdpcm_dir: info.intra_bdpcm_luma_dir,
             };
-            let mut d = dequantize_tb_flat(&residual.luma_levels, &params)?;
+            let mut d = self.dequantize_tb(
+                &residual.luma_levels,
+                &params,
+                PredModeKind::Intra,
+                0,
+                /*apply_lfnst=*/ info.lfnst_idx > 0 && !transform_skip,
+            )?;
             // §8.7.4.1 inverse LFNST — when lfnst_idx > 0 the dequantised
             // coefficients are passed through the secondary non-separable
             // transform before the regular separable inverse transform.
@@ -5519,7 +5615,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm: false,
             bdpcm_dir: false,
         };
-        let d = dequantize_tb_flat(levels, &params)?;
+        let d = self.dequantize_tb(
+            levels,
+            &params,
+            PredModeKind::InterOrIbc,
+            c_idx,
+            /*apply_lfnst=*/ false,
+        )?;
         // §8.7.4.6 — when transform_skip_flag is 1 the dequantised array is
         // the residual sample array directly (res[x][y] = d[x][y]); the
         // separable inverse transform is bypassed. Otherwise run the
@@ -5659,7 +5761,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm: false,
             bdpcm_dir: false,
         };
-        let d = dequantize_tb_flat(coded_levels, &params)?;
+        // §8.7.2 codedCIdx — the coded component drives the eq. 1149
+        // Table 38 id (Cr for mode 3, Cb otherwise).
+        let coded_c_idx = match mode {
+            TuCResMode::CrCoded => 2,
+            _ => 1,
+        };
+        let d = self.dequantize_tb(
+            coded_levels,
+            &params,
+            PredModeKind::InterOrIbc,
+            coded_c_idx,
+            /*apply_lfnst=*/ false,
+        )?;
         // §8.7.4.6 — when the coded chroma TB carries transform_skip the
         // single dequantised block is the residual directly (CodedTransform
         // ::Skip); otherwise the §8.7.4.1 DCT-II × DCT-II inverse runs.
@@ -6133,7 +6247,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bdpcm: false,
                     bdpcm_dir: false,
                 };
-                let d = dequantize_tb_flat(&sub.levels, &params)?;
+                let d = self.dequantize_tb(
+                    &sub.levels,
+                    &params,
+                    PredModeKind::Intra,
+                    0,
+                    /*apply_lfnst=*/ false,
+                )?;
                 inverse_transform_2d(
                     n_w,
                     n_h,
@@ -6383,7 +6503,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bdpcm: info.intra_bdpcm_chroma,
                     bdpcm_dir: info.intra_bdpcm_chroma_dir,
                 };
-                let d = dequantize_tb_flat(levels, &params)?;
+                let d = self.dequantize_tb(
+                    levels,
+                    &params,
+                    PredModeKind::Intra,
+                    c_idx,
+                    /*apply_lfnst=*/ false,
+                )?;
                 if transform_skip {
                     // Transform-skip (BDPCM-chroma or plain
                     // transform_skip_flag): bypass the inverse transform;
@@ -6447,6 +6573,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return Err(Error::unsupported(
                 "h266 CTU walker: sh_lmcs_used_flag == 1 but no LMCS APS payload bound — \
                  call set_lmcs() with the ph_lmcs_aps_id-referenced lmcs_data() first",
+            ));
+        }
+        // §8.7.3 — same fail-fast shape for explicit scaling lists:
+        // decoding without the ph_scaling_list_aps_id-referenced
+        // matrices would silently dequantise with the flat m = 16.
+        if self.sh.sh_explicit_scaling_list_used_flag && self.scaling_list.is_none() {
+            return Err(Error::unsupported(
+                "h266 CTU walker: sh_explicit_scaling_list_used_flag == 1 but no scaling-list \
+                 APS payload bound — call set_scaling_list() first",
             ));
         }
         let ctus: Vec<CtuPos> = self.iter_ctus().collect();
@@ -9663,13 +9798,20 @@ mod tests {
         let mut out = PictureBuffer::yuv420_filled(32, 32, 128);
         w.decode_picture_into(&mut out).unwrap();
 
-        let data = [0u8; 8];
+        // Explicit scaling lists are accepted at slice start since
+        // round 387; decoding without a bound APS payload fails fast,
+        // and binding one lets the picture decode.
         let mut sh = intra_slice_header();
         sh.sh_explicit_scaling_list_used_flag = true;
+        let mut w = CtuWalker::begin_slice(&layout32, &sps32, &pps32, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(32, 32, 128);
         assert!(matches!(
-            CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err(),
+            w.decode_picture_into(&mut out).unwrap_err(),
             Error::Unsupported(_)
         ));
+        let mut w = CtuWalker::begin_slice(&layout32, &sps32, &pps32, &sh, 0, &data).unwrap();
+        w.set_scaling_list(&crate::scaling_list::ScalingListData::flat16());
+        w.decode_picture_into(&mut out).unwrap();
     }
 
     /// Non-identity BD-8 `lmcs_data()` payload used by the LMCS

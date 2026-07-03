@@ -3064,3 +3064,124 @@ fn reconstruct_leaf_cu_chroma_transform_skip_bypasses_transform() {
         }
     }
 }
+
+/// Round-387 — explicit scaling lists live in the walker's dequant:
+/// `reconstruct_leaf_cu` on a slice with
+/// `sh_explicit_scaling_list_used_flag = 1` + a bound scaling-list APS
+/// payload must reproduce the public
+/// `dequantize_tb_with_scaling_list` pipeline (§8.7.3 eqs. 1148–1150,
+/// Table 38 id 2 for an INTRA 4×4 luma TB), and differ from the flat
+/// `m = 16` reconstruction when the matrix is non-flat.
+#[test]
+fn reconstruct_leaf_cu_explicit_scaling_list_changes_pixels() {
+    use oxideav_h266::coding_tree::Cu;
+    use oxideav_h266::ctu::CtuCu;
+    use oxideav_h266::dequant::{
+        dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, DequantParams,
+    };
+    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
+    use oxideav_h266::scaling_list::ScalingListData;
+    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+
+    let sps = dummy_sps(0, 32, 32);
+    let pps = dummy_pps(32, 32);
+    let mut sh = intra_slice_header();
+    sh.sh_explicit_scaling_list_used_flag = true;
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 256];
+
+    // Non-flat scaling matrices: INTRA luma 4×4 is Table 38 id 2 —
+    // double the weight (32) so every non-zero level dequantises to
+    // twice the flat value.
+    let mut data = ScalingListData::flat16();
+    data.scaling_matrix_rec[2] = vec![32u8; 16];
+
+    let levels: Vec<i32> = vec![
+        3, -1, 0, 0, //
+        2, 1, 0, 0, //
+        0, 0, 0, 0, //
+        0, 0, 0, 0,
+    ];
+    let cu = CtuCu {
+        ctu_addr_rs: 0,
+        cu: Cu {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            cqt_depth: 0,
+            mtt_depth: 0,
+        },
+    };
+    let info = LeafCuInfo {
+        x0: 0,
+        y0: 0,
+        cb_width: 4,
+        cb_height: 4,
+        pred_mode: CuPredMode::Intra,
+        intra_pred_mode_y: INTRA_PLANAR,
+        tu_y_coded_flag: true,
+        ..LeafCuInfo::default()
+    };
+    let residual = LeafCuResidual {
+        luma_levels: levels.clone(),
+        ..LeafCuResidual::default()
+    };
+
+    // Run A: flat (no binding is required when the SH flag is off).
+    let mut sh_flat = intra_slice_header();
+    sh_flat.sh_explicit_scaling_list_used_flag = false;
+    let mut out_flat = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker =
+            CtuWalker::begin_slice(&layout, &sps, &pps, &sh_flat, 0, &payload).unwrap();
+        walker
+            .reconstruct_leaf_cu(&cu, &info, &residual, &mut out_flat)
+            .unwrap();
+    }
+    // Run B: explicit scaling list bound.
+    let mut out_sl = PictureBuffer::yuv420_filled(32, 32, 30);
+    {
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+        walker.set_scaling_list(&data);
+        walker
+            .reconstruct_leaf_cu(&cu, &info, &residual, &mut out_sl)
+            .unwrap();
+    }
+
+    let stride = out_flat.luma.stride;
+    assert!(
+        (0..4).any(|y| (0..4)
+            .any(|x| out_flat.luma.samples[y * stride + x] != out_sl.luma.samples[y * stride + x])),
+        "non-flat scaling matrix must change the reconstruction"
+    );
+
+    // Golden cross-check: pixel delta == residual delta from the public
+    // dequant pipeline (prediction identical between runs).
+    let params = DequantParams {
+        bit_depth: 8,
+        log2_transform_range: 15,
+        n_tb_w: 4,
+        n_tb_h: 4,
+        qp: 26,
+        dep_quant: false,
+        transform_skip: false,
+        bdpcm: false,
+        bdpcm_dir: false,
+    };
+    let d_flat = dequantize_tb_flat(&levels, &params).unwrap();
+    let m = expand_scaling_matrix(&data.scaling_matrix_rec[2], 2, 4, 4, None).unwrap();
+    let d_sl = dequantize_tb_with_scaling_list(&levels, &m, &params).unwrap();
+    let r_flat =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d_flat, 8, 15).unwrap();
+    let r_sl =
+        inverse_transform_2d(4, 4, 4, 4, TrType::DctII, TrType::DctII, &d_sl, 8, 15).unwrap();
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let pix_delta = out_sl.luma.samples[y * stride + x] as i32
+                - out_flat.luma.samples[y * stride + x] as i32;
+            let res_delta = r_sl[y * 4 + x] - r_flat[y * 4 + x];
+            assert_eq!(pix_delta, res_delta, "delta mismatch at ({x},{y})");
+        }
+    }
+}
