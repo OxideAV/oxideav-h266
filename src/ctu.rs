@@ -993,6 +993,50 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.sh.sh_lmcs_used_flag && self.lmcs.is_some()
     }
 
+    /// §8.7.5.2 — derive `predMapSamples` for a MODE_INTER (non-CIIP)
+    /// CU by forward-mapping its motion-compensated luma prediction in
+    /// place. Right after MC the picture plane holds `predSamples`;
+    /// eq. 1213 lifts each sample into the LMCS codeword domain so the
+    /// eq. 1214 residual add — and every later mapped-domain read
+    /// (intra reference samples, the §8.7.5.3 `invAvgLuma`
+    /// neighbourhood) — sees mapped values. The §8.7.5.2 pass-through
+    /// modes (MODE_INTRA / MODE_IBC / MODE_PLT, and MODE_INTER with
+    /// `ciip_flag == 1`) must NOT call this. No-op unless the slice
+    /// uses LMCS with a bound payload.
+    ///
+    /// Eq. 1213 itself is unclamped; the value is clamped to
+    /// `[0, (1 << BitDepth) − 1]` for plane storage — the §7.4.3.19
+    /// eq. 96 `Σ lmcsCW <= (1 << BitDepth) − 1` budget keeps
+    /// `predMapSamples` inside that range, so the clamp never changes
+    /// an in-range mapping.
+    fn lmcs_forward_map_luma_rect(
+        &self,
+        out: &mut PictureBuffer,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if !self.lmcs_active() {
+            return;
+        }
+        let l = self.lmcs.as_ref().expect("lmcs_active checked is_some");
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let up = bit_depth.saturating_sub(8);
+        let hi = (1i64 << bit_depth) - 1;
+        let plane = &mut out.luma;
+        let y1 = (y0 + h).min(plane.height);
+        let x1 = (x0 + w).min(plane.width);
+        for row in y0..y1 {
+            for col in x0..x1 {
+                let idx = row * plane.stride + col;
+                let s = u32::from(plane.samples[idx]) << up;
+                let m = l.derived.forward_map_luma_sample(s).clamp(0, hi) as u32;
+                plane.samples[idx] = (m >> up) as u8;
+            }
+        }
+    }
+
     /// Install the per-slice reference-picture list 0. P-slice callers
     /// must invoke this before `decode_picture_into` so the round-21
     /// inter path has a reference to copy from. Subsequent re-use of
@@ -2974,6 +3018,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        // §8.7.5.2 `predMapSamples` — a MODE_INTER CU with
+        // `ciip_flag == 0` forward-maps its MC luma prediction before
+        // the eq. 1214 residual add. CIIP CUs (and the intra paths,
+        // which never reach here) take the pass-through arm
+        // (`predMapSamples = predSamples`). Runs before the residual
+        // add below so the eq. 1214 `Clip1(predMap + res)` sees mapped
+        // prediction samples; skip CUs (no coded residual) still map,
+        // leaving the reconstruction in the mapped domain the §8.8.2
+        // in-loop inverse pass expects.
+        if !info.inter.merge_data.ciip_flag {
+            self.lmcs_forward_map_luma_rect(
+                out,
+                cu.cu.x as usize,
+                cu.cu.y as usize,
+                cu.cu.w as usize,
+                cu.cu.h as usize,
+            );
+        }
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let cu_qp_delta = info.cu_qp_delta_val;
         if info.cu_sbt_flag {
@@ -4086,6 +4148,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             )),
         };
         recon_result?;
+
+        // §8.7.5.2 — an affine non-merge CU is MODE_INTER with
+        // `ciip_flag == 0` (CIIP is merge-only), so its MC luma
+        // prediction forward-maps into the LMCS codeword domain.
+        self.lmcs_forward_map_luma_rect(
+            out,
+            cb_x as usize,
+            cb_y as usize,
+            cb_w as usize,
+            cb_h as usize,
+        );
 
         // Broadcast the affine CB record into the per-CB CPMV store so
         // later CUs' §8.5.5.7 inherited scan can recover this block's
@@ -5651,6 +5724,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 bit_depth,
             );
         }
+
+        // §8.7.5.2 — a GPM CU is MODE_INTER with `ciip_flag == 0`, so
+        // its blended luma prediction forward-maps into the LMCS
+        // codeword domain (the GPM path carries no coded residual
+        // today, so the mapped prediction IS the mapped-domain
+        // reconstruction the §8.8.2 in-loop inverse pass expects).
+        self.lmcs_forward_map_luma_rect(
+            out,
+            cb_x as usize,
+            cb_y as usize,
+            cb_w as usize,
+            cb_h as usize,
+        );
 
         // §8.5.7.3 — Motion vector storing process. Round-40 broadcasts
         // partition A's MV uniformly across the CU's 4×4 motion-field
@@ -9442,6 +9528,115 @@ mod tests {
         let luma_before = out.luma.samples.clone();
         w.apply_in_loop_filters(&mut out).unwrap();
         assert_eq!(out.luma.samples, luma_before);
+    }
+
+    #[test]
+    fn lmcs_forward_maps_inter_luma_prediction_then_inverse_maps_in_loop() {
+        // §8.7.5.2 — a MODE_INTER (non-CIIP) CU's MC luma prediction is
+        // forward-mapped in place (eq. 1213), so with a zero residual
+        // the reconstruction equals FwdMap(predSamples); the §8.8.1
+        // step-1 in-loop pass then inverse-maps it (§8.8.2.2). Both
+        // stages are checked against the per-sample lmcs folds.
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        sh.sh_lmcs_used_flag = true;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.current_poc = 0;
+        let lmcs = lmcs_test_data();
+        walker.set_lmcs(&lmcs).unwrap();
+
+        // Horizontal-gradient reference; zero-MV merge candidate falls
+        // out of the empty motion field, so the MC prediction is a
+        // straight copy of the collocated reference block.
+        let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        for y in 0..pic_h as usize {
+            for x in 0..pic_w as usize {
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+            }
+        }
+        let ref_pic = ReferencePicture {
+            poc: 4,
+            frame: ref_frame.clone(),
+            motion_field: None,
+        };
+        walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("merge inter path should reconstruct");
+
+        // Stage 1 — the reconstruction is the forward-mapped MC
+        // prediction (zero-MV copy of the reference block).
+        let derived = lmcs.derive(8).unwrap();
+        let mut mapped_expect = vec![0u8; 16 * 16];
+        for row in 0..16usize {
+            for col in 0..16usize {
+                let pred =
+                    u32::from(ref_frame.luma.samples[row * ref_frame.luma.stride + 16 + col]);
+                let m = derived.forward_map_luma_sample(pred).clamp(0, 255) as u8;
+                mapped_expect[row * 16 + col] = m;
+                assert_eq!(
+                    out.luma.samples[row * out.luma.stride + 16 + col],
+                    m,
+                    "mapped-domain luma at ({col}, {row})"
+                );
+            }
+        }
+        assert_ne!(
+            &mapped_expect[..16],
+            &ref_frame.luma.samples[16..32],
+            "test mapping must change the first row"
+        );
+
+        // Stage 2 — the in-loop inverse pass (§8.8.1 step 1) restores
+        // the original domain. For this payload every bin >= 1 maps
+        // x → x − 8 with an exact inverse, so samples >= 16 round-trip
+        // bit-exactly.
+        walker.apply_in_loop_filters(&mut out).unwrap();
+        let (min_bin, max_bin) = (lmcs.lmcs_min_bin_idx, lmcs.lmcs_max_bin_idx());
+        for row in 0..16usize {
+            for col in 0..16usize {
+                let m = u32::from(mapped_expect[row * 16 + col]);
+                let iy = derived.idx_y_inv(m, min_bin, max_bin);
+                let expect = derived.inverse_map_luma_sample(m, iy) as u8;
+                let got = out.luma.samples[row * out.luma.stride + 16 + col];
+                assert_eq!(got, expect, "inverse-mapped luma at ({col}, {row})");
+                let orig = ref_frame.luma.samples[row * ref_frame.luma.stride + 16 + col];
+                if orig >= 16 {
+                    assert_eq!(got, orig, "exact round-trip for bins >= 1");
+                }
+            }
+        }
     }
 
     #[test]
