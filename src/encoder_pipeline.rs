@@ -1422,7 +1422,30 @@ pub fn encode_idr_with_qp_picker_cfg(
     // default-constructed config that only sets the round-54 knobs.
     config.width = w;
     config.height = h;
+    // Round-384 — LMCS (§8.7.5.2): with `config.lmcs` set the coding
+    // loop runs in the mapped luma domain. Derive the §7.4.3.19 arrays
+    // up front (validating the payload), forward-map a copy of the
+    // source luma for the residual-coding pass, and inverse-map the
+    // reconstruction (§8.8.1 step 1) before the deblock / SAO / ALF
+    // chain below. Chroma is untouched (`ph_chroma_residual_scale_flag
+    // = 0`).
+    let lmcs_derived = match config.lmcs.as_ref() {
+        Some(data) => Some(data.derive(8)?),
+        None => None,
+    };
+    let lmcs_payload = config.lmcs;
     let vvc_enc = VvcEncoder::new(config)?;
+    let coding_src_owned: PictureBuffer;
+    let coding_src: &PictureBuffer = if let Some(der) = lmcs_derived.as_ref() {
+        let mut mapped = src.clone();
+        for v in mapped.luma.samples.iter_mut() {
+            *v = der.forward_map_luma_sample(u32::from(*v)).clamp(0, 255) as u8;
+        }
+        coding_src_owned = mapped;
+        &coding_src_owned
+    } else {
+        src
+    };
 
     // --- Emit header NALs (VPS + SPS + PPS + PH) ---
     let mut bitstream = Vec::<u8>::new();
@@ -1458,7 +1481,12 @@ pub fn encode_idr_with_qp_picker_cfg(
     //               sh_no_output_of_prior_pics_flag = 0 (IDR).
     bw.write_bit(0); // sh_picture_header_in_slice_header_flag
     bw.write_bit(0); // sh_no_output_of_prior_pics_flag
-                     // byte_alignment() — 1-stop-bit + pad to byte.
+                     // Round-384 — §7.3.7 sh_lmcs_used_flag: transmitted
+                     // when ph_lmcs_enabled_flag == 1 with a separate PH.
+    if lmcs_payload.is_some() {
+        bw.write_bit(1); // sh_lmcs_used_flag = 1
+    }
+    // byte_alignment() — 1-stop-bit + pad to byte.
     bw.byte_alignment();
     // CABAC engine starts here.
     let slice_header_bytes = bw.into_bytes();
@@ -1531,7 +1559,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         && tb_y + 64 <= h as usize;
                     let cu = if mtt_eligible {
                         prepare_cu_with_mtt_picker(
-                            src,
+                            coding_src,
                             &mut rec,
                             tb_x,
                             tb_y,
@@ -1542,7 +1570,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                             config.enable_mtt_tt_picker,
                         )?
                     } else {
-                        prepare_leaf_cu(src, &mut rec, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp)?
+                        prepare_leaf_cu(coding_src, &mut rec, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp)?
                     };
 
                     // Accumulate deblock-CU records over every TB inside
@@ -1573,6 +1601,20 @@ pub fn encode_idr_with_qp_picker_cfg(
         bit_depth: 8,
         ..Default::default()
     };
+    // Round-384 — §8.8.1 step 1: with LMCS on, the coding-loop
+    // reconstruction is in the mapped luma domain; the picture inverse
+    // mapping (§8.8.2.1 / §8.8.2.2) runs BEFORE deblocking so the
+    // deblock / SAO / ALF designs (which compare against the ORIGINAL
+    // source) operate in the original domain, mirroring the decoder's
+    // in-loop order.
+    if let (Some(der), Some(data)) = (lmcs_derived.as_ref(), lmcs_payload.as_ref()) {
+        let (min_bin, max_bin) = (data.lmcs_min_bin_idx, data.lmcs_max_bin_idx());
+        for v in rec.luma.samples.iter_mut() {
+            let s32 = u32::from(*v);
+            let iy = der.idx_y_inv(s32, min_bin, max_bin);
+            *v = der.inverse_map_luma_sample(s32, iy) as u8;
+        }
+    }
     apply_deblocking(&mut rec, &all_deblock_cus, &dbp, 1);
 
     // SAO decision + apply.
@@ -2051,6 +2093,14 @@ pub fn encode_idr_with_qp_picker_cfg(
     if ship_aps {
         let luma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &luma_aps_rbsp);
         annex_b(&mut bitstream, &luma_aps_nal);
+    }
+
+    // Round-384 — ship the LMCS APS NAL (id 0) the PH references via
+    // ph_lmcs_aps_id. Wire order per §7.4.2.4: APS before the PH.
+    if let Some(data) = lmcs_payload.as_ref() {
+        let lmcs_aps_rbsp = crate::aps_enc::emit_lmcs_aps_rbsp(0, true, data)?;
+        let lmcs_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &lmcs_aps_rbsp);
+        annex_b(&mut bitstream, &lmcs_aps_nal);
     }
 
     // Picture header — must come AFTER the APSes it references
@@ -3388,5 +3438,130 @@ mod tests {
         assert_eq!(d_left.cb_w, 16);
         let d_mid = map.get(47, 0).expect("sub_b should cover (47, 0)");
         assert_eq!(d_mid.cb_w, 32);
+    }
+    /// Round-384 — LMCS payload used by the encoder tests: bin 0 shrunk
+    /// to 8 codewords, every other bin at OrgCW (Σ = 248 <= 255).
+    fn lmcs_enc_payload() -> crate::lmcs::LmcsData {
+        let mut abs_cw = [0u32; crate::lmcs::LMCS_NUM_BINS];
+        let mut sign_cw = [false; crate::lmcs::LMCS_NUM_BINS];
+        abs_cw[0] = 8;
+        sign_cw[0] = true;
+        crate::lmcs::LmcsData {
+            lmcs_min_bin_idx: 0,
+            lmcs_delta_max_bin_idx: 0,
+            lmcs_delta_cw_prec_minus1: 3,
+            lmcs_delta_abs_cw: abs_cw,
+            lmcs_delta_sign_cw_flag: sign_cw,
+            lmcs_delta_abs_crs: 0,
+            lmcs_delta_sign_crs_flag: false,
+        }
+    }
+
+    /// Round-384 — `EncoderConfig::lmcs` ships a decodable LMCS chain:
+    /// `sps_lmcs_enabled_flag = 1`, an LMCS APS NAL whose payload
+    /// round-trips through the §7.3.2.6 / §7.3.2.19 parser, a PH with
+    /// `ph_lmcs_enabled_flag = 1` / `ph_lmcs_aps_id = 0` /
+    /// `ph_chroma_residual_scale_flag = 0`, and a slice header carrying
+    /// `sh_lmcs_used_flag = 1`.
+    #[test]
+    fn round384_lmcs_encode_ships_parseable_lmcs_chain() {
+        use crate::aps::ApsParamsType;
+        use crate::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+        use crate::picture_header::parse_picture_header_stateful;
+        use crate::slice_header::{parse_slice_header_stateful, PhState};
+
+        let src = gradient_frame(64, 64);
+        let payload = lmcs_enc_payload();
+        let mut cfg = crate::encoder::EncoderConfig::new(64, 64);
+        cfg.lmcs = Some(payload);
+        let (bs, _rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+
+        let nals: Vec<_> = iter_annex_b(&bs).collect();
+        // SPS — lmcs enabled.
+        let sps_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .expect("SPS NAL");
+        let sps = crate::sps::parse_sps(&extract_rbsp(sps_nal.payload())).unwrap();
+        assert!(sps.tool_flags.lmcs_enabled_flag);
+
+        // PPS (needed for the PH / SH parsers below).
+        let pps_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .expect("PPS NAL");
+        let pps = crate::pps::parse_pps(&extract_rbsp(pps_nal.payload())).unwrap();
+
+        // LMCS APS — payload round-trips exactly.
+        let lmcs_aps = nals
+            .iter()
+            .filter(|n| n.header.nal_unit_type == NalUnitType::PrefixApsNut)
+            .filter_map(|n| crate::aps::parse_aps(&extract_rbsp(n.payload())).ok())
+            .find(|aps| aps.aps_params_type == ApsParamsType::Lmcs)
+            .expect("an LMCS APS NAL must ship");
+        assert_eq!(lmcs_aps.aps_adaptation_parameter_set_id, 0);
+        assert_eq!(lmcs_aps.lmcs_data, Some(payload));
+
+        // PH — LMCS chain present.
+        let ph_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+            .expect("PH NAL");
+        let ph = parse_picture_header_stateful(&extract_rbsp(ph_nal.payload()), &sps, &pps)
+            .expect("PH must parse with the LMCS chain");
+        assert!(ph.ph_lmcs_enabled_flag);
+        assert_eq!(ph.ph_lmcs_aps_id, 0);
+        assert!(!ph.ph_chroma_residual_scale_flag);
+
+        // Slice header — sh_lmcs_used_flag = 1.
+        let slice_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type.is_vcl())
+            .expect("slice NAL");
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+            ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+            ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+            ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+            ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+            ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+            ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+            ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
+            num_extra_sh_bits: 0,
+            nal_unit_type: slice_nal.header.nal_unit_type,
+        };
+        let sh =
+            parse_slice_header_stateful(&extract_rbsp(slice_nal.payload()), &sps, &pps, &ph_state)
+                .expect("slice header must parse");
+        assert!(sh.sh_lmcs_used_flag);
+    }
+
+    /// Round-384 — the LMCS coding loop (forward-map source →
+    /// mapped-domain intra coding → §8.8.1 inverse-map before the
+    /// filter chain) reconstructs in the ORIGINAL domain: PSNR_Y
+    /// against the unmapped source clears the same floor as the
+    /// baseline and stays within a small delta of it.
+    #[test]
+    fn round384_lmcs_recon_stays_in_original_domain() {
+        let src = gradient_frame(64, 64);
+        let cfg_off = crate::encoder::EncoderConfig::new(64, 64);
+        let (_bs_off, rec_off) = encode_idr_with_residuals_cfg(&src, 26, cfg_off).unwrap();
+        let psnr_off = psnr_y(&src.luma, &rec_off.luma).unwrap();
+
+        let mut cfg_on = crate::encoder::EncoderConfig::new(64, 64);
+        cfg_on.lmcs = Some(lmcs_enc_payload());
+        let (bs_on, rec_on) = encode_idr_with_residuals_cfg(&src, 26, cfg_on).unwrap();
+        assert!(!bs_on.is_empty());
+        let psnr_on = psnr_y(&src.luma, &rec_on.luma).unwrap();
+
+        eprintln!("round384 LMCS: PSNR off={psnr_off:.2} dB, on={psnr_on:.2} dB");
+        assert!(
+            psnr_on >= 30.0,
+            "PSNR_Y {psnr_on:.2} dB < 30 dB with LMCS on — recon must be inverse-mapped"
+        );
+        assert!(
+            (psnr_on - psnr_off).abs() <= 6.0,
+            "LMCS on/off PSNR gap too large: on={psnr_on:.2}, off={psnr_off:.2}"
+        );
     }
 }

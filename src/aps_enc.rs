@@ -5,8 +5,9 @@
 //! chroma + CC-ALF APSes in-memory (`build_chroma_alf_aps` /
 //! `build_cc_alf_aps` in [`crate::encoder_pipeline`]); this module turns
 //! those [`crate::aps::AlfApsData`] structs back into the wire-format
-//! RBSP bytes the §7.3.2.6 parser reads. LMCS / scaling-list APSes are
-//! out of scope.
+//! RBSP bytes the §7.3.2.6 parser reads. Round-384 adds the LMCS APS
+//! ([`emit_lmcs_aps_rbsp`] + the §7.3.2.19 `lmcs_data()` payload);
+//! scaling-list APSes remain out of scope.
 //!
 //! ## Wire layout (§7.3.2.6)
 //!
@@ -80,6 +81,75 @@ use crate::encoder::BitWriter;
 /// [`crate::aps::parse_aps`].
 ///
 /// `aps_id` must be in `0..=7` (per Table 6 / §7.4.3.6 ALF range).
+/// Emit a complete LMCS `adaptation_parameter_set_rbsp()` (§7.3.2.6
+/// with `aps_params_type = LMCS_APS = 1`) wrapping one §7.3.2.19
+/// `lmcs_data()` payload. Mirrors [`crate::lmcs::parse_lmcs_data`] in
+/// reverse; `aps_adaptation_parameter_set_id` for an LMCS APS ranges
+/// 0..=3 (§7.4.3.6).
+pub fn emit_lmcs_aps_rbsp(
+    aps_id: u8,
+    aps_chroma_present_flag: bool,
+    data: &crate::lmcs::LmcsData,
+) -> Result<Vec<u8>> {
+    if aps_id > 3 {
+        return Err(Error::invalid(format!(
+            "h266 LMCS APS: aps_adaptation_parameter_set_id out of range (got {aps_id})"
+        )));
+    }
+    let max_bin_idx = data.lmcs_max_bin_idx();
+    if data.lmcs_min_bin_idx > 15
+        || data.lmcs_delta_max_bin_idx > 15
+        || max_bin_idx < data.lmcs_min_bin_idx
+    {
+        return Err(Error::invalid(
+            "h266 LMCS APS: lmcs_min_bin_idx / lmcs_delta_max_bin_idx out of range",
+        ));
+    }
+    if data.lmcs_delta_cw_prec_minus1 > 14 {
+        return Err(Error::invalid(
+            "h266 LMCS APS: lmcs_delta_cw_prec_minus1 out of range (0..=14)",
+        ));
+    }
+    if !aps_chroma_present_flag && data.lmcs_delta_abs_crs != 0 {
+        return Err(Error::invalid(
+            "h266 LMCS APS: lmcs_delta_abs_crs signalled but aps_chroma_present_flag = 0",
+        ));
+    }
+
+    let mut bw = BitWriter::new();
+    bw.write_bits(1u32, 3); // aps_params_type = LMCS_APS = 1
+    bw.write_bits(aps_id as u32, 5);
+    bw.write_bit(if aps_chroma_present_flag { 1 } else { 0 });
+
+    // §7.3.2.19 lmcs_data().
+    bw.write_ue(u32::from(data.lmcs_min_bin_idx));
+    bw.write_ue(u32::from(data.lmcs_delta_max_bin_idx));
+    bw.write_ue(u32::from(data.lmcs_delta_cw_prec_minus1));
+    let width = u32::from(data.lmcs_delta_cw_prec_minus1) + 1;
+    for i in usize::from(data.lmcs_min_bin_idx)..=usize::from(max_bin_idx) {
+        if data.lmcs_delta_abs_cw[i] >= (1u32 << width) {
+            return Err(Error::invalid(format!(
+                "h266 LMCS APS: lmcs_delta_abs_cw[{i}] does not fit in {width} bits"
+            )));
+        }
+        bw.write_bits(data.lmcs_delta_abs_cw[i], width);
+        if data.lmcs_delta_abs_cw[i] > 0 {
+            bw.write_bit(u8::from(data.lmcs_delta_sign_cw_flag[i]));
+        }
+    }
+    if aps_chroma_present_flag {
+        bw.write_bits(u32::from(data.lmcs_delta_abs_crs), 3);
+        if data.lmcs_delta_abs_crs > 0 {
+            bw.write_bit(u8::from(data.lmcs_delta_sign_crs_flag));
+        }
+    }
+
+    // aps_extension_flag = 0 (no extension).
+    bw.write_bit(0);
+    bw.rbsp_trailing_bits();
+    Ok(bw.into_bytes())
+}
+
 pub fn emit_alf_aps_rbsp(
     aps_id: u8,
     aps_chroma_present_flag: bool,

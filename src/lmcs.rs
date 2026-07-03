@@ -47,7 +47,7 @@ pub const LMCS_NUM_BINS: usize = 16;
 /// §7.4.3.19 inferred defaults (`lmcs_delta_abs_cw = 0`,
 /// `lmcs_delta_sign_cw_flag = 0`), matching the "set equal 0" arms of
 /// the `lmcsCW[ i ]` derivation.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LmcsData {
     /// `lmcs_min_bin_idx` — minimum bin index used in the LMCS
     /// construction process. Range 0..=15 (§7.4.3.19).

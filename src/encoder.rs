@@ -300,6 +300,16 @@ pub struct EncoderConfig {
     /// to `{leaf, TT_VERT, TT_HORZ}`. Default `false` preserves the
     /// round-56 behaviour.
     pub enable_mtt_tt_picker: bool,
+    /// Round-384 — opt-in LMCS (§7.4.3.19 luma mapping with chroma
+    /// scaling). When `Some`, the pipeline forward-maps the source luma
+    /// before intra coding (the coding loop runs in the mapped domain),
+    /// emits `sps_lmcs_enabled_flag = 1`, ships the payload as an LMCS
+    /// APS NAL (id 0), signals `ph_lmcs_enabled_flag = 1` /
+    /// `ph_lmcs_aps_id = 0` / `ph_chroma_residual_scale_flag = 0` in
+    /// the picture header plus `sh_lmcs_used_flag = 1` in the slice
+    /// header, and inverse-maps the reconstruction (§8.8.1 step 1)
+    /// before the deblock / SAO / ALF chain. Default `None`.
+    pub lmcs: Option<crate::lmcs::LmcsData>,
 }
 
 impl EncoderConfig {
@@ -313,6 +323,7 @@ impl EncoderConfig {
             enable_chroma_sao_merge: false,
             enable_mtt_bt_picker: false,
             enable_mtt_tt_picker: false,
+            lmcs: None,
         }
     }
 
@@ -544,7 +555,10 @@ impl VvcEncoder {
                                                                  // we set both to 1.
         bw.write_bit(1); // alf_enabled
         bw.write_bit(1); // ccalf_enabled (gated by alf_enabled && chroma_format_idc != 0)
-        bw.write_bit(0); // lmcs_enabled
+                         // Round-384 — sps_lmcs_enabled_flag mirrors the
+                         // EncoderConfig::lmcs knob; the PH then carries the
+                         // §7.3.2.8 LMCS chain and an LMCS APS NAL ships.
+        bw.write_bit(if self.config.lmcs.is_some() { 1 } else { 0 }); // lmcs_enabled
         bw.write_bit(0); // weighted_pred
         bw.write_bit(0); // weighted_bipred
         bw.write_bit(0); // long_term_ref_pics
@@ -735,6 +749,18 @@ impl VvcEncoder {
         if chain.ph_alf_cc_cr_enabled_flag {
             bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
         }
+        // Round-384 — §7.3.2.8 LMCS chain, gated by
+        // sps_lmcs_enabled_flag (== config.lmcs.is_some()). The
+        // pipeline ships the LMCS APS at id 0 and keeps
+        // ph_chroma_residual_scale_flag = 0 (the mapped-domain coding
+        // loop only remaps luma).
+        if self.config.lmcs.is_some() {
+            bw.write_bit(1); // ph_lmcs_enabled_flag = 1
+            bw.write_bits(0, 2); // ph_lmcs_aps_id = 0
+            if self.config.chroma_format_idc != 0 {
+                bw.write_bit(0); // ph_chroma_residual_scale_flag = 0
+            }
+        }
         // pps_rpl_info_in_ph_flag inferred = 1 → parse_ref_pic_lists()
         // is called. With num_ref_pic_lists[0/1] = 0 each list falls
         // into the inline branch which emits `num_ref_entries = 0`
@@ -776,6 +802,11 @@ impl VvcEncoder {
         bw.write_bit(0);
         // sh_no_output_of_prior_pics_flag — emitted under IDR types.
         bw.write_bit(0);
+        // Round-384 — §7.3.7 sh_lmcs_used_flag: transmitted when
+        // ph_lmcs_enabled_flag == 1 and the PH is a separate NAL.
+        if self.config.lmcs.is_some() {
+            bw.write_bit(1);
+        }
         // `byte_alignment()` — stop bit + zero pad.
         bw.byte_alignment();
         let rbsp = bw.into_bytes();
