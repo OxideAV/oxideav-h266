@@ -112,6 +112,25 @@ P + B-slice merge subset:
 * **Intra** — PLANAR / DC / cardinal angular intra (modes 2, 18, 34,
   50, 66), MIP (§8.4.5.2.2, all 30 weight matrices), CCLM
   (§8.4.5.2.14), BDPCM, and ISP (§8.4.5.1, all 4 split types).
+* **Dependent quantization + sign data hiding** (r387) — the §7.4.12.11
+  eq. 198 `QStateTransTable` trellis runs through every regular
+  `residual_coding()` read (pass-1 `AbsLevelPass1 & 1` / pass-3
+  `AbsLevel & 1` advances, the QState-dependent §9.3.4.2.8 eqs.
+  1573 / 1574 sig-coeff ctxInc terms and §9.3.3.12 eq. 1536 `ZeroPos`,
+  and the `TransCoeffLevel = (2·AbsLevel − (QState > 1))·(1 − 2·sign)`
+  reconstruction re-walked from `startQStateSb`); sign data hiding
+  suppresses the first-significant sign bin on `signHiddenFlag`
+  sub-blocks and recovers it from the absolute-level-sum parity. The
+  §8.7.3 dequant takes the eq. 1143 `bdShift + 1` / eq. 1151
+  `(qP + 1)`-scaled levelScale arms from `sh_dep_quant_used_flag`.
+* **Explicit scaling lists** (r387) — the §7.3.2.21
+  `scaling_list_data()` APS payload is parsed and §7.4.3.20-derived
+  into `ScalingMatrixRec` / `ScalingMatrixDcRec`
+  (`scaling_list::parse_scaling_list_data`); `CtuWalker::
+  set_scaling_list` binds the matrices and every dequant site derives
+  the §8.7.3 eq. 1149 / 1150 `m[x][y]` (Table 38 id from
+  `(predMode, cIdx, nTbW, nTbH)`, DC substitution for ids > 13, and
+  the flat-16 arms for transform-skip / LFNST-disabled / ACT).
 * **Inter merge** — P + B-slice skip / merge: §8.5.2.3 spatial-merge
   candidates, §8.5.2.11 / §8.5.2.12 temporal collocated candidate with
   POC scaling and buffer compression, §8.5.2.6 HMVP, §8.5.2.4
@@ -294,7 +313,25 @@ the forward-mapped luma domain, the reconstruction is inverse-mapped
 carries `sps_lmcs_enabled_flag`, an LMCS APS NAL (§7.3.2.19 payload
 via `aps_enc::emit_lmcs_aps_rbsp`), the §7.3.2.8 PH LMCS chain and
 `sh_lmcs_used_flag` — all parse-verified against this crate's own
-parsers.
+parsers. Opt-in **dependent quantization**
+(`EncoderConfig::dep_quant`): every TB is quantised by the greedy
+hard-decision TCQ `transform_fwd::quantize_tb_dep_quant` (trellis-
+consistent by construction), reconstructed through the §8.7.3
+dep-quant arms and emitted with the dep-quant CABAC paths, with
+`sps_dep_quant_enabled_flag` + `sh_dep_quant_used_flag` on the wire;
+opt-in **sign data hiding** (`EncoderConfig::sign_data_hiding`,
+mutually exclusive per §7.3.7): `residual_enc::condition_levels_for_sdh`
+parity-conditions every hidden-sign sub-block with a one-step nudge.
+
+r387 wire-conformance sweep (black-box validated against a conforming
+third-party VVC decoder): the single-layer VPS drops the spurious
+`vps_num_ptls_minus1` byte and gains the mandatory
+`vps_extension_flag`; the §7.4.3.5 `pps_*_info_in_ph_flag` inferences
+flip to 0, moving the ALF chain / `sh_qp_delta` (the slice QP is now
+really signalled) / SAO flags from the PH into the §7.3.7 slice
+header. The full emitted header chain — VPS, SPS, PPS, APSes, PH,
+slice header — now parses externally; the remaining external-decode
+gap is the `coding_unit()` intra-mode bins.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
