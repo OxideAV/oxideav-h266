@@ -59,14 +59,14 @@ use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::ResidualCtxs;
 use crate::residual_enc::{
-    encode_tb_coefficients, write_cu_qp_delta, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+    encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
     write_tu_y_coded_flag,
 };
 use crate::sao::SaoConfig;
 use crate::sao_enc::sao_decide_picture;
 use crate::syntax_enc::{encode_coding_quadtree_split, TreeNeighbours};
 use crate::transform::{inverse_transform_2d, TrType};
-use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_flat};
+use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_dep_quant, quantize_tb_flat};
 
 /// Compute PSNR_Y (luma only) between two [`PicturePlane`]s.
 ///
@@ -286,6 +286,7 @@ fn prepare_luma_tb(
     n_tb_w: usize,
     n_tb_h: usize,
     qp: i32,
+    dep_quant: bool,
 ) -> Result<Vec<i32>> {
     // DC intra prediction: flat fill with mid-grey (128).
     let pred_val = 128u8;
@@ -304,11 +305,16 @@ fn prepare_luma_tb(
     // Forward DCT-II.
     let coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, 8)?;
 
-    // Quantise.
-    let levels = quantize_tb_flat(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?;
+    // Quantise — the dep-quant arm walks the §7.4.12.11 trellis.
+    let levels = if dep_quant {
+        quantize_tb_dep_quant(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?
+    } else {
+        quantize_tb_flat(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?
+    };
 
     // Dequant + IDCT to get decoded residual.
-    let params = DequantParams::luma_8bit(n_tb_w as u32, n_tb_h as u32, qp);
+    let mut params = DequantParams::luma_8bit(n_tb_w as u32, n_tb_h as u32, qp);
+    params.dep_quant = dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
     let rec_res = inverse_transform_2d(
         n_tb_w,
@@ -357,6 +363,7 @@ fn emit_tu_with_cbf(
     ctxs: &mut ResidualCtxs,
     tb: &PreparedLumaTb,
     qp_state: &mut QpDeltaState,
+    rc_opts: crate::residual::RcOpts,
 ) -> Result<()> {
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
@@ -394,26 +401,28 @@ fn emit_tu_with_cbf(
     // Residual blocks per component — only emitted when the
     // corresponding CBF is set (§7.3.11.10's spec gate).
     if cbf_y {
-        encode_tb_coefficients(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, &tb.levels)?;
+        encode_tb_coefficients_opts(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, &tb.levels, rc_opts)?;
     }
     if cbf_cb {
-        encode_tb_coefficients(
+        encode_tb_coefficients_opts(
             enc,
             ctxs,
             tb.n_tb_chroma_w,
             tb.n_tb_chroma_h,
             1,
             &tb.cb_levels,
+            rc_opts,
         )?;
     }
     if cbf_cr {
-        encode_tb_coefficients(
+        encode_tb_coefficients_opts(
             enc,
             ctxs,
             tb.n_tb_chroma_w,
             tb.n_tb_chroma_h,
             2,
             &tb.cr_levels,
+            rc_opts,
         )?;
     }
     Ok(())
@@ -473,6 +482,7 @@ fn prepare_chroma_tb(
     n_tb_c_w: usize,
     n_tb_c_h: usize,
     qp_c: i32,
+    dep_quant: bool,
 ) -> Result<Vec<i32>> {
     let pred_val = 128u8;
 
@@ -490,10 +500,15 @@ fn prepare_chroma_tb(
     // Forward DCT-II + flat quantisation (same ladder as luma; bit_depth
     // = 8 for 4:2:0 8-bit).
     let coeffs = forward_dct_ii_2d(n_tb_c_w, n_tb_c_h, &residual, 8)?;
-    let levels = quantize_tb_flat(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?;
+    let levels = if dep_quant {
+        quantize_tb_dep_quant(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?
+    } else {
+        quantize_tb_flat(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?
+    };
 
     // Dequant → IDCT → reconstruct.
-    let params = DequantParams::chroma_8bit(n_tb_c_w as u32, n_tb_c_h as u32, qp_c);
+    let mut params = DequantParams::chroma_8bit(n_tb_c_w as u32, n_tb_c_h as u32, qp_c);
+    params.dep_quant = dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
     let rec_res = inverse_transform_2d(
         n_tb_c_w,
@@ -536,8 +551,18 @@ fn prepare_leaf_cu(
     n_tb_w: usize,
     n_tb_h: usize,
     cu_qp: i32,
+    dep_quant: bool,
 ) -> Result<PreparedCu> {
-    let levels = prepare_luma_tb(&src.luma, &mut rec.luma, x, y, n_tb_w, n_tb_h, cu_qp)?;
+    let levels = prepare_luma_tb(
+        &src.luma,
+        &mut rec.luma,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        cu_qp,
+        dep_quant,
+    )?;
     let chr_x = x / 2;
     let chr_y = y / 2;
     let n_tb_chroma_w = (n_tb_w / 2).max(4);
@@ -551,6 +576,7 @@ fn prepare_leaf_cu(
         n_tb_chroma_w,
         n_tb_chroma_h,
         qp_c,
+        dep_quant,
     )?;
     let cr_levels = prepare_chroma_tb(
         &src.cr,
@@ -560,6 +586,7 @@ fn prepare_leaf_cu(
         n_tb_chroma_w,
         n_tb_chroma_h,
         qp_c,
+        dep_quant,
     )?;
     Ok(PreparedCu::Leaf(PreparedLumaTb {
         n_tb_w,
@@ -583,7 +610,11 @@ fn prepare_leaf_cu(
 /// to count the byte cost; this is a strict upper bound on the wire
 /// cost since the production stream amortises CABAC range across the
 /// whole frame.
-fn measure_cu_bits(cu: &PreparedCu, slice_qp_y: i32) -> Result<u64> {
+fn measure_cu_bits(
+    cu: &PreparedCu,
+    slice_qp_y: i32,
+    rc_opts: crate::residual::RcOpts,
+) -> Result<u64> {
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
     let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
@@ -596,12 +627,14 @@ fn measure_cu_bits(cu: &PreparedCu, slice_qp_y: i32) -> Result<u64> {
         &mut qp_state,
         0,
         0,
+        rc_opts,
     )?;
     enc.encode_terminate(1)?;
     let bytes = enc.finish();
     Ok((bytes.len() as u64) * 8)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_cu_bits_recurse(
     cu: &PreparedCu,
     enc: &mut crate::cabac_enc::ArithEncoder,
@@ -610,6 +643,7 @@ fn measure_cu_bits_recurse(
     qp_state: &mut QpDeltaState,
     cqt_depth: u32,
     mtt_depth: u32,
+    rc_opts: crate::residual::RcOpts,
 ) -> Result<()> {
     match cu {
         PreparedCu::Leaf(tb) => {
@@ -620,7 +654,7 @@ fn measure_cu_bits_recurse(
                 tb.n_tb_w as u32,
                 tb.n_tb_h as u32,
                 TreeNeighbours::default(),
-                |e| emit_tu_with_cbf(e, residual_ctxs, tb, qp_state),
+                |e| emit_tu_with_cbf(e, residual_ctxs, tb, qp_state, rc_opts),
             )
         }
         PreparedCu::BtSplit {
@@ -642,7 +676,16 @@ fn measure_cu_bits_recurse(
                 *dir,
                 |e, ctxs, idx, _w, _h| {
                     let child = if idx == 0 { sub_a } else { sub_b };
-                    measure_cu_bits_recurse(child, e, ctxs, residual_ctxs, qp_state, *cd, *md + 1)
+                    measure_cu_bits_recurse(
+                        child,
+                        e,
+                        ctxs,
+                        residual_ctxs,
+                        qp_state,
+                        *cd,
+                        *md + 1,
+                        rc_opts,
+                    )
                 },
             )
         }
@@ -671,7 +714,16 @@ fn measure_cu_bits_recurse(
                         1 => sub_b,
                         _ => sub_c,
                     };
-                    measure_cu_bits_recurse(child, e, ctxs, residual_ctxs, qp_state, *cd, *md + 1)
+                    measure_cu_bits_recurse(
+                        child,
+                        e,
+                        ctxs,
+                        residual_ctxs,
+                        qp_state,
+                        *cd,
+                        *md + 1,
+                        rc_opts,
+                    )
                 },
             )
         }
@@ -774,6 +826,7 @@ fn region_sse_y(
 /// — losing candidates' reconstructions are restored before returning.
 /// Callers must ensure the candidate region fits entirely inside the
 /// picture (`x + 64 <= w` and `y + 64 <= h`).
+#[allow(clippy::too_many_arguments)]
 fn prepare_cu_with_mtt_picker(
     src: &PictureBuffer,
     rec: &mut PictureBuffer,
@@ -784,9 +837,14 @@ fn prepare_cu_with_mtt_picker(
     slice_qp_y: i32,
     try_bt: bool,
     try_tt: bool,
+    dep_quant: bool,
 ) -> Result<PreparedCu> {
     debug_assert_eq!(cb_size, 64);
     let lambda = lambda_for_qp(slice_qp_y);
+    let rc_opts = crate::residual::RcOpts {
+        dep_quant,
+        sign_data_hiding: false,
+    };
 
     // Snapshot every plane so each trial starts from the same source.
     let snap_luma = rec.luma.samples.clone();
@@ -814,9 +872,9 @@ fn prepare_cu_with_mtt_picker(
     let mut trials: Vec<Trial> = Vec::with_capacity(5);
 
     // --- Trial 1: leaf 64×64 ---
-    let leaf = prepare_leaf_cu(src, rec, x, y, cb_size, cb_size, cu_qp)?;
+    let leaf = prepare_leaf_cu(src, rec, x, y, cb_size, cb_size, cu_qp, dep_quant)?;
     let leaf_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
-    let leaf_bits = measure_cu_bits(&leaf, slice_qp_y)?;
+    let leaf_bits = measure_cu_bits(&leaf, slice_qp_y, rc_opts)?;
     trials.push(Trial {
         cu: leaf,
         cost: leaf_sse as f64 + lambda * leaf_bits as f64,
@@ -831,8 +889,8 @@ fn prepare_cu_with_mtt_picker(
     if try_bt {
         // --- BT_VERT (two 32×64 sub-CUs) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp)?;
-        let bt_v_b = prepare_leaf_cu(src, rec, x + half, y, half, cb_size, cu_qp)?;
+        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp, dep_quant)?;
+        let bt_v_b = prepare_leaf_cu(src, rec, x + half, y, half, cb_size, cu_qp, dep_quant)?;
         let bt_v_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let bt_v_cu = PreparedCu::BtSplit {
             dir: crate::syntax_enc::MttSplitDir::Vertical,
@@ -841,7 +899,7 @@ fn prepare_cu_with_mtt_picker(
             sub_a: Box::new(bt_v_a),
             sub_b: Box::new(bt_v_b),
         };
-        let bt_v_bits = measure_cu_bits(&bt_v_cu, slice_qp_y)?;
+        let bt_v_bits = measure_cu_bits(&bt_v_cu, slice_qp_y, rc_opts)?;
         trials.push(Trial {
             cu: bt_v_cu,
             cost: bt_v_sse as f64 + lambda * bt_v_bits as f64,
@@ -852,8 +910,8 @@ fn prepare_cu_with_mtt_picker(
 
         // --- BT_HORZ (two 64×32 sub-CUs) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp)?;
-        let bt_h_b = prepare_leaf_cu(src, rec, x, y + half, cb_size, half, cu_qp)?;
+        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp, dep_quant)?;
+        let bt_h_b = prepare_leaf_cu(src, rec, x, y + half, cb_size, half, cu_qp, dep_quant)?;
         let bt_h_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let bt_h_cu = PreparedCu::BtSplit {
             dir: crate::syntax_enc::MttSplitDir::Horizontal,
@@ -862,7 +920,7 @@ fn prepare_cu_with_mtt_picker(
             sub_a: Box::new(bt_h_a),
             sub_b: Box::new(bt_h_b),
         };
-        let bt_h_bits = measure_cu_bits(&bt_h_cu, slice_qp_y)?;
+        let bt_h_bits = measure_cu_bits(&bt_h_cu, slice_qp_y, rc_opts)?;
         trials.push(Trial {
             cu: bt_h_cu,
             cost: bt_h_sse as f64 + lambda * bt_h_bits as f64,
@@ -875,9 +933,18 @@ fn prepare_cu_with_mtt_picker(
     if try_tt {
         // --- TT_VERT (16×64, 32×64, 16×64 — 1:2:1 ratio) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let tt_v_a = prepare_leaf_cu(src, rec, x, y, quarter, cb_size, cu_qp)?;
-        let tt_v_b = prepare_leaf_cu(src, rec, x + quarter, y, half, cb_size, cu_qp)?;
-        let tt_v_c = prepare_leaf_cu(src, rec, x + 3 * quarter, y, quarter, cb_size, cu_qp)?;
+        let tt_v_a = prepare_leaf_cu(src, rec, x, y, quarter, cb_size, cu_qp, dep_quant)?;
+        let tt_v_b = prepare_leaf_cu(src, rec, x + quarter, y, half, cb_size, cu_qp, dep_quant)?;
+        let tt_v_c = prepare_leaf_cu(
+            src,
+            rec,
+            x + 3 * quarter,
+            y,
+            quarter,
+            cb_size,
+            cu_qp,
+            dep_quant,
+        )?;
         let tt_v_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let tt_v_cu = PreparedCu::TtSplit {
             dir: crate::syntax_enc::MttSplitDir::Vertical,
@@ -887,7 +954,7 @@ fn prepare_cu_with_mtt_picker(
             sub_b: Box::new(tt_v_b),
             sub_c: Box::new(tt_v_c),
         };
-        let tt_v_bits = measure_cu_bits(&tt_v_cu, slice_qp_y)?;
+        let tt_v_bits = measure_cu_bits(&tt_v_cu, slice_qp_y, rc_opts)?;
         trials.push(Trial {
             cu: tt_v_cu,
             cost: tt_v_sse as f64 + lambda * tt_v_bits as f64,
@@ -898,9 +965,18 @@ fn prepare_cu_with_mtt_picker(
 
         // --- TT_HORZ (64×16, 64×32, 64×16 — 1:2:1 ratio) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let tt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, quarter, cu_qp)?;
-        let tt_h_b = prepare_leaf_cu(src, rec, x, y + quarter, cb_size, half, cu_qp)?;
-        let tt_h_c = prepare_leaf_cu(src, rec, x, y + 3 * quarter, cb_size, quarter, cu_qp)?;
+        let tt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, quarter, cu_qp, dep_quant)?;
+        let tt_h_b = prepare_leaf_cu(src, rec, x, y + quarter, cb_size, half, cu_qp, dep_quant)?;
+        let tt_h_c = prepare_leaf_cu(
+            src,
+            rec,
+            x,
+            y + 3 * quarter,
+            cb_size,
+            quarter,
+            cu_qp,
+            dep_quant,
+        )?;
         let tt_h_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let tt_h_cu = PreparedCu::TtSplit {
             dir: crate::syntax_enc::MttSplitDir::Horizontal,
@@ -910,7 +986,7 @@ fn prepare_cu_with_mtt_picker(
             sub_b: Box::new(tt_h_b),
             sub_c: Box::new(tt_h_c),
         };
-        let tt_h_bits = measure_cu_bits(&tt_h_cu, slice_qp_y)?;
+        let tt_h_bits = measure_cu_bits(&tt_h_cu, slice_qp_y, rc_opts)?;
         trials.push(Trial {
             cu: tt_h_cu,
             cost: tt_h_sse as f64 + lambda * tt_h_bits as f64,
@@ -1150,6 +1226,7 @@ fn emit_prepared_cu(
     cqt_depth: u32,
     mtt_depth: u32,
     cu_map: &CuStateMap,
+    rc_opts: crate::residual::RcOpts,
 ) -> Result<()> {
     let nbrs = build_tree_neighbours(cu_map, x, y);
     match cu {
@@ -1165,7 +1242,7 @@ fn emit_prepared_cu(
                 tb.n_tb_w as u32,
                 tb.n_tb_h as u32,
                 nbrs,
-                |e| emit_tu_with_cbf(e, residual_ctxs, tb, qp_state),
+                |e| emit_tu_with_cbf(e, residual_ctxs, tb, qp_state, rc_opts),
             )
         }
         PreparedCu::BtSplit {
@@ -1216,6 +1293,7 @@ fn emit_prepared_cu(
                         *cd,
                         *md + 1,
                         cu_map,
+                        rc_opts,
                     )
                 },
             )
@@ -1271,6 +1349,7 @@ fn emit_prepared_cu(
                         *cd,
                         *md + 1,
                         cu_map,
+                        rc_opts,
                     )
                 },
             )
@@ -1558,9 +1637,19 @@ pub fn encode_idr_with_qp_picker_cfg(
                             slice_qp_y,
                             config.enable_mtt_bt_picker,
                             config.enable_mtt_tt_picker,
+                            config.dep_quant,
                         )?
                     } else {
-                        prepare_leaf_cu(coding_src, &mut rec, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp)?
+                        prepare_leaf_cu(
+                            coding_src,
+                            &mut rec,
+                            tb_x,
+                            tb_y,
+                            n_tb_sq,
+                            n_tb_sq,
+                            cu_qp,
+                            config.dep_quant,
+                        )?
                     };
 
                     // Accumulate deblock-CU records over every TB inside
@@ -2162,6 +2251,11 @@ pub fn encode_idr_with_qp_picker_cfg(
         sh_cabac_init_flag: false,
     };
 
+    // §7.3.7 residual-coding switches for every residual emit below.
+    let rc_opts = crate::residual::RcOpts {
+        dep_quant: config.dep_quant,
+        sign_data_hiding: false,
+    };
     let mut cabac_enc = ArithEncoder::new();
     // Round-56 — picture-wide neighbour map for the §9.3.4.2 ctxInc
     // derivations. `cu_map` is the *read-only* snapshot the current
@@ -2322,6 +2416,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                             1,
                             0,
                             &cu_map,
+                            rc_opts,
                         )?;
                         record_cu_into_map(&mut cu_map_write, cu, qx as u32, qy as u32, 1);
                         Ok(())
@@ -2351,6 +2446,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         0,
                         0,
                         &cu_map,
+                        rc_opts,
                     )?;
                     record_cu_into_map(&mut cu_map_write, cu, cur_x as u32, cur_y as u32, 0);
                     // Advance position for the next CU in raster order.
@@ -2758,7 +2854,7 @@ mod tests {
     fn prepare_chroma_tb_flat_block_yields_zero_levels() {
         let src = PicturePlane::filled(8, 8, 128);
         let mut rec = PicturePlane::filled(8, 8, 0);
-        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 4, 26).unwrap();
+        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 4, 26, false).unwrap();
         assert!(
             levels.iter().all(|&l| l == 0),
             "got non-zero level: {levels:?}"
@@ -2785,7 +2881,7 @@ mod tests {
             }
         }
         let mut rec = PicturePlane::filled(8, 8, 0);
-        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 4, 26).unwrap();
+        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 4, 26, false).unwrap();
         assert!(
             levels.iter().any(|&l| l != 0),
             "expected at least one non-zero level on non-flat input, got all zeros"

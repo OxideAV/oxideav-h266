@@ -249,6 +249,100 @@ pub fn quantize_tb_flat(
     Ok(out)
 }
 
+/// Forward quantisation for **dependent quantization**
+/// (`sh_dep_quant_used_flag = 1`) — the encoder-side inverse of the
+/// §8.7.3 dep-quant dequant arms (`bdShift` + 1 per eq. 1143, the
+/// `(qP + 1)`-scaled levelScale per eq. 1151) combined with the
+/// §7.3.11.11 magnitude reconstruction
+/// `TransCoeffLevel = 2 · AbsLevel − (QState > 1)`.
+///
+/// Walks the whole TB in reverse diagonal scan order — the §7.4.12.11
+/// eq. 198 trellis coding order (positions above the last significant
+/// coefficient hold zeros and state 0 is a parity-0 fixed point, so
+/// starting from the very end of the TB is exact) — and makes a greedy
+/// hard decision per coefficient: the `AbsLevel` whose reconstruction
+/// under the CURRENT trellis state minimises the error, then advances
+/// the state on that level's parity. (A full trellis search over the
+/// four states is an encoder-quality upgrade, not a conformance
+/// requirement; the greedy output is always trellis-consistent, i.e.
+/// [`crate::residual_enc::encode_tb_coefficients_opts`] accepts it by
+/// construction.)
+///
+/// Returns the signed `TransCoeffLevel` array (row-major).
+pub fn quantize_tb_dep_quant(
+    coeffs: &[i32],
+    n_tb_w: u32,
+    n_tb_h: u32,
+    qp: i32,
+    bit_depth: u32,
+    log2_transform_range: u32,
+) -> Result<Vec<i32>> {
+    use crate::residual::q_state_advance;
+    use crate::scan::coeff_scan_positions;
+
+    let w = n_tb_w as usize;
+    let h = n_tb_h as usize;
+    if coeffs.len() != w * h {
+        return Err(Error::invalid(format!(
+            "h266 dep-quant fwd: input length {} != {}x{}",
+            coeffs.len(),
+            w,
+            h
+        )));
+    }
+    if !w.is_power_of_two() || !h.is_power_of_two() {
+        return Err(Error::invalid(
+            "h266 dep-quant fwd: nTbW and nTbH must be powers of two",
+        ));
+    }
+    let log2_w = w.trailing_zeros();
+    let log2_h = h.trailing_zeros();
+    let rect_non_ts = (((log2_w + log2_h) & 1) == 1) as u32;
+    // eq. 1143 with the `+ sh_dep_quant_used_flag` term.
+    let bd_shift = (bit_depth as i32 + rect_non_ts as i32 + ((log2_w + log2_h) as i32) / 2 + 10
+        - log2_transform_range as i32
+        + 1)
+    .max(0) as u32;
+    // eq. 1151 — (qP + 1) drives the levelScale arms.
+    let qe = qp + 1;
+    let q_mod = qe.rem_euclid(6) as usize;
+    let q_div = (qe / 6).max(0) as u32;
+    let ls = (16i64 * LEVEL_SCALE[rect_non_ts as usize][q_mod] as i64) << q_div;
+    let scale = 1i64 << bd_shift;
+
+    let positions = coeff_scan_positions(w, h);
+    let mut out = vec![0i32; w * h];
+    let mut q_state: i32 = 0;
+    for &(xc, yc) in positions.iter().rev() {
+        let idx = (yc as usize) * w + (xc as usize);
+        let c = coeffs[idx] as i64;
+        let target = c.unsigned_abs() as i64 * scale;
+        let delta = i64::from(q_state > 1);
+        // AbsLevel estimate from |t| ≈ target / ls, a = (|t| + δ) / 2.
+        let t_est = (target + ls / 2) / ls;
+        let a_mid = ((t_est + delta) / 2).max(0);
+        // Greedy hard decision: probe a_mid − 1 / a_mid / a_mid + 1
+        // (and 0), pick the minimum reconstruction error under the
+        // current state's quantizer.
+        let mut best_a: i64 = 0;
+        let mut best_err: i64 = target; // a = 0 → recon 0
+        for a in [a_mid.saturating_sub(1).max(1), a_mid.max(1), a_mid + 1] {
+            let recon = (2 * a - delta) * ls;
+            let err = (recon - target).abs();
+            if err < best_err {
+                best_err = err;
+                best_a = a;
+            }
+        }
+        if best_a > 0 {
+            let mag = (2 * best_a - delta) as i32;
+            out[idx] = if c < 0 { -mag } else { mag };
+        }
+        q_state = q_state_advance(q_state, best_a as u32);
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------
@@ -433,5 +527,76 @@ mod tests {
             sign_matches,
             nonzero_inputs
         );
+    }
+
+    /// `quantize_tb_dep_quant` output is trellis-consistent by
+    /// construction: the §7.3.11.11 writer accepts it and the decoder
+    /// recovers the exact TransCoeffLevel array; the reconstruction
+    /// through the §8.7.3 dep-quant dequant arms lands within one
+    /// half-step of the source coefficient.
+    #[test]
+    fn dep_quant_forward_quant_is_trellis_feasible_and_round_trips() {
+        use crate::cabac::ArithDecoder;
+        use crate::cabac_enc::ArithEncoder;
+        use crate::dequant::{dequantize_tb_flat, DequantParams};
+        use crate::residual::{decode_tb_coefficients_opts, RcOpts, ResidualCtxs};
+        use crate::residual_enc::encode_tb_coefficients_opts;
+
+        let mut state = 0xC0FFEEu32;
+        let mut rand = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state >> 16
+        };
+        let opts = RcOpts {
+            dep_quant: true,
+            sign_data_hiding: false,
+        };
+        for (w, h, qp) in [(8usize, 8usize, 26i32), (16, 16, 30), (4, 8, 22)] {
+            let mut coeffs = vec![0i32; w * h];
+            for c in coeffs.iter_mut() {
+                let r = rand();
+                *c = if r % 3 == 0 {
+                    0
+                } else {
+                    ((r % 4000) as i32 - 2000) * 4
+                };
+            }
+            let levels = quantize_tb_dep_quant(&coeffs, w as u32, h as u32, qp, 8, 15).unwrap();
+            if levels.iter().all(|&l| l == 0) {
+                continue; // nothing to code
+            }
+            // Trellis feasibility: the dep-quant writer accepts the array…
+            let mut enc = ArithEncoder::new();
+            let mut ectx = ResidualCtxs::init(26);
+            encode_tb_coefficients_opts(&mut enc, &mut ectx, w, h, 0, &levels, opts)
+                .expect("greedy TCQ output must be trellis-consistent");
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 64]);
+            // …and the reader recovers it exactly.
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            let mut dctx = ResidualCtxs::init(26);
+            let (rec, _) = decode_tb_coefficients_opts(&mut dec, &mut dctx, w, h, 0, opts).unwrap();
+            assert_eq!(rec, levels, "{w}x{h} qp={qp}");
+
+            // Reconstruction accuracy: |dequant(level) − coeff| bounded
+            // by one dep-quant step (ls / 2^bdShift in coefficient
+            // units, plus 1 for the rounding chain).
+            let mut params = DequantParams::luma_8bit(w as u32, h as u32, qp);
+            params.dep_quant = true;
+            let dq = dequantize_tb_flat(&levels, &params).unwrap();
+            let log2_sum = (w.trailing_zeros() + h.trailing_zeros()) as i32;
+            let rect = (log2_sum & 1) as usize;
+            let bd_shift = (8 + (log2_sum & 1) as i32 + log2_sum / 2 + 10 - 15 + 1).max(0);
+            let qe = qp + 1;
+            let ls =
+                (16i64 * crate::dequant::LEVEL_SCALE[rect][(qe % 6) as usize] as i64) << (qe / 6);
+            let step = ((ls >> bd_shift).max(1)) as i32;
+            for (i, (&d, &c)) in dq.iter().zip(&coeffs).enumerate() {
+                assert!(
+                    (d - c).abs() <= step + 1,
+                    "{w}x{h} qp={qp} pos {i}: dequant {d} vs coeff {c} (step {step})"
+                );
+            }
+        }
     }
 }

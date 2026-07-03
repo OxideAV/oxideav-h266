@@ -310,6 +310,15 @@ pub struct EncoderConfig {
     /// header, and inverse-maps the reconstruction (§8.8.1 step 1)
     /// before the deblock / SAO / ALF chain. Default `None`.
     pub lmcs: Option<crate::lmcs::LmcsData>,
+    /// Round-387 — opt-in **dependent quantization** (§7.4.12.11
+    /// eq. 198 trellis). When `true` the pipeline quantises every TB
+    /// with [`crate::transform_fwd::quantize_tb_dep_quant`] (greedy
+    /// hard-decision TCQ), reconstructs through the §8.7.3 dep-quant
+    /// dequant arms, emits the residual bins with
+    /// `RcOpts { dep_quant: true, .. }`, and signals
+    /// `sps_dep_quant_enabled_flag = 1` + `sh_dep_quant_used_flag = 1`
+    /// on the wire. Default `false`.
+    pub dep_quant: bool,
 }
 
 impl EncoderConfig {
@@ -324,6 +333,7 @@ impl EncoderConfig {
             enable_mtt_bt_picker: false,
             enable_mtt_tt_picker: false,
             lmcs: None,
+            dep_quant: false,
         }
     }
 
@@ -598,7 +608,7 @@ impl VvcEncoder {
         bw.write_bit(0); // ibc
         bw.write_bit(0); // ladf
         bw.write_bit(0); // explicit_scaling_list
-        bw.write_bit(0); // dep_quant
+        bw.write_bit(self.config.dep_quant as u8); // sps_dep_quant_enabled_flag
         bw.write_bit(0); // sign_data_hiding
         bw.write_bit(0); // virtual_boundaries_enabled
 
@@ -767,9 +777,15 @@ impl VvcEncoder {
                 bw.write_bit(chain.ph_sao_chroma_enabled_flag as u8);
             }
         }
-        // Deblocking override (PPS gate 0), dep-quant / SDH / TS /
-        // reverse-last-sig (SPS gates 0), SH extension (PPS gate 0):
-        // nothing to emit.
+        // Deblocking override (PPS gate 0): nothing to emit.
+        // §7.3.7 — sh_dep_quant_used_flag when
+        // sps_dep_quant_enabled_flag == 1; the SDH gate
+        // (`sps_sign_data_hiding_enabled_flag && !sh_dep_quant_used_flag`)
+        // then collapses, and TS / reverse-last-sig / SH extension stay
+        // closed (SPS + PPS gates 0).
+        if self.config.dep_quant {
+            bw.write_bit(1); // sh_dep_quant_used_flag = 1
+        }
         //
         // byte_alignment() — stop bit + zero pad; CABAC starts after.
         bw.byte_alignment();
