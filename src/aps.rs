@@ -112,9 +112,11 @@ pub struct AdaptationParameterSet {
     /// Decoded LMCS payload — `Some` iff `aps_params_type == Lmcs` and
     /// the §7.3.2.19 `lmcs_data()` payload was parsed successfully.
     pub lmcs_data: Option<LmcsData>,
+    /// Decoded + §7.4.3.20-derived scaling-list payload — `Some` iff
+    /// `aps_params_type == Scaling` and the §7.3.2.21
+    /// `scaling_list_data()` payload was parsed successfully (r387).
+    pub scaling_data: Option<crate::scaling_list::ScalingListData>,
     /// Raw APS payload bytes (full RBSP, including the 9-bit header).
-    /// Useful for scaling-list APSes that this round does not dispatch
-    /// into a typed structure.
     pub payload: Vec<u8>,
 }
 
@@ -160,12 +162,21 @@ pub fn parse_aps(rbsp: &[u8]) -> Result<AdaptationParameterSet> {
     } else {
         None
     };
+    let scaling_data = if matches!(aps_params_type, ApsParamsType::Scaling) {
+        Some(crate::scaling_list::parse_scaling_list_data(
+            &mut br,
+            aps_chroma_present_flag,
+        )?)
+    } else {
+        None
+    };
     Ok(AdaptationParameterSet {
         aps_params_type,
         aps_adaptation_parameter_set_id,
         aps_chroma_present_flag,
         alf_data,
         lmcs_data,
+        scaling_data,
         payload: rbsp.to_vec(),
     })
 }

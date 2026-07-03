@@ -217,6 +217,7 @@ pub mod sao;
 pub mod sao_enc;
 pub mod sao_syntax;
 pub mod sbtmvp;
+pub mod scaling_list;
 pub mod scan;
 pub mod sei_manifest;
 pub mod sei_message;
