@@ -145,3 +145,80 @@ fn dep_quant_changes_the_bitstream() {
     let (bs_dq, _) = encode_idr_with_residuals_cfg(&src, 30, cfg).unwrap();
     assert_ne!(bs_flat, bs_dq);
 }
+
+/// Round-387 — sign-data-hiding encoder knob: the pipeline
+/// parity-conditions each sub-block (§7.3.11.11 signHiddenFlag) and
+/// signals `sps_sign_data_hiding_enabled_flag` + the SH bit.
+#[test]
+fn sdh_pipeline_signals_flags_and_holds_psnr() {
+    let src = gradient_source(64);
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.sign_data_hiding = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+
+    let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+    assert!(
+        psnr >= 30.0,
+        "SDH reconstruction PSNR_Y {psnr:.2} dB < 30 dB"
+    );
+
+    let nals: Vec<_> = iter_annex_b(&bs).collect();
+    let sps = parse_sps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    assert!(sps.tool_flags.sign_data_hiding_enabled_flag);
+    assert!(!sps.tool_flags.dep_quant_enabled_flag);
+
+    let pps = parse_pps(&extract_rbsp(
+        nals.iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .unwrap()
+            .payload(),
+    ))
+    .unwrap();
+    let ph = parse_picture_header_stateful(
+        &extract_rbsp(
+            nals.iter()
+                .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+                .unwrap()
+                .payload(),
+        ),
+        &sps,
+        &pps,
+    )
+    .unwrap();
+    let ph_state = PhState {
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+        ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+        ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+        ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
+        num_extra_sh_bits: 0,
+        nal_unit_type: NalUnitType::IdrNLp,
+    };
+    let slice_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .expect("IDR slice");
+    let sh = parse_slice_header_stateful(&extract_rbsp(slice_nal.payload()), &sps, &pps, &ph_state)
+        .expect("SH parse");
+    assert!(!sh.sh_dep_quant_used_flag);
+    assert!(sh.sh_sign_data_hiding_used_flag);
+}
+
+/// dep_quant + sign_data_hiding on the same config is rejected (§7.3.7).
+#[test]
+fn dep_quant_and_sdh_config_mutually_exclusive() {
+    let src = gradient_source(64);
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.dep_quant = true;
+    cfg.sign_data_hiding = true;
+    assert!(encode_idr_with_residuals_cfg(&src, 26, cfg).is_err());
+}

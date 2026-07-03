@@ -286,7 +286,7 @@ fn prepare_luma_tb(
     n_tb_w: usize,
     n_tb_h: usize,
     qp: i32,
-    dep_quant: bool,
+    rc: crate::residual::RcOpts,
 ) -> Result<Vec<i32>> {
     // DC intra prediction: flat fill with mid-grey (128).
     let pred_val = 128u8;
@@ -305,16 +305,22 @@ fn prepare_luma_tb(
     // Forward DCT-II.
     let coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, 8)?;
 
-    // Quantise — the dep-quant arm walks the §7.4.12.11 trellis.
-    let levels = if dep_quant {
+    // Quantise — the dep-quant arm walks the §7.4.12.11 trellis; the
+    // SDH arm parity-conditions each sub-block so the hidden sign is
+    // recoverable (§7.3.11.11 signHiddenFlag).
+    let levels = if rc.dep_quant {
         quantize_tb_dep_quant(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?
     } else {
-        quantize_tb_flat(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?
+        let mut l = quantize_tb_flat(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?;
+        if rc.sign_data_hiding {
+            crate::residual_enc::condition_levels_for_sdh(&mut l, n_tb_w, n_tb_h);
+        }
+        l
     };
 
     // Dequant + IDCT to get decoded residual.
     let mut params = DequantParams::luma_8bit(n_tb_w as u32, n_tb_h as u32, qp);
-    params.dep_quant = dep_quant;
+    params.dep_quant = rc.dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
     let rec_res = inverse_transform_2d(
         n_tb_w,
@@ -482,7 +488,7 @@ fn prepare_chroma_tb(
     n_tb_c_w: usize,
     n_tb_c_h: usize,
     qp_c: i32,
-    dep_quant: bool,
+    rc: crate::residual::RcOpts,
 ) -> Result<Vec<i32>> {
     let pred_val = 128u8;
 
@@ -500,15 +506,19 @@ fn prepare_chroma_tb(
     // Forward DCT-II + flat quantisation (same ladder as luma; bit_depth
     // = 8 for 4:2:0 8-bit).
     let coeffs = forward_dct_ii_2d(n_tb_c_w, n_tb_c_h, &residual, 8)?;
-    let levels = if dep_quant {
+    let levels = if rc.dep_quant {
         quantize_tb_dep_quant(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?
     } else {
-        quantize_tb_flat(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?
+        let mut l = quantize_tb_flat(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?;
+        if rc.sign_data_hiding {
+            crate::residual_enc::condition_levels_for_sdh(&mut l, n_tb_c_w, n_tb_c_h);
+        }
+        l
     };
 
     // Dequant → IDCT → reconstruct.
     let mut params = DequantParams::chroma_8bit(n_tb_c_w as u32, n_tb_c_h as u32, qp_c);
-    params.dep_quant = dep_quant;
+    params.dep_quant = rc.dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
     let rec_res = inverse_transform_2d(
         n_tb_c_w,
@@ -551,18 +561,9 @@ fn prepare_leaf_cu(
     n_tb_w: usize,
     n_tb_h: usize,
     cu_qp: i32,
-    dep_quant: bool,
+    rc: crate::residual::RcOpts,
 ) -> Result<PreparedCu> {
-    let levels = prepare_luma_tb(
-        &src.luma,
-        &mut rec.luma,
-        x,
-        y,
-        n_tb_w,
-        n_tb_h,
-        cu_qp,
-        dep_quant,
-    )?;
+    let levels = prepare_luma_tb(&src.luma, &mut rec.luma, x, y, n_tb_w, n_tb_h, cu_qp, rc)?;
     let chr_x = x / 2;
     let chr_y = y / 2;
     let n_tb_chroma_w = (n_tb_w / 2).max(4);
@@ -576,7 +577,7 @@ fn prepare_leaf_cu(
         n_tb_chroma_w,
         n_tb_chroma_h,
         qp_c,
-        dep_quant,
+        rc,
     )?;
     let cr_levels = prepare_chroma_tb(
         &src.cr,
@@ -586,7 +587,7 @@ fn prepare_leaf_cu(
         n_tb_chroma_w,
         n_tb_chroma_h,
         qp_c,
-        dep_quant,
+        rc,
     )?;
     Ok(PreparedCu::Leaf(PreparedLumaTb {
         n_tb_w,
@@ -837,14 +838,10 @@ fn prepare_cu_with_mtt_picker(
     slice_qp_y: i32,
     try_bt: bool,
     try_tt: bool,
-    dep_quant: bool,
+    rc_opts: crate::residual::RcOpts,
 ) -> Result<PreparedCu> {
     debug_assert_eq!(cb_size, 64);
     let lambda = lambda_for_qp(slice_qp_y);
-    let rc_opts = crate::residual::RcOpts {
-        dep_quant,
-        sign_data_hiding: false,
-    };
 
     // Snapshot every plane so each trial starts from the same source.
     let snap_luma = rec.luma.samples.clone();
@@ -872,7 +869,7 @@ fn prepare_cu_with_mtt_picker(
     let mut trials: Vec<Trial> = Vec::with_capacity(5);
 
     // --- Trial 1: leaf 64×64 ---
-    let leaf = prepare_leaf_cu(src, rec, x, y, cb_size, cb_size, cu_qp, dep_quant)?;
+    let leaf = prepare_leaf_cu(src, rec, x, y, cb_size, cb_size, cu_qp, rc_opts)?;
     let leaf_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
     let leaf_bits = measure_cu_bits(&leaf, slice_qp_y, rc_opts)?;
     trials.push(Trial {
@@ -889,8 +886,8 @@ fn prepare_cu_with_mtt_picker(
     if try_bt {
         // --- BT_VERT (two 32×64 sub-CUs) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp, dep_quant)?;
-        let bt_v_b = prepare_leaf_cu(src, rec, x + half, y, half, cb_size, cu_qp, dep_quant)?;
+        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp, rc_opts)?;
+        let bt_v_b = prepare_leaf_cu(src, rec, x + half, y, half, cb_size, cu_qp, rc_opts)?;
         let bt_v_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let bt_v_cu = PreparedCu::BtSplit {
             dir: crate::syntax_enc::MttSplitDir::Vertical,
@@ -910,8 +907,8 @@ fn prepare_cu_with_mtt_picker(
 
         // --- BT_HORZ (two 64×32 sub-CUs) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp, dep_quant)?;
-        let bt_h_b = prepare_leaf_cu(src, rec, x, y + half, cb_size, half, cu_qp, dep_quant)?;
+        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp, rc_opts)?;
+        let bt_h_b = prepare_leaf_cu(src, rec, x, y + half, cb_size, half, cu_qp, rc_opts)?;
         let bt_h_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let bt_h_cu = PreparedCu::BtSplit {
             dir: crate::syntax_enc::MttSplitDir::Horizontal,
@@ -933,8 +930,8 @@ fn prepare_cu_with_mtt_picker(
     if try_tt {
         // --- TT_VERT (16×64, 32×64, 16×64 — 1:2:1 ratio) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let tt_v_a = prepare_leaf_cu(src, rec, x, y, quarter, cb_size, cu_qp, dep_quant)?;
-        let tt_v_b = prepare_leaf_cu(src, rec, x + quarter, y, half, cb_size, cu_qp, dep_quant)?;
+        let tt_v_a = prepare_leaf_cu(src, rec, x, y, quarter, cb_size, cu_qp, rc_opts)?;
+        let tt_v_b = prepare_leaf_cu(src, rec, x + quarter, y, half, cb_size, cu_qp, rc_opts)?;
         let tt_v_c = prepare_leaf_cu(
             src,
             rec,
@@ -943,7 +940,7 @@ fn prepare_cu_with_mtt_picker(
             quarter,
             cb_size,
             cu_qp,
-            dep_quant,
+            rc_opts,
         )?;
         let tt_v_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let tt_v_cu = PreparedCu::TtSplit {
@@ -965,8 +962,8 @@ fn prepare_cu_with_mtt_picker(
 
         // --- TT_HORZ (64×16, 64×32, 64×16 — 1:2:1 ratio) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let tt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, quarter, cu_qp, dep_quant)?;
-        let tt_h_b = prepare_leaf_cu(src, rec, x, y + quarter, cb_size, half, cu_qp, dep_quant)?;
+        let tt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, quarter, cu_qp, rc_opts)?;
+        let tt_h_b = prepare_leaf_cu(src, rec, x, y + quarter, cb_size, half, cu_qp, rc_opts)?;
         let tt_h_c = prepare_leaf_cu(
             src,
             rec,
@@ -975,7 +972,7 @@ fn prepare_cu_with_mtt_picker(
             cb_size,
             quarter,
             cu_qp,
-            dep_quant,
+            rc_opts,
         )?;
         let tt_h_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let tt_h_cu = PreparedCu::TtSplit {
@@ -1526,6 +1523,13 @@ pub fn encode_idr_with_qp_picker_cfg(
         src
     };
 
+    // §7.3.7 residual-coding switches, live through the first-pass
+    // quantisers and every residual emit below.
+    let rc_opts = crate::residual::RcOpts {
+        dep_quant: config.dep_quant,
+        sign_data_hiding: config.sign_data_hiding,
+    };
+
     // --- Emit header NALs (VPS + SPS + PPS + PH) ---
     let mut bitstream = Vec::<u8>::new();
 
@@ -1637,18 +1641,11 @@ pub fn encode_idr_with_qp_picker_cfg(
                             slice_qp_y,
                             config.enable_mtt_bt_picker,
                             config.enable_mtt_tt_picker,
-                            config.dep_quant,
+                            rc_opts,
                         )?
                     } else {
                         prepare_leaf_cu(
-                            coding_src,
-                            &mut rec,
-                            tb_x,
-                            tb_y,
-                            n_tb_sq,
-                            n_tb_sq,
-                            cu_qp,
-                            config.dep_quant,
+                            coding_src, &mut rec, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp, rc_opts,
                         )?
                     };
 
@@ -2251,11 +2248,6 @@ pub fn encode_idr_with_qp_picker_cfg(
         sh_cabac_init_flag: false,
     };
 
-    // §7.3.7 residual-coding switches for every residual emit below.
-    let rc_opts = crate::residual::RcOpts {
-        dep_quant: config.dep_quant,
-        sign_data_hiding: false,
-    };
     let mut cabac_enc = ArithEncoder::new();
     // Round-56 — picture-wide neighbour map for the §9.3.4.2 ctxInc
     // derivations. `cu_map` is the *read-only* snapshot the current
@@ -2854,7 +2846,17 @@ mod tests {
     fn prepare_chroma_tb_flat_block_yields_zero_levels() {
         let src = PicturePlane::filled(8, 8, 128);
         let mut rec = PicturePlane::filled(8, 8, 0);
-        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 4, 26, false).unwrap();
+        let levels = prepare_chroma_tb(
+            &src,
+            &mut rec,
+            0,
+            0,
+            4,
+            4,
+            26,
+            crate::residual::RcOpts::default(),
+        )
+        .unwrap();
         assert!(
             levels.iter().all(|&l| l == 0),
             "got non-zero level: {levels:?}"
@@ -2881,7 +2883,17 @@ mod tests {
             }
         }
         let mut rec = PicturePlane::filled(8, 8, 0);
-        let levels = prepare_chroma_tb(&src, &mut rec, 0, 0, 4, 4, 26, false).unwrap();
+        let levels = prepare_chroma_tb(
+            &src,
+            &mut rec,
+            0,
+            0,
+            4,
+            4,
+            26,
+            crate::residual::RcOpts::default(),
+        )
+        .unwrap();
         assert!(
             levels.iter().any(|&l| l != 0),
             "expected at least one non-zero level on non-flat input, got all zeros"

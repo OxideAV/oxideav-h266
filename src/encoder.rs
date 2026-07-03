@@ -319,6 +319,15 @@ pub struct EncoderConfig {
     /// `sps_dep_quant_enabled_flag = 1` + `sh_dep_quant_used_flag = 1`
     /// on the wire. Default `false`.
     pub dep_quant: bool,
+    /// Round-387 — opt-in **sign data hiding**
+    /// (`sh_sign_data_hiding_used_flag = 1`, mutually exclusive with
+    /// [`Self::dep_quant`] per §7.3.7). The pipeline parity-conditions
+    /// every quantised sub-block whose significant span exceeds 3
+    /// ([`crate::residual_enc::condition_levels_for_sdh`]) so the first
+    /// significant sign is recoverable from the absolute-level-sum
+    /// parity, and signals `sps_sign_data_hiding_enabled_flag = 1` +
+    /// the SH bit. Default `false`.
+    pub sign_data_hiding: bool,
 }
 
 impl EncoderConfig {
@@ -334,6 +343,7 @@ impl EncoderConfig {
             enable_mtt_tt_picker: false,
             lmcs: None,
             dep_quant: false,
+            sign_data_hiding: false,
         }
     }
 
@@ -352,6 +362,11 @@ impl EncoderConfig {
         if self.bit_depth != 8 {
             return Err(Error::unsupported(
                 "h266 encoder: only 8-bit is supported by the scaffold",
+            ));
+        }
+        if self.dep_quant && self.sign_data_hiding {
+            return Err(Error::invalid(
+                "h266 encoder: dep_quant and sign_data_hiding are mutually exclusive (§7.3.7)",
             ));
         }
         if self.chroma_format_idc != 1 {
@@ -609,7 +624,7 @@ impl VvcEncoder {
         bw.write_bit(0); // ladf
         bw.write_bit(0); // explicit_scaling_list
         bw.write_bit(self.config.dep_quant as u8); // sps_dep_quant_enabled_flag
-        bw.write_bit(0); // sign_data_hiding
+        bw.write_bit(self.config.sign_data_hiding as u8); // sps_sign_data_hiding_enabled_flag
         bw.write_bit(0); // virtual_boundaries_enabled
 
         bw.write_bit(0); // sps_field_seq_flag
@@ -785,6 +800,11 @@ impl VvcEncoder {
         // closed (SPS + PPS gates 0).
         if self.config.dep_quant {
             bw.write_bit(1); // sh_dep_quant_used_flag = 1
+        }
+        if self.config.sign_data_hiding {
+            // sps_sign_data_hiding_enabled_flag == 1 and (by config
+            // validation) sh_dep_quant_used_flag == 0.
+            bw.write_bit(1); // sh_sign_data_hiding_used_flag = 1
         }
         //
         // byte_alignment() — stop bit + zero pad; CABAC starts after.

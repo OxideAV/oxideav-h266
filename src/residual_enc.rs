@@ -674,6 +674,69 @@ pub fn encode_tb_coefficients_opts(
     Ok(())
 }
 
+/// Round-387 — condition a quantised `TransCoeffLevel` array so it is
+/// encodable under **sign data hiding** (`sh_sign_data_hiding_used_flag
+/// = 1`).
+///
+/// For every 4×4 coefficient sub-block whose significant scan span
+/// exceeds 3 (the §7.3.11.11 `signHiddenFlag` condition), the decoder
+/// infers the sign of the first significant coefficient from the parity
+/// of the sub-block absolute-level sum (negative ⇔ odd). When the
+/// quantiser's parity disagrees, this helper nudges ONE level by one
+/// step: the last-significant (highest scan index) coefficient's
+/// magnitude is decremented when it can afford it (`|level| > 1`, rate
+/// win) and incremented otherwise — either flips the parity without
+/// moving `firstSigScanPosSb` / `lastSigScanPosSb` or the coded
+/// sub-block set.
+///
+/// Returns the number of adjusted coefficients.
+pub fn condition_levels_for_sdh(levels: &mut [i32], n_tb_w: usize, n_tb_h: usize) -> usize {
+    debug_assert_eq!(levels.len(), n_tb_w * n_tb_h);
+    let positions = coeff_scan_positions(n_tb_w, n_tb_h);
+    let (num_sb_w, num_sb_h) = sb_grid(n_tb_w, n_tb_h);
+    let mut adjusted = 0usize;
+    for sb_idx in 0..(num_sb_w * num_sb_h) {
+        let start = sb_idx * 16;
+        let end = (start + 16).min(positions.len());
+        let mut first_sig: i32 = (end - start) as i32;
+        let mut last_sig: i32 = -1;
+        let mut sum_abs: u64 = 0;
+        for k in 0..(end - start) {
+            let (xc, yc) = positions[start + k];
+            let idx = (yc as usize) * n_tb_w + (xc as usize);
+            let a = levels[idx].unsigned_abs();
+            if a > 0 {
+                if last_sig < k as i32 {
+                    last_sig = k as i32;
+                }
+                if first_sig > k as i32 {
+                    first_sig = k as i32;
+                }
+                sum_abs += a as u64;
+            }
+        }
+        if last_sig - first_sig <= 3 {
+            continue; // signHiddenFlag == 0 — all signs coded explicitly.
+        }
+        let (fx, fy) = positions[start + first_sig as usize];
+        let hidden_neg = levels[(fy as usize) * n_tb_w + (fx as usize)] < 0;
+        if (sum_abs % 2 == 1) == hidden_neg {
+            continue; // parity already encodes the hidden sign.
+        }
+        // Nudge the last-significant coefficient by one step.
+        let (lx, ly) = positions[start + last_sig as usize];
+        let idx = (ly as usize) * n_tb_w + (lx as usize);
+        let l = levels[idx];
+        levels[idx] = if l.abs() > 1 {
+            l - l.signum()
+        } else {
+            l + l.signum()
+        };
+        adjusted += 1;
+    }
+    adjusted
+}
+
 // ------------------------------------------------------------------
 // Internal helpers
 // ------------------------------------------------------------------
@@ -1171,6 +1234,46 @@ mod tests {
                                // A later sub-block with a short span: explicit signs.
         levels[4] = -6; // (4,0) — second 4×4 sub-block
         assert_eq!(roundtrip_opts(&levels, 8, 8, 0, opts), levels);
+    }
+
+    /// `condition_levels_for_sdh` fixes the parity of every hidden-sign
+    /// sub-block with a one-step nudge and leaves conforming blocks
+    /// untouched.
+    #[test]
+    fn sdh_conditioner_fixes_parity_with_one_step() {
+        let mut state = 0xBEEFu32;
+        let mut rand = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state >> 16
+        };
+        for _ in 0..50 {
+            let (w, h) = (8usize, 8usize);
+            let mut levels = vec![0i32; w * h];
+            for l in levels.iter_mut() {
+                let r = rand();
+                *l = if r % 2 == 0 {
+                    0
+                } else {
+                    ((r % 9) as i32 + 1) * (if (r >> 8) & 1 == 1 { -1 } else { 1 })
+                };
+            }
+            let before = levels.clone();
+            let adjusted = condition_levels_for_sdh(&mut levels, w, h);
+            // Total distortion: exactly one ±1 step per adjusted sub-block.
+            let moved: i32 = levels.iter().zip(&before).map(|(a, b)| (a - b).abs()).sum();
+            assert_eq!(moved as usize, adjusted);
+            // Every hidden-sign sub-block now satisfies the parity rule —
+            // proven by the writer accepting the array and the reader
+            // recovering it bit-exactly.
+            let opts = RcOpts {
+                dep_quant: false,
+                sign_data_hiding: true,
+            };
+            if levels.iter().all(|&l| l == 0) {
+                continue;
+            }
+            assert_eq!(roundtrip_opts(&levels, w, h, 0, opts), levels);
+        }
     }
 
     /// dep_quant + sign_data_hiding cannot both be requested (§7.3.7
