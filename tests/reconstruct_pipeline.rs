@@ -159,6 +159,78 @@ fn decode_picture_into_64x64_zero_stream() {
     );
 }
 
+/// Round-384 — the same zero-stream decode with `sh_lmcs_used_flag = 1`
+/// and a bound LMCS APS payload: every leaf is intra, so the §8.7.5.2
+/// mapped-domain reconstruction is a pass-through and the pre-filter
+/// pixels match the non-LMCS decode bit-exactly; `apply_in_loop_filters`
+/// then runs the §8.8.1 step-1 picture inverse mapping, which must equal
+/// the per-sample §8.8.2.2 fold of the non-LMCS reconstruction.
+#[test]
+fn decode_picture_into_zero_stream_with_lmcs_inverse_maps_in_loop() {
+    use oxideav_h266::lmcs::{LmcsData, LMCS_NUM_BINS};
+
+    let sps = dummy_sps(0, 64, 64);
+    let pps = dummy_pps(64, 64);
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let payload = [0u8; 1024];
+
+    // Baseline decode (LMCS off).
+    let sh = intra_slice_header();
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut base = PictureBuffer::yuv420_filled(64, 64, 0);
+    walker.decode_picture_into(&mut base).unwrap();
+
+    // LMCS decode: bin 0 shrunk to 8 codewords, other bins at OrgCW.
+    let mut abs_cw = [0u32; LMCS_NUM_BINS];
+    let mut sign_cw = [false; LMCS_NUM_BINS];
+    abs_cw[0] = 8;
+    sign_cw[0] = true;
+    let lmcs = LmcsData {
+        lmcs_min_bin_idx: 0,
+        lmcs_delta_max_bin_idx: 0,
+        lmcs_delta_cw_prec_minus1: 3,
+        lmcs_delta_abs_cw: abs_cw,
+        lmcs_delta_sign_cw_flag: sign_cw,
+        lmcs_delta_abs_crs: 0,
+        lmcs_delta_sign_crs_flag: false,
+    };
+    let mut sh_lmcs = intra_slice_header();
+    sh_lmcs.sh_lmcs_used_flag = true;
+    // Disable deblocking so the in-loop chain is exactly the §8.8.1
+    // step-1 inverse mapping (SAO / ALF are already no-ops with the
+    // default empty per-CTB params).
+    sh_lmcs.sh_deblocking_filter_disabled_flag = true;
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh_lmcs, 0, &payload).unwrap();
+    walker.set_lmcs(&lmcs, false).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(64, 64, 0);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // Intra-only picture — §8.7.5.2 pass-through means the pre-filter
+    // reconstruction matches the baseline bit-exactly.
+    assert_eq!(out.luma.samples, base.luma.samples);
+    assert_eq!(out.cb.samples, base.cb.samples);
+
+    // §8.8.1 step 1 — the loop-filter stack inverse-maps the luma.
+    walker.apply_in_loop_filters(&mut out).unwrap();
+    let derived = lmcs.derive(8).unwrap();
+    let mut changed = false;
+    for (i, (&got, &pre)) in out
+        .luma
+        .samples
+        .iter()
+        .zip(base.luma.samples.iter())
+        .enumerate()
+    {
+        let iy = derived.idx_y_inv(u32::from(pre), 0, 15);
+        let expect = derived.inverse_map_luma_sample(u32::from(pre), iy) as u8;
+        assert_eq!(got, expect, "inverse-mapped luma sample {i}");
+        if got != pre {
+            changed = true;
+        }
+    }
+    assert!(changed, "the non-identity mapping must move some samples");
+}
+
 /// Smaller (32x32) single-CTU picture: makes sure
 /// `decode_picture_into` works for the smallest legal CTU layout
 /// `CtbLog2SizeY = 5`.

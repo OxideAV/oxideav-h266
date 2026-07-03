@@ -10140,6 +10140,150 @@ mod tests {
     }
 
     #[test]
+    fn lmcs_inverse_map_pass_bd10_uses_lifted_samples() {
+        // Main10 — the u8 plane stores narrowed samples; the §8.8.2
+        // pass must lift by `BitDepth − 8`, run the 10-bit fold, and
+        // narrow back. BD-10 payload: OrgCW = 64, bin 0 shrunk by 8
+        // (lmcsCW[0] = 56, Σ = 1016 <= 1023). A narrowed sample 10
+        // (10-bit 40, bin 0) inverse-maps through InvScaleCoeff[0] =
+        // 64·2048/56 = 2340: (2340·40 + 1024) >> 11 = 46 → narrowed 11.
+        let mut sps = dummy_sps(2, 64, 64);
+        sps.sps_bitdepth_minus8 = 2;
+        let pps = dummy_pps(64, 64, true);
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let mut sh = intra_slice_header();
+        sh.sh_lmcs_used_flag = true;
+        let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut abs_cw = [0u32; crate::lmcs::LMCS_NUM_BINS];
+        let mut sign_cw = [false; crate::lmcs::LMCS_NUM_BINS];
+        abs_cw[0] = 8;
+        sign_cw[0] = true; // lmcsCW[0] = 64 − 8 = 56.
+        let lmcs = LmcsData {
+            lmcs_min_bin_idx: 0,
+            lmcs_delta_max_bin_idx: 0,
+            lmcs_delta_cw_prec_minus1: 3,
+            lmcs_delta_abs_cw: abs_cw,
+            lmcs_delta_sign_cw_flag: sign_cw,
+            lmcs_delta_abs_crs: 0,
+            lmcs_delta_sign_crs_flag: false,
+        };
+        w.set_lmcs(&lmcs, false).unwrap();
+
+        let mut out = PictureBuffer::yuv420_filled(64, 64, 10);
+        w.apply_in_loop_filters(&mut out).unwrap();
+
+        // Every sample was the narrowed 10 → all inverse-map to 11.
+        let derived = lmcs.derive(10).unwrap();
+        let iy = derived.idx_y_inv(40, 0, 15);
+        assert_eq!(iy, 0);
+        assert_eq!(derived.inverse_map_luma_sample(40, iy), 46);
+        assert!(out.luma.samples.iter().all(|&v| v == 11));
+    }
+
+    #[test]
+    fn lmcs_chroma_scaling_averages_top_neighbour_luma() {
+        // §8.7.5.3 step 1, availT arm — a CU at (0, 64) has its
+        // sizeY(=64)-aligned corner at (0, 64): availL is false
+        // (x == 0) but availT holds, so the top row y = 63 of
+        // mapped-domain luma is averaged. Payload and expectations
+        // mirror the availL test (top row seeded 60 → varScale 1638;
+        // the mid-grey fallback would fold as identity 2048).
+        let pic_w = 64u32;
+        let pic_h = 128u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        sh.sh_lmcs_used_flag = true;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        let mut abs_cw = [0u32; crate::lmcs::LMCS_NUM_BINS];
+        let mut sign_cw = [false; crate::lmcs::LMCS_NUM_BINS];
+        for i in 8..16 {
+            abs_cw[i] = 4;
+            sign_cw[i] = true; // lmcsCW[8..=15] = 12.
+        }
+        let lmcs = LmcsData {
+            lmcs_min_bin_idx: 0,
+            lmcs_delta_max_bin_idx: 0,
+            lmcs_delta_cw_prec_minus1: 3,
+            lmcs_delta_abs_cw: abs_cw,
+            lmcs_delta_sign_cw_flag: sign_cw,
+            lmcs_delta_abs_crs: 4,
+            lmcs_delta_sign_crs_flag: false,
+        };
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 1,
+            cu: Cu {
+                x: 0,
+                y: 64,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 64,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = true;
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8;
+
+        walker.set_lmcs(&lmcs, false).unwrap();
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 60);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_off)
+            .expect("recon with chroma scaling off");
+
+        walker.set_lmcs(&lmcs, true).unwrap();
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 60);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_on)
+            .expect("recon with chroma scaling on");
+
+        let var_scale = 16u64 * 2048 / 20;
+        let stride = out_off.cb.stride;
+        let c_y = 32usize; // 64 / 2
+        let mut diff_seen = false;
+        for row in 0..8usize {
+            for col in 0..8usize {
+                let idx = (c_y + row) * stride + col;
+                let off = i64::from(out_off.cb.samples[idx]);
+                let res = off - 128;
+                let mag = ((res.unsigned_abs() * var_scale) + 1024) >> 11;
+                let scaled = if res < 0 { -(mag as i64) } else { mag as i64 };
+                let expect = (128 + scaled).clamp(0, 255) as u8;
+                let got = out_on.cb.samples[idx];
+                assert_eq!(got, expect, "scaled Cb at ({col}, {row})");
+                if got != out_off.cb.samples[idx] {
+                    diff_seen = true;
+                }
+            }
+        }
+        assert!(diff_seen, "top-average varScale must differ from identity");
+    }
+
+    #[test]
     fn set_lmcs_rejects_nonconforming_payload() {
         // The all-defaults full-window payload derives `lmcsCW[i] =
         // OrgCW` for all 16 bins, so `Σ lmcsCW = 1 << BitDepth` — one
