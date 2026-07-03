@@ -34,10 +34,17 @@
 //!   * A final per-sub-block sign-flag pass (bypass-coded) signs the
 //!     accumulated levels.
 //!
-//! Scope restrictions: `sh_dep_quant_used_flag = 0` (QState stays 0),
+//! Dependent quantization (`sh_dep_quant_used_flag = 1`, §7.4.12.11
+//! eq. 198 QState trellis + QState-dependent §9.3.4.2.8 ctxInc /
+//! §9.3.3.12 `ZeroPos` / `(2 * AbsLevel − (QState > 1)) * sign`
+//! reconstruction) and sign data hiding
+//! (`sh_sign_data_hiding_used_flag = 1`, `signHiddenFlag` + sub-block
+//! parity sign inference) are live through [`RcOpts`] /
+//! [`decode_tb_coefficients_opts`].
+//!
+//! Scope restrictions:
 //! `transform_skip_flag = 0` (regular residual coding only, no TS
 //! ctxInc variants §9.3.4.2.8 eq. 1572 / §9.3.4.2.9 eqs. 1575..1581),
-//! `sh_sign_data_hiding_used_flag = 0` (no signHiddenFlag path),
 //! `sps_persistent_rice_adaptation_enabled_flag = 0` (`HistValue = 0`),
 //! `sps_rrc_rice_extension_flag = 0` (`shiftVal = 0`), and zero-out
 //! off (`Log2ZoTb{W,H}` = full TB log2 sizes). Dequantisation
@@ -278,6 +285,10 @@ pub fn read_last_sig_coeff_pos(
 }
 
 /// Read the TR-binarised context-coded `last_sig_coeff_*_prefix` bins.
+///
+/// §9.3.3.6 TR with `cRiceParam = 0`: at most `cMax` prefix bins are
+/// coded and the terminating 0-bin is **absent** when the prefix value
+/// equals `cMax` (the all-ones codeword is self-delimiting).
 fn read_last_sig_prefix(
     dec: &mut ArithDecoder<'_>,
     ctxs: &mut [ContextModel],
@@ -287,8 +298,8 @@ fn read_last_sig_prefix(
 ) -> Result<u32> {
     let n = ctxs.len() - 1;
     let mut prefix = 0u32;
-    for bin_idx in 0..=c_max {
-        let inc = ctx_inc_last_sig_coeff_prefix(bin_idx, c_idx, log2_tb_size) as usize;
+    while prefix < c_max {
+        let inc = ctx_inc_last_sig_coeff_prefix(prefix, c_idx, log2_tb_size) as usize;
         let bit = dec.decode_decision(&mut ctxs[inc.min(n)])?;
         if bit == 0 {
             break;
@@ -390,14 +401,12 @@ pub fn decode_exp_golomb_k(dec: &mut ArithDecoder<'_>, k: u32) -> Result<u32> {
 ///
 /// Then a per-sub-block sign-flag pass (bypass-coded) recovers signs.
 ///
-/// Restrictions vs. full spec:
-/// * `sh_dep_quant_used_flag = 0` — QState remains 0 throughout; the
-///   dequant Q-state transition table is not wired.
+/// Restrictions vs. full spec (the flag-less entry points; dependent
+/// quantization and sign data hiding are live via
+/// [`decode_tb_coefficients_opts`] + [`RcOpts`]):
 /// * `transform_skip_flag = 0` — transform-skip residual coding uses a
 ///   different ctxInc regime (§9.3.4.2.8 eq. 1572, §9.3.4.2.9 eqs.
 ///   1575..1581) that is out of scope for this round.
-/// * `sh_sign_data_hiding_used_flag = 0` — the pseudo-code's
-///   `signHiddenFlag` branch is bypassed.
 /// * `sps_persistent_rice_adaptation_enabled_flag = 0` — `HistValue`
 ///   stays at 0 for the §9.3.3.2 neighbourhood fallback.
 /// * Zero-out (`MTS`, `SBT`) is treated as no-op: `Log2Zo{Tb}{Width,Height}`
@@ -485,6 +494,72 @@ pub fn decode_tb_coefficients_with_flags(
     n_tb_h: usize,
     c_idx: u32,
 ) -> Result<(Vec<i32>, TbResidualFlags)> {
+    decode_tb_coefficients_opts(dec, ctxs, n_tb_w, n_tb_h, c_idx, RcOpts::default())
+}
+
+/// §7.4.12.11 eq. 198 — `QStateTransTable[][]` for dependent
+/// quantization (`sh_dep_quant_used_flag == 1`).
+///
+/// The spec prints the array literal as two rows of four entries; read
+/// with the row selecting the level **parity** (`AbsLevel & 1`) and the
+/// column selecting the current `QState`, the machine is the four-state
+/// trellis whose quantizer selection is the `QState > 1` offset used by
+/// the §7.3.11.11 `TransCoeffLevel` reconstruction and the §9.3.3.12
+/// eq. 1536 `ZeroPos` derivation (`QState < 2 ? 1 : 2`). (The transposed
+/// `[state][parity]` reading of the same literal would leave states 1
+/// and 3 unreachable from the initial `QState = 0`, degenerating to a
+/// two-state machine, so it cannot be the intended one.) Indexing here:
+/// `Q_STATE_TRANS_TABLE[parity][state]`.
+pub(crate) const Q_STATE_TRANS_TABLE: [[i32; 4]; 2] = [[0, 2, 1, 3], [2, 0, 3, 1]];
+
+/// Advance the §7.4.12.11 dependent-quantization state machine by one
+/// coefficient of the given absolute level.
+#[inline]
+pub(crate) fn q_state_advance(q_state: i32, abs_level: u32) -> i32 {
+    Q_STATE_TRANS_TABLE[(abs_level & 1) as usize][(q_state & 3) as usize]
+}
+
+/// Slice-level residual-coding switches threaded into
+/// [`decode_tb_coefficients_opts`] (§7.3.11.11).
+///
+/// * `dep_quant` — `sh_dep_quant_used_flag`: drives the QState trellis
+///   ([`Q_STATE_TRANS_TABLE`]), the QState-dependent `sig_coeff_flag`
+///   ctxInc terms (§9.3.4.2.8 eqs. 1573 / 1574), the `ZeroPos`
+///   derivation (§9.3.3.12 eq. 1536) and the
+///   `TransCoeffLevel = (2 * AbsLevel − (QState > 1)) * sign` final
+///   reconstruction.
+/// * `sign_data_hiding` — `sh_sign_data_hiding_used_flag`: the
+///   `signHiddenFlag` sub-block condition
+///   (`lastSigScanPosSb − firstSigScanPosSb > 3`) suppresses the
+///   `coeff_sign_flag` bin of the first significant coefficient in scan
+///   order, whose sign is instead the parity of the sub-block's
+///   absolute-level sum.
+///
+/// The two are mutually exclusive by syntax: §7.3.7 only transmits
+/// `sh_sign_data_hiding_used_flag` when `sh_dep_quant_used_flag == 0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RcOpts {
+    pub dep_quant: bool,
+    pub sign_data_hiding: bool,
+}
+
+/// Like [`decode_tb_coefficients_with_flags`] but with the slice-level
+/// residual-coding switches ([`RcOpts`]) live: dependent quantization
+/// (`sh_dep_quant_used_flag`) and sign data hiding
+/// (`sh_sign_data_hiding_used_flag`).
+pub fn decode_tb_coefficients_opts(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut ResidualCtxs,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    c_idx: u32,
+    opts: RcOpts,
+) -> Result<(Vec<i32>, TbResidualFlags)> {
+    if opts.dep_quant && opts.sign_data_hiding {
+        return Err(Error::invalid(
+            "h266 residual: dep_quant and sign_data_hiding are mutually exclusive (§7.3.7)",
+        ));
+    }
     if !n_tb_w.is_power_of_two() || !n_tb_h.is_power_of_two() {
         return Err(Error::invalid(
             "h266 residual: nTbW / nTbH must be power of two",
@@ -558,7 +633,9 @@ pub fn decode_tb_coefficients_with_flags(
     // Track which sub-blocks are coded (for the csbfCtx neighbour).
     let mut sb_coded = vec![false; num_sb_w * num_sb_h];
 
-    let q_state: i32 = 0; // dep_quant off
+    // §7.3.11.11 — the dependent-quantization state. Stays 0 for the
+    // whole TB when `sh_dep_quant_used_flag == 0`.
+    let mut q_state: i32 = 0;
 
     // Walk sub-blocks in reverse diagonal scan order starting at
     // last_sb_idx. Sub-block 0 and `last_sb_idx` are inferred coded.
@@ -568,6 +645,10 @@ pub fn decode_tb_coefficients_with_flags(
         let right = xs + 1 < num_sb_w && sb_coded[ys * num_sb_w + (xs + 1)];
         let below = ys + 1 < num_sb_h && sb_coded[(ys + 1) * num_sb_w + xs];
         let csbf = csbf_ctx_regular(right, below);
+
+        // §7.3.11.11 `startQStateSb` — the reconstruction pass at the
+        // end of the sub-block restarts the trellis from here.
+        let start_q_state_sb = q_state;
 
         let is_inferred = sb_idx == last_sb_idx || sb_idx == 0;
         let coded = if is_inferred {
@@ -585,12 +666,23 @@ pub fn decode_tb_coefficients_with_flags(
             flags.mts_zero_out_sig_coeff_flag = false;
         }
         if !coded {
+            // §7.3.11.11 still walks the per-position QState updates of
+            // an uncoded sub-block, but every AbsLevel is 0 and the
+            // parity-0 transition permutation is (0)(3)(1 2), so the
+            // even sub-block coefficient count (16 or 4) returns QState
+            // to `start_q_state_sb`. Skipping the walk is exact.
             continue;
         }
 
         let start = sb_idx * 16;
         let end = (start + 16).min(positions.len());
         let num_sb_coeff = end - start;
+
+        // §7.3.11.11 `firstSigScanPosSb` / `lastSigScanPosSb` — the
+        // scan-index extremes of the significant coefficients in this
+        // sub-block, driving the sign-data-hiding `signHiddenFlag`.
+        let mut first_sig_scan_pos_sb: i32 = num_sb_coeff as i32;
+        let mut last_sig_scan_pos_sb: i32 = -1;
 
         // infer_sb_dc_sig_coeff_flag is true when this sub-block is
         // neither the last-sig sub-block nor the DC sub-block
@@ -689,10 +781,23 @@ pub fn decode_tb_coefficients_with_flags(
                     rem_bins_pass1 -= 1;
                 }
             }
+            if sig {
+                // §7.3.11.11 — first/last significant scan positions
+                // (pass-1 arm).
+                if last_sig_scan_pos_sb == -1 {
+                    last_sig_scan_pos_sb = n;
+                }
+                first_sig_scan_pos_sb = n;
+            }
             // AbsLevelPass1[xC][yC] = sig + par + gt1 + 2*gt3.
             let a1 = sig as u32 + par as u32 + gt1 as u32 + 2 * gt3 as u32;
             abs_level_pass1[(yc as usize) * n_tb_w + (xc as usize)] = a1;
             abs_level[(yc as usize) * n_tb_w + (xc as usize)] = a1;
+            if opts.dep_quant {
+                // QState = QStateTransTable[QState][AbsLevelPass1 & 1]
+                // (§7.3.11.11 pass-1 arm).
+                q_state = q_state_advance(q_state, a1);
+            }
             first_pos_mode1 = n - 1;
             n -= 1;
         }
@@ -752,18 +857,75 @@ pub fn decode_tb_coefficients_with_flags(
             if a > 0 {
                 abs_level[(yc as usize) * n_tb_w + (xc as usize)] = a;
                 sig_flag[(yc as usize) * n_tb_w + (xc as usize)] = true;
+                // §7.3.11.11 — first/last significant scan positions
+                // (pass-3 arm).
+                if last_sig_scan_pos_sb == -1 {
+                    last_sig_scan_pos_sb = n3;
+                }
+                first_sig_scan_pos_sb = n3;
+            }
+            if opts.dep_quant {
+                // QState = QStateTransTable[QState][AbsLevel & 1]
+                // (§7.3.11.11 pass-3 arm).
+                q_state = q_state_advance(q_state, a);
             }
         }
 
-        // Per-sb sign-flag pass (bypass-coded in regular RC).
+        // §7.3.11.11 `signHiddenFlag` — hide the sign bin of the first
+        // significant coefficient in scan order when the significant
+        // span of the sub-block exceeds 3.
+        let sign_hidden =
+            opts.sign_data_hiding && (last_sig_scan_pos_sb - first_sig_scan_pos_sb > 3);
+
+        // Per-sb sign-flag pass (bypass-coded in regular RC). Signs are
+        // collected first; the TransCoeffLevel reconstruction below
+        // needs the dep-quant trellis re-walk / SDH parity fold.
+        let mut sign_neg = [false; 16];
         for k in (0..num_sb_coeff).rev() {
             let pos_idx = start + k;
             let (xc, yc) = positions[pos_idx];
             let a = abs_level[(yc as usize) * n_tb_w + (xc as usize)];
-            if a > 0 {
-                let sign = dec.decode_bypass()?;
-                let signed = if sign == 1 { -(a as i32) } else { a as i32 };
-                out[(yc as usize) * n_tb_w + (xc as usize)] = signed;
+            if a > 0 && (!sign_hidden || k as i32 != first_sig_scan_pos_sb) {
+                sign_neg[k] = dec.decode_bypass()? == 1;
+            }
+        }
+
+        if opts.dep_quant {
+            // §7.3.11.11 — TransCoeffLevel[..] =
+            //   (2 * AbsLevel − (QState > 1 ? 1 : 0)) * (1 − 2 * sign),
+            // re-walking the trellis from `startQStateSb` over every
+            // scan position of the sub-block.
+            let mut q = start_q_state_sb;
+            for k in (0..num_sb_coeff).rev() {
+                let pos_idx = start + k;
+                let (xc, yc) = positions[pos_idx];
+                let a = abs_level[(yc as usize) * n_tb_w + (xc as usize)];
+                if a > 0 {
+                    let mag = 2 * (a as i32) - i32::from(q > 1);
+                    out[(yc as usize) * n_tb_w + (xc as usize)] =
+                        if sign_neg[k] { -mag } else { mag };
+                }
+                q = q_state_advance(q, a);
+            }
+        } else {
+            // §7.3.11.11 — TransCoeffLevel = AbsLevel * (1 − 2 * sign),
+            // with the hidden sign recovered from the parity of the
+            // sub-block absolute-level sum.
+            let mut sum_abs_level: u64 = 0;
+            for k in (0..num_sb_coeff).rev() {
+                let pos_idx = start + k;
+                let (xc, yc) = positions[pos_idx];
+                let a = abs_level[(yc as usize) * n_tb_w + (xc as usize)];
+                if a > 0 {
+                    let mut v = if sign_neg[k] { -(a as i32) } else { a as i32 };
+                    if sign_hidden {
+                        sum_abs_level += a as u64;
+                        if k as i32 == first_sig_scan_pos_sb && sum_abs_level % 2 == 1 {
+                            v = -v;
+                        }
+                    }
+                    out[(yc as usize) * n_tb_w + (xc as usize)] = v;
+                }
             }
         }
     }
@@ -1540,5 +1702,57 @@ mod tests {
         // coded magnitude 1 has DC predecessor magnitude 3 → lifts to 3.
         assert_eq!(levels[at(1, 0)], -3, "level-prediction fold not applied");
         assert_eq!(levels[at(0, 0)], 3);
+    }
+
+    /// §7.4.12.11 eq. 198 — QStateTransTable structural properties.
+    ///
+    /// * Every state is reachable from the initial `QState = 0` (the
+    ///   transposed reading of the printed literal would strand states
+    ///   1 and 3 — see the [`Q_STATE_TRANS_TABLE`] doc).
+    /// * State 0 is a parity-0 fixed point, so the reconstruction-pass
+    ///   walk over the never-visited zero positions above the last
+    ///   significant coefficient of the last sub-block is inert.
+    /// * The parity-0 transition is the permutation (0)(3)(1 2): any
+    ///   even-length run of zero levels (e.g. a skipped uncoded 16- or
+    ///   4-coefficient sub-block) returns the trellis to its entry
+    ///   state.
+    #[test]
+    fn q_state_trans_table_properties() {
+        // Reachability from state 0.
+        let mut reached = [false; 4];
+        reached[0] = true;
+        for _ in 0..4 {
+            for s in 0..4i32 {
+                if reached[s as usize] {
+                    reached[q_state_advance(s, 0) as usize] = true;
+                    reached[q_state_advance(s, 1) as usize] = true;
+                }
+            }
+        }
+        assert_eq!(reached, [true; 4], "all four trellis states reachable");
+
+        // Parity-0 fixed point at state 0 + involution on {1, 2}.
+        assert_eq!(q_state_advance(0, 0), 0);
+        assert_eq!(q_state_advance(3, 0), 3);
+        assert_eq!(q_state_advance(1, 0), 2);
+        assert_eq!(q_state_advance(2, 0), 1);
+        for s in 0..4i32 {
+            let mut q = s;
+            for _ in 0..16 {
+                q = q_state_advance(q, 0);
+            }
+            assert_eq!(q, s, "16 zero-parity steps are the identity");
+            let mut q = s;
+            for _ in 0..4 {
+                q = q_state_advance(q, 0);
+            }
+            assert_eq!(q, s, "4 zero-parity steps are the identity");
+        }
+
+        // Parity-1 (odd-level) transitions: 0→2, 1→0, 2→3, 3→1.
+        assert_eq!(q_state_advance(0, 1), 2);
+        assert_eq!(q_state_advance(1, 1), 0);
+        assert_eq!(q_state_advance(2, 1), 3);
+        assert_eq!(q_state_advance(3, 1), 1);
     }
 }

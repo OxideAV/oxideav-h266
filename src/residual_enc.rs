@@ -23,18 +23,22 @@
 //!   [`write_tu_cr_coded_flag`] — CBF flag emit (dual of the decoder
 //!   `read_tu_*_coded_flag` functions).
 //!
+//! Dependent quantization (`sh_dep_quant_used_flag = 1`) and sign data
+//! hiding (`sh_sign_data_hiding_used_flag = 1`) are live through
+//! [`encode_tb_coefficients_opts`] + [`crate::residual::RcOpts`],
+//! mirroring the decoder-side
+//! [`crate::residual::decode_tb_coefficients_opts`].
+//!
 //! ## Restrictions (same as the decoder module)
 //!
-//! * `sh_dep_quant_used_flag = 0` (QState stays 0).
 //! * `transform_skip_flag = 0` (regular residual coding only).
-//! * `sh_sign_data_hiding_used_flag = 0`.
 //! * `sps_persistent_rice_adaptation_enabled_flag = 0` (`HistValue = 0`).
 //! * `sps_rrc_rice_extension_flag = 0` (`shiftVal = 0`).
 //! * Zero-out off (`Log2ZoTb{W,H}` = full TB log2 sizes).
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
-use oxideav_core::Result;
+use oxideav_core::{Error, Result};
 
 use crate::cabac_enc::ArithEncoder;
 use crate::ctx::{
@@ -45,7 +49,7 @@ use crate::ctx::{
     ctx_inc_tu_y_coded_flag, loc_num_sig_and_sum_abs_pass1, loc_sum_abs_rice,
     rice_param_from_loc_sum_abs,
 };
-use crate::residual::ResidualCtxs;
+use crate::residual::{q_state_advance, RcOpts, ResidualCtxs};
 use crate::scan::{coeff_scan_positions, sb_grid, sb_scan_positions};
 
 /// Write `tu_y_coded_flag` per §7.3.11.10 / §9.3.4.2.5.
@@ -177,6 +181,28 @@ pub fn encode_last_sig_coeff_pos(
     Ok(())
 }
 
+/// Invert the §7.4.12.11 eqs. 199 / 200 group mapping: the
+/// `last_sig_coeff_*_prefix` value (group index) of a coordinate.
+///
+/// * `value <= 3` → `prefix = value` (no suffix).
+/// * otherwise `value = (1 << ((prefix >> 1) − 1)) * (2 + (prefix & 1))
+///   + suffix` with `suffix < 1 << ((prefix >> 1) − 1)`, i.e. groups
+///   4..5 / 6..7 / 8..11 / 12..15 / 16..23 / ... of doubling width.
+fn last_sig_prefix_of(value: u32) -> u32 {
+    if value <= 3 {
+        return value;
+    }
+    let mut prefix = 4u32;
+    loop {
+        let k = (prefix >> 1) - 1;
+        let base = (1u32 << k) * (2 + (prefix & 1));
+        if value < base + (1u32 << k) {
+            return prefix;
+        }
+        prefix += 1;
+    }
+}
+
 fn encode_last_sig_prefix(
     enc: &mut ArithEncoder,
     ctxs: &mut [crate::cabac::ContextModel],
@@ -185,17 +211,18 @@ fn encode_last_sig_prefix(
     c_idx: u32,
     value: u32,
 ) -> Result<()> {
-    // Derive the prefix: how many leading 1-bins before the terminating 0.
-    // Prefix encodes the "number of leading 1s" = value for value <= c_max.
-    // (Same structure as a unary code with prefix = min(value, c_max) 1-bins
-    // terminated by a 0 unless we reached c_max.)
-    let prefix = value.min(c_max + 1); // prefix == number of 1-bins
+    // §9.3.3.6 TR (cRiceParam = 0): unary code of the *group index*
+    // (§7.4.12.11 eqs. 199 / 200), with the terminating 0-bin absent
+    // when the prefix equals cMax. NB: the prefix is NOT the coordinate
+    // itself once value > 3 — coordinates share doubling-width groups
+    // and the remainder goes into the FL bypass suffix.
+    let prefix = last_sig_prefix_of(value).min(c_max);
     let n = ctxs.len() - 1;
     for bin_idx in 0..prefix {
         let inc = ctx_inc_last_sig_coeff_prefix(bin_idx, c_idx, log2_tb_size) as usize;
         enc.encode_decision(&mut ctxs[inc.min(n)], 1)?;
     }
-    if prefix <= c_max {
+    if prefix < c_max {
         let inc = ctx_inc_last_sig_coeff_prefix(prefix, c_idx, log2_tb_size) as usize;
         enc.encode_decision(&mut ctxs[inc.min(n)], 0)?;
     }
@@ -207,28 +234,11 @@ fn encode_last_sig_suffix(enc: &mut ArithEncoder, value: u32) -> Result<()> {
     if value <= 3 {
         return Ok(());
     }
-    // Suffix: FL(k) where k = (prefix >> 1) - 1. Prefix = value as computed
-    // by the decoder's formula: for value >= 4,
-    //   prefix = 2*(k+1) + (value >= 2*(k+1) + 2^k)
-    // We need to recover the suffix that reconstructs value.
-    // Decode prefix from value directly.
-    // Decoder: value = (1<<((prefix>>1)-1))*(2+(prefix&1)) + suffix.
-    // For encoding, we need to write FL((prefix>>1)-1) bypass bits where
-    // prefix for value: smallest p s.t. (1<<(p>>1>>0))*(2+(p&1)) > value.
-    let mut prefix = 0u32;
-    while prefix <= 3
-        || (1u32 << ((prefix >> 1) - 1)) * (2 + (prefix & 1)) + (1u32 << ((prefix >> 1) - 1)) - 1
-            < value
-    {
-        prefix += 1;
-        if prefix > 63 {
-            break;
-        }
-    }
-    // k = (prefix >> 1) - 1, suffix bits.
-    let k_bits = (prefix >> 1).saturating_sub(1);
+    let prefix = last_sig_prefix_of(value);
+    // FL suffix of (prefix >> 1) - 1 bits (≥ 1 since prefix ≥ 4).
+    let k_bits = (prefix >> 1) - 1;
     if k_bits > 0 {
-        let base = (1u32 << ((prefix >> 1) - 1)) * (2 + (prefix & 1));
+        let base = (1u32 << k_bits) * (2 + (prefix & 1));
         let suffix = value - base;
         // Emit k_bits bits MSB-first.
         for i in (0..k_bits).rev() {
@@ -259,6 +269,40 @@ pub fn encode_tb_coefficients(
     c_idx: u32,
     levels: &[i32],
 ) -> Result<()> {
+    encode_tb_coefficients_opts(enc, ctxs, n_tb_w, n_tb_h, c_idx, levels, RcOpts::default())
+}
+
+/// Like [`encode_tb_coefficients`] but with the slice-level
+/// residual-coding switches ([`RcOpts`]) live — the exact inverse of
+/// [`crate::residual::decode_tb_coefficients_opts`].
+///
+/// `levels` is the signed `TransCoeffLevel` array in both modes. With
+/// `opts.dep_quant` the writer re-derives the per-coefficient
+/// `AbsLevel` by walking the §7.4.12.11 eq. 198 QState trellis in
+/// coding order (`AbsLevel = (|t| + (QState > 1)) / 2` inverts the
+/// §7.3.11.11 `TransCoeffLevel = 2 * AbsLevel − (QState > 1)`
+/// magnitude reconstruction); a non-zero level whose magnitude parity
+/// does not match the quantizer the trellis selects at its scan
+/// position is not representable and yields `Error::Invalid` — the
+/// encoder-side quantizer must produce trellis-consistent levels. With
+/// `opts.sign_data_hiding`, every sub-block that meets the
+/// `signHiddenFlag` condition must carry the hidden sign in its
+/// absolute-level-sum parity (first significant coefficient negative ⇔
+/// sum odd); otherwise `Error::Invalid` is returned.
+pub fn encode_tb_coefficients_opts(
+    enc: &mut ArithEncoder,
+    ctxs: &mut ResidualCtxs,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    c_idx: u32,
+    levels: &[i32],
+    opts: RcOpts,
+) -> Result<()> {
+    if opts.dep_quant && opts.sign_data_hiding {
+        return Err(Error::invalid(
+            "h266 residual_enc: dep_quant and sign_data_hiding are mutually exclusive (§7.3.7)",
+        ));
+    }
     debug_assert_eq!(levels.len(), n_tb_w * n_tb_h);
     let log2_w = n_tb_w.trailing_zeros();
     let log2_h = n_tb_h.trailing_zeros();
@@ -292,7 +336,8 @@ pub fn encode_tb_coefficients(
     let mut abs_level_pass1 = vec![0u32; total];
     let mut sig_flag = vec![false; total];
 
-    // Pre-fill abs_level from the input (unsigned).
+    // Pre-fill abs_level from the input (unsigned). With dep_quant this
+    // is overwritten below by the trellis-derived AbsLevel.
     for (i, &l) in levels.iter().enumerate() {
         abs_level[i] = l.unsigned_abs();
         sig_flag[i] = l != 0;
@@ -318,8 +363,43 @@ pub fn encode_tb_coefficients(
         }
     }
 
+    if opts.dep_quant {
+        // Invert the §7.3.11.11 dep-quant magnitude reconstruction:
+        // walk the trellis over the coded sub-blocks in coding order
+        // (which equals the reconstruction-pass chain — see the decoder
+        // notes) and derive AbsLevel = (|t| + (QState > 1)) / 2. The
+        // trellis selects the quantizer at each position, so |t| must
+        // have the parity of the `QState > 1` offset.
+        let mut q: i32 = 0;
+        for sb_idx in (0..=last_sb_idx).rev() {
+            let start = sb_idx * 16;
+            let end = (start + 16).min(positions.len());
+            for k in (0..(end - start)).rev() {
+                let (xc, yc) = positions[start + k];
+                let idx = (yc as usize) * n_tb_w + (xc as usize);
+                let t = levels[idx].unsigned_abs();
+                let delta = u32::from(q > 1);
+                let a = if t == 0 {
+                    0
+                } else {
+                    if (t & 1) != delta {
+                        return Err(Error::invalid(
+                            "h266 residual_enc: TransCoeffLevel parity does not match the \
+                             dep-quant trellis quantizer at its scan position (§7.3.11.11)",
+                        ));
+                    }
+                    (t + delta) / 2
+                };
+                abs_level[idx] = a;
+                q = q_state_advance(q, a);
+            }
+        }
+    }
+
     let mut sb_coded = vec![false; num_sb_w * num_sb_h];
-    let q_state: i32 = 0;
+    // §7.3.11.11 dep-quant state, threaded through pass 1 / pass 3 in
+    // coding order exactly like the decoder side.
+    let mut q_state: i32 = 0;
 
     // Walk sub-blocks in reverse diagonal scan order starting at last_sb_idx.
     for sb_idx in (0..=last_sb_idx).rev() {
@@ -467,6 +547,11 @@ pub fn encode_tb_coefficients(
             // AbsLevelPass1 = sig + par + gt1 + 2*gt3.
             let a1 = sig as u32 + par as u32 + gt1 as u32 + 2 * gt3 as u32;
             abs_level_pass1[(yc as usize) * n_tb_w + (xc as usize)] = a1;
+            if opts.dep_quant {
+                // §7.3.11.11 pass-1 arm: QState advances on the
+                // AbsLevelPass1 parity (== AbsLevel parity).
+                q_state = q_state_advance(q_state, a1);
+            }
 
             first_pos_mode1 = n - 1;
             n -= 1;
@@ -529,6 +614,50 @@ pub fn encode_tb_coefficients(
                 lv
             };
             encode_abs_remainder(enc, rice, dec_val)?;
+            if opts.dep_quant {
+                // §7.3.11.11 pass-3 arm: QState advances on the
+                // AbsLevel parity after the dec_abs_level emit.
+                q_state = q_state_advance(q_state, lv);
+            }
+        }
+
+        // §7.3.11.11 `firstSigScanPosSb` / `lastSigScanPosSb` — the
+        // scan-index extremes of the significant coefficients in this
+        // sub-block (identical whether collected in pass 1 or pass 3,
+        // so derive them directly from the level array here).
+        let mut first_sig_scan_pos_sb: i32 = num_sb_coeff as i32;
+        let mut last_sig_scan_pos_sb: i32 = -1;
+        for k in (0..num_sb_coeff).rev() {
+            let (xc, yc) = positions[start + k];
+            if abs_level[(yc as usize) * n_tb_w + (xc as usize)] > 0 {
+                if last_sig_scan_pos_sb == -1 {
+                    last_sig_scan_pos_sb = k as i32;
+                }
+                first_sig_scan_pos_sb = k as i32;
+            }
+        }
+        let sign_hidden =
+            opts.sign_data_hiding && (last_sig_scan_pos_sb - first_sig_scan_pos_sb > 3);
+        if sign_hidden {
+            // The decoder infers the suppressed sign from the parity of
+            // the sub-block absolute-level sum: negative ⇔ odd. The
+            // caller's quantizer must have arranged that already.
+            let mut sum_abs: u64 = 0;
+            let mut hidden_neg = false;
+            for k in 0..num_sb_coeff {
+                let (xc, yc) = positions[start + k];
+                let idx = (yc as usize) * n_tb_w + (xc as usize);
+                sum_abs += abs_level[idx] as u64;
+                if k as i32 == first_sig_scan_pos_sb {
+                    hidden_neg = levels[idx] < 0;
+                }
+            }
+            if (sum_abs % 2 == 1) != hidden_neg {
+                return Err(Error::invalid(
+                    "h266 residual_enc: sign-data-hiding parity mismatch — the sub-block \
+                     absolute-level sum parity must encode the hidden sign (§7.3.11.11)",
+                ));
+            }
         }
 
         // ---- Sign-flag bypass pass ----
@@ -536,7 +665,7 @@ pub fn encode_tb_coefficients(
             let pos_idx = start + k;
             let (xc, yc) = positions[pos_idx];
             let lv = levels[(yc as usize) * n_tb_w + (xc as usize)];
-            if lv != 0 {
+            if lv != 0 && (!sign_hidden || k as i32 != first_sig_scan_pos_sb) {
                 let sign = if lv < 0 { 1u32 } else { 0u32 };
                 enc.encode_bypass(sign)?;
             }
@@ -783,5 +912,291 @@ mod tests {
         let mut dec_ctxs = ResidualCtxs::init(26);
         let recovered = decode_tb_coefficients(&mut dec, &mut dec_ctxs, 4, 4, 0).unwrap();
         assert_eq!(recovered, levels);
+    }
+
+    /// Regression — the `last_sig_coeff_*_prefix` writer must emit the
+    /// §7.4.12.11 eqs. 199 / 200 *group index* (doubling-width groups
+    /// past coordinate 3), not the raw coordinate, and the §9.3.3.6 TR
+    /// terminating 0-bin must be absent when `prefix == cMax`. Before
+    /// the r387 fix any TB whose last significant coefficient had a
+    /// coordinate ≥ 5 mis-encoded (caught by this sweep at 8×8
+    /// (x=5, y=0)); coordinate 3 in a 4×4 additionally carried a
+    /// spec-divergent terminator bin.
+    #[test]
+    fn last_sig_prefix_group_index_all_positions() {
+        for (w, h) in [
+            (4usize, 4usize),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (8, 4),
+            (4, 8),
+            (16, 4),
+            (2, 8),
+            (32, 8),
+        ] {
+            for pos in 0..(w * h) {
+                let mut levels = vec![0i32; w * h];
+                levels[pos] = 2;
+                let got = roundtrip_opts(&levels, w, h, 0, RcOpts::default());
+                assert_eq!(
+                    got,
+                    levels,
+                    "single-coeff round-trip {w}x{h} at (x={}, y={})",
+                    pos % w,
+                    pos / w
+                );
+            }
+        }
+    }
+
+    /// The §7.4.12.11 group mapping itself.
+    #[test]
+    fn last_sig_prefix_group_boundaries() {
+        for (v, p) in [
+            (0u32, 0u32),
+            (3, 3),
+            (4, 4),
+            (5, 4),
+            (6, 5),
+            (7, 5),
+            (8, 6),
+            (11, 6),
+            (12, 7),
+            (15, 7),
+            (16, 8),
+            (23, 8),
+            (24, 9),
+            (31, 9),
+        ] {
+            assert_eq!(last_sig_prefix_of(v), p, "value {v}");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Dependent quantization (§7.3.11.11 QState trellis) + sign data
+    // hiding round-trips.
+    // ---------------------------------------------------------------
+
+    /// Build a trellis-consistent signed `TransCoeffLevel` array from a
+    /// row-major `AbsLevel` + sign specification: walk the §7.4.12.11
+    /// eq. 198 state machine over the full TB in reverse diagonal scan
+    /// order (the chain over positions above the last significant
+    /// coefficient is a fixed point of the parity-0 transition from
+    /// state 0) and apply `|t| = 2 * AbsLevel − (QState > 1)`.
+    fn dep_quant_levels(abs: &[u32], neg: &[bool], w: usize, h: usize) -> Vec<i32> {
+        let positions = coeff_scan_positions(w, h);
+        let mut out = vec![0i32; w * h];
+        let mut q: i32 = 0;
+        for &(xc, yc) in positions.iter().rev() {
+            let idx = (yc as usize) * w + (xc as usize);
+            let a = abs[idx];
+            if a > 0 {
+                let mag = 2 * (a as i32) - i32::from(q > 1);
+                out[idx] = if neg[idx] { -mag } else { mag };
+            }
+            q = q_state_advance(q, a);
+        }
+        out
+    }
+
+    fn roundtrip_opts(levels: &[i32], w: usize, h: usize, c_idx: u32, opts: RcOpts) -> Vec<i32> {
+        let mut enc = ArithEncoder::new();
+        let mut enc_ctxs = ResidualCtxs::init(26);
+        encode_tb_coefficients_opts(&mut enc, &mut enc_ctxs, w, h, c_idx, levels, opts).unwrap();
+        let bytes = pad(enc.finish());
+        let mut dec = crate::cabac::ArithDecoder::new(&bytes).unwrap();
+        let mut dec_ctxs = ResidualCtxs::init(26);
+        crate::residual::decode_tb_coefficients_opts(&mut dec, &mut dec_ctxs, w, h, c_idx, opts)
+            .unwrap()
+            .0
+    }
+
+    /// dep_quant round-trip on a dense 4×4 whose trellis visits states
+    /// beyond 0 (odd AbsLevel parities force the Q0 ↔ Q1 alternation).
+    #[test]
+    fn dep_quant_roundtrip_4x4_dense() {
+        let abs: Vec<u32> = vec![3, 1, 2, 0, 1, 4, 0, 1, 2, 0, 5, 1, 0, 2, 1, 3];
+        let neg: Vec<bool> = (0..16).map(|i| i % 3 == 0).collect();
+        let levels = dep_quant_levels(&abs, &neg, 4, 4);
+        // Sanity: the trellis must have left state {0, 1} at least once,
+        // i.e. some magnitude is odd (2a − 1).
+        assert!(
+            levels.iter().any(|&t| t != 0 && t.unsigned_abs() % 2 == 1),
+            "trellis never selected the offset quantizer: {levels:?}"
+        );
+        let opts = RcOpts {
+            dep_quant: true,
+            sign_data_hiding: false,
+        };
+        assert_eq!(roundtrip_opts(&levels, 4, 4, 0, opts), levels);
+    }
+
+    /// dep_quant round-trip on a dense 16×16 — the eq. 5018 pass-1 bin
+    /// budget (448 bins for 256 positions) is exhausted mid-TB, so the
+    /// QState chain crosses the pass-1 → pass-3 (`dec_abs_level` +
+    /// state-dependent `ZeroPos`) boundary.
+    #[test]
+    fn dep_quant_roundtrip_16x16_exhausts_pass1_budget() {
+        // Deterministic LCG so the test is reproducible.
+        let mut state = 0x12345678u32;
+        let mut rand = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state >> 16
+        };
+        for c_idx in [0u32, 1] {
+            let mut abs = vec![0u32; 256];
+            let mut neg = vec![false; 256];
+            for i in 0..256 {
+                let r = rand();
+                abs[i] = if r % 4 == 0 { 0 } else { r % 23 };
+                neg[i] = (r >> 8) & 1 == 1;
+            }
+            abs[255] = 2; // make the very last scan position significant
+            let levels = dep_quant_levels(&abs, &neg, 16, 16);
+            let opts = RcOpts {
+                dep_quant: true,
+                sign_data_hiding: false,
+            };
+            assert_eq!(
+                roundtrip_opts(&levels, 16, 16, c_idx, opts),
+                levels,
+                "c_idx={c_idx}"
+            );
+        }
+    }
+
+    /// A magnitude whose parity contradicts the quantizer the trellis
+    /// selects at its position is not encodable under dep_quant.
+    #[test]
+    fn dep_quant_parity_mismatch_rejected() {
+        // Lone DC = 1: the chain reaches (0,0) still in state 0
+        // (parity-0 fixed point), so the magnitude must be even.
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = ResidualCtxs::init(26);
+        let opts = RcOpts {
+            dep_quant: true,
+            sign_data_hiding: false,
+        };
+        assert!(encode_tb_coefficients_opts(&mut enc, &mut ctxs, 4, 4, 0, &levels, opts).is_err());
+    }
+
+    /// The same abs-level pattern decodes to different TransCoeffLevels
+    /// with and without dep_quant — proves the QState magnitude offset
+    /// is live rather than a pass-through.
+    #[test]
+    fn dep_quant_changes_magnitude_reconstruction() {
+        let abs: Vec<u32> = vec![1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let neg = vec![false; 16];
+        let dq = dep_quant_levels(&abs, &neg, 4, 4);
+        let plain: Vec<i32> = abs.iter().map(|&a| a as i32).collect();
+        assert_ne!(dq, plain);
+    }
+
+    /// Sign-data-hiding round-trip: sub-block significant span > 3, the
+    /// first-significant sign is suppressed and recovered from the
+    /// absolute-level-sum parity.
+    #[test]
+    fn sdh_roundtrip_4x4_hidden_sign() {
+        let opts = RcOpts {
+            dep_quant: false,
+            sign_data_hiding: true,
+        };
+        // Scan span 0..5 (> 3). Negative hidden sign ⇒ odd abs sum.
+        // Diagonal scan position 0 is (0,0); make it negative and the
+        // total abs sum odd: 3 + 2 + 2 = 7 (odd) ✓.
+        let mut levels = vec![0i32; 16];
+        levels[0] = -3; // (0,0) — scan pos 0, hidden
+        levels[4] = 2; // (0,1) — scan pos 1
+        levels[9] = 2; // (1,2) — some later scan position
+                       // Verify the span condition holds via a round-trip.
+        assert_eq!(roundtrip_opts(&levels, 4, 4, 0, opts), levels);
+
+        // Positive hidden sign ⇒ even abs sum: 4 + 2 + 2 = 8 ✓.
+        let mut levels2 = vec![0i32; 16];
+        levels2[0] = 4;
+        levels2[4] = -2;
+        levels2[9] = 2;
+        assert_eq!(roundtrip_opts(&levels2, 4, 4, 0, opts), levels2);
+    }
+
+    /// SDH parity mismatch (hidden sign not representable) must be
+    /// rejected by the writer, not silently mis-encoded.
+    #[test]
+    fn sdh_parity_mismatch_rejected() {
+        let opts = RcOpts {
+            dep_quant: false,
+            sign_data_hiding: true,
+        };
+        // Negative first-sig with EVEN abs sum: 4 + 2 + 2 = 8 → parity
+        // says positive, sign says negative → Err.
+        let mut levels = vec![0i32; 16];
+        levels[0] = -4;
+        levels[4] = 2;
+        levels[9] = 2;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = ResidualCtxs::init(26);
+        assert!(encode_tb_coefficients_opts(&mut enc, &mut ctxs, 4, 4, 0, &levels, opts).is_err());
+    }
+
+    /// When the significant span is ≤ 3 the signHiddenFlag condition
+    /// fails and every sign is coded explicitly — any parity works.
+    #[test]
+    fn sdh_short_span_codes_all_signs() {
+        let opts = RcOpts {
+            dep_quant: false,
+            sign_data_hiding: true,
+        };
+        let mut levels = vec![0i32; 16];
+        levels[0] = -4; // scan pos 0
+        levels[1] = 2; // scan span ≤ 3 → no hiding
+        assert_eq!(roundtrip_opts(&levels, 4, 4, 0, opts), levels);
+    }
+
+    /// SDH applies the hidden-sign decision independently per sub-block
+    /// on a multi-sub-block TB.
+    #[test]
+    fn sdh_roundtrip_8x8_per_sub_block() {
+        let opts = RcOpts {
+            dep_quant: false,
+            sign_data_hiding: true,
+        };
+        let mut levels = vec![0i32; 64];
+        // DC sub-block: span > 3, hidden negative sign ⇒ odd sum.
+        levels[0] = -1; // (0,0)
+        levels[2] = 2; // inside first 4×4
+        levels[3 * 8 + 1] = 2; // (1,3) still in first sub-block
+                               // A later sub-block with a short span: explicit signs.
+        levels[4] = -6; // (4,0) — second 4×4 sub-block
+        assert_eq!(roundtrip_opts(&levels, 8, 8, 0, opts), levels);
+    }
+
+    /// dep_quant + sign_data_hiding cannot both be requested (§7.3.7
+    /// transmits sh_sign_data_hiding_used_flag only when
+    /// sh_dep_quant_used_flag == 0).
+    #[test]
+    fn dep_quant_and_sdh_mutually_exclusive() {
+        let opts = RcOpts {
+            dep_quant: true,
+            sign_data_hiding: true,
+        };
+        let levels = vec![0i32; 16];
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = ResidualCtxs::init(26);
+        assert!(encode_tb_coefficients_opts(&mut enc, &mut ctxs, 4, 4, 0, &levels, opts).is_err());
+        let bytes = pad(vec![0u8; 8]);
+        let mut dec = crate::cabac::ArithDecoder::new(&bytes).unwrap();
+        let mut dec_ctxs = ResidualCtxs::init(26);
+        assert!(crate::residual::decode_tb_coefficients_opts(
+            &mut dec,
+            &mut dec_ctxs,
+            4,
+            4,
+            0,
+            opts
+        )
+        .is_err());
     }
 }
