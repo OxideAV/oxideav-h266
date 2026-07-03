@@ -421,42 +421,70 @@ fn encoder_pipeline_ph_alf_chain_round_trip() {
     );
 
     let pps = parse_pps(&extract_rbsp(pps_nal.payload())).expect("PPS parse");
+    // r387 — §7.4.3.5: with pps_no_pic_partition_flag = 1 the flag is
+    // absent and infers to 0, so the ALF chain lives in the §7.3.7
+    // slice header, NOT the PH.
     assert!(
-        pps.pps_alf_info_in_ph_flag,
-        "pps_no_pic_partition_flag = 1 → pps_alf_info_in_ph_flag = 1 (inferred)"
+        !pps.pps_alf_info_in_ph_flag,
+        "pps_no_pic_partition_flag = 1 → pps_alf_info_in_ph_flag = 0 (inferred, §7.4.3.5)"
     );
 
     let ph = parse_picture_header_stateful(&extract_rbsp(ph_nal.payload()), &sps, &pps)
         .expect("PH parse");
-    assert!(ph.ph_alf_enabled_flag, "ph_alf_enabled_flag must be 1");
+    assert!(
+        !ph.ph_alf_enabled_flag,
+        "PH must not carry an ALF chain when pps_alf_info_in_ph_flag = 0"
+    );
+
+    // Parse the slice header for the chain.
+    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    let slice_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .expect("IDR slice");
+    let ph_state = PhState {
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+        ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+        ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+        ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+        ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+        ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
+        num_extra_sh_bits: 0,
+        nal_unit_type: NalUnitType::IdrNLp,
+    };
+    let sh = parse_slice_header_stateful(&extract_rbsp(slice_nal.payload()), &sps, &pps, &ph_state)
+        .expect("SH parse");
+    assert!(sh.sh_alf_enabled_flag, "sh_alf_enabled_flag must be 1");
     // Round-48 — the picture-bits trade-off skipped the luma APS for
     // this 128×128 single-grey-tone source (no SSE win).
     assert_eq!(
-        ph.ph_num_alf_aps_ids_luma, 0,
+        sh.sh_num_alf_aps_ids_luma, 0,
         "round-48 trade-off must skip luma APS on flat source"
     );
     // Round-51 — chroma APS RDO drops the chroma APS on flat sources;
-    // both `ph_alf_{cb,cr}_enabled_flag` must mirror the same RDO
-    // decision, and when both are 0 the `ph_alf_aps_id_chroma` field
-    // is suppressed by the §7.4.3.8 spec gate.
+    // both `sh_alf_{cb,cr}_enabled_flag` must mirror the same RDO
+    // decision, and when both are 0 the `sh_alf_aps_id_chroma` field
+    // is suppressed by the spec gate.
     assert_eq!(
-        ph.ph_alf_cb_enabled_flag, ph.ph_alf_cr_enabled_flag,
+        sh.sh_alf_cb_enabled_flag, sh.sh_alf_cr_enabled_flag,
         "chroma APS gates Cb + Cr together"
     );
-    if ph.ph_alf_cb_enabled_flag {
+    if sh.sh_alf_cb_enabled_flag {
         assert_eq!(
-            ph.ph_alf_aps_id_chroma, 0,
+            sh.sh_alf_aps_id_chroma, 0,
             "primary chroma ALF (when shipped) must bind to APS id 0"
         );
     }
     // Round-51 — CC-ALF Cb and CC-ALF Cr each have their own RDO; the
     // shared APS NAL ships if either picks anything. When the gate is
     // on, the bound id must be 1.
-    if ph.ph_alf_cc_cb_enabled_flag {
-        assert_eq!(ph.ph_alf_cc_cb_aps_id, 1, "CC-ALF Cb must bind to APS id 1");
+    if sh.sh_alf_cc_cb_enabled_flag {
+        assert_eq!(sh.sh_alf_cc_cb_aps_id, 1, "CC-ALF Cb must bind to APS id 1");
     }
-    if ph.ph_alf_cc_cr_enabled_flag {
-        assert_eq!(ph.ph_alf_cc_cr_aps_id, 1, "CC-ALF Cr must bind to APS id 1");
+    if sh.sh_alf_cc_cr_enabled_flag {
+        assert_eq!(sh.sh_alf_cc_cr_aps_id, 1, "CC-ALF Cr must bind to APS id 1");
     }
 }
 
@@ -519,7 +547,8 @@ fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
-    assert!(ph_state.ph_alf_enabled_flag);
+    // r387 — the PH no longer carries the ALF chain; the SH does.
+    assert!(!ph_state.ph_alf_enabled_flag);
 
     let slice_nal = nals
         .iter()
@@ -528,10 +557,11 @@ fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
     let slice_rbsp = extract_rbsp(slice_nal.payload());
     let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).expect("slice header");
 
-    // pps_alf_info_in_ph_flag = 1 → no SH-level ALF block; SH default.
+    // r387 — §7.4.3.5: pps_alf_info_in_ph_flag = 0 → the SH carries
+    // the ALF chain.
     assert!(
-        !sh.sh_alf_enabled_flag,
-        "PH-carried ALF must suppress SH ALF block"
+        sh.sh_alf_enabled_flag,
+        "SH must carry the ALF chain when pps_alf_info_in_ph_flag = 0"
     );
 
     // The CABAC payload starts after the byte-aligned SH; the first
@@ -542,11 +572,11 @@ fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
     // Decode the inlined ALF bins for the 1×1 CTU grid.
     let cfg = AlfSyntaxConfig {
         alf_enabled: true,
-        cb_enabled: ph.ph_alf_cb_enabled_flag,
-        cr_enabled: ph.ph_alf_cr_enabled_flag,
-        cc_cb_enabled: ph.ph_alf_cc_cb_enabled_flag,
-        cc_cr_enabled: ph.ph_alf_cc_cr_enabled_flag,
-        sh_num_alf_aps_ids_luma: ph.ph_num_alf_aps_ids_luma,
+        cb_enabled: sh.sh_alf_cb_enabled_flag,
+        cr_enabled: sh.sh_alf_cr_enabled_flag,
+        cc_cb_enabled: sh.sh_alf_cc_cb_enabled_flag,
+        cc_cr_enabled: sh.sh_alf_cc_cr_enabled_flag,
+        sh_num_alf_aps_ids_luma: sh.sh_num_alf_aps_ids_luma,
         // The chroma APS the encoder ships carries one alt filter
         // (`alf_chroma_num_alt_filters_minus1 = 0`) so the per-CTB
         // alt-idx fields are not transmitted; same for CC-ALF
@@ -1417,8 +1447,8 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
     ))
     .unwrap();
     assert!(
-        pps.pps_sao_info_in_ph_flag,
-        "pps_no_pic_partition_flag = 1 → pps_sao_info_in_ph_flag = 1 (inferred)"
+        !pps.pps_sao_info_in_ph_flag,
+        "pps_no_pic_partition_flag = 1 → pps_sao_info_in_ph_flag = 0 (inferred, §7.4.3.5)"
     );
 
     let ph = parse_picture_header_stateful(
@@ -1432,17 +1462,10 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
         &pps,
     )
     .unwrap();
-    assert!(
-        !ph.ph_sao_luma_enabled_flag,
-        "round-54 luma SAO stays internal-only on this path"
-    );
-    assert!(
-        ph.ph_sao_chroma_enabled_flag,
-        "round-54 chroma SAO merge → ph_sao_chroma_enabled_flag = 1"
-    );
-
-    // SH inference: with pps_sao_info_in_ph_flag = 1, the SH does not
-    // emit sao_*_used flags; both inferred from the PH per §7.4.8.
+    // r387 — the PH carries no SAO flags (pps_sao_info_in_ph_flag = 0);
+    // the SH transmits sh_sao_*_used_flag directly.
+    assert!(!ph.ph_sao_luma_enabled_flag);
+    assert!(!ph.ph_sao_chroma_enabled_flag);
     let ph_state = PhState {
         ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
         ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
@@ -1463,11 +1486,11 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
     let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).unwrap();
     assert!(
         !sh.sh_sao_luma_used_flag,
-        "luma SAO inferred off from ph_sao_luma_enabled_flag = 0"
+        "luma SAO transmitted 0 in the SH (internal-only path)"
     );
     assert!(
         sh.sh_sao_chroma_used_flag,
-        "chroma SAO inferred on from ph_sao_chroma_enabled_flag = 1"
+        "chroma SAO merge → sh_sao_chroma_used_flag transmitted 1 in the SH"
     );
 }
 

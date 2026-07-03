@@ -387,7 +387,7 @@ impl VvcEncoder {
         annex_b_wrap(&sps, &mut bitstream);
         let pps = self.emit_pps()?;
         annex_b_wrap(&pps, &mut bitstream);
-        let ph = self.emit_picture_header_nal_with_alf_chain(1, 2)?;
+        let ph = self.emit_picture_header_nal()?;
         annex_b_wrap(&ph, &mut bitstream);
         let slice = self.emit_idr_slice()?;
         annex_b_wrap(&slice, &mut bitstream);
@@ -401,25 +401,16 @@ impl VvcEncoder {
             EmittedNalKind::Vps => self.emit_vps(),
             EmittedNalKind::Sps => self.emit_sps(),
             EmittedNalKind::Pps => self.emit_pps(),
-            EmittedNalKind::PictureHeader => {
-                // Default behaviour preserves the round-47 PH layout
-                // (one luma APS bound at id 2). Round-48 callers that
-                // want a different `ph_num_alf_aps_ids_luma` must use
-                // `emit_nal_with_alf_aps_chain` instead.
-                self.emit_picture_header_nal_with_alf_chain(1, 2)
-            }
+            EmittedNalKind::PictureHeader => self.emit_picture_header_nal(),
             EmittedNalKind::IdrSlice => self.emit_idr_slice(),
         }
     }
 
-    /// Round-48 — emit a NAL with a parameterised §7.3.2.8 luma ALF APS
-    /// chain. When `num_alf_aps_ids_luma == 0` the encoder pipeline is
-    /// expected to also skip the APS NAL emission (the
-    /// picture-bits trade-off chose fixed-only); when 1 the bound
-    /// `ph_alf_aps_id_luma[0]` is `first_aps_id`.
-    ///
-    /// Currently only `EmittedNalKind::PictureHeader` reads these
-    /// parameters; other NAL kinds delegate to [`emit_nal`].
+    /// Round-387 — emit a NAL with a parameterised §7.3.7 luma ALF APS
+    /// chain. Since the §7.4.3.5 `pps_alf_info_in_ph_flag = 0`
+    /// inference fix, the ALF chain lives in the SLICE HEADER: the
+    /// `IdrSlice` kind reads the parameters; the `PictureHeader` kind
+    /// no longer carries an ALF chain at all.
     pub fn emit_nal_with_alf_aps_chain(
         &self,
         kind: EmittedNalKind,
@@ -427,8 +418,14 @@ impl VvcEncoder {
         first_aps_id: u8,
     ) -> Result<Vec<u8>> {
         match kind {
-            EmittedNalKind::PictureHeader => {
-                self.emit_picture_header_nal_with_alf_chain(num_alf_aps_ids_luma, first_aps_id)
+            EmittedNalKind::IdrSlice => {
+                let chain = AlfPhChain {
+                    num_alf_aps_ids_luma,
+                    luma_aps_id: first_aps_id,
+                    ..AlfPhChain::default_full()
+                };
+                let header = self.emit_idr_slice_header_bytes(&chain, 0);
+                Ok(Self::wrap_nal(NalUnitType::IdrNLp, 0, 1, &header))
             }
             _ => self.emit_nal(kind),
         }
@@ -662,38 +659,14 @@ impl VvcEncoder {
     // Picture Header NAL (§7.3.2.7) + IDR slice (§7.3.7)
     // ------------------------------------------------------------------
 
-    fn emit_picture_header_nal_with_alf_chain(
-        &self,
-        num_alf_aps_ids_luma: u8,
-        first_aps_id: u8,
-    ) -> Result<Vec<u8>> {
-        self.emit_picture_header_nal_with_alf_chain_full(AlfPhChain {
-            num_alf_aps_ids_luma,
-            luma_aps_id: first_aps_id,
-            ph_alf_cb_enabled_flag: true,
-            ph_alf_cr_enabled_flag: true,
-            ph_alf_aps_id_chroma: 0,
-            ph_alf_cc_cb_enabled_flag: true,
-            ph_alf_cc_cb_aps_id: 1,
-            ph_alf_cc_cr_enabled_flag: true,
-            ph_alf_cc_cr_aps_id: 1,
-            ph_sao_luma_enabled_flag: false,
-            ph_sao_chroma_enabled_flag: false,
-        })
-    }
-
-    /// Round-51 — emit a §7.3.2.7 PH NAL with a fully-parameterised
-    /// §7.3.2.8 ALF chain (luma + chroma + CC-ALF). The round-48 entry
-    /// point [`emit_nal_with_alf_aps_chain`] forwards through this with
-    /// the chroma + CC flags pinned on; round-51 callers that ran the
-    /// chroma APS / CC-ALF APS RDO trade-off use this directly to drop
-    /// individual flags when the trade-off skipped the corresponding APS.
-    pub fn emit_picture_header_nal_with_alf_chain_full(
-        &self,
-        chain: AlfPhChain,
-    ) -> Result<Vec<u8>> {
+    /// Emit the §7.3.2.7 PH NAL. Since the §7.4.3.5
+    /// `pps_*_info_in_ph_flag = 0` inference fix (r387), the PH of the
+    /// no-partition profile is minimal: the ALF chain / ref-pic lists /
+    /// qp-delta / SAO / deblocking gates all live in the slice header
+    /// (§7.3.7) — see [`Self::emit_idr_slice_header_bytes`].
+    pub fn emit_picture_header_nal(&self) -> Result<Vec<u8>> {
         let mut bw = BitWriter::new();
-        self.emit_picture_header_body(&mut bw, &chain);
+        self.emit_picture_header_body(&mut bw);
         bw.rbsp_trailing_bits();
         let rbsp = bw.into_bytes();
         Ok(Self::wrap_nal(NalUnitType::PhNut, 0, 1, &rbsp))
@@ -701,14 +674,17 @@ impl VvcEncoder {
 
     /// Emit the §7.3.2.8 `picture_header_structure()` body into `bw`.
     ///
-    /// `chain.num_alf_aps_ids_luma` is the §7.4.3.8
-    /// `ph_num_alf_aps_ids_luma`; when `> 0`, `chain.luma_aps_id` is
-    /// repeated as `ph_alf_aps_id_luma[i]` for every `i` (round-48 ships
-    /// at most one luma APS, so the trade-off cap is 1).
-    /// `chain.ph_alf_{cb,cr,cc_cb,cc_cr}_enabled_flag` mirror the §7.3.2.8
-    /// per-component gates; round-51 added per-APS RDO that may skip
-    /// the chroma + CC-ALF APSes independently.
-    fn emit_picture_header_body(&self, bw: &mut BitWriter, chain: &AlfPhChain) {
+    /// Gates that are closed by our SPS / PPS profile (and therefore
+    /// emit nothing): ALF chain (`pps_alf_info_in_ph_flag = 0` — §7.4.3.5
+    /// inference from `pps_no_pic_partition_flag = 1`), explicit scaling
+    /// lists / virtual boundaries / POC MSB (SPS gates 0), output flag
+    /// (`pps_output_flag_present_flag = 0`), ref_pic_lists
+    /// (`pps_rpl_info_in_ph_flag = 0`), partition-constraints override
+    /// (SPS gate 0), `ph_qp_delta` (`pps_qp_delta_info_in_ph_flag = 0` —
+    /// the slice header carries `sh_qp_delta`), SAO
+    /// (`pps_sao_info_in_ph_flag = 0`) and deblocking
+    /// (`pps_dbf_info_in_ph_flag = 0`).
+    fn emit_picture_header_body(&self, bw: &mut BitWriter) {
         // IRAP IDR intra-only picture.
         bw.write_bit(1); // ph_gdr_or_irap_pic_flag = 1
         bw.write_bit(0); // ph_non_ref_pic_flag = 0
@@ -717,46 +693,6 @@ impl VvcEncoder {
         bw.write_ue(0); // ph_pic_parameter_set_id = 0
                         // ph_pic_order_cnt_lsb — 8 bits.
         bw.write_bits(0, 8);
-        // Round-46 — picture-header ALF chain (§7.3.2.8). Gated by
-        // `sps.alf_enabled_flag && pps.pps_alf_info_in_ph_flag` per
-        // §7.4.3.8. `pps_no_pic_partition_flag = 1` infers
-        // `pps_alf_info_in_ph_flag = 1` (§7.4.3.5), so the chain lives
-        // here rather than in the slice header. The pipeline binds
-        // primary chroma ALF to APS id 0 (when shipped) and CC-ALF
-        // Cb / Cr to APS id 1 (when shipped); the round-48 luma APS
-        // (when shipped) lives at id 2.
-        bw.write_bit(1); // ph_alf_enabled_flag
-                         // Round-48 — luma APS chain count is parameterised: the
-                         // picture-bits trade-off in `encode_idr_with_residuals` may
-                         // skip the luma APS NAL entirely (`num = 0`) when the SSE
-                         // gain is smaller than the APS byte cost.
-        bw.write_bits(chain.num_alf_aps_ids_luma as u32, 3);
-        for _ in 0..chain.num_alf_aps_ids_luma {
-            bw.write_bits(chain.luma_aps_id as u32, 3); // ph_alf_aps_id_luma[i]
-        }
-        // chroma_format_idc != 0 → emit per-component chroma flags.
-        // Round-51 — when the picture-bits trade-off drops the chroma APS,
-        // the per-CTB chroma ALF passes never fired, so both chroma flags
-        // signal 0 here and the §7.4.3.8 `ph_alf_aps_id_chroma` field is
-        // suppressed by the spec gate `if (ph_alf_cb_enabled_flag ||
-        // ph_alf_cr_enabled_flag)`.
-        bw.write_bit(chain.ph_alf_cb_enabled_flag as u8);
-        bw.write_bit(chain.ph_alf_cr_enabled_flag as u8);
-        if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
-            bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
-        }
-        // ccalf_enabled_flag = 1 → CC-ALF chain. Round-51 — each
-        // component's enable bit is independent: the CC-ALF Cb APS RDO
-        // and the CC-ALF Cr APS RDO each pick their own ship/skip
-        // decision, mirrored here by the per-component flag.
-        bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
-        if chain.ph_alf_cc_cb_enabled_flag {
-            bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
-        }
-        bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
-        if chain.ph_alf_cc_cr_enabled_flag {
-            bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
-        }
         // Round-384 — §7.3.2.8 LMCS chain, gated by
         // sps_lmcs_enabled_flag (== config.lmcs.is_some()). The
         // pipeline ships the LMCS APS at id 0 and keeps
@@ -769,55 +705,82 @@ impl VvcEncoder {
                 bw.write_bit(0); // ph_chroma_residual_scale_flag = 0
             }
         }
-        // pps_rpl_info_in_ph_flag inferred = 1 → parse_ref_pic_lists()
-        // is called. With num_ref_pic_lists[0/1] = 0 each list falls
-        // into the inline branch which emits `num_ref_entries = 0`
-        // (one ue(0) per list).
-        bw.write_ue(0); // list 0: num_ref_entries = 0
-        bw.write_ue(0); // list 1: num_ref_entries = 0
-                        // Round-52 — `pps_cu_qp_delta_enabled_flag = 1` (per
-                        // round-52 PPS) gates the §7.3.2.8 emit of
-                        // `ph_cu_qp_delta_subdiv_intra_slice`. The pipeline
-                        // runs with QG = CTB granularity (no sub-CTB QG split)
-                        // → emit `ue(0)`. The matching `ph_cu_qp_delta_subdiv_inter_slice`
-                        // gate is suppressed because `ph_inter_slice_allowed_flag = 0`
-                        // (intra-only IDR).
+        // ph_intra_slice_allowed_flag == 1 (inferred) arm:
+        // `if( pps_cu_qp_delta_enabled_flag )` — the round-52 PPS sets
+        // it, and the pipeline runs with QG = CTB granularity.
         bw.write_ue(0); // ph_cu_qp_delta_subdiv_intra_slice = 0
-                        // pps_qp_delta_info_in_ph_flag inferred = 1 → emit ph_qp_delta.
-        bw.write_se(0); // ph_qp_delta = 0
-                        // Round-54 — `ph_sao_*_enabled_flag` lives between
-                        // `ph_qp_delta` and `ph_deblocking_params_present_flag`
-                        // in §7.3.2.8 / §7.4.3.7 — it is gated by
-                        // `sps_sao_enabled_flag && pps_sao_info_in_ph_flag`.
-                        // The round-35 PPS infers `pps_sao_info_in_ph_flag = 1`
-                        // (`pps_no_pic_partition_flag = 1`), so the only gate
-                        // here is the SPS bit, which we tie to the
-                        // round-54 EncoderConfig knob.
+    }
+
+    /// Round-387 — emit the §7.3.7 IDR slice-header bits (through
+    /// `byte_alignment()`), ready to be prefixed to the CABAC payload.
+    ///
+    /// Carries everything the §7.4.3.5 `pps_*_info_in_ph_flag = 0`
+    /// inferences move out of the PH: the ALF chain, `sh_lmcs_used_flag`,
+    /// `sh_qp_delta` (`SliceQpY = 26 + pps_init_qp_minus26 + sh_qp_delta`,
+    /// so callers pass `slice_qp_y − 26`) and the SAO used flags.
+    pub fn emit_idr_slice_header_bytes(&self, chain: &AlfPhChain, sh_qp_delta: i32) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        // sh_picture_header_in_slice_header_flag = 0 (separate PH NAL).
+        bw.write_bit(0);
+        // Single-slice no-partition profile: no sh_subpic_id /
+        // sh_slice_address / sh_extra_bit / tile count. With
+        // ph_inter_slice_allowed_flag = 0, sh_slice_type is inferred I.
+        //
+        // IDR nal_unit_type → sh_no_output_of_prior_pics_flag.
+        bw.write_bit(0);
+        // §7.3.7 ALF chain — sps_alf_enabled_flag && !pps_alf_info_in_ph_flag.
+        bw.write_bit(1); // sh_alf_enabled_flag = 1
+        bw.write_bits(chain.num_alf_aps_ids_luma as u32, 3);
+        for _ in 0..chain.num_alf_aps_ids_luma {
+            bw.write_bits(chain.luma_aps_id as u32, 3); // sh_alf_aps_id_luma[i]
+        }
+        if self.config.chroma_format_idc != 0 {
+            bw.write_bit(chain.ph_alf_cb_enabled_flag as u8);
+            bw.write_bit(chain.ph_alf_cr_enabled_flag as u8);
+        }
+        if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
+            bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
+        }
+        // sps_ccalf_enabled_flag = 1 in our SPS.
+        bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
+        if chain.ph_alf_cc_cb_enabled_flag {
+            bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
+        }
+        bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
+        if chain.ph_alf_cc_cr_enabled_flag {
+            bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+        }
+        // sh_lmcs_used_flag — ph_lmcs_enabled_flag && separate PH.
+        if self.config.lmcs.is_some() {
+            bw.write_bit(1);
+        }
+        // ref_pic_lists() skipped: IDR without sps_idr_rpl_present_flag.
+        // I-slice → no cabac_init / collocated / pred_weight_table.
+        //
+        // !pps_qp_delta_info_in_ph_flag → sh_qp_delta.
+        bw.write_se(sh_qp_delta);
+        // No slice chroma QP offsets / cu-chroma-offset list (PPS gates 0).
+        // SAO — sps_sao_enabled_flag && !pps_sao_info_in_ph_flag.
         if self.config.enable_chroma_sao_merge {
             bw.write_bit(chain.ph_sao_luma_enabled_flag as u8);
-            // chroma_format_idc != 0 → emit chroma flag.
             if self.config.chroma_format_idc != 0 {
                 bw.write_bit(chain.ph_sao_chroma_enabled_flag as u8);
             }
         }
-        // pps_dbf_info_in_ph_flag inferred = 1 → emit gate.
-        bw.write_bit(0); // ph_deblocking_params_present_flag = 0
+        // Deblocking override (PPS gate 0), dep-quant / SDH / TS /
+        // reverse-last-sig (SPS gates 0), SH extension (PPS gate 0):
+        // nothing to emit.
+        //
+        // byte_alignment() — stop bit + zero pad; CABAC starts after.
+        bw.byte_alignment();
+        bw.into_bytes()
     }
 
     fn emit_idr_slice(&self) -> Result<Vec<u8>> {
-        let mut bw = BitWriter::new();
-        // sh_picture_header_in_slice_header_flag = 0.
-        bw.write_bit(0);
-        // sh_no_output_of_prior_pics_flag — emitted under IDR types.
-        bw.write_bit(0);
-        // Round-384 — §7.3.7 sh_lmcs_used_flag: transmitted when
-        // ph_lmcs_enabled_flag == 1 and the PH is a separate NAL.
-        if self.config.lmcs.is_some() {
-            bw.write_bit(1);
-        }
-        // `byte_alignment()` — stop bit + zero pad.
-        bw.byte_alignment();
-        let rbsp = bw.into_bytes();
+        // Header-only slice stub for parser tests: the default ALF
+        // chain matches the historical PH default (one luma APS at
+        // id 2, chroma + CC-ALF on), sh_qp_delta = 0.
+        let rbsp = self.emit_idr_slice_header_bytes(&AlfPhChain::default_full(), 0);
         Ok(Self::wrap_nal(NalUnitType::IdrNLp, 0, 1, &rbsp))
     }
 
@@ -844,17 +807,18 @@ pub enum EmittedNalKind {
     IdrSlice,
 }
 
-/// Round-51 — fully-parameterised §7.3.2.8 picture-header ALF chain.
+/// Round-51 — fully-parameterised ALF chain for the encoder emit.
 ///
 /// The encoder pipeline runs an APS-vs-fixed RDO trade-off per APS
 /// independently (round-51 extends round-48's luma trade-off to chroma
 /// and CC-ALF). This struct propagates each per-APS ship/skip decision
-/// into the PH bitstream emit by carrying every gate the §7.3.2.8 syntax
-/// reads when `ph_alf_enabled_flag = 1`.
+/// into the bitstream emit by carrying every gate the ALF-chain syntax
+/// reads when the enable flag is 1.
 ///
-/// Field semantics mirror the spec syntax names verbatim. Conditional
-/// fields (e.g. `ph_alf_aps_id_chroma`, `ph_alf_cc_*_aps_id`) are only
-/// written when the gating enable flag is set.
+/// r387 — since the §7.4.3.5 `pps_alf_info_in_ph_flag = 0` inference
+/// fix, the chain is emitted in the **slice header** (§7.3.7 `sh_alf_*`)
+/// rather than the PH; the historical `ph_alf_*` field names are kept
+/// (the values are the same syntax elements under their SH spelling).
 #[derive(Clone, Copy, Debug)]
 pub struct AlfPhChain {
     /// `ph_num_alf_aps_ids_luma` — 0 when the round-48 trade-off skipped
@@ -892,6 +856,26 @@ pub struct AlfPhChain {
     /// per-CTB `sao_type_idx_chroma` + the new `sao_merge_*_flag` bins
     /// flow through the wire stream.
     pub ph_sao_chroma_enabled_flag: bool,
+}
+
+impl AlfPhChain {
+    /// The historical default chain: one luma APS at id 2, primary
+    /// chroma ALF at id 0, CC-ALF Cb / Cr at id 1, SAO off.
+    pub fn default_full() -> Self {
+        Self {
+            num_alf_aps_ids_luma: 1,
+            luma_aps_id: 2,
+            ph_alf_cb_enabled_flag: true,
+            ph_alf_cr_enabled_flag: true,
+            ph_alf_aps_id_chroma: 0,
+            ph_alf_cc_cb_enabled_flag: true,
+            ph_alf_cc_cb_aps_id: 1,
+            ph_alf_cc_cr_enabled_flag: true,
+            ph_alf_cc_cr_aps_id: 1,
+            ph_sao_luma_enabled_flag: false,
+            ph_sao_chroma_enabled_flag: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1072,10 +1056,14 @@ mod tests {
         assert!(pps.pps_no_pic_partition_flag);
         assert_eq!(pps.pps_pic_width_in_luma_samples, 320);
         assert_eq!(pps.pps_pic_height_in_luma_samples, 240);
-        assert!(pps.pps_rpl_info_in_ph_flag);
-        assert!(pps.pps_sao_info_in_ph_flag);
-        assert!(pps.pps_alf_info_in_ph_flag);
-        assert!(pps.pps_qp_delta_info_in_ph_flag);
+        // §7.4.3.5 — with pps_no_pic_partition_flag == 1 every absent
+        // pps_*_info_in_ph_flag infers to 0: RPL / SAO / ALF / QP-delta
+        // information lives in the slice header.
+        assert!(!pps.pps_rpl_info_in_ph_flag);
+        assert!(!pps.pps_sao_info_in_ph_flag);
+        assert!(!pps.pps_alf_info_in_ph_flag);
+        assert!(!pps.pps_qp_delta_info_in_ph_flag);
+        assert!(!pps.pps_dbf_info_in_ph_flag);
         assert_eq!(pps.pps_init_qp_minus26, 0);
     }
 
@@ -1097,20 +1085,43 @@ mod tests {
         assert_eq!(ph.ph_pic_parameter_set_id, 0);
         assert_eq!(ph.ph_pic_order_cnt_lsb, 0);
         assert_eq!(ph.ph_qp_delta, 0);
-        // Round-47 — ALF on; PH carries `ph_alf_enabled_flag = 1` plus
-        // the luma APS chain bound to APS id 2 and the chroma + CC-ALF
-        // chain bound to APS id 0 / id 1.
-        assert!(ph.ph_alf_enabled_flag);
-        assert_eq!(ph.ph_num_alf_aps_ids_luma, 1);
-        assert_eq!(ph.ph_alf_aps_id_luma, vec![2]);
-        assert!(ph.ph_alf_cb_enabled_flag);
-        assert!(ph.ph_alf_cr_enabled_flag);
-        assert_eq!(ph.ph_alf_aps_id_chroma, 0);
-        assert!(ph.ph_alf_cc_cb_enabled_flag);
-        assert_eq!(ph.ph_alf_cc_cb_aps_id, 1);
-        assert!(ph.ph_alf_cc_cr_enabled_flag);
-        assert_eq!(ph.ph_alf_cc_cr_aps_id, 1);
+        // r387 — §7.4.3.5 pps_alf_info_in_ph_flag infers to 0 for the
+        // no-partition PPS, so the PH carries NO ALF chain (it lives in
+        // the §7.3.7 slice header — see the IdrSlice test below).
+        assert!(!ph.ph_alf_enabled_flag);
+        assert_eq!(ph.ph_num_alf_aps_ids_luma, 0);
         assert!(!ph.ph_lmcs_enabled_flag);
+
+        // The §7.3.7 slice header now carries the ALF chain: one luma
+        // APS at id 2, primary chroma at id 0, CC-ALF Cb / Cr at id 1
+        // (the AlfPhChain::default_full layout).
+        let slice_nal = enc.emit_nal(EmittedNalKind::IdrSlice).unwrap();
+        let slice_rbsp = extract_rbsp(&slice_nal[2..]);
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            ph_alf_enabled_flag: false,
+            ph_lmcs_enabled_flag: false,
+            ph_explicit_scaling_list_enabled_flag: false,
+            ph_temporal_mvp_enabled_flag: false,
+            ph_sao_luma_enabled_flag: false,
+            ph_sao_chroma_enabled_flag: false,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrNLp,
+        };
+        let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state)
+            .expect("slice header must parse");
+        assert!(sh.sh_alf_enabled_flag);
+        assert_eq!(sh.sh_num_alf_aps_ids_luma, 1);
+        assert_eq!(sh.sh_alf_aps_id_luma, vec![2]);
+        assert!(sh.sh_alf_cb_enabled_flag);
+        assert!(sh.sh_alf_cr_enabled_flag);
+        assert_eq!(sh.sh_alf_aps_id_chroma, 0);
+        assert!(sh.sh_alf_cc_cb_enabled_flag);
+        assert_eq!(sh.sh_alf_cc_cb_aps_id, 1);
+        assert!(sh.sh_alf_cc_cr_enabled_flag);
+        assert_eq!(sh.sh_alf_cc_cr_aps_id, 1);
+        assert_eq!(sh.sh_qp_delta, 0);
     }
 
     #[test]

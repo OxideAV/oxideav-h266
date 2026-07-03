@@ -1413,7 +1413,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     qp_picker: impl Fn(usize, usize, usize, usize) -> i32,
 ) -> Result<(Vec<u8>, PictureBuffer)> {
     use crate::cabac_enc::ArithEncoder;
-    use crate::encoder::{BitWriter, VvcEncoder};
+    use crate::encoder::VvcEncoder;
     use crate::nal::NalUnitType;
 
     let w = src.luma.width as u32;
@@ -1475,21 +1475,11 @@ pub fn encode_idr_with_qp_picker_cfg(
     let chroma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(0, true, &chroma_alf_aps)?;
     let cc_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(1, true, &cc_alf_aps)?;
 
-    // --- Build the slice RBSP ---
-    let mut bw = BitWriter::new();
-    // Slice header: sh_picture_header_in_slice_header_flag = 0,
-    //               sh_no_output_of_prior_pics_flag = 0 (IDR).
-    bw.write_bit(0); // sh_picture_header_in_slice_header_flag
-    bw.write_bit(0); // sh_no_output_of_prior_pics_flag
-                     // Round-384 — §7.3.7 sh_lmcs_used_flag: transmitted
-                     // when ph_lmcs_enabled_flag == 1 with a separate PH.
-    if lmcs_payload.is_some() {
-        bw.write_bit(1); // sh_lmcs_used_flag = 1
-    }
-    // byte_alignment() — 1-stop-bit + pad to byte.
-    bw.byte_alignment();
-    // CABAC engine starts here.
-    let slice_header_bytes = bw.into_bytes();
+    // The §7.3.7 slice-header bytes (ALF chain + sh_lmcs_used_flag +
+    // sh_qp_delta + SAO used flags) are emitted AFTER the in-loop
+    // filter RDO below — the ALF APS ship/skip decisions feed the
+    // chain since the §7.4.3.5 `pps_alf_info_in_ph_flag = 0` fix moved
+    // it out of the PH.
 
     // CABAC-encode every CTU.
     let ctb_size: usize = 128; // matches encoder SPS (log2_ctu_size_minus5 = 2 → 128)
@@ -2104,11 +2094,17 @@ pub fn encode_idr_with_qp_picker_cfg(
     }
 
     // Picture header — must come AFTER the APSes it references
-    // (§7.4.2.4). Round-51 PH carries per-component enable flags
-    // mirroring each APS RDO trade-off decision.
-    annex_b(
-        &mut bitstream,
-        &vvc_enc.emit_picture_header_nal_with_alf_chain_full(crate::encoder::AlfPhChain {
+    // (§7.4.2.4). Since the §7.4.3.5 inference fix the PH is minimal;
+    // the per-APS enable flags mirror into the SLICE-HEADER ALF chain
+    // below (§7.3.7).
+    annex_b(&mut bitstream, &vvc_enc.emit_picture_header_nal()?);
+
+    // §7.3.7 slice-header bytes: ALF chain (per-APS RDO decisions) +
+    // sh_lmcs_used_flag + sh_qp_delta (SliceQpY = 26 + sh_qp_delta on
+    // the wire, so the slice-level QP is now signalled instead of
+    // being implicitly pinned at 26) + SAO used flags.
+    let slice_header_bytes = vvc_enc.emit_idr_slice_header_bytes(
+        &crate::encoder::AlfPhChain {
             num_alf_aps_ids_luma: ph_num_alf_aps_ids_luma,
             luma_aps_id: 2,
             ph_alf_cb_enabled_flag: ship_chroma_aps,
@@ -2118,15 +2114,14 @@ pub fn encode_idr_with_qp_picker_cfg(
             ph_alf_cc_cb_aps_id: 1,
             ph_alf_cc_cr_enabled_flag: ship_cc_cr,
             ph_alf_cc_cr_aps_id: 1,
-            // Round-54 — `ph_sao_*_enabled_flag` are emitted only when
+            // Round-54 — SAO used flags are emitted only when
             // `EncoderConfig::enable_chroma_sao_merge` flips on
-            // `sps_sao_enabled_flag`. The encoder pipeline below
-            // configures the chroma slot when SAO is on; luma SAO stays
-            // internal-only on this path, so `ph_sao_luma_enabled_flag
-            // = false` even with the chroma merge knob on.
+            // `sps_sao_enabled_flag`. Luma SAO stays internal-only on
+            // this path.
             ph_sao_luma_enabled_flag: false,
             ph_sao_chroma_enabled_flag: config.enable_chroma_sao_merge,
-        })?,
+        },
+        slice_qp_y - 26,
     );
 
     // ------------------------------------------------------------------

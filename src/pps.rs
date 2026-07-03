@@ -168,9 +168,9 @@ pub struct PicParameterSet {
     pub pps_deblocking_filter_disabled_flag: bool,
     pub pps_dbf_info_in_ph_flag: bool,
     /// Present only when `pps_no_pic_partition_flag == 0`; inferred to
-    /// `true` otherwise (§7.4.3.5 / §7.3.2.5: the "in PH" flags default
-    /// to 1 when not signalled, forcing the slice header to skip the
-    /// corresponding per-slice fields).
+    /// `false` otherwise (§7.4.3.5: every absent `pps_*_info_in_ph_flag`
+    /// infers to 0 — the corresponding information then lives in the
+    /// slice header, not the PH).
     pub pps_rpl_info_in_ph_flag: bool,
     pub pps_sao_info_in_ph_flag: bool,
     pub pps_alf_info_in_ph_flag: bool,
@@ -478,14 +478,17 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
     let pps_deblocking_filter_control_present_flag = br.u1()? == 1;
     let mut pps_deblocking_filter_override_enabled_flag = false;
     let mut pps_deblocking_filter_disabled_flag = false;
-    let mut pps_dbf_info_in_ph_flag = true; // inferred when not present
+    // §7.4.3.5: "When not present, the value of pps_dbf_info_in_ph_flag
+    // is inferred to be equal to 0" — deblocking info then lives in the
+    // slice header, NOT the PH. (r387 fix: this used to infer to 1,
+    // desynchronising every emitted / parsed PH + SH against conforming
+    // implementations whenever pps_no_pic_partition_flag == 1.)
+    let mut pps_dbf_info_in_ph_flag = false;
     if pps_deblocking_filter_control_present_flag {
         pps_deblocking_filter_override_enabled_flag = br.u1()? == 1;
         pps_deblocking_filter_disabled_flag = br.u1()? == 1;
         // §7.3.2.5: pps_dbf_info_in_ph_flag is transmitted only when
         // `!pps_no_pic_partition_flag && pps_deblocking_filter_override_enabled_flag`.
-        // Otherwise it's inferred to 1 (so the slice header skips the
-        // deblocking-override branch).
         if !pps_no_pic_partition_flag && pps_deblocking_filter_override_enabled_flag {
             pps_dbf_info_in_ph_flag = br.u1()? == 1;
         }
@@ -502,22 +505,23 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
     }
 
     // `if (!pps_no_pic_partition_flag)` block: the five in_ph_flag
-    // members are either signalled or inferred (§7.4.3.5).
-    let mut pps_rpl_info_in_ph_flag = true;
-    let mut pps_sao_info_in_ph_flag = true;
-    let mut pps_alf_info_in_ph_flag = true;
-    let mut pps_wp_info_in_ph_flag = true;
-    let mut pps_qp_delta_info_in_ph_flag = true;
+    // members are either signalled or inferred. §7.4.3.5 infers every
+    // absent `pps_*_info_in_ph_flag` to **0** — with
+    // `pps_no_pic_partition_flag == 1` the RPL / SAO / ALF / WP /
+    // QP-delta information all lives in the slice header. (r387 fix:
+    // these used to infer to 1, moving the whole block into the PH
+    // against the spec.)
+    let mut pps_rpl_info_in_ph_flag = false;
+    let mut pps_sao_info_in_ph_flag = false;
+    let mut pps_alf_info_in_ph_flag = false;
+    let mut pps_wp_info_in_ph_flag = false;
+    let mut pps_qp_delta_info_in_ph_flag = false;
     if !pps_no_pic_partition_flag {
         pps_rpl_info_in_ph_flag = br.u1()? == 1;
         pps_sao_info_in_ph_flag = br.u1()? == 1;
         pps_alf_info_in_ph_flag = br.u1()? == 1;
         if (pps_weighted_pred_flag || pps_weighted_bipred_flag) && pps_rpl_info_in_ph_flag {
             pps_wp_info_in_ph_flag = br.u1()? == 1;
-        } else {
-            // §7.4.3.5: inferred to 0 when pps_rpl_info_in_ph_flag == 0
-            // (weighted-pred table must follow the per-slice RPL).
-            pps_wp_info_in_ph_flag = pps_rpl_info_in_ph_flag;
         }
         pps_qp_delta_info_in_ph_flag = br.u1()? == 1;
     }
@@ -747,12 +751,14 @@ mod tests {
         assert_eq!(pps.pps_pic_height_in_luma_samples, 240);
         assert!(pps.pps_no_pic_partition_flag);
         assert!(!pps.pps_subpic_id_mapping_present_flag);
-        // The info_in_ph flags must be inferred to true when the
-        // partition block was skipped.
-        assert!(pps.pps_rpl_info_in_ph_flag);
-        assert!(pps.pps_sao_info_in_ph_flag);
-        assert!(pps.pps_alf_info_in_ph_flag);
-        assert!(pps.pps_qp_delta_info_in_ph_flag);
+        // §7.4.3.5 — the info_in_ph flags infer to FALSE when the
+        // partition block was skipped (the information lives in the
+        // slice header, not the PH).
+        assert!(!pps.pps_rpl_info_in_ph_flag);
+        assert!(!pps.pps_sao_info_in_ph_flag);
+        assert!(!pps.pps_alf_info_in_ph_flag);
+        assert!(!pps.pps_qp_delta_info_in_ph_flag);
+        assert!(!pps.pps_dbf_info_in_ph_flag);
         assert_eq!(pps.pps_init_qp_minus26, 0);
     }
 
