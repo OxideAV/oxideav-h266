@@ -451,10 +451,14 @@ impl VvcEncoder {
                              // vps_layer_id[0] for the only layer.
         bw.write_bits(0, 6);
         // vps_max_layers_minus1 == 0 → skip the `each_layer_is_an_ols`
-        // / `vps_ols_mode_idc` / output-layer-flags block entirely.
+        // / `vps_ols_mode_idc` / output-layer-flags block entirely —
+        // including `vps_num_ptls_minus1`, which §7.3.2.3 places INSIDE
+        // the `vps_max_layers_minus1 > 0` block (§7.4.3.3 infers it to
+        // 0 when absent). r387: the emitter used to write the u(8)
+        // unconditionally, shifting the whole PTL by one byte on every
+        // single-layer VPS (caught by a conforming third-party decoder
+        // rejecting the `gci_alignment_zero_bit`).
         //
-        // vps_num_ptls_minus1 = 0 → 1 PTL.
-        bw.write_bits(0, 8);
         // vps_pt_present_flag[0] is implicit (always 1 for i = 0).
         // With vps_default_ptl_dpb_hrd_max_tid_flag inferred to 1 and
         // vps_max_sublayers_minus1 = 0, no per-PTL max-tid bits are
@@ -481,10 +485,14 @@ impl VvcEncoder {
         bw.write_bits(0, 8);
         // No sub-profiles → no general_sub_profile_idc entries.
 
-        // OLS / DPB / HRD / extension tail deliberately omitted — our
-        // VPS parser stops reading after the PTL list and the trailing
-        // bytes are ignored. Emit rbsp_trailing_bits() so downstream
-        // scanning is tidy.
+        // Single-layer tail (§7.3.2.3): TotalNumOlss = 1 with
+        // vps_num_ptls_minus1 = 0 → no vps_ols_ptl_idx;
+        // vps_each_layer_is_an_ols_flag infers to 1 → the whole
+        // DPB / HRD block (including vps_timing_hrd_params_present_flag)
+        // is skipped. Only vps_extension_flag remains before the
+        // trailing bits — r387: previously omitted, so a conforming
+        // decoder consumed our rbsp_stop_one_bit as the extension flag.
+        bw.write_bit(0); // vps_extension_flag = 0
         bw.rbsp_trailing_bits();
 
         let rbsp = bw.into_bytes();

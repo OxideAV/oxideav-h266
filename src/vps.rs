@@ -121,7 +121,18 @@ pub fn parse_vps(rbsp: &[u8]) -> Result<VideoParameterSet> {
             }
         }
     }
-    let vps_num_ptls_minus1 = br.u(8)? as u8;
+    // §7.3.2.3 — `vps_num_ptls_minus1` sits INSIDE the
+    // `vps_max_layers_minus1 > 0` block; for a single-layer VPS the
+    // §7.4.3.3 inference applies ("When not present, the value of
+    // vps_num_ptls_minus1 is inferred to be equal to 0"). r387: the
+    // parser used to read the u(8) unconditionally, desynchronising
+    // every single-layer VPS by one byte (caught by a conforming
+    // third-party decoder rejecting our emitted VPS).
+    let vps_num_ptls_minus1 = if vps_max_layers_minus1 > 0 {
+        br.u(8)? as u8
+    } else {
+        0
+    };
     let num_ptls = (vps_num_ptls_minus1 as usize) + 1;
     let mut vps_pt_present_flag = Vec::with_capacity(num_ptls);
     let mut vps_ptl_max_tid = Vec::with_capacity(num_ptls);
@@ -168,10 +179,24 @@ mod tests {
 
     /// Hand-built minimal VPS RBSP: vps_id=1, single layer, single sublayer,
     /// single PTL with level_idc = 0x5A.
+    ///
+    /// Bit layout (§7.3.2.3, single-layer arm — note
+    /// `vps_num_ptls_minus1` is NOT transmitted, it sits inside the
+    /// `vps_max_layers_minus1 > 0` block and infers to 0):
+    /// * byte 0: `0001` vps_id=1 + `0000` max_layers(hi)
+    /// * byte 1: `00` max_layers(lo) + `000` max_sublayers +
+    ///   `000` vps_layer_id[0](hi)
+    /// * byte 2: `000` vps_layer_id[0](lo) + `00000`
+    ///   vps_ptl_alignment_zero_bits
+    /// * byte 3: `0000001` general_profile_idc=1 + `0` tier
+    /// * byte 4: general_level_idc = 0x5A
+    /// * byte 5: `1` frame_only + `0` multilayer + `0` gci_present +
+    ///   `00000` gci_alignment_zero_bits
+    /// * byte 6: ptl_num_sub_profiles = 0
+    /// * byte 7: rbsp_stop_one_bit + padding
     #[test]
     fn minimal_vps_roundtrip() {
-        // See the module-level comments in the test for bit layout.
-        let data = [0x10u8, 0x00, 0x00, 0x00, 0x02, 0x5A, 0x80, 0x00];
+        let data = [0x10u8, 0x00, 0x00, 0x02, 0x5A, 0x80, 0x00, 0x80];
         let vps = parse_vps(&data).unwrap();
         assert_eq!(vps.vps_video_parameter_set_id, 1);
         assert_eq!(vps.vps_max_layers_minus1, 0);
