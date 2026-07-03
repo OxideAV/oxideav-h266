@@ -597,6 +597,27 @@ struct LmcsBinding {
     /// `LmcsMaxBinIdx = 15 − lmcs_delta_max_bin_idx` — upper bound of
     /// the §8.8.2.3 eq. 1224 scan.
     max_bin_idx: u8,
+    /// `ph_chroma_residual_scale_flag` — the picture-header gate for
+    /// the §8.7.5.3 chroma residual scaling (first bullet of the
+    /// pass-through list).
+    chroma_residual_scale: bool,
+}
+
+/// §8.7.5.3 eqs. 1219 / 1220 — scale a chroma residual sample array in
+/// place: each sample is first clamped to
+/// `Clip3( −( 1 << BitDepth ), ( 1 << BitDepth ) − 1, res )` (eq. 1219),
+/// then replaced by the eq. 1220 scale term
+/// `Sign( res ) * ( ( Abs( res ) * varScale + ( 1 << 10 ) ) >> 11 )`.
+/// The caller's ordinary `Clip1( pred + res )` add then matches
+/// eq. 1220 exactly.
+fn lmcs_scale_chroma_residuals(res: &mut [i32], var_scale: u32, bit_depth: u32) {
+    let lo = -(1i64 << bit_depth);
+    let hi = (1i64 << bit_depth) - 1;
+    for r in res.iter_mut() {
+        let v = i64::from(*r).clamp(lo, hi);
+        let mag = (v.unsigned_abs() * u64::from(var_scale) + (1 << 10)) >> 11;
+        *r = if v < 0 { -(mag as i64) } else { mag as i64 } as i32;
+    }
 }
 
 /// Top-level CTU walker.
@@ -792,6 +813,13 @@ pub struct CtuWalker<'a, 'b> {
     /// inert. [`Self::decode_picture_into`] fails fast when the slice
     /// uses LMCS but no binding was installed.
     lmcs: Option<LmcsBinding>,
+    /// §8.7.5.3 — per-4x4-cell top-left luma origin of the coding unit
+    /// covering the cell (shares the [`Self::intra_grid`] geometry).
+    /// Written by [`Self::write_intra_block`] as each leaf CU commits;
+    /// the chroma-residual-scaling `( xCuCb, yCuCb )` lookup samples it
+    /// for the CU containing the sizeY-aligned luma corner when that
+    /// corner falls outside the current CU.
+    cu_origin_grid: Vec<(u32, u32)>,
     /// Round-56 — picture-wide CU neighbour map used by the
     /// [`TreeWalker`] to derive the §9.3.4.2 ctxInc. Populated as each
     /// CTU's leaf CUs commit; `decode_ctu_partitions` hands a `&mut`
@@ -966,22 +994,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             inter_affine_grid,
             affine_cpmv_field,
             lmcs: None,
+            cu_origin_grid: vec![(0, 0); (intra_grid_w * intra_grid_h) as usize],
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
         })
     }
 
     /// Install the LMCS APS payload the picture header references via
     /// `ph_lmcs_aps_id` (§7.4.3.7), running the §7.4.3.19 BitDepth-bound
-    /// derivations against the active SPS. Must be called before
+    /// derivations against the active SPS.
+    /// `ph_chroma_residual_scale_flag` carries the picture-header gate
+    /// for the §8.7.5.3 chroma residual scaling. Must be called before
     /// [`Self::decode_picture_into`] / [`Self::apply_in_loop_filters`]
     /// whenever the slice header sets `sh_lmcs_used_flag`.
-    pub fn set_lmcs(&mut self, data: &LmcsData) -> Result<()> {
+    pub fn set_lmcs(&mut self, data: &LmcsData, ph_chroma_residual_scale_flag: bool) -> Result<()> {
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let derived = data.derive(bit_depth)?;
         self.lmcs = Some(LmcsBinding {
             derived,
             min_bin_idx: data.lmcs_min_bin_idx,
             max_bin_idx: data.lmcs_max_bin_idx(),
+            chroma_residual_scale: ph_chroma_residual_scale_flag,
         });
         Ok(())
     }
@@ -1035,6 +1067,90 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 plane.samples[idx] = (m >> up) as u8;
             }
         }
+    }
+
+    /// §8.7.5.3 ordered steps 1 – 3 — derive `varScale` for the current
+    /// CU's chroma transform block(s). Returns `None` when chroma
+    /// residual scaling does not apply at the CU level
+    /// (`sh_lmcs_used_flag == 0`, no binding, or
+    /// `ph_chroma_residual_scale_flag == 0`); the per-TB
+    /// `nCurrSw * nCurrSh <= 4` and `tuCbfChroma` gates live at the
+    /// call sites.
+    ///
+    /// * `sizeY = Min( CtbSizeY, 64 )`; the current luma location is
+    ///   the CU's luma origin (eq. 1215 with the chroma TB at the CU
+    ///   corner), aligned down to the sizeY grid.
+    /// * `( xCuCb, yCuCb )` is the top-left of the coding unit
+    ///   containing that aligned corner — the current CU when the
+    ///   corner falls inside it, otherwise the already-committed
+    ///   [`Self::cu_origin_grid`] cell.
+    /// * `availL` / `availT` follow the walker's single-slice §6.4.4
+    ///   picture-edge rule (`checkPredModeY == FALSE`, so intra / inter
+    ///   makes no difference).
+    /// * `recLuma[]` gathers the left column / top row of mapped-domain
+    ///   reconstructed luma with the eq.-clamps to the picture bounds;
+    ///   `invAvgLuma` is the eq. 1216 rounded average (eq. 1217
+    ///   mid-grey when neither side is available), which then walks
+    ///   §8.8.2.3 to `idxYInv` and eq. 1218 to
+    ///   `ChromaScaleCoeff[ idxYInv ]`.
+    fn lmcs_chroma_var_scale_for_cu(&self, cu: &CtuCu, out: &PictureBuffer) -> Option<u32> {
+        if !self.lmcs_active() {
+            return None;
+        }
+        let l = self.lmcs.as_ref().expect("lmcs_active checked is_some");
+        if !l.chroma_residual_scale {
+            return None;
+        }
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        let up = bit_depth.saturating_sub(8);
+        let size_y = (1usize << self.layout.ctb_log2_size_y).min(64);
+        // Aligned corner of the sizeY region containing the CU's luma
+        // origin (the chroma TB sits at the CU corner, so eq. 1215
+        // gives back the CU's luma origin).
+        let ax = (cu.cu.x as usize) / size_y * size_y;
+        let ay = (cu.cu.y as usize) / size_y * size_y;
+        let inside_current = ax >= cu.cu.x as usize
+            && ax < (cu.cu.x + cu.cu.w) as usize
+            && ay >= cu.cu.y as usize
+            && ay < (cu.cu.y + cu.cu.h) as usize;
+        let (x_cu_cb, y_cu_cb) = if inside_current {
+            (cu.cu.x as usize, cu.cu.y as usize)
+        } else {
+            let bx = ((ax / 4) as u32).min(self.intra_grid_w - 1);
+            let by = ((ay / 4) as u32).min(self.intra_grid_h - 1);
+            let (ox, oy) = self.cu_origin_grid[(by * self.intra_grid_w + bx) as usize];
+            (ox as usize, oy as usize)
+        };
+        let avail_l = x_cu_cb > 0;
+        let avail_t = y_cu_cb > 0;
+        let luma = &out.luma;
+        let mut sum: u64 = 0;
+        let mut cnt: usize = 0;
+        if avail_l {
+            for i in 0..size_y {
+                let yy = (y_cu_cb + i).min(luma.height - 1);
+                sum += u64::from(luma.samples[yy * luma.stride + (x_cu_cb - 1)]) << up;
+            }
+            cnt += size_y;
+        }
+        if avail_t {
+            for i in 0..size_y {
+                let xx = (x_cu_cb + i).min(luma.width - 1);
+                sum += u64::from(luma.samples[(y_cu_cb - 1) * luma.stride + xx]) << up;
+            }
+            cnt += size_y;
+        }
+        // eq. 1216 / eq. 1217 — `cnt` is sizeY or 2·sizeY, both powers
+        // of two, so `Log2( cnt )` is exact.
+        let inv_avg_luma = if cnt > 0 {
+            ((sum + (cnt as u64 >> 1)) >> cnt.trailing_zeros()) as u32
+        } else {
+            1u32 << (bit_depth - 1)
+        };
+        let idx_y_inv = l
+            .derived
+            .idx_y_inv(inv_avg_luma, l.min_bin_idx, l.max_bin_idx);
+        Some(l.derived.chroma_var_scale(idx_y_inv))
     }
 
     /// Install the per-slice reference-picture list 0. P-slice callers
@@ -1092,6 +1208,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let row_off = (by * self.intra_grid_w) as usize;
             for bx in bx0..bx1 {
                 self.intra_grid[row_off + bx as usize] = is_intra;
+                // §8.7.5.3 — record the covering CU's top-left luma
+                // origin so a later CU's `( xCuCb, yCuCb )` lookup can
+                // resolve the CU containing its sizeY-aligned corner.
+                self.cu_origin_grid[row_off + bx as usize] = (x, y);
             }
         }
         // Round-364 — an intra CB is never affine; clear any stale
@@ -3064,6 +3184,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     tr_v,
                     /*transform_skip=*/ false,
                     /*cu_chroma_qp_offset=*/ 0,
+                    /*lmcs_chroma_var_scale=*/ None,
                     out,
                 )?;
             }
@@ -3096,6 +3217,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             bit_depth,
                             /*transform_skip=*/ false,
                             /*cu_chroma_qp_offset=*/ 0,
+                            /*lmcs_chroma_var_scale=*/ None,
                             out,
                         )?;
                     }
@@ -3113,6 +3235,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bit_depth,
                     info.transform_skip_luma,
                     /*cu_chroma_qp_offset=*/ 0,
+                    /*lmcs_chroma_var_scale=*/ None,
                     out,
                 )?;
             }
@@ -3122,6 +3245,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let c_h = (cu.cu.h as usize) / 2;
             let c_x = (cu.cu.x as usize) / 2;
             let c_y = (cu.cu.y as usize) / 2;
+            // §8.7.5.3 — chroma residual scaling `varScale` for this
+            // CU's chroma TBs. The `nCurrSw * nCurrSh <= 4` bullet of
+            // the pass-through list gates it here; the remaining
+            // bullets (`ph_chroma_residual_scale_flag`,
+            // `sh_lmcs_used_flag`) live in the helper. The `invAvgLuma`
+            // neighbourhood reads the mapped-domain luma written above.
+            let lmcs_cvs = if c_w * c_h > 4 {
+                self.lmcs_chroma_var_scale_for_cu(cu, out)
+            } else {
+                None
+            };
             if info.tu_c_res_mode != 0 {
                 // §8.7.2 joint Cb-Cr — a single coded block reconstructs
                 // both chroma residuals.
@@ -3149,6 +3283,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu_off_cbcr,
                     info.transform_skip_cb,
                     info.transform_skip_cr,
+                    lmcs_cvs,
                     out,
                 )?;
             } else {
@@ -3181,6 +3316,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         bit_depth,
                         info.transform_skip_cb,
                         cu_off_cb,
+                        lmcs_cvs,
                         out,
                     )?;
                 }
@@ -3196,6 +3332,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         bit_depth,
                         info.transform_skip_cr,
                         cu_off_cr,
+                        lmcs_cvs,
                         out,
                     )?;
                 }
@@ -5261,6 +5398,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         bit_depth: u32,
         transform_skip: bool,
         cu_chroma_qp_offset: i32,
+        lmcs_chroma_var_scale: Option<u32>,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         // The regular (`cu_sbt_flag == 0`) inter residual path uses the
@@ -5281,6 +5419,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             TrType::DctII,
             transform_skip,
             cu_chroma_qp_offset,
+            lmcs_chroma_var_scale,
             out,
         )
     }
@@ -5304,6 +5443,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         tr_v: TrType,
         transform_skip: bool,
         cu_chroma_qp_offset: i32,
+        lmcs_chroma_var_scale: Option<u32>,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         if n_tb_w == 0 || n_tb_h == 0 || levels.len() != n_tb_w * n_tb_h {
@@ -5349,7 +5489,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // separable inverse transform is bypassed. Otherwise run the
         // §8.7.4.1 kernel (DCT-II for the regular path, Table-40 DST-VII /
         // DCT-VIII for SBT).
-        let res = if transform_skip {
+        let mut res = if transform_skip {
             d
         } else {
             // §8.7.4.1 eqs. 1171 / 1172 — non-zero coefficient ranges depend
@@ -5376,6 +5516,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 log2_tr_range,
             )?
         };
+        // §8.7.5.3 eqs. 1219 / 1220 — when LMCS chroma residual scaling
+        // applies to this chroma TB the caller passes the eq. 1218
+        // `varScale`; the residual is folded before the eq. 1220 add.
+        if c_idx != 0 {
+            if let Some(vs) = lmcs_chroma_var_scale {
+                lmcs_scale_chroma_residuals(&mut res, vs, bit_depth);
+            }
+        }
         // §8.7.5.1 — recSamples = Clip1(predSamples + resSamples). The
         // plane already holds predSamples; read each sample as pred,
         // add residual, clip. The 8-bit `PictureBuffer` stores narrowed
@@ -5432,6 +5580,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cu_qp_offset_cbcr: i32,
         coded_transform_skip_cb: bool,
         coded_transform_skip_cr: bool,
+        lmcs_chroma_var_scale: Option<u32>,
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
@@ -5492,7 +5641,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
         // Derive and add each chroma component's residual.
         for c_idx in [1u32, 2u32] {
-            let res = scaling_and_transformation(
+            let mut res = scaling_and_transformation(
                 c_idx,
                 mode,
                 self.ph_joint_cbcr_sign,
@@ -5503,6 +5652,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 bit_depth,
                 log2_tr_range,
             )?;
+            // §8.7.5.3 eqs. 1219 / 1220 — the scaling applies to the
+            // §8.7.2-derived `resSamples` of BOTH components (the
+            // `tu_joint_cbcr_residual_flag` arm of `tuCbfChroma`).
+            if let Some(vs) = lmcs_chroma_var_scale {
+                lmcs_scale_chroma_residuals(&mut res, vs, bit_depth);
+            }
             let plane = match c_idx {
                 1 => &mut out.cb,
                 _ => &mut out.cr,
@@ -6019,6 +6174,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // metadata up front so the immutable luma borrow can be created
         // alongside the mutable chroma borrow without aliasing.
         let mode_c = info.intra_pred_mode_c;
+        // §8.7.5.3 — chroma residual scaling applies to intra CUs too
+        // (only MODE_PLT is excluded). Derive `varScale` before the
+        // chroma plane is borrowed mutably; the `invAvgLuma`
+        // neighbourhood reads the (mapped-domain, when LMCS is used)
+        // reconstructed luma plane.
+        let lmcs_cvs = if n_tb_w * n_tb_h > 4 {
+            self.lmcs_chroma_var_scale_for_cu(cu, out)
+        } else {
+            None
+        };
         let is_cclm = matches!(mode_c, INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM);
         let luma_samples_snapshot: Option<Vec<u8>> = if is_cclm {
             Some(out.luma.samples.clone())
@@ -6207,6 +6372,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             } else {
                 vec![0i32; n_tb_w * n_tb_h]
             };
+
+        // §8.7.5.3 eqs. 1219 / 1220 — scale the residual before the
+        // eq. 1220 add when LMCS chroma residual scaling applies (an
+        // uncoded TB's all-zero residual is unaffected, matching the
+        // eq. 1221 pass-through arm).
+        let mut residual_samples = residual_samples;
+        if let Some(vs) = lmcs_cvs {
+            lmcs_scale_chroma_residuals(&mut residual_samples, vs, bit_depth);
+        }
 
         // 5. Reconstruct + clip into the chroma plane.
         reconstruct_tb_into(
@@ -9483,7 +9657,7 @@ mod tests {
         sh.sh_lmcs_used_flag = true;
         let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
         let lmcs = lmcs_test_data();
-        w.set_lmcs(&lmcs).unwrap();
+        w.set_lmcs(&lmcs, false).unwrap();
 
         let mut out = PictureBuffer::yuv420_filled(64, 64, 128);
         for (i, s) in out.luma.samples.iter_mut().enumerate() {
@@ -9519,7 +9693,7 @@ mod tests {
         let data = [0u8; 8];
         let sh = intra_slice_header();
         let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
-        w.set_lmcs(&lmcs_test_data()).unwrap();
+        w.set_lmcs(&lmcs_test_data(), true).unwrap();
 
         let mut out = PictureBuffer::yuv420_filled(64, 64, 128);
         for (i, s) in out.luma.samples.iter_mut().enumerate() {
@@ -9549,7 +9723,7 @@ mod tests {
         let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
         walker.current_poc = 0;
         let lmcs = lmcs_test_data();
-        walker.set_lmcs(&lmcs).unwrap();
+        walker.set_lmcs(&lmcs, false).unwrap();
 
         // Horizontal-gradient reference; zero-MV merge candidate falls
         // out of the empty motion field, so the MC prediction is a
@@ -9640,6 +9814,218 @@ mod tests {
     }
 
     #[test]
+    fn lmcs_chroma_residual_scaling_scales_inter_cb_residual() {
+        // §8.7.5.3 — with `ph_chroma_residual_scale_flag == 1` the
+        // chroma residual is folded through eq. 1220 before the add.
+        // The CU sits at (0, 0), so the sizeY-aligned corner falls
+        // inside it and neither neighbour column is available →
+        // `invAvgLuma = 1 << (BitDepth − 1) = 128` (eq. 1217), which
+        // lands in bin 8 (`lmcsCW[8] = 16`), and with
+        // `lmcsDeltaCrs = +4` eq. 100 gives
+        // `varScale = 16 * 2048 / 20 = 1638` — a non-identity scale.
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        sh.sh_lmcs_used_flag = true;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        let mut lmcs = lmcs_test_data();
+        lmcs.lmcs_delta_abs_crs = 4; // lmcsDeltaCrs = +4.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = true;
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8; // single Cb DC coefficient.
+
+        // Scaling gated off by ph_chroma_residual_scale_flag = 0.
+        walker.set_lmcs(&lmcs, false).unwrap();
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_off)
+            .expect("recon with chroma scaling off");
+
+        // Scaling on.
+        walker.set_lmcs(&lmcs, true).unwrap();
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_on)
+            .expect("recon with chroma scaling on");
+
+        // Expected: rec_on = Clip1(pred + (|res| * 1638 + 1024) >> 11)
+        // where pred = 128 (zero-MV copy — `yuv420_filled` seeds every
+        // chroma plane to neutral 128 regardless of the luma seed) and
+        // res = rec_off − pred.
+        let var_scale = 16u64 * 2048 / 20;
+        assert_eq!(var_scale, 1638);
+        let stride = out_off.cb.stride;
+        let mut diff_seen = false;
+        for row in 0..8usize {
+            for col in 0..8usize {
+                let off = i64::from(out_off.cb.samples[row * stride + col]);
+                let res = off - 128;
+                assert!(
+                    (1..=254).contains(&off),
+                    "unclipped baseline required at ({col}, {row})"
+                );
+                let mag = ((res.unsigned_abs() * var_scale) + 1024) >> 11;
+                let scaled = if res < 0 { -(mag as i64) } else { mag as i64 };
+                let expect = (128 + scaled).clamp(0, 255) as u8;
+                let got = out_on.cb.samples[row * stride + col];
+                assert_eq!(got, expect, "scaled Cb at ({col}, {row})");
+                if got != out_off.cb.samples[row * stride + col] {
+                    diff_seen = true;
+                }
+            }
+        }
+        assert!(diff_seen, "the eq. 1220 fold must change some samples");
+        // Luma and Cr are untouched by the Cb residual.
+        assert_eq!(out_on.cr.samples, out_off.cr.samples);
+        assert_eq!(out_on.luma.samples, out_off.luma.samples);
+    }
+
+    #[test]
+    fn lmcs_chroma_scaling_averages_left_neighbour_luma() {
+        // §8.7.5.3 step 1 — a CU whose sizeY-aligned corner has a left
+        // neighbour must average the left column of mapped-domain
+        // reconstructed luma (eq. 1216), NOT fall back to eq. 1217
+        // mid-grey. The payload puts `lmcsCW = 16` on bins 0..=7 and
+        // `lmcsCW = 12` on bins 8..=15 with `lmcsDeltaCrs = +4`:
+        //   * left-column luma 60 → bin 3 → varScale = 32768/20 = 1638;
+        //   * mid-grey 128 → bin 8 → varScale = 32768/16 = 2048 (an
+        //     identity fold).
+        // So a difference from the scaling-off reconstruction proves
+        // the neighbour average was used.
+        let pic_w = 128u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        sh.sh_lmcs_used_flag = true;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            motion_field: None,
+        }]);
+
+        let mut abs_cw = [0u32; crate::lmcs::LMCS_NUM_BINS];
+        let mut sign_cw = [false; crate::lmcs::LMCS_NUM_BINS];
+        for i in 8..16 {
+            abs_cw[i] = 4;
+            sign_cw[i] = true; // lmcsCW[8..=15] = 16 − 4 = 12.
+        }
+        let lmcs = LmcsData {
+            lmcs_min_bin_idx: 0,
+            lmcs_delta_max_bin_idx: 0,
+            lmcs_delta_cw_prec_minus1: 3,
+            lmcs_delta_abs_cw: abs_cw,
+            lmcs_delta_sign_cw_flag: sign_cw,
+            lmcs_delta_abs_crs: 4,
+            lmcs_delta_sign_crs_flag: false,
+        };
+
+        // CU at (64, 0) — the sizeY(=64)-aligned corner (64, 0) falls
+        // inside the CU, availL holds (x > 0), availT does not (y == 0).
+        let ccu = CtuCu {
+            ctu_addr_rs: 1,
+            cu: Cu {
+                x: 64,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 64,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.tu_y_coded_flag = false;
+        info.tu_cb_coded_flag = true;
+        let mut residual = LeafCuResidual::default();
+        residual.cb_levels = vec![0i32; 8 * 8];
+        residual.cb_levels[0] = 8;
+
+        // Baseline: scaling off. Seed the whole luma plane to 60 so the
+        // x = 63 column (left of the aligned corner) reads 60.
+        walker.set_lmcs(&lmcs, false).unwrap();
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 60);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_off)
+            .expect("recon with chroma scaling off");
+
+        walker.set_lmcs(&lmcs, true).unwrap();
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 60);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_on)
+            .expect("recon with chroma scaling on");
+
+        // Expected fold with the LEFT-average varScale (1638), checked
+        // exactly; the mid-grey fallback would give the identity 2048
+        // fold (== out_off), which `diff_seen` rules out.
+        let var_scale = 16u64 * 2048 / 20;
+        let stride = out_off.cb.stride;
+        let c_x = 32usize; // 64 / 2
+        let mut diff_seen = false;
+        for row in 0..8usize {
+            for col in 0..8usize {
+                let off = i64::from(out_off.cb.samples[row * stride + c_x + col]);
+                let res = off - 128;
+                let mag = ((res.unsigned_abs() * var_scale) + 1024) >> 11;
+                let scaled = if res < 0 { -(mag as i64) } else { mag as i64 };
+                let expect = (128 + scaled).clamp(0, 255) as u8;
+                let got = out_on.cb.samples[row * stride + c_x + col];
+                assert_eq!(got, expect, "scaled Cb at ({col}, {row})");
+                if got != out_off.cb.samples[row * stride + c_x + col] {
+                    diff_seen = true;
+                }
+            }
+        }
+        assert!(diff_seen, "left-average varScale must differ from identity");
+    }
+
+    #[test]
     fn set_lmcs_rejects_nonconforming_payload() {
         // The all-defaults full-window payload derives `lmcsCW[i] =
         // OrgCW` for all 16 bins, so `Σ lmcsCW = 1 << BitDepth` — one
@@ -9650,7 +10036,7 @@ mod tests {
         let data = [0u8; 8];
         let sh = intra_slice_header();
         let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
-        assert!(w.set_lmcs(&LmcsData::default()).is_err());
+        assert!(w.set_lmcs(&LmcsData::default(), false).is_err());
     }
 
     #[test]
