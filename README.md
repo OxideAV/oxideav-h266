@@ -48,7 +48,8 @@ oxideav-h266 = "0.0"
     the BitDepth-dependent §7.4.3.19 derivations (`OrgCW`, `lmcsCW`,
     `LmcsPivot`, `ScaleCoeff` / `InvScaleCoeff`, `ChromaScaleCoeff`) and
     the sample-domain forward / inverse luma mapping + chroma residual
-    scaling folds.
+    scaling folds — all **live in the reconstruction pipeline** (see
+    the LMCS bullet under Decode support).
 * **Auxiliary NAL units** — AUD (§7.3.2.10), Filler Data (§7.3.2.13),
   End of Sequence / End of Bitstream (§7.3.2.11 / §7.3.2.12),
   `rbsp_trailing_bits()` / `byte_alignment()` / `rbsp_slice_trailing_bits()`
@@ -262,6 +263,22 @@ P + B-slice merge subset:
   initValue / shiftIdx tables for every element currently parsed.
 * **In-loop filters** — §8.8.3 deblocking, §8.8.4 SAO (edge + band),
   §8.8.5 ALF including the fixed-filter family + CC-ALF.
+* **LMCS** (§8.7.5.2 / §8.7.5.3 / §8.8.2) is **live** end-to-end: a
+  slice with `sh_lmcs_used_flag == 1` (including the §7.4.8 PH-in-SH
+  inference) reconstructs its luma in the mapped domain —
+  `CtuWalker::set_lmcs` binds the `ph_lmcs_aps_id`-referenced payload,
+  every MODE_INTER (non-CIIP) CU forward-maps its MC luma prediction
+  (eq. 1213) before the eq. 1214 residual add, a CIIP CU forward-maps
+  its inter part inside the §8.5.6.7 eq. 997 blend, intra CUs pass
+  through, and the §8.8.1 step-1 picture inverse mapping (§8.8.2.2)
+  runs at the head of the in-loop filter stack. Chroma residual
+  scaling (§8.7.5.3, gated on `ph_chroma_residual_scale_flag`) derives
+  `varScale` from the eq. 1216 `invAvgLuma` neighbour average of the
+  sizeY-aligned containing CU (per-4x4 CU-origin grid + availL /
+  availT gathers, eq. 1217 mid-grey fallback) and applies the
+  eqs. 1219 / 1220 fold on the inter Cb / Cr, inter joint Cb-Cr and
+  intra chroma residual paths (`nCurrSw * nCurrSh <= 4` pass-through
+  honoured).
 
 ## Encoder
 
@@ -270,7 +287,14 @@ an Annex-B bitstream with real coded residuals, deblock, SAO, ALF, and
 CC-ALF, plus opt-in partitioning tools: an MTT BT picker
 (`EncoderConfig::enable_mtt_bt_picker`, `{leaf, BT_VERT, BT_HORZ}` on
 `cost = SSE_Y + λ·bits`) and an MTT TT picker
-(`EncoderConfig::enable_mtt_tt_picker`, adding `TT_VERT` / `TT_HORZ`).
+(`EncoderConfig::enable_mtt_tt_picker`, adding `TT_VERT` / `TT_HORZ`),
+and opt-in **LMCS** (`EncoderConfig::lmcs`): the coding loop runs in
+the forward-mapped luma domain, the reconstruction is inverse-mapped
+(§8.8.1 step 1) before the deblock / SAO / ALF designs, and the wire
+carries `sps_lmcs_enabled_flag`, an LMCS APS NAL (§7.3.2.19 payload
+via `aps_enc::emit_lmcs_aps_rbsp`), the §7.3.2.8 PH LMCS chain and
+`sh_lmcs_used_flag` — all parse-verified against this crate's own
+parsers.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
