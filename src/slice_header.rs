@@ -387,9 +387,21 @@ pub fn parse_slice_header_stateful(
 
     if ph_state.ph_lmcs_enabled_flag && !sh_picture_header_in_slice_header_flag {
         out.sh_lmcs_used_flag = br.u1()? == 1;
+    } else {
+        // §7.4.8 — when not present, sh_lmcs_used_flag is inferred to
+        // `sh_picture_header_in_slice_header_flag ?
+        // ph_lmcs_enabled_flag : 0` (a PH carried in the slice header
+        // speaks for exactly this one slice, so the PH enable IS the
+        // per-slice use).
+        out.sh_lmcs_used_flag =
+            sh_picture_header_in_slice_header_flag && ph_state.ph_lmcs_enabled_flag;
     }
     if ph_state.ph_explicit_scaling_list_enabled_flag && !sh_picture_header_in_slice_header_flag {
         out.sh_explicit_scaling_list_used_flag = br.u1()? == 1;
+    } else {
+        // §7.4.8 — same PH-in-SH inference shape as sh_lmcs_used_flag.
+        out.sh_explicit_scaling_list_used_flag = sh_picture_header_in_slice_header_flag
+            && ph_state.ph_explicit_scaling_list_enabled_flag;
     }
 
     // ref_pic_lists() — skipped because pps_rpl_info_in_ph_flag = 1 in
@@ -790,6 +802,86 @@ mod tests {
         assert_eq!(sh.sh_qp_delta, 0);
         assert!(!sh.sh_dep_quant_used_flag);
         assert!(sh.sh_slice_header_extension_bytes.is_empty());
+    }
+
+    /// §7.4.8 — `sh_lmcs_used_flag` / `sh_explicit_scaling_list_used_flag`
+    /// are not transmitted when the picture header rides in the slice
+    /// header; both are inferred to
+    /// `sh_picture_header_in_slice_header_flag ? ph_*_enabled_flag : 0`.
+    #[test]
+    fn stateful_ph_in_sh_infers_lmcs_and_scaling_list_flags() {
+        let (sps, pps) = synthetic_sps_pps();
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            ph_lmcs_enabled_flag: true,
+            ph_explicit_scaling_list_enabled_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrWRadl,
+            ..Default::default()
+        };
+
+        // sh_ph_in_sh_flag = 1 followed by a minimal embedded PH lead:
+        // ph_gdr_or_irap = 1, ph_non_ref = 0, ph_gdr_pic = 0,
+        // ph_inter_slice_allowed = 0, ph_pic_parameter_set_id ue(0).
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 1, 1); // sh_picture_header_in_slice_header_flag
+        push_u(&mut bits, 1, 1); // ph_gdr_or_irap_pic_flag
+        push_u(&mut bits, 0, 1); // ph_non_ref_pic_flag
+        push_u(&mut bits, 0, 1); // ph_gdr_pic_flag
+        push_u(&mut bits, 0, 1); // ph_inter_slice_allowed_flag
+        push_ue(&mut bits, 0); // ph_pic_parameter_set_id
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+                                 // sh_lmcs_used_flag NOT transmitted (PH in SH) — inferred 1.
+                                 // sh_explicit_scaling_list_used_flag — same inference.
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(sh.sh_picture_header_in_slice_header_flag);
+        assert!(sh.sh_lmcs_used_flag, "inferred from ph_lmcs_enabled_flag");
+        assert!(
+            sh.sh_explicit_scaling_list_used_flag,
+            "inferred from ph_explicit_scaling_list_enabled_flag"
+        );
+
+        // Same stream with the PH enables off — both infer to 0.
+        let ph_state_off = PhState {
+            ph_lmcs_enabled_flag: false,
+            ph_explicit_scaling_list_enabled_flag: false,
+            ..ph_state
+        };
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state_off).unwrap();
+        assert!(!sh.sh_lmcs_used_flag);
+        assert!(!sh.sh_explicit_scaling_list_used_flag);
+    }
+
+    /// §7.3.7 — without an embedded PH the two flags ARE transmitted
+    /// when the corresponding PH enable is set (and inferred 0
+    /// otherwise, which the intra-slice test above already covers).
+    #[test]
+    fn stateful_lmcs_and_scaling_list_flags_read_when_ph_separate() {
+        let (sps, pps) = synthetic_sps_pps();
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            ph_lmcs_enabled_flag: true,
+            ph_explicit_scaling_list_enabled_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrWRadl,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_u(&mut bits, 1, 1); // sh_lmcs_used_flag = 1
+        push_u(&mut bits, 0, 1); // sh_explicit_scaling_list_used_flag = 0
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(sh.sh_lmcs_used_flag);
+        assert!(!sh.sh_explicit_scaling_list_used_flag);
     }
 
     /// Inter slice (B, sh_slice_type = 0). ph_inter_slice_allowed = 1 →

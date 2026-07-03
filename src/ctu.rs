@@ -1025,20 +1025,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.sh.sh_lmcs_used_flag && self.lmcs.is_some()
     }
 
-    /// §8.7.5.2 — derive `predMapSamples` for a MODE_INTER (non-CIIP)
-    /// CU by forward-mapping its motion-compensated luma prediction in
-    /// place. Right after MC the picture plane holds `predSamples`;
-    /// eq. 1213 lifts each sample into the LMCS codeword domain so the
-    /// eq. 1214 residual add — and every later mapped-domain read
-    /// (intra reference samples, the §8.7.5.3 `invAvgLuma`
-    /// neighbourhood) — sees mapped values. The §8.7.5.2 pass-through
-    /// modes (MODE_INTRA / MODE_IBC / MODE_PLT, and MODE_INTER with
-    /// `ciip_flag == 1`) must NOT call this. No-op unless the slice
-    /// uses LMCS with a bound payload.
+    /// §8.7.5.2 eq. 1213 / §8.5.6.7 eq. 997 — forward-map a luma
+    /// prediction rectangle in place. Two callers:
+    ///
+    /// * a MODE_INTER CU with `ciip_flag == 0` maps its MC prediction
+    ///   right before the §8.7.5.2 eq. 1214 residual add
+    ///   (`predMapSamples`), so the add — and every later
+    ///   mapped-domain read (intra reference samples, the §8.7.5.3
+    ///   `invAvgLuma` neighbourhood) — sees mapped values;
+    /// * a CIIP CU maps its INTER prediction part before the
+    ///   §8.5.6.7 eq. 998 weighted blend (eq. 997), which is why the
+    ///   §8.7.5.2 `ciip_flag == 1` arm is a pass-through.
+    ///
+    /// The §8.7.5.2 pass-through modes (MODE_INTRA / MODE_IBC /
+    /// MODE_PLT) never call this. No-op unless the slice uses LMCS
+    /// with a bound payload.
     ///
     /// Eq. 1213 itself is unclamped; the value is clamped to
-    /// `[0, (1 << BitDepth) − 1]` for plane storage — the §7.4.3.19
-    /// eq. 96 `Σ lmcsCW <= (1 << BitDepth) − 1` budget keeps
+    /// `[0, (1 << BitDepth) − 1]` for plane storage — eq. 997 clips
+    /// explicitly, and on the eq. 1213 side the §7.4.3.19 eq. 96
+    /// `Σ lmcsCW <= (1 << BitDepth) − 1` budget keeps
     /// `predMapSamples` inside that range, so the clamp never changes
     /// an in-range mapping.
     fn lmcs_forward_map_luma_rect(
@@ -2858,6 +2864,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
         // ---- CIIP luma combine (§8.5.6.7 eq. 998) --------------------------
         if ciip_active {
+            // §8.5.6.7 eq. 997 — when the slice uses LMCS the INTER
+            // part of the CIIP prediction is forward-mapped (with
+            // Clip1) BEFORE the eq. 998 weighted blend; the intra part
+            // is already in the mapped domain (its reference samples
+            // come from the mapped-domain reconstruction). This is why
+            // the §8.7.5.2 `ciip_flag == 1` arm is a pass-through: the
+            // mapping already happened here. cIdx == 0 only — the
+            // chroma inter parts blend unmapped.
+            self.lmcs_forward_map_luma_rect(
+                out,
+                cu.cu.x as usize,
+                cu.cu.y as usize,
+                cu.cu.w as usize,
+                cu.cu.h as usize,
+            );
             apply_ciip_combine_to_plane(
                 &mut out.luma,
                 cu.cu.x as usize,
@@ -10023,6 +10044,99 @@ mod tests {
             }
         }
         assert!(diff_seen, "left-average varScale must differ from identity");
+    }
+
+    #[test]
+    fn lmcs_ciip_forward_maps_inter_part_before_blend() {
+        // §8.5.6.7 eq. 997 — when the slice uses LMCS a CIIP CU's INTER
+        // prediction part is forward-mapped (with Clip1) BEFORE the
+        // eq. 998 weighted blend; the intra part passes through (its
+        // reference samples already live in the mapped domain). With a
+        // constant-40 reference the inter part maps 40 → 32 under the
+        // test payload, so the blend output differs from the unmapped
+        // combine by (4 − w) · 8 / 4 per sample.
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let sps = dummy_sps(1, pic_w, pic_h);
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        sh.sh_lmcs_used_flag = true;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let lmcs = lmcs_test_data();
+        walker.set_lmcs(&lmcs, false).unwrap();
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: -1,
+            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+            motion_field: None,
+        }]);
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        info.inter.merge_data.ciip_flag = true;
+        let residual = LeafCuResidual::default();
+
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200);
+        // Expected intra part: the same PLANAR prediction the CIIP path
+        // captures from the pre-MC plane (top edge unavailable at
+        // y == 0, left column = the 200 seed).
+        let refs = OwnedIntraRefs::from_plane(&out.luma, 16, 0, 16, 16, false, true, 8);
+        let refs_view = IntraRefs {
+            above: &refs.above,
+            left: &refs.left,
+            top_left: refs.top_left,
+        };
+        let intra_expect = predict_planar(16, 16, &refs_view).unwrap();
+
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("CIIP merge path should reconstruct");
+
+        // eq. 997: inter part 40 → LmcsPivot[2] + (2048·(40 − 32) +
+        // 2^10) >> 11 = 24 + 8 = 32. Both CIIP neighbours are
+        // non-intra → w = 1 (eq. 998 weights: 1·intra + 3·inter).
+        let derived = lmcs.derive(8).unwrap();
+        let mapped_inter = derived.forward_map_luma_sample(40).clamp(0, 255);
+        assert_eq!(mapped_inter, 32);
+        let stride = out.luma.stride;
+        let mut differs_from_unmapped = false;
+        for row in 0..16usize {
+            for col in 0..16usize {
+                let intra = i64::from(intra_expect[row * 16 + col]);
+                let expect = ((intra + 3 * mapped_inter + 2) >> 2).clamp(0, 255) as u8;
+                let got = out.luma.samples[row * stride + 16 + col];
+                assert_eq!(got, expect, "CIIP blend at ({col}, {row})");
+                let unmapped = ((intra + 3 * 40 + 2) >> 2).clamp(0, 255) as u8;
+                if got != unmapped {
+                    differs_from_unmapped = true;
+                }
+            }
+        }
+        assert!(
+            differs_from_unmapped,
+            "eq. 997 must change the blend versus an unmapped inter part"
+        );
     }
 
     #[test]
