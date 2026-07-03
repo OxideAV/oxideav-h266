@@ -1,5 +1,7 @@
 # oxideav-h266
 
+[![CI](https://github.com/OxideAV/oxideav-h266/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-h266/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-h266.svg)](https://crates.io/crates/oxideav-h266) [![docs.rs](https://docs.rs/oxideav-h266/badge.svg)](https://docs.rs/oxideav-h266) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **H.266 / VVC** (ITU-T H.266 | ISO/IEC 23090-3) codec for
 oxideav. Zero C dependencies, no FFI, no `*-sys` crates.
 
