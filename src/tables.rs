@@ -87,6 +87,11 @@ pub enum SyntaxCtx {
     IntraLumaMpmFlag,
     IntraLumaNotPlanarFlag,
     IntraChromaPredMode,
+    /// Table 79 — `cclm_mode_flag` (3 ctxIdx, one per initType).
+    CclmModeFlag,
+    /// Table 80 — `cclm_mode_idx` (3 ctxIdx, one per initType; only
+    /// bin 0 is context-coded, bin 1 is bypass per Table 132).
+    CclmModeIdx,
     SigCoeffFlag,
     SbCodedFlag,
     AbsLevelGtxFlag,
@@ -343,6 +348,14 @@ pub const INTRA_LUMA_NOT_PLANAR_FLAG_SHIFT: &[u8] = &[1, 5, 1, 5, 1, 5];
 /// Table 81 — `intra_chroma_pred_mode` (3 ctxIdx).
 pub const INTRA_CHROMA_PRED_MODE_INIT: &[u8] = &[34, 25, 25];
 pub const INTRA_CHROMA_PRED_MODE_SHIFT: &[u8] = &[5, 5, 5];
+
+/// Table 79 — `cclm_mode_flag` (3 ctxIdx, one per initType).
+pub const CCLM_MODE_FLAG_INIT: &[u8] = &[59, 34, 26];
+pub const CCLM_MODE_FLAG_SHIFT: &[u8] = &[4, 4, 4];
+
+/// Table 80 — `cclm_mode_idx` (3 ctxIdx, one per initType).
+pub const CCLM_MODE_IDX_INIT: &[u8] = &[27, 27, 27];
+pub const CCLM_MODE_IDX_SHIFT: &[u8] = &[9, 9, 9];
 
 /// Table 112 — `tu_y_coded_flag` (12 ctxIdx).
 pub const TU_Y_CODED_FLAG_INIT: &[u8] = &[15, 12, 5, 7, 23, 5, 20, 7, 15, 6, 5, 14];
@@ -806,6 +819,8 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::IntraChromaPredMode => {
             (INTRA_CHROMA_PRED_MODE_INIT, INTRA_CHROMA_PRED_MODE_SHIFT)
         }
+        SyntaxCtx::CclmModeFlag => (CCLM_MODE_FLAG_INIT, CCLM_MODE_FLAG_SHIFT),
+        SyntaxCtx::CclmModeIdx => (CCLM_MODE_IDX_INIT, CCLM_MODE_IDX_SHIFT),
         SyntaxCtx::SigCoeffFlag => (SIG_COEFF_FLAG_INIT, SIG_COEFF_FLAG_SHIFT),
         SyntaxCtx::SbCodedFlag => (SB_CODED_FLAG_INIT, SB_CODED_FLAG_SHIFT),
         SyntaxCtx::AbsLevelGtxFlag => (ABS_LEVEL_GTX_FLAG_INIT, ABS_LEVEL_GTX_FLAG_SHIFT),
@@ -906,6 +921,8 @@ mod tests {
             SyntaxCtx::IntraLumaMpmFlag,
             SyntaxCtx::IntraLumaNotPlanarFlag,
             SyntaxCtx::IntraChromaPredMode,
+            SyntaxCtx::CclmModeFlag,
+            SyntaxCtx::CclmModeIdx,
             SyntaxCtx::SigCoeffFlag,
             SyntaxCtx::SbCodedFlag,
             SyntaxCtx::AbsLevelGtxFlag,

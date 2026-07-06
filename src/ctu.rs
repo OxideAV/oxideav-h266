@@ -71,7 +71,7 @@ use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
 use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_high_precision};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
-use crate::coding_tree::{Cu, CuNeighbourMap, TreeCtxs, TreeWalker};
+use crate::coding_tree::{Cu, CuNeighbourMap, TreeCtxs, TreeType, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{
     dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, log2_matrix_size,
@@ -864,6 +864,20 @@ pub struct CtuWalker<'a, 'b> {
     /// coded picture-edge default so multi-row CTBs see real left /
     /// above neighbour descriptors.
     nbr_map: CuNeighbourMap,
+    /// r391 — sibling neighbour map for the **chroma** coding trees of a
+    /// dual-tree I-slice (§7.3.11.2). The chroma tree's §9.3.4.2 split
+    /// ctxInc derivations must see chroma-tree neighbour CBs, not the
+    /// luma tree's, so the two walks keep separate maps.
+    nbr_map_chroma: CuNeighbourMap,
+    /// r391 — per-picture `IntraPredModeY[x][y]` store at 4×4-cell
+    /// granularity (same geometry as `intra_grid`). Written by the
+    /// dual-tree luma walk as each luma leaf CU parses; sampled by the
+    /// §8.4.3 chroma DM derivation at the collocated luma centre
+    /// `(xCb + cbWidth / 2, yCb + cbHeight / 2)`. A MIP luma CU stores
+    /// INTRA_PLANAR (its `intra_pred_mode_y` is 0), matching the §8.4.3
+    /// `IntraMipFlag → lumaIntraPredMode = INTRA_PLANAR` arm for 4:2:0.
+    /// Cells default to INTRA_PLANAR.
+    intra_luma_mode_grid: Vec<u8>,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -909,14 +923,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.5.3.2 invocation against RefPicList[1] + §8.5.6.6.2 eq.
         // 980 default-weighted bi-pred composition; BCW / weighted-pred
         // / BDOF / DMVR still surface `Error::Unsupported` further down).
-        // Dual-tree luma/chroma separate partitioning is not yet
-        // modelled.
-        if sps.partition_constraints.qtbtt_dual_tree_intra_flag {
-            return Err(Error::unsupported(
-                "h266 CTU walker: dual-tree intra partitioning (separate luma/chroma \
-                 coding trees) not supported by scaffold",
-            ));
-        }
+        // Dual-tree intra (`sps_qtbtt_dual_tree_intra_flag`) is walked
+        // since r391: an I-slice CTU runs the §7.3.11.2
+        // dual_tree_implicit_qt_split — per implicit-QT ≤64×64 node one
+        // DUAL_TREE_LUMA coding tree (luma-only CUs) followed by one
+        // DUAL_TREE_CHROMA coding tree (chroma-only CUs, §8.4.3 DM from
+        // the per-picture IntraPredModeY store) — via
+        // [`Self::decode_dual_tree_ctu`]. On P/B slices the flag has no
+        // effect (§7.3.11.2 gates the dual walk on `sh_slice_type == I`).
         // Deferred features that would change the per-CTU pipeline shape.
         // ALF (`sh_alf_enabled_flag`) is now accepted: the §8.8.5 apply
         // pass runs after SAO and the per-CTB on/off + filter selection
@@ -1031,6 +1045,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             scaling_list: None,
             cu_origin_grid: vec![(0, 0); (intra_grid_w * intra_grid_h) as usize],
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
+            nbr_map_chroma: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
+            intra_luma_mode_grid: vec![INTRA_PLANAR as u8; (intra_grid_w * intra_grid_h) as usize],
         })
     }
 
@@ -1368,6 +1384,37 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if is_intra {
             self.affine_cpmv_field.write_block(x, y, w, h, None);
         }
+    }
+
+    /// r391 — broadcast a luma CB's `IntraPredModeY` across every 4×4
+    /// cell it covers, so the §8.4.3 chroma DM derivation of a later
+    /// DUAL_TREE_CHROMA CU can sample the collocated luma mode.
+    fn write_luma_mode_block(&mut self, x: u32, y: u32, w: u32, h: u32, mode: u32) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
+        let by1 = (y + h).div_ceil(4).min(self.intra_grid_h);
+        let m = mode.min(66) as u8;
+        for by in by0..by1 {
+            let row_off = (by * self.intra_grid_w) as usize;
+            for bx in bx0..bx1 {
+                self.intra_luma_mode_grid[row_off + bx as usize] = m;
+            }
+        }
+    }
+
+    /// §8.4.3 — sample the per-picture `IntraPredModeY` store at
+    /// picture-absolute luma `(x, y)` (the chroma DM derivation passes
+    /// the collocated centre `(xCb + cbWidth / 2, yCb + cbHeight / 2)`).
+    /// Out-of-picture positions read INTRA_PLANAR, matching the grid
+    /// default.
+    fn luma_mode_at(&self, x: u32, y: u32) -> u32 {
+        let bx = x / 4;
+        let by = y / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return INTRA_PLANAR;
+        }
+        self.intra_luma_mode_grid[(by * self.intra_grid_w + bx) as usize] as u32
     }
 
     /// Round-149 — sample `MergeSubblockFlag[xCb][yCb]` at picture-
@@ -2063,6 +2110,245 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             .collect())
     }
 
+    /// §8.4.4 — cross-component chroma intra prediction mode checking
+    /// process, evaluated on the dual-tree I-slice chroma walk.
+    ///
+    /// * `sps_cclm_enabled_flag == 0` → FALSE.
+    /// * `CtbLog2SizeY < 6` → TRUE (the third early-TRUE arm; the first
+    ///   two — single-tree, non-I slice — never hold on this call path).
+    /// * Otherwise the derivation needs the 64-aligned
+    ///   `CqtDepth[1] / CbWidth[1] / CbHeight[1] / MttSplitMode` grids
+    ///   (eqs. 242 – 244 + the four 64-node conditions), which this
+    ///   walker does not track yet → a precise `Unsupported` so a
+    ///   CCLM-enabled dual-tree stream at CTB ≥ 64 fails loudly instead
+    ///   of mis-deriving bin presence.
+    fn cclm_enabled_dual_tree(&self) -> Result<bool> {
+        if !self.sps.tool_flags.cclm_enabled_flag {
+            return Ok(false);
+        }
+        let ctb_log2 = self.sps.sps_log2_ctu_size_minus5 as u32 + 5;
+        if ctb_log2 < 6 {
+            return Ok(true);
+        }
+        Err(Error::unsupported(
+            "h266 CTU walker: §8.4.4 CclmEnabled 64-grid derivation for dual-tree \
+             pictures with CtbLog2SizeY >= 6 not wired yet (CCLM + dual-tree needs \
+             CTB 32, or disable sps_cclm_enabled_flag)",
+        ))
+    }
+
+    /// §7.3.11.2 — walk one dual-tree I-slice CTU end-to-end:
+    /// `dual_tree_implicit_qt_split(xCtb, yCtb, CtbSizeY, 0)`. The
+    /// implicit quad split recurses (without reading any bin) while
+    /// `cbSize > 64`, gating each quadrant on the picture bounds; at
+    /// every surviving node it parses + reconstructs one DUAL_TREE_LUMA
+    /// coding tree followed by one DUAL_TREE_CHROMA coding tree.
+    ///
+    /// Parse-vs-reconstruct ordering inside a node matches the
+    /// scaffold's partitions-then-bodies convention (the same shape
+    /// [`Self::decode_ctu_full`] uses for single-tree CTUs): luma
+    /// partitions → luma CU bodies (each committed to the per-picture
+    /// `IntraPredModeY` store) → luma reconstruction → chroma
+    /// partitions → chroma CU bodies (§8.4.3 DM sampling that store) →
+    /// chroma reconstruction. Reconstructing the node's luma before its
+    /// chroma tree parses is also what makes CCLM work: the §8.4.5.2.14
+    /// predictor reads the reconstructed collocated luma.
+    fn decode_dual_tree_ctu(&mut self, ctu: &CtuPos, out: &mut PictureBuffer) -> Result<()> {
+        if ctu.width_luma == 0 || ctu.height_luma == 0 {
+            return Ok(());
+        }
+        let ctb = self.layout.ctb_size_y;
+        self.decode_dual_tree_node(ctu.ctu_addr_rs, ctu.x0, ctu.y0, ctb, out)
+    }
+
+    /// One `dual_tree_implicit_qt_split` node (§7.3.11.2). `cb_size` is
+    /// the square node size in luma samples; nodes larger than 64 split
+    /// implicitly (no bins), quadrants outside the picture are skipped
+    /// per the `x1 < pps_pic_width_in_luma_samples` /
+    /// `y1 < pps_pic_height_in_luma_samples` guards.
+    fn decode_dual_tree_node(
+        &mut self,
+        ctu_addr_rs: u32,
+        x0: u32,
+        y0: u32,
+        cb_size: u32,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        let pic_w = self.layout.pic_width_luma;
+        let pic_h = self.layout.pic_height_luma;
+        if x0 >= pic_w || y0 >= pic_h {
+            return Ok(());
+        }
+        if cb_size > 64 {
+            let half = cb_size / 2;
+            let x1 = x0 + half;
+            let y1 = y0 + half;
+            self.decode_dual_tree_node(ctu_addr_rs, x0, y0, half, out)?;
+            if x1 < pic_w {
+                self.decode_dual_tree_node(ctu_addr_rs, x1, y0, half, out)?;
+            }
+            if y1 < pic_h {
+                self.decode_dual_tree_node(ctu_addr_rs, x0, y1, half, out)?;
+            }
+            if x1 < pic_w && y1 < pic_h {
+                self.decode_dual_tree_node(ctu_addr_rs, x1, y1, half, out)?;
+            }
+            return Ok(());
+        }
+        // Clip the node to the picture (the scaffold's boundary model —
+        // the single-tree walker clips the CTU the same way).
+        let w = cb_size.min(pic_w - x0);
+        let h = cb_size.min(pic_h - y0);
+
+        // ---- DUAL_TREE_LUMA ------------------------------------------------
+        let luma_local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
+            .with_neighbour_map_rebased(&mut self.nbr_map, x0, y0)
+            .with_tree_type(TreeType::DualTreeLuma)
+            .walk(0, 0, w, h)?;
+        let luma_cus: Vec<CtuCu> = luma_local
+            .into_iter()
+            .map(|c| CtuCu {
+                ctu_addr_rs,
+                cu: Cu {
+                    x: c.x + x0,
+                    y: c.y + y0,
+                    ..c
+                },
+            })
+            .collect();
+        let mut luma_infos = Vec::with_capacity(luma_cus.len());
+        let mut luma_residuals = Vec::with_capacity(luma_cus.len());
+        for ccu in &luma_cus {
+            let neigh = self.compute_cu_neighbourhood(ccu);
+            let tools = self.cu_tool_flags();
+            let mut info = LeafCuInfo {
+                x0: ccu.cu.x,
+                y0: ccu.cu.y,
+                cb_width: ccu.cu.w,
+                cb_height: ccu.cu.h,
+                ..LeafCuInfo::default()
+            };
+            let mut residual = LeafCuResidual::default();
+            let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+                .with_tree_type(TreeType::DualTreeLuma);
+            reader.decode(&mut info, &mut residual, &neigh)?;
+            // Commit IntraPredModeY so this node's chroma tree (and any
+            // later chroma CU) can run the §8.4.3 DM derivation. A MIP
+            // CU's stored `intra_pred_mode_y` is 0 == INTRA_PLANAR,
+            // which is exactly the §8.4.3 IntraMipFlag arm for 4:2:0.
+            self.write_luma_mode_block(
+                ccu.cu.x,
+                ccu.cu.y,
+                ccu.cu.w,
+                ccu.cu.h,
+                info.intra_pred_mode_y,
+            );
+            luma_infos.push(info);
+            luma_residuals.push(residual);
+        }
+        for ((ccu, info), residual) in luma_cus
+            .iter()
+            .zip(luma_infos.iter())
+            .zip(luma_residuals.iter())
+        {
+            self.reconstruct_leaf_cu_with_tree(ccu, info, residual, out, TreeType::DualTreeLuma)?;
+        }
+
+        // ---- DUAL_TREE_CHROMA ----------------------------------------------
+        if self.sps.sps_chroma_format_idc == 0 {
+            // Monochrome never sets the dual-tree flag (§7.3.2.3 gates
+            // it on chroma_format_idc != 0); defensive skip.
+            return Ok(());
+        }
+        let cclm_enabled = self.cclm_enabled_dual_tree()?;
+        let chroma_local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
+            .with_neighbour_map_rebased(&mut self.nbr_map_chroma, x0, y0)
+            .with_tree_type(TreeType::DualTreeChroma)
+            .walk(0, 0, w, h)?;
+        let chroma_cus: Vec<CtuCu> = chroma_local
+            .into_iter()
+            .map(|c| CtuCu {
+                ctu_addr_rs,
+                cu: Cu {
+                    x: c.x + x0,
+                    y: c.y + y0,
+                    ..c
+                },
+            })
+            .collect();
+        let mut chroma_infos = Vec::with_capacity(chroma_cus.len());
+        let mut chroma_residuals = Vec::with_capacity(chroma_cus.len());
+        for ccu in &chroma_cus {
+            // §8.4.3 — collocated luma mode at the CB centre.
+            let dm_mode = self.luma_mode_at(ccu.cu.x + ccu.cu.w / 2, ccu.cu.y + ccu.cu.h / 2);
+            let tools = self.cu_tool_flags();
+            let mut info = LeafCuInfo {
+                x0: ccu.cu.x,
+                y0: ccu.cu.y,
+                cb_width: ccu.cu.w,
+                cb_height: ccu.cu.h,
+                ..LeafCuInfo::default()
+            };
+            let mut residual = LeafCuResidual::default();
+            let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+                .with_tree_type(TreeType::DualTreeChroma);
+            reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
+            chroma_infos.push(info);
+            chroma_residuals.push(residual);
+        }
+        for ((ccu, info), residual) in chroma_cus
+            .iter()
+            .zip(chroma_infos.iter())
+            .zip(chroma_residuals.iter())
+        {
+            self.reconstruct_leaf_cu_dual_chroma(ccu, info, residual, out)?;
+        }
+        Ok(())
+    }
+
+    /// Reconstruct a DUAL_TREE_CHROMA leaf CU — the Cb + Cr planes only,
+    /// through the same §8.4 / §8.7 chroma pipeline the single-tree path
+    /// uses (`reconstruct_chroma_plane` handles CCLM / BDPCM-chroma /
+    /// transform-skip / the chroma QP chain). Deblocking-edge records
+    /// are NOT pushed for chroma-tree CUs: the scaffold's [`DeblockCu`]
+    /// list drives both luma and chroma edge classification from one
+    /// geometry, and the luma-tree records already cover this area — a
+    /// documented approximation (the spec derives chroma edges from the
+    /// chroma tree on dual-tree slices, §8.8.3.2).
+    fn reconstruct_leaf_cu_dual_chroma(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        if self.sps.sps_chroma_format_idc != 1 {
+            return Err(Error::unsupported(
+                "h266 dual-tree chroma reconstruction: only 4:2:0 is walked",
+            ));
+        }
+        let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+        self.reconstruct_chroma_plane(
+            /*c_idx=*/ 1,
+            cu,
+            info,
+            &residual.cb_levels,
+            info.tu_cb_coded_flag,
+            bit_depth,
+            out,
+        )?;
+        self.reconstruct_chroma_plane(
+            /*c_idx=*/ 2,
+            cu,
+            info,
+            &residual.cr_levels,
+            info.tu_cr_coded_flag,
+            bit_depth,
+            out,
+        )?;
+        Ok(())
+    }
+
     /// Reconstruct one leaf CU into a frame buffer (luma plane only for
     /// this round; chroma planes are seeded mid-grey at allocation time
     /// and intentionally left untouched).
@@ -2095,6 +2381,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         info: &LeafCuInfo,
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
+    ) -> Result<()> {
+        self.reconstruct_leaf_cu_with_tree(cu, info, residual, out, TreeType::SingleTree)
+    }
+
+    /// Tree-typed variant of [`Self::reconstruct_leaf_cu`]. A
+    /// `DualTreeLuma` CU runs the identical intra luma pipeline but
+    /// skips the chroma pass — the sibling DUAL_TREE_CHROMA coding tree
+    /// carries this area's chroma CUs (§7.3.11.2).
+    fn reconstruct_leaf_cu_with_tree(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+        tree: TreeType,
     ) -> Result<()> {
         // Round-21 inter dispatch — runs the §8.5.2 spatial-merge
         // derivation, picks `mergeCandList[merge_idx]`, and writes the
@@ -2135,7 +2436,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // Fall through to the chroma + bookkeeping passes below.
             // The luma plane is fully written by the ISP walker so the
             // single-TB luma block (steps 1 – 5) is skipped.
-            if self.sps.sps_chroma_format_idc == 1 {
+            if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
                 self.reconstruct_chroma_plane(
                     /*c_idx=*/ 1,
                     cu,
@@ -2392,12 +2693,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bit_depth,
         )?;
 
-        // 6. Chroma planes (4:2:0 only — single-tree, monochrome formats
-        // skip this whole block). Both Cb and Cr go through the same
-        // §8.4 / §8.7 pipeline as luma, just at half spatial resolution
-        // and with the §8.4.3 chroma intra-mode mapping already baked
-        // into `info.intra_pred_mode_c`.
-        if self.sps.sps_chroma_format_idc == 1 {
+        // 6. Chroma planes (4:2:0 only — monochrome formats and the
+        // DUAL_TREE_LUMA walk skip this whole block; on a dual tree the
+        // sibling chroma coding tree reconstructs this area's chroma).
+        // Both Cb and Cr go through the same §8.4 / §8.7 pipeline as
+        // luma, just at half spatial resolution and with the §8.4.3
+        // chroma intra-mode mapping already baked into
+        // `info.intra_pred_mode_c`.
+        if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
             self.reconstruct_chroma_plane(
                 /*c_idx=*/ 1,
                 cu,
@@ -6728,12 +7031,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                  APS payload bound — call set_scaling_list() first",
             ));
         }
+        // §7.3.11.2 — an I-slice with `sps_qtbtt_dual_tree_intra_flag`
+        // walks each CTU as a dual tree (implicit QT to ≤64×64, then a
+        // luma-only and a chroma-only coding tree per node).
+        let dual_tree = self.sh.sh_slice_type == SliceType::I
+            && self.sps.partition_constraints.qtbtt_dual_tree_intra_flag;
         let ctus: Vec<CtuPos> = self.iter_ctus().collect();
         for ctu in &ctus {
             // §7.3.11.2: `sao(rx, ry)` is decoded at the start of every
             // CTU (before the partition tree). The helper short-circuits
             // when both sao_*_used_flags are 0.
             self.decode_sao_for_ctu(ctu)?;
+            if dual_tree {
+                self.decode_dual_tree_ctu(ctu, out)?;
+                continue;
+            }
             let (cus, infos, residuals) = self.decode_ctu_full(ctu)?;
             for ((ccu, info), residual) in cus.iter().zip(infos.iter()).zip(residuals.iter()) {
                 self.reconstruct_leaf_cu(ccu, info, residual, out)?;
@@ -10104,16 +10416,134 @@ mod tests {
         }
     }
 
+    /// r391 — dual-tree intra is walked: `begin_slice` accepts the SPS
+    /// flag and `decode_picture_into` drives the §7.3.11.2
+    /// dual_tree_implicit_qt_split (implicit QT from CTB 128 to four
+    /// 64×64 nodes, then per-node luma + chroma coding trees). The
+    /// zero-payload CABAC fixture must produce a structurally valid
+    /// picture: every luma AND chroma sample painted (non-zero — the
+    /// mid-grey / PLANAR fill at 8-bit lands near 128 on a
+    /// zero-initialised buffer).
     #[test]
-    fn walker_rejects_dual_tree_intra() {
+    fn walker_decodes_dual_tree_intra_picture() {
         let mut sps = dummy_sps(2, 128, 128);
         sps.partition_constraints.qtbtt_dual_tree_intra_flag = true;
         let pps = dummy_pps(128, 128, true);
         let sh = intra_slice_header();
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 4096];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data)
+            .expect("dual-tree SPS must be accepted since r391");
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        walker
+            .decode_picture_into(&mut out)
+            .expect("dual-tree I-picture decode");
+        // Luma: painted by the DUAL_TREE_LUMA walk.
+        let mut luma_painted = 0usize;
+        for v in &out.luma.samples {
+            if *v != 0 {
+                luma_painted += 1;
+            }
+        }
+        assert_eq!(
+            luma_painted,
+            128 * 128,
+            "every luma sample must be reconstructed by the luma tree"
+        );
+        // Chroma: painted by the DUAL_TREE_CHROMA walk.
+        let mut cb_painted = 0usize;
+        for v in &out.cb.samples {
+            if *v != 0 {
+                cb_painted += 1;
+            }
+        }
+        assert_eq!(
+            cb_painted,
+            64 * 64,
+            "every Cb sample must be reconstructed by the chroma tree"
+        );
+    }
+
+    /// §8.4.3 — the dual-tree chroma DM derivation samples the
+    /// per-picture IntraPredModeY store at the collocated luma centre.
+    /// Seed the grid with a known mode and check the sampler.
+    #[test]
+    fn dual_tree_luma_mode_grid_round_trips() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 8];
-        let err = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        // Default: PLANAR everywhere.
+        assert_eq!(walker.luma_mode_at(0, 0), INTRA_PLANAR);
+        // Broadcast ANGULAR50 over a 16×16 CB at (32, 48); the DM
+        // sample at the centre must read it back, a neighbour outside
+        // must not.
+        walker.write_luma_mode_block(32, 48, 16, 16, 50);
+        assert_eq!(walker.luma_mode_at(32 + 8, 48 + 8), 50);
+        assert_eq!(walker.luma_mode_at(0, 0), INTRA_PLANAR);
+        // Out-of-picture reads default to PLANAR.
+        assert_eq!(walker.luma_mode_at(4096, 4096), INTRA_PLANAR);
+    }
+
+    /// §8.4.4 — CclmEnabled on the dual-tree walk: FALSE when the SPS
+    /// tool flag is off; TRUE when `CtbLog2SizeY < 6` (CTB 32); a
+    /// precise Unsupported for the 64-grid derivation at CTB ≥ 64.
+    #[test]
+    fn dual_tree_cclm_enabled_arms() {
+        // CTB 128, cclm off → Ok(false).
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        assert!(!walker.cclm_enabled_dual_tree().unwrap());
+
+        // CTB 32 (log2 = 5 < 6), cclm on → Ok(true).
+        let mut sps32 = dummy_sps(0, 64, 64);
+        sps32.tool_flags.cclm_enabled_flag = true;
+        let pps32 = dummy_pps(64, 64, true);
+        let layout32 = CtuLayout::from_sps_pps(&sps32, &pps32);
+        let walker32 = CtuWalker::begin_slice(&layout32, &sps32, &pps32, &sh, 0, &data).unwrap();
+        assert!(walker32.cclm_enabled_dual_tree().unwrap());
+
+        // CTB 128, cclm on → Unsupported (64-grid derivation not wired).
+        let mut sps_on = dummy_sps(2, 128, 128);
+        sps_on.tool_flags.cclm_enabled_flag = true;
+        let walker_on = CtuWalker::begin_slice(&layout, &sps_on, &pps, &sh, 0, &data).unwrap();
+        assert!(matches!(
+            walker_on.cclm_enabled_dual_tree(),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    /// Dual-tree at CTB 32 with CCLM enabled decodes end-to-end (the
+    /// §8.4.4 `CtbLog2SizeY < 6` arm makes CclmEnabled exact, so the
+    /// chroma-tree parse may read `cclm_mode_flag` and the §8.4.5.2.14
+    /// CCLM predictor can fire on the reconstructed collocated luma).
+    #[test]
+    fn walker_decodes_dual_tree_ctb32_with_cclm() {
+        let mut sps = dummy_sps(0, 64, 64);
+        sps.partition_constraints.qtbtt_dual_tree_intra_flag = true;
+        sps.tool_flags.cclm_enabled_flag = true;
+        let pps = dummy_pps(64, 64, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 4096];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(64, 64, 0);
+        walker
+            .decode_picture_into(&mut out)
+            .expect("dual-tree CTB-32 CCLM decode");
+        let mut cb_painted = true;
+        for v in &out.cb.samples {
+            if *v == 0 {
+                cb_painted = false;
+            }
+        }
+        assert!(cb_painted, "chroma tree must paint every Cb sample");
     }
 
     #[test]

@@ -35,6 +35,18 @@ use crate::ctx::{
     ctx_inc_split_qt_flag,
 };
 
+/// §7.3.11.4 `treeType` — whether a single tree partitions the CTU
+/// (luma + chroma share one coding tree) or, on a dual-tree I-slice CTU
+/// (§7.3.11.2 `sps_qtbtt_dual_tree_intra_flag`), whether the luma or the
+/// chroma components are currently walked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TreeType {
+    #[default]
+    SingleTree,
+    DualTreeLuma,
+    DualTreeChroma,
+}
+
 /// A leaf coding unit emitted by the walker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cu {
@@ -193,6 +205,11 @@ pub struct TreeWalker<'a, 'b> {
     /// live in the *previous* CTU.
     base_x: u32,
     base_y: u32,
+    /// §7.3.11.4 `treeType` for this walk. `DualTreeChroma` swaps the
+    /// leaf floor for the §6.4.1 – §6.4.3 chroma bullets (see
+    /// [`Self::at_leaf_floor`]); `SingleTree` / `DualTreeLuma` share the
+    /// luma `MinCbLog2SizeY` floor.
+    tree_type: TreeType,
 }
 
 impl<'a, 'b> TreeWalker<'a, 'b> {
@@ -205,7 +222,16 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             nbr_map: None,
             base_x: 0,
             base_y: 0,
+            tree_type: TreeType::SingleTree,
         }
+    }
+
+    /// §7.3.11.4 — select which component tree this walker parses. The
+    /// dual-tree CTU walk (§7.3.11.2) issues one `DualTreeLuma` walk
+    /// followed by one `DualTreeChroma` walk per implicit-QT 64×64 node.
+    pub fn with_tree_type(mut self, tree_type: TreeType) -> Self {
+        self.tree_type = tree_type;
+        self
     }
 
     /// Round-56 — attach a picture-wide [`CuNeighbourMap`] to the
@@ -258,6 +284,27 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         }
     }
 
+    /// Leaf floor — the walker stops (emits a leaf without reading any
+    /// split bin) when no split family can be signalled:
+    ///
+    /// * `SingleTree` / `DualTreeLuma` — the luma `MinCbLog2SizeY` floor
+    ///   (either dimension at 4).
+    /// * `DualTreeChroma` (4:2:0) — an 8×8 luma-sample node is a 4×4
+    ///   chroma CB, where every split family is disallowed: §6.4.1 kills
+    ///   QT (`cbSize / SubWidthC <= 4`), §6.4.2 kills BT (the chroma
+    ///   area `(cbWidth / SubWidthC) · (cbHeight / SubHeightC) = 16`
+    ///   is `<= 16`), and §6.4.3 kills TT (chroma area `<= 32`). With
+    ///   no allowed split, `split_cu_flag` is not present (§7.3.11.4)
+    ///   and is inferred 0.
+    fn at_leaf_floor(&self, w: u32, h: u32) -> bool {
+        match self.tree_type {
+            TreeType::SingleTree | TreeType::DualTreeLuma => {
+                w.trailing_zeros() <= self.min_cb_log2 || h.trailing_zeros() <= self.min_cb_log2
+            }
+            TreeType::DualTreeChroma => w <= 8 && h <= 8,
+        }
+    }
+
     fn recurse(
         &mut self,
         x: u32,
@@ -268,8 +315,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         mtt_depth: u32,
     ) -> Result<()> {
         // At the minimum CU size we stop without reading a split flag.
-        let at_min =
-            w.trailing_zeros() <= self.min_cb_log2 || h.trailing_zeros() <= self.min_cb_log2;
+        let at_min = self.at_leaf_floor(w, h);
         if at_min {
             self.out.push(Cu {
                 x,
@@ -503,6 +549,50 @@ mod tests {
         let d = map.get(0, 0).expect("4×4 leaf must be inserted");
         assert_eq!(d.cb_w, 4);
         assert_eq!(d.cb_h, 4);
+    }
+
+    /// §6.4.1 – §6.4.3 — an 8×8 luma-sample node on the DUAL_TREE_CHROMA
+    /// walk is a 4×4 chroma CB where QT / BT / TT are all disallowed, so
+    /// the walker must emit a leaf without consuming any CABAC bin.
+    #[test]
+    fn dual_tree_chroma_walker_stops_at_chroma_4x4() {
+        let data = [0u8; 32];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = TreeCtxs::init(16);
+        let walker = TreeWalker::new(&mut dec, &mut ctxs).with_tree_type(TreeType::DualTreeChroma);
+        let cus = walker.walk(0, 0, 8, 8).unwrap();
+        assert_eq!(
+            cus,
+            vec![Cu {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+                cqt_depth: 0,
+                mtt_depth: 0
+            }],
+            "8×8 luma (4×4 chroma) must be an unsplittable chroma-tree leaf"
+        );
+    }
+
+    /// A DUAL_TREE_CHROMA walk over a 64×64 node emits a structurally
+    /// valid complete tiling. (The walker reads split flags as coded —
+    /// the §6.4.2 / §6.4.3 chroma-area allowances are the emitting
+    /// encoder's responsibility, matching the round-55 single-tree
+    /// stance — so this test only asserts geometry, not legality.)
+    #[test]
+    fn dual_tree_chroma_walk_64_structural() {
+        let data = [0x5au8; 64];
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = TreeCtxs::init(16);
+        let walker = TreeWalker::new(&mut dec, &mut ctxs).with_tree_type(TreeType::DualTreeChroma);
+        let cus = walker.walk(0, 0, 64, 64).unwrap();
+        let mut area = 0u32;
+        for c in &cus {
+            assert!(c.x + c.w <= 64 && c.y + c.h <= 64);
+            area += c.w * c.h;
+        }
+        assert_eq!(area, 64 * 64, "chroma-tree leaves must tile the node");
     }
 
     /// Round-56 — `TreeWalker::with_neighbour_map_rebased` adds the

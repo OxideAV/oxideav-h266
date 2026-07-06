@@ -48,6 +48,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
+use crate::coding_tree::TreeType;
 use crate::ctx::{
     ctx_inc_abs_mvd_greater0_flag, ctx_inc_abs_mvd_greater1_flag, ctx_inc_bcw_idx,
     ctx_inc_cu_affine_type_flag, ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag,
@@ -803,6 +804,11 @@ pub struct LeafCuCtxs {
     pub intra_luma_mpm_flag: Vec<ContextModel>,
     pub intra_luma_not_planar_flag: Vec<ContextModel>,
     pub intra_chroma_pred_mode: Vec<ContextModel>,
+    /// `cclm_mode_flag` (Table 79) — 3-entry, one per initType.
+    pub cclm_mode_flag: Vec<ContextModel>,
+    /// `cclm_mode_idx` (Table 80) — 3-entry, one per initType (bin 0
+    /// only; bin 1 is bypass per Table 132).
+    pub cclm_mode_idx: Vec<ContextModel>,
     /// `cu_skip_flag` (Table 64) — full 9-entry bundle. The per-slice
     /// `init_type` selects the slot used at parse time: `init_type * 3
     /// + ctxInc`.
@@ -1019,6 +1025,8 @@ impl LeafCuCtxs {
                 slice_qp_y,
             ),
             intra_chroma_pred_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
+            cclm_mode_flag: init_contexts(SyntaxCtx::CclmModeFlag, slice_qp_y),
+            cclm_mode_idx: init_contexts(SyntaxCtx::CclmModeIdx, slice_qp_y),
             cu_skip_flag: init_contexts(SyntaxCtx::CuSkipFlag, slice_qp_y),
             general_merge_flag: init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp_y),
             regular_merge_flag: init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp_y),
@@ -1281,6 +1289,12 @@ pub struct LeafCuReader<'a, 'b> {
     dec: &'a mut ArithDecoder<'b>,
     ctxs: &'a mut LeafCuCtxs,
     tools: CuToolFlags,
+    /// §7.3.11.4 `treeType` for the CU being parsed. `SingleTree` for
+    /// the classic walk; the dual-tree I-slice CTU walk (§7.3.11.2)
+    /// parses each implicit-QT node's luma tree with `DualTreeLuma`
+    /// (no chroma syntax) and its chroma tree with `DualTreeChroma`
+    /// (chroma-only syntax via [`Self::decode_dual_chroma`]).
+    tree: TreeType,
 }
 
 impl<'a, 'b> LeafCuReader<'a, 'b> {
@@ -1289,7 +1303,18 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         ctxs: &'a mut LeafCuCtxs,
         tools: CuToolFlags,
     ) -> Self {
-        Self { dec, ctxs, tools }
+        Self {
+            dec,
+            ctxs,
+            tools,
+            tree: TreeType::SingleTree,
+        }
+    }
+
+    /// §7.3.11.4 — select the component tree this reader parses.
+    pub fn with_tree_type(mut self, tree: TreeType) -> Self {
+        self.tree = tree;
+        self
     }
 
     /// Decode the `coding_unit()` body for a leaf CU in an I-slice,
@@ -1371,7 +1396,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 } else {
                     INTRA_ANGULAR18
                 };
-                self.derive_chroma(info);
+                if self.tree != TreeType::DualTreeLuma {
+                    self.derive_chroma(info);
+                }
                 return Ok(());
             }
         }
@@ -1402,7 +1429,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // MIP has its own mode namespace — we still store 0 for
             // intra_pred_mode_y so callers know to branch on the flag.
             info.intra_pred_mode_y = 0;
-            self.derive_chroma(info);
+            if self.tree != TreeType::DualTreeLuma {
+                self.derive_chroma(info);
+            }
             return Ok(());
         }
 
@@ -1519,12 +1548,228 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             &cand_list,
         );
 
-        // Chroma — skip for monochrome.
-        self.derive_chroma(info);
+        // Chroma — skip for monochrome (and for the DUAL_TREE_LUMA
+        // walk, where the chroma syntax lives in the sibling chroma
+        // coding tree per §7.3.11.5).
+        if self.tree != TreeType::DualTreeLuma {
+            self.derive_chroma(info);
+        }
 
         // --- transform_unit() reads (§7.3.11.10) ---
         self.decode_transform_unit(info, residual)?;
 
+        Ok(())
+    }
+
+    /// §7.3.11.5 — decode the `coding_unit()` body for a
+    /// **DUAL_TREE_CHROMA** leaf CU on a dual-tree I-slice.
+    ///
+    /// Only the chroma-side syntax is present on this tree
+    /// (`treeType == SINGLE_TREE || treeType == DUAL_TREE_CHROMA`
+    /// guards every chroma element, and the luma branch is gated on
+    /// `treeType == SINGLE_TREE || treeType == DUAL_TREE_LUMA`):
+    ///
+    /// * `intra_bdpcm_chroma_flag` / `intra_bdpcm_chroma_dir_flag`
+    ///   (gated on the chroma dims vs `MaxTsSize` +
+    ///   `sps_bdpcm_enabled_flag`),
+    /// * otherwise `cclm_mode_flag` (only when the §8.4.4
+    ///   `CclmEnabled` derivation holds — the caller passes it in) and
+    ///   either `cclm_mode_idx` (TR `cMax = 2`, bin 0 ctx-coded per
+    ///   Table 132, bin 1 bypass; Table 20 maps idx 0 / 1 / 2 to
+    ///   INTRA_LT_CCLM / INTRA_L_CCLM / INTRA_T_CCLM = 81 / 82 / 83)
+    ///   or `intra_chroma_pred_mode` (Table 130), folded through the
+    ///   §8.4.3 Table 20 derivation against `luma_intra_pred_mode` —
+    ///   the collocated luma mode sampled at
+    ///   `(xCb + cbWidth / 2, yCb + cbHeight / 2)` from the luma tree
+    ///   that parsed *before* this chroma tree (the caller samples its
+    ///   per-picture IntraPredModeY store; a MIP collocated luma reads
+    ///   as INTRA_PLANAR per §8.4.3),
+    /// * the chroma-only `transform_unit()` — `tu_cb_coded_flag` /
+    ///   `tu_cr_coded_flag`, the QP-delta / chroma-QP-offset reads,
+    ///   and the per-component chroma residuals at
+    ///   `(cbWidth / SubWidthC) × (cbHeight / SubHeightC)`.
+    ///
+    /// The chroma-tree `lfnst_idx` (with its `/ SubWidthC` size
+    /// scaling) is not yet parsed — inferred 0, matching this crate's
+    /// encoder which never emits it.
+    pub fn decode_dual_chroma(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+        luma_intra_pred_mode: u32,
+        cclm_enabled: bool,
+    ) -> Result<()> {
+        info.pred_mode = CuPredMode::Intra; // I-slice (§7.4.12.2).
+        if self.tools.ibc {
+            return Err(Error::unsupported(
+                "h266 leaf CU (dual-tree chroma): IBC not supported",
+            ));
+        }
+        if self.tools.palette {
+            return Err(Error::unsupported(
+                "h266 leaf CU (dual-tree chroma): palette coding not supported",
+            ));
+        }
+        if self.tools.chroma_format_idc != 1 {
+            return Err(Error::unsupported(
+                "h266 leaf CU (dual-tree chroma): only 4:2:0 is walked",
+            ));
+        }
+        let (sub_w, sub_h) = (2u32, 2u32);
+
+        // intra_bdpcm_chroma_flag — §7.3.11.5 gate:
+        // cbWidth / SubWidthC <= MaxTsSize && cbHeight / SubHeightC <=
+        // MaxTsSize && sps_bdpcm_enabled_flag (ACT is single-tree-only).
+        let bdpcm_chroma_gate = self.tools.bdpcm
+            && info.cb_width / sub_w <= self.tools.max_ts_size
+            && info.cb_height / sub_h <= self.tools.max_ts_size;
+        if bdpcm_chroma_gate {
+            let inc = ctx_inc_intra_bdpcm_chroma_flag() as usize;
+            let n = self.ctxs.intra_bdpcm_chroma_flag.len() - 1;
+            let bit = self
+                .dec
+                .decode_decision(&mut self.ctxs.intra_bdpcm_chroma_flag[inc.min(n)])?;
+            info.intra_bdpcm_chroma = bit == 1;
+            if info.intra_bdpcm_chroma {
+                let inc = ctx_inc_intra_bdpcm_chroma_dir_flag() as usize;
+                let n = self.ctxs.intra_bdpcm_chroma_dir_flag.len() - 1;
+                let bit = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.intra_bdpcm_chroma_dir_flag[inc.min(n)])?;
+                info.intra_bdpcm_chroma_dir = bit == 1;
+                // §8.4.3 — BdpcmDir[..][1] ? ANGULAR50 : ANGULAR18.
+                info.intra_pred_mode_c = if info.intra_bdpcm_chroma_dir {
+                    INTRA_ANGULAR50
+                } else {
+                    INTRA_ANGULAR18
+                };
+            }
+        }
+        if !info.intra_bdpcm_chroma {
+            // cclm_mode_flag — present only when CclmEnabled (§8.4.4);
+            // inferred 0 otherwise.
+            let cclm_flag = if cclm_enabled {
+                let idx = (self.ctxs.init_type as usize).min(self.ctxs.cclm_mode_flag.len() - 1);
+                self.dec
+                    .decode_decision(&mut self.ctxs.cclm_mode_flag[idx])?
+                    == 1
+            } else {
+                false
+            };
+            if cclm_flag {
+                // cclm_mode_idx — TR(cMax = 2, cRice = 0): bin 0 is
+                // ctx-coded (ctxInc 0), bin 1 bypass (Table 132).
+                let idx = (self.ctxs.init_type as usize).min(self.ctxs.cclm_mode_idx.len() - 1);
+                let bin0 = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.cclm_mode_idx[idx])?;
+                let cclm_idx = if bin0 == 0 {
+                    0
+                } else {
+                    let bin1 = self.dec.decode_bypass()?;
+                    if bin1 == 0 {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                // Table 20 (cclm_mode_flag == 1): 81 + cclm_mode_idx.
+                info.intra_pred_mode_c = INTRA_LT_CCLM + cclm_idx;
+            } else {
+                let icp = self.read_intra_chroma_pred_mode()?;
+                info.intra_chroma_pred_mode = icp;
+                info.intra_pred_mode_c = derive_intra_pred_mode_c(icp, luma_intra_pred_mode);
+            }
+        }
+
+        // ---- chroma-only transform_unit() (§7.3.11.10) ----
+        let cb_w = info.cb_width as usize;
+        let cb_h = info.cb_height as usize;
+        info.tu_cb_coded_flag =
+            read_tu_cb_coded_flag(self.dec, &mut self.ctxs.residual, info.intra_bdpcm_chroma)?;
+        info.tu_cr_coded_flag = read_tu_cr_coded_flag(
+            self.dec,
+            &mut self.ctxs.residual,
+            info.intra_bdpcm_chroma,
+            info.tu_cb_coded_flag,
+        )?;
+        let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
+        if self.tools.cu_qp_delta_enabled && chroma_cbf {
+            info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+        }
+        if self.tools.cu_chroma_qp_offset_enabled && chroma_cbf {
+            let (flag, idx) = read_cu_chroma_qp_offset(
+                self.dec,
+                &mut self.ctxs.residual,
+                self.tools.chroma_qp_offset_list_len_minus1,
+            )?;
+            info.cu_chroma_qp_offset_flag = flag;
+            info.cu_chroma_qp_offset_idx = idx;
+        }
+        if self.tools.joint_cbcr_enabled && chroma_cbf {
+            return Err(Error::unsupported(
+                "h266 leaf CU (dual-tree chroma): tu_joint_cbcr_residual_flag parsing \
+                 not plumbed yet",
+            ));
+        }
+        let cw = cb_w / sub_w as usize;
+        let ch = cb_h / sub_h as usize;
+        if cw >= 2 && ch >= 2 {
+            for c_idx in [1u32, 2u32] {
+                let coded = if c_idx == 1 {
+                    info.tu_cb_coded_flag
+                } else {
+                    info.tu_cr_coded_flag
+                };
+                if !coded {
+                    continue;
+                }
+                // §7.3.11.5 transform_skip_flag[xC][yC][cIdx] parse gate.
+                let ts_present = self.tools.transform_skip_enabled
+                    && !info.intra_bdpcm_chroma
+                    && (cw as u32) <= self.tools.max_ts_size
+                    && (ch as u32) <= self.tools.max_ts_size;
+                let ts = if ts_present {
+                    crate::residual::read_transform_skip_flag(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        c_idx,
+                    )?
+                } else {
+                    false
+                };
+                let levels = if ts && !self.tools.ts_residual_coding_disabled {
+                    crate::residual::decode_ts_tb_coefficients(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        cw,
+                        ch,
+                        c_idx,
+                        self.tools.ts_residual_coding_rice_idx,
+                        info.intra_bdpcm_chroma,
+                    )?
+                } else {
+                    let (levels, _flags) = decode_tb_coefficients_opts(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        cw,
+                        ch,
+                        c_idx,
+                        self.tools.rc_opts,
+                    )?;
+                    levels
+                };
+                if c_idx == 1 {
+                    info.transform_skip_cb = ts;
+                    residual.cb_levels = levels;
+                } else {
+                    info.transform_skip_cr = ts;
+                    residual.cr_levels = levels;
+                }
+            }
+        }
+        // Chroma-tree lfnst_idx / mts_idx — not parsed (inferred 0);
+        // see the method doc.
         Ok(())
     }
 
@@ -3197,7 +3442,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         let mut res_flags = crate::residual::TbResidualFlags::default();
         let cb_w = info.cb_width as usize;
         let cb_h = info.cb_height as usize;
-        let chroma = self.tools.chroma_format_idc != 0;
+        // §7.3.11.10 — the chroma CBFs / residuals are present only when
+        // the tree carries chroma (`treeType != DUAL_TREE_LUMA`); on the
+        // dual-tree luma walk they live in the sibling chroma tree.
+        let chroma = self.tools.chroma_format_idc != 0 && self.tree != TreeType::DualTreeLuma;
         // Chroma dims: 4:2:0 halves both, 4:2:2 halves width only, 4:4:4 keeps.
         // We only support 4:2:0 here (chroma_format_idc == 1); other formats
         // surface Unsupported the moment the code would diverge.
@@ -3573,7 +3821,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     ) -> Result<()> {
         let cb_w = info.cb_width;
         let cb_h = info.cb_height;
-        let chroma = self.tools.chroma_format_idc != 0;
+        // §7.3.11.10 — same DUAL_TREE_LUMA chroma-absence rule as the
+        // non-ISP path (the last-subpartition chroma reads are skipped).
+        let chroma = self.tools.chroma_format_idc != 0 && self.tree != TreeType::DualTreeLuma;
         let (sub_w, sub_h) = match self.tools.chroma_format_idc {
             0 => (1u32, 1u32),
             1 => (2, 2),
