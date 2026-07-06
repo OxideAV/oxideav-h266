@@ -719,7 +719,7 @@ struct LmcsBinding {
 /// `Sign( res ) * ( ( Abs( res ) * varScale + ( 1 << 10 ) ) >> 11 )`.
 /// The caller's ordinary `Clip1( pred + res )` add then matches
 /// eq. 1220 exactly.
-fn lmcs_scale_chroma_residuals(res: &mut [i32], var_scale: u32, bit_depth: u32) {
+pub(crate) fn lmcs_scale_chroma_residuals(res: &mut [i32], var_scale: u32, bit_depth: u32) {
     let lo = -(1i64 << bit_depth);
     let hi = (1i64 << bit_depth) - 1;
     for r in res.iter_mut() {

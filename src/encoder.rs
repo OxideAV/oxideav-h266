@@ -305,11 +305,21 @@ pub struct EncoderConfig {
     /// before intra coding (the coding loop runs in the mapped domain),
     /// emits `sps_lmcs_enabled_flag = 1`, ships the payload as an LMCS
     /// APS NAL (id 0), signals `ph_lmcs_enabled_flag = 1` /
-    /// `ph_lmcs_aps_id = 0` / `ph_chroma_residual_scale_flag = 0` in
-    /// the picture header plus `sh_lmcs_used_flag = 1` in the slice
-    /// header, and inverse-maps the reconstruction (§8.8.1 step 1)
-    /// before the deblock / SAO / ALF chain. Default `None`.
+    /// `ph_lmcs_aps_id = 0` / `ph_chroma_residual_scale_flag` (from
+    /// [`Self::lmcs_chroma_scaling`]) in the picture header plus
+    /// `sh_lmcs_used_flag = 1` in the slice header, and inverse-maps
+    /// the reconstruction (§8.8.1 step 1) before the deblock / SAO /
+    /// ALF chain. Default `None`.
     pub lmcs: Option<crate::lmcs::LmcsData>,
+    /// r391 — opt-in **LMCS chroma residual scaling** (§8.7.5.3), only
+    /// meaningful with [`Self::lmcs`] set. When `true` the pipeline
+    /// derives the per-CU `varScale` from the eq. 1216 mapped-domain
+    /// neighbour-luma average (decoder-mirrored), codes each chroma TB's
+    /// residual forward-scaled (the encoder inverse of the eqs.
+    /// 1219 / 1220 fold), reconstructs through the decoder-exact
+    /// rescale, and signals `ph_chroma_residual_scale_flag = 1` on the
+    /// wire. Default `false`.
+    pub lmcs_chroma_scaling: bool,
     /// Round-387 — opt-in **dependent quantization** (§7.4.12.11
     /// eq. 198 trellis). When `true` the pipeline quantises every TB
     /// with [`crate::transform_fwd::quantize_tb_dep_quant`] (greedy
@@ -342,6 +352,7 @@ impl EncoderConfig {
             enable_mtt_bt_picker: false,
             enable_mtt_tt_picker: false,
             lmcs: None,
+            lmcs_chroma_scaling: false,
             dep_quant: false,
             sign_data_hiding: false,
         }
@@ -720,14 +731,19 @@ impl VvcEncoder {
         bw.write_bits(0, 8);
         // Round-384 — §7.3.2.8 LMCS chain, gated by
         // sps_lmcs_enabled_flag (== config.lmcs.is_some()). The
-        // pipeline ships the LMCS APS at id 0 and keeps
-        // ph_chroma_residual_scale_flag = 0 (the mapped-domain coding
-        // loop only remaps luma).
+        // pipeline ships the LMCS APS at id 0;
+        // ph_chroma_residual_scale_flag mirrors the r391
+        // `lmcs_chroma_scaling` knob (the §8.7.5.3 chroma residual
+        // scaling pipeline).
         if self.config.lmcs.is_some() {
             bw.write_bit(1); // ph_lmcs_enabled_flag = 1
             bw.write_bits(0, 2); // ph_lmcs_aps_id = 0
             if self.config.chroma_format_idc != 0 {
-                bw.write_bit(0); // ph_chroma_residual_scale_flag = 0
+                bw.write_bit(if self.config.lmcs_chroma_scaling {
+                    1
+                } else {
+                    0
+                });
             }
         }
         // ph_intra_slice_allowed_flag == 1 (inferred) arm:

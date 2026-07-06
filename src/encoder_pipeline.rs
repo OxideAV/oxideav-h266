@@ -480,6 +480,7 @@ impl QpDeltaState {
 /// encoder analogue of the decoder using the §8.7.5 `(pred + dequant
 /// residual).clamp(0, 255)` reconstruction. The quantised levels are
 /// returned for the second-pass CABAC emit.
+#[allow(clippy::too_many_arguments)]
 fn prepare_chroma_tb(
     chroma_src: &PicturePlane,
     chroma_rec: &mut PicturePlane,
@@ -489,6 +490,7 @@ fn prepare_chroma_tb(
     n_tb_c_h: usize,
     qp_c: i32,
     rc: crate::residual::RcOpts,
+    chroma_scale: Option<u32>,
 ) -> Result<Vec<i32>> {
     let pred_val = 128u8;
 
@@ -501,6 +503,15 @@ fn prepare_chroma_tb(
             let src_s = chroma_src.get(sx, sy).unwrap_or(pred_val) as i32;
             residual[ty * n_tb_c_w + tx] = src_s - pred_val as i32;
         }
+    }
+
+    // r391 — §8.7.5.3 LMCS chroma residual scaling, encoder side: the
+    // CODED residual is the true residual divided by the per-CU
+    // `varScale` (the decoder rescales with the eq. 1219 / 1220
+    // multiply-fold, applied to the reconstruction below so encoder
+    // and decoder agree sample-exactly).
+    if let Some(vs) = chroma_scale {
+        lmcs_forward_scale_chroma_residuals(&mut residual, vs);
     }
 
     // Forward DCT-II + flat quantisation (same ladder as luma; bit_depth
@@ -520,7 +531,7 @@ fn prepare_chroma_tb(
     let mut params = DequantParams::chroma_8bit(n_tb_c_w as u32, n_tb_c_h as u32, qp_c);
     params.dep_quant = rc.dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
-    let rec_res = inverse_transform_2d(
+    let mut rec_res = inverse_transform_2d(
         n_tb_c_w,
         n_tb_c_h,
         n_tb_c_w,
@@ -531,6 +542,13 @@ fn prepare_chroma_tb(
         8,
         15,
     )?;
+
+    // r391 — decoder-exact §8.7.5.3 rescale of the reconstructed
+    // residual (the same eqs. 1219 / 1220 fold
+    // `CtuWalker::reconstruct_chroma_plane` applies).
+    if let Some(vs) = chroma_scale {
+        crate::ctu::lmcs_scale_chroma_residuals(&mut rec_res, vs, 8);
+    }
 
     for ty in 0..n_tb_c_h {
         for tx in 0..n_tb_c_w {
@@ -545,6 +563,63 @@ fn prepare_chroma_tb(
     Ok(levels)
 }
 
+/// r391 — encoder inverse of the §8.7.5.3 eqs. 1219 / 1220 fold: the
+/// coded chroma residual is `sign(r) · ((|r| << 11) + varScale / 2) /
+/// varScale`, so the decoder's `(coded · varScale + (1 << 10)) >> 11`
+/// rescale lands back on (a rounding of) the true residual.
+fn lmcs_forward_scale_chroma_residuals(res: &mut [i32], var_scale: u32) {
+    if var_scale == 0 {
+        return;
+    }
+    for r in res.iter_mut() {
+        let mag = ((u64::from(r.unsigned_abs()) << 11) + u64::from(var_scale >> 1))
+            / u64::from(var_scale);
+        *r = if *r < 0 { -(mag as i64) } else { mag as i64 } as i32;
+    }
+}
+
+/// r391 — encoder-side §8.7.5.3 `varScale` derivation, mirroring the
+/// decoder's per-CU logic (eq. 1216 `invAvgLuma` over the sizeY-long
+/// left column / top row of the CU's mapped-domain reconstructed luma
+/// neighbours, eq. 1217 mid-grey fallback, then the pivot inverse-index
+/// + `ChromaScaleCoeff` lookup). The encoder's CU grid is 64-aligned so
+/// the eq. 1215 sizeY-aligned corner is the CU origin itself.
+fn lmcs_chroma_var_scale_enc(
+    rec_luma: &PicturePlane,
+    cu_x: usize,
+    cu_y: usize,
+    size_y: usize,
+    der: &crate::lmcs::LmcsDerived,
+    min_bin: u8,
+    max_bin: u8,
+) -> u32 {
+    let avail_l = cu_x > 0;
+    let avail_t = cu_y > 0;
+    let mut sum: u64 = 0;
+    let mut cnt: usize = 0;
+    if avail_l {
+        for i in 0..size_y {
+            let yy = (cu_y + i).min(rec_luma.height - 1);
+            sum += u64::from(rec_luma.samples[yy * rec_luma.stride + (cu_x - 1)]);
+        }
+        cnt += size_y;
+    }
+    if avail_t {
+        for i in 0..size_y {
+            let xx = (cu_x + i).min(rec_luma.width - 1);
+            sum += u64::from(rec_luma.samples[(cu_y - 1) * rec_luma.stride + xx]);
+        }
+        cnt += size_y;
+    }
+    let inv_avg_luma = if cnt > 0 {
+        ((sum + (cnt as u64 >> 1)) >> cnt.trailing_zeros()) as u32
+    } else {
+        128 // eq. 1217, 8-bit mid-grey
+    };
+    let idx_y_inv = der.idx_y_inv(inv_avg_luma, min_bin, max_bin);
+    der.chroma_var_scale(idx_y_inv)
+}
+
 /// Round-56 — prepare one leaf CU at `(x, y)` of size `n_tb_w × n_tb_h`
 /// luma samples. Runs the round-49 luma + chroma DCT / quant / dequant /
 /// IDCT pipeline and returns a [`PreparedCu::Leaf`]. The chroma TB is
@@ -553,6 +628,7 @@ fn prepare_chroma_tb(
 ///
 /// `cu_qp` is the per-CU QP (used for both luma and the §8.7.1 identity-
 /// chroma-QP). The reconstruction is written directly into `rec`.
+#[allow(clippy::too_many_arguments)]
 fn prepare_leaf_cu(
     src: &PictureBuffer,
     rec: &mut PictureBuffer,
@@ -562,6 +638,7 @@ fn prepare_leaf_cu(
     n_tb_h: usize,
     cu_qp: i32,
     rc: crate::residual::RcOpts,
+    chroma_scale: Option<u32>,
 ) -> Result<PreparedCu> {
     let levels = prepare_luma_tb(&src.luma, &mut rec.luma, x, y, n_tb_w, n_tb_h, cu_qp, rc)?;
     let chr_x = x / 2;
@@ -578,6 +655,7 @@ fn prepare_leaf_cu(
         n_tb_chroma_h,
         qp_c,
         rc,
+        chroma_scale,
     )?;
     let cr_levels = prepare_chroma_tb(
         &src.cr,
@@ -588,6 +666,7 @@ fn prepare_leaf_cu(
         n_tb_chroma_h,
         qp_c,
         rc,
+        chroma_scale,
     )?;
     Ok(PreparedCu::Leaf(PreparedLumaTb {
         n_tb_w,
@@ -839,6 +918,7 @@ fn prepare_cu_with_mtt_picker(
     try_bt: bool,
     try_tt: bool,
     rc_opts: crate::residual::RcOpts,
+    chroma_scale: Option<u32>,
 ) -> Result<PreparedCu> {
     debug_assert_eq!(cb_size, 64);
     let lambda = lambda_for_qp(slice_qp_y);
@@ -869,7 +949,17 @@ fn prepare_cu_with_mtt_picker(
     let mut trials: Vec<Trial> = Vec::with_capacity(5);
 
     // --- Trial 1: leaf 64×64 ---
-    let leaf = prepare_leaf_cu(src, rec, x, y, cb_size, cb_size, cu_qp, rc_opts)?;
+    let leaf = prepare_leaf_cu(
+        src,
+        rec,
+        x,
+        y,
+        cb_size,
+        cb_size,
+        cu_qp,
+        rc_opts,
+        chroma_scale,
+    )?;
     let leaf_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
     let leaf_bits = measure_cu_bits(&leaf, slice_qp_y, rc_opts)?;
     trials.push(Trial {
@@ -886,8 +976,18 @@ fn prepare_cu_with_mtt_picker(
     if try_bt {
         // --- BT_VERT (two 32×64 sub-CUs) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp, rc_opts)?;
-        let bt_v_b = prepare_leaf_cu(src, rec, x + half, y, half, cb_size, cu_qp, rc_opts)?;
+        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp, rc_opts, chroma_scale)?;
+        let bt_v_b = prepare_leaf_cu(
+            src,
+            rec,
+            x + half,
+            y,
+            half,
+            cb_size,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
         let bt_v_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let bt_v_cu = PreparedCu::BtSplit {
             dir: crate::syntax_enc::MttSplitDir::Vertical,
@@ -907,8 +1007,18 @@ fn prepare_cu_with_mtt_picker(
 
         // --- BT_HORZ (two 64×32 sub-CUs) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp, rc_opts)?;
-        let bt_h_b = prepare_leaf_cu(src, rec, x, y + half, cb_size, half, cu_qp, rc_opts)?;
+        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp, rc_opts, chroma_scale)?;
+        let bt_h_b = prepare_leaf_cu(
+            src,
+            rec,
+            x,
+            y + half,
+            cb_size,
+            half,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
         let bt_h_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let bt_h_cu = PreparedCu::BtSplit {
             dir: crate::syntax_enc::MttSplitDir::Horizontal,
@@ -930,8 +1040,28 @@ fn prepare_cu_with_mtt_picker(
     if try_tt {
         // --- TT_VERT (16×64, 32×64, 16×64 — 1:2:1 ratio) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let tt_v_a = prepare_leaf_cu(src, rec, x, y, quarter, cb_size, cu_qp, rc_opts)?;
-        let tt_v_b = prepare_leaf_cu(src, rec, x + quarter, y, half, cb_size, cu_qp, rc_opts)?;
+        let tt_v_a = prepare_leaf_cu(
+            src,
+            rec,
+            x,
+            y,
+            quarter,
+            cb_size,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
+        let tt_v_b = prepare_leaf_cu(
+            src,
+            rec,
+            x + quarter,
+            y,
+            half,
+            cb_size,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
         let tt_v_c = prepare_leaf_cu(
             src,
             rec,
@@ -941,6 +1071,7 @@ fn prepare_cu_with_mtt_picker(
             cb_size,
             cu_qp,
             rc_opts,
+            chroma_scale,
         )?;
         let tt_v_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let tt_v_cu = PreparedCu::TtSplit {
@@ -962,8 +1093,28 @@ fn prepare_cu_with_mtt_picker(
 
         // --- TT_HORZ (64×16, 64×32, 64×16 — 1:2:1 ratio) ---
         restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let tt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, quarter, cu_qp, rc_opts)?;
-        let tt_h_b = prepare_leaf_cu(src, rec, x, y + quarter, cb_size, half, cu_qp, rc_opts)?;
+        let tt_h_a = prepare_leaf_cu(
+            src,
+            rec,
+            x,
+            y,
+            cb_size,
+            quarter,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
+        let tt_h_b = prepare_leaf_cu(
+            src,
+            rec,
+            x,
+            y + quarter,
+            cb_size,
+            half,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
         let tt_h_c = prepare_leaf_cu(
             src,
             rec,
@@ -973,6 +1124,7 @@ fn prepare_cu_with_mtt_picker(
             quarter,
             cu_qp,
             rc_opts,
+            chroma_scale,
         )?;
         let tt_h_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
         let tt_h_cu = PreparedCu::TtSplit {
@@ -1630,6 +1782,33 @@ pub fn encode_idr_with_qp_picker_cfg(
                         && n_tb_sq == 64
                         && tb_x + 64 <= w as usize
                         && tb_y + 64 <= h as usize;
+                    // r391 — §8.7.5.3 chroma residual scaling: derive the
+                    // per-CU `varScale` from the mapped-domain
+                    // reconstructed luma neighbours BEFORE this CU's
+                    // reconstruction is written (the eq. 1216 gather only
+                    // reads columns/rows outside the CU). The MTT
+                    // sub-CUs share the 64-grid CU's scale — mirroring
+                    // the decoder, whose eq. 1215 sizeY-aligned corner
+                    // resolves every sub-CU to the same neighbour gather.
+                    let chroma_scale: Option<u32> = if config.lmcs_chroma_scaling {
+                        lmcs_derived
+                            .as_ref()
+                            .zip(lmcs_payload.as_ref())
+                            .map(|(der, data)| {
+                                lmcs_chroma_var_scale_enc(
+                                    &rec.luma,
+                                    tb_x,
+                                    tb_y,
+                                    64,
+                                    der,
+                                    data.lmcs_min_bin_idx,
+                                    data.lmcs_max_bin_idx(),
+                                )
+                            })
+                    } else {
+                        None
+                    };
+
                     let cu = if mtt_eligible {
                         prepare_cu_with_mtt_picker(
                             coding_src,
@@ -1642,10 +1821,19 @@ pub fn encode_idr_with_qp_picker_cfg(
                             config.enable_mtt_bt_picker,
                             config.enable_mtt_tt_picker,
                             rc_opts,
+                            chroma_scale,
                         )?
                     } else {
                         prepare_leaf_cu(
-                            coding_src, &mut rec, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp, rc_opts,
+                            coding_src,
+                            &mut rec,
+                            tb_x,
+                            tb_y,
+                            n_tb_sq,
+                            n_tb_sq,
+                            cu_qp,
+                            rc_opts,
+                            chroma_scale,
                         )?
                     };
 
@@ -2855,6 +3043,7 @@ mod tests {
             4,
             26,
             crate::residual::RcOpts::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2892,6 +3081,7 @@ mod tests {
             4,
             26,
             crate::residual::RcOpts::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -3665,6 +3855,89 @@ mod tests {
         assert!(
             (psnr_on - psnr_off).abs() <= 6.0,
             "LMCS on/off PSNR gap too large: on={psnr_on:.2}, off={psnr_off:.2}"
+        );
+    }
+
+    /// r391 — the encoder forward chroma-residual scale is the exact
+    /// inverse of the decoder's §8.7.5.3 eqs. 1219 / 1220 fold: pushing
+    /// a residual through `lmcs_forward_scale_chroma_residuals` and
+    /// back through `crate::ctu::lmcs_scale_chroma_residuals` lands
+    /// within the fold's rounding of the original.
+    #[test]
+    fn r391_lmcs_chroma_forward_scale_round_trips() {
+        for vs in [1024u32, 1500, 2048, 3000] {
+            // Magnitudes kept within the decoder fold's 8-bit clamp
+            // (|coded| <= 255) for every trial scale.
+            let orig: Vec<i32> = vec![-100, -33, -1, 0, 1, 7, 64, 100];
+            let mut coded = orig.clone();
+            lmcs_forward_scale_chroma_residuals(&mut coded, vs);
+            let mut back = coded.clone();
+            crate::ctu::lmcs_scale_chroma_residuals(&mut back, vs, 8);
+            for (o, b) in orig.iter().zip(back.iter()) {
+                assert!(
+                    (o - b).abs() <= 2,
+                    "vs={vs}: {o} -> {b} deviates beyond the fold rounding"
+                );
+            }
+        }
+    }
+
+    /// r391 — `EncoderConfig::lmcs_chroma_scaling` signals
+    /// `ph_chroma_residual_scale_flag = 1` on the wire and the coded
+    /// chroma (forward-scaled residual, decoder-exact rescale at
+    /// reconstruction) still clears a sane chroma PSNR floor.
+    #[test]
+    fn r391_lmcs_chroma_scaling_on_wire_and_recon() {
+        use crate::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+        use crate::picture_header::parse_picture_header_stateful;
+
+        // Chroma-structured source so the chroma TBs carry real
+        // residual energy through the scaling path.
+        let mut src = gradient_frame(64, 64);
+        for y in 0..32usize {
+            for x in 0..32usize {
+                src.cb.samples[y * src.cb.stride + x] = 90 + ((x + y) % 64) as u8;
+                src.cr.samples[y * src.cr.stride + x] = 170 - ((x * 2 + y) % 64) as u8;
+            }
+        }
+
+        let mut cfg = crate::encoder::EncoderConfig::new(64, 64);
+        cfg.lmcs = Some(lmcs_enc_payload());
+        cfg.lmcs_chroma_scaling = true;
+        let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+
+        // PH — ph_chroma_residual_scale_flag = 1.
+        let nals: Vec<_> = iter_annex_b(&bs).collect();
+        let sps_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+            .expect("SPS NAL");
+        let sps = crate::sps::parse_sps(&extract_rbsp(sps_nal.payload())).unwrap();
+        let pps_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PpsNut)
+            .expect("PPS NAL");
+        let pps = crate::pps::parse_pps(&extract_rbsp(pps_nal.payload())).unwrap();
+        let ph_nal = nals
+            .iter()
+            .find(|n| n.header.nal_unit_type == NalUnitType::PhNut)
+            .expect("PH NAL");
+        let ph = parse_picture_header_stateful(&extract_rbsp(ph_nal.payload()), &sps, &pps)
+            .expect("PH must parse with the chroma-scaling LMCS chain");
+        assert!(ph.ph_lmcs_enabled_flag);
+        assert!(
+            ph.ph_chroma_residual_scale_flag,
+            "lmcs_chroma_scaling must set ph_chroma_residual_scale_flag"
+        );
+
+        // Chroma quality — the scale is inverted at reconstruction, so
+        // the coding loop stays lossless-modulo-quantisation.
+        let psnr_cb = psnr_y(&src.cb, &rec.cb).unwrap();
+        let psnr_cr = psnr_y(&src.cr, &rec.cr).unwrap();
+        eprintln!("r391 chroma scaling: PSNR Cb={psnr_cb:.2} dB Cr={psnr_cr:.2} dB");
+        assert!(
+            psnr_cb >= 28.0 && psnr_cr >= 28.0,
+            "chroma PSNR too low with residual scaling: Cb={psnr_cb:.2} Cr={psnr_cr:.2}"
         );
     }
 }
