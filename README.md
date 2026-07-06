@@ -114,6 +114,33 @@ P + B-slice merge subset:
 * **Intra** — PLANAR / DC / cardinal angular intra (modes 2, 18, 34,
   50, 66), MIP (§8.4.5.2.2, all 30 weight matrices), CCLM
   (§8.4.5.2.14), BDPCM, and ISP (§8.4.5.1, all 4 split types).
+* **Dual-tree intra** (r391) — an I-slice with
+  `sps_qtbtt_dual_tree_intra_flag` decodes through the §7.3.11.2
+  `dual_tree_implicit_qt_split` (bin-less quad recursion while
+  `cbSize > 64`, picture-bound quadrant gating); per surviving ≤64×64
+  node the walker parses + reconstructs one DUAL_TREE_LUMA coding tree
+  (luma-only CUs — chroma CBFs / residuals absent per §7.3.11.10) then
+  one DUAL_TREE_CHROMA coding tree, with a separate chroma-tree
+  neighbour map for the §9.3.4.2 split ctxIncs and the §6.4.1 – §6.4.3
+  chroma leaf floor (an 8×8 luma-sample node is an unsplittable 4×4
+  chroma CB). Chroma-tree CUs parse `intra_bdpcm_chroma_flag` / dir,
+  `cclm_mode_flag` (Table 79 ctx) + `cclm_mode_idx` (Table 80, TR
+  cMax = 2 → modes 81 – 83) or `intra_chroma_pred_mode`, the
+  chroma-only `transform_unit()`, and the chroma-tree `lfnst_idx`
+  (§7.3.11.5 `/ SubWidthC` size gates, chroma-half `lfnstNotTsFlag`);
+  the §8.4.3 DM derivation samples a per-picture `IntraPredModeY`
+  store at the collocated luma centre (MIP collocated → PLANAR).
+  §8.4.4 `CclmEnabled` runs **all** arms — the simple ones plus the
+  per-CB 64-grid derivation at CTB ≥ 64 (the walker logs
+  `MttSplitMode`; the four 64-node enabling conditions and both
+  luma-side suppressions are evaluated against the node's two trees).
+  Reconstruction runs luma-only for dual-luma CUs (ISP included) and
+  chroma-only for dual-chroma CUs — CCLM reads the node's
+  already-reconstructed collocated luma, and §8.7.4.1 eq. 180 applies
+  the inverse LFNST to both chroma TBs (eq. 1157 `predModeIntra` with
+  CCLM resolved to the collocated luma mode). Chroma-tree
+  deblocking-edge records are a documented approximation (luma-tree
+  geometry).
 * **Dependent quantization + sign data hiding** (r387) — the §7.4.12.11
   eq. 198 `QStateTransTable` trellis runs through every regular
   `residual_coding()` read (pass-1 `AbsLevelPass1 & 1` / pass-3
@@ -147,9 +174,14 @@ P + B-slice merge subset:
   `cbW >= 8 && cbH >= 8 && cbW*cbH >= 128`) splits the CU into ≤16×16
   sub-blocks (eqs. 452 – 459), runs the §8.5.3.1 bilateral-matching
   search (with the `minSad >= sbW*sbH` early-out) per sub-block, and
-  feeds the refined MVs to the §8.5.6 MC (and §8.5.6.5 BDOF on the
-  single-sub-block path); per the §8.5.1 NOTE the unrefined `MvLX` is
-  what the per-picture motion field stores for spatial-MVP / deblocking.
+  feeds the refined MVs to the §8.5.6 MC — with §8.5.6.5 BDOF running
+  per DMVR sub-block on that sub-block's refined pair when the
+  `bdofUsedFlag` derivation also holds (r391). Per the §8.5.1 NOTE the
+  unrefined `MvLX` is what the per-picture motion field stores for
+  spatial-MVP / deblocking, while every refined unit's `MvDmvrLX` is
+  recorded and exported through
+  `CtuWalker::motion_field_for_temporal()` so a later picture's
+  §8.5.2.11 / §8.5.2.12 collocated derivation sees the refined MVs.
   High-bit-depth (Main10 / Main12) reconstruction
   runs through `u16` picture planes. A non-skip merge / CIIP CU whose
   `cu_coded_flag == 1` decodes its §7.3.11.10 `transform_unit()`
@@ -315,7 +347,14 @@ the forward-mapped luma domain, the reconstruction is inverse-mapped
 carries `sps_lmcs_enabled_flag`, an LMCS APS NAL (§7.3.2.19 payload
 via `aps_enc::emit_lmcs_aps_rbsp`), the §7.3.2.8 PH LMCS chain and
 `sh_lmcs_used_flag` — all parse-verified against this crate's own
-parsers. Opt-in **dependent quantization**
+parsers. Opt-in **LMCS chroma residual scaling**
+(`EncoderConfig::lmcs_chroma_scaling`, r391): the per-CU `varScale`
+is derived decoder-mirrored (§8.7.5.3 eq. 1216 mapped-domain
+neighbour-luma average, eq. 1217 fallback), each chroma TB codes the
+forward-scaled residual (the exact inverse of the decoder's
+eqs. 1219 / 1220 fold), the encoder reconstruction rescales
+decoder-exact, and `ph_chroma_residual_scale_flag = 1` goes on the
+wire. Opt-in **dependent quantization**
 (`EncoderConfig::dep_quant`): every TB is quantised by the greedy
 hard-decision TCQ `transform_fwd::quantize_tb_dep_quant` (trellis-
 consistent by construction), reconstructed through the §8.7.3
