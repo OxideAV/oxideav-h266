@@ -210,6 +210,25 @@ pub struct TreeWalker<'a, 'b> {
     /// [`Self::at_leaf_floor`]); `SingleTree` / `DualTreeLuma` share the
     /// luma `MinCbLog2SizeY` floor.
     tree_type: TreeType,
+    /// r391 — `MttSplitMode[x0][y0][mttDepth]` log: one record per MTT
+    /// split the walk takes, in walk-local coordinates. The §8.4.4
+    /// CclmEnabled 64-grid derivation reads
+    /// `MttSplitMode[xCb64][yCb64][0]` / `MttSplitMode[xCb64][yCb32][1]`
+    /// off the chroma tree; QT splits are not logged (the array is only
+    /// consulted for MTT modes).
+    mtt_log: Vec<MttSplitRec>,
+}
+
+/// One `MttSplitMode[x0][y0][mttDepth]` record (§7.4.11.4) — the MTT
+/// split a coding-tree node at walk-local `(x, y)` and depth `mtt_depth`
+/// took. `vertical` / `binary` encode SPLIT_{BT,TT}_{VER,HOR}.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MttSplitRec {
+    pub x: u32,
+    pub y: u32,
+    pub mtt_depth: u32,
+    pub vertical: bool,
+    pub binary: bool,
 }
 
 impl<'a, 'b> TreeWalker<'a, 'b> {
@@ -223,6 +242,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             base_x: 0,
             base_y: 0,
             tree_type: TreeType::SingleTree,
+            mtt_log: Vec::new(),
         }
     }
 
@@ -267,6 +287,21 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
     pub fn walk(mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<Cu>> {
         self.recurse(x, y, w, h, 0, 0)?;
         Ok(self.out)
+    }
+
+    /// [`Self::walk`] variant that also returns the
+    /// `MttSplitMode[x0][y0][mttDepth]` log (walk-local coordinates,
+    /// one record per MTT split taken). The §8.4.4 CclmEnabled 64-grid
+    /// derivation consumes the chroma tree's log.
+    pub fn walk_logged(
+        mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<(Vec<Cu>, Vec<MttSplitRec>)> {
+        self.recurse(x, y, w, h, 0, 0)?;
+        Ok((self.out, self.mtt_log))
     }
 
     fn neighbour_state(&self, x: u32, y: u32) -> (bool, bool, u32, u32, u32, u32) {
@@ -417,6 +452,15 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         let mtt_binary = self
             .dec
             .decode_decision(&mut self.ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)])?;
+        // r391 — record MttSplitMode[x][y][mttDepth] for the §8.4.4
+        // 64-grid consumers.
+        self.mtt_log.push(MttSplitRec {
+            x,
+            y,
+            mtt_depth,
+            vertical: mtt_vertical == 1,
+            binary: mtt_binary == 1,
+        });
         if mtt_binary == 1 {
             // Binary split.
             if mtt_vertical == 1 {

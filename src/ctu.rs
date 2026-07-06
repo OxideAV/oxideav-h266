@@ -71,7 +71,7 @@ use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
 use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_high_precision};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
-use crate::coding_tree::{Cu, CuNeighbourMap, TreeCtxs, TreeType, TreeWalker};
+use crate::coding_tree::{Cu, CuNeighbourMap, MttSplitRec, TreeCtxs, TreeType, TreeWalker};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{
     dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, log2_matrix_size,
@@ -593,6 +593,94 @@ struct DmvrRefinedRect {
     h: u32,
     mv_l0: MotionVector,
     mv_l1: MotionVector,
+}
+
+/// §8.4.4 — the 64-grid arms of the CclmEnabled derivation, evaluated
+/// per chroma CB on a dual-tree I-slice with `CtbLog2SizeY >= 6`.
+///
+/// Inputs are the current implicit-QT node's two coding trees:
+/// `chroma_cus` / `chroma_mtt` are the DUAL_TREE_CHROMA leaves +
+/// `MttSplitMode` log (log coordinates are node-local; `node_x/y`
+/// rebases), `luma_cus` / `luma_infos` the DUAL_TREE_LUMA leaves. The
+/// nodes of the implicit split are exactly 64×64 (or picture-clipped),
+/// so the eqs. 242 – 244 anchors `(xCb64, yCb64)` coincide with the node
+/// origin and `yCb32` is the origin or origin + 32.
+///
+/// The spec's `CqtDepth[chType][x][y]` counts from the CTB root and the
+/// conditions compare it against `CtbLog2SizeY − 6` — the implicit-QT
+/// depth of a 64×64 node — so in node-local terms `CqtDepth ==
+/// CtbLog2SizeY − 6` ⇔ the covering leaf's walker `cqt_depth == 0`, and
+/// `CqtDepth > CtbLog2SizeY − 6` ⇔ `cqt_depth > 0`.
+///
+/// Enabled when one of the four 64-node conditions holds:
+/// 1. the chroma CB covering `(xCb64, yCb64)` is 64×64;
+/// 2. that CB has `cqt_depth == 0`, `MttSplitMode[xCb64][yCb64][0] ==
+///    SPLIT_BT_HOR`, and the chroma CB covering `(xCb64, yCb32)` is
+///    64×32;
+/// 3. that CB has `cqt_depth > 0`;
+/// 4. `cqt_depth == 0`, `MttSplitMode[xCb64][yCb64][0] == SPLIT_BT_HOR`
+///    and `MttSplitMode[xCb64][yCb32][1] == SPLIT_BT_VER`;
+///
+/// then suppressed (set back to FALSE) when the collocated luma 64-node
+/// is a 64×64 ISP CU, or when the luma CB covering the origin is
+/// smaller than 64 in either dimension while its `cqt_depth == 0` (luma
+/// stopped QT-splitting at 64 and went MTT).
+#[allow(clippy::too_many_arguments)]
+fn cclm_enabled_64_grid(
+    node_x: u32,
+    node_y: u32,
+    chroma_cus: &[CtuCu],
+    chroma_mtt: &[MttSplitRec],
+    luma_cus: &[CtuCu],
+    luma_infos: &[crate::leaf_cu::LeafCuInfo],
+    cb_x: u32,
+    cb_y: u32,
+) -> bool {
+    // eqs. 242 – 244.
+    let x64 = (cb_x >> 6) << 6;
+    let y64 = (cb_y >> 6) << 6;
+    let y32 = (cb_y >> 5) << 5;
+    let covers = |c: &CtuCu, px: u32, py: u32| {
+        px >= c.cu.x && px < c.cu.x + c.cu.w && py >= c.cu.y && py < c.cu.y + c.cu.h
+    };
+    let Some(c64) = chroma_cus.iter().find(|c| covers(c, x64, y64)) else {
+        return false;
+    };
+    // MttSplitMode look-ups (log is node-local).
+    let mtt_at = |px: u32, py: u32, depth: u32| {
+        chroma_mtt
+            .iter()
+            .find(|r| r.x == px - node_x && r.y == py - node_y && r.mtt_depth == depth)
+    };
+    let bt_hor_at_64 = mtt_at(x64, y64, 0).is_some_and(|r| r.binary && !r.vertical);
+    let bt_ver_at_y32 = mtt_at(x64, y32, 1).is_some_and(|r| r.binary && r.vertical);
+    let c_y32_is_64x32 = chroma_cus
+        .iter()
+        .find(|c| covers(c, x64, y32))
+        .is_some_and(|c| c.cu.w == 64 && c.cu.h == 32);
+
+    let cond1 = c64.cu.w == 64 && c64.cu.h == 64;
+    let cond2 = c64.cu.cqt_depth == 0 && bt_hor_at_64 && c_y32_is_64x32;
+    let cond3 = c64.cu.cqt_depth > 0;
+    let cond4 = c64.cu.cqt_depth == 0 && bt_hor_at_64 && bt_ver_at_y32;
+    let mut enabled = cond1 || cond2 || cond3 || cond4;
+
+    // Luma-side suppression.
+    if enabled {
+        if let Some(idx) = luma_cus.iter().position(|c| covers(c, x64, y64)) {
+            let lcu = &luma_cus[idx];
+            let isp = luma_infos
+                .get(idx)
+                .is_some_and(|i| i.isp_split != crate::leaf_cu::IspSplitType::NoSplit);
+            if lcu.cu.w == 64 && lcu.cu.h == 64 && isp {
+                enabled = false;
+            }
+            if (lcu.cu.w < 64 || lcu.cu.h < 64) && lcu.cu.cqt_depth == 0 {
+                enabled = false;
+            }
+        }
+    }
+    enabled
 }
 
 /// A leaf CU emitted by the walker, annotated with the CTU it belongs
@@ -2111,30 +2199,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     }
 
     /// §8.4.4 — cross-component chroma intra prediction mode checking
-    /// process, evaluated on the dual-tree I-slice chroma walk.
+    /// process, simple arms, evaluated on the dual-tree I-slice chroma
+    /// walk.
     ///
-    /// * `sps_cclm_enabled_flag == 0` → FALSE.
-    /// * `CtbLog2SizeY < 6` → TRUE (the third early-TRUE arm; the first
-    ///   two — single-tree, non-I slice — never hold on this call path).
-    /// * Otherwise the derivation needs the 64-aligned
-    ///   `CqtDepth[1] / CbWidth[1] / CbHeight[1] / MttSplitMode` grids
-    ///   (eqs. 242 – 244 + the four 64-node conditions), which this
-    ///   walker does not track yet → a precise `Unsupported` so a
-    ///   CCLM-enabled dual-tree stream at CTB ≥ 64 fails loudly instead
-    ///   of mis-deriving bin presence.
-    fn cclm_enabled_dual_tree(&self) -> Result<bool> {
+    /// * `sps_cclm_enabled_flag == 0` → `Some(false)`.
+    /// * `CtbLog2SizeY < 6` → `Some(true)` (the third early-TRUE arm;
+    ///   the first two — single-tree, non-I slice — never hold on this
+    ///   call path).
+    /// * Otherwise → `None`: the per-CB 64-grid derivation
+    ///   ([`cclm_enabled_64_grid`]) must run against the node's chroma
+    ///   leaves + MTT-split log and luma leaves.
+    fn cclm_enabled_dual_tree_simple(&self) -> Option<bool> {
         if !self.sps.tool_flags.cclm_enabled_flag {
-            return Ok(false);
+            return Some(false);
         }
         let ctb_log2 = self.sps.sps_log2_ctu_size_minus5 as u32 + 5;
         if ctb_log2 < 6 {
-            return Ok(true);
+            return Some(true);
         }
-        Err(Error::unsupported(
-            "h266 CTU walker: §8.4.4 CclmEnabled 64-grid derivation for dual-tree \
-             pictures with CtbLog2SizeY >= 6 not wired yet (CCLM + dual-tree needs \
-             CTB 32, or disable sps_cclm_enabled_flag)",
-        ))
+        None
     }
 
     /// §7.3.11.2 — walk one dual-tree I-slice CTU end-to-end:
@@ -2260,11 +2343,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // it on chroma_format_idc != 0); defensive skip.
             return Ok(());
         }
-        let cclm_enabled = self.cclm_enabled_dual_tree()?;
-        let chroma_local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
-            .with_neighbour_map_rebased(&mut self.nbr_map_chroma, x0, y0)
-            .with_tree_type(TreeType::DualTreeChroma)
-            .walk(0, 0, w, h)?;
+        let cclm_simple = self.cclm_enabled_dual_tree_simple();
+        let (chroma_local, chroma_mtt_log) =
+            TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
+                .with_neighbour_map_rebased(&mut self.nbr_map_chroma, x0, y0)
+                .with_tree_type(TreeType::DualTreeChroma)
+                .walk_logged(0, 0, w, h)?;
         let chroma_cus: Vec<CtuCu> = chroma_local
             .into_iter()
             .map(|c| CtuCu {
@@ -2281,6 +2365,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         for ccu in &chroma_cus {
             // §8.4.3 — collocated luma mode at the CB centre.
             let dm_mode = self.luma_mode_at(ccu.cu.x + ccu.cu.w / 2, ccu.cu.y + ccu.cu.h / 2);
+            // §8.4.4 — CclmEnabled: the simple arms, or the per-CB
+            // 64-grid derivation against this node's two trees.
+            let cclm_enabled = cclm_simple.unwrap_or_else(|| {
+                cclm_enabled_64_grid(
+                    x0,
+                    y0,
+                    &chroma_cus,
+                    &chroma_mtt_log,
+                    &luma_cus,
+                    &luma_infos,
+                    ccu.cu.x,
+                    ccu.cu.y,
+                )
+            });
             let tools = self.cu_tool_flags();
             let mut info = LeafCuInfo {
                 x0: ccu.cu.x,
@@ -10487,36 +10585,235 @@ mod tests {
         assert_eq!(walker.luma_mode_at(4096, 4096), INTRA_PLANAR);
     }
 
-    /// §8.4.4 — CclmEnabled on the dual-tree walk: FALSE when the SPS
-    /// tool flag is off; TRUE when `CtbLog2SizeY < 6` (CTB 32); a
-    /// precise Unsupported for the 64-grid derivation at CTB ≥ 64.
+    /// §8.4.4 — CclmEnabled simple arms on the dual-tree walk: FALSE
+    /// when the SPS tool flag is off; TRUE when `CtbLog2SizeY < 6`
+    /// (CTB 32); `None` (per-CB 64-grid derivation) at CTB ≥ 64.
     #[test]
     fn dual_tree_cclm_enabled_arms() {
-        // CTB 128, cclm off → Ok(false).
+        // CTB 128, cclm off → Some(false).
         let sps = dummy_sps(2, 128, 128);
         let pps = dummy_pps(128, 128, true);
         let sh = intra_slice_header();
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 8];
         let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
-        assert!(!walker.cclm_enabled_dual_tree().unwrap());
+        assert_eq!(walker.cclm_enabled_dual_tree_simple(), Some(false));
 
-        // CTB 32 (log2 = 5 < 6), cclm on → Ok(true).
+        // CTB 32 (log2 = 5 < 6), cclm on → Some(true).
         let mut sps32 = dummy_sps(0, 64, 64);
         sps32.tool_flags.cclm_enabled_flag = true;
         let pps32 = dummy_pps(64, 64, true);
         let layout32 = CtuLayout::from_sps_pps(&sps32, &pps32);
         let walker32 = CtuWalker::begin_slice(&layout32, &sps32, &pps32, &sh, 0, &data).unwrap();
-        assert!(walker32.cclm_enabled_dual_tree().unwrap());
+        assert_eq!(walker32.cclm_enabled_dual_tree_simple(), Some(true));
 
-        // CTB 128, cclm on → Unsupported (64-grid derivation not wired).
+        // CTB 128, cclm on → None (per-CB 64-grid derivation).
         let mut sps_on = dummy_sps(2, 128, 128);
         sps_on.tool_flags.cclm_enabled_flag = true;
         let walker_on = CtuWalker::begin_slice(&layout, &sps_on, &pps, &sh, 0, &data).unwrap();
-        assert!(matches!(
-            walker_on.cclm_enabled_dual_tree(),
-            Err(Error::Unsupported(_))
+        assert_eq!(walker_on.cclm_enabled_dual_tree_simple(), None);
+    }
+
+    /// §8.4.4 64-grid arms — direct unit tests of the four enabling
+    /// conditions + the two luma-side suppressions against synthetic
+    /// node trees.
+    #[test]
+    fn cclm_enabled_64_grid_conditions() {
+        let mk = |x, y, w, h, cqt| CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x,
+                y,
+                w,
+                h,
+                cqt_depth: cqt,
+                mtt_depth: 0,
+            },
+        };
+        let luma_unsplit = vec![mk(0, 0, 64, 64, 0)];
+        let luma_infos_plain = vec![LeafCuInfo::default()];
+
+        // Condition 1 — chroma 64-node unsplit → enabled.
+        let chroma_unsplit = vec![mk(0, 0, 64, 64, 0)];
+        assert!(cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_unsplit,
+            &[],
+            &luma_unsplit,
+            &luma_infos_plain,
+            0,
+            0
         ));
+
+        // Condition 3 — chroma QT-split below 64 (leaf cqt_depth > 0).
+        let chroma_qt = vec![
+            mk(0, 0, 32, 32, 1),
+            mk(32, 0, 32, 32, 1),
+            mk(0, 32, 32, 32, 1),
+            mk(32, 32, 32, 32, 1),
+        ];
+        assert!(cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_qt,
+            &[],
+            &luma_unsplit,
+            &luma_infos_plain,
+            32,
+            32
+        ));
+
+        // MTT split at the 64 node WITHOUT the BT_HOR shape → disabled
+        // (none of the four conditions hold): BT_VER halves.
+        let chroma_btv = vec![mk(0, 0, 32, 64, 0), mk(32, 0, 32, 64, 0)];
+        let log_btv = [MttSplitRec {
+            x: 0,
+            y: 0,
+            mtt_depth: 0,
+            vertical: true,
+            binary: true,
+        }];
+        assert!(!cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_btv,
+            &log_btv,
+            &luma_unsplit,
+            &luma_infos_plain,
+            0,
+            0
+        ));
+
+        // Condition 2 — BT_HOR at the 64 node into two 64×32 halves;
+        // the CB covering (x64, y32) is 64×32.
+        let chroma_bth = vec![mk(0, 0, 64, 32, 0), mk(0, 32, 64, 32, 0)];
+        let log_bth = [MttSplitRec {
+            x: 0,
+            y: 0,
+            mtt_depth: 0,
+            vertical: false,
+            binary: true,
+        }];
+        assert!(cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_bth,
+            &log_bth,
+            &luma_unsplit,
+            &luma_infos_plain,
+            0,
+            40
+        ));
+
+        // Condition 4 — BT_HOR at the 64 node, lower half BT_VER at
+        // depth 1 (leaves 32×32): enabled for a CB in the lower half.
+        let chroma_c4 = vec![
+            mk(0, 0, 64, 32, 0),
+            mk(0, 32, 32, 32, 0),
+            mk(32, 32, 32, 32, 0),
+        ];
+        let log_c4 = [
+            MttSplitRec {
+                x: 0,
+                y: 0,
+                mtt_depth: 0,
+                vertical: false,
+                binary: true,
+            },
+            MttSplitRec {
+                x: 0,
+                y: 32,
+                mtt_depth: 1,
+                vertical: true,
+                binary: true,
+            },
+        ];
+        assert!(cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_c4,
+            &log_c4,
+            &luma_unsplit,
+            &luma_infos_plain,
+            32,
+            32
+        ));
+
+        // Luma suppression A — collocated luma 64×64 with ISP.
+        let mut isp_info = LeafCuInfo::default();
+        isp_info.isp_split = crate::leaf_cu::IspSplitType::VerSplit;
+        let luma_isp_infos = vec![isp_info];
+        assert!(!cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_unsplit,
+            &[],
+            &luma_unsplit,
+            &luma_isp_infos,
+            0,
+            0
+        ));
+
+        // Luma suppression B — luma smaller than 64 at cqt_depth 0
+        // (luma stopped QT at 64 and used MTT).
+        let luma_mtt = vec![mk(0, 0, 32, 64, 0), mk(32, 0, 32, 64, 0)];
+        let luma_mtt_infos = vec![LeafCuInfo::default(), LeafCuInfo::default()];
+        assert!(!cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_unsplit,
+            &[],
+            &luma_mtt,
+            &luma_mtt_infos,
+            0,
+            0
+        ));
+        // …but NOT suppressed when the luma leaf is small because of a
+        // deeper QT (cqt_depth > 0).
+        let luma_qt = vec![
+            mk(0, 0, 32, 32, 1),
+            mk(32, 0, 32, 32, 1),
+            mk(0, 32, 32, 32, 1),
+            mk(32, 32, 32, 32, 1),
+        ];
+        let luma_qt_infos = vec![LeafCuInfo::default(); 4];
+        assert!(cclm_enabled_64_grid(
+            0,
+            0,
+            &chroma_unsplit,
+            &[],
+            &luma_qt,
+            &luma_qt_infos,
+            0,
+            0
+        ));
+    }
+
+    /// Dual-tree at CTB 128 with CCLM enabled decodes end-to-end
+    /// through the §8.4.4 per-CB 64-grid derivation (r391 closes the
+    /// former Unsupported).
+    #[test]
+    fn walker_decodes_dual_tree_ctb128_with_cclm() {
+        let mut sps = dummy_sps(2, 128, 128);
+        sps.partition_constraints.qtbtt_dual_tree_intra_flag = true;
+        sps.tool_flags.cclm_enabled_flag = true;
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 4096];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        walker
+            .decode_picture_into(&mut out)
+            .expect("dual-tree CTB-128 CCLM decode");
+        let mut cb_painted = true;
+        for v in &out.cb.samples {
+            if *v == 0 {
+                cb_painted = false;
+            }
+        }
+        assert!(cb_painted, "chroma tree must paint every Cb sample");
     }
 
     /// Dual-tree at CTB 32 with CCLM enabled decodes end-to-end (the
