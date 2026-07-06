@@ -2426,7 +2426,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ));
         }
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
-        self.reconstruct_chroma_plane(
+        // §8.7.4.1 eq. 1157 — predModeIntra for the chroma LFNST set:
+        // IntraPredModeC, with the CCLM modes resolved to the collocated
+        // luma centre mode (a MIP collocated CU reads INTRA_PLANAR from
+        // the grid). Only computed when the chroma-tree parse read a
+        // non-zero lfnst_idx (eq. 180).
+        let lfnst_pm = if info.lfnst_idx > 0 {
+            let pm = match info.intra_pred_mode_c {
+                INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM => {
+                    self.luma_mode_at(cu.cu.x + cu.cu.w / 2, cu.cu.y + cu.cu.h / 2)
+                }
+                m => m,
+            };
+            Some(pm)
+        } else {
+            None
+        };
+        self.reconstruct_chroma_plane_lfnst(
             /*c_idx=*/ 1,
             cu,
             info,
@@ -2434,8 +2450,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             info.tu_cb_coded_flag,
             bit_depth,
             out,
+            lfnst_pm,
         )?;
-        self.reconstruct_chroma_plane(
+        self.reconstruct_chroma_plane_lfnst(
             /*c_idx=*/ 2,
             cu,
             info,
@@ -2443,6 +2460,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             info.tu_cr_coded_flag,
             bit_depth,
             out,
+            lfnst_pm,
         )?;
         Ok(())
     }
@@ -6862,6 +6880,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         bit_depth: u32,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        self.reconstruct_chroma_plane_lfnst(
+            c_idx, cu, info, levels, coded_flag, bit_depth, out, None,
+        )
+    }
+
+    /// [`Self::reconstruct_chroma_plane`] with an optional chroma LFNST
+    /// activation. `lfnst_pred_mode` is `Some(predModeIntra)` only on
+    /// the DUAL_TREE_CHROMA path when `lfnst_idx > 0` (§8.7.4.1 eq. 180
+    /// — `ApplyLfnstFlag[cIdx] = lfnst_idx > 0 && treeType ==
+    /// DUAL_TREE_CHROMA`); the mode is the eq. 1157 `IntraPredModeC`
+    /// with the CCLM arms resolved to the collocated luma centre mode
+    /// (MIP collocated → INTRA_PLANAR). Single-tree callers always pass
+    /// `None` — LFNST never applies to chroma there.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_chroma_plane_lfnst(
+        &self,
+        c_idx: u32,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        levels: &[i32],
+        coded_flag: bool,
+        bit_depth: u32,
+        out: &mut PictureBuffer,
+        lfnst_pred_mode: Option<u32>,
+    ) -> Result<()> {
         // 4:2:0 chroma sub-sampling: half in both directions.
         let n_tb_w = (cu.cu.w as usize) / 2;
         let n_tb_h = (cu.cu.h as usize) / 2;
@@ -7048,13 +7091,30 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bdpcm: info.intra_bdpcm_chroma,
                     bdpcm_dir: info.intra_bdpcm_chroma_dir,
                 };
-                let d = self.dequantize_tb(
-                    levels,
-                    &params,
-                    PredModeKind::Intra,
-                    c_idx,
-                    /*apply_lfnst=*/ false,
-                )?;
+                // §8.7.4.1 eq. 180 — chroma LFNST fires only on the
+                // dual-tree chroma path (`lfnst_pred_mode` is `Some`)
+                // and never on a transform-skip TB.
+                let apply_lfnst =
+                    lfnst_pred_mode.is_some() && info.lfnst_idx > 0 && !transform_skip;
+                let mut d =
+                    self.dequantize_tb(levels, &params, PredModeKind::Intra, c_idx, apply_lfnst)?;
+                if apply_lfnst {
+                    // §8.7.4.1 – §8.7.4.3 — inverse LFNST on the chroma
+                    // TB with the eq. 1157 predModeIntra (CCLM already
+                    // resolved by the caller to the collocated luma
+                    // centre mode).
+                    let pm = lfnst_pred_mode.unwrap_or(INTRA_PLANAR);
+                    let max_c = (1i32 << log2_tr_range) - 1;
+                    crate::lfnst::apply_inverse_lfnst(
+                        &mut d,
+                        n_tb_w,
+                        n_tb_h,
+                        pm as i32,
+                        info.lfnst_idx,
+                        -(max_c + 1),
+                        max_c,
+                    )?;
+                }
                 if transform_skip {
                     // Transform-skip (BDPCM-chroma or plain
                     // transform_skip_flag): bypass the inverse transform;
@@ -7064,11 +7124,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     // DCT-II both axes — chroma never picks an MTS kernel
                     // explicitly; implicit-MTS would only apply to luma intra
                     // (§8.7.4.4). Sizes ∈ {4, 8, 16, 32, 64} are all covered.
+                    // With LFNST active only the low-frequency corner is
+                    // non-zero (§8.7.4.1 eqs. 1169 / 1170).
+                    let (non_zero_w, non_zero_h) = if apply_lfnst {
+                        let nz = if n_tb_w == 4 || n_tb_h == 4 { 4 } else { 8 };
+                        (n_tb_w.min(nz), n_tb_h.min(nz))
+                    } else {
+                        (n_tb_w, n_tb_h)
+                    };
                     inverse_transform_2d(
                         n_tb_w,
                         n_tb_h,
-                        n_tb_w,
-                        n_tb_h,
+                        non_zero_w,
+                        non_zero_h,
                         TrType::DctII,
                         TrType::DctII,
                         &d,
@@ -10788,6 +10856,116 @@ mod tests {
             0,
             0
         ));
+    }
+
+    /// §8.7.4.1 eq. 180 — a dual-tree chroma CU with `lfnst_idx > 0`
+    /// routes its coded chroma TBs through the inverse LFNST before the
+    /// DCT-II; the reconstruction must differ from the `lfnst_idx == 0`
+    /// decode of the same levels, and the single-tree entry point
+    /// (`reconstruct_chroma_plane`) must NOT apply LFNST to chroma even
+    /// when `info.lfnst_idx > 0` (single-tree LFNST is luma-only).
+    #[test]
+    fn dual_tree_chroma_lfnst_changes_reconstruction() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        // 8×8 chroma TB with a few non-zero low-frequency levels.
+        let mut cb_levels = vec![0i32; 8 * 8];
+        cb_levels[0] = 12;
+        cb_levels[1] = -7;
+        cb_levels[8] = 5;
+        let residual = LeafCuResidual {
+            cb_levels: cb_levels.clone(),
+            ..LeafCuResidual::default()
+        };
+        let mut info = LeafCuInfo {
+            x0: 0,
+            y0: 0,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Intra,
+            intra_pred_mode_c: INTRA_PLANAR,
+            tu_cb_coded_flag: true,
+            ..LeafCuInfo::default()
+        };
+
+        let mut walker0 = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out0 = PictureBuffer::yuv420_filled(128, 128, 0);
+        info.lfnst_idx = 0;
+        walker0
+            .reconstruct_leaf_cu_dual_chroma(&ccu, &info, &residual, &mut out0)
+            .expect("lfnst-off dual-chroma recon");
+
+        let mut walker1 = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out1 = PictureBuffer::yuv420_filled(128, 128, 0);
+        info.lfnst_idx = 1;
+        walker1
+            .reconstruct_leaf_cu_dual_chroma(&ccu, &info, &residual, &mut out1)
+            .expect("lfnst-on dual-chroma recon");
+
+        let differ = out0
+            .cb
+            .samples
+            .iter()
+            .zip(out1.cb.samples.iter())
+            .any(|(a, b)| a != b);
+        assert!(
+            differ,
+            "chroma LFNST must change the dual-tree chroma reconstruction"
+        );
+
+        // Single-tree chroma entry point ignores lfnst_idx (eq. 180
+        // requires DUAL_TREE_CHROMA): identical output whether the CU
+        // carries lfnst_idx 0 or 1.
+        let bit_depth = 8;
+        let mut st0 = PictureBuffer::yuv420_filled(128, 128, 0);
+        info.lfnst_idx = 0;
+        walker
+            .reconstruct_chroma_plane(1, &ccu, &info, &cb_levels, true, bit_depth, &mut st0)
+            .unwrap();
+        let mut st1 = PictureBuffer::yuv420_filled(128, 128, 0);
+        info.lfnst_idx = 1;
+        walker
+            .reconstruct_chroma_plane(1, &ccu, &info, &cb_levels, true, bit_depth, &mut st1)
+            .unwrap();
+        assert_eq!(
+            st0.cb.samples, st1.cb.samples,
+            "single-tree chroma must never apply LFNST"
+        );
+    }
+
+    /// Dual-tree decode with `sps_lfnst_enabled_flag` on — the chroma
+    /// tree parses (and, when the residual-flag gates fire, consumes)
+    /// `lfnst_idx` without structural failure.
+    #[test]
+    fn walker_decodes_dual_tree_with_lfnst_enabled() {
+        let mut sps = dummy_sps(2, 128, 128);
+        sps.partition_constraints.qtbtt_dual_tree_intra_flag = true;
+        sps.tool_flags.lfnst_enabled_flag = true;
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 4096];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 0);
+        walker
+            .decode_picture_into(&mut out)
+            .expect("dual-tree + LFNST decode");
     }
 
     /// Dual-tree at CTB 128 with CCLM enabled decodes end-to-end

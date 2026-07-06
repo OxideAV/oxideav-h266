@@ -1590,8 +1590,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     ///   `(cbWidth / SubWidthC) × (cbHeight / SubHeightC)`.
     ///
     /// The chroma-tree `lfnst_idx` (with its `/ SubWidthC` size
-    /// scaling) is not yet parsed — inferred 0, matching this crate's
-    /// encoder which never emits it.
+    /// scaling and `treeType != SINGLE_TREE` ctxInc) is parsed after
+    /// the residuals; `mts_idx` is never present on this tree.
     pub fn decode_dual_chroma(
         &mut self,
         info: &mut LeafCuInfo,
@@ -1714,6 +1714,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         }
         let cw = cb_w / sub_w as usize;
         let ch = cb_h / sub_h as usize;
+        // §7.3.11.5 — LfnstDcOnly / LfnstZeroOutSigCoeffFlag accumulate
+        // across this CU's coded chroma TBs and gate the chroma-tree
+        // lfnst_idx read below.
+        let mut res_flags = crate::residual::TbResidualFlags::default();
         if cw >= 2 && ch >= 2 {
             for c_idx in [1u32, 2u32] {
                 let coded = if c_idx == 1 {
@@ -1749,7 +1753,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         info.intra_bdpcm_chroma,
                     )?
                 } else {
-                    let (levels, _flags) = decode_tb_coefficients_opts(
+                    let (levels, flags) = decode_tb_coefficients_opts(
                         self.dec,
                         &mut self.ctxs.residual,
                         cw,
@@ -1757,6 +1761,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         c_idx,
                         self.tools.rc_opts,
                     )?;
+                    res_flags.merge(flags);
                     levels
                 };
                 if c_idx == 1 {
@@ -1768,8 +1773,46 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 }
             }
         }
-        // Chroma-tree lfnst_idx / mts_idx — not parsed (inferred 0);
-        // see the method doc.
+        // §7.3.11.5 — chroma-tree `lfnst_idx`. On DUAL_TREE_CHROMA the
+        // size gates use `lfnstWidth = cbWidth / SubWidthC` /
+        // `lfnstHeight = cbHeight / SubHeightC`; `lfnstNotTsFlag`
+        // reduces to the chroma half of its derivation (the luma term is
+        // TRUE for this treeType), and the MIP exception is TRUE. The
+        // inner gate is the ISP_NO_SPLIT arm: `LfnstDcOnly == 0 &&
+        // LfnstZeroOutSigCoeffFlag == 1`. Inferred 0 when absent. The
+        // §8.7.4.1 eq. 180 `ApplyLfnstFlag[cIdx]` then applies the
+        // inverse LFNST to BOTH chroma TBs at reconstruction.
+        info.lfnst_idx = 0;
+        let lfnst_w = info.cb_width / sub_w;
+        let lfnst_h = info.cb_height / sub_h;
+        let lfnst_not_ts = !info.intra_bdpcm_chroma
+            && (!info.tu_cb_coded_flag || !info.transform_skip_cb)
+            && (!info.tu_cr_coded_flag || !info.transform_skip_cr);
+        let lfnst_gate = self.tools.lfnst_enabled
+            && lfnst_w.min(lfnst_h) >= 4
+            && info.cb_width.max(info.cb_height) <= self.tools.max_tb_size_y
+            && lfnst_not_ts
+            && !res_flags.lfnst_dc_only
+            && res_flags.lfnst_zero_out_sig_coeff_flag;
+        if lfnst_gate {
+            // TR(cMax = 2): bin 0, then bin 1 only if bin 0 == 1;
+            // ctxInc per §9.3.4.2.2 with `treeType != SINGLE_TREE`.
+            let off = (self.ctxs.init_type as usize) * 3;
+            let n = self.ctxs.lfnst_idx.len() - 1;
+            let inc0 = crate::ctx::ctx_inc_lfnst_idx(0, /*tree_single=*/ false) as usize;
+            let bin0 = self
+                .dec
+                .decode_decision(&mut self.ctxs.lfnst_idx[(off + inc0).min(n)])?;
+            if bin0 == 1 {
+                let inc1 = crate::ctx::ctx_inc_lfnst_idx(1, false) as usize;
+                let bin1 = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.lfnst_idx[(off + inc1).min(n)])?;
+                info.lfnst_idx = if bin1 == 1 { 2 } else { 1 };
+            }
+        }
+        // Chroma-tree mts_idx is never present (§7.3.11.5 gates it on
+        // `treeType != DUAL_TREE_CHROMA`).
         Ok(())
     }
 
