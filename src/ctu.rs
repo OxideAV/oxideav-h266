@@ -577,6 +577,24 @@ impl SliceCabacState {
     }
 }
 
+/// §8.5.1 NOTE (above eq. 460) — one DMVR-refined rectangle
+/// (`MvDmvrLX`). The live [`CtuWalker::motion_field`] keeps the
+/// *unrefined* `MvLX` (spatial-MVP + deblocking read that), while the
+/// temporal (collocated) motion storage a *later* picture reads must see
+/// the refined pair. Each record covers one DMVR unit — the whole CU on
+/// the single-sub-block path, one 16×16 sub-block on the eqs. 452 – 459
+/// split — and is folded over a clone of the unrefined field by
+/// [`CtuWalker::motion_field_for_temporal`].
+#[derive(Clone, Copy, Debug)]
+struct DmvrRefinedRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    mv_l0: MotionVector,
+    mv_l1: MotionVector,
+}
+
 /// A leaf CU emitted by the walker, annotated with the CTU it belongs
 /// to. The geometry is in absolute (picture-wide) luma-sample
 /// coordinates, not CTU-relative.
@@ -685,6 +703,13 @@ pub struct CtuWalker<'a, 'b> {
     /// [`Self::reconstruct_leaf_cu`] for inter CUs and read back during
     /// the §8.5.2.3 spatial-merge derivation of subsequent CUs.
     motion_field: MotionField,
+    /// §8.5.1 NOTE — DMVR-refined MV records (`MvDmvrLX`). One entry per
+    /// refined DMVR unit; folded over [`Self::motion_field`] by
+    /// [`Self::motion_field_for_temporal`] so a later picture's
+    /// collocated (temporal) derivation sees the refined MVs while the
+    /// in-picture spatial-MVP / deblocking reads keep the unrefined
+    /// store.
+    dmvr_refined: Vec<DmvrRefinedRect>,
     /// Round-24 per-slice HMVP table (§8.5.2.6 + §8.5.2.16). Reset
     /// to empty at slice start (and at every CTU column tile-
     /// boundary per the §7.3.11 slice_data() pseudocode — for our
@@ -984,6 +1009,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ref_pic_list_l0: Vec::new(),
             ref_pic_list_l1: Vec::new(),
             motion_field,
+            dmvr_refined: Vec::new(),
             hmvp: HmvpTable::new(),
             log2_par_mrg_level,
             current_poc: 0,
@@ -1274,6 +1300,30 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// emits.
     pub fn motion_field(&self) -> &MotionField {
         &self.motion_field
+    }
+
+    /// §8.5.1 NOTE (above eq. 460) — the motion field that must back the
+    /// **temporal** (collocated) motion-vector storage when this picture
+    /// becomes a reference: the per-CU `MvLX` store with every DMVR-
+    /// refined unit's `MvDmvrLX` folded on top. Callers snapshot this
+    /// (instead of [`Self::motion_field`]) into
+    /// [`ReferencePicture::motion_field`] so a later picture's §8.5.2.11
+    /// / §8.5.2.12 collocated derivation reads the refined MVs, while
+    /// the in-picture spatial-MVP and deblocking processes keep reading
+    /// the unrefined store.
+    pub fn motion_field_for_temporal(&self) -> MotionField {
+        let mut mf = self.motion_field.clone();
+        for r in &self.dmvr_refined {
+            let base = mf.get_at_luma(r.x as i32, r.y as i32);
+            if !base.available {
+                continue;
+            }
+            let mut refined = base;
+            refined.mv_l0 = r.mv_l0;
+            refined.mv_l1 = r.mv_l1;
+            mf.write_block(r.x, r.y, r.w, r.h, refined);
+        }
+        mf
     }
 
     /// Round-28 §8.5.6.7 — sample the picture-wide 4x4 intra-coded
@@ -2641,10 +2691,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // processes. We therefore keep the pre-DMVR MVs in
         // `unrefined_mv_l{0,1}` and write *those* into the per-picture
         // motion field at the end, so a later CU's §8.5.2.3 spatial scan
-        // sees the unrefined neighbour motion. (The motion field also
-        // backs temporal derivation in this scaffold, which spec-wise
-        // should see the refined `MvDmvrLX`; modelling that split needs a
-        // second per-picture field and is a follow-up.)
+        // sees the unrefined neighbour motion. The refined `MvDmvrLX`
+        // pairs are recorded per DMVR unit in `dmvr_refined`;
+        // `motion_field_for_temporal` folds them over a clone of the
+        // unrefined store so the collocated (temporal) export a later
+        // picture reads sees the refined MVs, per the NOTE's split.
         let mut chosen = chosen;
         let unrefined_mv_l0 = chosen.mv_l0;
         let unrefined_mv_l1 = chosen.mv_l1;
@@ -2702,20 +2753,65 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     )?;
                     chosen.mv_l0 = refined.mv_l0_refined;
                     chosen.mv_l1 = refined.mv_l1_refined;
+                    // §8.5.1 NOTE — record `MvDmvrLX` for the temporal
+                    // (collocated) motion store this picture exports via
+                    // `motion_field_for_temporal`.
+                    self.dmvr_refined.push(DmvrRefinedRect {
+                        x: cu.cu.x,
+                        y: cu.cu.y,
+                        w: cu.cu.w,
+                        h: cu.cu.h,
+                        mv_l0: refined.mv_l0_refined,
+                        mv_l1: refined.mv_l1_refined,
+                    });
                 } else {
                     // Multi-sub-block split (§8.5.1 eqs. 456 – 459): each
                     // 16×16 sub-block is refined independently and runs
                     // its own §8.5.6 bi-pred MC (luma + 4:2:0 chroma) at
                     // the sub-block origin. The §8.5.6.6.2 blend uses the
                     // candidate's `bcwIdx` (always 0 on the DMVR gate, so
-                    // eq. 980 default-weighting). BDOF on the per-DMVR-
-                    // sub-block grid is a follow-up; the gate sets it off
-                    // for this path. The unrefined `MvLX` motion-field
-                    // store below still applies (the CU-wide MvField is
-                    // the pre-DMVR candidate).
+                    // eq. 980 default-weighting). When the §8.5.6.5
+                    // `bdofUsedFlag` derivation also holds, the BDOF
+                    // refinement runs per DMVR sub-block on that
+                    // sub-block's refined MV pair (the §8.5.1 sub-block
+                    // walk hands `sbWidth × sbHeight` units to §8.5.6.1).
+                    // The unrefined `MvLX` motion-field store below still
+                    // applies (the CU-wide MvField is the pre-DMVR
+                    // candidate); the per-sub-block refined pairs are
+                    // recorded for `motion_field_for_temporal`.
                     let sb_w = 16u32;
                     let sb_h = 16u32;
                     let chroma = self.sps.sps_chroma_format_idc == 1;
+                    let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+                    // §8.5.6.5 bdofUsedFlag — every DMVR gate bullet that
+                    // overlaps (bi-pred, symmetric STRP POC bracket,
+                    // bcwIdx 0, no WP, translational, non-sub-block-merge,
+                    // !ciip, size ≥ 8×8 with area ≥ 128) already held; the
+                    // remaining inputs mirror the CU-wide derivation used
+                    // on the single-sub-block path below.
+                    let bdof_runs = self.sps.tool_flags.bdof_enabled_flag
+                        && bdof_used_flag(
+                            self.ph_bdof_disabled,
+                            chosen.pred_flag_l0,
+                            chosen.pred_flag_l1,
+                            bracketed_same_diff_poc,
+                            /*is_strp_l0*/ true,
+                            /*is_strp_l1*/ true,
+                            /*motion_model_idc*/ 0,
+                            /*merge_subblock_flag*/ false,
+                            /*sym_mvd_flag*/ false,
+                            info.inter.merge_data.ciip_flag,
+                            chosen.bcw_idx,
+                            /*luma_weight_l0_flag*/ false,
+                            /*luma_weight_l1_flag*/ false,
+                            /*chroma_weight_l0_flag*/ false,
+                            /*chroma_weight_l1_flag*/ false,
+                            cu.cu.w,
+                            cu.cu.h,
+                            /*rpr_constraints_active_l0*/ false,
+                            /*rpr_constraints_active_l1*/ false,
+                            /*c_idx*/ 0,
+                        );
                     for sby in 0..num_sb_y {
                         for sbx in 0..num_sb_x {
                             let x = cu.cu.x + sbx * sb_w;
@@ -2730,18 +2826,66 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 &rp0.frame.luma,
                                 &rp1.frame.luma,
                             )?;
-                            predict_luma_block_bipred_bcw(
-                                &mut out.luma,
+                            self.dmvr_refined.push(DmvrRefinedRect {
                                 x,
                                 y,
-                                sb_w,
-                                sb_h,
-                                &rp0.frame.luma,
-                                refined.mv_l0_refined,
-                                &rp1.frame.luma,
-                                refined.mv_l1_refined,
-                                /*bcw_idx*/ 0,
-                            )?;
+                                w: sb_w,
+                                h: sb_h,
+                                mv_l0: refined.mv_l0_refined,
+                                mv_l1: refined.mv_l1_refined,
+                            });
+                            if bdof_runs {
+                                // §8.5.6.5 — spec-precision per-list MC
+                                // intermediates lifted into the
+                                // `(sbW + 2) × (sbH + 2)` extended layout,
+                                // then the BDOF gradient refinement writes
+                                // the sub-block's luma directly.
+                                let pred_l0 = predict_luma_block_high_precision(
+                                    x,
+                                    y,
+                                    sb_w,
+                                    sb_h,
+                                    &rp0.frame.luma,
+                                    refined.mv_l0_refined,
+                                    bit_depth,
+                                )?;
+                                let pred_l1 = predict_luma_block_high_precision(
+                                    x,
+                                    y,
+                                    sb_w,
+                                    sb_h,
+                                    &rp1.frame.luma,
+                                    refined.mv_l1_refined,
+                                    bit_depth,
+                                )?;
+                                let ext_l0 =
+                                    build_extended_pred_high_precision(&pred_l0, sb_w, sb_h)?;
+                                let ext_l1 =
+                                    build_extended_pred_high_precision(&pred_l1, sb_w, sb_h)?;
+                                bdof_refine_into(
+                                    &mut out.luma,
+                                    x,
+                                    y,
+                                    sb_w,
+                                    sb_h,
+                                    &ext_l0,
+                                    &ext_l1,
+                                    bit_depth,
+                                )?;
+                            } else {
+                                predict_luma_block_bipred_bcw(
+                                    &mut out.luma,
+                                    x,
+                                    y,
+                                    sb_w,
+                                    sb_h,
+                                    &rp0.frame.luma,
+                                    refined.mv_l0_refined,
+                                    &rp1.frame.luma,
+                                    refined.mv_l1_refined,
+                                    /*bcw_idx*/ 0,
+                                )?;
+                            }
                             if chroma {
                                 predict_chroma_block_bipred_bcw(
                                     &mut out.cb,
@@ -7633,6 +7777,228 @@ mod tests {
             region_differs(32),
             "right 16×16 DMVR sub-block must differ from the baseline"
         );
+
+        // §8.5.1 NOTE — the per-sub-block refined pairs surface through
+        // `motion_field_for_temporal` (one record per 16×16 sub-block)
+        // while the live motion field keeps the unrefined merge MV.
+        let live = walker_on.motion_field.get_at_luma(20, 20);
+        assert_eq!(live.mv_l0, MotionVector::ZERO);
+        let temporal = walker_on.motion_field_for_temporal();
+        let t_left = temporal.get_at_luma(20, 20);
+        let t_right = temporal.get_at_luma(36, 20);
+        assert!(
+            t_left.mv_l0 != MotionVector::ZERO || t_left.mv_l1 != MotionVector::ZERO,
+            "left sub-block temporal store must carry the refined MVs"
+        );
+        assert!(
+            t_left.mv_l0 != t_right.mv_l0 || t_left.mv_l1 != t_right.mv_l1,
+            "the two sub-blocks refine to different deltas, so the \
+             temporal store must differ per sub-block"
+        );
+    }
+
+    /// §8.5.1 + §8.5.6.5 — when both DMVR and BDOF gate on for a
+    /// multi-sub-block CU, the §8.5.6.5 refinement runs per 16×16 DMVR
+    /// sub-block on that sub-block's refined MV pair. The reconstruction
+    /// must succeed, paint the CU, and still differ from the DMVR-off
+    /// baseline.
+    #[test]
+    fn reconstruct_leaf_cu_inter_merge_dmvr_multi_subblock_bdof() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.dmvr_enabled_flag = true;
+        sps.tool_flags.bdof_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+
+        let ramp = |off_left: i32, off_right: i32| {
+            let mut f = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+            for y in 0..pic_h as usize {
+                for x in 0..pic_w as usize {
+                    let off = if x < 32 { off_left } else { off_right };
+                    let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
+                    let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
+                    let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    f.luma.samples[y * f.luma.stride + x] = v;
+                }
+            }
+            f
+        };
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 32,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 32,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let build_walker = |dmvr_disabled: bool, bdof_disabled: bool| {
+            let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+            w.current_poc = 4;
+            w.set_ph_dmvr_disabled(dmvr_disabled);
+            w.set_ph_bdof_disabled(bdof_disabled);
+            w.set_ref_pic_list_l0(vec![ReferencePicture {
+                poc: 0,
+                frame: ramp(0, 0),
+                motion_field: None,
+            }]);
+            w.set_ref_pic_list_l1(vec![ReferencePicture {
+                poc: 8,
+                frame: ramp(2, 3),
+                motion_field: None,
+            }]);
+            w
+        };
+
+        let mut walker_off = build_walker(true, true);
+        let mut out_off = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker_off
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_off)
+            .expect("dmvr-off bdof-off 32x16 merge recon");
+
+        let mut walker_on = build_walker(false, false);
+        let mut out_on = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker_on
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out_on)
+            .expect("dmvr+bdof 32x16 merge recon");
+
+        // The CU rectangle must be painted (non-zero on the sinusoid
+        // fixture) and must differ from the unrefined baseline.
+        let mut painted = false;
+        let mut differ = false;
+        for y in 0..16usize {
+            for x in 0..32usize {
+                let xi = 16 + x;
+                let yi = 16 + y;
+                let on = out_on.luma.samples[yi * out_on.luma.stride + xi];
+                let off = out_off.luma.samples[yi * out_off.luma.stride + xi];
+                if on != 0 {
+                    painted = true;
+                }
+                if on != off {
+                    differ = true;
+                }
+            }
+        }
+        assert!(painted, "DMVR+BDOF path must paint the CU luma");
+        assert!(
+            differ,
+            "DMVR+BDOF reconstruction must differ from the unrefined baseline"
+        );
+    }
+
+    /// §8.5.1 NOTE — the single-sub-block DMVR path records `MvDmvrLX`:
+    /// `motion_field_for_temporal` carries the refined pair (negated
+    /// across lists per eqs. 618 / 619) while `motion_field` keeps the
+    /// unrefined merge MV for spatial-MVP / deblocking.
+    #[test]
+    fn dmvr_temporal_motion_field_carries_refined_mvs() {
+        let pic_w = 64u32;
+        let pic_h = 64u32;
+        let mut sps = dummy_sps(1, pic_w, pic_h);
+        sps.tool_flags.dmvr_enabled_flag = true;
+        let pps = dummy_pps(pic_w, pic_h, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::B;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+
+        let ramp = |off: i32| {
+            let mut f = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+            for y in 0..pic_h as usize {
+                for x in 0..pic_w as usize {
+                    let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
+                    let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
+                    let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    f.luma.samples[y * f.luma.stride + x] = v;
+                }
+            }
+            f
+        };
+
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        };
+        let mut info = LeafCuInfo {
+            x0: 16,
+            y0: 16,
+            cb_width: 16,
+            cb_height: 16,
+            pred_mode: CuPredMode::Inter,
+            ..LeafCuInfo::default()
+        };
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        let residual = LeafCuResidual::default();
+
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.current_poc = 4;
+        walker.set_ph_dmvr_disabled(false);
+        walker.set_ref_pic_list_l0(vec![ReferencePicture {
+            poc: 0,
+            frame: ramp(0),
+            motion_field: None,
+        }]);
+        walker.set_ref_pic_list_l1(vec![ReferencePicture {
+            poc: 8,
+            frame: ramp(2),
+            motion_field: None,
+        }]);
+        let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("dmvr merge recon");
+
+        // Live (spatial) field: unrefined zero MVs.
+        let live = walker.motion_field.get_at_luma(20, 20);
+        assert_eq!(live.mv_l0, MotionVector::ZERO);
+        assert_eq!(live.mv_l1, MotionVector::ZERO);
+
+        // Temporal export: the refined pair, L1 = −L0 (eqs. 618 / 619).
+        let temporal = walker.motion_field_for_temporal();
+        let t = temporal.get_at_luma(20, 20);
+        assert!(t.available, "temporal field must inherit the CU record");
+        assert_ne!(
+            t.mv_l0,
+            MotionVector::ZERO,
+            "temporal store must carry the DMVR-refined L0 MV"
+        );
+        assert_eq!(t.mv_l1.x, -t.mv_l0.x, "dMvL1 must be −dMvL0 (x)");
+        assert_eq!(t.mv_l1.y, -t.mv_l0.y, "dMvL1 must be −dMvL0 (y)");
+        // Non-MV metadata is inherited from the CU-wide store.
+        assert_eq!(t.ref_idx_l0, live.ref_idx_l0);
+        assert_eq!(t.ref_idx_l1, live.ref_idx_l1);
+        assert!(t.pred_flag_l0 && t.pred_flag_l1);
     }
 
     /// §7.4.12.5 + §8.7.4.1 — an inter CU with `cu_sbt_flag == 1`
