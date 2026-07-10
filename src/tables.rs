@@ -130,6 +130,8 @@ pub enum SyntaxCtx {
     SaoTypeIdx,
     /// Table 64 — `cu_skip_flag` (9 ctxIdx, 3 per initType).
     CuSkipFlag,
+    /// Table 65 — `pred_mode_ibc_flag` (9 ctxIdx, 3 per initType).
+    PredModeIbcFlag,
     /// Table 82 — `general_merge_flag` (3 ctxIdx, one per initType).
     GeneralMergeFlag,
     /// Table 102 — `regular_merge_flag` (4 ctxIdx, two per initType for the
@@ -532,6 +534,14 @@ pub const SAO_TYPE_IDX_SHIFT: &[u8] = &[4, 4, 4];
 pub const CU_SKIP_FLAG_INIT: &[u8] = &[0, 26, 28, 57, 59, 45, 57, 60, 46];
 pub const CU_SKIP_FLAG_SHIFT: &[u8] = &[5, 4, 8, 5, 4, 8, 5, 4, 8];
 
+/// Table 65 — `pred_mode_ibc_flag` (9 ctxIdx, 3 per initType).
+/// `ctxInc = (condL && availableL) + (condA && availableA)` per
+/// §9.3.4.2.2 eq. 1551 with `condX = CuPredMode[chType][xNbX][yNbX]
+/// == MODE_IBC` (Table 133) and `ctxSetIdx = 0`. Final ctxIdx =
+/// `initType * 3 + ctxInc`.
+pub const PRED_MODE_IBC_FLAG_INIT: &[u8] = &[17, 42, 36, 0, 57, 44, 0, 43, 45];
+pub const PRED_MODE_IBC_FLAG_SHIFT: &[u8] = &[1, 5, 8, 1, 5, 8, 1, 5, 8];
+
 /// Table 82 — `general_merge_flag` (3 ctxIdx, one per initType).
 /// ctxInc = 0 per Table 132.
 pub const GENERAL_MERGE_FLAG_INIT: &[u8] = &[26, 21, 6];
@@ -849,6 +859,7 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::SaoMergeFlag => (SAO_MERGE_FLAG_INIT, SAO_MERGE_FLAG_SHIFT),
         SyntaxCtx::SaoTypeIdx => (SAO_TYPE_IDX_INIT, SAO_TYPE_IDX_SHIFT),
         SyntaxCtx::CuSkipFlag => (CU_SKIP_FLAG_INIT, CU_SKIP_FLAG_SHIFT),
+        SyntaxCtx::PredModeIbcFlag => (PRED_MODE_IBC_FLAG_INIT, PRED_MODE_IBC_FLAG_SHIFT),
         SyntaxCtx::GeneralMergeFlag => (GENERAL_MERGE_FLAG_INIT, GENERAL_MERGE_FLAG_SHIFT),
         SyntaxCtx::RegularMergeFlag => (REGULAR_MERGE_FLAG_INIT, REGULAR_MERGE_FLAG_SHIFT),
         SyntaxCtx::MmvdMergeFlag => (MMVD_MERGE_FLAG_INIT, MMVD_MERGE_FLAG_SHIFT),
@@ -941,6 +952,7 @@ mod tests {
             SyntaxCtx::SaoMergeFlag,
             SyntaxCtx::SaoTypeIdx,
             SyntaxCtx::CuSkipFlag,
+            SyntaxCtx::PredModeIbcFlag,
             SyntaxCtx::GeneralMergeFlag,
             SyntaxCtx::RegularMergeFlag,
             SyntaxCtx::MmvdMergeFlag,

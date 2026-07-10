@@ -913,6 +913,19 @@ pub struct CtuWalker<'a, 'b> {
     /// InterAffineFlag[...]` ctxInc only needs a one-line drop-in
     /// when the affine-inter walker arrives.
     inter_affine_grid: Vec<bool>,
+    /// Round-406 — per-CB `CuPredMode[0][x][y] == MODE_IBC` grid at
+    /// 4x4 luma granularity, committed at PARSE time (right after
+    /// each `coding_unit()` is read) so the §9.3.4.2.2 / Table 133
+    /// `pred_mode_ibc_flag` ctxInc sees within-CTU neighbours in
+    /// coding order. Every leaf CU writes its cells (true for
+    /// MODE_IBC, false otherwise).
+    ibc_mode_grid: Vec<bool>,
+    /// Round-406 — parse-time `CuSkipFlag[x][y]` mirror at 4x4 luma
+    /// granularity, committed like [`Self::ibc_mode_grid`]. The
+    /// I-slice IBC `cu_skip_flag` ctxInc samples this grid (the
+    /// legacy inter-slice path keeps sampling the motion field, which
+    /// is written at reconstruction time).
+    parse_cu_skip_grid: Vec<bool>,
     /// Round-364 — per-CB affine CPMV store sampled at 4x4 luma
     /// granularity (§8.5.5.7 / §8.5.5.5). Every affine-coded CB
     /// broadcasts its [`crate::inter::AffineCbRecord`] (origin, dims,
@@ -1086,6 +1099,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // unavailable neighbour.
         let subblock_merge_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let inter_affine_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        let ibc_mode_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        let parse_cu_skip_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         // Round-364 — per-CB affine CPMV store (§8.5.5.7 / §8.5.5.5).
         // Same 4x4 grid geometry as the motion field; every cell starts
         // `None` (covering CB not affine).
@@ -1128,6 +1143,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             intra_grid_h,
             subblock_merge_grid,
             inter_affine_grid,
+            ibc_mode_grid,
+            parse_cu_skip_grid,
             affine_cpmv_field,
             lmcs: None,
             scaling_list: None,
@@ -1539,6 +1556,51 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.inter_affine_grid[(by * self.intra_grid_w + bx) as usize]
     }
 
+    /// Round-406 — sample the parse-time `CuPredMode == MODE_IBC`
+    /// grid at picture-absolute luma `(x, y)`. `false` when out of
+    /// bounds (§6.4.4 unavailable → cond = 0).
+    fn sample_ibc_mode_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.ibc_mode_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// Round-406 — sample the parse-time `CuSkipFlag` grid at
+    /// picture-absolute luma `(x, y)`.
+    fn sample_parse_cu_skip_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.parse_cu_skip_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// Round-406 — broadcast the parse-time IBC / cu-skip cells for a
+    /// freshly parsed leaf CU.
+    fn write_parse_mode_block(&mut self, x: u32, y: u32, w: u32, h: u32, ibc: bool, skip: bool) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
+        let by1 = (y + h).div_ceil(4).min(self.intra_grid_h);
+        for by in by0..by1 {
+            let row_off = (by * self.intra_grid_w) as usize;
+            for bx in bx0..bx1 {
+                self.ibc_mode_grid[row_off + bx as usize] = ibc;
+                self.parse_cu_skip_grid[row_off + bx as usize] = skip;
+            }
+        }
+    }
+
     /// Round-149 — broadcast `is_subblock_merge` across every 4x4 cell
     /// touched by the rectangle `[x, x+w) x [y, y+h)`. Mirrors
     /// [`Self::write_intra_block`] for the §9.3.4.2.2 / Table 133
@@ -1932,6 +1994,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ts_residual_coding_disabled: self.sh.sh_ts_residual_coding_disabled_flag,
             slice_is_inter: self.sh.sh_slice_type != SliceType::I,
             max_num_merge_cand: max_num_merge,
+            // §7.4.3.4 eq. 62 — MaxNumIbcMergeCand = 6 −
+            // sps_six_minus_max_num_ibc_merge_cand when
+            // sps_ibc_enabled_flag == 1, else 0.
+            max_num_ibc_merge_cand: if tf.ibc_enabled_flag {
+                6u32.saturating_sub(tf.six_minus_max_num_ibc_merge_cand)
+            } else {
+                0
+            },
+            amvr_enabled: tf.amvr_enabled_flag,
             mmvd_enabled: tf.mmvd_enabled_flag,
             ph_mmvd_fullpel_only: self.ph_mmvd_fullpel_only,
             ciip_enabled: tf.ciip_enabled_flag,
@@ -2064,6 +2135,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // overlapping picture region is wiped. When the affine
         // walker lands, swap the `false` below for the parsed flag.
         self.write_inter_affine_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
+        // Round-406 — parse-time MODE_IBC + CuSkipFlag broadcast so
+        // the next CU's §9.3.4.2.2 pred_mode_ibc_flag / cu_skip_flag
+        // ctxIncs see this CU in coding order (the motion field is
+        // only written at reconstruction time, i.e. after the whole
+        // CTU has been parsed).
+        self.write_parse_mode_block(
+            cu.cu.x,
+            cu.cu.y,
+            cu.cu.w,
+            cu.cu.h,
+            matches!(info.pred_mode, CuPredMode::Ibc),
+            info.inter.cu_skip_flag,
+        );
     }
 
     /// Build a [`CuNeighbourhood`] for a CU at `ccu.cu.(x, y)` by
@@ -2095,17 +2179,38 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let above_merge_subblock = self.sample_subblock_merge_at_luma(x, y - 1);
         let left_inter_affine = self.sample_inter_affine_at_luma(x - 1, y);
         let above_inter_affine = self.sample_inter_affine_at_luma(x, y - 1);
+        // Round-406 — pred_mode_ibc_flag's Table 133 cond samples the
+        // parse-time MODE_IBC grid. In an I-slice the cu_skip ctxInc
+        // also uses the parse-time grid (the motion field lags a full
+        // CTU behind during the parse pass); the inter-slice path
+        // keeps its historical motion-field sourcing.
+        let left_ibc = self.sample_ibc_mode_at_luma(x - 1, y);
+        let above_ibc = self.sample_ibc_mode_at_luma(x, y - 1);
+        let slice_is_i = self.sh.sh_slice_type == SliceType::I;
+        let (left_cu_skip, above_cu_skip) = if slice_is_i {
+            (
+                self.sample_parse_cu_skip_at_luma(x - 1, y),
+                self.sample_parse_cu_skip_at_luma(x, y - 1),
+            )
+        } else {
+            (
+                left.available && left.cu_skip_flag,
+                above.available && above.cu_skip_flag,
+            )
+        };
         CuNeighbourhood {
             left_available: x > 0,
             above_available: y > 0,
             left: None,
             above: None,
-            left_cu_skip: left.available && left.cu_skip_flag,
-            above_cu_skip: above.available && above.cu_skip_flag,
+            left_cu_skip,
+            above_cu_skip,
             left_merge_subblock,
             above_merge_subblock,
             left_inter_affine,
             above_inter_affine,
+            left_ibc,
+            above_ibc,
         }
     }
 
@@ -2521,6 +2626,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if matches!(info.pred_mode, CuPredMode::Inter) {
             return self.reconstruct_leaf_cu_inter(cu, info, residual, out);
         }
+        if matches!(info.pred_mode, CuPredMode::Ibc) {
+            return self.reconstruct_leaf_cu_ibc(cu, info, residual, out);
+        }
 
         // MIP (§8.4.5.2.2) is wired below through [`crate::mip`]; the
         // prediction step dispatches on `info.intra_mip_flag` and
@@ -2900,6 +3008,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ///    can read it.
     /// 6. Append a zero-CBF [`DeblockCu`] record (skip CUs are coded
     ///    without residual) so the deblocker sees the inter boundary.
+    /// §8.6 — reconstruct a MODE_IBC leaf CU. Stubbed Unsupported in
+    /// the parse commit; the pixels land in the follow-on commit.
+    fn reconstruct_leaf_cu_ibc(
+        &mut self,
+        _cu: &CtuCu,
+        _info: &LeafCuInfo,
+        _residual: &LeafCuResidual,
+        _out: &mut PictureBuffer,
+    ) -> Result<()> {
+        Err(Error::unsupported(
+            "h266 CTU walker: MODE_IBC reconstruction not wired yet",
+        ))
+    }
+
     fn reconstruct_leaf_cu_inter(
         &mut self,
         cu: &CtuCu,

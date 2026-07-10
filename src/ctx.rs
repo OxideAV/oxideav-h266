@@ -273,6 +273,23 @@ pub fn ctx_inc_cu_skip_flag(
     (cond_l as u32) + (cond_a as u32)
 }
 
+/// ctxInc for `pred_mode_ibc_flag[x0][y0]` per §9.3.4.2.2 eq. 1551 +
+/// Table 133. Returns 0..2 — `(condL && availableL) + (condA &&
+/// availableA)` with `condX = CuPredMode[chType][xNbX][yNbX] ==
+/// MODE_IBC` and `ctxSetIdx = 0`. The per-slice `ctxIdx = init_type *
+/// 3 + this_value` mapping happens in the slice CABAC bundle (see
+/// [`crate::tables::PRED_MODE_IBC_FLAG_INIT`]).
+pub fn ctx_inc_pred_mode_ibc_flag(
+    available_l: bool,
+    available_a: bool,
+    left_ibc: bool,
+    above_ibc: bool,
+) -> u32 {
+    let cond_l = available_l && left_ibc;
+    let cond_a = available_a && above_ibc;
+    (cond_l as u32) + (cond_a as u32)
+}
+
 /// ctxInc for `general_merge_flag[x0][y0]` — fixed 0 (Table 132).
 pub fn ctx_inc_general_merge_flag() -> u32 {
     0
