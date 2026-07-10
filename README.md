@@ -9,8 +9,8 @@ VVC is a very large specification (500+ pages); this crate is an
 in-progress, spec-driven implementation. It provides a complete NAL
 framing + parameter-set parsing layer, a reconstruction pipeline that
 covers a growing subset of the intra and inter coding tools, and an
-IDR-frame encoder pipeline. Picture reconstruction for the full
-non-merge inter path and a complete encoder are still being built up
+IDR-frame encoder pipeline. Affine non-merge reconstruction inside the
+picture loop and a complete encoder are still being built up
 incrementally.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -162,8 +162,42 @@ P + B-slice merge subset:
   residual tail (without the §8.7.5.2 LMCS forward mapping — an IBC
   prediction copies already-mapped-domain samples), and the
   eqs. 1111 – 1118 bookkeeping (`MvL0 = bvL`, `PredFlagLX = 0`,
-  `RefIdxLX = −1`). Dual-tree-luma IBC and P/B-slice IBC surface a
-  precise `Error::Unsupported`.
+  `RefIdxLX = −1`). **r409:** IBC also decodes on **P/B slices** (the
+  inter-slice `cu_skip_flag` / `pred_mode_flag` / `pred_mode_ibc_flag`
+  prologue with the §7.4.12.5 inferences) and on the **DUAL_TREE_LUMA**
+  walk (luma-only §8.6.3 prediction; the sibling chroma tree paints the
+  chroma; per-luma-CU `IbcVirBuf` maintenance + parse-grid commits on
+  the dual-tree path).
+* **`pred_mode_flag` on P/B slices** (r409, §7.3.11.5) — intra CUs
+  inside inter slices decode to pixels: the bin is parsed under the
+  spec presence condition (with the §9.3.4.2.2 eq. 1552 ctxInc off a
+  parse-time `CuPredMode == MODE_INTRA` grid committed in coding
+  order, Table 51 / Table 66 context split) and the §7.4.12.5
+  inferences (4x4 → intra) apply; a MODE_INTRA CU runs the exact
+  I-slice intra branch and reconstructs through the intra pipeline,
+  its motion-field cells staying unavailable for later merge / AMVP
+  scans. §8.4.2 MPM candidates thread the neighbours' parse-time
+  `IntraPredModeY` / `IntraMipFlag` / `CuPredMode` (r409; previously
+  every neighbour read PLANAR).
+* **Non-merge inter (AMVP) parse in the full-CABAC walker** (r409,
+  §7.3.11.5) — a `general_merge_flag == 0` CU parses the whole
+  cascade through `decode_picture_into`: the affine pair (Table 133
+  merge-side ctxIncs off the live grids), `inter_pred_idc`, the
+  §8.3.5-resolved SMVD gate (`RefIdxSymLX` substituted for the
+  per-list `ref_idx_lX` under `sym_mvd_flag`), the spec-ordered
+  L0 / L1 blocks (per-CP `mvd_coding`, `mvp_lX_flag`, the
+  `ph_mvd_l1_zero_flag` arm), the AMVR cascade, `bcw_idx` (§8.3.6
+  `NoBackwardPredFlag` cMax), and the trailing `cu_coded_flag` +
+  MODE_INTER `transform_unit()` — driving translational P/B AMVP CUs
+  to pixels; an affine non-merge CU parses and surfaces a precise
+  `Error::Unsupported` at reconstruction. r409 conformance fixes in
+  the same area: the composite non-merge dispatchers emitted/read the
+  per-list elements in a spec-divergent interleave (bi-pred B-slice
+  desync — both sides now walk the L0 block fully first), the
+  inter-slice `cu_skip_flag` ctxInc sampled a stale motion field
+  instead of the parse-time `CuSkipFlag` grid, and the regular
+  §8.5.2.16 HMVP list now resets per CTU row (`NumHmvpCand = 0`,
+  §7.3.11.1) alongside the IBC resets.
 * **Dependent quantization + sign data hiding** (r387) — the §7.4.12.11
   eq. 198 `QStateTransTable` trellis runs through every regular
   `residual_coding()` read (pass-1 `AbsLevelPass1 & 1` / pass-3
