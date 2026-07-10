@@ -511,6 +511,36 @@ pub struct CuToolFlags {
     /// (P-slices never enter GPM); the round-21..30 paths only ever
     /// consulted `slice_is_inter`.
     pub slice_is_b: bool,
+    /// `sps_affine_enabled_flag` — outer gate for the non-merge
+    /// `inter_affine_flag` parse (§7.3.11.5, r409 walker wire-up).
+    pub affine_enabled: bool,
+    /// `sps_6param_affine_enabled_flag` — inner gate for
+    /// `cu_affine_type_flag`.
+    pub sixparam_affine_enabled: bool,
+    /// `sps_affine_amvr_enabled_flag` — the affine arm of the
+    /// §7.3.11.5 AMVR cascade.
+    pub affine_amvr_enabled: bool,
+    /// Resolved §7.3.11.5 SMVD gate: `sps_smvd_enabled_flag &&
+    /// !ph_mvd_l1_zero_flag && RefIdxSymL0 > −1 && RefIdxSymL1 > −1`
+    /// (the §8.3.5 derivation runs once per slice in the walker).
+    pub sym_mvd_gate_open: bool,
+    /// `RefIdxSymL0` (§8.3.5) — substituted for `ref_idx_l0` when
+    /// `sym_mvd_flag == 1` per §7.4.12.7. `-1` when unavailable.
+    pub ref_idx_sym_l0: i32,
+    /// `RefIdxSymL1` (§8.3.5) — L1 mirror.
+    pub ref_idx_sym_l1: i32,
+    /// `ph_mvd_l1_zero_flag` — §7.3.11.5 codes no L1-MVD bins on a
+    /// PRED_BI CU when set (every MvdL1 component reads 0).
+    pub mvd_l1_zero: bool,
+    /// `NumRefIdxActive[0]` — `ref_idx_l0` cMax + presence gate.
+    pub num_ref_idx_active_l0: u32,
+    /// `NumRefIdxActive[1]` — `ref_idx_l1` cMax + presence gate.
+    pub num_ref_idx_active_l1: u32,
+    /// `sps_bcw_enabled_flag` — §7.3.11.5 `bcw_idx` gate.
+    pub bcw_enabled: bool,
+    /// `NoBackwardPredFlag` (§8.3.6) — selects the `bcw_idx` cMax
+    /// (4 when set, 2 otherwise).
+    pub no_backward_pred: bool,
     /// `MaxNumSubblockMergeCand` derived per §7.4.3.4 eq. 85 from
     /// `sps_affine_enabled_flag`, `sps_five_minus_max_num_subblock_merge_cand`,
     /// `sps_sbtmvp_enabled_flag` and `ph_temporal_mvp_enabled_flag`
@@ -2114,12 +2144,113 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         info.inter.general_merge_flag = general_merge_flag;
 
         if !general_merge_flag {
-            // Non-merge inter CU — needs mvd_coding() + ref_idx + amvr.
-            // Out of scope for round-21 (covered by r22+).
-            return Err(Error::unsupported(
-                "h266 leaf CU inter: non-merge inter CUs (mvd_coding) not supported in round-21 \
-                 (only cu_skip / regular-merge are wired)",
-            ));
+            // ---- r409 — the §7.3.11.5 non-merge inter cascade -----------
+            //
+            // Composed from the crate's reader-side dispatchers:
+            // affine pair → inter_pred_idc → sym_mvd_flag → the L0
+            // block (ref_idx_l0 / per-CP mvd_coding / mvp_l0_flag) →
+            // the L1 block → the §7.3.11.5 AMVR cascade → bcw_idx.
+            let affine_gate = NonMergeInterAffineGate {
+                sps_affine_enabled: self.tools.affine_enabled,
+                sps_6param_affine_enabled: self.tools.sixparam_affine_enabled,
+                cb_width: info.cb_width,
+                cb_height: info.cb_height,
+                left_merge_subblock: neigh.left_merge_subblock,
+                left_inter_affine: neigh.left_inter_affine,
+                left_available: neigh.left_available,
+                above_merge_subblock: neigh.above_merge_subblock,
+                above_inter_affine: neigh.above_inter_affine,
+                above_available: neigh.above_available,
+            };
+            let mvp_gate = crate::non_merge_mvp_syntax_enc::NonMergeMvpSyntaxGate {
+                cb_width: info.cb_width,
+                cb_height: info.cb_height,
+                b_slice: self.tools.slice_is_b,
+                sym_mvd_gate_open: self.tools.sym_mvd_gate_open,
+                num_ref_idx_active_l0: self.tools.num_ref_idx_active_l0,
+                num_ref_idx_active_l1: self.tools.num_ref_idx_active_l1,
+                mvd_l1_zero: self.tools.mvd_l1_zero,
+            };
+            let d =
+                crate::non_merge_inter_pre_residual_dec::read_non_merge_inter_pre_residual_affine(
+                    self,
+                    &affine_gate,
+                    &mvp_gate,
+                )?;
+            // §7.3.11.5 AMVR cascade — the gate's MVD-non-zero inputs
+            // come from the just-parsed MVDs.
+            let num_cp = d.num_cp_mv();
+            let any_cp_nonzero = (0..num_cp).any(|i| {
+                d.mvd_cp_l0[i].x != 0
+                    || d.mvd_cp_l0[i].y != 0
+                    || d.mvd_cp_l1[i].x != 0
+                    || d.mvd_cp_l1[i].y != 0
+            });
+            let is_affine = d.affine.inter_affine_flag;
+            let amvr_gate = AmvrGate {
+                sps_amvr_enabled: self.tools.amvr_enabled,
+                sps_affine_amvr_enabled: self.tools.affine_amvr_enabled,
+                inter_affine_flag: is_affine,
+                any_mvd_l0_l1_nonzero: !is_affine && any_cp_nonzero,
+                any_mvd_cp_l0_l1_nonzero: is_affine && any_cp_nonzero,
+            };
+            let (_amvr_flag, _amvr_precision_idx, amvr_shift) =
+                self.read_amvr_inter_gated(&amvr_gate)?;
+            // §7.3.11.5 bcw_idx — the walker profile carries no
+            // pred_weight_table() (explicit weighted prediction is
+            // rejected upstream), so the four per-refIdx weight flags
+            // are 0.
+            let bcw_gate = BcwIdxGate {
+                sps_bcw_enabled: self.tools.bcw_enabled,
+                inter_pred_idc: Some(d.mvp.inter_pred_idc),
+                luma_weight_l0_flag: false,
+                luma_weight_l1_flag: false,
+                chroma_weight_l0_flag: false,
+                chroma_weight_l1_flag: false,
+                cb_width: info.cb_width,
+                cb_height: info.cb_height,
+                no_backward_pred_flag: self.tools.no_backward_pred,
+            };
+            let bcw_idx = self.read_bcw_idx_gated(bcw_gate)?;
+            // §7.4.12.7 — under sym_mvd_flag the per-list reference
+            // indices are the §8.3.5 RefIdxSymLX.
+            let (ref_idx_l0, ref_idx_l1) = if d.mvp.sym_mvd_flag {
+                (self.tools.ref_idx_sym_l0, self.tools.ref_idx_sym_l1)
+            } else {
+                (d.mvp.ref_idx_l0 as i32, d.mvp.ref_idx_l1 as i32)
+            };
+            info.inter.non_merge = crate::inter::NonMergeInterData {
+                pred_dir: d.mvp.inter_pred_idc,
+                ref_idx_l0,
+                ref_idx_l1,
+                mvp_l0_flag: d.mvp.mvp_l0_flag,
+                mvp_l1_flag: d.mvp.mvp_l1_flag,
+                mvd_l0: d.mvd_cp_l0[0],
+                mvd_l1: d.mvd_cp_l1[0],
+                amvr_shift,
+                bcw_idx: bcw_idx as u8,
+                inter_affine_flag: is_affine,
+                cu_affine_type_flag: d.affine.cu_affine_type_flag,
+                mvd_cp1_l0: d.mvd_cp_l0[1],
+                mvd_cp2_l0: d.mvd_cp_l0[2],
+                mvd_cp1_l1: d.mvd_cp_l1[1],
+                mvd_cp2_l1: d.mvd_cp_l1[2],
+            };
+            // ---- Residual (§7.3.11.5 tail) — general_merge == 0 → the
+            // cu_coded_flag bin is present.
+            info.tu_y_coded_flag = false;
+            info.tu_cb_coded_flag = false;
+            info.tu_cr_coded_flag = false;
+            let n = self.ctxs.cu_coded_flag.len() - 1;
+            let slot = (self.ctxs.init_type as usize).min(n);
+            let cu_coded = self
+                .dec
+                .decode_decision(&mut self.ctxs.cu_coded_flag[slot])?
+                == 1;
+            if cu_coded {
+                self.decode_inter_transform_unit(info, residual)?;
+            }
+            return Ok(());
         }
 
         // ---- merge_data() (§7.3.11.7) -----------------------------------
@@ -4720,6 +4851,7 @@ mod tests {
             explicit_mts_intra_enabled: false,
             explicit_mts_inter_enabled: false,
             rc_opts: RcOpts::default(),
+            ..CuToolFlags::default()
         };
         let data = [0u8; 128];
         let mut dec = ArithDecoder::new(&data).unwrap();
@@ -8686,5 +8818,171 @@ mod tests {
         assert!(info.inter.cu_skip_flag);
         assert!(info.inter.general_merge_flag);
         assert!(!info.tu_cb_coded_flag && !info.tu_cr_coded_flag);
+    }
+
+    // ==== Round-409: §7.3.11.5 non-merge inter cascade in decode() ====
+
+    /// P-slice non-merge (AMVP) CU end-to-end through
+    /// `LeafCuReader::decode`: cu_skip(0) → pred_mode_flag(0) →
+    /// general_merge_flag(0) → [affine gates closed, PRED_L0
+    /// inferred, SMVD closed] → ref_idx_l0 → mvd_coding →
+    /// mvp_l0_flag → [AMVR gate open on the non-zero MVD] →
+    /// amvr_flag(0) → [BCW closed] → cu_coded_flag(0).
+    #[test]
+    fn p_slice_non_merge_amvp_cu_decodes_through_walker_path() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_pred_mode_flag,
+        };
+        use crate::mvd_coding_enc::encode_mvd_coding;
+        use crate::non_merge_mvp_syntax_enc::{encode_mvp_lx_flag, encode_ref_idx_lx};
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let init_off = (init_type as usize) * 3;
+        let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+            .unwrap();
+        let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        enc.encode_decision(
+            &mut ctxs.pred_mode_flag[(init_type as usize - 1) * 2 + inc],
+            0,
+        )
+        .unwrap();
+        let inc = ctx_inc_general_merge_flag() as usize;
+        let n = ctxs.general_merge_flag.len() - 1;
+        enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
+            .unwrap();
+        // ---- L0 block, spec order (NumRefIdxActive[0] = 2) ----
+        encode_ref_idx_lx(&mut enc, &mut ctxs, 1, 2).unwrap();
+        encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 3, y: -1 }).unwrap();
+        encode_mvp_lx_flag(&mut enc, &mut ctxs, 1).unwrap();
+        // ---- AMVR: sps_amvr on + non-zero MVD → amvr_flag(0) ----
+        enc.encode_decision(&mut ctxs.amvr_flag[0], 0).unwrap();
+        // ---- cu_coded_flag(0) ----
+        let n = ctxs.cu_coded_flag.len() - 1;
+        enc.encode_decision(&mut ctxs.cu_coded_flag[(init_type as usize).min(n)], 0)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let tools = CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
+            slice_is_inter: true,
+            max_num_merge_cand: 6,
+            amvr_enabled: true,
+            num_ref_idx_active_l0: 2,
+            num_ref_idx_active_l1: 0,
+            ..CuToolFlags::default()
+        };
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("P-slice AMVP CU must decode through the walker path");
+        assert_eq!(info.pred_mode, CuPredMode::Inter);
+        assert!(!info.inter.general_merge_flag);
+        let nm = &info.inter.non_merge;
+        assert_eq!(nm.pred_dir, InterPredDir::PredL0);
+        assert_eq!(nm.ref_idx_l0, 1);
+        assert_eq!(nm.mvd_l0, MotionVector { x: 3, y: -1 });
+        assert_eq!(nm.mvp_l0_flag, 1);
+        assert_eq!(nm.amvr_shift, crate::amvr::AmvrShift(2));
+        assert!(!nm.inter_affine_flag);
+        assert!(!info.tu_y_coded_flag);
+    }
+
+    /// B-slice bi-predicted non-merge CU through `decode()` with the
+    /// spec L0-block-first element order and ph_mvd_l1_zero = 0.
+    #[test]
+    fn b_slice_non_merge_bi_pred_cu_decodes_through_walker_path() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_pred_mode_flag,
+        };
+        use crate::mvd_coding_enc::encode_mvd_coding;
+        use crate::non_merge_mvp_syntax_enc::{encode_inter_pred_idc, encode_mvp_lx_flag};
+        let slice_qp = 26;
+        let init_type = 2u8;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let init_off = (init_type as usize) * 3;
+        let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+            .unwrap();
+        let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        enc.encode_decision(
+            &mut ctxs.pred_mode_flag[(init_type as usize - 1) * 2 + inc],
+            0,
+        )
+        .unwrap();
+        let inc = ctx_inc_general_merge_flag() as usize;
+        let n = ctxs.general_merge_flag.len() - 1;
+        enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
+            .unwrap();
+        encode_inter_pred_idc(&mut enc, &mut ctxs, InterPredDir::PredBi, 16, 16).unwrap();
+        // L0 block (NumRefIdxActive[0] = 1 → no ref_idx bin).
+        encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -2, y: 0 }).unwrap();
+        encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+        // L1 block (NumRefIdxActive[1] = 1 → no ref_idx bin).
+        encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 5, y: 4 }).unwrap();
+        encode_mvp_lx_flag(&mut enc, &mut ctxs, 1).unwrap();
+        // AMVR off in SPS → no bins; BCW off → no bins; cu_coded(0).
+        let n = ctxs.cu_coded_flag.len() - 1;
+        enc.encode_decision(&mut ctxs.cu_coded_flag[(init_type as usize).min(n)], 0)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let tools = CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
+            slice_is_inter: true,
+            slice_is_b: true,
+            max_num_merge_cand: 6,
+            num_ref_idx_active_l0: 1,
+            num_ref_idx_active_l1: 1,
+            ..CuToolFlags::default()
+        };
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("B-slice bi-pred AMVP CU must decode through the walker path");
+        let nm = &info.inter.non_merge;
+        assert_eq!(nm.pred_dir, InterPredDir::PredBi);
+        assert_eq!(nm.mvd_l0, MotionVector { x: -2, y: 0 });
+        assert_eq!(nm.mvd_l1, MotionVector { x: 5, y: 4 });
+        assert_eq!(nm.mvp_l0_flag, 0);
+        assert_eq!(nm.mvp_l1_flag, 1);
+        assert_eq!(nm.bcw_idx, 0);
     }
 }

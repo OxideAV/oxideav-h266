@@ -831,6 +831,11 @@ pub struct CtuWalker<'a, 'b> {
     /// `RefPicList[1][col_ref_idx]`. Defaults to `true` per spec
     /// inference.
     collocated_from_l0: bool,
+    /// r409 §7.3.11.5 — `ph_mvd_l1_zero_flag`. When `true` a PRED_BI
+    /// non-merge CU codes no L1-MVD bins (MvdL1 = 0), and the §8.3.5
+    /// SMVD gate is forced closed. Callers set it from the parsed
+    /// picture header via [`Self::set_ph_mvd_l1_zero`].
+    ph_mvd_l1_zero: bool,
     /// Round-27 §8.5.2.7 — `ph_mmvd_fullpel_only_flag`. When `true`
     /// (and `sps_mmvd_enabled_flag` is also true), the MMVD distance
     /// table swaps from `MMVD_DISTANCE_TABLE` to
@@ -1165,6 +1170,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ph_temporal_mvp_enabled: false,
             col_ref_idx: 0,
             collocated_from_l0: true,
+            ph_mvd_l1_zero: false,
             ph_mmvd_fullpel_only: false,
             ph_bdof_disabled: true,
             ph_dmvr_disabled: true,
@@ -1743,6 +1749,59 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.ph_mmvd_fullpel_only = enabled;
     }
 
+    /// r409 — `ph_mvd_l1_zero_flag` from the picture header
+    /// (§7.3.11.5 L1-MVD suppression + §8.3.5 SMVD gate input).
+    pub fn set_ph_mvd_l1_zero(&mut self, enabled: bool) {
+        self.ph_mvd_l1_zero = enabled;
+    }
+
+    /// §8.3.5 — RefIdxSymL0 / RefIdxSymL1 for symmetric MVDs. Every
+    /// [`ReferencePicture`] this walker holds is short-term (the DPB
+    /// glue carries no long-term marking), so the short-term-only
+    /// conditions collapse to the POC comparisons. Runs over the
+    /// active lists with `DiffPicOrderCnt(curr, ref) = currPoc −
+    /// refPoc`.
+    fn derive_ref_idx_sym(&self) -> (i32, i32) {
+        let curr = self.current_poc;
+        // Forward pass: L0 wants the nearest ref with POC < curr,
+        // L1 the nearest with POC > curr.
+        let nearest = |list: &[ReferencePicture], before: bool| -> i32 {
+            let mut best = -1i32;
+            let mut best_diff = 0i64;
+            for (i, r) in list.iter().enumerate() {
+                let diff = i64::from(curr) - i64::from(r.poc);
+                let ok = if before { diff > 0 } else { diff < 0 };
+                if !ok {
+                    continue;
+                }
+                let closer = if before {
+                    best == -1 || diff < best_diff
+                } else {
+                    best == -1 || diff > best_diff
+                };
+                if closer {
+                    best = i as i32;
+                    best_diff = diff;
+                }
+            }
+            best
+        };
+        let l0 = nearest(&self.ref_pic_list_l0, true);
+        let l1 = nearest(&self.ref_pic_list_l1, false);
+        if l0 >= 0 && l1 >= 0 {
+            return (l0, l1);
+        }
+        // §8.3.5 fallback — the reversed arrangement (L0 after, L1
+        // before the current picture).
+        let l0 = nearest(&self.ref_pic_list_l0, false);
+        let l1 = nearest(&self.ref_pic_list_l1, true);
+        if l0 >= 0 && l1 >= 0 {
+            (l0, l1)
+        } else {
+            (-1, -1)
+        }
+    }
+
     /// Round-31 §8.5.5.1 / §8.5.6.5 — install the picture-header
     /// `ph_bdof_disabled_flag`. Takes effect for subsequent leaf-CU
     /// inter dispatches: when this flag is `false` AND the SPS-level
@@ -2088,6 +2147,35 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mts_enabled: tf.mts_enabled_flag,
             explicit_mts_intra_enabled: tf.explicit_mts_intra_enabled_flag,
             explicit_mts_inter_enabled: tf.explicit_mts_inter_enabled_flag,
+            // r409 — the §7.3.11.5 non-merge inter cascade inputs.
+            affine_enabled: tf.affine_enabled_flag,
+            sixparam_affine_enabled: tf.six_param_affine_enabled_flag,
+            affine_amvr_enabled: tf.affine_amvr_enabled_flag,
+            sym_mvd_gate_open: {
+                // §8.3.5 runs once per slice; the gate folds
+                // sps_smvd_enabled_flag && !ph_mvd_l1_zero_flag &&
+                // RefIdxSymL0 > −1 && RefIdxSymL1 > −1 (B-slice only).
+                let (s0, s1) = self.derive_ref_idx_sym();
+                tf.smvd_enabled_flag
+                    && !self.ph_mvd_l1_zero
+                    && self.sh.sh_slice_type == SliceType::B
+                    && s0 >= 0
+                    && s1 >= 0
+            },
+            ref_idx_sym_l0: self.derive_ref_idx_sym().0,
+            ref_idx_sym_l1: self.derive_ref_idx_sym().1,
+            mvd_l1_zero: self.ph_mvd_l1_zero,
+            // NumRefIdxActive — the walker's single-slice profile
+            // resolves the active lists through set_ref_pic_list_lX
+            // (pps_rpl_info_in_ph_flag = 1; no per-slice override).
+            num_ref_idx_active_l0: self.ref_pic_list_l0.len() as u32,
+            num_ref_idx_active_l1: if self.sh.sh_slice_type == SliceType::B {
+                self.ref_pic_list_l1.len() as u32
+            } else {
+                0
+            },
+            bcw_enabled: tf.bcw_enabled_flag,
+            no_backward_pred: self.no_backward_pred_flag(),
             rc_opts: self.rc_opts(),
         }
     }
@@ -2187,13 +2275,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     fn commit_subblock_neighbour_state(&mut self, cu: &CtuCu, info: &LeafCuInfo) {
         let merge_sb = info.inter.merge_data.merge_subblock_flag;
         self.write_subblock_merge_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, merge_sb);
-        // The non-merge affine inter path is not yet parsed by the
-        // CTU walker — `info.inter` carries no `inter_affine_flag`
-        // field today. Every leaf CU clears its 4x4 cells to `false`
-        // so any pre-existing stale state from a prior slice's
-        // overlapping picture region is wiped. When the affine
-        // walker lands, swap the `false` below for the parsed flag.
-        self.write_inter_affine_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
+        // r409 — the non-merge affine cascade is parsed; broadcast
+        // the per-CB `InterAffineFlag` so the §9.3.4.2.2 Table 133
+        // merge-side ctxIncs see it (false for every other CU kind,
+        // wiping stale state).
+        self.write_inter_affine_block(
+            cu.cu.x,
+            cu.cu.y,
+            cu.cu.w,
+            cu.cu.h,
+            !info.inter.general_merge_flag && info.inter.non_merge.inter_affine_flag,
+        );
         // Round-406/409 — parse-time CuPredMode + CuSkipFlag broadcast
         // so the next CU's §9.3.4.2.2 pred_mode_flag /
         // pred_mode_ibc_flag / cu_skip_flag ctxIncs see this CU in
@@ -3333,6 +3425,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // (`general_merge_flag == 1`) fall through to the merge-list
         // build below.
         if !info.inter.general_merge_flag {
+            if info.inter.non_merge.inter_affine_flag {
+                // r409 — the walker parses the affine non-merge
+                // cascade (per-CP MVDs live in info.inter.non_merge)
+                // but the decode_picture_into reconstruction hookup
+                // (per-sub-block motion-field write + residual tail
+                // around reconstruct_leaf_cu_inter_affine_amvp) is a
+                // follow-up; refuse precisely rather than reconstruct
+                // a translational approximation.
+                return Err(Error::unsupported(
+                    "h266 CTU walker: affine non-merge (AMVP) reconstruction inside \
+                     decode_picture_into is not wired yet (the affine cascade parses; \
+                     reconstruct_leaf_cu_inter_affine_amvp covers the standalone path)",
+                ));
+            }
             return self.reconstruct_leaf_cu_inter_amvp(cu, info, residual, out);
         }
         let max_merge = self.cu_tool_flags().max_num_merge_cand;

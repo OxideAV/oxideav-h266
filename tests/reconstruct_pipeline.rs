@@ -4059,3 +4059,217 @@ fn decode_dual_tree_ibc_luma_cu_copies_previous_ctu() {
         assert_eq!(*v, 128, "Cr must be flat 128 (chroma tree PLANAR), idx {i}");
     }
 }
+
+/// Round-409 — the §7.3.11.5 non-merge (AMVP) cascade is live in the
+/// full-CABAC walker: a P-slice CU with `general_merge_flag = 0`
+/// parses ref_idx/mvd/mvp/amvr/bcw through `decode_picture_into` and
+/// reconstructs via the §8.5.2.1 AMVP path. With no spatial/HMVP/temporal
+/// candidates the §8.5.2.8-10 list zero-pads, so the final MV is
+/// `0 + (MvdL0 << AmvrShift)` = a pure integer-pel translation of the
+/// reference that the output must reproduce sample-exactly.
+#[test]
+fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_pred_mode_flag,
+        ctx_inc_split_cu_flag,
+    };
+    use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::leaf_cu::LeafCuCtxs;
+    use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
+    use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+    let init_type = 1u8;
+
+    // Horizontal-gradient reference so the 4-px shift is observable.
+    let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x * 5) as u8;
+        }
+    }
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+        motion_field: None,
+    };
+
+    let mut enc = ArithEncoder::new();
+    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+    let init_off = (init_type as usize) * 3;
+
+    // split_cu_flag(0) — one 16x16 CU.
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_ctxs.len() - 1);
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    // cu_skip_flag(0), pred_mode_flag(0), general_merge_flag(0).
+    let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+        .unwrap();
+    let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+    enc.encode_decision(
+        &mut ctxs.pred_mode_flag[(init_type as usize - 1) * 2 + inc],
+        0,
+    )
+    .unwrap();
+    let inc = ctx_inc_general_merge_flag() as usize;
+    let n = ctxs.general_merge_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
+        .unwrap();
+    // L0 block: NumRefIdxActive[0] = 1 → no ref_idx bin; MvdL0 =
+    // (16, 0) quarter-luma = a 4-px right... (AmvrShift 2: 16 << 2 =
+    // 64 sixteenth-luma = 4 px); mvp_l0_flag(0) (zero-pad predictor).
+    encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 16, y: 0 }).unwrap();
+    encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+    // AMVR off in SPS → no bins. BCW off. cu_coded_flag(0).
+    let n = ctxs.cu_coded_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.cu_coded_flag[(init_type as usize).min(n)], 0)
+        .unwrap();
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // Expected: integer 4-px right shift = MC with mv (64, 0) in
+    // 1/16-luma units (edge-clamped on the right).
+    let mut expected = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    oxideav_h266::inter::predict_luma_block(
+        &mut expected.luma,
+        0,
+        0,
+        16,
+        16,
+        &ref_buf.luma,
+        MotionVector { x: 64, y: 0 },
+    )
+    .unwrap();
+    assert_eq!(
+        out.luma.samples, expected.luma.samples,
+        "AMVP CU must reconstruct the 4-px-shifted reference"
+    );
+
+    // The motion field must carry the folded MV and the AMVP CU must
+    // land in the HMVP table.
+    let mf = walker.motion_field();
+    let cell = mf.get_at_luma(8, 8);
+    assert!(cell.available && cell.pred_flag_l0 && !cell.pred_flag_l1);
+    assert_eq!(cell.mv_l0, MotionVector { x: 64, y: 0 });
+    assert_eq!(walker.hmvp_table().len(), 1);
+}
+
+/// Round-409 — B-slice bi-predicted non-merge CU end-to-end: PRED_BI
+/// with zero MVDs over two constant references must reconstruct the
+/// §8.5.6.6.2 eq. 980 default-weighted average `(L0 + L1 + 1) >> 1`.
+/// Exercises the spec L0-block-first element order and the walker's
+/// per-slice NumRefIdxActive / NoBackwardPredFlag / SMVD-gate inputs.
+#[test]
+fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_pred_mode_flag,
+        ctx_inc_split_cu_flag,
+    };
+    use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::leaf_cu::{InterPredDir, LeafCuCtxs};
+    use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
+    use oxideav_h266::non_merge_mvp_syntax_enc::{encode_inter_pred_idc, encode_mvp_lx_flag};
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+    let init_type = 2u8;
+
+    let ref_a = ReferencePicture {
+        poc: 0,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+        motion_field: None,
+    };
+    let ref_b = ReferencePicture {
+        poc: 2,
+        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 81),
+        motion_field: None,
+    };
+
+    let mut enc = ArithEncoder::new();
+    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+    let init_off = (init_type as usize) * 3;
+
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_ctxs.len() - 1);
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+        .unwrap();
+    let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+    enc.encode_decision(
+        &mut ctxs.pred_mode_flag[(init_type as usize - 1) * 2 + inc],
+        0,
+    )
+    .unwrap();
+    let inc = ctx_inc_general_merge_flag() as usize;
+    let n = ctxs.general_merge_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
+        .unwrap();
+    // inter_pred_idc = PRED_BI (two-bin form at 16+16 > 12).
+    encode_inter_pred_idc(&mut enc, &mut ctxs, InterPredDir::PredBi, 16, 16).unwrap();
+    // L0 block: no ref_idx bin (1 active), zero MVD, mvp_l0(0).
+    encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 0, y: 0 }).unwrap();
+    encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+    // L1 block: no ref_idx bin, zero MVD, mvp_l1(0).
+    encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 0, y: 0 }).unwrap();
+    encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+    // AMVR: all MVDs zero → gate closed. BCW: sps off. cu_coded(0).
+    let n = ctxs.cu_coded_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.cu_coded_flag[(init_type as usize).min(n)], 0)
+        .unwrap();
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::B,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_a]);
+    walker.set_ref_pic_list_l1(vec![ref_b]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    // (40 + 81 + 1) >> 1 = 61 on every luma sample.
+    assert!(
+        out.luma.samples.iter().all(|&v| v == 61),
+        "bi-pred default-weighted average must be (40 + 81 + 1) >> 1 = 61"
+    );
+
+    let mf = walker.motion_field();
+    let cell = mf.get_at_luma(8, 8);
+    assert!(cell.available && cell.pred_flag_l0 && cell.pred_flag_l1);
+    assert_eq!(cell.mv_l0, MotionVector { x: 0, y: 0 });
+    assert_eq!(cell.mv_l1, MotionVector { x: 0, y: 0 });
+}

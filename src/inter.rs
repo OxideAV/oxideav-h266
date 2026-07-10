@@ -1460,6 +1460,23 @@ pub struct NonMergeInterData {
     /// Inferred 0 when the §7.3.10.5 gate doesn't signal it (uni-pred,
     /// small CU, weighted-pred active, etc.).
     pub bcw_idx: u8,
+    /// r409 — `inter_affine_flag[x0][y0]` parsed on the non-merge
+    /// cascade. When set, [`Self::mvd_l0`] / [`Self::mvd_l1`] carry
+    /// `MvdCpLX[0]` and the `mvd_cp*` fields the higher control
+    /// points. The full-CABAC walker currently reconstructs the
+    /// translational path only; an affine non-merge CU surfaces a
+    /// precise `Error::Unsupported` at reconstruction.
+    pub inter_affine_flag: bool,
+    /// r409 — `cu_affine_type_flag[x0][y0]` (6-param when set).
+    pub cu_affine_type_flag: bool,
+    /// r409 — `MvdCpL0[1]` (raw parsed, pre-AMVR).
+    pub mvd_cp1_l0: MotionVector,
+    /// r409 — `MvdCpL0[2]`.
+    pub mvd_cp2_l0: MotionVector,
+    /// r409 — `MvdCpL1[1]`.
+    pub mvd_cp1_l1: MotionVector,
+    /// r409 — `MvdCpL1[2]`.
+    pub mvd_cp2_l1: MotionVector,
 }
 
 impl Default for NonMergeInterData {
@@ -1475,6 +1492,12 @@ impl Default for NonMergeInterData {
             // §7.4.11.6 Table 16 default — 1/4-luma resolution.
             amvr_shift: crate::amvr::AmvrShift(2),
             bcw_idx: 0,
+            inter_affine_flag: false,
+            cu_affine_type_flag: false,
+            mvd_cp1_l0: MotionVector::ZERO,
+            mvd_cp2_l0: MotionVector::ZERO,
+            mvd_cp1_l1: MotionVector::ZERO,
+            mvd_cp2_l1: MotionVector::ZERO,
         }
     }
 }
