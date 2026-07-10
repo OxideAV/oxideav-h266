@@ -2060,7 +2060,9 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
 ///   no parse, the inference rules pick 1 since CIIP is the only
 ///   non-regular branch open). No CABAC bin consumed.
 /// * `merge_idx = 0`               — TR(cMax = 5), bin 0 ctx-coded = 0.
-/// * `cu_coded_flag = 0`           — no transform_tree() body.
+/// * `transform_unit()`            — no `cu_coded_flag` bin on a merge
+///   CU (§7.4.12.5 inference = 1 for non-skip): tu_cb(0), tu_cr(1),
+///   tu_y(0), then a single-DC 4×4 Cr TB (luma plane untouched).
 ///
 /// Reference picture: a per-pixel ramp with each sample distinct so the
 /// CIIP combination is observable. Zero MV pad → predSamplesInter =
@@ -2092,6 +2094,11 @@ fn decode_p_slice_ciip_fires_and_decodes() {
         ctx_inc_split_cu_flag,
     };
     use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::residual::ResidualCtxs;
+    use oxideav_h266::residual_enc::{
+        encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+        write_tu_y_coded_flag,
+    };
     use oxideav_h266::tables::{init_contexts, SyntaxCtx};
 
     let pic_w = 8u32;
@@ -2120,7 +2127,6 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
     let mut regular_merge_ctxs = init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
-    let mut cu_coded_ctxs = init_contexts(SyntaxCtx::CuCodedFlag, slice_qp);
 
     let mut enc = ArithEncoder::new();
 
@@ -2165,10 +2171,20 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     enc.encode_decision(&mut merge_idx_ctxs[mi_slot], 0)
         .unwrap();
 
-    // 7. cu_coded_flag = 0 — no transform_tree(). Single ctx bin,
-    //    ctxInc = 0 per Table 132; ctxIdx = init_type per Table 92.
-    let cc_slot = (init_type as usize).min(cu_coded_ctxs.len() - 1);
-    enc.encode_decision(&mut cu_coded_ctxs[cc_slot], 0).unwrap();
+    // 7. transform_unit() — §7.3.11.5 puts no cu_coded_flag bin on a
+    //    merge CU; the §7.4.12.5 inference reads 1 for this non-skip
+    //    CU, so the MODE_INTER transform_unit() follows directly.
+    //    Emit tu_cb_coded(0), tu_cr_coded(1) (so the luma CBF is
+    //    parsed rather than inferred), tu_y_coded(0), then a
+    //    single-DC 4×4 Cr residual TB — the asserted luma plane stays
+    //    untouched by the residual.
+    let mut res_ctxs = ResidualCtxs::init(slice_qp);
+    write_tu_cb_coded_flag(&mut enc, &mut res_ctxs, false, false).unwrap();
+    write_tu_cr_coded_flag(&mut enc, &mut res_ctxs, true, false, false).unwrap();
+    write_tu_y_coded_flag(&mut enc, &mut res_ctxs, false, false, false, false).unwrap();
+    let mut cr_levels = vec![0i32; 4 * 4];
+    cr_levels[0] = 1;
+    encode_tb_coefficients(&mut enc, &mut res_ctxs, 4, 4, 2, &cr_levels).unwrap();
 
     enc.encode_terminate(1).unwrap();
     let payload = enc.finish();
@@ -2431,6 +2447,11 @@ fn decode_b_slice_gpm_fires_and_decodes() {
         ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_regular_merge_flag,
         ctx_inc_split_cu_flag,
     };
+    use oxideav_h266::residual::ResidualCtxs;
+    use oxideav_h266::residual_enc::{
+        encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+        write_tu_y_coded_flag,
+    };
     use oxideav_h266::tables::{init_contexts, SyntaxCtx};
 
     let pic_w = 16u32;
@@ -2458,7 +2479,6 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
     let mut regular_merge_ctxs = init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
-    let mut cu_coded_ctxs = init_contexts(SyntaxCtx::CuCodedFlag, slice_qp);
 
     let mut enc = ArithEncoder::new();
 
@@ -2505,9 +2525,19 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     enc.encode_decision(&mut merge_idx_ctxs[mi_slot], 0)
         .unwrap();
 
-    // 8. cu_coded_flag = 0 — no transform_tree(). Single ctx bin.
-    let cc_slot = (init_type as usize).min(cu_coded_ctxs.len() - 1);
-    enc.encode_decision(&mut cu_coded_ctxs[cc_slot], 0).unwrap();
+    // 8. transform_unit() — §7.3.11.5 puts no cu_coded_flag bin on a
+    //    merge CU; the §7.4.12.5 inference reads 1 for this non-skip
+    //    CU. Emit tu_cb_coded(0), tu_cr_coded(1) (so the luma CBF is
+    //    parsed rather than inferred), tu_y_coded(0), then a
+    //    single-DC 8×8 Cr residual TB — the asserted luma plane stays
+    //    untouched by the residual.
+    let mut res_ctxs = ResidualCtxs::init(slice_qp);
+    write_tu_cb_coded_flag(&mut enc, &mut res_ctxs, false, false).unwrap();
+    write_tu_cr_coded_flag(&mut enc, &mut res_ctxs, true, false, false).unwrap();
+    write_tu_y_coded_flag(&mut enc, &mut res_ctxs, false, false, false, false).unwrap();
+    let mut cr_levels = vec![0i32; 8 * 8];
+    cr_levels[0] = 1;
+    encode_tb_coefficients(&mut enc, &mut res_ctxs, 8, 8, 2, &cr_levels).unwrap();
 
     enc.encode_terminate(1).unwrap();
     let payload = enc.finish();
@@ -2525,7 +2555,11 @@ fn decode_b_slice_gpm_fires_and_decodes() {
         ..Default::default()
     };
     let layout = CtuLayout::from_sps_pps(&sps, &pps);
-    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 1, &payload).unwrap();
+    // ph_qp_delta = 0 so SliceQpY (§7.4.8 eq. 140) is 26, matching the
+    // `slice_qp` this fixture used to initialise its CABAC contexts.
+    // (The pre-r406 fixture passed 1 here; the divergent ctx init was
+    // masked because the old bin stream ended before any residual.)
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
     walker.set_ref_pic_list_l0(vec![ref_l0]);
     walker.set_ref_pic_list_l1(vec![ref_l1]);
 
