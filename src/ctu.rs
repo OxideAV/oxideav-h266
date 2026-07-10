@@ -2494,6 +2494,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ccu.cu.h,
                 info.intra_pred_mode_y,
             );
+            // r409 — commit the parse-time CuPredMode / CuSkipFlag (+
+            // merge-side) grids in coding order so the next luma-tree
+            // CU's cu_skip_flag / pred_mode_ibc_flag ctxIncs see this
+            // CU (the dual-tree IBC prologue reads them).
+            self.commit_subblock_neighbour_state(ccu, &info);
             luma_infos.push(info);
             luma_residuals.push(residual);
         }
@@ -2502,7 +2507,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             .zip(luma_infos.iter())
             .zip(luma_residuals.iter())
         {
+            // r409 — §7.4.12.5 eq. 181 / 182 IbcVirBuf maintenance per
+            // luma-tree coding_unit (mirrors reconstruct_leaf_cu on the
+            // single-tree path), and the §8.7.5.1 eqs. 1207 – 1209 fill
+            // afterwards — luma only: dual-tree IBC predicts luma alone
+            // (§8.6.3 with cIdx 0), so the chroma half of the buffer is
+            // never read on this path.
+            if let Some(ibc) = self.ibc.as_mut() {
+                let vsize = self.layout.ctb_size_y.min(64);
+                ibc.virbuf
+                    .on_cu_start(ccu.cu.x, ccu.cu.y, ccu.cu.w, ccu.cu.h, vsize);
+            }
             self.reconstruct_leaf_cu_with_tree(ccu, info, residual, out, TreeType::DualTreeLuma)?;
+            self.ibc_store_cu(ccu, out, false);
         }
 
         // ---- DUAL_TREE_CHROMA ----------------------------------------------
@@ -2678,15 +2695,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.reconstruct_leaf_cu_with_tree(cu, info, residual, out, TreeType::SingleTree)?;
         // §8.7.5.1 eqs. 1207 – 1209 — every reconstructed sample is
         // folded into IbcVirBuf so a later IBC CU can reference it.
-        self.ibc_store_cu(cu, out);
+        self.ibc_store_cu(cu, out, true);
         Ok(())
     }
 
     /// Round-406 — copy the CU's just-reconstructed rectangle from the
     /// picture planes into `IbcVirBuf` (§8.7.5.1 eqs. 1207 – 1209).
-    /// No-op when `sps_ibc_enabled_flag == 0`.
-    fn ibc_store_cu(&mut self, cu: &CtuCu, out: &PictureBuffer) {
-        let chroma_420 = self.sps.sps_chroma_format_idc == 1;
+    /// No-op when `sps_ibc_enabled_flag == 0`. `include_chroma` is
+    /// false on the DUAL_TREE_LUMA walk (r409): dual-tree IBC predicts
+    /// luma only (§8.6.3 with cIdx 0), and the luma-tree CU's chroma
+    /// area is not reconstructed yet when the fill runs.
+    fn ibc_store_cu(&mut self, cu: &CtuCu, out: &PictureBuffer, include_chroma: bool) {
+        let chroma_420 = include_chroma && self.sps.sps_chroma_format_idc == 1;
         let Some(ibc) = self.ibc.as_mut() else {
             return;
         };
@@ -2736,7 +2756,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return self.reconstruct_leaf_cu_inter(cu, info, residual, out);
         }
         if matches!(info.pred_mode, CuPredMode::Ibc) {
-            return self.reconstruct_leaf_cu_ibc(cu, info, residual, out);
+            return self.reconstruct_leaf_cu_ibc(cu, info, residual, out, tree);
         }
 
         // MIP (§8.4.5.2.2) is wired below through [`crate::mip`]; the
@@ -3146,6 +3166,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         info: &LeafCuInfo,
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
+        tree: TreeType,
     ) -> Result<()> {
         let x_cb = cu.cu.x;
         let y_cb = cu.cu.y;
@@ -3232,8 +3253,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     out.luma.samples[idx] = v as u8;
                 }
             }
-            if self.sps.sps_chroma_format_idc == 1 {
+            if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
                 // §8.6.2.5 — chroma block vector (1/32 chroma units).
+                // On the DUAL_TREE_LUMA walk the CU has no chroma —
+                // this area's chroma CBs live in the sibling
+                // DUAL_TREE_CHROMA coding tree (§7.3.11.2, r409).
                 let bv_c = crate::ibc::derive_chroma_bv(bv, 2, 2);
                 let (cx, cy, cw, ch) = (x_cb / 2, y_cb / 2, cb_w / 2, cb_h / 2);
                 for dy in 0..ch {
@@ -13543,7 +13567,7 @@ mod tests {
             .unwrap()
             .virbuf
             .on_cu_start(0, 0, 16, 16, 32);
-        walker.ibc_store_cu(&cu0, &out);
+        walker.ibc_store_cu(&cu0, &out, true);
 
         // IBC AMVP CU at (16, 0): bv = 0 (zero pad) + (−16 << 4).
         let cu1 = ibc_ccu(16, 0, 16, 16);
@@ -13652,7 +13676,7 @@ mod tests {
             .unwrap()
             .virbuf
             .on_cu_start(0, 0, 16, 16, 32);
-        walker.ibc_store_cu(&cu0, &out);
+        walker.ibc_store_cu(&cu0, &out, true);
 
         // CU1 (16, 0) — AMVP, bv = (−16 px, 0).
         let cu1 = ibc_ccu(16, 0, 16, 16);
@@ -13713,7 +13737,7 @@ mod tests {
             .unwrap()
             .virbuf
             .on_cu_start(0, 0, 32, 32, 32);
-        walker.ibc_store_cu(&cu0, &out);
+        walker.ibc_store_cu(&cu0, &out, true);
 
         // Row reset (as decode_picture_into does at CtbAddrX == 0 of
         // the next row).

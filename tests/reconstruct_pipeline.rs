@@ -3736,3 +3736,326 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
     assert!(!mf.get_at_luma(12, 12).available, "intra CU cell");
     assert!(mf.get_at_luma(4, 4).available, "skip CU cell");
 }
+
+/// Round-409 §8.6 — end-to-end **P-slice** IBC decode through the full
+/// CABAC pipeline (the r406 I-slice work extended to inter slices).
+///
+/// 64×32 picture, CTB 32 → two CTUs. CTU0 is a skip-merge inter CU
+/// picking the zero-MV pad candidate off a ramp reference (so CTU0's
+/// reconstruction is the non-flat ramp). CTU1 is an IBC non-merge CU:
+/// `cu_skip_flag = 0` (ctxInc 1 — the left CTU0 CU is skip on the
+/// parse-time grid), `pred_mode_flag = 0`, `pred_mode_ibc_flag = 1`,
+/// `general_merge_flag = 0`, `MvdL0 = (−32, 0)` over the zero-BV pad
+/// (CTU0 is MODE_INTER, so the §6.4.4 `checkPredModeY` gate rejects
+/// A1/B1), `mvp_l0_flag = 0`, `cu_coded_flag = 0`.
+///
+/// CTU1 must be a §8.6.3 sample-exact copy of CTU0 (luma + chroma),
+/// the IBC CU's motion field must carry the eqs. 1111 – 1118
+/// bookkeeping, and the regular §8.5.2.16 HMVP table must NOT gain an
+/// entry from the IBC CU (only CTU0's inter push).
+#[test]
+fn decode_p_slice_ibc_cu_copies_inter_ctu() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_merge_idx,
+        ctx_inc_pred_mode_flag, ctx_inc_pred_mode_ibc_flag, ctx_inc_split_cu_flag,
+    };
+    use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::leaf_cu::LeafCuCtxs;
+    use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
+    use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 64u32;
+    let pic_h = 32u32;
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
+
+    // Ramp reference so the copied content is non-flat.
+    let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
+    for y in 0..pic_h as usize {
+        for x in 0..pic_w as usize {
+            ref_buf.luma.samples[y * pic_w as usize + x] = (16 + x * 2 + y) as u8;
+        }
+    }
+    for y in 0..(pic_h / 2) as usize {
+        for x in 0..(pic_w / 2) as usize {
+            ref_buf.cb.samples[y * (pic_w / 2) as usize + x] = (80 + x + y) as u8;
+            ref_buf.cr.samples[y * (pic_w / 2) as usize + x] =
+                (160u16.wrapping_add((x + 2 * y) as u16) & 0xff) as u8;
+        }
+    }
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+        motion_field: None,
+    };
+
+    let mut enc = ArithEncoder::new();
+    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+    let init_off = (init_type as usize) * 3;
+
+    // ---- CTU0: 32×32 skip-merge inter CU ------------------------------
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 32, 32, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_ctxs.len() - 1);
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 1)
+        .unwrap();
+    // pred_mode_ibc_flag(0) — skip non-4x4 → the IBC gate is open on a
+    // P slice; 0 keeps the CU MODE_INTER (skip merge).
+    let inc = ctx_inc_pred_mode_ibc_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.pred_mode_ibc_flag[init_off + inc], 0)
+        .unwrap();
+    let inc = ctx_inc_merge_idx() as usize;
+    let n = ctxs.merge_idx.len() - 1;
+    enc.encode_decision(&mut ctxs.merge_idx[(init_type as usize + inc).min(n)], 0)
+        .unwrap();
+
+    // ---- CTU1: IBC non-merge CU, bv = (−32 px, 0) ----------------------
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    // cu_skip_flag(0) — the left neighbour (CTU0's CU) is skip on the
+    // parse-time grid → ctxInc 1.
+    let inc = ctx_inc_cu_skip_flag(true, false, true, false) as usize;
+    enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+        .unwrap();
+    // pred_mode_flag(0) — MODE_INTER-side; left neighbour is not intra.
+    let inc = ctx_inc_pred_mode_flag(true, false, false, false) as usize;
+    enc.encode_decision(
+        &mut ctxs.pred_mode_flag[(init_type as usize - 1) * 2 + inc],
+        0,
+    )
+    .unwrap();
+    // pred_mode_ibc_flag(1) — left neighbour is not IBC → ctxInc 0.
+    let inc = ctx_inc_pred_mode_ibc_flag(true, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.pred_mode_ibc_flag[init_off + inc], 1)
+        .unwrap();
+    // general_merge_flag(0) → the IBC AMVP arm.
+    let inc = ctx_inc_general_merge_flag() as usize;
+    let n = ctxs.general_merge_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
+        .unwrap();
+    encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -32, y: 0 }).unwrap();
+    encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+    // (no amvr_precision_idx — sps_amvr_enabled_flag = 0)
+    // cu_coded_flag(0) — parsed on the non-merge arm.
+    let n = ctxs.cu_coded_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.cu_coded_flag[(init_type as usize).min(n)], 0)
+        .unwrap();
+
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    // ---- SPS / PPS / slice header --------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.ibc_enabled_flag = true;
+    sps.tool_flags.six_minus_max_num_ibc_merge_cand = 0; // MaxNumIbcMergeCand = 6
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    let stride = pic_w as usize;
+    // CTU0 must equal the reference (skip merge, zero MV).
+    for y in 0..32usize {
+        for x in 0..32usize {
+            assert_eq!(
+                out.luma.samples[y * stride + x],
+                ref_buf.luma.samples[y * stride + x],
+                "CTU0 luma mismatch at ({x}, {y})"
+            );
+        }
+    }
+    // CTU1 == CTU0, sample-exact (§8.6.3 copy) — luma + chroma.
+    for y in 0..32usize {
+        for x in 0..32usize {
+            assert_eq!(
+                out.luma.samples[y * stride + 32 + x],
+                out.luma.samples[y * stride + x],
+                "IBC luma copy mismatch at ({x}, {y})"
+            );
+        }
+    }
+    let cstride = out.cb.stride;
+    for y in 0..16usize {
+        for x in 0..16usize {
+            assert_eq!(
+                out.cb.samples[y * cstride + 16 + x],
+                out.cb.samples[y * cstride + x],
+                "IBC cb copy mismatch at ({x}, {y})"
+            );
+            assert_eq!(
+                out.cr.samples[y * cstride + 16 + x],
+                out.cr.samples[y * cstride + x],
+                "IBC cr copy mismatch at ({x}, {y})"
+            );
+        }
+    }
+
+    // eqs. 1111 – 1118 bookkeeping on the IBC CU.
+    let mf = walker.motion_field();
+    let cell = mf.get_at_luma(40, 8);
+    assert!(cell.available);
+    assert!(!cell.pred_flag_l0 && !cell.pred_flag_l1);
+    assert_eq!(cell.ref_idx_l0, -1);
+    assert_eq!(cell.mv_l0, MotionVector { x: -32 << 4, y: 0 });
+
+    // The regular HMVP table must hold only CTU0's inter push — an
+    // IBC CU updates HmvpIbcCandList, never HmvpCandList.
+    assert_eq!(
+        walker.hmvp_table().len(),
+        1,
+        "IBC CU must not update the regular §8.5.2.16 HMVP table"
+    );
+}
+
+/// Round-409 §8.6 — end-to-end **dual-tree** I-slice IBC decode: with
+/// `sps_qtbtt_dual_tree_intra_flag` the IBC CU sits on a
+/// DUAL_TREE_LUMA coding tree and predicts luma only; its chroma area
+/// is coded by the sibling DUAL_TREE_CHROMA intra tree.
+///
+/// 64×32 picture, CTB 32 → two CTUs, each walked as luma tree +
+/// chroma tree. CTU0: luma tree carries a PLANAR intra CU with a
+/// low-frequency luma residual (non-flat); chroma tree codes DM (=
+/// PLANAR) with zero chroma CBFs → flat 128 chroma. CTU1: luma tree
+/// carries an IBC non-merge CU (`MvdL0 = (−32, 0)` over the zero-BV
+/// pad, `cu_coded_flag = 0`) — its luma must equal CTU0's luma
+/// sample-exactly; the chroma tree again codes DM/PLANAR (flat 128).
+#[test]
+fn decode_dual_tree_ibc_luma_cu_copies_previous_ctu() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_intra_chroma_pred_mode,
+        ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag,
+        ctx_inc_pred_mode_ibc_flag, ctx_inc_split_cu_flag,
+    };
+    use oxideav_h266::inter::MotionVector;
+    use oxideav_h266::leaf_cu::LeafCuCtxs;
+    use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
+    use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
+    use oxideav_h266::residual_enc::{
+        encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+        write_tu_y_coded_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 64u32;
+    let pic_h = 32u32;
+    let slice_qp = 26;
+
+    let mut enc = ArithEncoder::new();
+    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init(slice_qp);
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 32, 32, 1, 1, 1, 1, 1) as usize;
+    let split_slot = split_inc.min(split_ctxs.len() - 1);
+
+    // ---- CTU0 luma tree: intra 32×32 with a luma residual -------------
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.cu_skip_flag[inc], 0).unwrap();
+    let inc = ctx_inc_pred_mode_ibc_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.pred_mode_ibc_flag[inc], 0)
+        .unwrap();
+    let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[inc], 1)
+        .unwrap();
+    let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[inc], 0)
+        .unwrap();
+    // Dual-tree luma transform_unit(): tu_y only (no chroma CBFs).
+    write_tu_y_coded_flag(&mut enc, &mut ctxs.residual, true, false, false, false).unwrap();
+    let mut levels = vec![0i32; 32 * 32];
+    levels[0] = 12;
+    levels[1] = -9;
+    levels[32] = 7;
+    encode_tb_coefficients(&mut enc, &mut ctxs.residual, 32, 32, 0, &levels).unwrap();
+
+    // ---- CTU0 chroma tree: DM (PLANAR), zero chroma CBFs ---------------
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
+        .unwrap();
+    write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();
+    write_tu_cr_coded_flag(&mut enc, &mut ctxs.residual, false, false, false).unwrap();
+
+    // ---- CTU1 luma tree: IBC non-merge CU, bv = (−32 px, 0) ------------
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.cu_skip_flag[inc], 0).unwrap();
+    let inc = ctx_inc_pred_mode_ibc_flag(false, false, false, false) as usize;
+    enc.encode_decision(&mut ctxs.pred_mode_ibc_flag[inc], 1)
+        .unwrap();
+    let inc = ctx_inc_general_merge_flag() as usize;
+    enc.encode_decision(&mut ctxs.general_merge_flag[inc], 0)
+        .unwrap();
+    encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -32, y: 0 }).unwrap();
+    encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+    // cu_coded_flag(0) — init_type 0 → slot 0.
+    enc.encode_decision(&mut ctxs.cu_coded_flag[0], 0).unwrap();
+
+    // ---- CTU1 chroma tree: DM (PLANAR), zero chroma CBFs ---------------
+    enc.encode_decision(&mut split_ctxs[split_slot], 0).unwrap();
+    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
+        .unwrap();
+    write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();
+    write_tu_cr_coded_flag(&mut enc, &mut ctxs.residual, false, false, false).unwrap();
+
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    // ---- SPS / PPS / slice header ---------------------------------------
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.ibc_enabled_flag = true;
+    sps.tool_flags.six_minus_max_num_ibc_merge_cand = 0;
+    sps.partition_constraints.qtbtt_dual_tree_intra_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::I,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+
+    let stride = pic_w as usize;
+    // CTU0 must be non-flat (residual visible).
+    let first = out.luma.samples[0];
+    let non_flat = (0..32usize)
+        .flat_map(|y| (0..32usize).map(move |x| (x, y)))
+        .any(|(x, y)| out.luma.samples[y * stride + x] != first);
+    assert!(non_flat, "CTU0 must carry a visible luma residual");
+
+    // CTU1 luma == CTU0 luma, sample-exact (§8.6.3 luma-only copy).
+    for y in 0..32usize {
+        for x in 0..32usize {
+            assert_eq!(
+                out.luma.samples[y * stride + 32 + x],
+                out.luma.samples[y * stride + x],
+                "dual-tree IBC luma copy mismatch at ({x}, {y})"
+            );
+        }
+    }
+    // Chroma comes from the DUAL_TREE_CHROMA intra trees: DM = PLANAR
+    // over unavailable/flat references → flat 128 on both CTUs.
+    for (i, v) in out.cb.samples.iter().enumerate() {
+        assert_eq!(*v, 128, "Cb must be flat 128 (chroma tree PLANAR), idx {i}");
+    }
+    for (i, v) in out.cr.samples.iter().enumerate() {
+        assert_eq!(*v, 128, "Cr must be flat 128 (chroma tree PLANAR), idx {i}");
+    }
+}

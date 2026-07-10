@@ -30,11 +30,8 @@
 //!
 //! Out of scope (still returns `Error::Unsupported` one layer up):
 //!
-//! * CCLM (`cclm_mode_flag` / `cclm_mode_idx`) — chroma from luma.
-//! * IBC / PLT CUs — IBC parsing + palette coding.
-//! * CBF / residual coding / transforms / inverse quantisation.
-//! * Dual-tree luma / chroma split. Chroma intra mode is derived for
-//!   `treeType == SINGLE_TREE` only.
+//! * PLT CUs — palette coding (`pred_mode_plt_flag` / palette_coding()).
+//! * ACT — `cu_act_enabled_flag` colour-space conversion.
 //!
 //! The module is intentionally "parse + derive, don't reconstruct" —
 //! [`LeafCuInfo`] captures everything a follow-up round needs to build
@@ -1384,12 +1381,12 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // infers `pred_mode_ibc_flag = 0` (no bin) and falls through
         // to the intra cascade.
         if self.tools.ibc {
-            if self.tree != TreeType::SingleTree {
-                return Err(Error::unsupported(
-                    "h266 leaf CU: IBC in a dual-tree I-slice (DUAL_TREE_LUMA coding tree) \
-                     not supported by this round — single-tree IBC only",
-                ));
-            }
+            // r409 — the prologue applies to SINGLE_TREE and
+            // DUAL_TREE_LUMA alike (§7.3.11.5 gates every element on
+            // `treeType != DUAL_TREE_CHROMA`; the chroma tree parses
+            // through [`Self::decode_dual_chroma`], never here). An
+            // IBC CU on the DUAL_TREE_LUMA walk predicts luma only —
+            // §8.6.3 runs with cIdx 0 alone.
             let size_gate = info.cb_width <= 64 && info.cb_height <= 64;
             let init_type_offset = (self.ctxs.init_type as usize) * 3;
             let cu_skip = if size_gate {
@@ -1697,11 +1694,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         cclm_enabled: bool,
     ) -> Result<()> {
         info.pred_mode = CuPredMode::Intra; // I-slice (§7.4.12.2).
-        if self.tools.ibc {
-            return Err(Error::unsupported(
-                "h266 leaf CU (dual-tree chroma): IBC not supported",
-            ));
-        }
+                                            // sps_ibc_enabled_flag needs no gate here: §7.3.11.5 keys the
+                                            // whole cu_skip / pred_mode_ibc prologue on `treeType !=
+                                            // DUAL_TREE_CHROMA`, and §7.4.12.5 infers `pred_mode_ibc_flag
+                                            // = 0` for a DUAL_TREE_CHROMA CU — the chroma tree is always
+                                            // intra (r409; the pre-r409 reader refused the whole slice).
         if self.tools.palette {
             return Err(Error::unsupported(
                 "h266 leaf CU (dual-tree chroma): palette coding not supported",
@@ -2025,23 +2022,15 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         residual: &mut LeafCuResidual,
         neigh: &CuNeighbourhood,
     ) -> Result<()> {
-        // Round-406 — the I-slice IBC prologue is live, but the P/B
-        // `coding_unit()` prologue (`pred_mode_flag` +
-        // `pred_mode_ibc_flag` between cu_skip_flag and merge_data)
-        // is not wired on this path yet; refuse rather than mis-parse.
-        if self.tools.ibc {
-            return Err(Error::unsupported(
-                "h266 leaf CU inter: IBC in P/B slices not supported by this round \
-                 (the §7.3.11.5 pred_mode_flag / pred_mode_ibc_flag inter-slice \
-                 prologue is not wired; I-slice IBC is live)",
-            ));
-        }
-        // §7.3.11.5: cu_skip_flag is signalled when the CU is not
-        // 4x4 (and treeType != DUAL_TREE_CHROMA). For 4x4 it is
-        // implicitly 0 (the IBC corner only applies when sps_ibc_enabled).
+        // §7.3.11.5 cu_skip_flag gate on a P/B slice (treeType is
+        // never DUAL_TREE_CHROMA here; modeType is always
+        // MODE_TYPE_ALL — this walker never enters a local dual tree):
+        //   (!(4x4) && modeType != MODE_TYPE_INTRA) ||
+        //   (sps_ibc_enabled_flag && cbW <= 64 && cbH <= 64)
         let cb_is_4x4 = info.cb_width == 4 && info.cb_height == 4;
+        let ibc_size_ok = self.tools.ibc && info.cb_width <= 64 && info.cb_height <= 64;
         let init_type_offset = (self.ctxs.init_type as usize) * 3;
-        let cu_skip = if !cb_is_4x4 {
+        let cu_skip = if !cb_is_4x4 || ibc_size_ok {
             let inc = ctx_inc_cu_skip_flag(
                 neigh.left_available,
                 neigh.above_available,
@@ -2062,23 +2051,49 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         //
         // Presence condition: `cu_skip_flag == 0 && sh_slice_type != I
         // && !(cbWidth == 4 && cbHeight == 4) && modeType ==
-        // MODE_TYPE_ALL` (this walker never enters a local dual tree,
-        // so modeType is always MODE_TYPE_ALL). §7.4.12.5 inference
-        // when the bin is absent on a P/B slice: a 4x4 CU is intra
-        // (bullet 1); otherwise — necessarily a skip CU here — inter
-        // (last bullet). ctxInc per eq. 1552 samples the parse-time
-        // `CuPredMode[0][xNb][yNb] == MODE_INTRA` committed in coding
-        // order.
+        // MODE_TYPE_ALL`. §7.4.12.5 inference when the bin is absent
+        // on a P/B slice: a 4x4 CU is intra (bullet 1); otherwise —
+        // necessarily a skip CU here — inter (last bullet; a skip 4x4
+        // reads intra here too, but the pred_mode_ibc_flag inference
+        // below immediately overrides it to MODE_IBC). ctxInc per
+        // eq. 1552 samples the parse-time `CuPredMode[0][xNb][yNb] ==
+        // MODE_INTRA` committed in coding order.
         let mode_intra = if !cu_skip && !cb_is_4x4 {
             self.read_pred_mode_flag(neigh)?
         } else {
             cb_is_4x4
         };
+
+        // ---- pred_mode_ibc_flag (§7.3.11.5, r409 P/B arm) ---------------
+        //
+        // Presence condition on a non-I slice (modeType ==
+        // MODE_TYPE_ALL, treeType != DUAL_TREE_CHROMA):
+        //   (CuPredMode != MODE_INTRA ||
+        //    ((4x4 || modeType == MODE_TYPE_INTRA) && cu_skip == 0))
+        //   && cbW <= 64 && cbH <= 64 && sps_ibc_enabled_flag
+        // §7.4.12.5 inference when absent: skip && 4x4 → 1;
+        // 128-wide/-tall → 0; otherwise 0 on a P/B slice.
+        let ibc_gate = ibc_size_ok && (!mode_intra || (cb_is_4x4 && !cu_skip));
+        let mode_ibc = if ibc_gate {
+            let inc = ctx_inc_pred_mode_ibc_flag(
+                neigh.left_available,
+                neigh.above_available,
+                neigh.left_ibc,
+                neigh.above_ibc,
+            ) as usize;
+            let n = self.ctxs.pred_mode_ibc_flag.len() - 1;
+            self.dec.decode_decision(
+                &mut self.ctxs.pred_mode_ibc_flag[(init_type_offset + inc).min(n)],
+            )? == 1
+        } else {
+            cu_skip && cb_is_4x4
+        };
+        if mode_ibc {
+            return self.decode_ibc_tail(info, residual, cu_skip);
+        }
         if mode_intra {
             // MODE_INTRA CU inside a P/B slice — §7.3.11.5 continues
-            // with the exact intra branch the I-slice path uses
-            // (pred_mode_ibc_flag would only be present with
-            // sps_ibc_enabled_flag, handled one gate up).
+            // with the exact intra branch the I-slice path uses.
             return self.decode_intra_body(info, residual, neigh);
         }
         info.pred_mode = CuPredMode::Inter;
@@ -5130,10 +5145,10 @@ mod tests {
     }
 
     #[test]
-    fn ibc_and_palette_tools_surface_unsupported() {
-        // Round-406: single-tree I-slice IBC is live; the remaining
-        // precise-Unsupported arms are dual-tree-luma IBC, inter-slice
-        // IBC, and palette coding.
+    fn palette_tool_surfaces_unsupported() {
+        // Round-409: IBC is live on every reachable tree/slice
+        // combination (single-tree, DUAL_TREE_LUMA, P/B); palette
+        // coding remains the precise-Unsupported arm.
         let data = [0u8; 32];
         let mut dec = ArithDecoder::new(&data).unwrap();
         let mut ctxs = LeafCuCtxs::init(26);
@@ -5145,7 +5160,7 @@ mod tests {
         let mut residual = LeafCuResidual::default();
         let neigh = CuNeighbourhood::default();
 
-        let mut tools = CuToolFlags {
+        let tools = CuToolFlags {
             chroma_format_idc: 1,
             ctb_size_y: 128,
             max_tb_size_y: 64,
@@ -5153,28 +5168,9 @@ mod tests {
             transform_skip_enabled: false,
             max_ts_size: 32,
             ts_residual_coding_rice_idx: 1,
-            ibc: true,
+            palette: true,
             ..CuToolFlags::default()
         };
-        // Dual-tree-luma IBC → precise Unsupported.
-        let mut reader =
-            LeafCuReader::new(&mut dec, &mut ctxs, tools).with_tree_type(TreeType::DualTreeLuma);
-        assert!(matches!(
-            reader.decode(&mut info, &mut residual, &neigh),
-            Err(Error::Unsupported(_))
-        ));
-
-        // Inter-slice IBC → precise Unsupported.
-        tools.slice_is_inter = true;
-        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
-        assert!(matches!(
-            reader.decode(&mut info, &mut residual, &neigh),
-            Err(Error::Unsupported(_))
-        ));
-        tools.slice_is_inter = false;
-
-        tools.ibc = false;
-        tools.palette = true;
         let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
         assert!(matches!(
             reader.decode(&mut info, &mut residual, &neigh),
@@ -8462,5 +8458,233 @@ mod tests {
         assert_eq!(info.pred_mode, CuPredMode::Inter);
         assert!(info.inter.general_merge_flag);
         assert!(info.inter.merge_data.merge_subblock_flag);
+    }
+
+    // ==== Round-409: §7.3.11.5 IBC on P/B slices + DUAL_TREE_LUMA ====
+
+    /// P-slice IBC skip CU: cu_skip(1) → pred_mode_ibc_flag(1) →
+    /// merge inferred → merge_idx.
+    #[test]
+    fn p_slice_ibc_skip_merge_parses_prologue() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_pred_mode_ibc_flag};
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let init_off = (init_type as usize) * 3;
+        let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 1)
+            .unwrap();
+        // Skip non-4x4 → CuPredMode != MODE_INTRA → the IBC gate is
+        // open and the bin distinguishes IBC skip from inter skip.
+        let inc = ctx_inc_pred_mode_ibc_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.pred_mode_ibc_flag[init_off + inc], 1)
+            .unwrap();
+        // merge_idx(0) — TR cMax = MaxNumIbcMergeCand − 1 = 5.
+        let inc = ctx_inc_merge_idx() as usize;
+        let n = ctxs.merge_idx.len() - 1;
+        enc.encode_decision(&mut ctxs.merge_idx[(init_type as usize + inc).min(n)], 0)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let tools = CuToolFlags {
+            slice_is_inter: true,
+            max_num_merge_cand: 6,
+            ..tools_for_ibc(6, false)
+        };
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("P-slice IBC skip CU must decode clean");
+        assert_eq!(info.pred_mode, CuPredMode::Ibc);
+        assert!(info.inter.cu_skip_flag);
+        assert!(info.inter.general_merge_flag);
+        assert_eq!(info.inter.merge_data.merge_idx, 0);
+    }
+
+    /// P-slice IBC non-merge (AMVP) CU: cu_skip(0) →
+    /// pred_mode_flag(0) → pred_mode_ibc_flag(1) →
+    /// general_merge_flag(0) → mvd_coding + mvp_l0_flag +
+    /// cu_coded_flag(0).
+    #[test]
+    fn p_slice_ibc_amvp_parses_prologue_and_tail() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_pred_mode_flag,
+            ctx_inc_pred_mode_ibc_flag,
+        };
+        use crate::mvd_coding_enc::encode_mvd_coding;
+        use crate::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let init_off = (init_type as usize) * 3;
+        let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+            .unwrap();
+        let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        let pm_slot = (init_type as usize - 1) * 2 + inc;
+        enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 0)
+            .unwrap();
+        let inc = ctx_inc_pred_mode_ibc_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.pred_mode_ibc_flag[init_off + inc], 1)
+            .unwrap();
+        let inc = ctx_inc_general_merge_flag() as usize;
+        let n = ctxs.general_merge_flag.len() - 1;
+        enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
+            .unwrap();
+        encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -4, y: 0 }).unwrap();
+        encode_mvp_lx_flag(&mut enc, &mut ctxs, 1).unwrap();
+        // (no amvr_precision_idx — amvr disabled in tools)
+        let n = ctxs.cu_coded_flag.len() - 1;
+        enc.encode_decision(&mut ctxs.cu_coded_flag[(init_type as usize).min(n)], 0)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let tools = CuToolFlags {
+            slice_is_inter: true,
+            max_num_merge_cand: 6,
+            ..tools_for_ibc(6, false)
+        };
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("P-slice IBC AMVP CU must decode clean");
+        assert_eq!(info.pred_mode, CuPredMode::Ibc);
+        assert!(!info.inter.cu_skip_flag);
+        assert!(!info.inter.general_merge_flag);
+        assert_eq!(info.inter.non_merge.mvd_l0, MotionVector { x: -4, y: 0 });
+        assert_eq!(info.inter.non_merge.mvp_l0_flag, 1);
+        assert!(!info.tu_y_coded_flag);
+    }
+
+    /// §7.3.11.5 P/B gate — a non-4x4 CU whose pred_mode_flag reads 1
+    /// (MODE_INTRA) does NOT carry a pred_mode_ibc_flag bin (the gate
+    /// arm `(4x4 || modeType INTRA) && !skip` is closed): the intra
+    /// cascade follows directly even with sps_ibc_enabled_flag on.
+    #[test]
+    fn p_slice_intra_cu_with_ibc_enabled_reads_no_ibc_bin() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_cu_skip_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+            ctx_inc_intra_luma_not_planar_flag, ctx_inc_pred_mode_flag,
+        };
+        use crate::residual_enc::{
+            write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
+        };
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let init_off = (init_type as usize) * 3;
+        let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[init_off + inc], 0)
+            .unwrap();
+        let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        enc.encode_decision(
+            &mut ctxs.pred_mode_flag[(init_type as usize - 1) * 2 + inc],
+            1,
+        )
+        .unwrap();
+        // NO pred_mode_ibc_flag bin — straight to the intra cascade.
+        let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+        enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[inc], 1)
+            .unwrap();
+        let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+        enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[inc], 0)
+            .unwrap();
+        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
+            .unwrap();
+        write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();
+        write_tu_cr_coded_flag(&mut enc, &mut ctxs.residual, false, false, false).unwrap();
+        write_tu_y_coded_flag(&mut enc, &mut ctxs.residual, false, false, false, false).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let tools = CuToolFlags {
+            slice_is_inter: true,
+            max_num_merge_cand: 6,
+            ..tools_for_ibc(6, false)
+        };
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("P-slice intra CU with IBC enabled must decode clean");
+        assert_eq!(info.pred_mode, CuPredMode::Intra);
+        assert_eq!(info.intra_pred_mode_y, INTRA_PLANAR);
+    }
+
+    /// r409 — the I-slice IBC prologue runs on the DUAL_TREE_LUMA
+    /// coding tree (a skip CU is IBC by the §7.4.12.5 inference) and
+    /// the CU parses luma-only (no chroma CBF reads).
+    #[test]
+    fn dual_tree_luma_ibc_skip_cu_decodes() {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx};
+        let slice_qp = 26;
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init(slice_qp);
+        let inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
+        enc.encode_decision(&mut ctxs.cu_skip_flag[inc], 1).unwrap();
+        let inc = ctx_inc_merge_idx() as usize;
+        enc.encode_decision(&mut ctxs.merge_idx[inc], 0).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+
+        let tools = tools_for_ibc(6, false);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init(slice_qp);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader =
+            LeafCuReader::new(&mut dec, &mut dctx, tools).with_tree_type(TreeType::DualTreeLuma);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("dual-tree-luma IBC skip CU must decode clean");
+        assert_eq!(info.pred_mode, CuPredMode::Ibc);
+        assert!(info.inter.cu_skip_flag);
+        assert!(info.inter.general_merge_flag);
+        assert!(!info.tu_cb_coded_flag && !info.tu_cr_coded_flag);
     }
 }
