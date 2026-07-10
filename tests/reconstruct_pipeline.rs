@@ -4273,3 +4273,120 @@ fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
     assert_eq!(cell.mv_l0, MotionVector { x: 0, y: 0 });
     assert_eq!(cell.mv_l1, MotionVector { x: 0, y: 0 });
 }
+
+/// Round-409 — §8.4.2 MPM candidate threading: the walker commits each
+/// intra CU's parse-time `IntraPredModeY` / `IntraMipFlag` in coding
+/// order and the NEXT CU's candidate derivation samples them (pre-r409
+/// every neighbour read PLANAR, so any MPM-coded mode that depends on
+/// a non-planar neighbour derived wrong). TL codes an angular mode via
+/// `mpm_idx = 1` off the default (planar, planar) list; TR then codes
+/// `mpm_idx = 0`, whose §8.4.2 candModeList[0] must be TL's mode —
+/// provably different from the pre-r409 (planar, planar) head.
+#[test]
+fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+        ctx_inc_intra_luma_not_planar_flag, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
+    };
+    use oxideav_h266::leaf_cu::{build_mpm_cand_list, LeafCuCtxs, INTRA_PLANAR};
+    use oxideav_h266::residual_enc::{
+        write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+
+    let mut enc = ArithEncoder::new();
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init(slice_qp);
+
+    // Root split_cu(1) + split_qt(1) → four 8x8 CUs; per-leaf split(0).
+    let inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_n = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[inc.min(split_n)], 1)
+        .unwrap();
+    let inc = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let qt_slot = inc.min(split_qt_ctxs.len() - 1);
+    enc.encode_decision(&mut split_qt_ctxs[qt_slot], 1).unwrap();
+    let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    for _ in 0..4 {
+        enc.encode_decision(&mut split_cu_ctxs[split8.min(split_n)], 0)
+            .unwrap();
+    }
+
+    // Shared per-CU tail: DM chroma + all CBFs 0.
+    let emit_tail = |enc: &mut ArithEncoder, ctxs: &mut LeafCuCtxs| {
+        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
+            .unwrap();
+        write_tu_cb_coded_flag(enc, &mut ctxs.residual, false, false).unwrap();
+        write_tu_cr_coded_flag(enc, &mut ctxs.residual, false, false, false).unwrap();
+        write_tu_y_coded_flag(enc, &mut ctxs.residual, false, false, false, false).unwrap();
+    };
+
+    // TL — mpm(1), not_planar(1), mpm_idx = 1 (TR bypass "10").
+    let mpm_inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    let np_inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
+        .unwrap();
+    enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 1)
+        .unwrap();
+    enc.encode_bypass(1).unwrap();
+    enc.encode_bypass(0).unwrap();
+    emit_tail(&mut enc, &mut ctxs);
+
+    // TR — mpm(1), not_planar(1), mpm_idx = 0 (TR bypass "0").
+    enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
+        .unwrap();
+    enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 1)
+        .unwrap();
+    enc.encode_bypass(0).unwrap();
+    emit_tail(&mut enc, &mut ctxs);
+
+    // BL / BR — mpm(1), not_planar(0) → PLANAR.
+    for _ in 0..2 {
+        enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
+            .unwrap();
+        enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 0)
+            .unwrap();
+        emit_tail(&mut enc, &mut ctxs);
+    }
+
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    let sps = dummy_sps(0, pic_w, pic_h);
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let ctu0 = walker.iter_ctus().next().unwrap();
+    let (_cus, infos, _residuals) = walker.decode_ctu_full(&ctu0).unwrap();
+    assert_eq!(infos.len(), 4);
+
+    // TL's mode comes off the no-neighbour (planar, planar) list.
+    let default_list = build_mpm_cand_list(INTRA_PLANAR, INTRA_PLANAR);
+    let tl_mode = infos[0].intra_pred_mode_y;
+    assert_eq!(tl_mode, default_list[1], "TL picks candModeList[1]");
+    assert!(tl_mode > 1, "TL must be angular for the pin to bite");
+
+    // TR's candModeList must be built from cand_a = TL's committed
+    // mode (left neighbour) and cand_b = PLANAR (above unavailable).
+    let expected_tr = build_mpm_cand_list(tl_mode, INTRA_PLANAR)[0];
+    assert_eq!(
+        infos[1].intra_pred_mode_y, expected_tr,
+        "TR's MPM head must derive from TL's parse-time IntraPredModeY"
+    );
+    assert_ne!(
+        expected_tr, default_list[0],
+        "the pin must be distinguishable from the pre-r409 planar-only list"
+    );
+
+    assert_eq!(infos[2].intra_pred_mode_y, INTRA_PLANAR);
+    assert_eq!(infos[3].intra_pred_mode_y, INTRA_PLANAR);
+}

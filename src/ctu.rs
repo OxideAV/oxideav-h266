@@ -90,8 +90,8 @@ use crate::inter::{
 };
 use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
 use crate::leaf_cu::{
-    CuNeighbourhood, CuPredMode, CuToolFlags, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
-    INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
+    CuNeighbourhood, CuPredMode, CuToolFlags, IntraNeighbour, LeafCuCtxs, LeafCuInfo, LeafCuReader,
+    LeafCuResidual, INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
 };
 use crate::lmcs::{LmcsData, LmcsDerived};
 use crate::mip::predict_mip;
@@ -935,6 +935,11 @@ pub struct CtuWalker<'a, 'b> {
     /// [`Self::ibc_mode_grid`]. The P/B-slice `pred_mode_flag` ctxInc
     /// (§9.3.4.2.2 eq. 1552 / Table 133) samples this grid.
     parse_intra_grid: Vec<bool>,
+    /// r409 — parse-time `IntraMipFlag[x][y]` mirror at 4x4 luma
+    /// granularity, committed like [`Self::parse_intra_grid`]. The
+    /// §8.4.2 MPM candidate derivation reads it (a MIP neighbour
+    /// contributes PLANAR).
+    parse_mip_grid: Vec<bool>,
     /// Round-406 — §8.6 IBC state (IbcVirBuf + HmvpIbcCandList).
     /// `Some` iff `sps_ibc_enabled_flag`; the per-CTU-row resets fire
     /// in [`Self::decode_picture_into`], the per-CU eqs. 181 / 182
@@ -1125,6 +1130,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let ibc_mode_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let parse_cu_skip_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let parse_intra_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        let parse_mip_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         // Round-406 — §8.6 IBC state, allocated only when the SPS
         // enables the tool (§7.4.3.4 eqs. 45 / 46 buffer geometry).
         let ibc = if sps.tool_flags.ibc_enabled_flag {
@@ -1184,6 +1190,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc_mode_grid,
             parse_cu_skip_grid,
             parse_intra_grid,
+            parse_mip_grid,
             ibc,
             affine_cpmv_field,
             lmcs: None,
@@ -1623,6 +1630,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return false;
         }
         self.parse_cu_skip_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// r409 — sample the parse-time `IntraMipFlag` grid at
+    /// picture-absolute luma `(x, y)`.
+    fn sample_parse_mip_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.parse_mip_grid[(by * self.intra_grid_w + bx) as usize]
     }
 
     /// Round-409 — sample the parse-time `CuPredMode == MODE_INTRA`
@@ -2300,6 +2321,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             info.pred_mode,
             info.inter.cu_skip_flag,
         );
+        // r409 — commit the parse-time `IntraPredModeY` / `IntraMipFlag`
+        // so the NEXT CU's §8.4.2 MPM candidate derivation reads this
+        // CU's real luma mode in coding order (a MIP or non-intra
+        // neighbour contributes PLANAR through the candidate gates).
+        self.write_luma_mode_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, info.intra_pred_mode_y);
+        self.write_parse_mip_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, info.intra_mip_flag);
+    }
+
+    /// r409 — broadcast `IntraMipFlag` across the CU's 4x4 cells.
+    fn write_parse_mip_block(&mut self, x: u32, y: u32, w: u32, h: u32, value: bool) {
+        let bx0 = x / 4;
+        let by0 = y / 4;
+        let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
+        let by1 = (y + h).div_ceil(4).min(self.intra_grid_h);
+        for by in by0..by1 {
+            let row_off = (by * self.intra_grid_w) as usize;
+            for bx in bx0..bx1 {
+                self.parse_mip_grid[row_off + bx as usize] = value;
+            }
+        }
     }
 
     /// Build a [`CuNeighbourhood`] for a CU at `ccu.cu.(x, y)` by
@@ -2351,11 +2392,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             self.sample_parse_cu_skip_at_luma(x - 1, y),
             self.sample_parse_cu_skip_at_luma(x, y - 1),
         );
+        // r409 — §8.4.2 MPM candidate inputs: the neighbour's
+        // parse-time `IntraPredModeY` / `IntraMipFlag` / `CuPredMode`,
+        // committed in coding order (the left / above cells of a CU
+        // always precede it in decoding order on this walker's
+        // raster/z-order walk).
+        let intra_nb = |walker: &Self, xn: i32, yn: i32| -> Option<IntraNeighbour> {
+            if xn < 0 || yn < 0 {
+                return None;
+            }
+            let pred_mode = if walker.sample_parse_intra_at_luma(xn, yn) {
+                CuPredMode::Intra
+            } else if walker.sample_ibc_mode_at_luma(xn, yn) {
+                CuPredMode::Ibc
+            } else {
+                CuPredMode::Inter
+            };
+            Some(IntraNeighbour {
+                intra_pred_mode_y: walker.luma_mode_at(xn as u32, yn as u32),
+                mip: walker.sample_parse_mip_at_luma(xn, yn),
+                pred_mode: Some(pred_mode),
+            })
+        };
         CuNeighbourhood {
             left_available: x > 0,
             above_available: y > 0,
-            left: None,
-            above: None,
+            left: intra_nb(self, x - 1, y),
+            above: intra_nb(self, x, y - 1),
             left_cu_skip,
             above_cu_skip,
             left_merge_subblock,
