@@ -164,80 +164,62 @@ pub fn read_non_merge_inter_pre_residual(
     let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);
 
     // ------------------------------------------------------------------
-    // Step 4 — ref_idx_l0 (§7.3.11.7 per-list).
+    // Steps 4 – 6 — the L0 block (§7.3.11.5 `inter_pred_idc != PRED_L1`
+    // branch, IN SPEC ORDER): ref_idx_l0 → mvd_coding(L0) →
+    // mvp_l0_flag. r409 conformance fix: the pre-r409 dispatcher read
+    // ref_idx_l1 before the L0 MVD and mvp_l0_flag after the L1 MVD,
+    // desyncing on any conforming bi-predicted B-slice CU.
     //
-    // §7.4.12.7 infers 0 when not signalled (list inactive, sym_mvd
-    // shortcut, or `NumRefIdxActive[0] <= 1`).
+    // §7.4.12.7 infers ref_idx_l0 = 0 when not signalled (list
+    // inactive, sym_mvd shortcut, or `NumRefIdxActive[0] <= 1`).
     // ------------------------------------------------------------------
-    let ref_idx_l0 = if mvp_gate.ref_idx_l0_signalled(inter_pred_idc, sym_mvd_flag) {
-        reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l0)?
+    let (ref_idx_l0, mvd_l0, mvp_l0_flag) = if l0_active {
+        let ref_idx = if mvp_gate.ref_idx_l0_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l0)?
+        } else {
+            0
+        };
+        let mvd = reader.read_mvd_coding()?;
+        let mvp = reader.read_mvp_lx_flag()?;
+        (ref_idx, mvd, mvp)
     } else {
-        0
+        (0, MotionVector { x: 0, y: 0 }, 0)
     };
 
     // ------------------------------------------------------------------
-    // Step 5 — ref_idx_l1 (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
-        reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)?
-    } else {
-        0
-    };
-
-    // ------------------------------------------------------------------
-    // Step 6 — mvd_coding(L0, cpIdx = 0).
+    // Steps 7 – 9 — the L1 block (§7.3.11.5 `inter_pred_idc != PRED_L0`
+    // branch): ref_idx_l1 → the MvdL1 arm → mvp_l1_flag.
     //
-    // The §7.3.11.7 listing places mvd_coding BETWEEN the per-list
-    // ref_idx_lX and per-list mvp_lX_flag. Translational scope ⇒ one
-    // mvd_coding per active list (multi-CP affine deferred).
+    // The MvdL1 arm (§7.3.11.5):
+    // * `ph_mvd_l1_zero_flag && inter_pred_idc == PRED_BI` → MvdL1 = 0,
+    //   no bins (r409: previously unmodelled);
+    // * otherwise `sym_mvd_flag == 1` → §8.5.2.5 infers MvdL1 = −MvdL0,
+    //   no bins;
+    // * otherwise → mvd_coding(x0, y0, 1, 0).
     // ------------------------------------------------------------------
-    let mvd_l0 = if l0_active {
-        reader.read_mvd_coding()?
+    let (ref_idx_l1, mvd_l1, mvp_l1_flag) = if l1_active {
+        let ref_idx = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)?
+        } else {
+            0
+        };
+        let mvd = if mvp_gate.mvd_l1_zero && inter_pred_idc == InterPredDir::PredBi {
+            MotionVector { x: 0, y: 0 }
+        } else if sym_mvd_flag {
+            // §8.5.2.5 — MvdL1 = -MvdL0. The L1 magnitude bounds match
+            // L0 bin-for-bin so the negation is safe at the spec's
+            // signed-18-bit range.
+            MotionVector {
+                x: -mvd_l0.x,
+                y: -mvd_l0.y,
+            }
+        } else {
+            reader.read_mvd_coding()?
+        };
+        let mvp = reader.read_mvp_lx_flag()?;
+        (ref_idx, mvd, mvp)
     } else {
-        MotionVector { x: 0, y: 0 }
-    };
-
-    // ------------------------------------------------------------------
-    // Step 7 — mvd_coding(L1, cpIdx = 0).
-    //
-    // Under `sym_mvd_flag == 1` the §8.5.2.5 derivation infers MvdL1 =
-    // -MvdL0 and the reader consumes zero bins for the L1 MVD. The
-    // composed-decision field carries the inferred -MvdL0 so the
-    // returned struct exactly round-trips back through the encoder
-    // dispatcher (whose constructor clamps L1 to zero under the
-    // SMVD branch — both inferred forms round-trip bit-identically
-    // through the encoder).
-    // ------------------------------------------------------------------
-    let mvd_l1 = if l1_active && !sym_mvd_flag {
-        reader.read_mvd_coding()?
-    } else if l1_active && sym_mvd_flag {
-        // §8.5.2.5 — MvdL1 = -MvdL0. The L1 magnitude bounds match L0
-        // bin-for-bin so the negation is safe at the spec's signed-18-
-        // bit range.
-        MotionVector {
-            x: -mvd_l0.x,
-            y: -mvd_l0.y,
-        }
-    } else {
-        MotionVector { x: 0, y: 0 }
-    };
-
-    // ------------------------------------------------------------------
-    // Step 8 — mvp_l0_flag (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    let mvp_l0_flag = if l0_active {
-        reader.read_mvp_lx_flag()?
-    } else {
-        0
-    };
-
-    // ------------------------------------------------------------------
-    // Step 9 — mvp_l1_flag (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    let mvp_l1_flag = if l1_active {
-        reader.read_mvp_lx_flag()?
-    } else {
-        0
+        (0, MotionVector { x: 0, y: 0 }, 0)
     };
 
     // Build the MVP-side decision in the same shape the encoder's
@@ -557,93 +539,78 @@ pub fn read_non_merge_inter_pre_residual_affine(
     let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);
 
     // ------------------------------------------------------------------
-    // Step 4 — ref_idx_l0 (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    let ref_idx_l0 = if mvp_gate.ref_idx_l0_signalled(inter_pred_idc, sym_mvd_flag) {
-        reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l0)?
-    } else {
-        0
-    };
-
-    // ------------------------------------------------------------------
-    // Step 5 — ref_idx_l1 (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
-        reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)?
-    } else {
-        0
-    };
-
-    // ------------------------------------------------------------------
-    // Step 6 — per-CP mvd_coding for L0.
+    // Steps 4 – 6 — the L0 block (§7.3.11.5 `inter_pred_idc != PRED_L1`
+    // branch, IN SPEC ORDER): ref_idx_l0 → per-CP mvd_coding(L0) →
+    // mvp_l0_flag. r409 conformance fix: the pre-r409 dispatcher read
+    // ref_idx_l1 before the L0 MVDs and mvp_l0_flag after the L1 MVDs,
+    // desyncing on any conforming bi-predicted B-slice CU.
     //
-    // §7.3.10.5 listing:
+    // §7.3.11.5 per-CP listing:
     //   mvd_coding(x0, y0, 0, 0)
     //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 0, 1)
     //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 0, 2)
-    //
-    // Iterates 0..numCpMv on the L0 path when L0 is active. Slots
-    // beyond numCpMv stay at the zero default.
+    //   mvp_l0_flag
     // ------------------------------------------------------------------
     let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
-    if l0_active {
+    let (ref_idx_l0, mvp_l0_flag) = if l0_active {
+        let ref_idx = if mvp_gate.ref_idx_l0_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l0)?
+        } else {
+            0
+        };
         for slot in mvd_cp_l0.iter_mut().take(num_cp) {
             *slot = reader.read_mvd_coding()?;
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Step 7 — per-CP mvd_coding for L1.
-    //
-    // §7.3.10.5 listing (paraphrased per the spec's pseudocode):
-    //   if (sym_mvd_flag) { MvdL1[0] = -MvdL0[0]; }   // no bin
-    //   else mvd_coding(x0, y0, 1, 0)
-    //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 1, 1)
-    //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 1, 2)
-    //
-    // The spec ONLY suppresses the `cpIdx == 0` L1 MVD under
-    // sym_mvd_flag; the higher-CP L1 MVDs are read verbatim. In
-    // practice the affine path excludes SMVD so `cpIdx >= 1` only
-    // fires under `sym_mvd_flag == 0`. The translational degenerate
-    // (`numCpMv == 1`) with `sym_mvd_flag == 1` carries the §8.5.2.5
-    // -MvdL0 derivation in `mvd_cp_l1[0]` for symmetry with the
-    // round-219 dispatcher (both inferred forms round-trip bit-
-    // identically through the encoder).
-    // ------------------------------------------------------------------
-    let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
-    if l1_active {
-        if sym_mvd_flag {
-            // §8.5.2.5 — MvdL1[0] = -MvdL0[0]. The L1 magnitude bounds
-            // match L0 bin-for-bin so the negation is safe at the
-            // spec's signed-18-bit range.
-            mvd_cp_l1[0] = MotionVector {
-                x: -mvd_cp_l0[0].x,
-                y: -mvd_cp_l0[0].y,
-            };
-        } else {
-            mvd_cp_l1[0] = reader.read_mvd_coding()?;
-        }
-        for slot in mvd_cp_l1.iter_mut().take(num_cp).skip(1) {
-            *slot = reader.read_mvd_coding()?;
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Step 8 — mvp_l0_flag (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    let mvp_l0_flag = if l0_active {
-        reader.read_mvp_lx_flag()?
+        let mvp = reader.read_mvp_lx_flag()?;
+        (ref_idx, mvp)
     } else {
-        0
+        (0, 0)
     };
 
     // ------------------------------------------------------------------
-    // Step 9 — mvp_l1_flag (§7.3.11.7 per-list).
+    // Steps 7 – 9 — the L1 block (§7.3.11.5 `inter_pred_idc != PRED_L0`
+    // branch): ref_idx_l1 → the MvdL1 arm → mvp_l1_flag.
+    //
+    // The MvdL1 arm (§7.3.11.5):
+    // * `ph_mvd_l1_zero_flag && inter_pred_idc == PRED_BI` → EVERY
+    //   MvdL1 / MvdCpL1 slot is 0, no bins (r409: previously
+    //   unmodelled);
+    // * otherwise `sym_mvd_flag == 1` suppresses ONLY the `cpIdx == 0`
+    //   L1 MVD (§8.5.2.5 infers MvdL1[0] = −MvdL0[0]); the higher-CP
+    //   L1 MVDs are read verbatim — in practice the affine path
+    //   excludes SMVD so `cpIdx >= 1` only fires under
+    //   `sym_mvd_flag == 0`;
+    // * otherwise → mvd_coding(x0, y0, 1, cpIdx) for cpIdx 0..numCpMv.
     // ------------------------------------------------------------------
-    let mvp_l1_flag = if l1_active {
-        reader.read_mvp_lx_flag()?
+    let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
+    let (ref_idx_l1, mvp_l1_flag) = if l1_active {
+        let ref_idx = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader.read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)?
+        } else {
+            0
+        };
+        if mvp_gate.mvd_l1_zero && inter_pred_idc == InterPredDir::PredBi {
+            // §7.3.11.5 — MvdL1 = 0 and MvdCpL1[0..2] = 0, no bins.
+        } else {
+            if sym_mvd_flag {
+                // §8.5.2.5 — MvdL1[0] = -MvdL0[0]. The L1 magnitude
+                // bounds match L0 bin-for-bin so the negation is safe
+                // at the spec's signed-18-bit range.
+                mvd_cp_l1[0] = MotionVector {
+                    x: -mvd_cp_l0[0].x,
+                    y: -mvd_cp_l0[0].y,
+                };
+            } else {
+                mvd_cp_l1[0] = reader.read_mvd_coding()?;
+            }
+            for slot in mvd_cp_l1.iter_mut().take(num_cp).skip(1) {
+                *slot = reader.read_mvd_coding()?;
+            }
+        }
+        let mvp = reader.read_mvp_lx_flag()?;
+        (ref_idx, mvp)
     } else {
-        0
+        (0, 0)
     };
 
     let mvp = NonMergeMvpSyntaxDecision {
@@ -883,6 +850,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 0,
+            mvd_l1_zero: false,
         }
     }
 
@@ -894,6 +862,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         }
     }
 
@@ -905,6 +874,7 @@ mod tests {
             sym_mvd_gate_open: true,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         }
     }
 
@@ -1130,6 +1100,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 0,
+            mvd_l1_zero: false,
         };
         let affine = make_non_merge_inter_affine_decision(false, false);
         let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 1, 0, 1, 0);
@@ -1158,7 +1129,8 @@ mod tests {
             b_slice: true,
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
-            num_ref_idx_active_l1: 1, // ref_idx_l1 not signalled
+            num_ref_idx_active_l1: 1,
+            mvd_l1_zero: false, // ref_idx_l1 not signalled
         };
         let affine = make_non_merge_inter_affine_decision(false, false);
         let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 0, 0, 1);
@@ -1193,6 +1165,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         };
         let affine = make_non_merge_inter_affine_decision(false, false);
         let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL1, false, 0, 1, 0, 0);
@@ -1220,6 +1193,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 1,
             num_ref_idx_active_l1: 0,
+            mvd_l1_zero: false,
         };
         let affine = make_non_merge_inter_affine_decision(false, false);
         let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 1, 0);
@@ -1832,6 +1806,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         };
         let amvr_gate = AmvrGate {
             sps_amvr_enabled: true,
@@ -2558,5 +2533,114 @@ mod tests {
         );
         assert!(!rec_amvr.amvr_flag);
         assert_eq!(rec_bcw, 0);
+    }
+
+    /// r409 conformance pin — the §7.3.11.5 listing orders the two
+    /// per-list blocks L0-FULLY-FIRST: ref_idx_l0 → mvd_coding(L0) →
+    /// mvp_l0_flag → ref_idx_l1 → mvd_coding(L1) → mvp_l1_flag. Encode
+    /// a bi-predicted CU with the PER-ELEMENT helpers in exactly that
+    /// order and require the reader dispatcher to recover every field
+    /// (the pre-r409 dispatcher read ref_idx_l1 second and desynced).
+    #[test]
+    fn bi_pred_dispatcher_consumes_spec_element_order() {
+        use crate::mvd_coding_enc::encode_mvd_coding;
+        use crate::non_merge_mvp_syntax_enc::{
+            encode_inter_pred_idc, encode_mvp_lx_flag, encode_ref_idx_lx,
+        };
+
+        let affine_gate = affine_gate_off();
+        let mvp_gate = b_slice_gate();
+        let init_type = 2u8;
+
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        // (affine gate closed → zero bins)
+        encode_inter_pred_idc(
+            &mut enc,
+            &mut ctxs,
+            InterPredDir::PredBi,
+            mvp_gate.cb_width,
+            mvp_gate.cb_height,
+        )
+        .unwrap();
+        // (sym_mvd gate closed → zero bins)
+        // ---- L0 block, spec order ----
+        encode_ref_idx_lx(&mut enc, &mut ctxs, 1, mvp_gate.num_ref_idx_active_l0).unwrap();
+        encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -10, y: 11 }).unwrap();
+        encode_mvp_lx_flag(&mut enc, &mut ctxs, 1).unwrap();
+        // ---- L1 block, spec order ----
+        encode_ref_idx_lx(&mut enc, &mut ctxs, 0, mvp_gate.num_ref_idx_active_l1).unwrap();
+        encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 12, y: -13 }).unwrap();
+        encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut padded = enc.finish();
+        padded.extend_from_slice(&[0u8; 64]);
+
+        let mut dec = ArithDecoder::new(&padded).unwrap();
+        let mut dec_ctxs = LeafCuCtxs::init_with_init_type(26, init_type);
+        let tools = CuToolFlags::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
+        let d = read_non_merge_inter_pre_residual(&mut reader, &affine_gate, &mvp_gate).unwrap();
+        assert_eq!(d.mvp.inter_pred_idc, InterPredDir::PredBi);
+        assert_eq!(d.mvp.ref_idx_l0, 1);
+        assert_eq!(d.mvp.ref_idx_l1, 0);
+        assert_eq!(d.mvd_l0, MotionVector { x: -10, y: 11 });
+        assert_eq!(d.mvd_l1, MotionVector { x: 12, y: -13 });
+        assert_eq!(d.mvp.mvp_l0_flag, 1);
+        assert_eq!(d.mvp.mvp_l1_flag, 0);
+    }
+
+    /// r409 — `ph_mvd_l1_zero_flag && PRED_BI` codes NO L1 MVD bins;
+    /// the reader infers MvdL1 = 0 (§7.3.11.5) and the encoder emits
+    /// nothing for it. Round trip through both dispatchers.
+    #[test]
+    fn bi_pred_mvd_l1_zero_suppresses_l1_mvd() {
+        let affine_gate = affine_gate_off();
+        let mvp_gate = NonMergeMvpSyntaxGate {
+            mvd_l1_zero: true,
+            ..b_slice_gate()
+        };
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 1, 1, 0, 1);
+        let decision = NonMergeInterPreResidualDecision::new(
+            affine,
+            mvp,
+            MotionVector { x: -6, y: 3 },
+            MotionVector { x: 0, y: 0 },
+        );
+        let rec = round_trip_via_encoder(2, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(rec.mvp.inter_pred_idc, InterPredDir::PredBi);
+        assert_eq!(rec.mvd_l0, MotionVector { x: -6, y: 3 });
+        assert_eq!(
+            rec.mvd_l1,
+            MotionVector { x: 0, y: 0 },
+            "ph_mvd_l1_zero_flag → MvdL1 = 0 with zero bins"
+        );
+        assert_eq!(rec.mvp.ref_idx_l0, 1);
+        assert_eq!(rec.mvp.ref_idx_l1, 1);
+        assert_eq!(rec.mvp.mvp_l0_flag, 0);
+        assert_eq!(rec.mvp.mvp_l1_flag, 1);
+    }
+
+    /// r409 — `ph_mvd_l1_zero_flag` does NOT suppress a uni-L1 CU's
+    /// MVD (§7.3.11.5 requires PRED_BI for the zero arm).
+    #[test]
+    fn uni_l1_mvd_survives_mvd_l1_zero() {
+        let affine_gate = affine_gate_off();
+        let mvp_gate = NonMergeMvpSyntaxGate {
+            mvd_l1_zero: true,
+            ..b_slice_gate()
+        };
+        let affine = make_non_merge_inter_affine_decision(false, false);
+        let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL1, false, 0, 1, 0, 1);
+        let decision = NonMergeInterPreResidualDecision::new(
+            affine,
+            mvp,
+            MotionVector { x: 0, y: 0 },
+            MotionVector { x: 5, y: -2 },
+        );
+        let rec = round_trip_via_encoder(2, &affine_gate, &mvp_gate, &decision);
+        assert_eq!(rec.mvp.inter_pred_idc, InterPredDir::PredL1);
+        assert_eq!(rec.mvd_l1, MotionVector { x: 5, y: -2 });
     }
 }

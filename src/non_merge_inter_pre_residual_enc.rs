@@ -309,96 +309,38 @@ pub fn encode_non_merge_inter_pre_residual(
     );
 
     // ------------------------------------------------------------------
-    // Step 4 — ref_idx_l0 (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    if mvp_gate.ref_idx_l0_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
-        encode_ref_idx_lx(
-            enc,
-            ctxs,
-            decision.mvp.ref_idx_l0,
-            mvp_gate.num_ref_idx_active_l0,
-        )?;
-    } else {
-        debug_assert_eq!(
-            decision.mvp.ref_idx_l0, 0,
-            "ref_idx_l0 not signalled → §7.4.12.7 requires ref_idx_l0 = 0"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 5 — ref_idx_l1 (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    if mvp_gate.ref_idx_l1_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
-        encode_ref_idx_lx(
-            enc,
-            ctxs,
-            decision.mvp.ref_idx_l1,
-            mvp_gate.num_ref_idx_active_l1,
-        )?;
-    } else {
-        debug_assert_eq!(
-            decision.mvp.ref_idx_l1, 0,
-            "ref_idx_l1 not signalled → §7.4.12.7 requires ref_idx_l1 = 0"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 6 — mvd_coding(L0, cpIdx = 0).
-    //
-    // The §7.3.11.7 listing places mvd_coding BETWEEN the per-list
-    // ref_idx_lX and per-list mvp_lX_flag. The translational scope of
-    // this round implies one mvd_coding per active list (multi-CP
-    // affine is deferred).
+    // Steps 4 – 6 — the L0 block (§7.3.11.5 `inter_pred_idc != PRED_L1`
+    // branch, IN SPEC ORDER): ref_idx_l0 → mvd_coding(L0) →
+    // mvp_l0_flag. r409 conformance fix: the pre-r409 dispatcher
+    // emitted ref_idx_l1 before the L0 MVD and mvp_l0_flag after the
+    // L1 MVD — a spec-divergent wire layout on bi-predicted CUs.
     // ------------------------------------------------------------------
     if l0_active {
+        if mvp_gate.ref_idx_l0_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
+            encode_ref_idx_lx(
+                enc,
+                ctxs,
+                decision.mvp.ref_idx_l0,
+                mvp_gate.num_ref_idx_active_l0,
+            )?;
+        } else {
+            debug_assert_eq!(
+                decision.mvp.ref_idx_l0, 0,
+                "ref_idx_l0 not signalled → §7.4.12.7 requires ref_idx_l0 = 0"
+            );
+        }
         encode_mvd_coding(enc, ctxs, decision.mvd_l0)?;
+        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l0_flag)?;
     } else {
         debug_assert_eq!(
             (decision.mvd_l0.x, decision.mvd_l0.y),
             (0, 0),
             "L0 inactive → mvd_l0 must be zero per the dispatcher's contract"
         );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 7 — mvd_coding(L1, cpIdx = 0).
-    //
-    // Under sym_mvd_flag == 1 the §8.5.2.5 derivation infers MvdL1 =
-    // -MvdL0 and the reader consumes zero bins for the L1 MVD; the
-    // dispatcher mirrors that.
-    // ------------------------------------------------------------------
-    if l1_active && !effective_sym_mvd_flag {
-        encode_mvd_coding(enc, ctxs, decision.mvd_l1)?;
-    } else if l1_active && effective_sym_mvd_flag {
-        // Caller-conformance check: an SMVD CU's mvd_l1 should
-        // either be the inferred `-mvd_l0` or zero (the
-        // [`NonMergeInterPreResidualDecision::new`] clamp). Either way
-        // the dispatcher emits zero bins for the L1 MVD.
-        let inferred_match =
-            decision.mvd_l1.x == -decision.mvd_l0.x && decision.mvd_l1.y == -decision.mvd_l0.y;
-        let zero = decision.mvd_l1.x == 0 && decision.mvd_l1.y == 0;
-        debug_assert!(
-            inferred_match || zero,
-            "sym_mvd_flag = 1 → mvd_l1 must be inferred -mvd_l0 or zero (was ({}, {}) for mvd_l0 = ({}, {}))",
-            decision.mvd_l1.x,
-            decision.mvd_l1.y,
-            decision.mvd_l0.x,
-            decision.mvd_l0.y
-        );
-    } else {
         debug_assert_eq!(
-            (decision.mvd_l1.x, decision.mvd_l1.y),
-            (0, 0),
-            "L1 inactive → mvd_l1 must be zero per the dispatcher's contract"
+            decision.mvp.ref_idx_l0, 0,
+            "L0 inactive → §7.4.12.7 requires ref_idx_l0 = 0"
         );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 8 — mvp_l0_flag (§7.3.11.7 per-list).
-    // ------------------------------------------------------------------
-    if l0_active {
-        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l0_flag)?;
-    } else {
         debug_assert_eq!(
             decision.mvp.mvp_l0_flag, 0,
             "L0 inactive → §7.4.12.7 requires mvp_l0_flag = 0"
@@ -406,11 +348,63 @@ pub fn encode_non_merge_inter_pre_residual(
     }
 
     // ------------------------------------------------------------------
-    // Step 9 — mvp_l1_flag (§7.3.11.7 per-list).
+    // Steps 7 – 9 — the L1 block (§7.3.11.5 `inter_pred_idc != PRED_L0`
+    // branch): ref_idx_l1 → the MvdL1 arm → mvp_l1_flag.
+    //
+    // The MvdL1 arm: `ph_mvd_l1_zero_flag && PRED_BI` → no bins
+    // (MvdL1 = 0); `sym_mvd_flag == 1` → no bins (§8.5.2.5 infers
+    // MvdL1 = −MvdL0); otherwise mvd_coding(x0, y0, 1, 0).
     // ------------------------------------------------------------------
     if l1_active {
+        if mvp_gate.ref_idx_l1_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
+            encode_ref_idx_lx(
+                enc,
+                ctxs,
+                decision.mvp.ref_idx_l1,
+                mvp_gate.num_ref_idx_active_l1,
+            )?;
+        } else {
+            debug_assert_eq!(
+                decision.mvp.ref_idx_l1, 0,
+                "ref_idx_l1 not signalled → §7.4.12.7 requires ref_idx_l1 = 0"
+            );
+        }
+        if mvp_gate.mvd_l1_zero && effective_inter_pred_idc == InterPredDir::PredBi {
+            debug_assert_eq!(
+                (decision.mvd_l1.x, decision.mvd_l1.y),
+                (0, 0),
+                "ph_mvd_l1_zero_flag && PRED_BI → mvd_l1 must be zero"
+            );
+        } else if effective_sym_mvd_flag {
+            // Caller-conformance check: an SMVD CU's mvd_l1 should
+            // either be the inferred `-mvd_l0` or zero (the
+            // [`NonMergeInterPreResidualDecision::new`] clamp). Either
+            // way the dispatcher emits zero bins for the L1 MVD.
+            let inferred_match =
+                decision.mvd_l1.x == -decision.mvd_l0.x && decision.mvd_l1.y == -decision.mvd_l0.y;
+            let zero = decision.mvd_l1.x == 0 && decision.mvd_l1.y == 0;
+            debug_assert!(
+                inferred_match || zero,
+                "sym_mvd_flag = 1 → mvd_l1 must be inferred -mvd_l0 or zero (was ({}, {}) for mvd_l0 = ({}, {}))",
+                decision.mvd_l1.x,
+                decision.mvd_l1.y,
+                decision.mvd_l0.x,
+                decision.mvd_l0.y
+            );
+        } else {
+            encode_mvd_coding(enc, ctxs, decision.mvd_l1)?;
+        }
         encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l1_flag)?;
     } else {
+        debug_assert_eq!(
+            (decision.mvd_l1.x, decision.mvd_l1.y),
+            (0, 0),
+            "L1 inactive → mvd_l1 must be zero per the dispatcher's contract"
+        );
+        debug_assert_eq!(
+            decision.mvp.ref_idx_l1, 0,
+            "L1 inactive → §7.4.12.7 requires ref_idx_l1 = 0"
+        );
         debug_assert_eq!(
             decision.mvp.mvp_l1_flag, 0,
             "L1 inactive → §7.4.12.7 requires mvp_l1_flag = 0"
@@ -824,50 +818,32 @@ pub fn encode_non_merge_inter_pre_residual_affine(
     );
 
     // ------------------------------------------------------------------
-    // Step 4 — ref_idx_l0.
-    // ------------------------------------------------------------------
-    if mvp_gate.ref_idx_l0_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
-        encode_ref_idx_lx(
-            enc,
-            ctxs,
-            decision.mvp.ref_idx_l0,
-            mvp_gate.num_ref_idx_active_l0,
-        )?;
-    } else {
-        debug_assert_eq!(
-            decision.mvp.ref_idx_l0, 0,
-            "ref_idx_l0 not signalled → §7.4.12.7 requires ref_idx_l0 = 0"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 5 — ref_idx_l1.
-    // ------------------------------------------------------------------
-    if mvp_gate.ref_idx_l1_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
-        encode_ref_idx_lx(
-            enc,
-            ctxs,
-            decision.mvp.ref_idx_l1,
-            mvp_gate.num_ref_idx_active_l1,
-        )?;
-    } else {
-        debug_assert_eq!(
-            decision.mvp.ref_idx_l1, 0,
-            "ref_idx_l1 not signalled → §7.4.12.7 requires ref_idx_l1 = 0"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 6 — per-CP mvd_coding for L0.
+    // Steps 4 – 6 — the L0 block (§7.3.11.5 `inter_pred_idc != PRED_L1`
+    // branch, IN SPEC ORDER): ref_idx_l0 → per-CP mvd_coding(L0) →
+    // mvp_l0_flag. r409 conformance fix: the pre-r409 dispatcher
+    // emitted ref_idx_l1 before the L0 MVDs and mvp_l0_flag after the
+    // L1 MVDs — a spec-divergent wire layout on bi-predicted CUs.
     //
-    // §7.3.10.5 listing:
+    // §7.3.11.5 per-CP listing:
     //   mvd_coding(x0, y0, 0, 0)
     //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 0, 1)
     //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 0, 2)
-    //
-    // Iterates 0..numCpMv on the L0 path when L0 is active.
+    //   mvp_l0_flag
     // ------------------------------------------------------------------
     if l0_active {
+        if mvp_gate.ref_idx_l0_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
+            encode_ref_idx_lx(
+                enc,
+                ctxs,
+                decision.mvp.ref_idx_l0,
+                mvp_gate.num_ref_idx_active_l0,
+            )?;
+        } else {
+            debug_assert_eq!(
+                decision.mvp.ref_idx_l0, 0,
+                "ref_idx_l0 not signalled → §7.4.12.7 requires ref_idx_l0 = 0"
+            );
+        }
         for cp_idx in 0..num_cp {
             encode_mvd_coding(enc, ctxs, decision.mvd_cp_l0[cp_idx])?;
         }
@@ -881,6 +857,7 @@ pub fn encode_non_merge_inter_pre_residual_affine(
                 num_cp,
             );
         }
+        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l0_flag)?;
     } else {
         for cp_idx in 0..3 {
             debug_assert_eq!(
@@ -890,47 +867,77 @@ pub fn encode_non_merge_inter_pre_residual_affine(
                 cp_idx,
             );
         }
+        debug_assert_eq!(
+            decision.mvp.ref_idx_l0, 0,
+            "L0 inactive → §7.4.12.7 requires ref_idx_l0 = 0"
+        );
+        debug_assert_eq!(
+            decision.mvp.mvp_l0_flag, 0,
+            "L0 inactive → §7.4.12.7 requires mvp_l0_flag = 0"
+        );
     }
 
     // ------------------------------------------------------------------
-    // Step 7 — per-CP mvd_coding for L1.
+    // Steps 7 – 9 — the L1 block (§7.3.11.5 `inter_pred_idc != PRED_L0`
+    // branch): ref_idx_l1 → the MvdL1 arm → mvp_l1_flag.
     //
-    // §7.3.10.5 listing (paraphrased per the spec's pseudocode):
-    //   if (sym_mvd_flag) { MvdL1[0] = -MvdL0[0]; }   // no bin
-    //   else mvd_coding(x0, y0, 1, 0)
-    //   if (MotionModelIdc > 0) mvd_coding(x0, y0, 1, 1)
-    //   if (MotionModelIdc > 1) mvd_coding(x0, y0, 1, 2)
-    //
-    // Note: the spec ONLY suppresses the `cpIdx == 0` L1 MVD under
-    // sym_mvd_flag; the higher-CP L1 MVDs are read verbatim. In
-    // practice the debug-assert above rules out the affine+SMVD
-    // combination, so `cpIdx >= 1` only fires under sym_mvd_flag == 0.
-    // The translational path with sym_mvd_flag == 1 has numCpMv == 1
-    // and never enters the `cp_idx >= 1` branch.
+    // The MvdL1 arm (§7.3.11.5):
+    // * `ph_mvd_l1_zero_flag && PRED_BI` → EVERY MvdL1 / MvdCpL1 slot
+    //   is 0, no bins;
+    // * otherwise `sym_mvd_flag == 1` suppresses ONLY the `cpIdx == 0`
+    //   L1 MVD (§8.5.2.5 infers MvdL1[0] = −MvdL0[0]); the higher-CP
+    //   L1 MVDs are emitted verbatim — the affine+SMVD combination is
+    //   ruled out by the debug-assert above, so `cpIdx >= 1` only
+    //   fires under sym_mvd_flag == 0;
+    // * otherwise → mvd_coding(x0, y0, 1, cpIdx) for cpIdx 0..numCpMv.
     // ------------------------------------------------------------------
     if l1_active {
-        // cpIdx = 0 is suppressed under sym_mvd_flag == 1 per §8.5.2.5.
-        if !effective_sym_mvd_flag {
-            encode_mvd_coding(enc, ctxs, decision.mvd_cp_l1[0])?;
+        if mvp_gate.ref_idx_l1_signalled(effective_inter_pred_idc, effective_sym_mvd_flag) {
+            encode_ref_idx_lx(
+                enc,
+                ctxs,
+                decision.mvp.ref_idx_l1,
+                mvp_gate.num_ref_idx_active_l1,
+            )?;
         } else {
-            // Caller-conformance check: an SMVD CU's mvd_cp_l1[0]
-            // should either be the inferred -mvd_cp_l0[0] or zero.
-            let inferred_match = decision.mvd_cp_l1[0].x == -decision.mvd_cp_l0[0].x
-                && decision.mvd_cp_l1[0].y == -decision.mvd_cp_l0[0].y;
-            let zero = decision.mvd_cp_l1[0].x == 0 && decision.mvd_cp_l1[0].y == 0;
-            debug_assert!(
-                inferred_match || zero,
-                "sym_mvd_flag = 1 → mvd_cp_l1[0] must be inferred -mvd_cp_l0[0] or zero \
-                 (was ({}, {}) for mvd_cp_l0[0] = ({}, {}))",
-                decision.mvd_cp_l1[0].x,
-                decision.mvd_cp_l1[0].y,
-                decision.mvd_cp_l0[0].x,
-                decision.mvd_cp_l0[0].y,
+            debug_assert_eq!(
+                decision.mvp.ref_idx_l1, 0,
+                "ref_idx_l1 not signalled → §7.4.12.7 requires ref_idx_l1 = 0"
             );
         }
-        // cpIdx = 1, 2 — gated on MotionModelIdc per §7.3.10.5.
-        for cp_idx in 1..num_cp {
-            encode_mvd_coding(enc, ctxs, decision.mvd_cp_l1[cp_idx])?;
+        if mvp_gate.mvd_l1_zero && effective_inter_pred_idc == InterPredDir::PredBi {
+            for cp_idx in 0..3 {
+                debug_assert_eq!(
+                    (decision.mvd_cp_l1[cp_idx].x, decision.mvd_cp_l1[cp_idx].y),
+                    (0, 0),
+                    "ph_mvd_l1_zero_flag && PRED_BI → mvd_cp_l1[{}] must be zero",
+                    cp_idx,
+                );
+            }
+        } else {
+            // cpIdx = 0 is suppressed under sym_mvd_flag == 1 per §8.5.2.5.
+            if !effective_sym_mvd_flag {
+                encode_mvd_coding(enc, ctxs, decision.mvd_cp_l1[0])?;
+            } else {
+                // Caller-conformance check: an SMVD CU's mvd_cp_l1[0]
+                // should either be the inferred -mvd_cp_l0[0] or zero.
+                let inferred_match = decision.mvd_cp_l1[0].x == -decision.mvd_cp_l0[0].x
+                    && decision.mvd_cp_l1[0].y == -decision.mvd_cp_l0[0].y;
+                let zero = decision.mvd_cp_l1[0].x == 0 && decision.mvd_cp_l1[0].y == 0;
+                debug_assert!(
+                    inferred_match || zero,
+                    "sym_mvd_flag = 1 → mvd_cp_l1[0] must be inferred -mvd_cp_l0[0] or zero \
+                     (was ({}, {}) for mvd_cp_l0[0] = ({}, {}))",
+                    decision.mvd_cp_l1[0].x,
+                    decision.mvd_cp_l1[0].y,
+                    decision.mvd_cp_l0[0].x,
+                    decision.mvd_cp_l0[0].y,
+                );
+            }
+            // cpIdx = 1, 2 — gated on MotionModelIdc per §7.3.10.5.
+            for cp_idx in 1..num_cp {
+                encode_mvd_coding(enc, ctxs, decision.mvd_cp_l1[cp_idx])?;
+            }
         }
         for cp_idx in num_cp..3 {
             debug_assert_eq!(
@@ -941,6 +948,7 @@ pub fn encode_non_merge_inter_pre_residual_affine(
                 num_cp,
             );
         }
+        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l1_flag)?;
     } else {
         for cp_idx in 0..3 {
             debug_assert_eq!(
@@ -950,26 +958,10 @@ pub fn encode_non_merge_inter_pre_residual_affine(
                 cp_idx,
             );
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Step 8 — mvp_l0_flag.
-    // ------------------------------------------------------------------
-    if l0_active {
-        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l0_flag)?;
-    } else {
         debug_assert_eq!(
-            decision.mvp.mvp_l0_flag, 0,
-            "L0 inactive → §7.4.12.7 requires mvp_l0_flag = 0"
+            decision.mvp.ref_idx_l1, 0,
+            "L1 inactive → §7.4.12.7 requires ref_idx_l1 = 0"
         );
-    }
-
-    // ------------------------------------------------------------------
-    // Step 9 — mvp_l1_flag.
-    // ------------------------------------------------------------------
-    if l1_active {
-        encode_mvp_lx_flag(enc, ctxs, decision.mvp.mvp_l1_flag)?;
-    } else {
         debug_assert_eq!(
             decision.mvp.mvp_l1_flag, 0,
             "L1 inactive → §7.4.12.7 requires mvp_l1_flag = 0"
@@ -1267,25 +1259,9 @@ mod tests {
             0
         };
 
-        // Step 5 — ref_idx_l1.
-        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
-            reader
-                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
-                .expect("reader reads ref_idx_l1")
-        } else {
-            0
-        };
-
         // Step 6 — mvd_coding(L0).
         let mvd_l0 = if l0_active {
             reader.read_mvd_coding().expect("reader reads mvd L0")
-        } else {
-            MotionVector { x: 0, y: 0 }
-        };
-
-        // Step 7 — mvd_coding(L1).
-        let mvd_l1 = if l1_active && !sym_mvd_flag {
-            reader.read_mvd_coding().expect("reader reads mvd L1")
         } else {
             MotionVector { x: 0, y: 0 }
         };
@@ -1295,6 +1271,22 @@ mod tests {
             reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
         } else {
             0
+        };
+
+        // Step 5 — ref_idx_l1.
+        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader
+                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
+                .expect("reader reads ref_idx_l1")
+        } else {
+            0
+        };
+
+        // Step 7 — mvd_coding(L1).
+        let mvd_l1 = if l1_active && !sym_mvd_flag {
+            reader.read_mvd_coding().expect("reader reads mvd L1")
+        } else {
+            MotionVector { x: 0, y: 0 }
         };
 
         // Step 9 — mvp_l1_flag.
@@ -1325,6 +1317,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 0,
+            mvd_l1_zero: false,
         }
     }
 
@@ -1336,6 +1329,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         }
     }
 
@@ -1562,6 +1556,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 1,
             num_ref_idx_active_l1: 1,
+            mvd_l1_zero: false,
         };
         let affine = make_non_merge_inter_affine_decision(false, false);
         let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL1, false, 0, 0, 1, 1);
@@ -1589,6 +1584,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 1,
             num_ref_idx_active_l1: 0,
+            mvd_l1_zero: false,
         };
         let affine = make_non_merge_inter_affine_decision(false, false);
         let mvp = make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, 0, 0, 0, 0);
@@ -1744,23 +1740,9 @@ mod tests {
         } else {
             0
         };
-        // Step 5 — ref_idx_l1.
-        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
-            reader
-                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
-                .expect("reader reads ref_idx_l1")
-        } else {
-            0
-        };
         // Step 6 — mvd_coding(L0).
         let mvd_l0 = if l0_active {
             reader.read_mvd_coding().expect("reader reads mvd L0")
-        } else {
-            MotionVector { x: 0, y: 0 }
-        };
-        // Step 7 — mvd_coding(L1).
-        let mvd_l1 = if l1_active && !sym_mvd_flag {
-            reader.read_mvd_coding().expect("reader reads mvd L1")
         } else {
             MotionVector { x: 0, y: 0 }
         };
@@ -1769,6 +1751,20 @@ mod tests {
             reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
         } else {
             0
+        };
+        // Step 5 — ref_idx_l1.
+        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader
+                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
+                .expect("reader reads ref_idx_l1")
+        } else {
+            0
+        };
+        // Step 7 — mvd_coding(L1).
+        let mvd_l1 = if l1_active && !sym_mvd_flag {
+            reader.read_mvd_coding().expect("reader reads mvd L1")
+        } else {
+            MotionVector { x: 0, y: 0 }
         };
         // Step 9 — mvp_l1_flag.
         let mvp_l1_flag = if l1_active {
@@ -1961,23 +1957,9 @@ mod tests {
         } else {
             0
         };
-        // Step 5 — ref_idx_l1.
-        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
-            reader
-                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
-                .expect("reader reads ref_idx_l1")
-        } else {
-            0
-        };
         // Step 6 — mvd_coding(L0).
         let mvd_l0 = if l0_active {
             reader.read_mvd_coding().expect("reader reads mvd L0")
-        } else {
-            MotionVector { x: 0, y: 0 }
-        };
-        // Step 7 — mvd_coding(L1).
-        let mvd_l1 = if l1_active && !sym_mvd_flag {
-            reader.read_mvd_coding().expect("reader reads mvd L1")
         } else {
             MotionVector { x: 0, y: 0 }
         };
@@ -1986,6 +1968,20 @@ mod tests {
             reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
         } else {
             0
+        };
+        // Step 5 — ref_idx_l1.
+        let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
+            reader
+                .read_ref_idx_lx(mvp_gate.num_ref_idx_active_l1)
+                .expect("reader reads ref_idx_l1")
+        } else {
+            0
+        };
+        // Step 7 — mvd_coding(L1).
+        let mvd_l1 = if l1_active && !sym_mvd_flag {
+            reader.read_mvd_coding().expect("reader reads mvd L1")
+        } else {
+            MotionVector { x: 0, y: 0 }
         };
         // Step 9 — mvp_l1_flag.
         let mvp_l1_flag = if l1_active {
@@ -2240,6 +2236,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         };
         let amvr_gate = AmvrGate {
             sps_amvr_enabled: false,
@@ -2450,6 +2447,21 @@ mod tests {
             0
         };
 
+        // Step 6 — per-CP mvd_coding L0.
+        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        if l0_active {
+            for i in 0..num_cp {
+                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
+            }
+        }
+
+        // Step 8 — mvp_l0_flag.
+        let mvp_l0_flag = if l0_active {
+            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
+        } else {
+            0
+        };
+
         // Step 5 — ref_idx_l1.
         let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
             reader
@@ -2458,14 +2470,6 @@ mod tests {
         } else {
             0
         };
-
-        // Step 6 — per-CP mvd_coding L0.
-        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
-        if l0_active {
-            for i in 0..num_cp {
-                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
-            }
-        }
 
         // Step 7 — per-CP mvd_coding L1.
         let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
@@ -2477,13 +2481,6 @@ mod tests {
                 mvd_cp_l1[i] = reader.read_mvd_coding().expect("reader reads mvd L1 cp");
             }
         }
-
-        // Step 8 — mvp_l0_flag.
-        let mvp_l0_flag = if l0_active {
-            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
-        } else {
-            0
-        };
 
         // Step 9 — mvp_l1_flag.
         let mvp_l1_flag = if l1_active {
@@ -2853,6 +2850,21 @@ mod tests {
             0
         };
 
+        // Step 6 — per-CP mvd_coding L0.
+        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        if l0_active {
+            for i in 0..num_cp {
+                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
+            }
+        }
+
+        // Step 8 — mvp_l0_flag.
+        let mvp_l0_flag = if l0_active {
+            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
+        } else {
+            0
+        };
+
         // Step 5 — ref_idx_l1.
         let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
             reader
@@ -2861,14 +2873,6 @@ mod tests {
         } else {
             0
         };
-
-        // Step 6 — per-CP mvd_coding L0.
-        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
-        if l0_active {
-            for i in 0..num_cp {
-                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
-            }
-        }
 
         // Step 7 — per-CP mvd_coding L1.
         let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
@@ -2880,13 +2884,6 @@ mod tests {
                 mvd_cp_l1[i] = reader.read_mvd_coding().expect("reader reads mvd L1 cp");
             }
         }
-
-        // Step 8 — mvp_l0_flag.
-        let mvp_l0_flag = if l0_active {
-            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
-        } else {
-            0
-        };
 
         // Step 9 — mvp_l1_flag.
         let mvp_l1_flag = if l1_active {
@@ -2999,6 +2996,21 @@ mod tests {
             0
         };
 
+        // Step 6 — per-CP mvd_coding L0.
+        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
+        if l0_active {
+            for i in 0..num_cp {
+                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
+            }
+        }
+
+        // Step 8 — mvp_l0_flag.
+        let mvp_l0_flag = if l0_active {
+            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
+        } else {
+            0
+        };
+
         // Step 5 — ref_idx_l1.
         let ref_idx_l1 = if mvp_gate.ref_idx_l1_signalled(inter_pred_idc, sym_mvd_flag) {
             reader
@@ -3007,14 +3019,6 @@ mod tests {
         } else {
             0
         };
-
-        // Step 6 — per-CP mvd_coding L0.
-        let mut mvd_cp_l0 = [MotionVector { x: 0, y: 0 }; 3];
-        if l0_active {
-            for i in 0..num_cp {
-                mvd_cp_l0[i] = reader.read_mvd_coding().expect("reader reads mvd L0 cp");
-            }
-        }
 
         // Step 7 — per-CP mvd_coding L1.
         let mut mvd_cp_l1 = [MotionVector { x: 0, y: 0 }; 3];
@@ -3026,13 +3030,6 @@ mod tests {
                 mvd_cp_l1[i] = reader.read_mvd_coding().expect("reader reads mvd L1 cp");
             }
         }
-
-        // Step 8 — mvp_l0_flag.
-        let mvp_l0_flag = if l0_active {
-            reader.read_mvp_lx_flag().expect("reader reads mvp_l0_flag")
-        } else {
-            0
-        };
 
         // Step 9 — mvp_l1_flag.
         let mvp_l1_flag = if l1_active {

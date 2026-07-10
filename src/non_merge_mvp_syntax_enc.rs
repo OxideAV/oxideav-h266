@@ -120,6 +120,13 @@ pub struct NonMergeMvpSyntaxGate {
     /// `cMax = NumRefIdxActive[1] - 1`; when this is `0` or `1` no
     /// `ref_idx_l1` bins are emitted and §7.4.12.7 infers it as 0.
     pub num_ref_idx_active_l1: u32,
+    /// `ph_mvd_l1_zero_flag` from the picture header (r409). When
+    /// `true` and the CU resolves to `PRED_BI`, §7.3.11.5 codes NO
+    /// L1 MVD bins and every `MvdL1` / `MvdCpL1` component is 0.
+    /// Callers must keep this consistent with
+    /// [`Self::sym_mvd_gate_open`] (the SMVD gate requires
+    /// `!ph_mvd_l1_zero_flag`).
+    pub mvd_l1_zero: bool,
 }
 
 impl NonMergeMvpSyntaxGate {
@@ -726,6 +733,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 1,
             num_ref_idx_active_l1: 0,
+            mvd_l1_zero: false,
         };
         let decision = NonMergeMvpSyntaxDecision {
             inter_pred_idc: InterPredDir::PredL0,
@@ -755,6 +763,7 @@ mod tests {
                 sym_mvd_gate_open: false,
                 num_ref_idx_active_l0: 4,
                 num_ref_idx_active_l1: 4,
+                mvd_l1_zero: false,
             };
             let decision = make_non_merge_mvp_syntax_decision(dir, false, 2, 3, 1, 0);
             let got = dispatcher_round_trip(2, gate, decision);
@@ -773,6 +782,7 @@ mod tests {
                 sym_mvd_gate_open: false,
                 num_ref_idx_active_l0: 2,
                 num_ref_idx_active_l1: 2,
+                mvd_l1_zero: false,
             };
             let decision = make_non_merge_mvp_syntax_decision(dir, false, 1, 1, 1, 1);
             let got = dispatcher_round_trip(2, gate, decision);
@@ -790,6 +800,7 @@ mod tests {
             sym_mvd_gate_open: true,
             num_ref_idx_active_l0: 4,
             num_ref_idx_active_l1: 4,
+            mvd_l1_zero: false,
         };
         // sym_mvd_flag = true under PRED_BI: ref_idx_lX is skipped per
         // §7.3.11.7 (sym path infers refIdx), so the decision must zero
@@ -826,6 +837,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 1,
             num_ref_idx_active_l1: 1,
+            mvd_l1_zero: false,
         };
         let decision = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 0, 0, 1, 1);
         let got = dispatcher_round_trip(2, gate, decision);
@@ -845,6 +857,7 @@ mod tests {
                 sym_mvd_gate_open: false,
                 num_ref_idx_active_l0: 4,
                 num_ref_idx_active_l1: 1,
+                mvd_l1_zero: false,
             };
             let decision =
                 make_non_merge_mvp_syntax_decision(InterPredDir::PredL0, false, v, 0, 0, 0);
@@ -864,6 +877,7 @@ mod tests {
                 sym_mvd_gate_open: false,
                 num_ref_idx_active_l0: 2,
                 num_ref_idx_active_l1: 2,
+                mvd_l1_zero: false,
             };
             let decision =
                 make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 0, 0, v, 1 - v);
@@ -883,6 +897,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 4,
             num_ref_idx_active_l1: 4,
+            mvd_l1_zero: false,
         };
         let decision = make_non_merge_mvp_syntax_decision(InterPredDir::PredBi, false, 2, 3, 1, 0);
         let got = dispatcher_round_trip(2, gate, decision);
@@ -905,6 +920,7 @@ mod tests {
             sym_mvd_gate_open: true, // gate-open meaningless on P-slice
             num_ref_idx_active_l0: 4,
             num_ref_idx_active_l1: 4,
+            mvd_l1_zero: false,
         };
         assert!(!p_gate.inter_pred_idc_gate_open());
         // Under the inferred PRED_L0, L0 is active and L1 is not.
@@ -920,6 +936,7 @@ mod tests {
             sym_mvd_gate_open: true,
             num_ref_idx_active_l0: 4,
             num_ref_idx_active_l1: 4,
+            mvd_l1_zero: false,
         };
         assert!(b_gate.inter_pred_idc_gate_open());
         assert!(b_gate.inter_pred_idc_two_bin_form());
@@ -938,6 +955,7 @@ mod tests {
             sym_mvd_gate_open: false,
             num_ref_idx_active_l0: 2,
             num_ref_idx_active_l1: 2,
+            mvd_l1_zero: false,
         };
         assert!(one_bin_gate.inter_pred_idc_gate_open());
         assert!(!one_bin_gate.inter_pred_idc_two_bin_form());
