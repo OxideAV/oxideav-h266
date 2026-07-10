@@ -59,8 +59,8 @@ use crate::ctx::{
     ctx_inc_intra_luma_not_planar_flag, ctx_inc_intra_luma_ref_idx, ctx_inc_intra_mip_flag,
     ctx_inc_intra_subpartitions_mode_flag, ctx_inc_intra_subpartitions_split_flag,
     ctx_inc_merge_subblock_flag, ctx_inc_merge_subblock_idx, ctx_inc_mvp_lx_flag,
-    ctx_inc_pred_mode_ibc_flag, ctx_inc_ref_idx_lx, ctx_inc_regular_merge_flag,
-    ctx_inc_sym_mvd_flag,
+    ctx_inc_pred_mode_flag, ctx_inc_pred_mode_ibc_flag, ctx_inc_ref_idx_lx,
+    ctx_inc_regular_merge_flag, ctx_inc_sym_mvd_flag,
 };
 use crate::inter::{InterCuInfo, MergeData, MotionVector, MvField};
 use crate::residual::{
@@ -828,6 +828,11 @@ pub struct LeafCuCtxs {
     /// like `cu_skip_flag` (`init_type * 3 + ctxInc`, ctxInc from
     /// [`crate::ctx::ctx_inc_pred_mode_ibc_flag`]).
     pub pred_mode_ibc_flag: Vec<ContextModel>,
+    /// `pred_mode_flag` (Table 66) — 4 entries; Table 51 allocates
+    /// initType 1 → slots 0..1 and initType 2 → slots 2..3 (I slices
+    /// never code the bin). Indexed `(init_type - 1) * 2 + ctxInc`
+    /// with ctxInc from [`crate::ctx::ctx_inc_pred_mode_flag`].
+    pub pred_mode_flag: Vec<ContextModel>,
     /// `general_merge_flag` (Table 82) — 3-entry, indexed by
     /// `init_type`.
     pub general_merge_flag: Vec<ContextModel>,
@@ -1044,6 +1049,7 @@ impl LeafCuCtxs {
             cclm_mode_idx: init_contexts(SyntaxCtx::CclmModeIdx, slice_qp_y),
             cu_skip_flag: init_contexts(SyntaxCtx::CuSkipFlag, slice_qp_y),
             pred_mode_ibc_flag: init_contexts(SyntaxCtx::PredModeIbcFlag, slice_qp_y),
+            pred_mode_flag: init_contexts(SyntaxCtx::PredModeFlag, slice_qp_y),
             general_merge_flag: init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp_y),
             regular_merge_flag: init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp_y),
             merge_idx: init_contexts(SyntaxCtx::MergeIdx, slice_qp_y),
@@ -1303,6 +1309,14 @@ pub struct CuNeighbourhood {
     /// Round-406 — `CuPredMode[chType][xNbA][yNbA] == MODE_IBC`
     /// (above mirror of [`Self::left_ibc`]).
     pub above_ibc: bool,
+    /// Round-409 — `CuPredMode[chType][xNbL][yNbL] == MODE_INTRA` per
+    /// §9.3.4.2.2 eq. 1552 / Table 133; drives the `pred_mode_flag`
+    /// ctxInc ([`crate::ctx::ctx_inc_pred_mode_flag`]) on P/B slices.
+    /// Sampled from the same parse-time mode grid as the IBC cond.
+    pub left_intra: bool,
+    /// Round-409 — `CuPredMode[chType][xNbA][yNbA] == MODE_INTRA`
+    /// (above mirror of [`Self::left_intra`]).
+    pub above_intra: bool,
 }
 
 /// Leaf-CU syntax reader. Stateless w.r.t. the spec (each call to
@@ -1340,8 +1354,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         self
     }
 
-    /// Decode the `coding_unit()` body for a leaf CU in an I-slice,
-    /// single-tree pipeline. `info.x0 / y0 / cb_width / cb_height`
+    /// Decode the `coding_unit()` body for a leaf CU (any slice type,
+    /// single-tree or DUAL_TREE_LUMA pipeline).
+    /// `info.x0 / y0 / cb_width / cb_height`
     /// must be populated by the caller; every other field is written
     /// by this method. The residual-level storage (per-plane
     /// coefficient arrays) is filled into `residual` when any CBF
@@ -1355,12 +1370,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     ) -> Result<()> {
         info.pred_mode = CuPredMode::Intra; // I-slice default (§7.4.12.2).
 
-        // ---- Round-21 P/B-slice inter path ------------------------------
-        //
-        // §7.3.11.5 cu_skip_flag is read only outside the
-        // `cbWidth==4 && cbHeight==4` (and IBC corner) cases. In an
-        // inter slice we always read it for the supported sizes; for
-        // 4x4 CUs we infer cu_skip_flag = 0 (no IBC support yet).
+        // ---- P/B-slice path (§7.3.11.5 inter-slice prologue) ------------
         if self.tools.slice_is_inter {
             return self.decode_inter(info, residual, neigh);
         }
@@ -1418,6 +1428,24 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 return self.decode_ibc_tail(info, residual, cu_skip);
             }
         }
+
+        self.decode_intra_body(info, residual, neigh)
+    }
+
+    /// §7.3.11.5 — the MODE_INTRA branch of `coding_unit()`: the
+    /// palette / ACT gates, the intra luma mode cascade (BDPCM → MIP →
+    /// MRL → ISP → MPM), the §8.4.2 / §8.4.3 mode derivations, and the
+    /// intra `transform_unit()` reads. Shared between the I-slice path
+    /// and a P/B-slice CU whose `pred_mode_flag` (or its §7.4.12.5
+    /// inference) resolved to MODE_INTRA — the intra branch of the
+    /// syntax table carries no slice-type condition.
+    fn decode_intra_body(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+        neigh: &CuNeighbourhood,
+    ) -> Result<()> {
+        info.pred_mode = CuPredMode::Intra;
 
         if self.tools.palette {
             return Err(Error::unsupported(
@@ -1969,6 +1997,28 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         Ok(())
     }
 
+    /// §7.3.11.5 `pred_mode_flag` — one bin, FL cMax = 1 (Table 126).
+    /// ctxInc per §9.3.4.2.2 eq. 1552 / Table 133: `(condL && availL)
+    /// || (condA && availA)` with `cond = CuPredMode[chType][xNb][yNb]
+    /// == MODE_INTRA` sampled from the parse-time mode grid. Table 51
+    /// allocates Table 66's 4 contexts as initType 1 → slots 0..1,
+    /// initType 2 → slots 2..3 (an I slice never codes the bin).
+    /// Returns `true` for MODE_INTRA (`pred_mode_flag == 1`).
+    fn read_pred_mode_flag(&mut self, neigh: &CuNeighbourhood) -> Result<bool> {
+        let inc = ctx_inc_pred_mode_flag(
+            neigh.left_available,
+            neigh.above_available,
+            neigh.left_intra,
+            neigh.above_intra,
+        ) as usize;
+        let init_off = (self.ctxs.init_type as usize).saturating_sub(1) * 2;
+        let n = self.ctxs.pred_mode_flag.len() - 1;
+        let bit = self
+            .dec
+            .decode_decision(&mut self.ctxs.pred_mode_flag[(init_off + inc).min(n)])?;
+        Ok(bit == 1)
+    }
+
     fn decode_inter(
         &mut self,
         info: &mut LeafCuInfo,
@@ -2008,15 +2058,30 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         };
         info.inter.cu_skip_flag = cu_skip;
 
-        // pred_mode_flag is signalled when cu_skip_flag == 0 in P/B for
-        // CUs that are not 4x4 and treeType is single. Round-21 does
-        // not yet support non-merge inter CUs (they need MVD coding).
-        // Force MODE_INTER. When cu_skip_flag == 1 the CU is also
-        // necessarily MODE_INTER (and general_merge_flag is inferred 1).
+        // ---- pred_mode_flag (§7.3.11.5, r409) ---------------------------
+        //
+        // Presence condition: `cu_skip_flag == 0 && sh_slice_type != I
+        // && !(cbWidth == 4 && cbHeight == 4) && modeType ==
+        // MODE_TYPE_ALL` (this walker never enters a local dual tree,
+        // so modeType is always MODE_TYPE_ALL). §7.4.12.5 inference
+        // when the bin is absent on a P/B slice: a 4x4 CU is intra
+        // (bullet 1); otherwise — necessarily a skip CU here — inter
+        // (last bullet). ctxInc per eq. 1552 samples the parse-time
+        // `CuPredMode[0][xNb][yNb] == MODE_INTRA` committed in coding
+        // order.
+        let mode_intra = if !cu_skip && !cb_is_4x4 {
+            self.read_pred_mode_flag(neigh)?
+        } else {
+            cb_is_4x4
+        };
+        if mode_intra {
+            // MODE_INTRA CU inside a P/B slice — §7.3.11.5 continues
+            // with the exact intra branch the I-slice path uses
+            // (pred_mode_ibc_flag would only be present with
+            // sps_ibc_enabled_flag, handled one gate up).
+            return self.decode_intra_body(info, residual, neigh);
+        }
         info.pred_mode = CuPredMode::Inter;
-
-        // pred_mode_ibc_flag: not parsed (sps_ibc_enabled_flag = false
-        // in r21 fixtures).
 
         // §7.3.11.5 inter else-branch: if !cu_skip_flag, read
         // general_merge_flag. Otherwise infer it to 1.
@@ -7036,6 +7101,14 @@ mod tests {
         enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
             .unwrap();
 
+        // pred_mode_flag(0) — MODE_INTER (r409: §7.3.11.5 parses the
+        // bin on P/B when cu_skip == 0 and the CU is not 4x4).
+        let pm_inc = crate::ctx::ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        let pm_n = ctxs.pred_mode_flag.len() - 1;
+        let pm_slot = ((init_type as usize).saturating_sub(1) * 2 + pm_inc).min(pm_n);
+        enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 0)
+            .unwrap();
+
         // general_merge_flag(1).
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
@@ -7105,6 +7178,14 @@ mod tests {
         enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
             .unwrap();
 
+        // pred_mode_flag(0) — MODE_INTER (r409: §7.3.11.5 parses the
+        // bin on P/B when cu_skip == 0 and the CU is not 4x4).
+        let pm_inc = crate::ctx::ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        let pm_n = ctxs.pred_mode_flag.len() - 1;
+        let pm_slot = ((init_type as usize).saturating_sub(1) * 2 + pm_inc).min(pm_n);
+        enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 0)
+            .unwrap();
+
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
         let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
@@ -7169,6 +7250,14 @@ mod tests {
         let skip_slot = (init_type as usize) * 3 + skip_inc;
         enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
             .unwrap();
+
+        // pred_mode_flag(0) — MODE_INTER (r409: §7.3.11.5 parses the
+        // bin on P/B when cu_skip == 0 and the CU is not 4x4).
+        let pm_inc = crate::ctx::ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        let pm_n = ctxs.pred_mode_flag.len() - 1;
+        let pm_slot = ((init_type as usize).saturating_sub(1) * 2 + pm_inc).min(pm_n);
+        enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 0)
+            .unwrap();
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
         let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
@@ -7216,6 +7305,14 @@ mod tests {
         let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
         let skip_slot = (init_type as usize) * 3 + skip_inc;
         enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
+            .unwrap();
+
+        // pred_mode_flag(0) — MODE_INTER (r409: §7.3.11.5 parses the
+        // bin on P/B when cu_skip == 0 and the CU is not 4x4).
+        let pm_inc = crate::ctx::ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+        let pm_n = ctxs.pred_mode_flag.len() - 1;
+        let pm_slot = ((init_type as usize).saturating_sub(1) * 2 + pm_inc).min(pm_n);
+        enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 0)
             .unwrap();
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
@@ -8179,5 +8276,191 @@ mod tests {
         let _ = reader.decode(&mut info, &mut residual, &neigh);
         assert_eq!(info.pred_mode, CuPredMode::Intra);
         assert!(!info.inter.cu_skip_flag);
+    }
+
+    // ==== Round-409: §7.3.11.5 pred_mode_flag on P/B slices ====
+
+    fn tools_for_pb_intra() -> CuToolFlags {
+        CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
+            slice_is_inter: true,
+            max_num_merge_cand: 6,
+            ..CuToolFlags::default()
+        }
+    }
+
+    /// Encoder mirror of the r409 P/B prologue + a minimal intra CU:
+    /// cu_skip_flag(0), pred_mode_flag(1), intra_luma_mpm_flag(1),
+    /// intra_luma_not_planar_flag(0) → PLANAR, intra_chroma_pred_mode
+    /// bin0 = 0 → DM (mode 4), then the intra `transform_unit()` CBFs
+    /// all 0.
+    fn build_pb_intra_cu_payload(
+        slice_qp: i32,
+        init_type: u8,
+        pm_inc: u32,
+        skip_inc: u32,
+        with_prologue: bool,
+    ) -> Vec<u8> {
+        use crate::cabac_enc::ArithEncoder;
+        use crate::ctx::{
+            ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+            ctx_inc_intra_luma_not_planar_flag,
+        };
+        use crate::residual_enc::{
+            write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
+        };
+        let mut enc = ArithEncoder::new();
+        let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        if with_prologue {
+            let skip_slot = (init_type as usize) * 3 + skip_inc as usize;
+            enc.encode_decision(&mut ctxs.cu_skip_flag[skip_slot], 0)
+                .unwrap();
+            let pm_n = ctxs.pred_mode_flag.len() - 1;
+            let pm_slot = ((init_type as usize).saturating_sub(1) * 2 + pm_inc as usize).min(pm_n);
+            enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 1)
+                .unwrap();
+        }
+        let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+        enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[inc], 1)
+            .unwrap();
+        let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+        enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[inc], 0)
+            .unwrap();
+        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
+            .unwrap();
+        write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();
+        write_tu_cr_coded_flag(&mut enc, &mut ctxs.residual, false, false, false).unwrap();
+        write_tu_y_coded_flag(&mut enc, &mut ctxs.residual, false, false, false, false).unwrap();
+        enc.encode_terminate(1).unwrap();
+        let mut payload = enc.finish();
+        payload.extend_from_slice(&[0u8; 32]);
+        payload
+    }
+
+    /// §7.3.11.5 — `pred_mode_flag == 1` on a P-slice CU decodes the
+    /// full intra branch (PLANAR + DM chroma + all-zero CBFs) and sets
+    /// `CuPredMode = MODE_INTRA`.
+    #[test]
+    fn pred_mode_flag_one_decodes_intra_cu_on_p_slice() {
+        let slice_qp = 26;
+        let init_type = 1u8; // P-slice.
+        let payload = build_pb_intra_cu_payload(slice_qp, init_type, 0, 0, true);
+        let tools = tools_for_pb_intra();
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("P-slice intra CU must decode clean");
+        assert_eq!(info.pred_mode, CuPredMode::Intra);
+        assert!(!info.inter.cu_skip_flag);
+        assert!(!info.inter.general_merge_flag);
+        assert_eq!(info.intra_pred_mode_y, INTRA_PLANAR);
+        assert_eq!(info.intra_chroma_pred_mode, 4); // DM
+        assert!(!info.tu_y_coded_flag);
+        assert!(!info.tu_cb_coded_flag);
+        assert!(!info.tu_cr_coded_flag);
+    }
+
+    /// §9.3.4.2.2 eq. 1552 — an intra left neighbour flips the
+    /// pred_mode_flag ctxInc to 1; on a B-slice (initType 2) the slot
+    /// is `(2 - 1) * 2 + 1 = 3`. The encoder writes that exact slot
+    /// and the reader must land on it via `CuNeighbourhood`.
+    #[test]
+    fn pred_mode_flag_ctx_inc_samples_intra_neighbour() {
+        let slice_qp = 26;
+        let init_type = 2u8; // B-slice.
+        let payload = build_pb_intra_cu_payload(slice_qp, init_type, 1, 0, true);
+        let tools = tools_for_pb_intra();
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            x0: 8,
+            cb_width: 8,
+            cb_height: 8,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood {
+            left_available: true,
+            left_intra: true,
+            ..CuNeighbourhood::default()
+        };
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("B-slice intra CU with intra left neighbour must decode clean");
+        assert_eq!(info.pred_mode, CuPredMode::Intra);
+        assert_eq!(info.intra_pred_mode_y, INTRA_PLANAR);
+    }
+
+    /// §7.4.12.5 — a 4x4 CU on a P/B slice parses NEITHER cu_skip_flag
+    /// (no IBC) NOR pred_mode_flag; both infer and the CU is
+    /// MODE_INTRA. The payload starts directly at the intra cascade.
+    #[test]
+    fn pred_mode_flag_inferred_intra_on_4x4_pb_cu() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        let payload = build_pb_intra_cu_payload(slice_qp, init_type, 0, 0, false);
+        let tools = tools_for_pb_intra();
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 4,
+            cb_height: 4,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("4x4 P-slice CU must decode as inferred-intra");
+        assert_eq!(info.pred_mode, CuPredMode::Intra);
+        assert!(!info.inter.cu_skip_flag);
+        assert_eq!(info.intra_pred_mode_y, INTRA_PLANAR);
+    }
+
+    /// §7.3.11.5 — `pred_mode_flag == 0` falls through to the
+    /// MODE_INTER merge tail exactly as before (regression guard for
+    /// the r409 prologue insertion).
+    #[test]
+    fn pred_mode_flag_zero_falls_through_to_merge_path() {
+        let slice_qp = 26;
+        let init_type = 1u8;
+        // Reuse the subblock-merge builder: cu_skip(0) →
+        // pred_mode_flag(0) → general_merge(1) → merge_subblock(1) +
+        // idx(0) → residual.
+        let payload = build_subblock_merge_payload(slice_qp, init_type, true, Some((0, 5)), 16, 16);
+        let tools = tools_for_subblock_merge(5);
+        let mut dec = ArithDecoder::new(&payload).unwrap();
+        let mut dctx = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let mut reader = LeafCuReader::new(&mut dec, &mut dctx, tools);
+        reader
+            .decode(&mut info, &mut residual, &neigh)
+            .expect("pred_mode_flag == 0 must continue into merge_data()");
+        assert_eq!(info.pred_mode, CuPredMode::Inter);
+        assert!(info.inter.general_merge_flag);
+        assert!(info.inter.merge_data.merge_subblock_flag);
     }
 }

@@ -2155,6 +2155,15 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 0)
         .unwrap();
 
+    // 2b. pred_mode_flag(0) — MODE_INTER (r409: §7.3.11.5 parses the
+    //     bin on P/B when cu_skip == 0 and the CU is not 4x4). Table
+    //     51 slot = (init_type - 1) * 2 + ctxInc.
+    let mut pred_mode_ctxs = init_contexts(SyntaxCtx::PredModeFlag, slice_qp);
+    let pm_inc = oxideav_h266::ctx::ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+    let pm_slot = ((init_type as usize - 1) * 2 + pm_inc).min(pred_mode_ctxs.len() - 1);
+    enc.encode_decision(&mut pred_mode_ctxs[pm_slot], 0)
+        .unwrap();
+
     // 3. general_merge_flag(1) — merge_data() follows. The leaf
     //    reader picks the ctx slot via `(init_type * 3 + ctxInc).min(n)`
     //    against the 3-entry Table 82 array; encode-side mirrors the
@@ -2505,6 +2514,15 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
     let skip_slot = (init_type as usize) * 3 + skip_inc;
     enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 0)
+        .unwrap();
+
+    // 2b. pred_mode_flag(0) — MODE_INTER (r409: §7.3.11.5 parses the
+    //     bin on P/B when cu_skip == 0 and the CU is not 4x4). Table
+    //     51 slot = (init_type - 1) * 2 + ctxInc.
+    let mut pred_mode_ctxs = init_contexts(SyntaxCtx::PredModeFlag, slice_qp);
+    let pm_inc = oxideav_h266::ctx::ctx_inc_pred_mode_flag(false, false, false, false) as usize;
+    let pm_slot = ((init_type as usize - 1) * 2 + pm_inc).min(pred_mode_ctxs.len() - 1);
+    enc.encode_decision(&mut pred_mode_ctxs[pm_slot], 0)
         .unwrap();
 
     // 3. general_merge_flag(1).
@@ -3562,4 +3580,159 @@ fn decode_i_slice_ibc_skip_merge_amvr_chain() {
     let c3 = mf.get_at_luma(104, 8);
     assert_eq!(c3.mv_l0, MotionVector { x: -64 << 4, y: 0 });
     assert!(!c1.pred_flag_l0 && !c2.pred_flag_l0 && !c3.pred_flag_l0);
+}
+
+/// Round-409 — §7.3.11.5 `pred_mode_flag` on a P-slice, end-to-end.
+/// A 16x16 P-slice quad-splits into four 8x8 CUs: TL / TR / BL are
+/// skip-merge CUs picking the zero-MV candidate off a constant-64
+/// reference, and BR — the LAST CU in z-order, so every intra
+/// reference sample is either already reconstructed or outside the
+/// picture — is a MODE_INTRA CU (`pred_mode_flag == 1`) coding
+/// PLANAR + DM chroma with all CBFs 0. On a constant reference the
+/// PLANAR prediction over constant neighbours is constant, so the
+/// whole decoded picture must equal the reference byte-for-byte.
+///
+/// The fixture also pins two r409 ctxInc derivations end-to-end:
+/// * cu_skip_flag samples the parse-time `CuSkipFlag` grid (TR / BL
+///   read inc 1 off the skip TL; BR reads inc 2 — left BL and above
+///   TR are both skip);
+/// * pred_mode_flag's eq. 1552 ctxInc is 0 for BR (left BL and above
+///   TR are both MODE_INTER).
+#[test]
+fn decode_p_slice_intra_cu_via_pred_mode_flag() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_cu_skip_flag, ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+        ctx_inc_intra_luma_not_planar_flag, ctx_inc_merge_idx, ctx_inc_pred_mode_flag,
+        ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
+    };
+    use oxideav_h266::leaf_cu::LeafCuCtxs;
+    use oxideav_h266::residual_enc::{
+        write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64);
+    let ref_pic = ReferencePicture {
+        poc: 0,
+        frame: ref_buf.clone(),
+        motion_field: None,
+    };
+
+    let slice_qp = 26;
+    let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut leaf_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
+    let mut enc = ArithEncoder::new();
+
+    // Root split_cu_flag(1) + split_qt_flag(1) → four 8x8 children.
+    let split_cu_inc_root =
+        ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_cu_n = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[split_cu_inc_root.min(split_cu_n)], 1)
+        .unwrap();
+    let split_qt_inc_root = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let split_qt_n = split_qt_ctxs.len() - 1;
+    enc.encode_decision(&mut split_qt_ctxs[split_qt_inc_root.min(split_qt_n)], 1)
+        .unwrap();
+    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    for _ in 0..4 {
+        enc.encode_decision(&mut split_cu_ctxs[split_inc_8.min(split_cu_n)], 0)
+            .unwrap();
+    }
+
+    let skip_slot = |inc: u32| (init_type as usize) * 3 + inc as usize;
+    let merge_inc = ctx_inc_merge_idx() as usize;
+    let merge_n = leaf_ctxs.merge_idx.len() - 1;
+    let merge_slot = (init_type as usize + merge_inc).min(merge_n);
+
+    // TL — skip merge (inc 0, no committed neighbours).
+    let inc = ctx_inc_cu_skip_flag(false, false, false, false);
+    enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 1)
+        .unwrap();
+    enc.encode_decision(&mut leaf_ctxs.merge_idx[merge_slot], 0)
+        .unwrap();
+
+    // TR — skip merge (inc 1: left TL is skip).
+    let inc = ctx_inc_cu_skip_flag(true, false, true, false);
+    enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 1)
+        .unwrap();
+    enc.encode_decision(&mut leaf_ctxs.merge_idx[merge_slot], 0)
+        .unwrap();
+
+    // BL — skip merge (inc 1: above TL is skip).
+    let inc = ctx_inc_cu_skip_flag(false, true, false, true);
+    enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 1)
+        .unwrap();
+    enc.encode_decision(&mut leaf_ctxs.merge_idx[merge_slot], 0)
+        .unwrap();
+
+    // BR — intra CU. cu_skip(0) with inc 2 (left BL and above TR both
+    // skip on the parse-time grid); pred_mode_flag(1) with eq. 1552
+    // inc 0 (both neighbours are MODE_INTER).
+    let inc = ctx_inc_cu_skip_flag(true, true, true, true);
+    enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 0)
+        .unwrap();
+    let pm_inc = ctx_inc_pred_mode_flag(true, true, false, false) as usize;
+    let pm_n = leaf_ctxs.pred_mode_flag.len() - 1;
+    let pm_slot = ((init_type as usize - 1) * 2 + pm_inc).min(pm_n);
+    enc.encode_decision(&mut leaf_ctxs.pred_mode_flag[pm_slot], 1)
+        .unwrap();
+    // Intra cascade: MPM → PLANAR; DM chroma; all CBFs 0.
+    let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    enc.encode_decision(&mut leaf_ctxs.intra_luma_mpm_flag[inc], 1)
+        .unwrap();
+    let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    enc.encode_decision(&mut leaf_ctxs.intra_luma_not_planar_flag[inc], 0)
+        .unwrap();
+    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    enc.encode_decision(&mut leaf_ctxs.intra_chroma_pred_mode[inc], 0)
+        .unwrap();
+    write_tu_cb_coded_flag(&mut enc, &mut leaf_ctxs.residual, false, false).unwrap();
+    write_tu_cr_coded_flag(&mut enc, &mut leaf_ctxs.residual, false, false, false).unwrap();
+    write_tu_y_coded_flag(
+        &mut enc,
+        &mut leaf_ctxs.residual,
+        false,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    enc.encode_terminate(1).unwrap();
+    let payload = enc.finish();
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.six_minus_max_num_merge_cand = 0; // MaxNumMergeCand = 6
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = StatefulSliceHeader {
+        sh_slice_type: SliceType::P,
+        sh_qp_delta: 0,
+        ..Default::default()
+    };
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    walker.set_ref_pic_list_l0(vec![ref_pic]);
+
+    let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 222);
+    walker.decode_picture_into(&mut out).unwrap();
+    walker.apply_in_loop_filters(&mut out).unwrap();
+
+    assert_eq!(
+        out.luma.samples, ref_buf.luma.samples,
+        "P-slice with an intra PLANAR CU over a constant reference must stay constant"
+    );
+    assert_eq!(out.cb.samples, ref_buf.cb.samples, "Cb plane");
+    assert_eq!(out.cr.samples, ref_buf.cr.samples, "Cr plane");
+
+    // The intra CU must NOT write the motion field — its cells stay
+    // unavailable so later merge/AMVP scans reject them per §6.4.4 +
+    // the CuPredMode != MODE_INTER candidate gates.
+    let mf = walker.motion_field();
+    assert!(!mf.get_at_luma(12, 12).available, "intra CU cell");
+    assert!(mf.get_at_luma(4, 4).available, "skip CU cell");
 }

@@ -31,8 +31,7 @@ use oxideav_core::Result;
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::ctx::{
     ctx_inc_intra_luma_mpm_flag, ctx_inc_mtt_split_cu_binary_flag,
-    ctx_inc_mtt_split_cu_vertical_flag, ctx_inc_pred_mode_flag, ctx_inc_split_cu_flag,
-    ctx_inc_split_qt_flag,
+    ctx_inc_mtt_split_cu_vertical_flag, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
 };
 
 /// §7.3.11.4 `treeType` — whether a single tree partitions the CTU
@@ -73,12 +72,11 @@ pub struct TreeCtxs {
     pub mtt_split_vertical: Vec<ContextModel>,
     /// Round-55 — `mtt_split_cu_binary_flag` per Table 62 (12 ctxIdx).
     pub mtt_split_binary: Vec<ContextModel>,
-    pub pred_mode: Vec<ContextModel>,
     pub intra_luma_mpm: Vec<ContextModel>,
 }
 
 impl TreeCtxs {
-    /// Build the context arrays from Table 59 / 60 / 61 / 62 / 66 / 75
+    /// Build the context arrays from Table 59 / 60 / 61 / 62 / 75
     /// at the supplied slice QP.
     pub fn init(slice_qp_y: i32) -> Self {
         use crate::tables::{init_contexts, SyntaxCtx};
@@ -87,7 +85,6 @@ impl TreeCtxs {
             split_qt: init_contexts(SyntaxCtx::SplitQtFlag, slice_qp_y),
             mtt_split_vertical: init_contexts(SyntaxCtx::MttSplitCuVerticalFlag, slice_qp_y),
             mtt_split_binary: init_contexts(SyntaxCtx::MttSplitCuBinaryFlag, slice_qp_y),
-            pred_mode: init_contexts(SyntaxCtx::PredModeFlag, slice_qp_y),
             intra_luma_mpm: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp_y),
         }
     }
@@ -495,14 +492,6 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
 pub fn read_intra_luma_mpm_flag(dec: &mut ArithDecoder<'_>, ctxs: &mut TreeCtxs) -> Result<u32> {
     let inc = ctx_inc_intra_luma_mpm_flag() as usize;
     dec.decode_decision(&mut ctxs.intra_luma_mpm[inc])
-}
-
-/// Read a `pred_mode_flag` bin at the root of an intra-inter-capable
-/// CU. Always returns 1 in an I-slice because pred_mode_flag is never
-/// signalled there — but exposed for completeness.
-pub fn read_pred_mode_flag(dec: &mut ArithDecoder<'_>, ctxs: &mut TreeCtxs) -> Result<u32> {
-    let inc = ctx_inc_pred_mode_flag(false, false, false, false) as usize;
-    dec.decode_decision(&mut ctxs.pred_mode[inc])
 }
 
 #[cfg(test)]

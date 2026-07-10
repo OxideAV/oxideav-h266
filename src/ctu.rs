@@ -922,10 +922,14 @@ pub struct CtuWalker<'a, 'b> {
     ibc_mode_grid: Vec<bool>,
     /// Round-406 — parse-time `CuSkipFlag[x][y]` mirror at 4x4 luma
     /// granularity, committed like [`Self::ibc_mode_grid`]. The
-    /// I-slice IBC `cu_skip_flag` ctxInc samples this grid (the
-    /// legacy inter-slice path keeps sampling the motion field, which
-    /// is written at reconstruction time).
+    /// `cu_skip_flag` ctxInc samples this grid on every slice type
+    /// (§7.4.12.5 defines CuSkipFlag as a parse-time variable; r409).
     parse_cu_skip_grid: Vec<bool>,
+    /// Round-409 — parse-time `CuPredMode[0][x][y] == MODE_INTRA`
+    /// mirror at 4x4 luma granularity, committed like
+    /// [`Self::ibc_mode_grid`]. The P/B-slice `pred_mode_flag` ctxInc
+    /// (§9.3.4.2.2 eq. 1552 / Table 133) samples this grid.
+    parse_intra_grid: Vec<bool>,
     /// Round-406 — §8.6 IBC state (IbcVirBuf + HmvpIbcCandList).
     /// `Some` iff `sps_ibc_enabled_flag`; the per-CTU-row resets fire
     /// in [`Self::decode_picture_into`], the per-CU eqs. 181 / 182
@@ -1115,6 +1119,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let inter_affine_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let ibc_mode_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let parse_cu_skip_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        let parse_intra_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         // Round-406 — §8.6 IBC state, allocated only when the SPS
         // enables the tool (§7.4.3.4 eqs. 45 / 46 buffer geometry).
         let ibc = if sps.tool_flags.ibc_enabled_flag {
@@ -1172,6 +1177,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             inter_affine_grid,
             ibc_mode_grid,
             parse_cu_skip_grid,
+            parse_intra_grid,
             ibc,
             affine_cpmv_field,
             lmcs: None,
@@ -1613,9 +1619,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.parse_cu_skip_grid[(by * self.intra_grid_w + bx) as usize]
     }
 
-    /// Round-406 — broadcast the parse-time IBC / cu-skip cells for a
-    /// freshly parsed leaf CU.
-    fn write_parse_mode_block(&mut self, x: u32, y: u32, w: u32, h: u32, ibc: bool, skip: bool) {
+    /// Round-409 — sample the parse-time `CuPredMode == MODE_INTRA`
+    /// grid at picture-absolute luma `(x, y)`. `false` when out of
+    /// bounds (§6.4.4 unavailable → cond = 0).
+    fn sample_parse_intra_at_luma(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.intra_grid_w || by >= self.intra_grid_h {
+            return false;
+        }
+        self.parse_intra_grid[(by * self.intra_grid_w + bx) as usize]
+    }
+
+    /// Round-406/409 — broadcast the parse-time `CuPredMode` +
+    /// `CuSkipFlag` cells for a freshly parsed leaf CU (committed in
+    /// coding order, per the §7.4.12.5 variable definitions).
+    fn write_parse_mode_block(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        mode: CuPredMode,
+        skip: bool,
+    ) {
         let bx0 = x / 4;
         let by0 = y / 4;
         let bx1 = (x + w).div_ceil(4).min(self.intra_grid_w);
@@ -1623,7 +1653,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         for by in by0..by1 {
             let row_off = (by * self.intra_grid_w) as usize;
             for bx in bx0..bx1 {
-                self.ibc_mode_grid[row_off + bx as usize] = ibc;
+                self.ibc_mode_grid[row_off + bx as usize] = matches!(mode, CuPredMode::Ibc);
+                self.parse_intra_grid[row_off + bx as usize] = matches!(mode, CuPredMode::Intra);
                 self.parse_cu_skip_grid[row_off + bx as usize] = skip;
             }
         }
@@ -2163,17 +2194,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // overlapping picture region is wiped. When the affine
         // walker lands, swap the `false` below for the parsed flag.
         self.write_inter_affine_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
-        // Round-406 — parse-time MODE_IBC + CuSkipFlag broadcast so
-        // the next CU's §9.3.4.2.2 pred_mode_ibc_flag / cu_skip_flag
-        // ctxIncs see this CU in coding order (the motion field is
-        // only written at reconstruction time, i.e. after the whole
-        // CTU has been parsed).
+        // Round-406/409 — parse-time CuPredMode + CuSkipFlag broadcast
+        // so the next CU's §9.3.4.2.2 pred_mode_flag /
+        // pred_mode_ibc_flag / cu_skip_flag ctxIncs see this CU in
+        // coding order (the motion field is only written at
+        // reconstruction time, i.e. after the whole CTU has been
+        // parsed).
         self.write_parse_mode_block(
             cu.cu.x,
             cu.cu.y,
             cu.cu.w,
             cu.cu.h,
-            matches!(info.pred_mode, CuPredMode::Ibc),
+            info.pred_mode,
             info.inter.cu_skip_flag,
         );
     }
@@ -2209,6 +2241,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // parse-time MODE_IBC grid.
         let left_ibc = self.sample_ibc_mode_at_luma(x - 1, y);
         let above_ibc = self.sample_ibc_mode_at_luma(x, y - 1);
+        // Round-409 — pred_mode_flag's Table 133 cond (`CuPredMode ==
+        // MODE_INTRA`) samples the parse-time mode grid the same way.
+        let left_intra = self.sample_parse_intra_at_luma(x - 1, y);
+        let above_intra = self.sample_parse_intra_at_luma(x, y - 1);
         // Round-409 conformance fix — §7.4.12.5 defines `CuSkipFlag[x][y]`
         // as a PARSE-TIME variable committed per `coding_unit()` in
         // decoding order, and the Table 133 cu_skip_flag row samples it
@@ -2236,6 +2272,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             above_inter_affine,
             left_ibc,
             above_ibc,
+            left_intra,
+            above_intra,
         }
     }
 
@@ -3244,7 +3282,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bdpcm_chroma: false,
         });
         self.write_intra_block(x_cb, y_cb, cb_w, cb_h, false);
-        self.write_parse_mode_block(x_cb, y_cb, cb_w, cb_h, true, info.inter.cu_skip_flag);
+        self.write_parse_mode_block(
+            x_cb,
+            y_cb,
+            cb_w,
+            cb_h,
+            CuPredMode::Ibc,
+            info.inter.cu_skip_flag,
+        );
         self.commit_subblock_neighbour_state(cu, info);
         Ok(())
     }
@@ -7966,7 +8011,7 @@ mod tests {
         // All four table groups must be populated.
         assert!(!state.tree_ctxs.split_cu.is_empty());
         assert!(!state.tree_ctxs.split_qt.is_empty());
-        assert!(!state.tree_ctxs.pred_mode.is_empty());
+        assert!(!state.tree_ctxs.mtt_split_vertical.is_empty());
         assert!(!state.tree_ctxs.intra_luma_mpm.is_empty());
     }
 
@@ -13759,7 +13804,7 @@ mod tests {
         // CU parsed earlier in the same CTU. Commit that CU's
         // parse-time state as skip; leave the motion field untouched
         // (reconstruction has not run — the stale pre-r409 source).
-        walker.write_parse_mode_block(0, 0, 8, 8, false, true);
+        walker.write_parse_mode_block(0, 0, 8, 8, CuPredMode::Inter, true);
         let ccu = CtuCu {
             ctu_addr_rs: 0,
             cu: Cu {
