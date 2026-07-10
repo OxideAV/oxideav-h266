@@ -189,6 +189,7 @@ pub mod end_of_seq;
 pub mod filler_data;
 pub mod gpm;
 pub mod hrd;
+pub mod ibc;
 pub mod inter;
 pub mod intra;
 pub mod isp;
