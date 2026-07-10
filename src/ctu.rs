@@ -2197,8 +2197,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     fn compute_cu_neighbourhood(&self, ccu: &CtuCu) -> CuNeighbourhood {
         let x = ccu.cu.x as i32;
         let y = ccu.cu.y as i32;
-        let left = self.motion_field.get_at_luma(x - 1, y);
-        let above = self.motion_field.get_at_luma(x, y - 1);
         // §9.3.4.2.2 / Table 133 neighbour positions: the merge-side
         // ctxInc samples the same `(xCb − 1, yCb)` (left) and
         // `(xCb, yCb − 1)` (above) 4×4 cells the cu_skip_flag /
@@ -2208,24 +2206,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let left_inter_affine = self.sample_inter_affine_at_luma(x - 1, y);
         let above_inter_affine = self.sample_inter_affine_at_luma(x, y - 1);
         // Round-406 — pred_mode_ibc_flag's Table 133 cond samples the
-        // parse-time MODE_IBC grid. In an I-slice the cu_skip ctxInc
-        // also uses the parse-time grid (the motion field lags a full
-        // CTU behind during the parse pass); the inter-slice path
-        // keeps its historical motion-field sourcing.
+        // parse-time MODE_IBC grid.
         let left_ibc = self.sample_ibc_mode_at_luma(x - 1, y);
         let above_ibc = self.sample_ibc_mode_at_luma(x, y - 1);
-        let slice_is_i = self.sh.sh_slice_type == SliceType::I;
-        let (left_cu_skip, above_cu_skip) = if slice_is_i {
-            (
-                self.sample_parse_cu_skip_at_luma(x - 1, y),
-                self.sample_parse_cu_skip_at_luma(x, y - 1),
-            )
-        } else {
-            (
-                left.available && left.cu_skip_flag,
-                above.available && above.cu_skip_flag,
-            )
-        };
+        // Round-409 conformance fix — §7.4.12.5 defines `CuSkipFlag[x][y]`
+        // as a PARSE-TIME variable committed per `coding_unit()` in
+        // decoding order, and the Table 133 cu_skip_flag row samples it
+        // directly. The pre-r409 inter-slice path sampled the motion
+        // field instead, which is only written during reconstruction —
+        // one whole CTU behind the parse — so every within-CTU
+        // neighbour read a stale `false` and the eq. 1551 ctxInc was
+        // wrong on any conforming stream with adjacent skip CUs inside
+        // one CTU. All slice types now sample the parse-time grid
+        // (the same one the I-slice IBC prologue used since r406).
+        let (left_cu_skip, above_cu_skip) = (
+            self.sample_parse_cu_skip_at_luma(x - 1, y),
+            self.sample_parse_cu_skip_at_luma(x, y - 1),
+        );
         CuNeighbourhood {
             left_available: x > 0,
             above_available: y > 0,
@@ -7573,16 +7570,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             && self.sps.partition_constraints.qtbtt_dual_tree_intra_flag;
         let ctus: Vec<CtuPos> = self.iter_ctus().collect();
         for ctu in &ctus {
-            // §7.3.11.1 — at the start of every CTU row (this walker's
-            // single-tile layout puts the tile-column boundary at
-            // CtbAddrX == 0) the IBC history list resets
-            // (`NumHmvpIbcCand = 0`) and `ResetIbcBuf = 1` arms the
-            // §7.4.12.5 eq. 181 buffer invalidation.
             if ctu.x_ctb == 0 {
-                if let Some(ibc) = self.ibc.as_mut() {
-                    ibc.hmvp.reset();
-                    ibc.virbuf.mark_reset();
-                }
+                self.on_ctu_row_start();
             }
             // §7.3.11.2: `sao(rx, ry)` is decoded at the start of every
             // CTU (before the partition tree). The helper short-circuits
@@ -7598,6 +7587,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
         }
         Ok(())
+    }
+
+    /// §7.3.11.1 — the per-CTU-row state resets. `slice_data()` runs
+    /// this whenever `CtbAddrX == CtbToTileColBd[CtbAddrX]` — with this
+    /// walker's single-tile layout, exactly at the start of every CTU
+    /// row (`CtbAddrX == 0`):
+    ///
+    /// * `NumHmvpCand = 0` — the §8.5.2.16 regular HMVP candidate
+    ///   list empties (r409 conformance fix: pre-r409 the table
+    ///   persisted across CTU rows, so a merge / AMVP candidate list
+    ///   on any picture taller than one CTU could pull in an HMVP
+    ///   candidate the spec had discarded);
+    /// * `NumHmvpIbcCand = 0` — the §8.6.2.6 IBC history list empties;
+    /// * `ResetIbcBuf = 1` — arms the §7.4.12.5 eq. 181 `IbcVirBuf`
+    ///   invalidation applied at the next `coding_unit()`.
+    fn on_ctu_row_start(&mut self) {
+        self.hmvp.reset();
+        if let Some(ibc) = self.ibc.as_mut() {
+            ibc.hmvp.reset();
+            ibc.virbuf.mark_reset();
+        }
     }
 
     /// Apply the §8.8 in-loop filters to a partially-reconstructed
@@ -13678,5 +13688,122 @@ mod tests {
             .reconstruct_leaf_cu(&cu1, &info, &residual, &mut out)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    /// §7.3.11.1 — `NumHmvpCand = 0` at every tile-column start (CTU
+    /// row start in the single-tile layout). r409 conformance fix: the
+    /// regular §8.5.2.16 HMVP table must empty alongside the IBC list,
+    /// so a merge / AMVP candidate list in a new CTU row never sees a
+    /// history candidate from the previous row.
+    #[test]
+    fn on_ctu_row_start_resets_regular_and_ibc_hmvp() {
+        let sps = ibc_sps(32, 64);
+        let pps = dummy_pps(32, 64, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 16];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        walker.hmvp.update_with(MvField {
+            mv_l0: MotionVector::from_int_pel(2, 1),
+            ref_idx_l0: 0,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+        });
+        walker
+            .ibc
+            .as_mut()
+            .unwrap()
+            .hmvp
+            .update(MotionVector::from_int_pel(-8, 0));
+        assert_eq!(walker.hmvp_table().len(), 1);
+        assert_eq!(walker.ibc.as_ref().unwrap().hmvp.len(), 1);
+
+        walker.on_ctu_row_start();
+
+        assert_eq!(
+            walker.hmvp_table().len(),
+            0,
+            "§7.3.11.1 NumHmvpCand = 0 must empty the regular HMVP table at a CTU-row start"
+        );
+        assert_eq!(
+            walker.ibc.as_ref().unwrap().hmvp.len(),
+            0,
+            "§7.3.11.1 NumHmvpIbcCand = 0 must empty the IBC HMVP list at a CTU-row start"
+        );
+    }
+
+    /// §7.4.12.5 / Table 133 — `CuSkipFlag[x][y]` is a parse-time
+    /// variable committed per `coding_unit()` in decoding order; the
+    /// cu_skip_flag ctxInc must sample it on EVERY slice type. r409
+    /// conformance fix: the inter-slice path used to sample the motion
+    /// field, which reconstruction writes a whole CTU behind the parse.
+    #[test]
+    fn cu_skip_neighbourhood_samples_parse_time_grid_on_inter_slices() {
+        let sps = dummy_sps(0, 32, 32);
+        let pps = dummy_pps(32, 32, true);
+        let mut sh = intra_slice_header();
+        sh.sh_slice_type = SliceType::P;
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 16];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // A CU at (8, 0): its left neighbour cell (7, 0) belongs to a
+        // CU parsed earlier in the same CTU. Commit that CU's
+        // parse-time state as skip; leave the motion field untouched
+        // (reconstruction has not run — the stale pre-r409 source).
+        walker.write_parse_mode_block(0, 0, 8, 8, false, true);
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 8,
+                y: 0,
+                w: 8,
+                h: 8,
+                cqt_depth: 1,
+                mtt_depth: 0,
+            },
+        };
+        let neigh = walker.compute_cu_neighbourhood(&ccu);
+        assert!(
+            neigh.left_cu_skip,
+            "left CuSkipFlag must come from the parse-time grid on a P-slice"
+        );
+        assert!(!neigh.above_cu_skip);
+
+        // Conversely: a motion-field-only skip mark (as if from a
+        // previous picture's reconstruction) must NOT leak into the
+        // parse-time ctxInc.
+        let mut walker2 = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker2.motion_field.write_block(
+            0,
+            0,
+            8,
+            8,
+            MvField {
+                mv_l0: MotionVector::ZERO,
+                ref_idx_l0: 0,
+                pred_flag_l0: true,
+                mv_l1: MotionVector::ZERO,
+                ref_idx_l1: -1,
+                pred_flag_l1: false,
+                cu_skip_flag: true,
+                mode_inter: true,
+                available: true,
+                bcw_idx: 0,
+            },
+        );
+        let neigh2 = walker2.compute_cu_neighbourhood(&ccu);
+        assert!(
+            !neigh2.left_cu_skip,
+            "the motion field must no longer drive the cu_skip_flag ctxInc"
+        );
     }
 }

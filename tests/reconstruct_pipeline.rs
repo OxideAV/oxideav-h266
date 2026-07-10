@@ -1260,30 +1260,35 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
     //    leaf_ctxs), the arithmetic coder's range/low state is shared,
     //    so bin order in the stream must match the decoder's read order.
     //
-    // Note on cu_skip_flag ctxInc: the decoder's
-    // [`CtuWalker::compute_cu_neighbourhood`] samples the motion field
-    // in its parse-time state. The motion-field writes performed by
-    // [`CtuWalker::reconstruct_leaf_cu_inter`] only happen during
-    // [`CtuWalker::decode_picture_into`] — *after* `decode_ctu_full`
-    // has parsed every CU's syntax. So during parse every prior CU's
-    // motion-field slot is still UNAVAILABLE, `left_cu_skip =
-    // above_cu_skip = false` for every CU, ctxInc = 0, and the slot
-    // is `init_type * 3 + 0 = 3` uniformly.
+    // Note on cu_skip_flag ctxInc (r409): §7.4.12.5 defines
+    // `CuSkipFlag[x][y]` as a parse-time variable committed per
+    // `coding_unit()` in decoding order, and the decoder samples it
+    // through its parse-time grid. In z-order TL parses first with no
+    // committed neighbours (ctxInc 0); TR sees the skip TL on its left
+    // (ctxInc 1); BL sees the skip TL above (ctxInc 1); BR sees the
+    // skip BL left AND the skip TR above (ctxInc 2). Slot =
+    // `init_type * 3 + ctxInc`.
     let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
     let split_slot_8 = split_inc_8.min(split_cu_n_minus1);
     let merge_inc = ctx_inc_merge_idx() as usize;
     let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
     let merge_slot = (init_type as usize + merge_inc).min(merge_idx_n_minus1);
-    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
-    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    let skip_incs = [
+        ctx_inc_cu_skip_flag(false, false, false, false), // TL
+        ctx_inc_cu_skip_flag(true, false, true, false),   // TR: left = skip TL
+        ctx_inc_cu_skip_flag(false, true, false, true),   // BL: above = skip TL
+        ctx_inc_cu_skip_flag(true, true, true, true),     // BR: left BL + above TR
+    ];
 
     // a) Four split_cu_flag(0) for the four 8x8 children (TL, TR, BL, BR).
     for _ in 0..4 {
         enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
             .unwrap();
     }
-    // b) Four (cu_skip(1) + merge_idx(0)) pairs in z-order.
-    for _ in 0..4 {
+    // b) Four (cu_skip(1) + merge_idx(0)) pairs in z-order, each with
+    //    its own parse-time-grid ctxInc.
+    for inc in skip_incs {
+        let skip_slot = (init_type as usize) * 3 + inc as usize;
         enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
             .unwrap();
         enc.encode_decision(&mut merge_idx_ctxs[merge_slot], 0)
@@ -1723,14 +1728,21 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
     )
     .unwrap();
 
-    // Per-leaf bin slots.
+    // Per-leaf bin slots. cu_skip_flag ctxInc follows the parse-time
+    // `CuSkipFlag` grid committed in z-order (§7.4.12.5 / Table 133,
+    // r409): TL has no committed neighbours (inc 0), TR / BL each see
+    // one skip neighbour (inc 1), BR sees two (inc 2).
     let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
     let split_slot_8 = split_inc_8.min(split_cu_n_minus1);
     let merge_inc = ctx_inc_merge_idx() as usize;
     let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
     let merge_slot = (init_type as usize + merge_inc).min(merge_idx_n_minus1);
-    let skip_inc = ctx_inc_cu_skip_flag(false, false, false, false) as usize;
-    let skip_slot = (init_type as usize) * 3 + skip_inc;
+    let skip_incs = [
+        ctx_inc_cu_skip_flag(false, false, false, false), // TL
+        ctx_inc_cu_skip_flag(true, false, true, false),   // TR: left = skip TL
+        ctx_inc_cu_skip_flag(false, true, false, true),   // BL: above = skip TL
+        ctx_inc_cu_skip_flag(true, true, true, true),     // BR: left BL + above TR
+    ];
 
     // Four split_cu_flag(0) for the four 8x8 children.
     for _ in 0..4 {
@@ -1748,8 +1760,9 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
     //     (`while val < cmax` falls through).
     let max_merge_minus1: u32 = 5;
     let merge_idx_values: [u32; 4] = [0, 1, 2, 5];
-    for &mi in &merge_idx_values {
+    for (&mi, &skip_inc) in merge_idx_values.iter().zip(skip_incs.iter()) {
         // cu_skip_flag(1).
+        let skip_slot = (init_type as usize) * 3 + skip_inc as usize;
         enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
             .unwrap();
         // merge_idx truncated-unary encode.
