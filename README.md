@@ -141,6 +141,29 @@ P + B-slice merge subset:
   CCLM resolved to the collocated luma mode). Chroma-tree
   deblocking-edge records are a documented approximation (luma-tree
   geometry).
+* **IBC — intra block copy** (r406, §7.3.11.5 / §8.6) — single-tree
+  I-slice IBC decodes end-to-end. Parse: the `cu_skip_flag` /
+  `pred_mode_ibc_flag` prologue (Table 65 contexts, the §9.3.4.2.2
+  eq. 1551 ctxInc against a parse-time per-4×4 `CuPredMode == MODE_IBC`
+  neighbour grid committed in coding order), the §7.3.11.7 IBC merge
+  arm (`merge_idx`, TR `cMax = MaxNumIbcMergeCand − 1`, eq. 62), and
+  the non-merge arm (`mvd_coding`, `mvp_l0_flag`,
+  `amvr_precision_idx` with the Table 16 IBC column — 1-pel / 4-pel).
+  Reconstruction: the §8.6.2 block-vector derivation (spatial A1 / B1
+  with the §6.4.4 `checkPredModeY` IBC-neighbour gate,
+  `HmvpIbcCandList` with the §8.6.2.6 update + the §7.3.11.1
+  per-CTU-row reset, zero pad, §8.5.2.14 AMVR rounding of the
+  predictor + the eqs. 1092 – 1095 18-bit fold), the §8.6.3 prediction
+  from the `IbcVirBuf` virtual buffer (§7.4.3.4 eqs. 45 – 47 geometry,
+  §7.4.12.5 eqs. 181 / 182 per-CU invalidation, §8.7.5.1
+  eqs. 1207 – 1209 fill after every reconstructed CU, and the
+  §8.6.2.1 reference-region conformance constraints enforced) for
+  luma + 4:2:0 chroma via the §8.6.2.5 `bvC`, the shared MODE_INTER
+  residual tail (without the §8.7.5.2 LMCS forward mapping — an IBC
+  prediction copies already-mapped-domain samples), and the
+  eqs. 1111 – 1118 bookkeeping (`MvL0 = bvL`, `PredFlagLX = 0`,
+  `RefIdxLX = −1`). Dual-tree-luma IBC and P/B-slice IBC surface a
+  precise `Error::Unsupported`.
 * **Dependent quantization + sign data hiding** (r387) — the §7.4.12.11
   eq. 198 `QStateTransTable` trellis runs through every regular
   `residual_coding()` read (pass-1 `AbsLevelPass1 & 1` / pass-3
@@ -183,9 +206,12 @@ P + B-slice merge subset:
   `CtuWalker::motion_field_for_temporal()` so a later picture's
   §8.5.2.11 / §8.5.2.12 collocated derivation sees the refined MVs.
   High-bit-depth (Main10 / Main12) reconstruction
-  runs through `u16` picture planes. A non-skip merge / CIIP CU whose
-  `cu_coded_flag == 1` decodes its §7.3.11.10 `transform_unit()`
-  residual (MODE_INTER luma-CBF condition + chroma CBFs) and adds the
+  runs through `u16` picture planes. A non-skip merge / CIIP CU always
+  decodes its §7.3.11.10 `transform_unit()` residual — §7.3.11.5 puts
+  no `cu_coded_flag` bin on a merge CU; the §7.4.12.5 inference reads
+  0 for skip and 1 otherwise (r406 conformance fix: the reader
+  previously consumed a spurious bin here) — (MODE_INTER luma-CBF
+  condition + chroma CBFs) and adds the
   §8.7.3 dequant + §8.7.4 inverse-DCT-II residual to the MC prediction
   per §8.5.8 + §8.7.5.1 (`recSamples = Clip1(predSamples + resSamples)`).
   **SBT** (§7.4.12.5 / §8.7.4.1): when `cu_sbt_flag == 1` the CU's luma
