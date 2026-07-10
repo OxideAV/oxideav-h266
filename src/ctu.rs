@@ -926,6 +926,12 @@ pub struct CtuWalker<'a, 'b> {
     /// legacy inter-slice path keeps sampling the motion field, which
     /// is written at reconstruction time).
     parse_cu_skip_grid: Vec<bool>,
+    /// Round-406 — §8.6 IBC state (IbcVirBuf + HmvpIbcCandList).
+    /// `Some` iff `sps_ibc_enabled_flag`; the per-CTU-row resets fire
+    /// in [`Self::decode_picture_into`], the per-CU eqs. 181 / 182
+    /// invalidations + the §8.7.5.1 eqs. 1207 – 1209 fill in
+    /// [`Self::reconstruct_leaf_cu`].
+    ibc: Option<IbcState>,
     /// Round-364 — per-CB affine CPMV store sampled at 4x4 luma
     /// granularity (§8.5.5.7 / §8.5.5.5). Every affine-coded CB
     /// broadcasts its [`crate::inter::AffineCbRecord`] (origin, dims,
@@ -989,6 +995,14 @@ impl std::fmt::Debug for CtuWalker<'_, '_> {
             .field("sh_cabac_init_flag", &self.cabac.sh_cabac_init_flag)
             .finish()
     }
+}
+
+/// Round-406 — §8.6 IBC per-slice state bundle.
+struct IbcState {
+    /// `IbcVirBuf` (§7.4.3.4 eqs. 45 / 46 geometry).
+    virbuf: crate::ibc::IbcVirtualBuffer,
+    /// `HmvpIbcCandList` (§8.6.2.4 / §8.6.2.6).
+    hmvp: crate::ibc::HmvpIbcList,
 }
 
 impl<'a, 'b> CtuWalker<'a, 'b> {
@@ -1101,6 +1115,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let inter_affine_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let ibc_mode_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
         let parse_cu_skip_grid = vec![false; (intra_grid_w * intra_grid_h) as usize];
+        // Round-406 — §8.6 IBC state, allocated only when the SPS
+        // enables the tool (§7.4.3.4 eqs. 45 / 46 buffer geometry).
+        let ibc = if sps.tool_flags.ibc_enabled_flag {
+            Some(IbcState {
+                virbuf: crate::ibc::IbcVirtualBuffer::new(
+                    layout.ctb_size_y,
+                    sps.sps_chroma_format_idc as u32,
+                )?,
+                hmvp: crate::ibc::HmvpIbcList::new(),
+            })
+        } else {
+            None
+        };
         // Round-364 — per-CB affine CPMV store (§8.5.5.7 / §8.5.5.5).
         // Same 4x4 grid geometry as the motion field; every cell starts
         // `None` (covering CB not affine).
@@ -1145,6 +1172,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             inter_affine_grid,
             ibc_mode_grid,
             parse_cu_skip_grid,
+            ibc,
             affine_cpmv_field,
             lmcs: None,
             scaling_list: None,
@@ -2603,7 +2631,53 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        self.reconstruct_leaf_cu_with_tree(cu, info, residual, out, TreeType::SingleTree)
+        // Round-406 — §7.4.12.5 IbcVirBuf maintenance runs per
+        // `coding_unit()` in decode order for EVERY prediction mode:
+        // eq. 181 applies a pending `ResetIbcBuf`, eq. 182 invalidates
+        // the half-buffer-ahead VPDU footprint.
+        if let Some(ibc) = self.ibc.as_mut() {
+            let vsize = self.layout.ctb_size_y.min(64);
+            ibc.virbuf
+                .on_cu_start(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, vsize);
+        }
+        self.reconstruct_leaf_cu_with_tree(cu, info, residual, out, TreeType::SingleTree)?;
+        // §8.7.5.1 eqs. 1207 – 1209 — every reconstructed sample is
+        // folded into IbcVirBuf so a later IBC CU can reference it.
+        self.ibc_store_cu(cu, out);
+        Ok(())
+    }
+
+    /// Round-406 — copy the CU's just-reconstructed rectangle from the
+    /// picture planes into `IbcVirBuf` (§8.7.5.1 eqs. 1207 – 1209).
+    /// No-op when `sps_ibc_enabled_flag == 0`.
+    fn ibc_store_cu(&mut self, cu: &CtuCu, out: &PictureBuffer) {
+        let chroma_420 = self.sps.sps_chroma_format_idc == 1;
+        let Some(ibc) = self.ibc.as_mut() else {
+            return;
+        };
+        let (x, y) = (cu.cu.x, cu.cu.y);
+        let w = cu.cu.w.min((out.luma.width as u32).saturating_sub(x));
+        let h = cu.cu.h.min((out.luma.height as u32).saturating_sub(y));
+        if w == 0 || h == 0 {
+            return;
+        }
+        let plane = &out.luma;
+        ibc.virbuf.store_region(0, x, y, w, h, |dx, dy| {
+            i32::from(plane.samples[(y + dy) as usize * plane.stride + (x + dx) as usize])
+        });
+        if chroma_420 {
+            let (cx, cy, cw, ch) = (x / 2, y / 2, w / 2, h / 2);
+            if cw > 0 && ch > 0 {
+                let pcb = &out.cb;
+                ibc.virbuf.store_region(1, cx, cy, cw, ch, |dx, dy| {
+                    i32::from(pcb.samples[(cy + dy) as usize * pcb.stride + (cx + dx) as usize])
+                });
+                let pcr = &out.cr;
+                ibc.virbuf.store_region(2, cx, cy, cw, ch, |dx, dy| {
+                    i32::from(pcr.samples[(cy + dy) as usize * pcr.stride + (cx + dx) as usize])
+                });
+            }
+        }
     }
 
     /// Tree-typed variant of [`Self::reconstruct_leaf_cu`]. A
@@ -3008,18 +3082,174 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ///    can read it.
     /// 6. Append a zero-CBF [`DeblockCu`] record (skip CUs are coded
     ///    without residual) so the deblocker sees the inter boundary.
-    /// §8.6 — reconstruct a MODE_IBC leaf CU. Stubbed Unsupported in
-    /// the parse commit; the pixels land in the follow-on commit.
+    /// §8.6 — reconstruct a MODE_IBC leaf CU to pixels.
+    ///
+    /// Ordered per §8.6.1: (1) the §8.6.2 block-vector derivation —
+    /// §8.6.2.2 candidate list (spatial A1 / B1 with the §6.4.4
+    /// `checkPredModeY` IBC-neighbour gate, §8.6.2.4 HMVP fill, zero
+    /// pad), `bvIdx = general_merge_flag ? merge_idx : mvp_l0_flag`
+    /// (eq. 1097), and for the non-merge arm the §8.5.2.14 AMVR
+    /// rounding of the predictor + the eqs. 1092 – 1095 18-bit fold
+    /// with `MvdL0 << AmvrShift`; the §8.6.2.6 HMVP update runs with
+    /// the final `bvL` when `IsGt4by4`. (2) the §8.6.3 prediction
+    /// reads from `IbcVirBuf` (luma eqs. 1105 – 1107; chroma via the
+    /// §8.6.2.5 `bvC` and eqs. 1108 – 1110). (3) the §8.5.8 residual +
+    /// §8.7.5.1 reconstruction — the shared MODE_INTER residual tail,
+    /// WITHOUT the §8.7.5.2 LMCS forward mapping (an IBC prediction
+    /// copies mapped-domain samples of the current picture, so it is
+    /// already in the mapped domain). (4) the eqs. 1111 – 1118
+    /// bookkeeping: `MvL0 = bvL` with `RefIdxL0/L1 = −1`,
+    /// `PredFlagL0/L1 = 0`, `BcwIdx = 0`.
+    ///
+    /// The §8.6.2.1 bitstream-conformance constraints (no CTU-row
+    /// straddle; every referenced `IbcVirBuf` luma entry valid) are
+    /// enforced — a violating stream fails loud instead of reading
+    /// stale buffer contents.
     fn reconstruct_leaf_cu_ibc(
         &mut self,
-        _cu: &CtuCu,
-        _info: &LeafCuInfo,
-        _residual: &LeafCuResidual,
-        _out: &mut PictureBuffer,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
     ) -> Result<()> {
-        Err(Error::unsupported(
-            "h266 CTU walker: MODE_IBC reconstruction not wired yet",
-        ))
+        let x_cb = cu.cu.x;
+        let y_cb = cu.cu.y;
+        let cb_w = cu.cu.w;
+        let cb_h = cu.cu.h;
+        if self.ibc.is_none() {
+            return Err(Error::invalid(
+                "h266 CTU walker: MODE_IBC CU on a slice whose SPS has \
+                 sps_ibc_enabled_flag == 0",
+            ));
+        }
+        let is_gt = crate::ibc::is_gt_4by4(cb_w, cb_h);
+        // ---- §8.6.2.2 steps 1 – 5: candidate list --------------------
+        let sample_bv = |walker: &Self, xn: i32, yn: i32| -> Option<MotionVector> {
+            // §6.4.4 with checkPredModeY = TRUE — the neighbour must
+            // be in-picture, already decoded, and itself MODE_IBC; its
+            // MvL0 carries the block vector (§8.6.3 eq. 1111).
+            if xn < 0 || yn < 0 || !walker.sample_ibc_mode_at_luma(xn, yn) {
+                return None;
+            }
+            let mf = walker.motion_field.get_at_luma(xn, yn);
+            if !mf.available {
+                return None;
+            }
+            Some(mf.mv_l0)
+        };
+        let a1 = if is_gt {
+            sample_bv(self, x_cb as i32 - 1, (y_cb + cb_h) as i32 - 1)
+        } else {
+            None
+        };
+        let b1 = if is_gt {
+            sample_bv(self, (x_cb + cb_w) as i32 - 1, y_cb as i32 - 1)
+        } else {
+            None
+        };
+        let max_ibc = self.cu_tool_flags().max_num_ibc_merge_cand;
+        let cand_list = {
+            let ibc = self.ibc.as_ref().expect("checked is_some above");
+            crate::ibc::build_bv_cand_list(a1, b1, &ibc.hmvp, is_gt, max_ibc)
+        };
+        // ---- §8.6.2.2 steps 6 / 7 + §8.6.2.1 step 2 / 3 --------------
+        let bv_idx = if info.inter.general_merge_flag {
+            info.inter.merge_data.merge_idx
+        } else {
+            info.inter.non_merge.mvp_l0_flag
+        } as usize;
+        let mut bv = *cand_list.get(bv_idx).ok_or_else(|| {
+            Error::invalid(format!(
+                "h266 IBC: bvIdx {bv_idx} out of range for MaxNumIbcMergeCand {max_ibc}"
+            ))
+        })?;
+        if !info.inter.general_merge_flag {
+            let shift = info.inter.non_merge.amvr_shift;
+            // §8.6.2.1 step 2 — §8.5.2.14 rounding of the predictor
+            // with rightShift = leftShift = AmvrShift.
+            bv = crate::amvp::round_mv_amvr(bv, shift);
+            // §7.4.12.7 eqs. 161 / 162 — MvdL0 <<= AmvrShift; then the
+            // eqs. 1092 – 1095 wrap-around fold.
+            let bvd = crate::amvr::apply_amvr_shift(info.inter.non_merge.mvd_l0, shift);
+            bv = crate::ibc::fold_bv_with_bvd(bv, bvd);
+        }
+        {
+            let ibc = self.ibc.as_mut().expect("checked is_some above");
+            if !ibc.virbuf.bv_conformance_ok(x_cb, y_cb, cb_w, cb_h, bv) {
+                return Err(Error::invalid(format!(
+                    "h266 IBC: block vector ({}, {}) at CU ({x_cb}, {y_cb}) {cb_w}x{cb_h} \
+                     violates the §8.6.2.1 reference-region constraints",
+                    bv.x, bv.y
+                )));
+            }
+            // §8.6.2.1 — HMVP update with the final bvL (IsGt4by4 only).
+            if is_gt {
+                ibc.hmvp.update(bv);
+            }
+        }
+        // ---- §8.6.3 prediction ---------------------------------------
+        {
+            let ibc = self.ibc.as_ref().expect("checked is_some above");
+            for dy in 0..cb_h {
+                for dx in 0..cb_w {
+                    let v = ibc.virbuf.luma_at(x_cb + dx, y_cb + dy, bv)?;
+                    let idx = (y_cb + dy) as usize * out.luma.stride + (x_cb + dx) as usize;
+                    out.luma.samples[idx] = v as u8;
+                }
+            }
+            if self.sps.sps_chroma_format_idc == 1 {
+                // §8.6.2.5 — chroma block vector (1/32 chroma units).
+                let bv_c = crate::ibc::derive_chroma_bv(bv, 2, 2);
+                let (cx, cy, cw, ch) = (x_cb / 2, y_cb / 2, cb_w / 2, cb_h / 2);
+                for dy in 0..ch {
+                    for dx in 0..cw {
+                        let vcb = ibc.virbuf.chroma_at(1, cx + dx, cy + dy, bv_c)?;
+                        let vcr = ibc.virbuf.chroma_at(2, cx + dx, cy + dy, bv_c)?;
+                        let idx = (cy + dy) as usize * out.cb.stride + (cx + dx) as usize;
+                        out.cb.samples[idx] = vcb as u8;
+                        out.cr.samples[idx] = vcr as u8;
+                    }
+                }
+            }
+        }
+        // ---- §8.5.8 residual + §8.7.5.1 reconstruction ---------------
+        // Same MODE_INTER tail as the inter paths, minus the §8.7.5.2
+        // forward mapping (IBC predictions are already mapped-domain).
+        self.add_inter_cu_residual_opts(cu, info, residual, out, false)?;
+        // ---- eqs. 1111 – 1118 bookkeeping ----------------------------
+        let mvf = MvField {
+            mv_l0: bv,
+            ref_idx_l0: -1,
+            pred_flag_l0: false,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: info.inter.cu_skip_flag,
+            mode_inter: false,
+            available: true,
+            bcw_idx: 0,
+        };
+        self.motion_field.write_block(x_cb, y_cb, cb_w, cb_h, mvf);
+        self.affine_cpmv_field
+            .write_block(x_cb, y_cb, cb_w, cb_h, None);
+        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
+        self.deblock_cus.push(DeblockCu {
+            x: x_cb,
+            y: y_cb,
+            w: cb_w,
+            h: cb_h,
+            qp_y,
+            intra: false,
+            tu_y_coded: info.tu_y_coded_flag,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        });
+        self.write_intra_block(x_cb, y_cb, cb_w, cb_h, false);
+        self.write_parse_mode_block(x_cb, y_cb, cb_w, cb_h, true, info.inter.cu_skip_flag);
+        self.commit_subblock_neighbour_state(cu, info);
+        Ok(())
     }
 
     fn reconstruct_leaf_cu_inter(
@@ -3955,6 +4185,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        self.add_inter_cu_residual_opts(cu, info, residual, out, true)
+    }
+
+    /// Round-406 — [`Self::add_inter_cu_residual`] with the §8.7.5.2
+    /// LMCS forward-mapping arm selectable: the MODE_INTER callers
+    /// pass `true`; the MODE_IBC caller passes `false` because an IBC
+    /// prediction copies already-mapped-domain samples of the current
+    /// picture (§8.7.5.2 only maps `CuPredMode == MODE_INTER`
+    /// non-CIIP predictions).
+    fn add_inter_cu_residual_opts(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+        lmcs_forward_map_luma: bool,
+    ) -> Result<()> {
         // §8.7.5.2 `predMapSamples` — a MODE_INTER CU with
         // `ciip_flag == 0` forward-maps its MC luma prediction before
         // the eq. 1214 residual add. CIIP CUs (and the intra paths,
@@ -3964,7 +4211,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // prediction samples; skip CUs (no coded residual) still map,
         // leaving the reconstruction in the mapped domain the §8.8.2
         // in-loop inverse pass expects.
-        if !info.inter.merge_data.ciip_flag {
+        if lmcs_forward_map_luma && !info.inter.merge_data.ciip_flag {
             self.lmcs_forward_map_luma_rect(
                 out,
                 cu.cu.x as usize,
@@ -7326,6 +7573,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             && self.sps.partition_constraints.qtbtt_dual_tree_intra_flag;
         let ctus: Vec<CtuPos> = self.iter_ctus().collect();
         for ctu in &ctus {
+            // §7.3.11.1 — at the start of every CTU row (this walker's
+            // single-tile layout puts the tile-column boundary at
+            // CtbAddrX == 0) the IBC history list resets
+            // (`NumHmvpIbcCand = 0`) and `ResetIbcBuf = 1` arms the
+            // §7.4.12.5 eq. 181 buffer invalidation.
+            if ctu.x_ctb == 0 {
+                if let Some(ibc) = self.ibc.as_mut() {
+                    ibc.hmvp.reset();
+                    ibc.virbuf.mark_reset();
+                }
+            }
             // §7.3.11.2: `sao(rx, ry)` is decoded at the start of every
             // CTU (before the partition tree). The helper short-circuits
             // when both sao_*_used_flags are 0.
@@ -13156,5 +13414,269 @@ mod tests {
         assert!(!neigh.above_merge_subblock);
         assert!(!neigh.left_inter_affine);
         assert!(!neigh.above_inter_affine);
+    }
+
+    // ==== Round-406: §8.6 IBC reconstruction ====
+
+    fn ibc_sps(pic_w: u32, pic_h: u32) -> SeqParameterSet {
+        let mut sps = dummy_sps(0, pic_w, pic_h); // CTB 32
+        sps.tool_flags.ibc_enabled_flag = true;
+        sps.tool_flags.six_minus_max_num_ibc_merge_cand = 0; // MaxNumIbcMergeCand = 6
+        sps
+    }
+
+    fn ibc_ccu(x: u32, y: u32, w: u32, h: u32) -> CtuCu {
+        CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x,
+                y,
+                w,
+                h,
+                cqt_depth: 0,
+                mtt_depth: 0,
+            },
+        }
+    }
+
+    fn ibc_info(x: u32, y: u32, w: u32, h: u32) -> LeafCuInfo {
+        LeafCuInfo {
+            x0: x,
+            y0: y,
+            cb_width: w,
+            cb_height: h,
+            pred_mode: CuPredMode::Ibc,
+            ..LeafCuInfo::default()
+        }
+    }
+
+    /// Non-merge IBC CU with `MvdL0 = (−16, 0)` / AmvrShift 4 over an
+    /// empty candidate list (zero-BV pad predictor): the reconstructed
+    /// block must be a §8.6.3 copy of the block 16 luma samples to the
+    /// left (luma + both 4:2:0 chroma planes via the §8.6.2.5 bvC),
+    /// the eqs. 1111 – 1118 bookkeeping must land in the motion field,
+    /// and the §8.6.2.6 HMVP update must record the final bvL.
+    #[test]
+    fn reconstruct_leaf_cu_ibc_amvp_copies_left_block() {
+        let sps = ibc_sps(64, 32);
+        let pps = dummy_pps(64, 32, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        // Ramp picture so a displaced copy is distinguishable.
+        let mut out = PictureBuffer::yuv420_filled(64, 32, 0);
+        for y in 0..32usize {
+            for x in 0..64usize {
+                out.luma.samples[y * out.luma.stride + x] = ((x * 3 + y * 5) & 0xff) as u8;
+            }
+        }
+        for y in 0..16usize {
+            for x in 0..32usize {
+                out.cb.samples[y * out.cb.stride + x] = (40 + x + y) as u8;
+                out.cr.samples[y * out.cr.stride + x] = (200 - x - y) as u8;
+            }
+        }
+
+        // Simulate the already-decoded CU at (0, 0)-(16, 16): the
+        // §7.4.12.5 maintenance + the §8.7.5.1 eqs. 1207 – 1209 store.
+        let cu0 = ibc_ccu(0, 0, 16, 16);
+        walker
+            .ibc
+            .as_mut()
+            .unwrap()
+            .virbuf
+            .on_cu_start(0, 0, 16, 16, 32);
+        walker.ibc_store_cu(&cu0, &out);
+
+        // IBC AMVP CU at (16, 0): bv = 0 (zero pad) + (−16 << 4).
+        let cu1 = ibc_ccu(16, 0, 16, 16);
+        let mut info = ibc_info(16, 0, 16, 16);
+        info.inter.general_merge_flag = false;
+        info.inter.non_merge.mvd_l0 = MotionVector { x: -16, y: 0 };
+        info.inter.non_merge.mvp_l0_flag = 0;
+        info.inter.non_merge.amvr_shift = crate::amvr::AmvrShift(4);
+        let residual = LeafCuResidual::default();
+        let snapshot = out.clone();
+        walker
+            .reconstruct_leaf_cu(&cu1, &info, &residual, &mut out)
+            .unwrap();
+
+        for dy in 0..16usize {
+            for dx in 0..16usize {
+                assert_eq!(
+                    out.luma.samples[dy * out.luma.stride + 16 + dx],
+                    snapshot.luma.samples[dy * out.luma.stride + dx],
+                    "luma copy mismatch at ({dx}, {dy})"
+                );
+            }
+        }
+        for dy in 0..8usize {
+            for dx in 0..8usize {
+                assert_eq!(
+                    out.cb.samples[dy * out.cb.stride + 8 + dx],
+                    snapshot.cb.samples[dy * out.cb.stride + dx],
+                    "cb copy mismatch at ({dx}, {dy})"
+                );
+                assert_eq!(
+                    out.cr.samples[dy * out.cr.stride + 8 + dx],
+                    snapshot.cr.samples[dy * out.cr.stride + dx],
+                    "cr copy mismatch at ({dx}, {dy})"
+                );
+            }
+        }
+
+        // eqs. 1111 – 1118 — MvL0 = bvL, both pred flags 0, RefIdx −1.
+        let mf = walker.motion_field.get_at_luma(20, 4);
+        assert!(mf.available);
+        assert!(!mf.pred_flag_l0 && !mf.pred_flag_l1);
+        assert_eq!(mf.ref_idx_l0, -1);
+        assert_eq!(mf.ref_idx_l1, -1);
+        assert_eq!(mf.mv_l0, MotionVector { x: -256, y: 0 });
+        assert_eq!(mf.mv_l1, MotionVector::ZERO);
+        assert!(!mf.mode_inter);
+        // §8.6.2.6 — HmvpIbcCandList picked up the final bvL.
+        assert_eq!(walker.ibc.as_ref().unwrap().hmvp.len(), 1);
+    }
+
+    /// A block vector referencing never-reconstructed `IbcVirBuf`
+    /// entries violates the §8.6.2.1 conformance constraints — the
+    /// walker fails loud with InvalidData instead of reading the −1
+    /// markers.
+    #[test]
+    fn reconstruct_leaf_cu_ibc_rejects_invalid_reference() {
+        let sps = ibc_sps(64, 32);
+        let pps = dummy_pps(64, 32, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(64, 32, 90);
+
+        // First CU of the picture in merge mode: every candidate is
+        // the zero-BV pad, which references the CU's own (invalid)
+        // region.
+        let cu = ibc_ccu(0, 0, 16, 16);
+        let mut info = ibc_info(0, 0, 16, 16);
+        info.inter.general_merge_flag = true;
+        info.inter.merge_data.merge_idx = 0;
+        let residual = LeafCuResidual::default();
+        let err = walker
+            .reconstruct_leaf_cu(&cu, &info, &residual, &mut out)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    /// Merge IBC CU inheriting the A1 spatial candidate from an
+    /// already-decoded IBC neighbour: the §8.6.2.3 scan finds the
+    /// neighbour's bv in the motion field (gated on the §6.4.4
+    /// checkPredModeY IBC-mode test) and the §8.6.2.6 update de-dupes
+    /// the identical vector.
+    #[test]
+    fn reconstruct_leaf_cu_ibc_merge_inherits_spatial_a1() {
+        let sps = ibc_sps(64, 32);
+        let pps = dummy_pps(64, 32, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut out = PictureBuffer::yuv420_filled(64, 32, 0);
+        for y in 0..32usize {
+            for x in 0..64usize {
+                out.luma.samples[y * out.luma.stride + x] = ((x * 7 + y * 3) & 0xff) as u8;
+            }
+        }
+
+        // Seed CU0 (0, 0)-(16, 16) as "already reconstructed".
+        let cu0 = ibc_ccu(0, 0, 16, 16);
+        walker
+            .ibc
+            .as_mut()
+            .unwrap()
+            .virbuf
+            .on_cu_start(0, 0, 16, 16, 32);
+        walker.ibc_store_cu(&cu0, &out);
+
+        // CU1 (16, 0) — AMVP, bv = (−16 px, 0).
+        let cu1 = ibc_ccu(16, 0, 16, 16);
+        let mut info1 = ibc_info(16, 0, 16, 16);
+        info1.inter.general_merge_flag = false;
+        info1.inter.non_merge.mvd_l0 = MotionVector { x: -16, y: 0 };
+        info1.inter.non_merge.amvr_shift = crate::amvr::AmvrShift(4);
+        let residual = LeafCuResidual::default();
+        walker
+            .reconstruct_leaf_cu(&cu1, &info1, &residual, &mut out)
+            .unwrap();
+        assert_eq!(walker.ibc.as_ref().unwrap().hmvp.len(), 1);
+
+        // CU2 (32, 0) — merge_idx 0 → A1 = CU1's bv (−16 px, 0);
+        // the copy source is CU1's just-reconstructed block.
+        let cu2 = ibc_ccu(32, 0, 16, 16);
+        let mut info2 = ibc_info(32, 0, 16, 16);
+        info2.inter.general_merge_flag = true;
+        info2.inter.merge_data.merge_idx = 0;
+        let snapshot = out.clone();
+        walker
+            .reconstruct_leaf_cu(&cu2, &info2, &residual, &mut out)
+            .unwrap();
+        for dy in 0..16usize {
+            for dx in 0..16usize {
+                assert_eq!(
+                    out.luma.samples[dy * out.luma.stride + 32 + dx],
+                    snapshot.luma.samples[dy * out.luma.stride + 16 + dx],
+                    "A1-merge copy mismatch at ({dx}, {dy})"
+                );
+            }
+        }
+        let mf = walker.motion_field.get_at_luma(36, 4);
+        assert_eq!(mf.mv_l0, MotionVector { x: -256, y: 0 });
+        // §8.6.2.6 — identical bv de-dupes (list stays at 1 entry).
+        assert_eq!(walker.ibc.as_ref().unwrap().hmvp.len(), 1);
+    }
+
+    /// The eq. 182 VPDU invalidation + eq. 181 row reset keep the
+    /// reference window rolling: after a row reset the previous row's
+    /// samples are unreachable (conformance error), matching the
+    /// §7.3.11.1 `ResetIbcBuf` semantics.
+    #[test]
+    fn reconstruct_leaf_cu_ibc_row_reset_invalidates_previous_row() {
+        let sps = ibc_sps(32, 64);
+        let pps = dummy_pps(32, 64, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(32, 64, 55);
+
+        // Seed the whole first CTU row (one 32×32 CTU).
+        let cu0 = ibc_ccu(0, 0, 32, 32);
+        walker
+            .ibc
+            .as_mut()
+            .unwrap()
+            .virbuf
+            .on_cu_start(0, 0, 32, 32, 32);
+        walker.ibc_store_cu(&cu0, &out);
+
+        // Row reset (as decode_picture_into does at CtbAddrX == 0 of
+        // the next row).
+        walker.ibc.as_mut().unwrap().hmvp.reset();
+        walker.ibc.as_mut().unwrap().virbuf.mark_reset();
+
+        // An IBC CU in the new row pointing up at the previous row
+        // must fail the §8.6.2.1 constraints (the row straddle bound
+        // fires even before validity).
+        let cu1 = ibc_ccu(0, 32, 16, 16);
+        let mut info = ibc_info(0, 32, 16, 16);
+        info.inter.general_merge_flag = false;
+        info.inter.non_merge.mvd_l0 = MotionVector { x: 0, y: -16 };
+        info.inter.non_merge.amvr_shift = crate::amvr::AmvrShift(4);
+        let residual = LeafCuResidual::default();
+        let err = walker
+            .reconstruct_leaf_cu(&cu1, &info, &residual, &mut out)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
     }
 }
