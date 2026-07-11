@@ -55,6 +55,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::cabac::ContextModel;
+use crate::coding_tree::SplitConstraints;
 use crate::ctx::{
     ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag,
 };
@@ -274,6 +275,26 @@ impl PreparedCu {
                 sub_c.for_each_leaf(f);
             }
         }
+    }
+}
+
+/// r412 — the §6.4.1 – §6.4.3 constraints matching the EMITTED SPS
+/// partition fields: MinQtSizeY = MinCbSizeY = 4; with the MTT pickers
+/// off, `sps_max_mtt_hierarchy_depth_intra_slice_luma = 0` (BT/TT
+/// never allowed); with a picker on, depth 1 with MaxBtSizeY =
+/// MaxTtSizeY = 64. The emitted split bins MUST follow these
+/// constraints — presence and ctxIncs — or a conforming decoder
+/// desyncs (r412: the pre-r412 emitter always coded split_qt/mtt bins
+/// with allow-everything ctxIncs).
+fn encoder_split_constraints(pic_w: u32, pic_h: u32, mtt_enabled: bool) -> SplitConstraints {
+    SplitConstraints {
+        min_qt_log2: 2,
+        max_mtt_depth: u32::from(mtt_enabled),
+        max_bt_size: if mtt_enabled { 64 } else { 4 },
+        max_tt_size: if mtt_enabled { 64 } else { 4 },
+        min_cb_log2: 2,
+        pic_w,
+        pic_h,
     }
 }
 
@@ -898,6 +919,9 @@ fn measure_cu_bits(
     cu: &PreparedCu,
     slice_qp_y: i32,
     rc_opts: crate::residual::RcOpts,
+    constraints: &SplitConstraints,
+    x: u32,
+    y: u32,
 ) -> Result<u64> {
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
@@ -914,6 +938,9 @@ fn measure_cu_bits(
         0,
         0,
         rc_opts,
+        constraints,
+        x,
+        y,
     )?;
     enc.encode_terminate(1)?;
     let bytes = enc.finish();
@@ -931,16 +958,30 @@ fn measure_cu_bits_recurse(
     cqt_depth: u32,
     mtt_depth: u32,
     rc_opts: crate::residual::RcOpts,
+    constraints: &SplitConstraints,
+    x: u32,
+    y: u32,
 ) -> Result<()> {
     match cu {
         PreparedCu::Leaf(tb) => {
             qp_state.begin_cu();
+            let allows = constraints.allows(
+                x,
+                y,
+                tb.n_tb_w as u32,
+                tb.n_tb_h as u32,
+                mtt_depth,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
             crate::syntax_enc::encode_coding_tree_leaf_iframe(
                 enc,
                 tree_ctxs,
                 tb.n_tb_w as u32,
                 tb.n_tb_h as u32,
                 TreeNeighbours::default(),
+                allows,
                 |e| emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts),
             )
         }
@@ -952,17 +993,33 @@ fn measure_cu_bits_recurse(
             sub_b,
         } => {
             let _ = (cqt_depth, mtt_depth);
+            let (pw, ph) = (bt_cu_w(sub_a, sub_b, *dir), bt_cu_h(sub_a, sub_b, *dir));
+            let allows = constraints.allows(
+                x,
+                y,
+                pw,
+                ph,
+                *md,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
             crate::syntax_enc::encode_coding_tree_bt_split(
                 enc,
                 tree_ctxs,
-                bt_cu_w(sub_a, sub_b, *dir),
-                bt_cu_h(sub_a, sub_b, *dir),
+                pw,
+                ph,
                 TreeNeighbours::default(),
                 *cd,
                 *md,
                 *dir,
+                allows,
                 |e, ctxs, idx, _w, _h| {
                     let child = if idx == 0 { sub_a } else { sub_b };
+                    let (cx, cy) = match dir {
+                        crate::syntax_enc::MttSplitDir::Vertical => (x + idx * (pw / 2), y),
+                        crate::syntax_enc::MttSplitDir::Horizontal => (x, y + idx * (ph / 2)),
+                    };
                     measure_cu_bits_recurse(
                         child,
                         e,
@@ -973,6 +1030,9 @@ fn measure_cu_bits_recurse(
                         *cd,
                         *md + 1,
                         rc_opts,
+                        constraints,
+                        cx,
+                        cy,
                     )
                 },
             )
@@ -987,6 +1047,16 @@ fn measure_cu_bits_recurse(
         } => {
             let _ = (cqt_depth, mtt_depth);
             let (cb_w, cb_h) = tt_parent_dims(sub_a, sub_b, sub_c, *dir);
+            let allows = constraints.allows(
+                x,
+                y,
+                cb_w,
+                cb_h,
+                *md,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
             crate::syntax_enc::encode_coding_tree_tt_split(
                 enc,
                 tree_ctxs,
@@ -996,11 +1066,20 @@ fn measure_cu_bits_recurse(
                 *cd,
                 *md,
                 *dir,
+                allows,
                 |e, ctxs, idx, _w, _h| {
                     let child = match idx {
                         0 => sub_a,
                         1 => sub_b,
                         _ => sub_c,
+                    };
+                    let (cx, cy) = match dir {
+                        crate::syntax_enc::MttSplitDir::Vertical => {
+                            (x + [0, cb_w / 4, 3 * cb_w / 4][idx as usize], y)
+                        }
+                        crate::syntax_enc::MttSplitDir::Horizontal => {
+                            (x, y + [0, cb_h / 4, 3 * cb_h / 4][idx as usize])
+                        }
                     };
                     measure_cu_bits_recurse(
                         child,
@@ -1012,6 +1091,9 @@ fn measure_cu_bits_recurse(
                         *cd,
                         *md + 1,
                         rc_opts,
+                        constraints,
+                        cx,
+                        cy,
                     )
                 },
             )
@@ -1132,6 +1214,13 @@ fn prepare_cu_with_mtt_picker(
 ) -> Result<PreparedCu> {
     debug_assert_eq!(cb_size, 64);
     let lambda = lambda_for_qp(slice_qp_y);
+    // r412 — the emitted-SPS split constraints (MTT enabled on this
+    // path) drive the measured split-bin presence/ctxIncs.
+    let constraints = encoder_split_constraints(
+        rec.luma.width as u32,
+        rec.luma.height as u32,
+        /*mtt_enabled=*/ true,
+    );
 
     // Snapshot every plane (and the r412 availability masks) so each
     // trial starts from the same source.
@@ -1187,7 +1276,7 @@ fn prepare_cu_with_mtt_picker(
         chroma_scale,
     )?;
     let leaf_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
-    let leaf_bits = measure_cu_bits(&leaf, slice_qp_y, rc_opts)?;
+    let leaf_bits = measure_cu_bits(&leaf, slice_qp_y, rc_opts, &constraints, x as u32, y as u32)?;
     trials.push(Trial {
         cu: leaf,
         cost: leaf_sse as f64 + lambda * leaf_bits as f64,
@@ -1238,7 +1327,14 @@ fn prepare_cu_with_mtt_picker(
             sub_a: Box::new(bt_v_a),
             sub_b: Box::new(bt_v_b),
         };
-        let bt_v_bits = measure_cu_bits(&bt_v_cu, slice_qp_y, rc_opts)?;
+        let bt_v_bits = measure_cu_bits(
+            &bt_v_cu,
+            slice_qp_y,
+            rc_opts,
+            &constraints,
+            x as u32,
+            y as u32,
+        )?;
         trials.push(Trial {
             cu: bt_v_cu,
             cost: bt_v_sse as f64 + lambda * bt_v_bits as f64,
@@ -1285,7 +1381,14 @@ fn prepare_cu_with_mtt_picker(
             sub_a: Box::new(bt_h_a),
             sub_b: Box::new(bt_h_b),
         };
-        let bt_h_bits = measure_cu_bits(&bt_h_cu, slice_qp_y, rc_opts)?;
+        let bt_h_bits = measure_cu_bits(
+            &bt_h_cu,
+            slice_qp_y,
+            rc_opts,
+            &constraints,
+            x as u32,
+            y as u32,
+        )?;
         trials.push(Trial {
             cu: bt_h_cu,
             cost: bt_h_sse as f64 + lambda * bt_h_bits as f64,
@@ -1347,7 +1450,14 @@ fn prepare_cu_with_mtt_picker(
             sub_b: Box::new(tt_v_b),
             sub_c: Box::new(tt_v_c),
         };
-        let tt_v_bits = measure_cu_bits(&tt_v_cu, slice_qp_y, rc_opts)?;
+        let tt_v_bits = measure_cu_bits(
+            &tt_v_cu,
+            slice_qp_y,
+            rc_opts,
+            &constraints,
+            x as u32,
+            y as u32,
+        )?;
         trials.push(Trial {
             cu: tt_v_cu,
             cost: tt_v_sse as f64 + lambda * tt_v_bits as f64,
@@ -1407,7 +1517,14 @@ fn prepare_cu_with_mtt_picker(
             sub_b: Box::new(tt_h_b),
             sub_c: Box::new(tt_h_c),
         };
-        let tt_h_bits = measure_cu_bits(&tt_h_cu, slice_qp_y, rc_opts)?;
+        let tt_h_bits = measure_cu_bits(
+            &tt_h_cu,
+            slice_qp_y,
+            rc_opts,
+            &constraints,
+            x as u32,
+            y as u32,
+        )?;
         trials.push(Trial {
             cu: tt_h_cu,
             cost: tt_h_sse as f64 + lambda * tt_h_bits as f64,
@@ -1590,21 +1707,31 @@ fn emit_prepared_cu(
     mtt_depth: u32,
     cu_map: &mut CuStateMap,
     rc_opts: crate::residual::RcOpts,
+    constraints: &SplitConstraints,
 ) -> Result<()> {
     let nbrs = build_tree_neighbours(cu_map, x, y);
     match cu {
         PreparedCu::Leaf(tb) => {
-            // For a leaf at MTT depth > 0 (i.e. inside a BT split) the
-            // round-55 `encode_coding_tree_leaf_iframe` still emits
-            // `split_cu_flag = 0` which is correct — the sub-CU is a
-            // leaf of the BT, not a further split.
-            let _ = mtt_depth;
+            // r412 — the leaf's split_cu_flag = 0 is emitted only when
+            // §6.4.1 – §6.4.3 allow a split here (e.g. an MTT child at
+            // maxMttDepth has no bin — a conforming decoder infers 0).
+            let allows = constraints.allows(
+                x,
+                y,
+                tb.n_tb_w as u32,
+                tb.n_tb_h as u32,
+                mtt_depth,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
             crate::syntax_enc::encode_coding_tree_leaf_iframe(
                 enc,
                 tree_ctxs,
                 tb.n_tb_w as u32,
                 tb.n_tb_h as u32,
                 nbrs,
+                allows,
                 |e| emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts),
             )?;
             // r412 — record the leaf IMMEDIATELY (decoding-order
@@ -1625,6 +1752,16 @@ fn emit_prepared_cu(
             sub_b,
         } => {
             let (cb_w, cb_h) = parent_cu_dims(cu);
+            let allows = constraints.allows(
+                x,
+                y,
+                cb_w as u32,
+                cb_h as u32,
+                *md,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
             crate::syntax_enc::encode_coding_tree_bt_split(
                 enc,
                 tree_ctxs,
@@ -1634,6 +1771,7 @@ fn emit_prepared_cu(
                 *cd,
                 *md,
                 *dir,
+                allows,
                 |e, ctxs, idx, _w, _h| {
                     let (child, cx, cy) = match dir {
                         crate::syntax_enc::MttSplitDir::Vertical => {
@@ -1667,6 +1805,7 @@ fn emit_prepared_cu(
                         *md + 1,
                         &mut *cu_map,
                         rc_opts,
+                        constraints,
                     )
                 },
             )
@@ -1680,6 +1819,16 @@ fn emit_prepared_cu(
             sub_c,
         } => {
             let (cb_w, cb_h) = parent_cu_dims(cu);
+            let allows = constraints.allows(
+                x,
+                y,
+                cb_w as u32,
+                cb_h as u32,
+                *md,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
             crate::syntax_enc::encode_coding_tree_tt_split(
                 enc,
                 tree_ctxs,
@@ -1689,6 +1838,7 @@ fn emit_prepared_cu(
                 *cd,
                 *md,
                 *dir,
+                allows,
                 |e, ctxs, idx, _w, _h| {
                     let (child, cx, cy) = match dir {
                         crate::syntax_enc::MttSplitDir::Vertical => {
@@ -1724,6 +1874,7 @@ fn emit_prepared_cu(
                         *md + 1,
                         &mut *cu_map,
                         rc_opts,
+                        constraints,
                     )
                 },
             )
@@ -1950,6 +2101,13 @@ pub fn encode_idr_with_qp_picker_cfg(
     // r412 — eq. 1212 availability masks for the decoder-mirrored
     // intra prediction in the coding loop.
     let mut avail = EncAvail::new(w as usize, h as usize);
+    // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
+    // partition fields; drive every split-bin presence + ctxInc.
+    let split_constraints = encoder_split_constraints(
+        w,
+        h,
+        config.enable_mtt_bt_picker || config.enable_mtt_tt_picker,
+    );
     let mut all_deblock_cus: Vec<DeblockCu> = Vec::new();
 
     // TB size: use the full CTB for simplicity.  For large pictures this
@@ -2818,6 +2976,16 @@ pub fn encode_idr_with_qp_picker_cfg(
                     (ctb_x, ctb_y + 64),
                     (ctb_x + 64, ctb_y + 64),
                 ];
+                let allows_root = split_constraints.allows(
+                    ctb_x as u32,
+                    ctb_y as u32,
+                    ctb_size as u32,
+                    ctb_size as u32,
+                    0,
+                    crate::coding_tree::TreeType::SingleTree,
+                    None,
+                    0,
+                );
                 encode_coding_quadtree_split(
                     &mut cabac_enc,
                     &mut tree_ctxs,
@@ -2825,6 +2993,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                     ctb_size as u32,
                     nbrs_ctb,
                     /*cqt_depth=*/ 0,
+                    allows_root,
                     |enc, ctxs, q, _w, _h| {
                         let cu = &cus[q as usize];
                         let (qx, qy) = ctu_origins[q as usize];
@@ -2842,6 +3011,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                             0,
                             &mut cu_map,
                             rc_opts,
+                            &split_constraints,
                         )?;
                         Ok(())
                     },
@@ -2870,6 +3040,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         0,
                         &mut cu_map,
                         rc_opts,
+                        &split_constraints,
                     )?;
                     // Advance position for the next CU in raster order.
                     let (cw, ch) = parent_cu_dims(cu);

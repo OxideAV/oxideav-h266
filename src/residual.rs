@@ -263,19 +263,24 @@ pub fn read_last_sig_coeff_pos(
     ctxs: &mut ResidualCtxs,
     log2_zo_tb_width: u32,
     log2_zo_tb_height: u32,
+    log2_full_tb_width: u32,
+    log2_full_tb_height: u32,
     c_idx: u32,
 ) -> Result<LastSigCoeffPos> {
+    // r412 — §9.3.4.2.4 derives the prefix ctxInc from the FULL TB
+    // log2 sizes (`Log2FullTb{Width,Height}`) while the §7.4.12.11
+    // binarisation range (cMax) runs on the zeroed-out dims.
     let prefix_x = read_last_sig_prefix(
         dec,
         &mut ctxs.last_x,
-        log2_zo_tb_width,
+        log2_full_tb_width,
         (log2_zo_tb_width << 1).saturating_sub(1),
         c_idx,
     )?;
     let prefix_y = read_last_sig_prefix(
         dec,
         &mut ctxs.last_y,
-        log2_zo_tb_height,
+        log2_full_tb_height,
         (log2_zo_tb_height << 1).saturating_sub(1),
         c_idx,
     )?;
@@ -578,7 +583,7 @@ pub fn decode_tb_coefficients_opts(
     let log2_zo_h = log2_h.min(5);
     let zo_w = 1usize << log2_zo_w;
     let zo_h = 1usize << log2_zo_h;
-    let last = read_last_sig_coeff_pos(dec, ctxs, log2_zo_w, log2_zo_h, c_idx)?;
+    let last = read_last_sig_coeff_pos(dec, ctxs, log2_zo_w, log2_zo_h, log2_w, log2_h, c_idx)?;
 
     // Running per-TB state threaded by §9.3.4.2.7 / §9.3.3.2.
     let total = n_tb_w * n_tb_h;

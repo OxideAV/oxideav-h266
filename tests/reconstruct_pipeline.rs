@@ -49,7 +49,23 @@ fn dummy_sps(ctb_log2_minus5: u8, pic_w: u32, pic_h: u32) -> SeqParameterSet {
         num_extra_sh_bits: 0,
         sps_sublayer_dpb_params_flag: false,
         dpb_parameters: None,
-        partition_constraints: PartitionConstraints::default(),
+        partition_constraints: PartitionConstraints {
+            // r412 — permissive split constraints so hand-built CABAC
+            // fixtures may use any split family at any node: the
+            // §6.4.1 – §6.4.3 derivations (now driving split-bin
+            // presence + ctxIncs) see MaxMttDepth 3 and MaxBt/MaxTt at
+            // their spec maxima for the fixture CTB sizes.
+            max_mtt_hierarchy_depth_intra_slice_luma: 3,
+            log2_diff_max_bt_min_qt_intra_slice_luma: ctb_log2_minus5 as u32 + 3,
+            log2_diff_max_tt_min_qt_intra_slice_luma: (ctb_log2_minus5 as u32 + 5).min(6) - 2,
+            max_mtt_hierarchy_depth_intra_slice_chroma: 3,
+            log2_diff_max_bt_min_qt_intra_slice_chroma: ctb_log2_minus5 as u32 + 3,
+            log2_diff_max_tt_min_qt_intra_slice_chroma: (ctb_log2_minus5 as u32 + 5).min(6) - 2,
+            max_mtt_hierarchy_depth_inter_slice: 3,
+            log2_diff_max_bt_min_qt_inter_slice: ctb_log2_minus5 as u32 + 3,
+            log2_diff_max_tt_min_qt_inter_slice: (ctb_log2_minus5 as u32 + 5).min(6) - 2,
+            ..PartitionConstraints::default()
+        },
         tool_flags: ToolFlags::default(),
         subpic_info: None,
         sps_timing_hrd_params_present_flag: false,
@@ -679,9 +695,9 @@ fn decode_p_slice_all_skip_matches_reference() {
 
     let mut enc = ArithEncoder::new();
     // 1. split_cu_flag(0). ctxInc here mirrors the TreeWalker's call:
-    //    `ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1)`.
+    //    `ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1)`.
     let split_inc =
-        oxideav_h266::ctx::ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+        oxideav_h266::ctx::ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_n_minus1 = split_cu_ctxs.len() - 1;
     enc.encode_decision(&mut split_cu_ctxs[split_inc.min(split_n_minus1)], 0)
         .unwrap();
@@ -777,7 +793,7 @@ fn decode_p_slice_writes_motion_field() {
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
-    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
     enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
         .unwrap();
@@ -886,7 +902,7 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
 
     let mut enc = ArithEncoder::new();
     // 1. split_cu_flag(0).
-    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
     enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
         .unwrap();
@@ -986,7 +1002,7 @@ fn decode_b_slice_writes_bipred_motion_field() {
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
-    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
     enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
         .unwrap();
@@ -1077,7 +1093,7 @@ fn decode_p_slice_populates_hmvp_table() {
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
-    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
     enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
         .unwrap();
@@ -1268,7 +1284,7 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
     // (ctxInc 1); BL sees the skip TL above (ctxInc 1); BR sees the
     // skip BL left AND the skip TR above (ctxInc 2). Slot =
     // `init_type * 3 + ctxInc`.
-    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot_8 = split_inc_8.min(split_cu_n_minus1);
     let merge_inc = ctx_inc_merge_idx() as usize;
     let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
@@ -1730,7 +1746,7 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
     // `CuSkipFlag` grid committed in z-order (§7.4.12.5 / Table 133,
     // r409): TL has no committed neighbours (inc 0), TR / BL each see
     // one skip neighbour (inc 1), BR sees two (inc 2).
-    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot_8 = split_inc_8.min(split_cu_n_minus1);
     let merge_inc = ctx_inc_merge_idx() as usize;
     let merge_idx_n_minus1 = merge_idx_ctxs.len() - 1;
@@ -1947,7 +1963,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     let mut enc = ArithEncoder::new();
 
     // 1. split_cu_flag(0) — single 8x8 CU at the CTU root.
-    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
     enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
         .unwrap();
@@ -2143,7 +2159,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     let mut enc = ArithEncoder::new();
 
     // 1. split_cu_flag(0) — single 8x8 CU at the CTU root.
-    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
     enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
         .unwrap();
@@ -3639,7 +3655,7 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
         .unwrap();
     // r412 — §7.3.11.4 interleaved order: each child's split_cu_flag(0)
     // immediately precedes that leaf's coding_unit() bins.
-    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split_slot_8 = split_inc_8.min(split_cu_n);
 
     let skip_slot = |inc: u32| (init_type as usize) * 3 + inc as usize;
@@ -4320,7 +4336,7 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
     enc.encode_decision(&mut split_qt_ctxs[qt_slot], 1).unwrap();
     // r412 — §7.3.11.4 interleaved order: each leaf's split_cu_flag(0)
     // immediately precedes its coding_unit() bins.
-    let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
+    let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
     let split8_slot = split8.min(split_n);
 
     // Shared per-CU tail: DM chroma + all CBFs 0.

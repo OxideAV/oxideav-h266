@@ -61,7 +61,7 @@ use oxideav_core::Result;
 
 use crate::cabac::ArithDecoder;
 use crate::cabac_enc::ArithEncoder;
-use crate::coding_tree::TreeCtxs;
+use crate::coding_tree::{SplitAllows, TreeCtxs};
 use crate::ctx::{
     ctx_inc_mtt_split_cu_binary_flag, ctx_inc_mtt_split_cu_vertical_flag, ctx_inc_split_cu_flag,
     ctx_inc_split_qt_flag,
@@ -97,32 +97,33 @@ pub fn encode_coding_tree_leaf_iframe<F>(
     cb_w: u32,
     cb_h: u32,
     nbrs: TreeNeighbours,
+    allows: SplitAllows,
     body_emit: F,
 ) -> Result<()>
 where
     F: FnOnce(&mut ArithEncoder) -> Result<()>,
 {
-    // Emit split_cu_flag = 0 (leaf CU). Per §9.3.4.2.2 eq. 1551 the
-    // ctxInc reads two neighbour conditions — `cbHeightLeft < cbHeight`
-    // and `cbWidthAbove < cbWidth` — plus the partition-allowance
-    // `ctxSetIdx`. For a root-CU at the max size all splits are allowed
-    // (allow_*_flag = 1); the picture-edge case has both availabilities
-    // false so condL / condA collapse to false.
-    let inc = ctx_inc_split_cu_flag(
-        nbrs.left_avail,
-        nbrs.above_avail,
-        nbrs.cb_height_left,
-        nbrs.cb_width_above,
-        cb_w,
-        cb_h,
-        /*allow_split_bt_ver=*/ 1,
-        /*allow_split_bt_hor=*/ 1,
-        /*allow_split_tt_ver=*/ 1,
-        /*allow_split_tt_hor=*/ 1,
-        /*allow_split_qt=*/ 1,
-    ) as usize;
-    let n = ctxs.split_cu.len() - 1;
-    enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 0)?;
+    // Emit split_cu_flag = 0 (leaf CU) — r412: present ONLY when at
+    // least one §6.4.1 – §6.4.3 split family is allowed at this node
+    // (§7.3.11.4; when absent the decoder infers 0), and the
+    // §9.3.4.2.2 ctxInc consumes the REAL allow flags.
+    if allows.any() {
+        let inc = ctx_inc_split_cu_flag(
+            nbrs.left_avail,
+            nbrs.above_avail,
+            nbrs.cb_height_left,
+            nbrs.cb_width_above,
+            cb_w,
+            cb_h,
+            allows.bt_ver as u32,
+            allows.bt_hor as u32,
+            allows.tt_ver as u32,
+            allows.tt_hor as u32,
+            allows.qt as u32,
+        ) as usize;
+        let n = ctxs.split_cu.len() - 1;
+        enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 0)?;
+    }
 
     // coding_unit() body — caller-provided. In I-slice intra-only scope
     // this is just transform_tree() (cu_skip_flag / pred_mode_flag are
@@ -169,12 +170,14 @@ pub fn encode_coding_quadtree_split<F>(
     cb_h: u32,
     nbrs: TreeNeighbours,
     cqt_depth: u32,
+    allows: SplitAllows,
     mut body_emit_quadrant: F,
 ) -> Result<()>
 where
     F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32, u32, u32) -> Result<()>,
 {
-    // split_cu_flag = 1.
+    // split_cu_flag = 1 — real §6.4.1 – §6.4.3 allow flags feed the
+    // §9.3.4.2.2 ctxInc (r412).
     let inc = ctx_inc_split_cu_flag(
         nbrs.left_avail,
         nbrs.above_avail,
@@ -182,16 +185,21 @@ where
         nbrs.cb_width_above,
         cb_w,
         cb_h,
-        1,
-        1,
-        1,
-        1,
-        1,
+        allows.bt_ver as u32,
+        allows.bt_hor as u32,
+        allows.tt_ver as u32,
+        allows.tt_hor as u32,
+        allows.qt as u32,
     ) as usize;
     let n = ctxs.split_cu.len() - 1;
     enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 1)?;
-    // split_qt_flag = 1.
-    encode_split_qt_flag(enc, ctxs, true, nbrs, cqt_depth)?;
+    // split_qt_flag = 1 — §7.3.11.4: the bin is coded only when a QT
+    // split AND at least one MTT split are both allowed; otherwise a
+    // conforming decoder infers it (r412 — the pre-r412 emitter always
+    // wrote the bin, desyncing QT-only nodes).
+    if allows.qt && allows.any_mtt() {
+        encode_split_qt_flag(enc, ctxs, true, nbrs, cqt_depth)?;
+    }
     let hw = cb_w / 2;
     let hh = cb_h / 2;
     for q in 0..4u32 {
@@ -242,12 +250,13 @@ pub fn encode_coding_tree_bt_split<F>(
     cqt_depth: u32,
     mtt_depth: u32,
     dir: MttSplitDir,
+    allows: SplitAllows,
     mut body_emit_subblock: F,
 ) -> Result<()>
 where
     F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32, u32, u32) -> Result<()>,
 {
-    // split_cu_flag = 1.
+    // split_cu_flag = 1 (r412 — real allow flags in the ctxInc).
     let inc = ctx_inc_split_cu_flag(
         nbrs.left_avail,
         nbrs.above_avail,
@@ -255,36 +264,50 @@ where
         nbrs.cb_width_above,
         cb_w,
         cb_h,
-        1,
-        1,
-        1,
-        1,
-        1,
+        allows.bt_ver as u32,
+        allows.bt_hor as u32,
+        allows.tt_ver as u32,
+        allows.tt_hor as u32,
+        allows.qt as u32,
     ) as usize;
     let n = ctxs.split_cu.len() - 1;
     enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 1)?;
-    // split_qt_flag = 0 (we're going into MTT).
-    encode_split_qt_flag(enc, ctxs, false, nbrs, cqt_depth)?;
-    // mtt_split_cu_vertical_flag.
-    let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
-        nbrs.left_avail,
-        nbrs.above_avail,
-        nbrs.cb_height_left,
-        nbrs.cb_width_above,
-        cb_w,
-        cb_h,
-        1,
-        1,
-        1,
-        1,
-    ) as usize;
-    let mtt_v_n = ctxs.mtt_split_vertical.len() - 1;
+    // split_qt_flag = 0 — coded only when QT and MTT are both allowed
+    // (§7.3.11.4; r412).
+    if allows.qt && allows.any_mtt() {
+        encode_split_qt_flag(enc, ctxs, false, nbrs, cqt_depth)?;
+    }
     let mtt_v = dir.vertical_flag();
-    enc.encode_decision(&mut ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)], mtt_v)?;
-    // mtt_split_cu_binary_flag = 1 (BT).
-    let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_v, mtt_depth) as usize;
-    let mtt_b_n = ctxs.mtt_split_binary.len() - 1;
-    enc.encode_decision(&mut ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)], 1)?;
+    // mtt_split_cu_vertical_flag — coded only when both directions are
+    // possible (§7.3.11.4; r412).
+    if (allows.bt_hor || allows.tt_hor) && (allows.bt_ver || allows.tt_ver) {
+        let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
+            nbrs.left_avail,
+            nbrs.above_avail,
+            nbrs.cb_height_left,
+            nbrs.cb_width_above,
+            cb_w,
+            cb_h,
+            allows.bt_ver as u32,
+            allows.bt_hor as u32,
+            allows.tt_ver as u32,
+            allows.tt_hor as u32,
+        ) as usize;
+        let mtt_v_n = ctxs.mtt_split_vertical.len() - 1;
+        enc.encode_decision(&mut ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)], mtt_v)?;
+    }
+    // mtt_split_cu_binary_flag = 1 (BT) — coded only when both the
+    // binary and ternary split are allowed in the chosen direction.
+    let bin_coded = if mtt_v == 1 {
+        allows.bt_ver && allows.tt_ver
+    } else {
+        allows.bt_hor && allows.tt_hor
+    };
+    if bin_coded {
+        let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_v, mtt_depth) as usize;
+        let mtt_b_n = ctxs.mtt_split_binary.len() - 1;
+        enc.encode_decision(&mut ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)], 1)?;
+    }
 
     // Two sub-blocks of equal size.
     let (sub_w, sub_h) = match dir {
@@ -316,12 +339,13 @@ pub fn encode_coding_tree_tt_split<F>(
     cqt_depth: u32,
     mtt_depth: u32,
     dir: MttSplitDir,
+    allows: SplitAllows,
     mut body_emit_subblock: F,
 ) -> Result<()>
 where
     F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32, u32, u32) -> Result<()>,
 {
-    // split_cu_flag = 1.
+    // split_cu_flag = 1 (r412 — real allow flags in the ctxInc).
     let inc = ctx_inc_split_cu_flag(
         nbrs.left_avail,
         nbrs.above_avail,
@@ -329,36 +353,47 @@ where
         nbrs.cb_width_above,
         cb_w,
         cb_h,
-        1,
-        1,
-        1,
-        1,
-        1,
+        allows.bt_ver as u32,
+        allows.bt_hor as u32,
+        allows.tt_ver as u32,
+        allows.tt_hor as u32,
+        allows.qt as u32,
     ) as usize;
     let n = ctxs.split_cu.len() - 1;
     enc.encode_decision(&mut ctxs.split_cu[inc.min(n)], 1)?;
-    // split_qt_flag = 0.
-    encode_split_qt_flag(enc, ctxs, false, nbrs, cqt_depth)?;
-    // mtt_split_cu_vertical_flag.
-    let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
-        nbrs.left_avail,
-        nbrs.above_avail,
-        nbrs.cb_height_left,
-        nbrs.cb_width_above,
-        cb_w,
-        cb_h,
-        1,
-        1,
-        1,
-        1,
-    ) as usize;
-    let mtt_v_n = ctxs.mtt_split_vertical.len() - 1;
+    // split_qt_flag = 0 — §7.3.11.4 presence (r412).
+    if allows.qt && allows.any_mtt() {
+        encode_split_qt_flag(enc, ctxs, false, nbrs, cqt_depth)?;
+    }
     let mtt_v = dir.vertical_flag();
-    enc.encode_decision(&mut ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)], mtt_v)?;
-    // mtt_split_cu_binary_flag = 0 (TT).
-    let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_v, mtt_depth) as usize;
-    let mtt_b_n = ctxs.mtt_split_binary.len() - 1;
-    enc.encode_decision(&mut ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)], 0)?;
+    // mtt_split_cu_vertical_flag — §7.3.11.4 presence (r412).
+    if (allows.bt_hor || allows.tt_hor) && (allows.bt_ver || allows.tt_ver) {
+        let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
+            nbrs.left_avail,
+            nbrs.above_avail,
+            nbrs.cb_height_left,
+            nbrs.cb_width_above,
+            cb_w,
+            cb_h,
+            allows.bt_ver as u32,
+            allows.bt_hor as u32,
+            allows.tt_ver as u32,
+            allows.tt_hor as u32,
+        ) as usize;
+        let mtt_v_n = ctxs.mtt_split_vertical.len() - 1;
+        enc.encode_decision(&mut ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)], mtt_v)?;
+    }
+    // mtt_split_cu_binary_flag = 0 (TT) — §7.3.11.4 presence (r412).
+    let bin_coded = if mtt_v == 1 {
+        allows.bt_ver && allows.tt_ver
+    } else {
+        allows.bt_hor && allows.tt_hor
+    };
+    if bin_coded {
+        let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_v, mtt_depth) as usize;
+        let mtt_b_n = ctxs.mtt_split_binary.len() - 1;
+        enc.encode_decision(&mut ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)], 0)?;
+    }
 
     // Three sub-blocks with the 1:2:1 ratio.
     let (sub0_dim, sub1_dim, sub2_dim) = match dir {
@@ -385,6 +420,7 @@ pub fn decode_coding_tree_split_cu_flag(
     cb_w: u32,
     cb_h: u32,
     nbrs: TreeNeighbours,
+    allows: SplitAllows,
 ) -> Result<u32> {
     let inc = ctx_inc_split_cu_flag(
         nbrs.left_avail,
@@ -393,11 +429,11 @@ pub fn decode_coding_tree_split_cu_flag(
         nbrs.cb_width_above,
         cb_w,
         cb_h,
-        1,
-        1,
-        1,
-        1,
-        1,
+        allows.bt_ver as u32,
+        allows.bt_hor as u32,
+        allows.tt_ver as u32,
+        allows.tt_hor as u32,
+        allows.qt as u32,
     ) as usize;
     let n = ctxs.split_cu.len() - 1;
     dec.decode_decision(&mut ctxs.split_cu[inc.min(n)])
@@ -502,6 +538,13 @@ mod tests {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
             |e| {
                 body_called = true;
                 // Body is empty — emit one bypass bin so the test sees the
@@ -523,6 +566,13 @@ mod tests {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
         )
         .unwrap();
         assert_eq!(split, 0, "expected split_cu_flag = 0");
@@ -545,6 +595,13 @@ mod tests {
             128,
             TreeNeighbours::default(),
             0,
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
             |_e, _ctxs, q, _w, _h| {
                 quadrants.push(q);
                 Ok(())
@@ -563,6 +620,13 @@ mod tests {
             128,
             128,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
         )
         .unwrap();
         assert_eq!(split_cu, 1);
@@ -595,6 +659,13 @@ mod tests {
             0,
             0,
             MttSplitDir::Vertical,
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
             |_e, _ctxs, idx, w, h| {
                 subblocks.push((idx, w, h));
                 Ok(())
@@ -613,6 +684,13 @@ mod tests {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
         )
         .unwrap();
         assert_eq!(split_cu, 1);
@@ -651,6 +729,13 @@ mod tests {
             0,
             1,
             MttSplitDir::Horizontal,
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
             |_e, _ctxs, idx, w, h| {
                 subblocks.push((idx, w, h));
                 Ok(())
@@ -669,6 +754,13 @@ mod tests {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
         )
         .unwrap();
         decode_coding_tree_split_qt_flag(&mut dec, &mut dec_ctxs, TreeNeighbours::default(), 0)
@@ -704,6 +796,13 @@ mod tests {
             0,
             0,
             MttSplitDir::Vertical,
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
             |_e, _ctxs, idx, w, h| {
                 subblocks.push((idx, w, h));
                 Ok(())
@@ -722,6 +821,13 @@ mod tests {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: true,
+                bt_hor: true,
+                tt_ver: true,
+                tt_hor: true,
+            },
         )
         .unwrap();
         decode_coding_tree_split_qt_flag(&mut dec, &mut dec_ctxs, TreeNeighbours::default(), 0)

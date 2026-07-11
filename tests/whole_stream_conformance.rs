@@ -134,6 +134,8 @@ fn decode_whole_stream(bs: &[u8]) -> PictureBuffer {
     walker
         .decode_picture_into(&mut out)
         .expect("decode_picture_into");
+    // §7.3.11.1 — the stream must end on end_of_slice_one_bit == 1.
+    walker.finish_slice().expect("end_of_slice_one_bit");
 
     // §8.8 in-loop filters with the SH-referenced ALF APS bindings.
     let luma_slots: Vec<Option<&oxideav_h266::aps::AlfApsData>> = sh
@@ -231,12 +233,33 @@ fn structured_source(w: usize, h: usize) -> PictureBuffer {
     src
 }
 
+/// Optional corpus dump for external black-box validation: when
+/// `H266_CORPUS_DIR` is set, write the Annex-B stream and the decoded
+/// planes (planar YUV 4:2:0, luma then Cb then Cr) under that
+/// directory. `tests/WHOLE_STREAM_CORPUS.md` records the validation
+/// commands + SHA-256 hashes.
+fn dump_corpus(name: &str, bs: &[u8], dec: &PictureBuffer) {
+    let Ok(dir) = std::env::var("H266_CORPUS_DIR") else {
+        return;
+    };
+    let base = std::path::Path::new(&dir);
+    std::fs::create_dir_all(base).expect("corpus dir");
+    std::fs::write(base.join(format!("{name}.266")), bs).expect("write stream");
+    let mut yuv =
+        Vec::with_capacity(dec.luma.samples.len() + dec.cb.samples.len() + dec.cr.samples.len());
+    yuv.extend_from_slice(&dec.luma.samples);
+    yuv.extend_from_slice(&dec.cb.samples);
+    yuv.extend_from_slice(&dec.cr.samples);
+    std::fs::write(base.join(format!("{name}.yuv")), yuv).expect("write planes");
+}
+
 #[test]
 fn whole_stream_default_qp26() {
     let src = structured_source(128, 128);
     let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "default qp26");
+    dump_corpus("default_qp26", &bs, &dec);
 }
 
 #[test]
@@ -246,6 +269,7 @@ fn whole_stream_qp_sweep() {
         let (bs, rec) = encode_idr_with_residuals(&src, qp).unwrap();
         let dec = decode_whole_stream(&bs);
         assert_byte_exact(&dec, &rec, &format!("qp {qp}"));
+        dump_corpus(&format!("qp{qp}"), &bs, &dec);
     }
 }
 
@@ -255,6 +279,7 @@ fn whole_stream_flat_source() {
     let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "flat");
+    dump_corpus("flat_qp26", &bs, &dec);
 }
 
 /// Multi-CTU-row / multi-CTU-column layout — pins the §7.3.11.1
@@ -266,6 +291,7 @@ fn whole_stream_multi_ctu_256x256() {
     let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "256x256");
+    dump_corpus("multi_ctu_256x256", &bs, &dec);
 }
 
 #[test]
@@ -276,6 +302,7 @@ fn whole_stream_chroma_sao_merge() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "chroma SAO merge");
+    dump_corpus("chroma_sao_merge", &bs, &dec);
 }
 
 #[test]
@@ -286,6 +313,7 @@ fn whole_stream_mtt_bt_picker() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 30, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "MTT BT");
+    dump_corpus("mtt_bt", &bs, &dec);
 }
 
 #[test]
@@ -297,6 +325,7 @@ fn whole_stream_mtt_tt_picker() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 30, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "MTT BT+TT");
+    dump_corpus("mtt_bt_tt", &bs, &dec);
 }
 
 /// The LMCS payload the encoder ships (mirrors the crate's LMCS
@@ -325,6 +354,7 @@ fn whole_stream_lmcs() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "LMCS");
+    dump_corpus("lmcs", &bs, &dec);
 }
 
 #[test]
@@ -336,6 +366,7 @@ fn whole_stream_lmcs_chroma_scaling() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "LMCS + chroma scaling");
+    dump_corpus("lmcs_chroma_scaling", &bs, &dec);
 }
 
 #[test]
@@ -346,6 +377,7 @@ fn whole_stream_dep_quant() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "dep-quant");
+    dump_corpus("dep_quant", &bs, &dec);
 }
 
 #[test]
@@ -356,4 +388,5 @@ fn whole_stream_sign_data_hiding() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "sign data hiding");
+    dump_corpus("sign_data_hiding", &bs, &dec);
 }

@@ -188,6 +188,274 @@ impl CuNeighbourMap {
 /// [`ctx_inc_mtt_split_cu_vertical_flag`]. With `nbr_map = None` the
 /// walker preserves the round-55 picture-edge default
 /// (`nbrs.left/above_avail = false`).
+/// r412 — §6.4.1 / §6.4.2 / §6.4.3 allowed-split constraints for one
+/// coding-tree walk. Derived once per slice from the SPS partition
+/// constraints (the `partition_constraints_override_enabled_flag = 0`
+/// profile — no PH overrides) and consulted per node for BOTH the
+/// §7.3.11.4 bin-presence conditions and the §9.3.4.2.2 split ctxIncs.
+///
+/// Scope notes: `modeType` is always MODE_TYPE_ALL on the walked
+/// profiles (no local dual tree), and the picture-boundary arms only
+/// see nodes fully inside the picture (the walker's CTU layout clips
+/// edge CTUs to their in-picture rectangle).
+#[derive(Clone, Copy, Debug)]
+pub struct SplitConstraints {
+    /// `MinQtLog2Size{Intra,Inter}Y` (eq. 50 / 51).
+    pub min_qt_log2: u32,
+    /// `MaxMttDepth` (`sps_max_mtt_hierarchy_depth_*`).
+    pub max_mtt_depth: u32,
+    /// `MaxBtSize` = `1 << (min_qt_log2 + sps_log2_diff_max_bt_min_qt_*)`.
+    pub max_bt_size: u32,
+    /// `MaxTtSize` = `1 << (min_qt_log2 + sps_log2_diff_max_tt_min_qt_*)`.
+    pub max_tt_size: u32,
+    /// `MinCbLog2SizeY` — `MinBtSizeY` / `MinTtSizeY` floor.
+    pub min_cb_log2: u32,
+    /// `pps_pic_width_in_luma_samples` / `pps_pic_height_...` for the
+    /// §6.4.2 / §6.4.3 boundary arms.
+    pub pic_w: u32,
+    pub pic_h: u32,
+}
+
+/// The five per-node §6.4.1 – §6.4.3 outcomes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitAllows {
+    pub qt: bool,
+    pub bt_ver: bool,
+    pub bt_hor: bool,
+    pub tt_ver: bool,
+    pub tt_hor: bool,
+}
+
+impl SplitAllows {
+    #[inline]
+    pub fn any_mtt(&self) -> bool {
+        self.bt_ver || self.bt_hor || self.tt_ver || self.tt_hor
+    }
+    #[inline]
+    pub fn any(&self) -> bool {
+        self.qt || self.any_mtt()
+    }
+}
+
+impl SplitConstraints {
+    /// Intra-slice luma / single-tree constraints from the SPS.
+    pub fn intra_luma(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
+        let pc = &sps.partition_constraints;
+        let min_cb_log2 = pc.log2_min_luma_coding_block_size_minus2 + 2;
+        let min_qt_log2 = pc.log2_diff_min_qt_min_cb_intra_slice_luma + min_cb_log2;
+        Self {
+            min_qt_log2,
+            max_mtt_depth: pc.max_mtt_hierarchy_depth_intra_slice_luma,
+            max_bt_size: 1 << (min_qt_log2 + pc.log2_diff_max_bt_min_qt_intra_slice_luma),
+            max_tt_size: 1 << (min_qt_log2 + pc.log2_diff_max_tt_min_qt_intra_slice_luma),
+            min_cb_log2,
+            pic_w,
+            pic_h,
+        }
+    }
+
+    /// Inter-slice constraints from the SPS.
+    pub fn inter(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
+        let pc = &sps.partition_constraints;
+        let min_cb_log2 = pc.log2_min_luma_coding_block_size_minus2 + 2;
+        let min_qt_log2 = pc.log2_diff_min_qt_min_cb_inter_slice + min_cb_log2;
+        Self {
+            min_qt_log2,
+            max_mtt_depth: pc.max_mtt_hierarchy_depth_inter_slice,
+            max_bt_size: 1 << (min_qt_log2 + pc.log2_diff_max_bt_min_qt_inter_slice),
+            max_tt_size: 1 << (min_qt_log2 + pc.log2_diff_max_tt_min_qt_inter_slice),
+            min_cb_log2,
+            pic_w,
+            pic_h,
+        }
+    }
+
+    /// Dual-tree intra chroma constraints from the SPS (dimensions in
+    /// luma samples, matching the chroma coding-tree walk).
+    pub fn intra_chroma(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
+        let pc = &sps.partition_constraints;
+        let min_cb_log2 = pc.log2_min_luma_coding_block_size_minus2 + 2;
+        let min_qt_log2 = pc.log2_diff_min_qt_min_cb_intra_slice_chroma + min_cb_log2;
+        Self {
+            min_qt_log2,
+            max_mtt_depth: pc.max_mtt_hierarchy_depth_intra_slice_chroma,
+            max_bt_size: 1 << (min_qt_log2 + pc.log2_diff_max_bt_min_qt_intra_slice_chroma),
+            max_tt_size: 1 << (min_qt_log2 + pc.log2_diff_max_tt_min_qt_intra_slice_chroma),
+            min_cb_log2,
+            pic_w,
+            pic_h,
+        }
+    }
+
+    /// Permissive constraints reproducing the pre-r412 allow-everything
+    /// behaviour — every split family allowed down to the 4-sample
+    /// leaf floor. Used by leaf-level harnesses that hand-build split
+    /// bins without an SPS.
+    pub fn permissive(pic_w: u32, pic_h: u32) -> Self {
+        Self {
+            min_qt_log2: 2,
+            max_mtt_depth: u32::MAX,
+            max_bt_size: 1 << 7,
+            max_tt_size: 1 << 6,
+            min_cb_log2: 2,
+            pic_w,
+            pic_h,
+        }
+    }
+
+    /// §6.4.1 — allowSplitQt.
+    pub fn allow_split_qt(&self, cb_size: u32, mtt_depth: u32, tree: TreeType) -> bool {
+        if mtt_depth != 0 {
+            return false;
+        }
+        match tree {
+            TreeType::SingleTree | TreeType::DualTreeLuma => cb_size > (1 << self.min_qt_log2),
+            // 4:2:0 chroma tree: MinQtSizeC gate + the (cbSize /
+            // SubWidthC) <= 4 kill (dimensions in luma samples).
+            TreeType::DualTreeChroma => cb_size > (1 << self.min_qt_log2) && (cb_size / 2) > 4,
+        }
+    }
+
+    /// §6.4.2 — allowBtSplit for one direction. `parent_tt_ver` is
+    /// `Some(vertical)` when the node is a middle/second child of a TT
+    /// split at `mtt_depth − 1` (the parallel-TT suppression);
+    /// `part_idx` is the child index within the parent MTT split.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allow_bt(
+        &self,
+        vertical: bool,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        mtt_depth: u32,
+        tree: TreeType,
+        parent_tt_ver: Option<bool>,
+        part_idx: u32,
+    ) -> bool {
+        let cb_size = if vertical { w } else { h };
+        let min_bt = 1u32 << self.min_cb_log2;
+        if cb_size <= min_bt
+            || w > self.max_bt_size
+            || h > self.max_bt_size
+            || mtt_depth >= self.max_mtt_depth
+        {
+            return false;
+        }
+        if tree == TreeType::DualTreeChroma {
+            if (w / 2) * (h / 2) <= 16 {
+                return false;
+            }
+            if (w / 2) == 4 && vertical {
+                return false;
+            }
+        }
+        // Picture-boundary arms (x1/y1 relative to the picture).
+        let x1 = x0 + w;
+        let y1 = y0 + h;
+        if vertical && y1 > self.pic_h {
+            return false;
+        }
+        if vertical && h > 64 && x1 > self.pic_w {
+            return false;
+        }
+        if !vertical && w > 64 && y1 > self.pic_h {
+            return false;
+        }
+        if x1 > self.pic_w && y1 > self.pic_h && w > (1 << self.min_qt_log2) {
+            return false;
+        }
+        if !vertical && x1 > self.pic_w && y1 <= self.pic_h {
+            return false;
+        }
+        // Parallel-TT suppression: the second child of a TT split may
+        // not immediately re-split parallel to it.
+        if mtt_depth > 0 && part_idx == 1 {
+            if let Some(tt_ver) = parent_tt_ver {
+                if tt_ver == vertical {
+                    return false;
+                }
+            }
+        }
+        // VPDU shape arms.
+        if vertical && w <= 64 && h > 64 {
+            return false;
+        }
+        if !vertical && w > 64 && h <= 64 {
+            return false;
+        }
+        true
+    }
+
+    /// §6.4.3 — allowTtSplit for one direction.
+    pub fn allow_tt(
+        &self,
+        vertical: bool,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        mtt_depth: u32,
+        tree: TreeType,
+    ) -> bool {
+        let cb_size = if vertical { w } else { h };
+        let min_tt = 1u32 << self.min_cb_log2;
+        let max_tt = self.max_tt_size.min(64);
+        if cb_size <= 2 * min_tt
+            || w > max_tt
+            || h > max_tt
+            || mtt_depth >= self.max_mtt_depth
+            || x0 + w > self.pic_w
+            || y0 + h > self.pic_h
+        {
+            return false;
+        }
+        if tree == TreeType::DualTreeChroma {
+            if (w / 2) * (h / 2) <= 32 {
+                return false;
+            }
+            if (w / 2) == 8 && vertical {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// All five outcomes for one node.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allows(
+        &self,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        mtt_depth: u32,
+        tree: TreeType,
+        parent_tt_ver: Option<bool>,
+        part_idx: u32,
+    ) -> SplitAllows {
+        // §6.4.1 quad split keys on cbSize = cbWidth (square nodes on
+        // the QT phase; MTT-phase nodes have mtt_depth != 0 → false).
+        SplitAllows {
+            qt: self.allow_split_qt(w.max(h), mtt_depth, tree),
+            bt_ver: self.allow_bt(true, x0, y0, w, h, mtt_depth, tree, parent_tt_ver, part_idx),
+            bt_hor: self.allow_bt(
+                false,
+                x0,
+                y0,
+                w,
+                h,
+                mtt_depth,
+                tree,
+                parent_tt_ver,
+                part_idx,
+            ),
+            tt_ver: self.allow_tt(true, x0, y0, w, h, mtt_depth, tree),
+            tt_hor: self.allow_tt(false, x0, y0, w, h, mtt_depth, tree),
+        }
+    }
+}
+
 pub struct TreeWalker<'a, 'b> {
     dec: &'a mut ArithDecoder<'b>,
     ctxs: &'a mut TreeCtxs,
@@ -214,6 +482,12 @@ pub struct TreeWalker<'a, 'b> {
     /// off the chroma tree; QT splits are not logged (the array is only
     /// consulted for MTT modes).
     mtt_log: Vec<MttSplitRec>,
+    /// r412 — §6.4.1 – §6.4.3 allowed-split constraints driving the
+    /// §7.3.11.4 bin-presence conditions and the §9.3.4.2.2 ctxIncs.
+    /// Defaults to [`SplitConstraints::permissive`] over a huge
+    /// picture; real decodes install the SPS-derived set via
+    /// [`Self::with_constraints`].
+    constraints: SplitConstraints,
 }
 
 /// One `MttSplitMode[x0][y0][mttDepth]` record (§7.4.11.4) — the MTT
@@ -240,7 +514,14 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             base_y: 0,
             tree_type: TreeType::SingleTree,
             mtt_log: Vec::new(),
+            constraints: SplitConstraints::permissive(u32::MAX, u32::MAX),
         }
+    }
+
+    /// r412 — install the SPS-derived §6.4.1 – §6.4.3 constraints.
+    pub fn with_constraints(mut self, constraints: SplitConstraints) -> Self {
+        self.constraints = constraints;
+        self
     }
 
     /// §7.3.11.4 — select which component tree this walker parses. The
@@ -282,7 +563,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
     /// Walk a coding_tree() rooted at `(x, y)` of size `w × h`.
     /// Returns a flat list of leaf CUs in decoding order.
     pub fn walk(mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<Cu>> {
-        self.recurse(x, y, w, h, 0, 0)?;
+        self.recurse(x, y, w, h, 0, 0, None, 0)?;
         Ok(self.out)
     }
 
@@ -297,7 +578,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         w: u32,
         h: u32,
     ) -> Result<(Vec<Cu>, Vec<MttSplitRec>)> {
-        self.recurse(x, y, w, h, 0, 0)?;
+        self.recurse(x, y, w, h, 0, 0, None, 0)?;
         Ok((self.out, self.mtt_log))
     }
 
@@ -337,6 +618,7 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recurse(
         &mut self,
         x: u32,
@@ -345,24 +627,26 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
         h: u32,
         cqt_depth: u32,
         mtt_depth: u32,
+        parent_tt_ver: Option<bool>,
+        part_idx: u32,
     ) -> Result<()> {
-        // At the minimum CU size we stop without reading a split flag.
-        let at_min = self.at_leaf_floor(w, h);
-        if at_min {
-            self.out.push(Cu {
-                x,
-                y,
-                w,
-                h,
-                cqt_depth,
-                mtt_depth,
-            });
-            self.record_cu(x, y, w, h, cqt_depth);
-            return Ok(());
-        }
-        // split_cu_flag — round-56 ctxInc uses real neighbour
-        // availability when the walker has been attached to a
-        // [`CuNeighbourMap`] (otherwise picture-edge defaults).
+        // r412 — §6.4.1 – §6.4.3: derive the five allowed-split
+        // outcomes for this node; they gate the §7.3.11.4 bin
+        // presence AND feed the §9.3.4.2.2 ctxIncs.
+        let allows = self.constraints.allows(
+            self.base_x + x,
+            self.base_y + y,
+            w,
+            h,
+            mtt_depth,
+            self.tree_type,
+            parent_tt_ver,
+            part_idx,
+        );
+        // Historical chroma-tree floor kept as a defensive backstop
+        // (it coincides with the allows-derived floor for 4:2:0).
+        let at_min = self.at_leaf_floor(w, h) && !allows.any();
+        let _ = at_min;
         let (
             left_avail,
             above_avail,
@@ -371,23 +655,29 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             cqt_depth_left,
             cqt_depth_above,
         ) = self.neighbour_state(x, y);
-        let split_cu_inc = ctx_inc_split_cu_flag(
-            left_avail,
-            above_avail,
-            cb_height_left,
-            cb_width_above,
-            w,
-            h,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ) as usize;
-        let split_cu_ctx_n = self.ctxs.split_cu.len() - 1;
-        let split_cu = self
-            .dec
-            .decode_decision(&mut self.ctxs.split_cu[split_cu_inc.min(split_cu_ctx_n)])?;
+        // split_cu_flag — present iff any split family is allowed
+        // (interior nodes; edge CTUs are pre-clipped by the layout so
+        // the boundary inferred-1 arm never fires on this walker).
+        let split_cu = if allows.any() {
+            let inc = ctx_inc_split_cu_flag(
+                left_avail,
+                above_avail,
+                cb_height_left,
+                cb_width_above,
+                w,
+                h,
+                allows.bt_ver as u32,
+                allows.bt_hor as u32,
+                allows.tt_ver as u32,
+                allows.tt_hor as u32,
+                allows.qt as u32,
+            ) as usize;
+            let n = self.ctxs.split_cu.len() - 1;
+            self.dec
+                .decode_decision(&mut self.ctxs.split_cu[inc.min(n)])?
+        } else {
+            0
+        };
         if split_cu == 0 {
             self.out.push(Cu {
                 x,
@@ -400,9 +690,10 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             self.record_cu(x, y, w, h, cqt_depth);
             return Ok(());
         }
-        // split_qt_flag — only readable while we're in the quad-tree
-        // phase (mtt_depth == 0). Outside that we force BT/TT.
-        let split_qt = if mtt_depth == 0 {
+        // split_qt_flag — §7.3.11.4: present iff a QT split AND at
+        // least one MTT split are both allowed; §7.4.12.4 inference
+        // otherwise (interior nodes: allowSplitQt).
+        let split_qt = if allows.qt && allows.any_mtt() {
             let inc = ctx_inc_split_qt_flag(
                 left_avail,
                 above_avail,
@@ -414,41 +705,62 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             self.dec
                 .decode_decision(&mut self.ctxs.split_qt[inc.min(n)])?
         } else {
-            0
+            u32::from(allows.qt)
         };
         if split_qt == 1 {
             let hw = w / 2;
             let hh = h / 2;
-            self.recurse(x, y, hw, hh, cqt_depth + 1, mtt_depth)?;
-            self.recurse(x + hw, y, hw, hh, cqt_depth + 1, mtt_depth)?;
-            self.recurse(x, y + hh, hw, hh, cqt_depth + 1, mtt_depth)?;
-            self.recurse(x + hw, y + hh, hw, hh, cqt_depth + 1, mtt_depth)?;
+            self.recurse(x, y, hw, hh, cqt_depth + 1, mtt_depth, None, 0)?;
+            self.recurse(x + hw, y, hw, hh, cqt_depth + 1, mtt_depth, None, 1)?;
+            self.recurse(x, y + hh, hw, hh, cqt_depth + 1, mtt_depth, None, 2)?;
+            self.recurse(x + hw, y + hh, hw, hh, cqt_depth + 1, mtt_depth, None, 3)?;
             return Ok(());
         }
-        // Round-55 — multi-type-tree split. Round-56 — feed the same
-        // neighbour state into the §9.3.4.2.3 derivation so multi-row
-        // pictures see the proper aspect-ratio branch.
-        let mtt_v_inc = ctx_inc_mtt_split_cu_vertical_flag(
-            left_avail,
-            above_avail,
-            cb_height_left,
-            cb_width_above,
-            w,
-            h,
-            1,
-            1,
-            1,
-            1,
-        ) as usize;
-        let mtt_v_n = self.ctxs.mtt_split_vertical.len() - 1;
-        let mtt_vertical = self
-            .dec
-            .decode_decision(&mut self.ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)])?;
-        let mtt_b_inc = ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, mtt_depth) as usize;
-        let mtt_b_n = self.ctxs.mtt_split_binary.len() - 1;
-        let mtt_binary = self
-            .dec
-            .decode_decision(&mut self.ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)])?;
+        // mtt_split_cu_vertical_flag — present iff both a horizontal
+        // and a vertical MTT split are allowed; §7.4.12.4 inference
+        // otherwise.
+        let mtt_vertical = if (allows.bt_hor || allows.tt_hor) && (allows.bt_ver || allows.tt_ver) {
+            let inc = ctx_inc_mtt_split_cu_vertical_flag(
+                left_avail,
+                above_avail,
+                cb_height_left,
+                cb_width_above,
+                w,
+                h,
+                allows.bt_ver as u32,
+                allows.bt_hor as u32,
+                allows.tt_ver as u32,
+                allows.tt_hor as u32,
+            ) as usize;
+            let n = self.ctxs.mtt_split_vertical.len() - 1;
+            self.dec
+                .decode_decision(&mut self.ctxs.mtt_split_vertical[inc.min(n)])?
+        } else if allows.bt_hor || allows.tt_hor {
+            0
+        } else {
+            1
+        };
+        // mtt_split_cu_binary_flag — present iff BOTH the binary and
+        // ternary split are allowed in the chosen direction.
+        let bin_coded = if mtt_vertical == 1 {
+            allows.bt_ver && allows.tt_ver
+        } else {
+            allows.bt_hor && allows.tt_hor
+        };
+        let mtt_binary = if bin_coded {
+            let inc = ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, mtt_depth) as usize;
+            let n = self.ctxs.mtt_split_binary.len() - 1;
+            self.dec
+                .decode_decision(&mut self.ctxs.mtt_split_binary[inc.min(n)])?
+        } else if !allows.bt_ver && !allows.bt_hor {
+            0
+        } else if !allows.tt_ver && !allows.tt_hor {
+            1
+        } else if allows.bt_hor && allows.tt_ver {
+            1 - mtt_vertical
+        } else {
+            mtt_vertical
+        };
         // r391 — record MttSplitMode[x][y][mttDepth] for the §8.4.4
         // 64-grid consumers.
         self.mtt_log.push(MttSplitRec {
@@ -462,25 +774,27 @@ impl<'a, 'b> TreeWalker<'a, 'b> {
             // Binary split.
             if mtt_vertical == 1 {
                 let hw = w / 2;
-                self.recurse(x, y, hw, h, cqt_depth, mtt_depth + 1)?;
-                self.recurse(x + hw, y, hw, h, cqt_depth, mtt_depth + 1)?;
+                self.recurse(x, y, hw, h, cqt_depth, mtt_depth + 1, None, 0)?;
+                self.recurse(x + hw, y, hw, h, cqt_depth, mtt_depth + 1, None, 1)?;
             } else {
                 let hh = h / 2;
-                self.recurse(x, y, w, hh, cqt_depth, mtt_depth + 1)?;
-                self.recurse(x, y + hh, w, hh, cqt_depth, mtt_depth + 1)?;
+                self.recurse(x, y, w, hh, cqt_depth, mtt_depth + 1, None, 0)?;
+                self.recurse(x, y + hh, w, hh, cqt_depth, mtt_depth + 1, None, 1)?;
             }
         } else {
-            // Ternary split (1:2:1 sizes).
+            // Ternary split (1:2:1 sizes) — children thread the TT
+            // direction for the §6.4.2 parallel-TT suppression.
+            let tt = Some(mtt_vertical == 1);
             if mtt_vertical == 1 {
                 let q = w / 4;
-                self.recurse(x, y, q, h, cqt_depth, mtt_depth + 1)?;
-                self.recurse(x + q, y, q * 2, h, cqt_depth, mtt_depth + 1)?;
-                self.recurse(x + q * 3, y, q, h, cqt_depth, mtt_depth + 1)?;
+                self.recurse(x, y, q, h, cqt_depth, mtt_depth + 1, tt, 0)?;
+                self.recurse(x + q, y, q * 2, h, cqt_depth, mtt_depth + 1, tt, 1)?;
+                self.recurse(x + q * 3, y, q, h, cqt_depth, mtt_depth + 1, tt, 2)?;
             } else {
                 let q = h / 4;
-                self.recurse(x, y, w, q, cqt_depth, mtt_depth + 1)?;
-                self.recurse(x, y + q, w, q * 2, cqt_depth, mtt_depth + 1)?;
-                self.recurse(x, y + q * 3, w, q, cqt_depth, mtt_depth + 1)?;
+                self.recurse(x, y, w, q, cqt_depth, mtt_depth + 1, tt, 0)?;
+                self.recurse(x, y + q, w, q * 2, cqt_depth, mtt_depth + 1, tt, 1)?;
+                self.recurse(x, y + q * 3, w, q, cqt_depth, mtt_depth + 1, tt, 2)?;
             }
         }
         Ok(())

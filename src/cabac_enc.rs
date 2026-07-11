@@ -244,11 +244,37 @@ impl ArithEncoder {
         //
         // Even safer: emit one extra "1" bit after `v` so any future
         // bit-9 register comparison falls comfortably inside.
-        let target = self.low;
         let remaining_bits = self.precision - self.committed;
-        for i in (0..remaining_bits).rev() {
-            let bit = ((target >> i) & 1) as u8;
-            self.commit_bit(bit);
+        if self.terminated && remaining_bits >= 8 {
+            // r412 — §9.3.4.3.5 termination flush. The decoder's total
+            // consumption is `precision − 7` bits (the 9-bit §9.3.2.5
+            // init plus one bit per renormalization, EXCEPT the final
+            // terminate-1 bin which renormalizes only on the encoder
+            // side), and the spec pins "the last bit inserted in
+            // register ivlOffset is equal to 1" — that bit is the
+            // `rbsp_stop_one_bit` of `rbsp_slice_trailing_bits()`. So
+            // the flush emits exactly `remaining − 7` bits: the value
+            // `w` must satisfy `low <= (w << 7) < low + range`
+            // (range = 256 after the terminate renormalization; the
+            // 7 dropped bits are never read and decode as zeros) and
+            // must be ODD so the stop bit lands on the last consumed
+            // position. `w = ceil(low / 128)` rounded up to odd fits:
+            // `(w << 7) <= low + 127 + 128 < low + 256`. The pre-r412
+            // tail emitted `low` verbatim + zero alignment — fine for
+            // this crate's reader (which never checked the stop bit)
+            // but structurally broken for a conforming decoder.
+            let w0 = (self.low + 127) >> 7;
+            let w = if w0 & 1 == 1 { w0 } else { w0 + 1 };
+            for i in (0..remaining_bits - 7).rev() {
+                let bit = ((w >> i) & 1) as u8;
+                self.commit_bit(bit);
+            }
+        } else {
+            let target = self.low;
+            for i in (0..remaining_bits).rev() {
+                let bit = ((target >> i) & 1) as u8;
+                self.commit_bit(bit);
+            }
         }
         // Byte-align with zeros.
         while self.bit_pos != 0 {

@@ -172,6 +172,13 @@ impl<'a> ArithDecoder<'a> {
         Ok(dec)
     }
 
+    /// r412 — total bits consumed from the payload so far (the §9.3.2.5
+    /// 9-bit initial fill plus every renormalization / bypass read).
+    /// Diagnostic surface for slice-end conformance checks.
+    pub fn bits_consumed(&self) -> u64 {
+        (self.byte_pos as u64) * 8 + u64::from(self.bit_pos)
+    }
+
     /// Has the terminate-MPS path fired?
     pub fn is_terminated(&self) -> bool {
         self.terminated

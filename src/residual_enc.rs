@@ -156,14 +156,18 @@ pub fn encode_last_sig_coeff_pos(
     ctxs: &mut ResidualCtxs,
     log2_zo_tb_width: u32,
     log2_zo_tb_height: u32,
+    log2_full_tb_width: u32,
+    log2_full_tb_height: u32,
     c_idx: u32,
     last_x: u32,
     last_y: u32,
 ) -> Result<()> {
+    // r412 — §9.3.4.2.4: prefix ctxInc from the FULL TB log2 dims;
+    // §7.4.12.11 cMax from the zeroed-out dims.
     encode_last_sig_prefix(
         enc,
         &mut ctxs.last_x,
-        log2_zo_tb_width,
+        log2_full_tb_width,
         (log2_zo_tb_width << 1).saturating_sub(1),
         c_idx,
         last_x,
@@ -171,7 +175,7 @@ pub fn encode_last_sig_coeff_pos(
     encode_last_sig_prefix(
         enc,
         &mut ctxs.last_y,
-        log2_zo_tb_height,
+        log2_full_tb_height,
         (log2_zo_tb_height << 1).saturating_sub(1),
         c_idx,
         last_y,
@@ -346,8 +350,11 @@ pub fn encode_tb_coefficients_opts(
         last_y = 0;
     }
 
-    // Emit last_sig_coeff_x/y_prefix / suffix (Zo-dim binarisation).
-    encode_last_sig_coeff_pos(enc, ctxs, log2_zo_w, log2_zo_h, c_idx, last_x, last_y)?;
+    // Emit last_sig_coeff_x/y_prefix / suffix (Zo-dim binarisation,
+    // full-dim ctx).
+    encode_last_sig_coeff_pos(
+        enc, ctxs, log2_zo_w, log2_zo_h, log2_w, log2_h, c_idx, last_x, last_y,
+    )?;
 
     // Build state arrays mirroring the decoder.
     let total = n_tb_w * n_tb_h;

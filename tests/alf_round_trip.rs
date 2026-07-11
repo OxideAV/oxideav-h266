@@ -664,6 +664,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     use oxideav_h266::alf::AlfPicture;
     use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
     use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
@@ -674,9 +675,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{
-        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
-    };
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     let src = PictureBuffer::yuv420_filled(128, 128, 128);
     let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
@@ -759,19 +758,22 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
         128,
         128,
         TreeNeighbours::default(),
+        SplitAllows {
+            qt: true,
+            bt_ver: false,
+            bt_hor: false,
+            tt_ver: false,
+            tt_hor: false,
+        },
     )
     .unwrap();
     assert_eq!(
         split_root, 1,
         "round-55 128×128 CTB: split_cu_flag must decode as 1 (forced QT)"
     );
-    let split_qt =
-        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
-            .unwrap();
-    assert_eq!(
-        split_qt, 1,
-        "round-55 128×128 CTB: split_qt_flag must decode as 1"
-    );
+    // r412 — split_qt_flag is NOT coded here: the emitted SPS allows
+    // only the QT split at the 128 root (max_mtt_depth 0), so §7.4.12.4
+    // infers split_qt_flag = 1.
     // Round-52 — each of the four 64×64 sub-CUs is wrapped in a
     // `coding_tree() → split_cu_flag = 0` shell that precedes the
     // §7.3.10 transform_unit() emit. Read the shell bin first, then the
@@ -783,6 +785,13 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: false,
+                bt_hor: false,
+                tt_ver: false,
+                tt_hor: false,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -810,6 +819,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     use oxideav_h266::alf::AlfPicture;
     use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
     use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
@@ -820,9 +830,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{
-        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
-    };
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     // High-contrast luma + chroma noise → the encoder's flat quant
     // ladder leaves non-trivial residuals on every plane.
@@ -916,13 +924,17 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
         128,
         128,
         TreeNeighbours::default(),
+        SplitAllows {
+            qt: true,
+            bt_ver: false,
+            bt_hor: false,
+            tt_ver: false,
+            tt_hor: false,
+        },
     )
     .unwrap();
     assert_eq!(split_root, 1, "round-55 forced QT split_cu_flag = 1");
-    let split_qt =
-        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
-            .unwrap();
-    assert_eq!(split_qt, 1, "round-55 forced QT split_qt_flag = 1");
+    // r412 — split_qt_flag inferred 1 (QT-only root; §7.4.12.4).
     // Round-52 — `coding_tree()` shell wraps every leaf CU; read the
     // `split_cu_flag = 0` bin per TB before the CBF triplet.
     let mut any_nonzero_cbf = false;
@@ -936,6 +948,13 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: false,
+                bt_hor: false,
+                tt_ver: false,
+                tt_hor: false,
+            },
         )
         .unwrap();
         assert_eq!(split, 0, "round-52 split_cu_flag must decode as 0");
@@ -1094,6 +1113,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     use oxideav_h266::alf::AlfPicture;
     use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
     use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
     use oxideav_h266::encoder_pipeline::encode_idr_with_qp_picker;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
@@ -1105,9 +1125,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{
-        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
-    };
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     // 128×64 source: two stacked 64×64 CUs in row 0 of a 128×128 CTB
     // grid. CU(0,0) is the left half (flat 128 → all-zero residuals at
@@ -1223,13 +1241,17 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
         128,
         128,
         TreeNeighbours::default(),
+        SplitAllows {
+            qt: true,
+            bt_ver: false,
+            bt_hor: false,
+            tt_ver: false,
+            tt_hor: false,
+        },
     )
     .unwrap();
     assert_eq!(split_root, 1, "round-55 forced QT split_cu_flag = 1");
-    let split_qt =
-        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
-            .unwrap();
-    assert_eq!(split_qt, 1, "round-55 forced QT split_qt_flag = 1");
+    // r412 — split_qt_flag inferred 1 (QT-only root; §7.4.12.4).
     for tb_idx in 0..4 {
         let split = decode_coding_tree_split_cu_flag(
             &mut dec,
@@ -1237,6 +1259,13 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: false,
+                bt_hor: false,
+                tt_ver: false,
+                tt_hor: false,
+            },
         )
         .unwrap();
         assert_eq!(split, 0, "round-52 split_cu_flag must decode as 0");
@@ -1298,6 +1327,7 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     use oxideav_h266::alf::AlfPicture;
     use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
     use oxideav_h266::cabac::ArithDecoder;
+    use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
@@ -1309,9 +1339,7 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     };
     use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{
-        decode_coding_tree_split_cu_flag, decode_coding_tree_split_qt_flag, TreeNeighbours,
-    };
+    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     // 128×128 source with structured luma so at least one CU emits a
     // non-zero CBF.
@@ -1404,13 +1432,17 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
         128,
         128,
         TreeNeighbours::default(),
+        SplitAllows {
+            qt: true,
+            bt_ver: false,
+            bt_hor: false,
+            tt_ver: false,
+            tt_hor: false,
+        },
     )
     .unwrap();
     assert_eq!(split_root, 1, "round-55 forced QT split_cu_flag = 1");
-    let split_qt =
-        decode_coding_tree_split_qt_flag(&mut dec, &mut tree_ctxs, TreeNeighbours::default(), 0)
-            .unwrap();
-    assert_eq!(split_qt, 1, "round-55 forced QT split_qt_flag = 1");
+    // r412 — split_qt_flag inferred 1 (QT-only root; §7.4.12.4).
     for tb_idx in 0..4 {
         let split = decode_coding_tree_split_cu_flag(
             &mut dec,
@@ -1418,6 +1450,13 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
             64,
             64,
             TreeNeighbours::default(),
+            SplitAllows {
+                qt: true,
+                bt_ver: false,
+                bt_hor: false,
+                tt_ver: false,
+                tt_hor: false,
+            },
         )
         .unwrap();
         assert_eq!(

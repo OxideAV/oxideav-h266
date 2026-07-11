@@ -564,11 +564,28 @@ impl VvcEncoder {
         bw.write_ue(0); // log2_min_luma_cb_size_minus2
         bw.write_bit(0); // partition_constraints_override_enabled
         bw.write_ue(0); // log2_diff_min_qt_min_cb_intra_luma
-        bw.write_ue(0); // max_mtt_depth_intra_luma = 0 → skip bt/tt
+                        // r412 — the MTT pickers emit BT/TT splits at the 64x64 level,
+                        // which §6.4.2 / §6.4.3 only allow when the SPS signals a
+                        // non-zero MTT depth and MaxBtSizeY / MaxTtSizeY >= 64
+                        // (MinQtSizeY is 4, so both log2 diffs are 4). With the
+                        // pickers off the fields stay 0 and a conforming decoder
+                        // never reads BT/TT bins — matching the emitted stream.
+        let mtt_on = self.config.enable_mtt_bt_picker || self.config.enable_mtt_tt_picker;
+        if mtt_on {
+            bw.write_ue(1); // max_mtt_depth_intra_luma = 1
+            bw.write_ue(4); // log2_diff_max_bt_min_qt_intra_luma → MaxBt 64
+            bw.write_ue(4); // log2_diff_max_tt_min_qt_intra_luma → MaxTt 64
+        } else {
+            bw.write_ue(0); // max_mtt_depth_intra_luma = 0 → skip bt/tt
+        }
         bw.write_bit(0); // qtbtt_dual_tree_intra = 0 → skip chroma block
         bw.write_ue(0); // log2_diff_min_qt_min_cb_inter
         bw.write_ue(0); // max_mtt_depth_inter = 0 → skip bt/tt
-        bw.write_bit(0); // max_luma_transform_size_64_flag
+                        // r412 wire-conformance fix — the pipeline codes 64x64 luma
+                        // TBs, so the SPS must signal MaxTbSizeY = 64; with the bit at
+                        // 0 a conforming decoder tiles every 64x64 CU into four 32x32
+                        // transform_tree() TUs and desyncs on our single-TB layout.
+        bw.write_bit(1); // max_luma_transform_size_64_flag
 
         // ---- Tool flags (§7.3.2.4 tail) ----
         bw.write_bit(0); // transform_skip_enabled

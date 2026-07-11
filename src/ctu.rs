@@ -1197,6 +1197,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.alf_syntax_cfg = Some(cfg);
     }
 
+    /// r412 — §7.3.11.1 `end_of_slice_one_bit`: decode the slice-final
+    /// terminate bin and verify it reads 1. Callers invoke this after
+    /// [`Self::decode_picture_into`] to confirm the CABAC stream ends
+    /// exactly where the spec ends it (a desync usually surfaces here
+    /// even when every earlier bin happened to decode).
+    pub fn finish_slice(&mut self) -> Result<()> {
+        let bin = self.arith.decode_terminate()?;
+        if bin != 1 {
+            return Err(Error::invalid(
+                "h266 slice_data: end_of_slice_one_bit decoded as 0 (must be 1)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// r412 — diagnostic surface: total CABAC bits consumed so far
+    /// (see [`crate::cabac::ArithDecoder::bits_consumed`]).
+    pub fn arith_bits_consumed(&self) -> u64 {
+        self.arith.bits_consumed()
+    }
+
     /// r412 — §8.7.5.1 eq. 1212: mark a just-reconstructed luma
     /// rectangle "available for use in the §6.4.4 derivation".
     /// Public so leaf-level callers driving [`Self::reconstruct_leaf_cu`]
@@ -2309,7 +2330,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             h: u32,
             cqt_depth: u32,
             mtt_depth: u32,
+            parent_tt_ver: Option<bool>,
+            part_idx: u32,
         }
+        // r412 — §6.4.1 – §6.4.3 allowed-split constraints from the
+        // SPS partition constraints (intra vs inter slice set).
+        let constraints = if self.sh.sh_slice_type == SliceType::I {
+            crate::coding_tree::SplitConstraints::intra_luma(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            )
+        } else {
+            crate::coding_tree::SplitConstraints::inter(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            )
+        };
         let mut cus: Vec<CtuCu> = Vec::new();
         let mut infos: Vec<LeafCuInfo> = Vec::new();
         let mut residuals: Vec<LeafCuResidual> = Vec::new();
@@ -2320,12 +2358,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             h: ctu.height_luma,
             cqt_depth: 0,
             mtt_depth: 0,
+            parent_tt_ver: None,
+            part_idx: 0,
         }];
-        // Luma MinCbLog2SizeY floor (mirrors TreeWalker::at_leaf_floor
-        // for SINGLE_TREE).
-        let min_cb_log2 = 2u32;
         while let Some(n) = stack.pop() {
-            let at_min = n.w.trailing_zeros() <= min_cb_log2 || n.h.trailing_zeros() <= min_cb_log2;
+            let allows = constraints.allows(
+                ctu.x0 + n.x,
+                ctu.y0 + n.y,
+                n.w,
+                n.h,
+                n.mtt_depth,
+                TreeType::SingleTree,
+                n.parent_tt_ver,
+                n.part_idx,
+            );
             let (
                 left_avail,
                 above_avail,
@@ -2334,9 +2380,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cqt_depth_left,
                 cqt_depth_above,
             ) = self.nbr_map.neighbour_state(ctu.x0 + n.x, ctu.y0 + n.y);
-            let split_cu = if at_min {
-                0
-            } else {
+            // split_cu_flag — §7.3.11.4 presence: any allowed split
+            // (interior nodes; edge CTUs are pre-clipped).
+            let split_cu = if allows.any() {
                 let inc = crate::ctx::ctx_inc_split_cu_flag(
                     left_avail,
                     above_avail,
@@ -2344,15 +2390,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cb_width_above,
                     n.w,
                     n.h,
-                    1,
-                    1,
-                    1,
-                    1,
-                    1,
+                    allows.bt_ver as u32,
+                    allows.bt_hor as u32,
+                    allows.tt_ver as u32,
+                    allows.tt_hor as u32,
+                    allows.qt as u32,
                 ) as usize;
                 let ctx_n = self.cabac.tree_ctxs.split_cu.len() - 1;
                 self.arith
                     .decode_decision(&mut self.cabac.tree_ctxs.split_cu[inc.min(ctx_n)])?
+            } else {
+                0
             };
             if split_cu == 0 {
                 // Leaf — commit to the neighbour map, then decode this
@@ -2374,18 +2422,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let neigh = self.compute_cu_neighbourhood(&ccu);
                 let (info, residual) = self.decode_leaf_cu_syntax(&ccu, &neigh)?;
                 // Round-149/406/409 — commit the parse-time neighbour
-                // grids (MergeSubblockFlag / InterAffineFlag /
-                // CuPredMode / CuSkipFlag / IntraPredModeY / MIP) so
-                // the NEXT CU's ctxInc + MPM derivations see this CU
-                // in coding order.
+                // grids so the NEXT CU's ctxInc + MPM derivations see
+                // this CU in coding order.
                 self.commit_subblock_neighbour_state(&ccu, &info);
                 cus.push(ccu);
                 infos.push(info);
                 residuals.push(residual);
                 continue;
             }
-            // split_qt_flag — only readable in the quad-tree phase.
-            let split_qt = if n.mtt_depth == 0 {
+            // split_qt_flag — present iff QT and at least one MTT
+            // split are both allowed (§7.3.11.4); §7.4.12.4 inference
+            // otherwise.
+            let split_qt = if allows.qt && allows.any_mtt() {
                 let inc = crate::ctx::ctx_inc_split_qt_flag(
                     left_avail,
                     above_avail,
@@ -2397,7 +2445,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.arith
                     .decode_decision(&mut self.cabac.tree_ctxs.split_qt[inc.min(ctx_n)])?
             } else {
-                0
+                u32::from(allows.qt)
             };
             let children: Vec<Node> = if split_qt == 1 {
                 let hw = n.w / 2;
@@ -2410,6 +2458,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         h: hh,
                         cqt_depth: n.cqt_depth + 1,
                         mtt_depth: n.mtt_depth,
+                        parent_tt_ver: None,
+                        part_idx: 0,
                     },
                     Node {
                         x: n.x + hw,
@@ -2418,6 +2468,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         h: hh,
                         cqt_depth: n.cqt_depth + 1,
                         mtt_depth: n.mtt_depth,
+                        parent_tt_ver: None,
+                        part_idx: 1,
                     },
                     Node {
                         x: n.x,
@@ -2426,6 +2478,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         h: hh,
                         cqt_depth: n.cqt_depth + 1,
                         mtt_depth: n.mtt_depth,
+                        parent_tt_ver: None,
+                        part_idx: 2,
                     },
                     Node {
                         x: n.x + hw,
@@ -2434,33 +2488,58 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         h: hh,
                         cqt_depth: n.cqt_depth + 1,
                         mtt_depth: n.mtt_depth,
+                        parent_tt_ver: None,
+                        part_idx: 3,
                     },
                 ]
             } else {
-                // MTT split (§9.3.4.2.3 ctxIncs).
-                let mtt_v_inc = crate::ctx::ctx_inc_mtt_split_cu_vertical_flag(
-                    left_avail,
-                    above_avail,
-                    cb_height_left,
-                    cb_width_above,
-                    n.w,
-                    n.h,
-                    1,
-                    1,
-                    1,
-                    1,
-                ) as usize;
-                let mtt_v_n = self.cabac.tree_ctxs.mtt_split_vertical.len() - 1;
-                let mtt_vertical = self.arith.decode_decision(
-                    &mut self.cabac.tree_ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)],
-                )?;
-                let mtt_b_inc =
-                    crate::ctx::ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, n.mtt_depth)
-                        as usize;
-                let mtt_b_n = self.cabac.tree_ctxs.mtt_split_binary.len() - 1;
-                let mtt_binary = self.arith.decode_decision(
-                    &mut self.cabac.tree_ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)],
-                )?;
+                // MTT split — presence-aware vertical / binary flags
+                // (§7.3.11.4 / §7.4.12.4).
+                let mtt_vertical =
+                    if (allows.bt_hor || allows.tt_hor) && (allows.bt_ver || allows.tt_ver) {
+                        let inc = crate::ctx::ctx_inc_mtt_split_cu_vertical_flag(
+                            left_avail,
+                            above_avail,
+                            cb_height_left,
+                            cb_width_above,
+                            n.w,
+                            n.h,
+                            allows.bt_ver as u32,
+                            allows.bt_hor as u32,
+                            allows.tt_ver as u32,
+                            allows.tt_hor as u32,
+                        ) as usize;
+                        let mtt_v_n = self.cabac.tree_ctxs.mtt_split_vertical.len() - 1;
+                        self.arith.decode_decision(
+                            &mut self.cabac.tree_ctxs.mtt_split_vertical[inc.min(mtt_v_n)],
+                        )?
+                    } else if allows.bt_hor || allows.tt_hor {
+                        0
+                    } else {
+                        1
+                    };
+                let bin_coded = if mtt_vertical == 1 {
+                    allows.bt_ver && allows.tt_ver
+                } else {
+                    allows.bt_hor && allows.tt_hor
+                };
+                let mtt_binary = if bin_coded {
+                    let inc =
+                        crate::ctx::ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, n.mtt_depth)
+                            as usize;
+                    let mtt_b_n = self.cabac.tree_ctxs.mtt_split_binary.len() - 1;
+                    self.arith.decode_decision(
+                        &mut self.cabac.tree_ctxs.mtt_split_binary[inc.min(mtt_b_n)],
+                    )?
+                } else if !allows.bt_ver && !allows.bt_hor {
+                    0
+                } else if !allows.tt_ver && !allows.tt_hor {
+                    1
+                } else if allows.bt_hor && allows.tt_ver {
+                    1 - mtt_vertical
+                } else {
+                    mtt_vertical
+                };
                 if mtt_binary == 1 {
                     if mtt_vertical == 1 {
                         let hw = n.w / 2;
@@ -2472,6 +2551,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 h: n.h,
                                 cqt_depth: n.cqt_depth,
                                 mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: None,
+                                part_idx: 0,
                             },
                             Node {
                                 x: n.x + hw,
@@ -2480,6 +2561,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 h: n.h,
                                 cqt_depth: n.cqt_depth,
                                 mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: None,
+                                part_idx: 1,
                             },
                         ]
                     } else {
@@ -2492,6 +2575,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 h: hh,
                                 cqt_depth: n.cqt_depth,
                                 mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: None,
+                                part_idx: 0,
                             },
                             Node {
                                 x: n.x,
@@ -2500,65 +2585,82 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 h: hh,
                                 cqt_depth: n.cqt_depth,
                                 mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: None,
+                                part_idx: 1,
                             },
                         ]
                     }
-                } else if mtt_vertical == 1 {
-                    let q = n.w / 4;
-                    vec![
-                        Node {
-                            x: n.x,
-                            y: n.y,
-                            w: q,
-                            h: n.h,
-                            cqt_depth: n.cqt_depth,
-                            mtt_depth: n.mtt_depth + 1,
-                        },
-                        Node {
-                            x: n.x + q,
-                            y: n.y,
-                            w: q * 2,
-                            h: n.h,
-                            cqt_depth: n.cqt_depth,
-                            mtt_depth: n.mtt_depth + 1,
-                        },
-                        Node {
-                            x: n.x + q * 3,
-                            y: n.y,
-                            w: q,
-                            h: n.h,
-                            cqt_depth: n.cqt_depth,
-                            mtt_depth: n.mtt_depth + 1,
-                        },
-                    ]
                 } else {
-                    let q = n.h / 4;
-                    vec![
-                        Node {
-                            x: n.x,
-                            y: n.y,
-                            w: n.w,
-                            h: q,
-                            cqt_depth: n.cqt_depth,
-                            mtt_depth: n.mtt_depth + 1,
-                        },
-                        Node {
-                            x: n.x,
-                            y: n.y + q,
-                            w: n.w,
-                            h: q * 2,
-                            cqt_depth: n.cqt_depth,
-                            mtt_depth: n.mtt_depth + 1,
-                        },
-                        Node {
-                            x: n.x,
-                            y: n.y + q * 3,
-                            w: n.w,
-                            h: q,
-                            cqt_depth: n.cqt_depth,
-                            mtt_depth: n.mtt_depth + 1,
-                        },
-                    ]
+                    let tt = Some(mtt_vertical == 1);
+                    if mtt_vertical == 1 {
+                        let q = n.w / 4;
+                        vec![
+                            Node {
+                                x: n.x,
+                                y: n.y,
+                                w: q,
+                                h: n.h,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: tt,
+                                part_idx: 0,
+                            },
+                            Node {
+                                x: n.x + q,
+                                y: n.y,
+                                w: q * 2,
+                                h: n.h,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: tt,
+                                part_idx: 1,
+                            },
+                            Node {
+                                x: n.x + q * 3,
+                                y: n.y,
+                                w: q,
+                                h: n.h,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: tt,
+                                part_idx: 2,
+                            },
+                        ]
+                    } else {
+                        let q = n.h / 4;
+                        vec![
+                            Node {
+                                x: n.x,
+                                y: n.y,
+                                w: n.w,
+                                h: q,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: tt,
+                                part_idx: 0,
+                            },
+                            Node {
+                                x: n.x,
+                                y: n.y + q,
+                                w: n.w,
+                                h: q * 2,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: tt,
+                                part_idx: 1,
+                            },
+                            Node {
+                                x: n.x,
+                                y: n.y + q * 3,
+                                w: n.w,
+                                h: q,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                                parent_tt_ver: tt,
+                                part_idx: 2,
+                            },
+                        ]
+                    }
                 }
             };
             for child in children.into_iter().rev() {
@@ -2788,8 +2890,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // picture map rebased onto the CTU origin: leaves it inserts
         // are picture-absolute via the rebase below.
         let _avail = Self::neighbour_avail(ctu);
+        let constraints = if self.sh.sh_slice_type == SliceType::I {
+            crate::coding_tree::SplitConstraints::intra_luma(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            )
+        } else {
+            crate::coding_tree::SplitConstraints::inter(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            )
+        };
         let local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
             .with_neighbour_map_rebased(&mut self.nbr_map, ctu.x0, ctu.y0)
+            .with_constraints(constraints)
             .walk(0, 0, ctu.width_luma, ctu.height_luma)?;
         Ok(local
             .into_iter()
@@ -2893,6 +3009,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let luma_local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
             .with_neighbour_map_rebased(&mut self.nbr_map, x0, y0)
             .with_tree_type(TreeType::DualTreeLuma)
+            .with_constraints(crate::coding_tree::SplitConstraints::intra_luma(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            ))
             .walk(0, 0, w, h)?;
         let luma_cus: Vec<CtuCu> = luma_local
             .into_iter()
@@ -2974,6 +3095,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
                 .with_neighbour_map_rebased(&mut self.nbr_map_chroma, x0, y0)
                 .with_tree_type(TreeType::DualTreeChroma)
+                .with_constraints(crate::coding_tree::SplitConstraints::intra_chroma(
+                    self.sps,
+                    self.layout.pic_width_luma,
+                    self.layout.pic_height_luma,
+                ))
                 .walk_logged(0, 0, w, h)?;
         let chroma_cus: Vec<CtuCu> = chroma_local
             .into_iter()
@@ -8387,7 +8513,23 @@ mod tests {
             num_extra_sh_bits: 0,
             sps_sublayer_dpb_params_flag: false,
             dpb_parameters: None,
-            partition_constraints: PartitionConstraints::default(),
+            partition_constraints: PartitionConstraints {
+                // r412 — permissive split constraints so hand-built CABAC
+                // fixtures may use any split family at any node: the
+                // §6.4.1 – §6.4.3 derivations (now driving split-bin
+                // presence + ctxIncs) see MaxMttDepth 3 and MaxBt/MaxTt at
+                // their spec maxima for the fixture CTB sizes.
+                max_mtt_hierarchy_depth_intra_slice_luma: 3,
+                log2_diff_max_bt_min_qt_intra_slice_luma: ctb_log2_minus5 as u32 + 3,
+                log2_diff_max_tt_min_qt_intra_slice_luma: (ctb_log2_minus5 as u32 + 5).min(6) - 2,
+                max_mtt_hierarchy_depth_intra_slice_chroma: 3,
+                log2_diff_max_bt_min_qt_intra_slice_chroma: ctb_log2_minus5 as u32 + 3,
+                log2_diff_max_tt_min_qt_intra_slice_chroma: (ctb_log2_minus5 as u32 + 5).min(6) - 2,
+                max_mtt_hierarchy_depth_inter_slice: 3,
+                log2_diff_max_bt_min_qt_inter_slice: ctb_log2_minus5 as u32 + 3,
+                log2_diff_max_tt_min_qt_inter_slice: (ctb_log2_minus5 as u32 + 5).min(6) - 2,
+                ..PartitionConstraints::default()
+            },
             tool_flags: ToolFlags::default(),
             subpic_info: None,
             sps_timing_hrd_params_present_flag: false,
