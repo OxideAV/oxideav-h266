@@ -46,6 +46,52 @@ fn encoder_pipeline_cfg() -> AlfSyntaxConfig {
     }
 }
 
+/// r412 — the §7.3.11.5 intra-mode cascade the encoder pipeline now
+/// codes before every transform_unit(): `intra_luma_mpm_flag = 1`,
+/// `intra_luma_not_planar_flag = 1`, `intra_luma_mpm_idx = 0` (one
+/// bypass 0-bin) and `intra_chroma_pred_mode` = DM ("0" ctx bin).
+struct IntraCascadeCtxs {
+    mpm: Vec<oxideav_h266::cabac::ContextModel>,
+    np: Vec<oxideav_h266::cabac::ContextModel>,
+    cm: Vec<oxideav_h266::cabac::ContextModel>,
+}
+
+fn intra_cascade_ctxs(slice_qp: i32) -> IntraCascadeCtxs {
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    IntraCascadeCtxs {
+        mpm: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp),
+        np: init_contexts(SyntaxCtx::IntraLumaNotPlanarFlag, slice_qp),
+        cm: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp),
+    }
+}
+
+fn read_intra_dc_cascade(
+    dec: &mut oxideav_h266::cabac::ArithDecoder<'_>,
+    icx: &mut IntraCascadeCtxs,
+) {
+    use oxideav_h266::ctx::{
+        ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+        ctx_inc_intra_luma_not_planar_flag,
+    };
+    let b = dec
+        .decode_decision(&mut icx.mpm[ctx_inc_intra_luma_mpm_flag() as usize])
+        .unwrap();
+    assert_eq!(b, 1, "pipeline CU signals intra_luma_mpm_flag = 1");
+    let b = dec
+        .decode_decision(&mut icx.np[ctx_inc_intra_luma_not_planar_flag(false) as usize])
+        .unwrap();
+    assert_eq!(b, 1, "pipeline CU signals intra_luma_not_planar_flag = 1");
+    assert_eq!(
+        dec.decode_bypass().unwrap(),
+        0,
+        "pipeline CU signals intra_luma_mpm_idx = 0"
+    );
+    let b = dec
+        .decode_decision(&mut icx.cm[ctx_inc_intra_chroma_pred_mode() as usize])
+        .unwrap();
+    assert_eq!(b, 0, "pipeline CU signals DM chroma");
+}
+
 /// Round-45 — encode a 4×3 grid of mixed ALF decisions, decode it back,
 /// every CTB matches.
 #[test]
@@ -705,6 +751,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     // so the wire stream begins with `split_cu_flag = 1` +
     // `split_qt_flag = 1` before the four 64×64 leaf-CU shells.
     let mut residual_ctxs = ResidualCtxs::init(26);
+    let mut icx = intra_cascade_ctxs(26);
     let mut tree_ctxs = TreeCtxs::init(26);
     let split_root = decode_coding_tree_split_cu_flag(
         &mut dec,
@@ -742,6 +789,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
             split, 0,
             "round-52 single-CU-per-CTB scope: split_cu_flag must decode as 0"
         );
+        read_intra_dc_cascade(&mut dec, &mut icx);
         let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
         let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
         let cbf_y =
@@ -860,6 +908,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     // Round-55 — read the forced QT split flag pair before the four
     // 64×64 leaf-CU shells (128×128 CTB per §7.3.11.4).
     let mut residual_ctxs = ResidualCtxs::init(26);
+    let mut icx = intra_cascade_ctxs(26);
     let mut tree_ctxs = TreeCtxs::init(26);
     let split_root = decode_coding_tree_split_cu_flag(
         &mut dec,
@@ -890,6 +939,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
         )
         .unwrap();
         assert_eq!(split, 0, "round-52 split_cu_flag must decode as 0");
+        read_intra_dc_cascade(&mut dec, &mut icx);
         let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
         let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
         let cbf_y =
@@ -1161,6 +1211,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     // (1,1)=30 per the qp_for picker). Track the cumulative reconstructed
     // QP via §8.7.1: `qp_y(cu_n) = qp_y(prev_qp_in_qg) + cu_qp_delta`.
     let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
+    let mut icx = intra_cascade_ctxs(slice_qp_y);
     let mut tree_ctxs = TreeCtxs::init(slice_qp_y);
     let mut prev_qp = slice_qp_y;
     let mut deltas_seen = Vec::<(usize, i32)>::new();
@@ -1189,6 +1240,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
         )
         .unwrap();
         assert_eq!(split, 0, "round-52 split_cu_flag must decode as 0");
+        read_intra_dc_cascade(&mut dec, &mut icx);
         let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
         let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
         let cbf_y =
@@ -1341,6 +1393,7 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     // → every delta must decode as 0, leaving the cumulative QP at the
     // slice baseline (26).
     let mut residual_ctxs = ResidualCtxs::init(26);
+    let mut icx = intra_cascade_ctxs(26);
     let mut tree_ctxs = TreeCtxs::init(26);
     let mut any_cbf_seen = false;
     let mut max_abs_delta = 0i32;
@@ -1371,6 +1424,7 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
             split, 0,
             "constant-QP path: split_cu_flag mis-aligned at TB {tb_idx}"
         );
+        read_intra_dc_cascade(&mut dec, &mut icx);
         let cbf_cb = read_tu_cb_coded_flag(&mut dec, &mut residual_ctxs, false).unwrap();
         let cbf_cr = read_tu_cr_coded_flag(&mut dec, &mut residual_ctxs, false, cbf_cb).unwrap();
         let cbf_y =

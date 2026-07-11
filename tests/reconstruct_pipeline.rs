@@ -1280,14 +1280,12 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
         ctx_inc_cu_skip_flag(true, true, true, true),     // BR: left BL + above TR
     ];
 
-    // a) Four split_cu_flag(0) for the four 8x8 children (TL, TR, BL, BR).
-    for _ in 0..4 {
+    // r412 — §7.3.11.4 `coding_tree()` interleaves depth-first: each
+    // child's split_cu_flag(0) is immediately followed by that leaf's
+    // coding_unit() bins (cu_skip(1) + merge_idx(0)), in z-order.
+    for inc in skip_incs {
         enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
             .unwrap();
-    }
-    // b) Four (cu_skip(1) + merge_idx(0)) pairs in z-order, each with
-    //    its own parse-time-grid ctxInc.
-    for inc in skip_incs {
         let skip_slot = (init_type as usize) * 3 + inc as usize;
         enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
             .unwrap();
@@ -1744,12 +1742,10 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
         ctx_inc_cu_skip_flag(true, true, true, true),     // BR: left BL + above TR
     ];
 
-    // Four split_cu_flag(0) for the four 8x8 children.
-    for _ in 0..4 {
-        enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
-            .unwrap();
-    }
-
+    // r412 — §7.3.11.4 interleaved order: each child's split_cu_flag(0)
+    // immediately precedes that leaf's coding_unit() bins (see the
+    // per-CU loop below).
+    //
     // Per-CU (cu_skip(1), merge_idx) pairs in z-order. The merge_idx
     // truncated-unary encoding (cMax = MaxNumMergeCand - 1 = 5):
     //   * value 0 → bin0=0 (1 ctx-coded bin)
@@ -1761,6 +1757,9 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
     let max_merge_minus1: u32 = 5;
     let merge_idx_values: [u32; 4] = [0, 1, 2, 5];
     for (&mi, &skip_inc) in merge_idx_values.iter().zip(skip_incs.iter()) {
+        // split_cu_flag(0) for this 8x8 leaf (§7.3.11.4 interleave).
+        enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+            .unwrap();
         // cu_skip_flag(1).
         let skip_slot = (init_type as usize) * 3 + skip_inc as usize;
         enc.encode_decision(&mut cu_skip_ctxs[skip_slot], 1)
@@ -3638,41 +3637,48 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
     let split_qt_n = split_qt_ctxs.len() - 1;
     enc.encode_decision(&mut split_qt_ctxs[split_qt_inc_root.min(split_qt_n)], 1)
         .unwrap();
+    // r412 — §7.3.11.4 interleaved order: each child's split_cu_flag(0)
+    // immediately precedes that leaf's coding_unit() bins.
     let split_inc_8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
-    for _ in 0..4 {
-        enc.encode_decision(&mut split_cu_ctxs[split_inc_8.min(split_cu_n)], 0)
-            .unwrap();
-    }
+    let split_slot_8 = split_inc_8.min(split_cu_n);
 
     let skip_slot = |inc: u32| (init_type as usize) * 3 + inc as usize;
     let merge_inc = ctx_inc_merge_idx() as usize;
     let merge_n = leaf_ctxs.merge_idx.len() - 1;
     let merge_slot = (init_type as usize + merge_inc).min(merge_n);
 
-    // TL — skip merge (inc 0, no committed neighbours).
+    // TL — split(0) + skip merge (inc 0, no committed neighbours).
+    enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+        .unwrap();
     let inc = ctx_inc_cu_skip_flag(false, false, false, false);
     enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 1)
         .unwrap();
     enc.encode_decision(&mut leaf_ctxs.merge_idx[merge_slot], 0)
         .unwrap();
 
-    // TR — skip merge (inc 1: left TL is skip).
+    // TR — split(0) + skip merge (inc 1: left TL is skip).
+    enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+        .unwrap();
     let inc = ctx_inc_cu_skip_flag(true, false, true, false);
     enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 1)
         .unwrap();
     enc.encode_decision(&mut leaf_ctxs.merge_idx[merge_slot], 0)
         .unwrap();
 
-    // BL — skip merge (inc 1: above TL is skip).
+    // BL — split(0) + skip merge (inc 1: above TL is skip).
+    enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+        .unwrap();
     let inc = ctx_inc_cu_skip_flag(false, true, false, true);
     enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 1)
         .unwrap();
     enc.encode_decision(&mut leaf_ctxs.merge_idx[merge_slot], 0)
         .unwrap();
 
-    // BR — intra CU. cu_skip(0) with inc 2 (left BL and above TR both
-    // skip on the parse-time grid); pred_mode_flag(1) with eq. 1552
-    // inc 0 (both neighbours are MODE_INTER).
+    // BR — split(0) + intra CU. cu_skip(0) with inc 2 (left BL and
+    // above TR both skip on the parse-time grid); pred_mode_flag(1)
+    // with eq. 1552 inc 0 (both neighbours are MODE_INTER).
+    enc.encode_decision(&mut split_cu_ctxs[split_slot_8], 0)
+        .unwrap();
     let inc = ctx_inc_cu_skip_flag(true, true, true, true);
     enc.encode_decision(&mut leaf_ctxs.cu_skip_flag[skip_slot(inc)], 0)
         .unwrap();
@@ -4312,11 +4318,10 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
     let inc = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
     let qt_slot = inc.min(split_qt_ctxs.len() - 1);
     enc.encode_decision(&mut split_qt_ctxs[qt_slot], 1).unwrap();
+    // r412 — §7.3.11.4 interleaved order: each leaf's split_cu_flag(0)
+    // immediately precedes its coding_unit() bins.
     let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 1, 1, 1) as usize;
-    for _ in 0..4 {
-        enc.encode_decision(&mut split_cu_ctxs[split8.min(split_n)], 0)
-            .unwrap();
-    }
+    let split8_slot = split8.min(split_n);
 
     // Shared per-CU tail: DM chroma + all CBFs 0.
     let emit_tail = |enc: &mut ArithEncoder, ctxs: &mut LeafCuCtxs| {
@@ -4328,9 +4333,12 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
         write_tu_y_coded_flag(enc, &mut ctxs.residual, false, false, false, false).unwrap();
     };
 
-    // TL — mpm(1), not_planar(1), mpm_idx = 1 (TR bypass "10").
+    // TL — split(0), then mpm(1), not_planar(1), mpm_idx = 1 (TR
+    // bypass "10").
     let mpm_inc = ctx_inc_intra_luma_mpm_flag() as usize;
     let np_inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    enc.encode_decision(&mut split_cu_ctxs[split8_slot], 0)
+        .unwrap();
     enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
         .unwrap();
     enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 1)
@@ -4339,7 +4347,10 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
     enc.encode_bypass(0).unwrap();
     emit_tail(&mut enc, &mut ctxs);
 
-    // TR — mpm(1), not_planar(1), mpm_idx = 0 (TR bypass "0").
+    // TR — split(0), then mpm(1), not_planar(1), mpm_idx = 0 (TR
+    // bypass "0").
+    enc.encode_decision(&mut split_cu_ctxs[split8_slot], 0)
+        .unwrap();
     enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
         .unwrap();
     enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 1)
@@ -4347,8 +4358,10 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
     enc.encode_bypass(0).unwrap();
     emit_tail(&mut enc, &mut ctxs);
 
-    // BL / BR — mpm(1), not_planar(0) → PLANAR.
+    // BL / BR — split(0), then mpm(1), not_planar(0) → PLANAR.
     for _ in 0..2 {
+        enc.encode_decision(&mut split_cu_ctxs[split8_slot], 0)
+            .unwrap();
         enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
             .unwrap();
         enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 0)

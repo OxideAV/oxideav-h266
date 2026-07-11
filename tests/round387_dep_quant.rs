@@ -121,9 +121,16 @@ fn dep_quant_pipeline_psnr_holds_the_floor() {
     let (_, rec_dq) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
     let psnr_dq = psnr_y(&src.luma, &rec_dq.luma).unwrap();
 
+    // r412 re-baseline: the §7.3.11.11 / §8.7.4.1 64-point zero-out is
+    // now implemented (only the low-frequency 32-corner of a 64×64 TB
+    // is coded, as the spec mandates), and this fixture's sawtooth
+    // (`% 200`) content carries real energy in the zeroed-out
+    // frequencies — a conforming encoder would split the CU instead.
+    // Measured 23.2 dB; the flat-vs-dep-quant comparison below is the
+    // real invariant.
     assert!(
-        psnr_dq >= 30.0,
-        "dep-quant reconstruction PSNR_Y {psnr_dq:.2} dB < 30 dB floor"
+        psnr_dq >= 22.0,
+        "dep-quant reconstruction PSNR_Y {psnr_dq:.2} dB < 22 dB floor"
     );
     // The greedy TCQ runs at half the quantisation step of the flat
     // ladder ((qP + 1)-scaled levelScale + bdShift + 1), so its
@@ -157,9 +164,11 @@ fn sdh_pipeline_signals_flags_and_holds_psnr() {
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
 
     let psnr = psnr_y(&src.luma, &rec.luma).unwrap();
+    // r412 re-baseline — see dep_quant_pipeline_psnr_holds_the_floor:
+    // the spec 64-point zero-out costs this sawtooth fixture ~7 dB.
     assert!(
-        psnr >= 30.0,
-        "SDH reconstruction PSNR_Y {psnr:.2} dB < 30 dB"
+        psnr >= 22.0,
+        "SDH reconstruction PSNR_Y {psnr:.2} dB < 22 dB"
     );
 
     let nals: Vec<_> = iter_annex_b(&bs).collect();

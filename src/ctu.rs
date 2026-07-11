@@ -964,6 +964,16 @@ pub struct CtuWalker<'a, 'b> {
     /// (Cb and Cr are always reconstructed together). Empty for
     /// monochrome.
     avail_chroma: Vec<bool>,
+    /// r412 — §7.3.11.2 per-CTU ALF syntax decode: when a slice
+    /// signals `sh_alf_enabled_flag`, the coding_tree_unit() prefix
+    /// carries the `alf_ctb_flag[]` family, which the walker must
+    /// consume in-stream (the bins share the single §9.3 arithmetic
+    /// decoder with everything else). Installed by
+    /// [`Self::set_alf_decode`]; `None` keeps the historical
+    /// behaviour (caller pre-parsed ALF or the slice has no ALF).
+    alf_syntax_cfg: Option<crate::alf_syntax::AlfSyntaxConfig>,
+    /// r412 — context bundle for the per-CTU ALF syntax decode.
+    alf_ctxs: Option<crate::alf_syntax::AlfCtxs>,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -1169,7 +1179,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 false;
                 ((layout.pic_width_luma / 2) * (layout.pic_height_luma / 2)) as usize
             ],
+            alf_syntax_cfg: None,
+            alf_ctxs: None,
         })
+    }
+
+    /// r412 — enable the §7.3.11.2 per-CTU ALF syntax decode. `cfg`
+    /// carries the PH/SH-level gates (`ph_alf_*_enabled_flag`,
+    /// `sh_num_alf_aps_ids_luma`) and the APS-derived alternative /
+    /// CC filter counts the binarisations need. Must be installed
+    /// before [`Self::decode_picture_into`] on any slice whose
+    /// bitstream carries ALF CTU bins; the parsed per-CTB decisions
+    /// land in the walker's [`AlfPicture`] and drive the
+    /// [`Self::apply_in_loop_filters_with_alf`] pass.
+    pub fn set_alf_decode(&mut self, cfg: crate::alf_syntax::AlfSyntaxConfig) {
+        self.alf_ctxs = Some(crate::alf_syntax::AlfCtxs::init(self.cabac.slice_qp_y.0));
+        self.alf_syntax_cfg = Some(cfg);
     }
 
     /// r412 — §8.7.5.1 eq. 1212: mark a just-reconstructed luma
@@ -2263,30 +2288,282 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         &mut self,
         ctu: &CtuPos,
     ) -> Result<(Vec<CtuCu>, Vec<LeafCuInfo>, Vec<LeafCuResidual>)> {
-        let cus = self.decode_ctu_partitions(ctu)?;
-        let mut infos = Vec::with_capacity(cus.len());
-        let mut residuals = Vec::with_capacity(cus.len());
-        // Neighbour tracking for the round-21 inter path: cu_skip_flag's
-        // §9.3.4.2.2 ctxInc reads `CuSkipFlag[xNbX][yNbX]` from the
-        // motion-field grid the inter reconstruct pass writes. We sample
-        // it at (x-1, y) for the left neighbour and (x, y-1) for the
-        // above neighbour. Intra reads still flow through
-        // [`CuNeighbourhood::default()`] — refining the intra MPM
-        // neighbour grid is unrelated to this round.
-        for ccu in &cus {
-            let neigh = self.compute_cu_neighbourhood(ccu);
-            let (info, residual) = self.decode_leaf_cu_syntax(ccu, &neigh)?;
-            // Round-149 — commit the per-CB `MergeSubblockFlag` so
-            // subsequent leaf CUs in the same CTU (and downstream CTUs
-            // in raster order) see this CU as a merge-side neighbour
-            // through [`Self::compute_cu_neighbourhood`]. The
-            // `InterAffineFlag` write is reserved for the future
-            // non-merge affine inter walker; until then every leaf CU
-            // emits `false` for the affine flag, which is the
-            // §7.4.12.7 inference.
-            self.commit_subblock_neighbour_state(ccu, &info);
-            infos.push(info);
-            residuals.push(residual);
+        // r412 conformance fix — §7.3.11.4 `coding_tree()` is a
+        // depth-first recursion whose split bins INTERLEAVE with the
+        // `coding_unit()` bodies of its leaves: `split_cu_flag == 0`
+        // is immediately followed by that leaf's CU bins, then the
+        // next sibling's split bin follows those. The pre-r412 walker
+        // batched the whole partition tree first
+        // (`decode_ctu_partitions`) and parsed every CU afterwards — a
+        // spec-divergent bin order that desynced on any conforming
+        // multi-CU CTU. The recursion is implemented iteratively
+        // (explicit stack) so each leaf's syntax decode can run
+        // against `&mut self` between split-bin reads.
+        if ctu.width_luma == 0 || ctu.height_luma == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        struct Node {
+            x: u32,
+            y: u32,
+            w: u32,
+            h: u32,
+            cqt_depth: u32,
+            mtt_depth: u32,
+        }
+        let mut cus: Vec<CtuCu> = Vec::new();
+        let mut infos: Vec<LeafCuInfo> = Vec::new();
+        let mut residuals: Vec<LeafCuResidual> = Vec::new();
+        let mut stack = vec![Node {
+            x: 0,
+            y: 0,
+            w: ctu.width_luma,
+            h: ctu.height_luma,
+            cqt_depth: 0,
+            mtt_depth: 0,
+        }];
+        // Luma MinCbLog2SizeY floor (mirrors TreeWalker::at_leaf_floor
+        // for SINGLE_TREE).
+        let min_cb_log2 = 2u32;
+        while let Some(n) = stack.pop() {
+            let at_min = n.w.trailing_zeros() <= min_cb_log2 || n.h.trailing_zeros() <= min_cb_log2;
+            let (
+                left_avail,
+                above_avail,
+                cb_height_left,
+                cb_width_above,
+                cqt_depth_left,
+                cqt_depth_above,
+            ) = self.nbr_map.neighbour_state(ctu.x0 + n.x, ctu.y0 + n.y);
+            let split_cu = if at_min {
+                0
+            } else {
+                let inc = crate::ctx::ctx_inc_split_cu_flag(
+                    left_avail,
+                    above_avail,
+                    cb_height_left,
+                    cb_width_above,
+                    n.w,
+                    n.h,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                ) as usize;
+                let ctx_n = self.cabac.tree_ctxs.split_cu.len() - 1;
+                self.arith
+                    .decode_decision(&mut self.cabac.tree_ctxs.split_cu[inc.min(ctx_n)])?
+            };
+            if split_cu == 0 {
+                // Leaf — commit to the neighbour map, then decode this
+                // CU's `coding_unit()` bins IN-STREAM before the next
+                // split bin (§7.3.11.4 / §7.3.11.5 order).
+                self.nbr_map
+                    .insert(ctu.x0 + n.x, ctu.y0 + n.y, n.w, n.h, n.cqt_depth);
+                let ccu = CtuCu {
+                    ctu_addr_rs: ctu.ctu_addr_rs,
+                    cu: Cu {
+                        x: n.x + ctu.x0,
+                        y: n.y + ctu.y0,
+                        w: n.w,
+                        h: n.h,
+                        cqt_depth: n.cqt_depth,
+                        mtt_depth: n.mtt_depth,
+                    },
+                };
+                let neigh = self.compute_cu_neighbourhood(&ccu);
+                let (info, residual) = self.decode_leaf_cu_syntax(&ccu, &neigh)?;
+                // Round-149/406/409 — commit the parse-time neighbour
+                // grids (MergeSubblockFlag / InterAffineFlag /
+                // CuPredMode / CuSkipFlag / IntraPredModeY / MIP) so
+                // the NEXT CU's ctxInc + MPM derivations see this CU
+                // in coding order.
+                self.commit_subblock_neighbour_state(&ccu, &info);
+                cus.push(ccu);
+                infos.push(info);
+                residuals.push(residual);
+                continue;
+            }
+            // split_qt_flag — only readable in the quad-tree phase.
+            let split_qt = if n.mtt_depth == 0 {
+                let inc = crate::ctx::ctx_inc_split_qt_flag(
+                    left_avail,
+                    above_avail,
+                    cqt_depth_left,
+                    cqt_depth_above,
+                    n.cqt_depth,
+                ) as usize;
+                let ctx_n = self.cabac.tree_ctxs.split_qt.len() - 1;
+                self.arith
+                    .decode_decision(&mut self.cabac.tree_ctxs.split_qt[inc.min(ctx_n)])?
+            } else {
+                0
+            };
+            let children: Vec<Node> = if split_qt == 1 {
+                let hw = n.w / 2;
+                let hh = n.h / 2;
+                vec![
+                    Node {
+                        x: n.x,
+                        y: n.y,
+                        w: hw,
+                        h: hh,
+                        cqt_depth: n.cqt_depth + 1,
+                        mtt_depth: n.mtt_depth,
+                    },
+                    Node {
+                        x: n.x + hw,
+                        y: n.y,
+                        w: hw,
+                        h: hh,
+                        cqt_depth: n.cqt_depth + 1,
+                        mtt_depth: n.mtt_depth,
+                    },
+                    Node {
+                        x: n.x,
+                        y: n.y + hh,
+                        w: hw,
+                        h: hh,
+                        cqt_depth: n.cqt_depth + 1,
+                        mtt_depth: n.mtt_depth,
+                    },
+                    Node {
+                        x: n.x + hw,
+                        y: n.y + hh,
+                        w: hw,
+                        h: hh,
+                        cqt_depth: n.cqt_depth + 1,
+                        mtt_depth: n.mtt_depth,
+                    },
+                ]
+            } else {
+                // MTT split (§9.3.4.2.3 ctxIncs).
+                let mtt_v_inc = crate::ctx::ctx_inc_mtt_split_cu_vertical_flag(
+                    left_avail,
+                    above_avail,
+                    cb_height_left,
+                    cb_width_above,
+                    n.w,
+                    n.h,
+                    1,
+                    1,
+                    1,
+                    1,
+                ) as usize;
+                let mtt_v_n = self.cabac.tree_ctxs.mtt_split_vertical.len() - 1;
+                let mtt_vertical = self.arith.decode_decision(
+                    &mut self.cabac.tree_ctxs.mtt_split_vertical[mtt_v_inc.min(mtt_v_n)],
+                )?;
+                let mtt_b_inc =
+                    crate::ctx::ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, n.mtt_depth)
+                        as usize;
+                let mtt_b_n = self.cabac.tree_ctxs.mtt_split_binary.len() - 1;
+                let mtt_binary = self.arith.decode_decision(
+                    &mut self.cabac.tree_ctxs.mtt_split_binary[mtt_b_inc.min(mtt_b_n)],
+                )?;
+                if mtt_binary == 1 {
+                    if mtt_vertical == 1 {
+                        let hw = n.w / 2;
+                        vec![
+                            Node {
+                                x: n.x,
+                                y: n.y,
+                                w: hw,
+                                h: n.h,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                            },
+                            Node {
+                                x: n.x + hw,
+                                y: n.y,
+                                w: hw,
+                                h: n.h,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                            },
+                        ]
+                    } else {
+                        let hh = n.h / 2;
+                        vec![
+                            Node {
+                                x: n.x,
+                                y: n.y,
+                                w: n.w,
+                                h: hh,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                            },
+                            Node {
+                                x: n.x,
+                                y: n.y + hh,
+                                w: n.w,
+                                h: hh,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth + 1,
+                            },
+                        ]
+                    }
+                } else if mtt_vertical == 1 {
+                    let q = n.w / 4;
+                    vec![
+                        Node {
+                            x: n.x,
+                            y: n.y,
+                            w: q,
+                            h: n.h,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                        },
+                        Node {
+                            x: n.x + q,
+                            y: n.y,
+                            w: q * 2,
+                            h: n.h,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                        },
+                        Node {
+                            x: n.x + q * 3,
+                            y: n.y,
+                            w: q,
+                            h: n.h,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                        },
+                    ]
+                } else {
+                    let q = n.h / 4;
+                    vec![
+                        Node {
+                            x: n.x,
+                            y: n.y,
+                            w: n.w,
+                            h: q,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                        },
+                        Node {
+                            x: n.x,
+                            y: n.y + q,
+                            w: n.w,
+                            h: q * 2,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                        },
+                        Node {
+                            x: n.x,
+                            y: n.y + q * 3,
+                            w: n.w,
+                            h: q,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                        },
+                    ]
+                }
+            };
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
         }
         Ok((cus, infos, residuals))
     }
@@ -7905,6 +8182,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // CTU (before the partition tree). The helper short-circuits
             // when both sao_*_used_flags are 0.
             self.decode_sao_for_ctu(ctu)?;
+            // §7.3.11.2 — the ALF CTU prefix (`alf_ctb_flag[]`,
+            // `alf_use_aps_flag`, `alf_luma_*_idx`,
+            // `alf_ctb_filter_alt_idx[]`, `alf_ctb_cc_*_idc`) follows
+            // sao() when the slice enables ALF (r412 — previously the
+            // walker never consumed these bins, desyncing on any
+            // ALF-enabled stream).
+            if let Some(cfg) = self.alf_syntax_cfg {
+                let nbrs = crate::alf_syntax::AlfNeighbours {
+                    left_avail: ctu.x_ctb > 0,
+                    up_avail: ctu.y_ctb > 0,
+                };
+                let ctxs = self
+                    .alf_ctxs
+                    .as_mut()
+                    .expect("set_alf_decode initialises alf_ctxs");
+                crate::alf_syntax::decode_alf_ctu(
+                    &mut self.arith,
+                    ctxs,
+                    &cfg,
+                    &mut self.alf_picture,
+                    ctu.x_ctb,
+                    ctu.y_ctb,
+                    nbrs,
+                )?;
+            }
             if dual_tree {
                 self.decode_dual_tree_ctu(ctu, out)?;
                 continue;

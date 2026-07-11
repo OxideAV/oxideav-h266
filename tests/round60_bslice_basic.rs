@@ -117,9 +117,13 @@ fn bslice_decoder_roundtrip_byte_identical() {
 }
 
 /// Round-60 — the round-58 P-slice regression on the 4-px translation
-/// fixture must still hit 78.23 dB after the B-slice path lands (the
-/// P-slice code path is unchanged and lives next to the B-slice code
-/// in `encoder_inter`).
+/// fixture must hold after the B-slice path lands (the P-slice code
+/// path is unchanged and lives next to the B-slice code in
+/// `encoder_inter`). r412 re-baseline: the IDR reference
+/// reconstruction is now wire-conformant (real DC prediction + PDPC,
+/// no un-signalled SAO polish), so the MC reference carries honest
+/// quantisation noise — measured 44.3 dB on this fixture (was
+/// 78.23 dB against the polished, non-conformant reference).
 #[test]
 fn pslice_regression_holds_at_78db() {
     let (frame_i, frame_p) = translation_pair(4);
@@ -129,8 +133,8 @@ fn pslice_regression_holds_at_78db() {
     assert_eq!(rec_p.luma.samples, dec_rec.luma.samples);
     let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
     assert!(
-        psnr >= 78.0,
-        "P-slice regression: {psnr:.2} dB < 78 dB after B-slice landing"
+        psnr >= 40.0,
+        "P-slice regression: {psnr:.2} dB < 40 dB after B-slice landing"
     );
 }
 

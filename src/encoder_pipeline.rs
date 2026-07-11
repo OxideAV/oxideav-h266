@@ -54,8 +54,13 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::cabac::ContextModel;
+use crate::ctx::{
+    ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag,
+};
 use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
+use crate::intra::{predict_intra, IntraPredParams};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::ResidualCtxs;
 use crate::residual_enc::{
@@ -65,6 +70,7 @@ use crate::residual_enc::{
 use crate::sao::SaoConfig;
 use crate::sao_enc::sao_decide_picture;
 use crate::syntax_enc::{encode_coding_quadtree_split, TreeNeighbours};
+use crate::tables::{init_contexts, SyntaxCtx};
 use crate::transform::{inverse_transform_2d, TrType};
 use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_dep_quant, quantize_tb_flat};
 
@@ -271,6 +277,132 @@ impl PreparedCu {
     }
 }
 
+/// r412 — encoder-side §8.7.5.1 eq. 1212 availability masks. The
+/// coding loop mirrors the decoder: a reference sample is usable for
+/// intra prediction only when its covering block has already been
+/// reconstructed in walk order (§6.4.4). The MTT picker snapshots /
+/// restores these masks alongside the reconstruction planes so losing
+/// trials leave no phantom availability.
+struct EncAvail {
+    luma: Vec<bool>,
+    chroma: Vec<bool>,
+    w: usize,
+    h: usize,
+}
+
+impl EncAvail {
+    fn new(w: usize, h: usize) -> Self {
+        Self {
+            luma: vec![false; w * h],
+            chroma: vec![false; (w / 2) * (h / 2)],
+            w,
+            h,
+        }
+    }
+
+    fn mark_luma(&mut self, x: usize, y: usize, bw: usize, bh: usize) {
+        for yy in y..(y + bh).min(self.h) {
+            for xx in x..(x + bw).min(self.w) {
+                self.luma[yy * self.w + xx] = true;
+            }
+        }
+    }
+
+    fn mark_chroma(&mut self, cx: usize, cy: usize, bw: usize, bh: usize) {
+        let (cw, ch) = (self.w / 2, self.h / 2);
+        for yy in cy..(cy + bh).min(ch) {
+            for xx in cx..(cx + bw).min(cw) {
+                self.chroma[yy * cw + xx] = true;
+            }
+        }
+    }
+}
+
+/// r412 — the decoder-mirrored §8.4.5.2.6 DC prediction (with PDPC and
+/// the §8.4.5.2.9 substitution) for one encoder TB. `avail` / `aw` /
+/// `ah` describe the eq. 1212 mask of the plane being predicted.
+#[allow(clippy::too_many_arguments)]
+fn predict_dc_block(
+    plane: &PicturePlane,
+    avail: &[bool],
+    aw: usize,
+    ah: usize,
+    x0: usize,
+    y0: usize,
+    n_w: usize,
+    n_h: usize,
+    c_idx: u32,
+) -> Result<Vec<i16>> {
+    predict_intra(
+        &IntraPredParams {
+            mode: crate::leaf_cu::INTRA_DC,
+            n_tb_w: n_w,
+            n_tb_h: n_h,
+            n_cb_w: n_w,
+            n_cb_h: n_h,
+            c_idx,
+            isp_no_split: true,
+            ref_idx: 0,
+            bdpcm: false,
+            bit_depth: 8,
+        },
+        |dx: i32, dy: i32| {
+            let x = x0 as i32 + dx;
+            let y = y0 as i32 + dy;
+            if x < 0 || y < 0 || x >= aw as i32 || y >= ah as i32 {
+                return None;
+            }
+            if !avail[(y as usize) * aw + x as usize] {
+                return None;
+            }
+            plane.get(x as usize, y as usize).map(|v| v as i16)
+        },
+    )
+}
+
+/// r412 — §7.3.11.5 intra-mode cascade contexts shared across the
+/// second-pass CABAC emit (and the RDO bit measurement). The init
+/// tables are the same `SyntaxCtx` entries the decoder's `LeafCuCtxs`
+/// uses, so encoder and decoder context state stay in lockstep.
+struct IntraModeCtxs {
+    mpm_flag: Vec<ContextModel>,
+    not_planar: Vec<ContextModel>,
+    chroma_mode: Vec<ContextModel>,
+}
+
+impl IntraModeCtxs {
+    fn init(slice_qp_y: i32) -> Self {
+        Self {
+            mpm_flag: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp_y),
+            not_planar: init_contexts(SyntaxCtx::IntraLumaNotPlanarFlag, slice_qp_y),
+            chroma_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
+        }
+    }
+}
+
+/// r412 — emit the §7.3.11.5 intra-mode cascade for one pipeline CU:
+/// `intra_luma_mpm_flag = 1`, `intra_luma_not_planar_flag = 1`,
+/// `intra_luma_mpm_idx = 0` (TR cMax = 4, one bypass 0-bin) and
+/// `intra_chroma_pred_mode` = DM (Table 130 "0" bin). Every pipeline
+/// CU codes INTRA_DC, so no neighbour is ever angular and the §8.4.2
+/// default candModeList always carries DC at index 0; DM chroma then
+/// inherits DC per Table 20.
+fn emit_intra_dc_mode_bins(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    ictx: &mut IntraModeCtxs,
+) -> Result<()> {
+    let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    enc.encode_decision(&mut ictx.mpm_flag[inc], 1)?;
+    let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    let n = ictx.not_planar.len() - 1;
+    enc.encode_decision(&mut ictx.not_planar[inc.min(n)], 1)?;
+    enc.encode_bypass(0)?; // intra_luma_mpm_idx = 0
+    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    let n = ictx.chroma_mode.len() - 1;
+    enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
+    Ok(())
+}
+
 /// Compute residual + reconstruction for one luma TB without touching
 /// any CABAC stream. Returns the quantised levels for the later
 /// per-CTU CABAC emit pass.
@@ -281,6 +413,7 @@ impl PreparedCu {
 fn prepare_luma_tb(
     src: &PicturePlane,
     rec_plane: &mut PicturePlane,
+    avail: &mut EncAvail,
     x: usize,
     y: usize,
     n_tb_w: usize,
@@ -288,8 +421,21 @@ fn prepare_luma_tb(
     qp: i32,
     rc: crate::residual::RcOpts,
 ) -> Result<Vec<i32>> {
-    // DC intra prediction: flat fill with mid-grey (128).
-    let pred_val = 128u8;
+    // r412 — real §8.4.5.2.12 DC intra prediction (+ PDPC) from the
+    // partially-reconstructed plane, decoder-mirrored: the wire
+    // signals INTRA_DC per CU, so the encoder reconstruction must use
+    // the exact prediction a conforming decoder derives.
+    let pred = predict_dc_block(
+        rec_plane,
+        &avail.luma,
+        avail.w,
+        avail.h,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        0,
+    )?;
 
     // Extract source block → residual.
     let mut residual = vec![0i32; n_tb_w * n_tb_h];
@@ -297,13 +443,29 @@ fn prepare_luma_tb(
         for tx in 0..n_tb_w {
             let sx = x + tx;
             let sy = y + ty;
-            let src_s = src.get(sx, sy).unwrap_or(pred_val) as i32;
-            residual[ty * n_tb_w + tx] = src_s - pred_val as i32;
+            let p = pred[ty * n_tb_w + tx] as i32;
+            let src_s = src.get(sx, sy).map(|v| v as i32).unwrap_or(p);
+            residual[ty * n_tb_w + tx] = src_s - p;
         }
     }
 
     // Forward DCT-II.
-    let coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, 8)?;
+    let mut coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, 8)?;
+    // §7.3.11.11 / §8.7.4.1 zero-out (r412) — a 64-point DCT-II TB
+    // codes only the low-frequency 32-corner (Log2ZoTb = Min(log2Tb,
+    // 5); the decoder's eqs. 1171/1172 inverse-transform extents cap
+    // there too). Zero the out-of-corner coefficients BEFORE
+    // quantisation so the coded levels, the reconstruction, and a
+    // conforming decoder all agree.
+    if n_tb_w > 32 || n_tb_h > 32 {
+        for yc in 0..n_tb_h {
+            for xc in 0..n_tb_w {
+                if xc >= 32 || yc >= 32 {
+                    coeffs[yc * n_tb_w + xc] = 0;
+                }
+            }
+        }
+    }
 
     // Quantise — the dep-quant arm walks the §7.4.12.11 trellis; the
     // SDH arm parity-conditions each sub-block so the hidden sign is
@@ -340,11 +502,13 @@ fn prepare_luma_tb(
             let rx = x + tx;
             let ry = y + ty;
             if rx < rec_plane.width && ry < rec_plane.height {
-                let s = pred_val as i32 + rec_res[ty * n_tb_w + tx];
+                let s = pred[ty * n_tb_w + tx] as i32 + rec_res[ty * n_tb_w + tx];
                 rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, 255) as u8;
             }
         }
     }
+    // §8.7.5.1 eq. 1212 — this TB's samples become available.
+    avail.mark_luma(x, y, n_tb_w, n_tb_h);
     Ok(levels)
 }
 
@@ -367,10 +531,15 @@ fn prepare_luma_tb(
 fn emit_tu_with_cbf(
     enc: &mut crate::cabac_enc::ArithEncoder,
     ctxs: &mut ResidualCtxs,
+    ictx: &mut IntraModeCtxs,
     tb: &PreparedLumaTb,
     qp_state: &mut QpDeltaState,
     rc_opts: crate::residual::RcOpts,
 ) -> Result<()> {
+    // r412 — §7.3.11.5 orders the intra-mode cascade before
+    // transform_tree(): signal INTRA_DC via the MPM path + DM chroma.
+    emit_intra_dc_mode_bins(enc, ictx)?;
+
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
     let cbf_cr = tb.cr_levels.iter().any(|&l| l != 0);
@@ -484,6 +653,8 @@ impl QpDeltaState {
 fn prepare_chroma_tb(
     chroma_src: &PicturePlane,
     chroma_rec: &mut PicturePlane,
+    avail: &mut EncAvail,
+    c_idx: u32,
     cx: usize,
     cy: usize,
     n_tb_c_w: usize,
@@ -492,7 +663,20 @@ fn prepare_chroma_tb(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<Vec<i32>> {
-    let pred_val = 128u8;
+    // r412 — DM chroma inherits the luma INTRA_DC mode (Table 20), so
+    // the chroma prediction is the decoder-mirrored §8.4.5.2.12 DC
+    // (+ PDPC) on the chroma plane.
+    let pred = predict_dc_block(
+        chroma_rec,
+        &avail.chroma,
+        avail.w / 2,
+        avail.h / 2,
+        cx,
+        cy,
+        n_tb_c_w,
+        n_tb_c_h,
+        c_idx,
+    )?;
 
     // Extract source block → residual.
     let mut residual = vec![0i32; n_tb_c_w * n_tb_c_h];
@@ -500,8 +684,9 @@ fn prepare_chroma_tb(
         for tx in 0..n_tb_c_w {
             let sx = cx + tx;
             let sy = cy + ty;
-            let src_s = chroma_src.get(sx, sy).unwrap_or(pred_val) as i32;
-            residual[ty * n_tb_c_w + tx] = src_s - pred_val as i32;
+            let p = pred[ty * n_tb_c_w + tx] as i32;
+            let src_s = chroma_src.get(sx, sy).map(|v| v as i32).unwrap_or(p);
+            residual[ty * n_tb_c_w + tx] = src_s - p;
         }
     }
 
@@ -555,11 +740,15 @@ fn prepare_chroma_tb(
             let rx = cx + tx;
             let ry = cy + ty;
             if rx < chroma_rec.width && ry < chroma_rec.height {
-                let s = pred_val as i32 + rec_res[ty * n_tb_c_w + tx];
+                let s = pred[ty * n_tb_c_w + tx] as i32 + rec_res[ty * n_tb_c_w + tx];
                 chroma_rec.samples[ry * chroma_rec.stride + rx] = s.clamp(0, 255) as u8;
             }
         }
     }
+    // §8.7.5.1 eq. 1212 — the chroma mask is shared by Cb and Cr;
+    // marking on the Cb pass is idempotent for the Cr pass (the TB's
+    // own rectangle never feeds its own references).
+    avail.mark_chroma(cx, cy, n_tb_c_w, n_tb_c_h);
     Ok(levels)
 }
 
@@ -632,6 +821,7 @@ fn lmcs_chroma_var_scale_enc(
 fn prepare_leaf_cu(
     src: &PictureBuffer,
     rec: &mut PictureBuffer,
+    avail: &mut EncAvail,
     x: usize,
     y: usize,
     n_tb_w: usize,
@@ -640,7 +830,17 @@ fn prepare_leaf_cu(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<PreparedCu> {
-    let levels = prepare_luma_tb(&src.luma, &mut rec.luma, x, y, n_tb_w, n_tb_h, cu_qp, rc)?;
+    let levels = prepare_luma_tb(
+        &src.luma,
+        &mut rec.luma,
+        avail,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        cu_qp,
+        rc,
+    )?;
     let chr_x = x / 2;
     let chr_y = y / 2;
     let n_tb_chroma_w = (n_tb_w / 2).max(4);
@@ -649,6 +849,8 @@ fn prepare_leaf_cu(
     let cb_levels = prepare_chroma_tb(
         &src.cb,
         &mut rec.cb,
+        avail,
+        1,
         chr_x,
         chr_y,
         n_tb_chroma_w,
@@ -660,6 +862,8 @@ fn prepare_leaf_cu(
     let cr_levels = prepare_chroma_tb(
         &src.cr,
         &mut rec.cr,
+        avail,
+        2,
         chr_x,
         chr_y,
         n_tb_chroma_w,
@@ -698,12 +902,14 @@ fn measure_cu_bits(
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
     let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
+    let mut intra_ctxs = IntraModeCtxs::init(slice_qp_y);
     let mut qp_state = QpDeltaState::new(true, slice_qp_y);
     measure_cu_bits_recurse(
         cu,
         &mut enc,
         &mut tree_ctxs,
         &mut residual_ctxs,
+        &mut intra_ctxs,
         &mut qp_state,
         0,
         0,
@@ -720,6 +926,7 @@ fn measure_cu_bits_recurse(
     enc: &mut crate::cabac_enc::ArithEncoder,
     tree_ctxs: &mut crate::coding_tree::TreeCtxs,
     residual_ctxs: &mut ResidualCtxs,
+    intra_ctxs: &mut IntraModeCtxs,
     qp_state: &mut QpDeltaState,
     cqt_depth: u32,
     mtt_depth: u32,
@@ -734,7 +941,7 @@ fn measure_cu_bits_recurse(
                 tb.n_tb_w as u32,
                 tb.n_tb_h as u32,
                 TreeNeighbours::default(),
-                |e| emit_tu_with_cbf(e, residual_ctxs, tb, qp_state, rc_opts),
+                |e| emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts),
             )
         }
         PreparedCu::BtSplit {
@@ -761,6 +968,7 @@ fn measure_cu_bits_recurse(
                         e,
                         ctxs,
                         residual_ctxs,
+                        intra_ctxs,
                         qp_state,
                         *cd,
                         *md + 1,
@@ -799,6 +1007,7 @@ fn measure_cu_bits_recurse(
                         e,
                         ctxs,
                         residual_ctxs,
+                        intra_ctxs,
                         qp_state,
                         *cd,
                         *md + 1,
@@ -910,6 +1119,7 @@ fn region_sse_y(
 fn prepare_cu_with_mtt_picker(
     src: &PictureBuffer,
     rec: &mut PictureBuffer,
+    avail: &mut EncAvail,
     x: usize,
     y: usize,
     cb_size: usize, // 64
@@ -923,27 +1133,42 @@ fn prepare_cu_with_mtt_picker(
     debug_assert_eq!(cb_size, 64);
     let lambda = lambda_for_qp(slice_qp_y);
 
-    // Snapshot every plane so each trial starts from the same source.
+    // Snapshot every plane (and the r412 availability masks) so each
+    // trial starts from the same source.
     let snap_luma = rec.luma.samples.clone();
     let snap_cb = rec.cb.samples.clone();
     let snap_cr = rec.cr.samples.clone();
-    let restore =
-        |rec: &mut PictureBuffer, snap_luma: &Vec<u8>, snap_cb: &Vec<u8>, snap_cr: &Vec<u8>| {
-            rec.luma.samples.copy_from_slice(snap_luma);
-            rec.cb.samples.copy_from_slice(snap_cb);
-            rec.cr.samples.copy_from_slice(snap_cr);
-        };
+    let snap_av_l = avail.luma.clone();
+    let snap_av_c = avail.chroma.clone();
+    #[allow(clippy::too_many_arguments)]
+    fn restore(
+        rec: &mut PictureBuffer,
+        avail: &mut EncAvail,
+        snap_luma: &[u8],
+        snap_cb: &[u8],
+        snap_cr: &[u8],
+        snap_av_l: &[bool],
+        snap_av_c: &[bool],
+    ) {
+        rec.luma.samples.copy_from_slice(snap_luma);
+        rec.cb.samples.copy_from_slice(snap_cb);
+        rec.cr.samples.copy_from_slice(snap_cr);
+        avail.luma.copy_from_slice(snap_av_l);
+        avail.chroma.copy_from_slice(snap_av_c);
+    }
 
-    // Generic trial state — `(cu, cost, snap_luma, snap_cb, snap_cr)`.
-    // Storing the trial's reconstruction snapshot lets the picker
-    // restore the chosen candidate's reconstruction after running
-    // every later trial.
+    // Generic trial state — the prepared CU, its cost, and the
+    // post-trial reconstruction + availability snapshots. Storing the
+    // trial's snapshots lets the picker restore the chosen candidate's
+    // state after running every later trial.
     struct Trial {
         cu: PreparedCu,
         cost: f64,
         snap_luma: Vec<u8>,
         snap_cb: Vec<u8>,
         snap_cr: Vec<u8>,
+        snap_av_l: Vec<bool>,
+        snap_av_c: Vec<bool>,
     }
 
     let mut trials: Vec<Trial> = Vec::with_capacity(5);
@@ -952,6 +1177,7 @@ fn prepare_cu_with_mtt_picker(
     let leaf = prepare_leaf_cu(
         src,
         rec,
+        avail,
         x,
         y,
         cb_size,
@@ -968,6 +1194,8 @@ fn prepare_cu_with_mtt_picker(
         snap_luma: rec.luma.samples.clone(),
         snap_cb: rec.cb.samples.clone(),
         snap_cr: rec.cr.samples.clone(),
+        snap_av_l: avail.luma.clone(),
+        snap_av_c: avail.chroma.clone(),
     });
 
     let half = cb_size / 2;
@@ -975,11 +1203,25 @@ fn prepare_cu_with_mtt_picker(
 
     if try_bt {
         // --- BT_VERT (two 32×64 sub-CUs) ---
-        restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_v_a = prepare_leaf_cu(src, rec, x, y, half, cb_size, cu_qp, rc_opts, chroma_scale)?;
+        restore(
+            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+        );
+        let bt_v_a = prepare_leaf_cu(
+            src,
+            rec,
+            avail,
+            x,
+            y,
+            half,
+            cb_size,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
         let bt_v_b = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x + half,
             y,
             half,
@@ -1003,14 +1245,30 @@ fn prepare_cu_with_mtt_picker(
             snap_luma: rec.luma.samples.clone(),
             snap_cb: rec.cb.samples.clone(),
             snap_cr: rec.cr.samples.clone(),
+            snap_av_l: avail.luma.clone(),
+            snap_av_c: avail.chroma.clone(),
         });
 
         // --- BT_HORZ (two 64×32 sub-CUs) ---
-        restore(rec, &snap_luma, &snap_cb, &snap_cr);
-        let bt_h_a = prepare_leaf_cu(src, rec, x, y, cb_size, half, cu_qp, rc_opts, chroma_scale)?;
+        restore(
+            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+        );
+        let bt_h_a = prepare_leaf_cu(
+            src,
+            rec,
+            avail,
+            x,
+            y,
+            cb_size,
+            half,
+            cu_qp,
+            rc_opts,
+            chroma_scale,
+        )?;
         let bt_h_b = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x,
             y + half,
             cb_size,
@@ -1034,15 +1292,20 @@ fn prepare_cu_with_mtt_picker(
             snap_luma: rec.luma.samples.clone(),
             snap_cb: rec.cb.samples.clone(),
             snap_cr: rec.cr.samples.clone(),
+            snap_av_l: avail.luma.clone(),
+            snap_av_c: avail.chroma.clone(),
         });
     }
 
     if try_tt {
         // --- TT_VERT (16×64, 32×64, 16×64 — 1:2:1 ratio) ---
-        restore(rec, &snap_luma, &snap_cb, &snap_cr);
+        restore(
+            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+        );
         let tt_v_a = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x,
             y,
             quarter,
@@ -1054,6 +1317,7 @@ fn prepare_cu_with_mtt_picker(
         let tt_v_b = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x + quarter,
             y,
             half,
@@ -1065,6 +1329,7 @@ fn prepare_cu_with_mtt_picker(
         let tt_v_c = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x + 3 * quarter,
             y,
             quarter,
@@ -1089,13 +1354,18 @@ fn prepare_cu_with_mtt_picker(
             snap_luma: rec.luma.samples.clone(),
             snap_cb: rec.cb.samples.clone(),
             snap_cr: rec.cr.samples.clone(),
+            snap_av_l: avail.luma.clone(),
+            snap_av_c: avail.chroma.clone(),
         });
 
         // --- TT_HORZ (64×16, 64×32, 64×16 — 1:2:1 ratio) ---
-        restore(rec, &snap_luma, &snap_cb, &snap_cr);
+        restore(
+            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+        );
         let tt_h_a = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x,
             y,
             cb_size,
@@ -1107,6 +1377,7 @@ fn prepare_cu_with_mtt_picker(
         let tt_h_b = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x,
             y + quarter,
             cb_size,
@@ -1118,6 +1389,7 @@ fn prepare_cu_with_mtt_picker(
         let tt_h_c = prepare_leaf_cu(
             src,
             rec,
+            avail,
             x,
             y + 3 * quarter,
             cb_size,
@@ -1142,6 +1414,8 @@ fn prepare_cu_with_mtt_picker(
             snap_luma: rec.luma.samples.clone(),
             snap_cb: rec.cb.samples.clone(),
             snap_cr: rec.cr.samples.clone(),
+            snap_av_l: avail.luma.clone(),
+            snap_av_c: avail.chroma.clone(),
         });
     }
 
@@ -1156,6 +1430,8 @@ fn prepare_cu_with_mtt_picker(
     rec.luma.samples.copy_from_slice(&best.snap_luma);
     rec.cb.samples.copy_from_slice(&best.snap_cb);
     rec.cr.samples.copy_from_slice(&best.snap_cr);
+    avail.luma.copy_from_slice(&best.snap_av_l);
+    avail.chroma.copy_from_slice(&best.snap_av_c);
     Ok(best.cu)
 }
 
@@ -1269,69 +1545,6 @@ fn build_tree_neighbours(map: &CuStateMap, x: u32, y: u32) -> TreeNeighbours {
     }
 }
 
-/// Round-56 — register every leaf CU inside one prepared CU into the
-/// neighbour map. Walks the BT-split tree to recover each leaf's
-/// sample-coordinate origin from the parent CU origin + split
-/// direction.
-fn record_cu_into_map(map: &mut CuStateMap, cu: &PreparedCu, x: u32, y: u32, cqt_depth: u32) {
-    match cu {
-        PreparedCu::Leaf(tb) => {
-            map.insert(x, y, tb.n_tb_w as u32, tb.n_tb_h as u32, cqt_depth);
-        }
-        PreparedCu::BtSplit {
-            dir,
-            cqt_depth: cd,
-            sub_a,
-            sub_b,
-            ..
-        } => {
-            let (aw, ah) = leaf_dims(sub_a);
-            match dir {
-                crate::syntax_enc::MttSplitDir::Vertical => {
-                    record_cu_into_map(map, sub_a, x, y, *cd);
-                    record_cu_into_map(map, sub_b, x + aw as u32, y, *cd);
-                }
-                crate::syntax_enc::MttSplitDir::Horizontal => {
-                    record_cu_into_map(map, sub_a, x, y, *cd);
-                    record_cu_into_map(map, sub_b, x, y + ah as u32, *cd);
-                }
-            }
-        }
-        PreparedCu::TtSplit {
-            dir,
-            cqt_depth: cd,
-            sub_a,
-            sub_b,
-            sub_c,
-            ..
-        } => {
-            // Round-57 — 1:2:1 ratio: side sub-CUs occupy 1/4 of the
-            // parent dim along the split axis; middle sub-CU occupies
-            // 1/2 (= 2 × side). Sub-block origins are
-            //   sub_a: (x, y)
-            //   sub_b: (x + side, y)            (vertical)
-            //          (x, y + side)            (horizontal)
-            //   sub_c: (x + 3*side, y)          (vertical)
-            //          (x, y + 3*side)          (horizontal)
-            let (aw, ah) = leaf_dims(sub_a);
-            match dir {
-                crate::syntax_enc::MttSplitDir::Vertical => {
-                    let side = aw as u32;
-                    record_cu_into_map(map, sub_a, x, y, *cd);
-                    record_cu_into_map(map, sub_b, x + side, y, *cd);
-                    record_cu_into_map(map, sub_c, x + 3 * side, y, *cd);
-                }
-                crate::syntax_enc::MttSplitDir::Horizontal => {
-                    let side = ah as u32;
-                    record_cu_into_map(map, sub_a, x, y, *cd);
-                    record_cu_into_map(map, sub_b, x, y + side, *cd);
-                    record_cu_into_map(map, sub_c, x, y + 3 * side, *cd);
-                }
-            }
-        }
-    }
-}
-
 /// Round-56 — recover the (cb_w, cb_h) of one prepared CU. For a
 /// `BtSplit` the dims are 2× the child dim along the split axis; for a
 /// `TtSplit` the parent dim along the split axis is 4× the side
@@ -1368,13 +1581,14 @@ fn emit_prepared_cu(
     enc: &mut crate::cabac_enc::ArithEncoder,
     tree_ctxs: &mut crate::coding_tree::TreeCtxs,
     residual_ctxs: &mut ResidualCtxs,
+    intra_ctxs: &mut IntraModeCtxs,
     qp_state: &mut QpDeltaState,
     cu: &PreparedCu,
     x: u32,
     y: u32,
     cqt_depth: u32,
     mtt_depth: u32,
-    cu_map: &CuStateMap,
+    cu_map: &mut CuStateMap,
     rc_opts: crate::residual::RcOpts,
 ) -> Result<()> {
     let nbrs = build_tree_neighbours(cu_map, x, y);
@@ -1384,15 +1598,24 @@ fn emit_prepared_cu(
             // round-55 `encode_coding_tree_leaf_iframe` still emits
             // `split_cu_flag = 0` which is correct — the sub-CU is a
             // leaf of the BT, not a further split.
-            let _ = (cqt_depth, mtt_depth);
+            let _ = mtt_depth;
             crate::syntax_enc::encode_coding_tree_leaf_iframe(
                 enc,
                 tree_ctxs,
                 tb.n_tb_w as u32,
                 tb.n_tb_h as u32,
                 nbrs,
-                |e| emit_tu_with_cbf(e, residual_ctxs, tb, qp_state, rc_opts),
-            )
+                |e| emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts),
+            )?;
+            // r412 — record the leaf IMMEDIATELY (decoding-order
+            // semantics): the §9.3.4.2.2 split ctxIncs of the NEXT
+            // sibling read this CU as a live neighbour, exactly like
+            // the decoder's per-leaf neighbour-map insert. The
+            // pre-r412 post-CTB commit fed stale neighbour state to
+            // every within-CTB lookup, desyncing the ctx selection on
+            // mixed-size (MTT) layouts.
+            cu_map.insert(x, y, tb.n_tb_w as u32, tb.n_tb_h as u32, cqt_depth);
+            Ok(())
         }
         PreparedCu::BtSplit {
             dir,
@@ -1435,13 +1658,14 @@ fn emit_prepared_cu(
                         e,
                         ctxs,
                         residual_ctxs,
+                        intra_ctxs,
                         qp_state,
                         child,
                         cx,
                         cy,
                         *cd,
                         *md + 1,
-                        cu_map,
+                        &mut *cu_map,
                         rc_opts,
                     )
                 },
@@ -1491,13 +1715,14 @@ fn emit_prepared_cu(
                         e,
                         ctxs,
                         residual_ctxs,
+                        intra_ctxs,
                         qp_state,
                         child,
                         cx,
                         cy,
                         *cd,
                         *md + 1,
-                        cu_map,
+                        &mut *cu_map,
                         rc_opts,
                     )
                 },
@@ -1722,6 +1947,9 @@ pub fn encode_idr_with_qp_picker_cfg(
     let pic_h_ctbs = (h as usize + ctb_size - 1) / ctb_size;
 
     let mut rec = PictureBuffer::yuv420_filled(w as usize, h as usize, 128);
+    // r412 — eq. 1212 availability masks for the decoder-mirrored
+    // intra prediction in the coding loop.
+    let mut avail = EncAvail::new(w as usize, h as usize);
     let mut all_deblock_cus: Vec<DeblockCu> = Vec::new();
 
     // TB size: use the full CTB for simplicity.  For large pictures this
@@ -1813,6 +2041,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         prepare_cu_with_mtt_picker(
                             coding_src,
                             &mut rec,
+                            &mut avail,
                             tb_x,
                             tb_y,
                             n_tb_sq,
@@ -1827,6 +2056,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         prepare_leaf_cu(
                             coding_src,
                             &mut rec,
+                            &mut avail,
                             tb_x,
                             tb_y,
                             n_tb_sq,
@@ -1894,7 +2124,16 @@ pub fn encode_idr_with_qp_picker_cfg(
     // a self-roundtrip pipeline; SAO modifies the in-loop reconstruction
     // but is not signalled on the wire), so flipping `chroma_used` on
     // changes only the *internal* reconstruction the PSNR test reads.
-    let sao_indep = sao_decide_picture(src, &rec, 7, 8, true, true);
+    // r412 wire-conformance fix — SAO may only modify the coding-loop
+    // reconstruction when it is actually SIGNALLED: the pipeline emits
+    // SAO syntax exclusively under `enable_chroma_sao_merge` (chroma
+    // components only — `sps_sao_enabled_flag` mirrors the knob and the
+    // per-CTB emit runs with `luma_used = false`). The pre-r412 code
+    // designed and applied luma + chroma SAO unconditionally while
+    // signalling nothing, so no conforming decoder could reproduce the
+    // encoder reconstruction.
+    let sao_signalled_chroma = config.enable_chroma_sao_merge;
+    let sao_indep = sao_decide_picture(src, &rec, 7, 8, false, sao_signalled_chroma);
     // Round-54 — when the encoder config opts in, run the per-CTB chroma
     // SAO merge pass on top of the independent decisions. The returned
     // `merged` SaoPicture rewrites the chroma slots to the chosen
@@ -1912,8 +2151,8 @@ pub fn encode_idr_with_qp_picker_cfg(
         )
     };
     let sao_cfg = SaoConfig {
-        luma_used: true,
-        chroma_used: true,
+        luma_used: false,
+        chroma_used: sao_signalled_chroma,
         bit_depth: 8,
         ctb_log2_size_y: 7,
         chroma_format_idc: 1,
@@ -2444,14 +2683,19 @@ pub fn encode_idr_with_qp_picker_cfg(
     // two views keeps CTBs from seeing partially-emitted neighbours
     // mid-walk (the spec's neighbour-availability rules are post-
     // commit only).
+    // r412 — ONE live neighbour map, updated per emitted leaf exactly
+    // like the decoder's per-leaf insert (the pre-r412 read-snapshot /
+    // post-CTB-commit split fed stale within-CTB neighbour state to
+    // the split-flag ctxIncs, desyncing mixed-size MTT layouts).
     let mut cu_map = CuStateMap::new(w, h);
-    let mut cu_map_write = cu_map.clone();
     // §9.3.4.2 ctx init draws on the slice QP (eq. 1571 SliceQpY, eq. 1573
     // m,n derivation). Round-52 ties every CABAC context family to the
     // single slice QP — round-51 hardcoded QP=26, but the round-52
     // per-CU QP picker may run at a different baseline.
     let mut alf_ctxs = crate::alf_syntax::AlfCtxs::init(slice_qp_y);
     let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
+    // r412 — §7.3.11.5 intra-mode cascade ctxs (decoder-matching init).
+    let mut intra_ctxs = IntraModeCtxs::init(slice_qp_y);
     // Round-52 — coding_tree() shell ctxs (`split_cu_flag` + `split_qt_flag`
     // + `pred_mode_flag` + `intra_luma_mpm_flag`) initialised at the slice
     // QP. Used by `encode_coding_tree_leaf_iframe`.
@@ -2589,21 +2833,19 @@ pub fn encode_idr_with_qp_picker_cfg(
                             enc,
                             ctxs,
                             &mut residual_ctxs,
+                            &mut intra_ctxs,
                             &mut qp_state,
                             cu,
                             qx as u32,
                             qy as u32,
                             1,
                             0,
-                            &cu_map,
+                            &mut cu_map,
                             rc_opts,
                         )?;
-                        record_cu_into_map(&mut cu_map_write, cu, qx as u32, qy as u32, 1);
                         Ok(())
                     },
                 )?;
-                // Merge the CTB's writes into the persistent map.
-                cu_map = cu_map_write.clone();
             } else {
                 // Round-56 — single-leaf or split CUs at the CTB level.
                 // Each CU starts at its own (x, y) within the CTB; for
@@ -2619,16 +2861,16 @@ pub fn encode_idr_with_qp_picker_cfg(
                         &mut cabac_enc,
                         &mut tree_ctxs,
                         &mut residual_ctxs,
+                        &mut intra_ctxs,
                         &mut qp_state,
                         cu,
                         cur_x as u32,
                         cur_y as u32,
                         0,
                         0,
-                        &cu_map,
+                        &mut cu_map,
                         rc_opts,
                     )?;
-                    record_cu_into_map(&mut cu_map_write, cu, cur_x as u32, cur_y as u32, 0);
                     // Advance position for the next CU in raster order.
                     let (cw, ch) = parent_cu_dims(cu);
                     cur_x += cw;
@@ -2637,7 +2879,6 @@ pub fn encode_idr_with_qp_picker_cfg(
                         cur_y += ch;
                     }
                 }
-                cu_map = cu_map_write.clone();
             }
             // QG resets at the end of every CTB (§7.4.13.2 with
             // `cu_qp_delta_subdiv = 0`): the first CU of the next CTB
@@ -2645,9 +2886,17 @@ pub fn encode_idr_with_qp_picker_cfg(
             // `prev_qp_in_qg`.
             qp_state.pending = qp_state.enabled;
 
-            // CABAC end_of_slice_segment_flag for CTU termination.
+            // §7.3.11.1 — in a single-tile slice the ONLY in-stream
+            // terminate bin is `end_of_slice_one_bit /* equal to 1 */`
+            // after the LAST CTU (r412 conformance fix: the pipeline
+            // previously emitted an end_of_slice_segment-style
+            // terminate-0 bin after every CTU, a bin §7.3.11.1 never
+            // codes — desyncing any conforming decoder on multi-CTU
+            // pictures).
             let is_last_ctu = ry == pic_h_ctbs - 1 && rx == pic_w_ctbs - 1;
-            cabac_enc.encode_terminate(if is_last_ctu { 1 } else { 0 })?;
+            if is_last_ctu {
+                cabac_enc.encode_terminate(1)?;
+            }
         }
     }
     let cabac_bytes = cabac_enc.finish();
@@ -3034,9 +3283,15 @@ mod tests {
     fn prepare_chroma_tb_flat_block_yields_zero_levels() {
         let src = PicturePlane::filled(8, 8, 128);
         let mut rec = PicturePlane::filled(8, 8, 0);
+        // r412 — no neighbour is available, so the §8.4.5.2.9
+        // substitution collapses the DC prediction to mid-grey (128),
+        // matching the historical flat-128 assumption of this test.
+        let mut avail = EncAvail::new(16, 16);
         let levels = prepare_chroma_tb(
             &src,
             &mut rec,
+            &mut avail,
+            1,
             0,
             0,
             4,
@@ -3072,9 +3327,12 @@ mod tests {
             }
         }
         let mut rec = PicturePlane::filled(8, 8, 0);
+        let mut avail = EncAvail::new(16, 16);
         let levels = prepare_chroma_tb(
             &src,
             &mut rec,
+            &mut avail,
+            1,
             0,
             0,
             4,
@@ -3112,16 +3370,22 @@ mod tests {
         let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
         let psnr_cb = psnr_y(&src.cb, &rec.cb).unwrap();
         let psnr_cr = psnr_y(&src.cr, &rec.cr).unwrap();
-        // Round-49 baseline: 57.16 / 56.65 dB. Allow a small margin
-        // (1 dB) below the measured round-50 numbers (59.20 / 57.74 dB)
-        // so unrelated future RDO tweaks have headroom.
+        // r412 re-baseline: the coding loop now uses the conformant
+        // §8.4.5.2.12 neighbour-DC prediction (+ PDPC) instead of the
+        // historical flat-128 fill — the wire signals INTRA_DC, so the
+        // reconstruction must match what a conforming decoder derives.
+        // On this synthetic ramp the PDPC-shaped prediction leaves a
+        // slightly harder residual at QP 26 (measured 52.04 / 52.27 dB
+        // vs the flat-fill 59.20 / 57.74 dB); QP 0 measures 74.7 /
+        // 81.2 dB, confirming prediction and reconstruction agree and
+        // the delta is pure quantisation behaviour.
         assert!(
-            psnr_cb >= 58.0,
-            "Cb PSNR {psnr_cb:.2} dB regressed below the round-50 chroma-SAO floor (≥ 58 dB)"
+            psnr_cb >= 51.0,
+            "Cb PSNR {psnr_cb:.2} dB regressed below the r412 chroma-SAO floor (≥ 51 dB)"
         );
         assert!(
-            psnr_cr >= 57.0,
-            "Cr PSNR {psnr_cr:.2} dB regressed below the round-50 chroma-SAO floor (≥ 57 dB)"
+            psnr_cr >= 51.0,
+            "Cr PSNR {psnr_cr:.2} dB regressed below the r412 chroma-SAO floor (≥ 51 dB)"
         );
     }
 
@@ -3275,16 +3539,18 @@ mod tests {
             bs_on.len(),
             bs_off.len()
         );
-        // Chroma PSNR must still clear the round-50 floor.
+        // Chroma PSNR must still clear the (r412 re-baselined) floor —
+        // see round50_chroma_sao_does_not_regress_chroma_psnr for the
+        // conformant-DC-prediction re-baseline rationale.
         let psnr_cb = psnr_y(&src.cb, &rec_on.cb).unwrap();
         let psnr_cr = psnr_y(&src.cr, &rec_on.cr).unwrap();
         assert!(
-            psnr_cb >= 57.0,
-            "Cb PSNR {psnr_cb:.2} dB regressed below the round-50 chroma-SAO floor"
+            psnr_cb >= 51.0,
+            "Cb PSNR {psnr_cb:.2} dB regressed below the r412 chroma-SAO floor"
         );
         assert!(
-            psnr_cr >= 57.0,
-            "Cr PSNR {psnr_cr:.2} dB regressed below the round-50 chroma-SAO floor"
+            psnr_cr >= 51.0,
+            "Cr PSNR {psnr_cr:.2} dB regressed below the r412 chroma-SAO floor"
         );
     }
 
@@ -3687,51 +3953,6 @@ mod tests {
         assert_eq!((pw, ph), (64, 64));
     }
 
-    /// Round-57 — TT-split origin walk inside `record_cu_into_map`:
-    /// inserting a TT_VERT-split 64×64 CU at origin (0, 0) populates the
-    /// neighbour map with the three sub-CU rectangles at the expected
-    /// origins (0, 0), (16, 0), (48, 0). Sanity-checks the §6.4.4 origin
-    /// recovery from the 1:2:1 ratio.
-    #[test]
-    fn round57_record_tt_split_populates_three_sub_cu_origins() {
-        let mk_leaf = |w: usize, h: usize| {
-            PreparedCu::Leaf(PreparedLumaTb {
-                n_tb_w: w,
-                n_tb_h: h,
-                levels: vec![0; w * h],
-                n_tb_chroma_w: (w / 2).max(4),
-                n_tb_chroma_h: (h / 2).max(4),
-                cb_levels: vec![0; (w / 2).max(4) * (h / 2).max(4)],
-                cr_levels: vec![0; (w / 2).max(4) * (h / 2).max(4)],
-                cu_qp_local: 26,
-            })
-        };
-        let cu = PreparedCu::TtSplit {
-            dir: crate::syntax_enc::MttSplitDir::Vertical,
-            cqt_depth: 1,
-            mtt_depth: 0,
-            sub_a: Box::new(mk_leaf(16, 64)),
-            sub_b: Box::new(mk_leaf(32, 64)),
-            sub_c: Box::new(mk_leaf(16, 64)),
-        };
-        let mut map = CuStateMap::new(128, 128);
-        record_cu_into_map(&mut map, &cu, 0, 0, 1);
-        // sub_a covers (0..16, 0..64).
-        let d0 = map.get(0, 0).expect("sub_a should populate (0, 0)");
-        assert_eq!(d0.cb_w, 16);
-        assert_eq!(d0.cb_h, 64);
-        // sub_b covers (16..48, 0..64).
-        let d1 = map.get(16, 0).expect("sub_b should populate (16, 0)");
-        assert_eq!(d1.cb_w, 32);
-        // sub_c covers (48..64, 0..64).
-        let d2 = map.get(48, 0).expect("sub_c should populate (48, 0)");
-        assert_eq!(d2.cb_w, 16);
-        // Boundaries: (15, 0) is inside sub_a; (47, 0) is inside sub_b.
-        let d_left = map.get(15, 0).expect("sub_a should cover (15, 0)");
-        assert_eq!(d_left.cb_w, 16);
-        let d_mid = map.get(47, 0).expect("sub_b should cover (47, 0)");
-        assert_eq!(d_mid.cb_w, 32);
-    }
     /// Round-384 — LMCS payload used by the encoder tests: bin 0 shrunk
     /// to 8 codewords, every other bin at OrgCW (Σ = 248 <= 255).
     fn lmcs_enc_payload() -> crate::lmcs::LmcsData {

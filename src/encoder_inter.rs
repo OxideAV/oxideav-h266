@@ -2396,9 +2396,13 @@ mod tests {
         // Allow generous headroom — the round-59 sub-pel refinement
         // adds at most a handful of bypass bins per block when it
         // declines the integer-pel result (which it generally does
-        // not on identical frames).
+        // not on identical frames). r412 re-baseline: the IDR
+        // reference reconstruction is now wire-conformant (real DC
+        // prediction, no un-signalled SAO polish), so the P residual
+        // against the source carries more quantisation noise
+        // (measured 1114 B).
         assert!(
-            bs_p.len() < 800,
+            bs_p.len() < 1600,
             "P-slice on identical frames ({} B) larger than the no-residual ceiling",
             bs_p.len(),
         );
@@ -2685,9 +2689,13 @@ mod tests {
         let (bs_p, rec_p) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
         assert!(!bs_p.is_empty());
         let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
+        // r412 re-baseline: the ≥ 70 dB figure relied on the IDR
+        // pipeline's un-signalled SAO polish (removed for wire
+        // conformance) — the honest reference reconstruction now
+        // leaves the P residual at ~44 dB on this fixture.
         assert!(
-            psnr >= 70.0,
-            "Round-58 integer-pel fixture regressed to PSNR_Y {psnr:.2} dB (< 70 dB) after sub-pel wiring"
+            psnr >= 40.0,
+            "Round-58 integer-pel fixture regressed to PSNR_Y {psnr:.2} dB (< 40 dB) after sub-pel wiring"
         );
     }
 

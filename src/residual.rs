@@ -567,7 +567,18 @@ pub fn decode_tb_coefficients_opts(
     }
     let log2_w = n_tb_w.trailing_zeros();
     let log2_h = n_tb_h.trailing_zeros();
-    let last = read_last_sig_coeff_pos(dec, ctxs, log2_w, log2_h, c_idx)?;
+    // §7.3.11.11 zero-out (r412) — a 64-point DCT-II only codes the
+    // low-frequency 32-corner: `Log2ZoTbWidth = Min(log2TbWidth, 5)`
+    // (the SBT 32→16 arm never fires on this path — `cu_sbt_flag` TBs
+    // route through the SBT-specific reconstruction). Every coded
+    // geometry input below (last-sig binarisation, sub-block grid,
+    // scan, pass-1 bin budget) runs on the Zo dims; the output array
+    // keeps the full TB stride with the zeroed-out region at 0.
+    let log2_zo_w = log2_w.min(5);
+    let log2_zo_h = log2_h.min(5);
+    let zo_w = 1usize << log2_zo_w;
+    let zo_h = 1usize << log2_zo_h;
+    let last = read_last_sig_coeff_pos(dec, ctxs, log2_zo_w, log2_zo_h, c_idx)?;
 
     // Running per-TB state threaded by §9.3.4.2.7 / §9.3.3.2.
     let total = n_tb_w * n_tb_h;
@@ -576,12 +587,12 @@ pub fn decode_tb_coefficients_opts(
     let mut sig_flag = vec![false; total];
     let mut out = vec![0i32; total];
 
-    // eq. 5018: pass-1 bin budget.
-    let mut rem_bins_pass1: i32 = ((1i32 << (log2_w + log2_h)) * 7) >> 2;
+    // eq. 5018: pass-1 bin budget (Zo dims).
+    let mut rem_bins_pass1: i32 = ((1i32 << (log2_zo_w + log2_zo_h)) * 7) >> 2;
 
-    let (num_sb_w, num_sb_h) = sb_grid(n_tb_w, n_tb_h);
-    let positions = coeff_scan_positions(n_tb_w, n_tb_h);
-    let sb_origins = crate::scan::sb_scan_positions(n_tb_w, n_tb_h);
+    let (num_sb_w, num_sb_h) = sb_grid(zo_w, zo_h);
+    let positions = coeff_scan_positions(zo_w, zo_h);
+    let sb_origins = crate::scan::sb_scan_positions(zo_w, zo_h);
 
     // Find the sub-block that contains the last-sig position plus the
     // within-sub-block scan index of that position.
@@ -598,12 +609,8 @@ pub fn decode_tb_coefficients_opts(
         }
     }
 
-    // §7.3.11.11 LFNST / MTS gating flags. Zero-out is a no-op in this
-    // scaffold so `Log2ZoTb{Width,Height}` equal the full TB log2 dims
-    // (`log2_w` / `log2_h`).
+    // §7.3.11.11 LFNST / MTS gating flags (Zo-dim driven).
     let mut flags = TbResidualFlags::default();
-    let log2_zo_w = log2_w;
-    let log2_zo_h = log2_h;
     // transform_skip_flag == 0 in this path.
     let transform_skip = false;
     // LfnstDcOnly: cleared when the last-sig coeff is past scan position 0

@@ -25,7 +25,7 @@
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026) §8.8.4.
 
 use crate::reconstruct::{PictureBuffer, PicturePlane};
-use crate::sao::{SaoCtb, SaoCtbParams, SaoEoClass, SaoMergeMap, SaoPicture};
+use crate::sao::{SaoCtb, SaoCtbParams, SaoEoClass, SaoMergeMap, SaoPicture, SaoTypeIdx};
 
 /// Source + reconstruction plane pair for one component.
 pub struct PlaneRef<'a> {
@@ -112,9 +112,15 @@ fn try_band_offset(
         for i in 0..4 {
             let b = start + i;
             if band_count[b] > 0 {
-                // Optimal offset = round(sum_diff / count), clipped to [-31, 31].
+                // Optimal offset = round(sum_diff / count), clipped to
+                // the SIGNALLABLE `sao_offset_abs` range — Table 127
+                // cMax = (1 << (Min(BitDepth, 10) − 5)) − 1 (r412
+                // conformance fix: the pre-r412 ±31 clip produced
+                // offsets the §7.3.11.3 syntax cannot carry at 8-bit,
+                // so the applied SAO diverged from the wire).
+                let cmax = (1i64 << (bit_depth.min(10) - 5)) - 1;
                 let opt = (band_diff[b] + band_count[b] / 2) / band_count[b];
-                let opt_clipped = opt.clamp(-31, 31) as i32;
+                let opt_clipped = opt.clamp(-cmax, cmax) as i32;
                 offsets[i] = opt_clipped;
                 // Delta = -sum(count * offset^2 - 2 * diff * offset)
                 // Actually just approximate with sum(diff * offset).
@@ -186,6 +192,34 @@ fn try_best_edge_offset(
     let mut best_ctb: Option<SaoCtb> = None;
 
     for (cls_idx, &eo_class) in eo_classes.iter().enumerate() {
+        if let Some((ctb, delta)) = try_edge_offset_class(
+            src, rec, ctb_x, ctb_y, ctb_w, ctb_h, bit_depth, cls_idx, eo_class,
+        ) {
+            if delta < best_delta {
+                best_delta = delta;
+                best_ctb = Some(ctb);
+            }
+        }
+    }
+
+    best_ctb
+}
+
+/// One §8.8.4.2 edge-offset trial for a FIXED `eo_class`. Returns the
+/// candidate and its (negative-is-better) distortion delta.
+#[allow(clippy::too_many_arguments)]
+fn try_edge_offset_class(
+    src: &PicturePlane,
+    rec: &PicturePlane,
+    ctb_x: usize,
+    ctb_y: usize,
+    ctb_w: usize,
+    ctb_h: usize,
+    bit_depth: u32,
+    cls_idx: usize,
+    eo_class: SaoEoClass,
+) -> Option<(SaoCtb, i64)> {
+    {
         let (dx0, dy0, dx1, dy1) = EO_DIRS[cls_idx];
 
         // Category statistics: 5 categories.
@@ -240,13 +274,65 @@ fn try_best_edge_offset(
             }
         }
 
-        if delta < best_delta {
-            best_delta = delta;
-            best_ctb = Some(SaoCtb::edge_offset(eo_class, offsets, bit_depth));
+        Some((SaoCtb::edge_offset(eo_class, offsets, bit_depth), delta))
+    }
+}
+
+/// r412 — §7.3.11.3 constrains Cr to Cb's `sao_type_idx_chroma` (and
+/// `sao_eo_class_chroma`): only the offsets (and BO band position) are
+/// per-component. The Cr decision therefore optimises within Cb's
+/// chosen type; when nothing helps, the offsets collapse to zero
+/// (identity) while the shared type stays on the wire.
+fn sao_decide_ctb_constrained(
+    plane: PlaneRef<'_>,
+    ctb_x: usize,
+    ctb_y: usize,
+    ctb_w: usize,
+    ctb_h: usize,
+    bit_depth: u32,
+    shared: &SaoCtb,
+) -> SaoCtb {
+    match shared.sao_type_idx {
+        SaoTypeIdx::NotApplied => SaoCtb::not_applied(),
+        SaoTypeIdx::BandOffset => {
+            match try_band_offset(plane.src, plane.rec, ctb_x, ctb_y, ctb_w, ctb_h, bit_depth) {
+                Some(bo) => bo,
+                None => SaoCtb {
+                    sao_type_idx: SaoTypeIdx::BandOffset,
+                    eo_class: SaoEoClass::Horizontal,
+                    band_position: 0,
+                    offset_val: [0; 5],
+                },
+            }
+        }
+        SaoTypeIdx::EdgeOffset => {
+            let cls_idx = match shared.eo_class {
+                SaoEoClass::Horizontal => 0,
+                SaoEoClass::Vertical => 1,
+                SaoEoClass::Deg135 => 2,
+                SaoEoClass::Deg45 => 3,
+            };
+            match try_edge_offset_class(
+                plane.src,
+                plane.rec,
+                ctb_x,
+                ctb_y,
+                ctb_w,
+                ctb_h,
+                bit_depth,
+                cls_idx,
+                shared.eo_class,
+            ) {
+                Some((eo, delta)) if delta < 0 => eo,
+                _ => SaoCtb {
+                    sao_type_idx: SaoTypeIdx::EdgeOffset,
+                    eo_class: shared.eo_class,
+                    band_position: 0,
+                    offset_val: [0; 5],
+                },
+            }
         }
     }
-
-    best_ctb
 }
 
 /// Derive EO category (0..4) for sample `r` with neighbours `n0`, `n1`.
@@ -355,8 +441,14 @@ pub fn sao_decide_picture(
                 SaoCtb::not_applied()
             };
 
+            // r412 — Cr shares `sao_type_idx_chroma` / `sao_eo_class_
+            // chroma` with Cb on the wire (§7.3.11.3), so its decision
+            // optimises within Cb's chosen type instead of running
+            // free (the pre-r412 independent pick could choose a type
+            // the syntax cannot express for Cr, diverging the applied
+            // SAO from any conforming decode).
             let cr = if sao_chroma && chr_w > 0 && chr_h > 0 {
-                sao_decide_ctb(
+                sao_decide_ctb_constrained(
                     PlaneRef {
                         src: &src.cr,
                         rec: &rec.cr,
@@ -366,6 +458,7 @@ pub fn sao_decide_picture(
                     chr_w,
                     chr_h,
                     bit_depth,
+                    &cb,
                 )
             } else {
                 SaoCtb::not_applied()

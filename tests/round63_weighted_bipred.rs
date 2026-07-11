@@ -131,9 +131,11 @@ fn round63_bslice_no_fade_keeps_wp_off_and_matches_round61() {
     let dec_rec = decode_b_slice(&bs_b, &rec_l0, &rec_l1).unwrap();
     assert_eq!(rec_b.luma.samples, dec_rec.luma.samples);
     let psnr = psnr_y(&c.luma, &rec_b.luma).unwrap();
+    // r412 re-baseline — honest (wire-conformant) IDR references;
+    // measured 44.1 dB.
     assert!(
-        psnr >= 60.0,
-        "round-63 no-fade B-slice PSNR_Y {psnr:.2} dB < 60 dB",
+        psnr >= 40.0,
+        "round-63 no-fade B-slice PSNR_Y {psnr:.2} dB < 40 dB",
     );
 }
 

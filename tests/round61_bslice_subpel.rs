@@ -130,9 +130,11 @@ fn round61_bslice_bi_split_translation_picks_bi_and_clears_50db() {
     );
 
     let psnr = psnr_y(&frame_a.luma, &rec_b.luma).unwrap();
+    // r412 re-baseline: the IDR reference reconstruction is now
+    // wire-conformant (no un-signalled SAO polish) — measured 44.1 dB.
     assert!(
-        psnr >= 50.0,
-        "round-61 bi-pred split translation PSNR_Y {psnr:.2} dB < 50 dB"
+        psnr >= 40.0,
+        "round-61 bi-pred split translation PSNR_Y {psnr:.2} dB < 40 dB"
     );
 }
 
@@ -151,9 +153,11 @@ fn round61_integer_pel_regression_holds() {
         "round-61 encoder + decoder B-slice luma must still match byte-for-byte"
     );
     let psnr = psnr_y(&frame_b.luma, &rec_b.luma).unwrap();
+    // r412 re-baseline: honest (wire-conformant) IDR reference —
+    // measured 43.9 dB on this fixture.
     assert!(
-        psnr >= 70.0,
-        "round-61: round-60 integer-pel B-slice fixture regressed to PSNR_Y {psnr:.2} dB (< 70 dB)"
+        psnr >= 40.0,
+        "round-61: round-60 integer-pel B-slice fixture regressed to PSNR_Y {psnr:.2} dB (< 40 dB)"
     );
 }
 

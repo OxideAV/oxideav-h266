@@ -306,9 +306,28 @@ pub fn encode_tb_coefficients_opts(
     debug_assert_eq!(levels.len(), n_tb_w * n_tb_h);
     let log2_w = n_tb_w.trailing_zeros();
     let log2_h = n_tb_h.trailing_zeros();
+    // §7.3.11.11 zero-out (r412) — the coded geometry runs on
+    // `Log2ZoTb{Width,Height} = Min(log2Tb, 5)`; a 64-point DCT-II TB
+    // must not carry coefficients outside the low-frequency 32-corner
+    // (callers zero them after quantisation — fail loud otherwise).
+    let log2_zo_w = log2_w.min(5);
+    let log2_zo_h = log2_h.min(5);
+    let zo_w = 1usize << log2_zo_w;
+    let zo_h = 1usize << log2_zo_h;
+    if zo_w < n_tb_w || zo_h < n_tb_h {
+        for yc in 0..n_tb_h {
+            for xc in 0..n_tb_w {
+                if (xc >= zo_w || yc >= zo_h) && levels[yc * n_tb_w + xc] != 0 {
+                    return Err(Error::invalid(format!(
+                        "h266 residual_enc: non-zero coefficient at ({xc},{yc}) inside the                          §7.3.11.11 zeroed-out region of a {n_tb_w}x{n_tb_h} TB"
+                    )));
+                }
+            }
+        }
+    }
 
     // Find the last non-zero coefficient in diagonal scan order.
-    let positions = coeff_scan_positions(n_tb_w, n_tb_h);
+    let positions = coeff_scan_positions(zo_w, zo_h);
     let mut last_x = 0u32;
     let mut last_y = 0u32;
     let mut found = false;
@@ -327,8 +346,8 @@ pub fn encode_tb_coefficients_opts(
         last_y = 0;
     }
 
-    // Emit last_sig_coeff_x/y_prefix / suffix.
-    encode_last_sig_coeff_pos(enc, ctxs, log2_w, log2_h, c_idx, last_x, last_y)?;
+    // Emit last_sig_coeff_x/y_prefix / suffix (Zo-dim binarisation).
+    encode_last_sig_coeff_pos(enc, ctxs, log2_zo_w, log2_zo_h, c_idx, last_x, last_y)?;
 
     // Build state arrays mirroring the decoder.
     let total = n_tb_w * n_tb_h;
@@ -343,11 +362,11 @@ pub fn encode_tb_coefficients_opts(
         sig_flag[i] = l != 0;
     }
 
-    // eq. 5018: pass-1 bin budget.
-    let mut rem_bins_pass1: i32 = ((1i32 << (log2_w + log2_h)) * 7) >> 2;
+    // eq. 5018: pass-1 bin budget (Zo dims).
+    let mut rem_bins_pass1: i32 = ((1i32 << (log2_zo_w + log2_zo_h)) * 7) >> 2;
 
-    let (num_sb_w, num_sb_h) = sb_grid(n_tb_w, n_tb_h);
-    let sb_origins = sb_scan_positions(n_tb_w, n_tb_h);
+    let (num_sb_w, num_sb_h) = sb_grid(zo_w, zo_h);
+    let sb_origins = sb_scan_positions(zo_w, zo_h);
 
     // Find the sub-block that contains the last-sig position.
     let mut last_sb_idx = 0usize;

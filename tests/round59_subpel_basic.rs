@@ -94,9 +94,13 @@ fn round59_integer_pel_regression_holds() {
     let (bs_p, rec_p) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
     assert!(!bs_p.is_empty());
     let psnr = psnr_y(&frame_p.luma, &rec_p.luma).unwrap();
+    // r412 re-baseline: the IDR reference reconstruction is now
+    // wire-conformant (real DC prediction + PDPC, no un-signalled SAO
+    // polish), so the P-slice's MC reference carries honest
+    // quantisation noise (measured 44.3 dB on this fixture).
     assert!(
-        psnr >= 70.0,
-        "integer-pel regression: PSNR_Y {psnr:.2} dB < 70 dB"
+        psnr >= 40.0,
+        "integer-pel regression: PSNR_Y {psnr:.2} dB < 40 dB"
     );
 }
 

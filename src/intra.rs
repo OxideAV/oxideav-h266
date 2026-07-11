@@ -762,6 +762,19 @@ pub fn pdpc_applies(mode: i32, n_tb_w: usize, n_tb_h: usize, ref_idx: usize, bdp
         && (mode == 0 || mode == 1 || mode <= 18 || (50..81).contains(&mode))
 }
 
+/// Eq. 408/409/412/413/417/423 weight `32 >> ((coord << 1) >> nScale)`
+/// with the spec's unbounded right shift (any shift ≥ 6 yields 0 —
+/// Rust's `>>` would panic instead).
+#[inline]
+fn pdpc_weight(coord: i32, n_scale: i32) -> i32 {
+    let shift = (coord << 1) >> n_scale;
+    if shift >= 6 {
+        0
+    } else {
+        32 >> shift
+    }
+}
+
 /// §8.4.5.2.15 — position-dependent intra prediction sample filtering.
 ///
 /// `refs` is the (filtered) reference array with `ref_idx == 0`;
@@ -799,8 +812,8 @@ pub fn apply_pdpc(
                 (
                     refs.p(-1, y as i32)? as i32,
                     refs.p(x as i32, -1)? as i32,
-                    32 >> (((x as i32) << 1) >> n_scale),
-                    32 >> (((y as i32) << 1) >> n_scale),
+                    pdpc_weight(x as i32, n_scale),
+                    pdpc_weight(y as i32, n_scale),
                 )
             } else if mode == 18 || mode == 50 {
                 // Eqs. 410 – 413.
@@ -809,12 +822,12 @@ pub fn apply_pdpc(
                     refs.p(-1, y as i32)? as i32 - corner + cur,
                     refs.p(x as i32, -1)? as i32 - corner + cur,
                     if mode == 50 {
-                        32 >> (((x as i32) << 1) >> n_scale)
+                        pdpc_weight(x as i32, n_scale)
                     } else {
                         0
                     },
                     if mode == 18 {
-                        32 >> (((y as i32) << 1) >> n_scale)
+                        pdpc_weight(y as i32, n_scale)
                     } else {
                         0
                     },
@@ -829,7 +842,7 @@ pub fn apply_pdpc(
                 } else {
                     0
                 };
-                (0, ref_t, 0, 32 >> (((y as i32) << 1) >> n_scale))
+                (0, ref_t, 0, pdpc_weight(y as i32, n_scale))
             } else if mode > 50 && n_scale >= 0 {
                 // Eqs. 419 – 423 (sideRef = left column).
                 let ia = inv_angle(intra_pred_angle(mode)?);
@@ -840,7 +853,7 @@ pub fn apply_pdpc(
                 } else {
                     0
                 };
-                (ref_l, 0, 32 >> (((x as i32) << 1) >> n_scale), 0)
+                (ref_l, 0, pdpc_weight(x as i32, n_scale), 0)
             } else {
                 (0, 0, 0, 0)
             };

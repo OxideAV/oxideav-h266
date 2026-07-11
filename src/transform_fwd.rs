@@ -310,7 +310,12 @@ pub fn quantize_tb_dep_quant(
     let ls = (16i64 * LEVEL_SCALE[rect_non_ts as usize][q_mod] as i64) << q_div;
     let scale = 1i64 << bd_shift;
 
-    let positions = coeff_scan_positions(w, h);
+    // §7.3.11.11 zero-out (r412) — the trellis walks the CODED scan,
+    // which for a 64-point dimension covers only the low-frequency
+    // 32-corner (`Log2ZoTb = Min(log2Tb, 5)`). Out-of-corner
+    // coefficients are never coded; callers zero them before the
+    // forward quantisation (the reconstruction ignores them too).
+    let positions = coeff_scan_positions(w.min(32), h.min(32));
     let mut out = vec![0i32; w * h];
     let mut q_state: i32 = 0;
     for &(xc, yc) in positions.iter().rev() {
