@@ -12662,6 +12662,76 @@ mod tests {
         assert_eq!(out.cb.samples[8 * 64 + 0], 17);
     }
 
+    /// r412 regression pin — §6.4.4 decode-order reference
+    /// availability. The BR quadrant of a quad split decodes LAST; its
+    /// above-right reference run (dx = 8..15 on an 8×8 CU) falls in a
+    /// region that has not been decoded yet, which §8.4.5.2.8 must
+    /// mark unavailable and §8.4.5.2.9 substitute from the last
+    /// available top sample. The pre-r412 walker used a picture-edge
+    /// availability rule and read the raw plane there — this test
+    /// poisons exactly that region and asserts the poison cannot leak
+    /// into the prediction.
+    #[test]
+    fn intra_refs_above_right_of_undecoded_region_substituted() {
+        let sps = dummy_sps(2, 128, 128);
+        let pps = dummy_pps(128, 128, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 32];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+
+        let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        // Poison the not-yet-decoded region to the right of the
+        // 16-wide quad (the BR CU's above-right run reads y = 7,
+        // x = 16..23 under the old picture-bound rule).
+        for x in 16..32usize {
+            out.luma.samples[7 * 128 + x] = 250;
+        }
+        // Decode order TL → TR → BL → (BR next): mark the three
+        // decoded quadrants of the 16×16 area only.
+        walker.mark_reconstructed_rect(0, 0, 16, 8); // TL + TR
+        walker.mark_reconstructed_rect(0, 8, 8, 8); // BL
+
+        // BR CU (8, 8) 8×8, mode 66 — its main reference is the above
+        // row extended to refW = 16, whose right half is unavailable.
+        let ccu = CtuCu {
+            ctu_addr_rs: 0,
+            cu: Cu {
+                x: 8,
+                y: 8,
+                w: 8,
+                h: 8,
+                cqt_depth: 1,
+                mtt_depth: 0,
+            },
+        };
+        let info = LeafCuInfo {
+            x0: 8,
+            y0: 8,
+            cb_width: 8,
+            cb_height: 8,
+            intra_pred_mode_y: 66,
+            ..LeafCuInfo::default()
+        };
+        let residual = LeafCuResidual::default();
+        walker
+            .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
+            .expect("mode-66 BR CU should reconstruct");
+        // The available references are all 100 and the substituted
+        // above-right run repeats the last available sample (100), so
+        // the whole prediction is exactly 100. Any 250-poison leak
+        // (the pre-r412 behaviour) breaks this.
+        for y in 8..16usize {
+            for x in 8..16usize {
+                assert_eq!(
+                    out.luma.samples[y * 128 + x],
+                    100,
+                    "decode-order poison leaked into BR prediction at ({x},{y})"
+                );
+            }
+        }
+    }
+
     /// CCLM end-to-end: place a CU away from the picture edge so the
     /// chroma + luma neighbours are inside the plane, set
     /// `intra_pred_mode_c == INTRA_LT_CCLM`, and confirm the chroma
