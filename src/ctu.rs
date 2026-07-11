@@ -88,69 +88,20 @@ use crate::inter::{
     predict_luma_block_bipred_bcw, predict_luma_block_high_precision, HmvpTable, MotionField,
     MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
 };
-use crate::intra::{predict_angular, predict_dc, predict_planar, IntraRefs};
+use crate::intra::{predict_intra, IntraPredParams, RefSamples};
 use crate::leaf_cu::{
     CuNeighbourhood, CuPredMode, CuToolFlags, IntraNeighbour, LeafCuCtxs, LeafCuInfo, LeafCuReader,
-    LeafCuResidual, INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
+    LeafCuResidual, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
 };
 use crate::lmcs::{LmcsData, LmcsDerived};
 use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
-use crate::reconstruct::{clip_pixel, reconstruct_tb_into, OwnedIntraRefs, PictureBuffer};
+use crate::reconstruct::{clip_pixel, reconstruct_tb_into, PictureBuffer, PicturePlane};
 use crate::sao::{apply_sao, SaoConfig, SaoPicture};
 use crate::sao_syntax::{decode_sao_ctb, SaoCtxs, SaoSyntaxConfig};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
 use crate::transform::{inverse_transform_2d, TrType};
-
-/// Snap an arbitrary VVC angular intra mode `m ∈ 2..=66` to the nearest
-/// of the cardinal/diagonal subset implemented by [`crate::intra::predict_angular`]
-/// (`{2, 18, 34, 50, 66}`). Used as a fallback by
-/// [`CtuWalker::reconstruct_leaf_cu`] until the full angular-prediction
-/// pipeline (§8.4.5.2.13 — wide-angle remap, 4-tap reference filter,
-/// fractional-position interpolation) is wired.
-pub(crate) fn nearest_supported_angular(mode: u32) -> u32 {
-    const CARDINALS: [u32; 5] = [2, 18, 34, 50, 66];
-    CARDINALS
-        .iter()
-        .copied()
-        .min_by_key(|c| c.abs_diff(mode))
-        .unwrap_or(crate::leaf_cu::INTRA_PLANAR)
-}
-
-/// Map an `IntraPredModeC` (§8.4.3 output, range 0..=83) to one of the
-/// directional intra modes the per-sample chroma predictor understands
-/// in this scaffold (PLANAR, DC, or one of the cardinal angulars
-/// `{2, 18, 34, 50, 66}`).
-///
-/// CCLM modes (`81..=83`) bypass this helper — the CCLM path in
-/// [`CtuWalker::reconstruct_chroma_plane`] runs the dedicated
-/// §8.4.5.2.14 predictor against the reconstructed luma plane. The
-/// helper still maps them to `PLANAR` as a safety fallback if CCLM
-/// derivation fails (e.g. neither neighbour available — eq. 365 covers
-/// that path inside CCLM, but PLANAR keeps the chroma plane
-/// numerically defined). Non-cardinal angular modes (anything outside
-/// the cardinal set) are snapped to the nearest cardinal via
-/// [`nearest_supported_angular`], matching the luma-side fallback
-/// used by [`CtuWalker::reconstruct_leaf_cu`].
-pub(crate) fn chroma_pred_mode_for_predict(mode_c: u32) -> u32 {
-    use crate::leaf_cu::{INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM};
-    match mode_c {
-        INTRA_PLANAR => INTRA_PLANAR,
-        INTRA_DC => INTRA_DC,
-        // CCLM is dispatched separately by `reconstruct_chroma_plane`.
-        // Map to PLANAR here as the safety fallback.
-        INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM => INTRA_PLANAR,
-        m @ 2..=66 => {
-            if matches!(m, 2 | 18 | 34 | 50 | 66) {
-                m
-            } else {
-                nearest_supported_angular(m)
-            }
-        }
-        _ => INTRA_PLANAR,
-    }
-}
 
 /// Build the chroma neighbour rows / columns that [`predict_cclm`] needs
 /// from the partially-reconstructed chroma plane. Returns `(top, left)`
@@ -999,6 +950,20 @@ pub struct CtuWalker<'a, 'b> {
     /// `IntraMipFlag → lumaIntraPredMode = INTRA_PLANAR` arm for 4:2:0.
     /// Cells default to INTRA_PLANAR.
     intra_luma_mode_grid: Vec<u8>,
+    /// r412 — §7.4.12.2 eq. 152 / §8.7.5.1 eq. 1212 `IsAvailable[0][x][y]`:
+    /// per-luma-sample "constructed prior to the in-loop filter" mask
+    /// consulted by the §6.4.4 neighbouring-block availability
+    /// derivation for intra reference samples. Marked `true` per
+    /// reconstructed block in decoding order — a reference position in
+    /// a not-yet-decoded block (e.g. above-right of a CU whose Z-order
+    /// sibling comes later) reads unavailable and the §8.4.5.2.9
+    /// substitution fills it, fixing the r409-observed decode-order
+    /// availability bug (the old rule was picture-edge-only).
+    avail_luma: Vec<bool>,
+    /// r412 — `IsAvailable[1..2][x][y]` at 4:2:0 chroma resolution
+    /// (Cb and Cr are always reconstructed together). Empty for
+    /// monochrome.
+    avail_chroma: Vec<bool>,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -1199,7 +1164,48 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
             nbr_map_chroma: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
             intra_luma_mode_grid: vec![INTRA_PLANAR as u8; (intra_grid_w * intra_grid_h) as usize],
+            avail_luma: vec![false; (layout.pic_width_luma * layout.pic_height_luma) as usize],
+            avail_chroma: vec![
+                false;
+                ((layout.pic_width_luma / 2) * (layout.pic_height_luma / 2)) as usize
+            ],
         })
+    }
+
+    /// r412 — §8.7.5.1 eq. 1212: mark a just-reconstructed luma
+    /// rectangle "available for use in the §6.4.4 derivation".
+    /// Public so leaf-level callers driving [`Self::reconstruct_leaf_cu`]
+    /// directly (outside [`Self::decode_picture_into`]) can install the
+    /// availability state of samples they painted themselves.
+    pub fn mark_reconstructed_luma(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let pw = self.layout.pic_width_luma as usize;
+        let ph = self.layout.pic_height_luma as usize;
+        for yy in (y as usize)..((y + h) as usize).min(ph) {
+            for xx in (x as usize)..((x + w) as usize).min(pw) {
+                self.avail_luma[yy * pw + xx] = true;
+            }
+        }
+    }
+
+    /// r412 — eq. 1212 for the chroma planes (4:2:0 chroma
+    /// coordinates; Cb and Cr are reconstructed together).
+    pub fn mark_reconstructed_chroma(&mut self, cx: u32, cy: u32, cw: u32, ch: u32) {
+        let pw = (self.layout.pic_width_luma / 2) as usize;
+        let ph = (self.layout.pic_height_luma / 2) as usize;
+        for yy in (cy as usize)..((cy + ch) as usize).min(ph) {
+            for xx in (cx as usize)..((cx + cw) as usize).min(pw) {
+                self.avail_chroma[yy * pw + xx] = true;
+            }
+        }
+    }
+
+    /// r412 — convenience: mark a luma rectangle plus its collocated
+    /// 4:2:0 chroma rectangle reconstructed.
+    pub fn mark_reconstructed_rect(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        self.mark_reconstructed_luma(x, y, w, h);
+        if self.sps.sps_chroma_format_idc == 1 {
+            self.mark_reconstructed_chroma(x / 2, y / 2, w.div_ceil(2), h.div_ceil(2));
+        }
     }
 
     /// Install the LMCS APS payload the picture header references via
@@ -2675,6 +2681,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             self.reconstruct_leaf_cu_with_tree(ccu, info, residual, out, TreeType::DualTreeLuma)?;
             self.ibc_store_cu(ccu, out, false);
+            // §8.7.5.1 eq. 1212 — luma-tree CUs mark the luma plane
+            // only; the sibling chroma tree marks the chroma planes.
+            self.mark_reconstructed_luma(ccu.cu.x, ccu.cu.y, ccu.cu.w, ccu.cu.h);
         }
 
         // ---- DUAL_TREE_CHROMA ----------------------------------------------
@@ -2802,35 +2811,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             out,
             lfnst_pm,
         )?;
+        // §8.7.5.1 eq. 1212 — chroma-tree CUs mark the chroma planes.
+        self.mark_reconstructed_chroma(
+            cu.cu.x / 2,
+            cu.cu.y / 2,
+            cu.cu.w.div_ceil(2),
+            cu.cu.h.div_ceil(2),
+        );
         Ok(())
     }
 
-    /// Reconstruct one leaf CU into a frame buffer (luma plane only for
-    /// this round; chroma planes are seeded mid-grey at allocation time
-    /// and intentionally left untouched).
+    /// Reconstruct one leaf CU into a frame buffer (luma + 4:2:0
+    /// chroma).
     ///
     /// Pipeline (§8.4 / §8.7.3 / §8.7.4 / §8.7.5):
     ///
-    /// 1. Build reference samples from the partially-reconstructed luma
-    ///    plane via [`OwnedIntraRefs::from_plane`] (§8.4.5.2.8 fill).
-    /// 2. Generate intra prediction samples for the derived
-    ///    `intra_pred_mode_y`. PLANAR / DC are spec-exact; the cardinal
-    ///    /diagonal angular modes (2 / 18 / 34 / 50 / 66) use the
-    ///    nearest-neighbour subset already in [`crate::intra`]. Other
-    ///    angular modes degrade to PLANAR — the residual is preserved,
-    ///    so the picture loses some prediction accuracy but stays
-    ///    structurally correct.
-    /// 3. Dequantise the parsed luma coefficient levels via
-    ///    [`crate::dequant::dequantize_tb_flat`] (eqs. 1141 – 1156).
-    /// 4. Inverse 2D transform (§8.7.4.1) — DCT-II both axes for now.
-    /// 5. Add residual + clip with [`reconstruct_tb_into`] (eq. 1426).
-    ///
-    /// Out of scope for this round: ISP / SBT / MIP / LFNST / MTS / CCLM,
-    /// chroma reconstruction, in-loop filters, dependent quantisation,
-    /// scaling lists. Those CUs are written to the picture as the pure
-    /// prediction (no inverse transform) when the residual cannot be
-    /// applied; the helpers above are therefore best-effort but never
-    /// panic.
+    /// 1. §8.4.5.2.6 – §8.4.5.2.15 intra prediction (r412): reference
+    ///    samples from the partially-reconstructed planes under the
+    ///    §6.4.4 / eq. 1212 decode-order availability mask, spec-order
+    ///    §8.4.5.2.9 substitution, the §8.4.5.2.10 [1 2 1] reference
+    ///    filter, the full Table 24/25 angular interpolation with
+    ///    wide-angle remap and MRL reference lines, MIP, and PDPC.
+    /// 2. Dequantise the parsed coefficient levels (eqs. 1141 – 1156).
+    /// 3. Inverse transforms per §8.7.4 (DCT-II / DST-VII / DCT-VIII,
+    ///    LFNST, transform skip).
+    /// 4. Add residual + clip with [`reconstruct_tb_into`] (eq. 1426).
+    /// 5. Mark the CU's rectangle reconstructed (eq. 1212) so later
+    ///    CUs' §6.4.4 derivations see it.
     pub fn reconstruct_leaf_cu(
         &mut self,
         cu: &CtuCu,
@@ -2851,6 +2858,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.7.5.1 eqs. 1207 – 1209 — every reconstructed sample is
         // folded into IbcVirBuf so a later IBC CU can reference it.
         self.ibc_store_cu(cu, out, true);
+        // §8.7.5.1 eq. 1212 — the reconstructed samples become
+        // available for the §6.4.4 derivation of later CUs.
+        self.mark_reconstructed_rect(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h);
         Ok(())
     }
 
@@ -3003,71 +3013,73 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             )));
         }
 
-        // 1. Reference samples from the partially-reconstructed plane.
-        // Availability follows the simple slice-edge rule (§6.4.4 in the
-        // single-slice case): top / left exist when not on a picture
-        // edge.
-        let above_avail = y0 > 0;
-        let left_avail = x0 > 0;
-        let refs = OwnedIntraRefs::from_plane(
-            &out.luma,
-            x0,
-            y0,
-            n_tb_w,
-            n_tb_h,
-            above_avail,
-            left_avail,
-            bit_depth,
-        );
-        let refs_view = IntraRefs {
-            above: &refs.above,
-            left: &refs.left,
-            top_left: refs.top_left,
-        };
-
-        // 2. Intra prediction. MIP (§8.4.5.2.2) is dispatched first
-        // when the leaf-CU parser flagged it: `info.intra_mip_mode`
+        // 1./2. §8.4.5.2 reference generation + intra prediction.
+        // Reference-sample availability runs the §6.4.4 derivation
+        // against the per-sample eq. 1212 `IsAvailable` mask (marked in
+        // decoding order), so a reference position covered by a
+        // not-yet-decoded block substitutes per §8.4.5.2.9 — the
+        // r409-observed decode-order availability fix. MIP
+        // (§8.4.5.2.2) is dispatched first: `info.intra_mip_mode`
         // lives in a separate mode namespace from the angular /
-        // PLANAR / DC modes, so we cannot fall through to the angular
-        // path. The MIP helper takes the unfiltered reference rows
-        // directly (refs.above[0..n_tb_w] and refs.left[0..n_tb_h]) —
-        // the §8.4.5.2.8 / §8.4.5.2.9 substitution has already been
-        // applied by [`OwnedIntraRefs::from_plane`].
-        let pred: Vec<i16> = if info.intra_mip_flag {
-            // refs.above has length n_tb_w + 1 (includes the extra
-            // sample at column nTbW used by PLANAR). MIP only consumes
-            // refT[0..nTbW-1], so we slice off the trailing sample.
-            let ref_t: &[i16] = &refs.above[..n_tb_w];
-            let ref_l: &[i16] = &refs.left[..n_tb_h];
-            predict_mip(
-                n_tb_w,
-                n_tb_h,
-                info.intra_mip_mode,
-                info.intra_mip_transposed_flag,
-                ref_t,
-                ref_l,
-                bit_depth,
-            )?
-        } else {
-            match info.intra_pred_mode_y {
-                INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
-                INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
-                mode @ (2 | 18 | 34 | 50 | 66) => {
-                    predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?
+        // PLANAR / DC modes. Everything else goes through the
+        // §8.4.5.2.6 orchestrator (wide-angle remap, substitution,
+        // reference filter, Table 24/25 angular interpolation, PDPC).
+        let pred: Vec<i16> = {
+            let pw = self.layout.pic_width_luma as i32;
+            let ph = self.layout.pic_height_luma as i32;
+            let avail = &self.avail_luma;
+            let plane = &out.luma;
+            let (x0i, y0i) = (x0 as i32, y0 as i32);
+            let fetch = |dx: i32, dy: i32| -> Option<i16> {
+                let x = x0i + dx;
+                let y = y0i + dy;
+                if x < 0 || y < 0 || x >= pw || y >= ph {
+                    return None;
                 }
-                // Fallback: angular mode outside the implemented
-                // cardinal subset. Snap to the nearest cardinal /
-                // diagonal so the CU still gets a plausible
-                // prediction; the accumulated residual will absorb the
-                // difference (lossy but stable).
-                mode if (2..=66).contains(&mode) => {
-                    let snapped = nearest_supported_angular(mode);
-                    predict_angular(n_tb_w, n_tb_h, snapped, &refs_view)?
+                if !avail[(y as usize) * (pw as usize) + x as usize] {
+                    return None;
                 }
-                // Anything else is a spec-illegal mode; prefer PLANAR
-                // over bailing the whole picture so the stream still
-                // produces pixels.
-                _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+                plane.get(x as usize, y as usize).map(|v| v as i16)
+            };
+            if info.intra_mip_flag {
+                // §8.4.5.2.2 — eqs. 263 / 264: refW = nTbW + 1, refH =
+                // nTbH + 1; the availability marking + substitution run
+                // over that L-shape, then refT / refL are the top /
+                // left rows (eqs. 265 / 266).
+                let refs = RefSamples::build(fetch, 0, n_tb_w + 1, n_tb_h + 1, bit_depth);
+                let mut ref_t = Vec::with_capacity(n_tb_w);
+                for x in 0..n_tb_w {
+                    ref_t.push(refs.p(x as i32, -1)?);
+                }
+                let mut ref_l = Vec::with_capacity(n_tb_h);
+                for y in 0..n_tb_h {
+                    ref_l.push(refs.p(-1, y as i32)?);
+                }
+                predict_mip(
+                    n_tb_w,
+                    n_tb_h,
+                    info.intra_mip_mode,
+                    info.intra_mip_transposed_flag,
+                    &ref_t,
+                    &ref_l,
+                    bit_depth,
+                )?
+            } else {
+                predict_intra(
+                    &IntraPredParams {
+                        mode: info.intra_pred_mode_y,
+                        n_tb_w,
+                        n_tb_h,
+                        n_cb_w: n_tb_w,
+                        n_cb_h: n_tb_h,
+                        c_idx: 0,
+                        isp_no_split: true,
+                        ref_idx: info.intra_luma_ref_idx as usize,
+                        bdpcm: info.intra_bdpcm_luma,
+                        bit_depth,
+                    },
+                    fetch,
+                )?
             }
         };
 
@@ -3958,29 +3970,42 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let ciip_pred_intra_luma: Vec<i16> = if ciip_active {
             let n_w = cu.cu.w as usize;
             let n_h = cu.cu.h as usize;
-            let above_avail = cu.cu.y > 0;
-            let left_avail = cu.cu.x > 0;
-            let refs = OwnedIntraRefs::from_plane(
-                &out.luma,
-                cu.cu.x as usize,
-                cu.cu.y as usize,
-                n_w,
-                n_h,
-                above_avail,
-                left_avail,
-                bit_depth_ciip,
-            );
-            let refs_view = IntraRefs {
-                above: &refs.above,
-                left: &refs.left,
-                top_left: refs.top_left,
-            };
             // §7.4.5.2 — when ciip_flag == 1 the spec sets
             // IntraPredModeY[x][y] = INTRA_PLANAR for every sample of
-            // the CB. The chroma intra mode is derived from luma per
-            // §8.4.3 / Table 20 → also INTRA_PLANAR for our 4:2:0
-            // single-tree case.
-            predict_planar(n_w, n_h, &refs_view)?
+            // the CB. §8.5.6.7 invokes the §8.4.5.2.6 general intra
+            // sample prediction, so the r412 pipeline applies — PDPC
+            // included (a CIIP CB is always ≥ 8×8) — with the §6.4.4
+            // decode-order availability mask.
+            let pw = self.layout.pic_width_luma as i32;
+            let ph = self.layout.pic_height_luma as i32;
+            let avail = &self.avail_luma;
+            let plane = &out.luma;
+            let (x0i, y0i) = (cu.cu.x as i32, cu.cu.y as i32);
+            predict_intra(
+                &IntraPredParams {
+                    mode: INTRA_PLANAR,
+                    n_tb_w: n_w,
+                    n_tb_h: n_h,
+                    n_cb_w: n_w,
+                    n_cb_h: n_h,
+                    c_idx: 0,
+                    isp_no_split: true,
+                    ref_idx: 0,
+                    bdpcm: false,
+                    bit_depth: bit_depth_ciip,
+                },
+                |dx: i32, dy: i32| -> Option<i16> {
+                    let x = x0i + dx;
+                    let y = y0i + dy;
+                    if x < 0 || y < 0 || x >= pw || y >= ph {
+                        return None;
+                    }
+                    if !avail[(y as usize) * (pw as usize) + x as usize] {
+                        return None;
+                    }
+                    plane.get(x as usize, y as usize).map(|v| v as i16)
+                },
+            )?
         } else {
             Vec::new()
         };
@@ -4168,42 +4193,56 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let (ciip_pred_intra_cb, ciip_pred_intra_cr) = if ciip_active {
                 let n_w_c = cb_w_c as usize;
                 let n_h_c = cb_h_c as usize;
-                let above_avail_c = cb_y_c > 0;
-                let left_avail_c = cb_x_c > 0;
-                let refs_cb = OwnedIntraRefs::from_plane(
-                    &out.cb,
-                    cb_x_c as usize,
-                    cb_y_c as usize,
-                    n_w_c,
-                    n_h_c,
-                    above_avail_c,
-                    left_avail_c,
-                    bit_depth_ciip,
-                );
-                let refs_cr = OwnedIntraRefs::from_plane(
-                    &out.cr,
-                    cb_x_c as usize,
-                    cb_y_c as usize,
-                    n_w_c,
-                    n_h_c,
-                    above_avail_c,
-                    left_avail_c,
-                    bit_depth_ciip,
-                );
-                let view_cb = IntraRefs {
-                    above: &refs_cb.above,
-                    left: &refs_cb.left,
-                    top_left: refs_cb.top_left,
+                // §8.5.6.7 chroma intra parts run the same §8.4.5.2.6
+                // pipeline (PLANAR + PDPC) against the chroma-plane
+                // §6.4.4 decode-order availability mask.
+                let cw = (self.layout.pic_width_luma / 2) as i32;
+                let chh = (self.layout.pic_height_luma / 2) as i32;
+                let avail = &self.avail_chroma;
+                let (x0i, y0i) = (cb_x_c as i32, cb_y_c as i32);
+                let params_c = IntraPredParams {
+                    mode: INTRA_PLANAR,
+                    n_tb_w: n_w_c,
+                    n_tb_h: n_h_c,
+                    n_cb_w: n_w_c,
+                    n_cb_h: n_h_c,
+                    c_idx: 1,
+                    isp_no_split: true,
+                    ref_idx: 0,
+                    bdpcm: false,
+                    bit_depth: bit_depth_ciip,
                 };
-                let view_cr = IntraRefs {
-                    above: &refs_cr.above,
-                    left: &refs_cr.left,
-                    top_left: refs_cr.top_left,
-                };
-                (
-                    predict_planar(n_w_c, n_h_c, &view_cb)?,
-                    predict_planar(n_w_c, n_h_c, &view_cr)?,
-                )
+                fn fetch_c(
+                    plane: &PicturePlane,
+                    avail: &[bool],
+                    cw: i32,
+                    chh: i32,
+                    x0i: i32,
+                    y0i: i32,
+                    dx: i32,
+                    dy: i32,
+                ) -> Option<i16> {
+                    let x = x0i + dx;
+                    let y = y0i + dy;
+                    if x < 0 || y < 0 || x >= cw || y >= chh {
+                        return None;
+                    }
+                    if !avail[(y as usize) * (cw as usize) + x as usize] {
+                        return None;
+                    }
+                    plane.get(x as usize, y as usize).map(|v| v as i16)
+                }
+                let pred_cb = predict_intra(&params_c, |dx, dy| {
+                    fetch_c(&out.cb, avail, cw, chh, x0i, y0i, dx, dy)
+                })?;
+                let pred_cr = predict_intra(
+                    &IntraPredParams {
+                        c_idx: 2,
+                        ..params_c
+                    },
+                    |dx, dy| fetch_c(&out.cr, avail, cw, chh, x0i, y0i, dx, dy),
+                )?;
+                (pred_cb, pred_cr)
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -7291,7 +7330,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// Returns once every subpartition has been written to the picture
     /// buffer; the chroma plane is handled separately by the caller.
     fn reconstruct_leaf_cu_isp_luma(
-        &self,
+        &mut self,
         cu: &CtuCu,
         info: &LeafCuInfo,
         residual: &LeafCuResidual,
@@ -7345,34 +7384,47 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             //    the predictor; for pbFactor == 2 the window is
             //    reused for the second partition in each pair.
             if p.x_part_pb_idx == 0 {
-                let above_avail = abs_y > 0;
-                let left_avail = abs_x > 0;
-                let refs = OwnedIntraRefs::from_plane(
-                    &out.luma,
-                    abs_x,
-                    abs_y,
-                    n_pb_w,
-                    n_h,
-                    above_avail,
-                    left_avail,
-                    bit_depth,
-                );
-                let refs_view = IntraRefs {
-                    above: &refs.above,
-                    left: &refs.left,
-                    top_left: refs.top_left,
-                };
-                let pred = match info.intra_pred_mode_y {
-                    INTRA_PLANAR => predict_planar(n_pb_w, n_h, &refs_view)?,
-                    INTRA_DC => predict_dc(n_pb_w, n_h, &refs_view)?,
-                    mode @ (2 | 18 | 34 | 50 | 66) => {
-                        predict_angular(n_pb_w, n_h, mode, &refs_view)?
-                    }
-                    mode if (2..=66).contains(&mode) => {
-                        let snapped = nearest_supported_angular(mode);
-                        predict_angular(n_pb_w, n_h, snapped, &refs_view)?
-                    }
-                    _ => predict_planar(n_pb_w, n_h, &refs_view)?,
+                // §8.4.5.1 invokes §8.4.5.2.6 with the transform block
+                // set to the (nPbW)x(nH) prediction window and the
+                // coding block set to the CU — eqs. 315 / 316 extend
+                // refW / refH to nCb + nTb on the ISP luma path, and
+                // the §8.4.5.2.7 remap runs on the CU dimensions
+                // (eqs. 320 / 321). Availability per §6.4.4 against
+                // the eq. 1212 mask — earlier subpartitions of this CU
+                // are marked as they reconstruct, so partition k can
+                // reference partition k−1 spec-exactly.
+                let pred = {
+                    let pw = self.layout.pic_width_luma as i32;
+                    let ph = self.layout.pic_height_luma as i32;
+                    let avail = &self.avail_luma;
+                    let plane = &out.luma;
+                    let (x0i, y0i) = (abs_x as i32, abs_y as i32);
+                    let fetch = |dx: i32, dy: i32| -> Option<i16> {
+                        let x = x0i + dx;
+                        let y = y0i + dy;
+                        if x < 0 || y < 0 || x >= pw || y >= ph {
+                            return None;
+                        }
+                        if !avail[(y as usize) * (pw as usize) + x as usize] {
+                            return None;
+                        }
+                        plane.get(x as usize, y as usize).map(|v| v as i16)
+                    };
+                    predict_intra(
+                        &IntraPredParams {
+                            mode: info.intra_pred_mode_y,
+                            n_tb_w: n_pb_w,
+                            n_tb_h: n_h,
+                            n_cb_w: cb_w as usize,
+                            n_cb_h: cb_h as usize,
+                            c_idx: 0,
+                            isp_no_split: false,
+                            ref_idx: 0,
+                            bdpcm: false,
+                            bit_depth,
+                        },
+                        fetch,
+                    )?
                 };
                 pred_window = pred;
                 pred_window_w = n_pb_w;
@@ -7449,6 +7501,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 n_h,
                 bit_depth,
             )?;
+            // §8.7.5.1 eq. 1212 — per-subpartition marking: the next
+            // partition's §6.4.4 derivation must see this one.
+            self.mark_reconstructed_luma(abs_x as u32, abs_y as u32, n_w as u32, n_h as u32);
         }
 
         Ok(())
@@ -7457,13 +7512,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// Reconstruct a single chroma TB (Cb when `c_idx == 1`, Cr when
     /// `c_idx == 2`) into the corresponding plane of `out`.
     ///
-    /// Pipeline mirrors the luma path: §8.4.5.2.8 reference fetch on
-    /// the half-resolution chroma plane, PLANAR / DC / cardinal-angular
-    /// intra prediction (`info.intra_pred_mode_c` mapped via
-    /// [`chroma_pred_mode_for_predict`]; CCLM and non-cardinal angulars
-    /// are snapped to PLANAR / nearest-cardinal as a placeholder),
-    /// §8.7.3 flat-list dequant (with the §8.7.1 chroma QP — currently
-    /// the identity mapping `QpC = QpY + pps_chroma_qp_offset
+    /// Pipeline mirrors the luma path: the §8.4.5.2.6 – §8.4.5.2.15
+    /// intra prediction on the half-resolution chroma plane (full
+    /// angular mode range with the 2-tap chroma interpolation,
+    /// wide-angle remap, PDPC, and §6.4.4 decode-order reference
+    /// availability; CCLM dispatches to the dedicated §8.4.5.2.14
+    /// path), §8.7.3 flat-list dequant (with the §8.7.1 chroma QP —
+    /// currently the identity mapping `QpC = QpY + pps_chroma_qp_offset
     /// + cu_chroma_qp_offset`), §8.7.4.1 separable DCT-II inverse
     /// transform, and §8.7.5.1 reconstruct + clip.
     ///
@@ -7550,32 +7605,44 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             _ => return Ok(()),
         };
 
-        // 1. Reference samples from the partially-reconstructed chroma
-        // plane. Same picture-edge rule as luma in the single-slice
-        // case.
-        let above_avail = y0 > 0;
-        let left_avail = x0 > 0;
-        let refs = OwnedIntraRefs::from_plane(
-            plane,
-            x0,
-            y0,
-            n_tb_w,
-            n_tb_h,
-            above_avail,
-            left_avail,
-            bit_depth,
-        );
-        let refs_view = IntraRefs {
-            above: &refs.above,
-            left: &refs.left,
-            top_left: refs.top_left,
+        // 1. Reference availability per §6.4.4 against the chroma-plane
+        // eq. 1212 mask (r412 — decode-order availability; previously a
+        // picture-edge-only rule).
+        let cw = (self.layout.pic_width_luma / 2) as i32;
+        let chh = (self.layout.pic_height_luma / 2) as i32;
+        let avail = &self.avail_chroma;
+        let above_avail = y0 > 0
+            && avail
+                .get((y0 - 1) * cw as usize + x0)
+                .copied()
+                .unwrap_or(false);
+        let left_avail = x0 > 0
+            && avail
+                .get(y0 * cw as usize + (x0 - 1))
+                .copied()
+                .unwrap_or(false);
+        let fetch = {
+            let plane: &PicturePlane = plane;
+            let (x0i, y0i) = (x0 as i32, y0 as i32);
+            move |dx: i32, dy: i32| -> Option<i16> {
+                let x = x0i + dx;
+                let y = y0i + dy;
+                if x < 0 || y < 0 || x >= cw || y >= chh {
+                    return None;
+                }
+                if !avail[(y as usize) * (cw as usize) + x as usize] {
+                    return None;
+                }
+                plane.get(x as usize, y as usize).map(|v| v as i16)
+            }
         };
 
         // 2. Intra prediction. CCLM (§8.4.5.2.14) is dispatched first
         // when the §8.4.3 chroma-mode derivation produced one of the
         // CCLM modes (81 / 82 / 83); the helper consumes the
         // reconstructed luma plane snapshot taken just above. The
-        // remaining modes go through the cardinal-only fallback.
+        // remaining modes run the full §8.4.5.2.6 pipeline (2-tap
+        // chroma angular interpolation, wide-angle remap, PDPC).
         let pred = if is_cclm {
             // Build the 4:2:0 chroma neighbour rows. Both `INTRA_T_CCLM`
             // and `INTRA_L_CCLM` extend the corresponding side; the
@@ -7626,18 +7693,41 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // defined even on degenerate input.
             match predict_cclm(&inputs) {
                 Ok(p) => p,
-                Err(_) => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
+                Err(_) => predict_intra(
+                    &IntraPredParams {
+                        mode: INTRA_PLANAR,
+                        n_tb_w,
+                        n_tb_h,
+                        n_cb_w: n_tb_w,
+                        n_cb_h: n_tb_h,
+                        c_idx,
+                        isp_no_split: true,
+                        ref_idx: 0,
+                        bdpcm: false,
+                        bit_depth,
+                    },
+                    fetch,
+                )?,
             }
         } else {
-            let mapped = chroma_pred_mode_for_predict(mode_c);
-            match mapped {
-                INTRA_PLANAR => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
-                INTRA_DC => predict_dc(n_tb_w, n_tb_h, &refs_view)?,
-                mode @ (2 | 18 | 34 | 50 | 66) => {
-                    predict_angular(n_tb_w, n_tb_h, mode, &refs_view)?
-                }
-                _ => predict_planar(n_tb_w, n_tb_h, &refs_view)?,
-            }
+            // §8.4.5.2.6 — the full chroma pipeline: PLANAR / DC /
+            // general angular (2-tap eqs. 346/347/356/357) with the
+            // wide-angle remap on the chroma TB shape and PDPC.
+            predict_intra(
+                &IntraPredParams {
+                    mode: mode_c,
+                    n_tb_w,
+                    n_tb_h,
+                    n_cb_w: n_tb_w,
+                    n_cb_h: n_tb_h,
+                    c_idx,
+                    isp_no_split: true,
+                    ref_idx: 0,
+                    bdpcm: info.intra_bdpcm_chroma,
+                    bit_depth,
+                },
+                fetch,
+            )?
         };
 
         // 3. Dequantise + 4. inverse 2D transform when there is a coded
@@ -12170,16 +12260,36 @@ mod tests {
         let residual = LeafCuResidual::default();
 
         let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200);
-        // Expected intra part: the same PLANAR prediction the CIIP path
-        // captures from the pre-MC plane (top edge unavailable at
-        // y == 0, left column = the 200 seed).
-        let refs = OwnedIntraRefs::from_plane(&out.luma, 16, 0, 16, 16, false, true, 8);
-        let refs_view = IntraRefs {
-            above: &refs.above,
-            left: &refs.left,
-            top_left: refs.top_left,
-        };
-        let intra_expect = predict_planar(16, 16, &refs_view).unwrap();
+        // The painted seed plane stands in for already-reconstructed
+        // content — install its eq. 1212 availability so the CIIP
+        // intra part sees the left column per §6.4.4 (r412).
+        walker.mark_reconstructed_rect(0, 0, pic_w, pic_h);
+        // Expected intra part: the same §8.4.5.2.6 prediction the CIIP
+        // path captures from the pre-MC plane (top edge unavailable at
+        // y == 0, left column = the 200 seed), PDPC included.
+        let intra_expect = crate::intra::predict_intra(
+            &crate::intra::IntraPredParams {
+                mode: INTRA_PLANAR,
+                n_tb_w: 16,
+                n_tb_h: 16,
+                n_cb_w: 16,
+                n_cb_h: 16,
+                c_idx: 0,
+                isp_no_split: true,
+                ref_idx: 0,
+                bdpcm: false,
+                bit_depth: 8,
+            },
+            |dx: i32, dy: i32| {
+                let x = 16 + dx;
+                let y = dy;
+                if x < 0 || y < 0 || x >= pic_w as i32 || y >= pic_h as i32 {
+                    return None;
+                }
+                out.luma.get(x as usize, y as usize).map(|v| v as i16)
+            },
+        )
+        .unwrap();
 
         walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
@@ -12552,29 +12662,6 @@ mod tests {
         assert_eq!(out.cb.samples[8 * 64 + 0], 17);
     }
 
-    /// `chroma_pred_mode_for_predict` keeps PLANAR / DC / cardinal
-    /// angulars verbatim, snaps non-cardinal angulars to the nearest
-    /// cardinal, and falls CCLM back to PLANAR (the actual CCLM dispatch
-    /// happens in `reconstruct_chroma_plane` before this helper runs —
-    /// CCLM only hits this PLANAR fallback if the dedicated path
-    /// rejects its inputs).
-    #[test]
-    fn chroma_pred_mode_mapping_keeps_planar_dc_and_snaps_angulars() {
-        use crate::leaf_cu::{INTRA_DC, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM};
-        assert_eq!(chroma_pred_mode_for_predict(INTRA_PLANAR), INTRA_PLANAR);
-        assert_eq!(chroma_pred_mode_for_predict(INTRA_DC), INTRA_DC);
-        assert_eq!(chroma_pred_mode_for_predict(50), 50);
-        assert_eq!(chroma_pred_mode_for_predict(2), 2);
-        assert_eq!(chroma_pred_mode_for_predict(66), 66);
-        // Non-cardinal angular -> snap to nearest cardinal (matches
-        // the luma fallback).
-        assert_eq!(chroma_pred_mode_for_predict(40), 34);
-        // CCLM modes drop to PLANAR here as a safety fallback.
-        assert_eq!(chroma_pred_mode_for_predict(INTRA_LT_CCLM), INTRA_PLANAR);
-        assert_eq!(chroma_pred_mode_for_predict(INTRA_L_CCLM), INTRA_PLANAR);
-        assert_eq!(chroma_pred_mode_for_predict(INTRA_T_CCLM), INTRA_PLANAR);
-    }
-
     /// CCLM end-to-end: place a CU away from the picture edge so the
     /// chroma + luma neighbours are inside the plane, set
     /// `intra_pred_mode_c == INTRA_LT_CCLM`, and confirm the chroma
@@ -12620,6 +12707,10 @@ mod tests {
         for v in out.cr.samples.iter_mut() {
             *v = 70;
         }
+        // r412 — the painted surround stands in for already-decoded
+        // content: install its eq. 1212 availability so §6.4.4 sees
+        // the neighbours.
+        walker.mark_reconstructed_rect(0, 0, 128, 128);
         walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .expect("CCLM_LT path should succeed");
@@ -13027,6 +13118,9 @@ mod tests {
             });
         }
         let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        // r412 — install the painted surround's eq. 1212 availability
+        // so the §6.4.4 derivation sees the neighbours.
+        walker.mark_reconstructed_rect(0, 0, 128, 128);
         walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .expect("ISP HOR split path should succeed");
@@ -13108,6 +13202,9 @@ mod tests {
             });
         }
         let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        // r412 — install the painted surround's eq. 1212 availability
+        // so the §6.4.4 derivation sees the neighbours.
+        walker.mark_reconstructed_rect(0, 0, 128, 128);
         walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .expect("ISP VER split path should succeed");
@@ -13172,6 +13269,9 @@ mod tests {
             });
         }
         let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        // r412 — install the painted surround's eq. 1212 availability
+        // so the §6.4.4 derivation sees the neighbours.
+        walker.mark_reconstructed_rect(0, 0, 128, 128);
         walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .expect("ISP VER pb_factor=2 path should succeed");
@@ -13239,6 +13339,9 @@ mod tests {
             levels: last_levels,
         });
         let mut out = PictureBuffer::yuv420_filled(128, 128, 100);
+        // r412 — install the painted surround's eq. 1212 availability
+        // so the §6.4.4 derivation sees the neighbours.
+        walker.mark_reconstructed_rect(0, 0, 128, 128);
         walker
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .expect("ISP HOR last-partition residual path should succeed");
@@ -13265,19 +13368,6 @@ mod tests {
             last_strip_changed,
             "ISP bottom subpartition residual must move at least one sample"
         );
-    }
-
-    /// The fallback angular-snap helper picks the closest cardinal
-    /// mode by absolute index distance.
-    #[test]
-    fn nearest_supported_angular_snaps_to_cardinals() {
-        assert_eq!(nearest_supported_angular(2), 2);
-        assert_eq!(nearest_supported_angular(10), 2);
-        assert_eq!(nearest_supported_angular(11), 18);
-        assert_eq!(nearest_supported_angular(26), 18);
-        assert_eq!(nearest_supported_angular(40), 34);
-        assert_eq!(nearest_supported_angular(60), 66);
-        assert_eq!(nearest_supported_angular(66), 66);
     }
 
     /// Round-12: `apply_in_loop_filters` is wired to the §8.8.3
