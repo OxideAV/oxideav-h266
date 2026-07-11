@@ -111,9 +111,39 @@ The reconstruction pipeline is built incrementally and currently covers
 the **intra-only single-tile single-slice subset** plus a substantial
 P + B-slice merge subset:
 
-* **Intra** — PLANAR / DC / cardinal angular intra (modes 2, 18, 34,
-  50, 66), MIP (§8.4.5.2.2, all 30 weight matrices), CCLM
-  (§8.4.5.2.14), BDPCM, and ISP (§8.4.5.1, all 4 split types).
+* **Intra** (r412 — the full §8.4.5.2 pipeline) — PLANAR / DC and the
+  complete general angular range (§8.4.5.2.13: Table 24 angles
+  −14..=80 with the §8.4.5.2.7 wide-angle remap, eq. 337 invAngle
+  side-projection, Table 25 fC/fG 4-tap luma interpolation with the
+  Table 23 minDistVerHor filter selection, 2-tap chroma
+  interpolation), PDPC (§8.4.5.2.15, all four refL/refT/wT/wL arms,
+  luma + chroma), the §8.4.5.2.10 [1 2 1] reference filter, the
+  spec-order §8.4.5.2.9 reference substitution, MRL reference lines
+  (the parsed `intra_luma_ref_idx` selects the line at
+  reconstruction), MIP (§8.4.5.2.2, all 30 weight matrices, eqs.
+  263 – 266 reference rows), CCLM (§8.4.5.2.14), BDPCM, and ISP
+  (§8.4.5.1, all 4 split types, eqs. 315/316 refW/refH and
+  (nPbW)x(nH) prediction windows). Reference-sample availability runs
+  the §6.4.4 derivation against per-sample `IsAvailable` masks marked
+  in decoding order (§7.4.12.2 eq. 152 / §8.7.5.1 eq. 1212) — a
+  reference position in a not-yet-decoded block substitutes instead
+  of leaking stale plane bytes (the r409-observed decode-order bug).
+* **§7.3.11.4 coding_tree conformance** (r412) — the single-tree
+  walker decodes the coding tree in the spec's depth-first
+  interleaved order (each leaf's `coding_unit()` bins follow its
+  `split_cu_flag == 0` immediately), with the §6.4.1 – §6.4.3
+  allowed-split derivations (SplitConstraints from the SPS partition
+  constraints) gating both the split-bin presence (§7.4.12.4
+  inferences when absent) and the §9.3.4.2.2 ctxIncs. The §7.3.11.2
+  ALF CTU prefix (`alf_ctb_flag` family) is consumed in-stream via
+  `set_alf_decode`. `finish_slice()` verifies
+  `end_of_slice_one_bit == 1`.
+* **§7.3.11.11 zero-out** (r412) — a 64-point DCT-II TB codes only
+  the low-frequency 32-corner: the coded geometry (last-sig
+  binarisation cMax, sub-block grid + scan, pass-1 bin budget) runs
+  on `Log2ZoTb = Min(log2Tb, 5)` while the §9.3.4.2.4 last-sig prefix
+  ctxInc keeps the full-TB dims, matching the §8.7.4.1 eqs. 1171/1172
+  inverse-transform extents.
 * **Dual-tree intra** (r391) — an I-slice with
   `sps_qtbtt_dual_tree_intra_flag` decodes through the §7.3.11.2
   `dual_tree_implicit_qt_split` (bin-less quad recursion while
@@ -424,15 +454,26 @@ opt-in **sign data hiding** (`EncoderConfig::sign_data_hiding`,
 mutually exclusive per §7.3.7): `residual_enc::condition_levels_for_sdh`
 parity-conditions every hidden-sign sub-block with a one-step nudge.
 
-r387 wire-conformance sweep (black-box validated against a conforming
-third-party VVC decoder): the single-layer VPS drops the spurious
-`vps_num_ptls_minus1` byte and gains the mandatory
-`vps_extension_flag`; the §7.4.3.5 `pps_*_info_in_ph_flag` inferences
-flip to 0, moving the ALF chain / `sh_qp_delta` (the slice QP is now
-really signalled) / SAO flags from the PH into the §7.3.7 slice
-header. The full emitted header chain — VPS, SPS, PPS, APSes, PH,
-slice header — now parses externally; the remaining external-decode
-gap is the `coding_unit()` intra-mode bins.
+r387/r412 wire-conformance sweeps (black-box validated against a
+conforming third-party VVC decoder): the emitted stream now carries
+the §7.3.11.5 intra-mode cascade (every pipeline CU signals INTRA_DC
+through the MPM path + DM chroma), the coding loop predicts real
+§8.4.5.2.12 DC (+ PDPC) from the partially-reconstructed planes with
+encoder-side eq. 1212 availability masks, `end_of_slice_one_bit` sits
+only after the last CTU (§7.3.11.1), the final CABAC flush follows
+§9.3.4.3.5 (the last consumed bit is the `rbsp_stop_one_bit`), SAO is
+applied to the reconstruction only when actually signalled (and Cr's
+decision is constrained to Cb's shared `sao_type_idx_chroma` /
+`sao_eo_class_chroma`), the SPS signals `MaxTbSizeY = 64` and — with
+the MTT pickers on — a real MTT depth and 64-sample MaxBt/MaxTt, and
+all split bins follow the §6.4.1 – §6.4.3 presence/ctxInc rules.
+`tests/whole_stream_conformance.rs` pins 11 tool axes (QP sweep,
+multi-CTU, chroma SAO merge, MTT BT/TT, LMCS ± chroma scaling,
+dep-quant, SDH) decoding BYTE-EXACTLY through this crate's own full
+receive path; the flat axis plus a battery of residual probes decode
+byte-exactly through the external decoder too, with one remaining
+sparse-residual 64x64-TB divergence documented in
+`tests/WHOLE_STREAM_CORPUS.md`.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
