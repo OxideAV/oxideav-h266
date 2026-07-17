@@ -232,10 +232,12 @@ impl ChromaQpTable {
     /// `(k + qp_bd_offset) as usize`); use [`Self::map_qp`] for a
     /// clamped lookup that mirrors §8.7.1.
     ///
-    /// The default single-point all-zero-delta table this crate emits
-    /// (`same_qp_table_for_chroma`, `num_points = 1`) reduces to the
-    /// identity `ChromaQpTable[k] = Clip3(−QpBdOffset, 63, k)`, matching
-    /// the previous `chroma_qp_identity` behaviour.
+    /// The single-point table this crate emits (`same_qp_table_for_chroma`,
+    /// `num_points = 1`, `delta_qp_in_val_minus1 = 0`,
+    /// `delta_qp_diff_val = 1`) derives to the identity
+    /// `ChromaQpTable[k] = Clip3(−QpBdOffset, 63, k)`. NB an all-zero
+    /// point does NOT: `qpOutVal` would hold at the start value and the
+    /// tail extrapolation lands on `k − 1` above it (r415).
     pub fn build(&self, qp_bd_offset: i32) -> Vec<i32> {
         let num_points = self.entries.len(); // sps_num_points_in_qp_table_minus1 + 1
                                              // qpInVal / qpOutVal pivot arrays (length num_points + 1).

@@ -88,6 +88,10 @@ pub struct DeblockParams {
     pub chroma_qp_offset_cb: i32,
     pub chroma_qp_offset_cr: i32,
     pub bit_depth: u32,
+    /// `CtbLog2SizeY` — the §8.8.3.3 chroma `maxFilterLength` derivation
+    /// caps the P side to 1 on horizontal edges that coincide with a
+    /// chroma-CTB row boundary (r415).
+    pub ctb_log2_size_y: u32,
 }
 
 /// Spec Table 43 — β′ as a function of the QP-derived index Q ∈ [0, 63].
@@ -167,6 +171,8 @@ struct PlaneCtx<'a> {
     /// PPS + slice chroma QP offset (added to `qP` for chroma).
     qp_offset: i32,
     bit_depth: u32,
+    /// `CtbSizeY` in luma samples (for the §8.8.3.3 chroma CTB-row rule).
+    ctb_size_y: u32,
 }
 
 /// Apply §8.8.3 deblocking to all three planes of `out`. CUs in `cus`
@@ -197,6 +203,7 @@ pub fn apply_deblocking(
         tc_offset_div2: params.luma_tc_offset_div2,
         qp_offset: 0,
         bit_depth: params.bit_depth,
+        ctb_size_y: 1 << params.ctb_log2_size_y,
     };
     deblock_one_direction(&mut luma, cus, &grid, EdgeType::Vertical);
     deblock_one_direction(&mut luma, cus, &grid, EdgeType::Horizontal);
@@ -211,6 +218,7 @@ pub fn apply_deblocking(
             tc_offset_div2: params.cb_tc_offset_div2,
             qp_offset: params.chroma_qp_offset_cb,
             bit_depth: params.bit_depth,
+            ctb_size_y: 1 << params.ctb_log2_size_y,
         };
         deblock_one_direction(&mut cb, cus, &grid, EdgeType::Vertical);
         deblock_one_direction(&mut cb, cus, &grid, EdgeType::Horizontal);
@@ -223,6 +231,7 @@ pub fn apply_deblocking(
             tc_offset_div2: params.cr_tc_offset_div2,
             qp_offset: params.chroma_qp_offset_cr,
             bit_depth: params.bit_depth,
+            ctb_size_y: 1 << params.ctb_log2_size_y,
         };
         deblock_one_direction(&mut cr, cus, &grid, EdgeType::Vertical);
         deblock_one_direction(&mut cr, cus, &grid, EdgeType::Horizontal);
@@ -443,7 +452,8 @@ fn deblock_cu_top_edge(
             k += luma_segment / (plane.sub_w as i32).max(1);
         } else {
             let (_qp, beta, tc) = compute_thresholds_chroma(plane, p_cu, q_cu, b_s);
-            let (mfl_p, mfl_q) = chroma_max_filter_length_h(p_cu, q_cu, plane.sub_h);
+            let ctb_h_c = plane.ctb_size_y / plane.sub_h.max(1);
+            let (mfl_p, mfl_q) = chroma_max_filter_length_h(p_cu, q_cu, plane.sub_h, cy, ctb_h_c);
             run_chroma_filter_h(plane.plane, cx + k, cy, beta, tc, b_s, mfl_p, mfl_q);
             k += step;
         }
@@ -473,13 +483,27 @@ fn chroma_max_filter_length_v(p_cu: &DeblockCu, q_cu: &DeblockCu, sub_w: u32) ->
 }
 
 /// Mirror of [`chroma_max_filter_length_v`] for an EDGE_HOR edge —
-/// uses the chroma TB *height* on each side.
+/// uses the chroma TB *height* on each side. §8.8.3.3 (r415): when the
+/// horizontal edge coincides with a chroma CTB row boundary
+/// (`(yCb + y) % CtbHeightC == 0`), the P side reaches into the CTB row
+/// above (the decoder's line buffer), so `maxFilterLengthP` is capped
+/// at 1 while `maxFilterLengthQ` stays 3.
 #[inline]
-fn chroma_max_filter_length_h(p_cu: &DeblockCu, q_cu: &DeblockCu, sub_h: u32) -> (u32, u32) {
+fn chroma_max_filter_length_h(
+    p_cu: &DeblockCu,
+    q_cu: &DeblockCu,
+    sub_h: u32,
+    edge_chroma_y: i32,
+    ctb_h_c: u32,
+) -> (u32, u32) {
     let p_chroma_h = p_cu.h / sub_h.max(1);
     let q_chroma_h = q_cu.h / sub_h.max(1);
     if p_chroma_h >= 8 && q_chroma_h >= 8 {
-        (3, 3)
+        if ctb_h_c > 0 && (edge_chroma_y as u32) % ctb_h_c == 0 {
+            (1, 3)
+        } else {
+            (3, 3)
+        }
     } else {
         (1, 1)
     }
@@ -1300,13 +1324,25 @@ fn run_chroma_filter_h(
     let bd = 8u32;
     let max_k = 1i32;
 
-    let strong_eligible = max_filter_length_p == 3 && max_filter_length_q == 3;
+    // §8.8.3.6.4: with both lengths 1 and bS != 2 the edge is left
+    // untouched entirely.
+    if max_filter_length_p == 1 && max_filter_length_q == 1 && _b_s != 2 {
+        return;
+    }
+    // §8.8.3.6.4 / §8.8.3.6.10 — the strong path runs when
+    // maxFilterLengthQ == 3; the P side is either 3 (symmetric
+    // eqs. 1411-1416) or 1 (the r415 chroma-CTB-row asymmetric
+    // variant, eqs. 1417-1420, with the decision's p3/p2 := p1
+    // substitution).
+    let strong_eligible =
+        max_filter_length_q == 3 && (max_filter_length_p == 3 || max_filter_length_p == 1);
     if strong_eligible {
-        let dec0 = chroma_strong_decision_h(plane, cx, cy, beta, tc);
-        let dec1 = chroma_strong_decision_h(plane, cx + max_k, cy, beta, tc);
+        let short_p = max_filter_length_p == 1;
+        let dec0 = chroma_strong_decision_h(plane, cx, cy, beta, tc, short_p);
+        let dec1 = chroma_strong_decision_h(plane, cx + max_k, cy, beta, tc, short_p);
         if dec0 && dec1 {
             for k in 0..=max_k {
-                chroma_strong_apply_h(plane, cx + k, cy, tc, bd);
+                chroma_strong_apply_h(plane, cx + k, cy, tc, bd, short_p);
             }
             return;
         }
@@ -1344,11 +1380,28 @@ fn chroma_strong_decision_v(plane: &PicturePlane, cx: i32, cy: i32, beta: i32, t
     dpq < (beta >> 2) && edge < (beta >> 3) && centre < (5 * tc + 1) >> 1
 }
 
-/// §8.8.3.6.9 mirror for an EDGE_HOR edge.
-fn chroma_strong_decision_h(plane: &PicturePlane, cx: i32, cy: i32, beta: i32, tc: i32) -> bool {
-    let p3 = read_clamped(plane, cx, cy - 4);
-    let p2 = read_clamped(plane, cx, cy - 3);
+/// §8.8.3.6.9 mirror for an EDGE_HOR edge. With `short_p` (the r415
+/// maxFilterLengthP == 1 CTB-row case) §8.8.3.6.4 step 2 substitutes
+/// `p3 = p2 = p1` before the decision math.
+fn chroma_strong_decision_h(
+    plane: &PicturePlane,
+    cx: i32,
+    cy: i32,
+    beta: i32,
+    tc: i32,
+    short_p: bool,
+) -> bool {
     let p1 = read_clamped(plane, cx, cy - 2);
+    let p3 = if short_p {
+        p1
+    } else {
+        read_clamped(plane, cx, cy - 4)
+    };
+    let p2 = if short_p {
+        p1
+    } else {
+        read_clamped(plane, cx, cy - 3)
+    };
     let p0 = read_clamped(plane, cx, cy - 1);
     let q0 = read_clamped(plane, cx, cy);
     let q1 = read_clamped(plane, cx, cy + 1);
@@ -1387,16 +1440,36 @@ fn chroma_strong_apply_v(plane: &mut PicturePlane, cx: i32, cy: i32, tc: i32, bd
     write(plane, cx + 2, cy, q2n, bd);
 }
 
-/// Mirror of [`chroma_strong_apply_v`] for an EDGE_HOR edge.
-fn chroma_strong_apply_h(plane: &mut PicturePlane, cx: i32, cy: i32, tc: i32, bd: u32) {
-    let p3 = read_clamped(plane, cx, cy - 4);
-    let p2 = read_clamped(plane, cx, cy - 3);
+/// Mirror of [`chroma_strong_apply_v`] for an EDGE_HOR edge. With
+/// `short_p` the §8.8.3.6.10 asymmetric (P = 1, Q = 3) filter applies
+/// (eqs. 1417 - 1420): only p0 is modified on the P side.
+fn chroma_strong_apply_h(
+    plane: &mut PicturePlane,
+    cx: i32,
+    cy: i32,
+    tc: i32,
+    bd: u32,
+    short_p: bool,
+) {
     let p1 = read_clamped(plane, cx, cy - 2);
     let p0 = read_clamped(plane, cx, cy - 1);
     let q0 = read_clamped(plane, cx, cy);
     let q1 = read_clamped(plane, cx, cy + 1);
     let q2 = read_clamped(plane, cx, cy + 2);
     let q3 = read_clamped(plane, cx, cy + 3);
+    if short_p {
+        let p0n = ((3 * p1 + 2 * p0 + q0 + q1 + q2 + 4) >> 3).clamp(p0 - tc, p0 + tc);
+        let q0n = ((2 * p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) >> 3).clamp(q0 - tc, q0 + tc);
+        let q1n = ((p1 + p0 + q0 + 2 * q1 + q2 + 2 * q3 + 4) >> 3).clamp(q1 - tc, q1 + tc);
+        let q2n = ((p0 + q0 + q1 + 2 * q2 + 3 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
+        write(plane, cx, cy - 1, p0n, bd);
+        write(plane, cx, cy, q0n, bd);
+        write(plane, cx, cy + 1, q1n, bd);
+        write(plane, cx, cy + 2, q2n, bd);
+        return;
+    }
+    let p3 = read_clamped(plane, cx, cy - 4);
+    let p2 = read_clamped(plane, cx, cy - 3);
     let p0n = ((p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2 + 4) >> 3).clamp(p0 - tc, p0 + tc);
     let p1n = ((2 * p3 + p2 + 2 * p1 + p0 + q0 + q1 + 4) >> 3).clamp(p1 - tc, p1 + tc);
     let p2n = ((3 * p3 + 2 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc, p2 + tc);

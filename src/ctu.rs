@@ -239,6 +239,33 @@ pub(crate) fn chroma_qp_identity(qp_y: i32, qp_offset: i32) -> i32 {
     (qp_y + qp_offset).clamp(0, 63)
 }
 
+/// §8.7.1 chroma QP derivation through the SPS `ChromaQpTable`
+/// (§7.4.3.4): `qPChroma = Clip3(-QpBdOffset, 63, QpY)` is mapped
+/// through the derived table for the component (`table_idx` 0 = Cb,
+/// 1 = Cr, 2 = joint Cb-Cr; clamped to the tables actually present so
+/// `sps_same_qp_table_for_chroma_flag = 1` streams reuse table 0),
+/// then the additive PPS/SH/CU offsets apply. r415 — the pre-r415
+/// walker used [`chroma_qp_identity`] (QpC = QpY), which only matches
+/// a table that derives to the identity; the corpus SPS derived to
+/// `QpC = QpY - 1` above the table start, desyncing every chroma
+/// reconstruction at QP > 27 against conforming decoders.
+pub(crate) fn chroma_qp_mapped(
+    sps: &crate::sps::SeqParameterSet,
+    table_idx: usize,
+    qp_y: i32,
+    qp_offset: i32,
+) -> i32 {
+    let tables = &sps.tool_flags.chroma_qp_tables;
+    if tables.is_empty() {
+        return chroma_qp_identity(qp_y, qp_offset);
+    }
+    let qp_bd_offset = 6 * sps.sps_bitdepth_minus8 as i32;
+    let t = &tables[table_idx.min(tables.len() - 1)];
+    let built = t.build(qp_bd_offset);
+    let qp_c = crate::sps::ChromaQpTable::map_qp(&built, qp_y, qp_bd_offset);
+    (qp_c + qp_offset).clamp(-qp_bd_offset, 63)
+}
+
 /// §8.7.1 eqs. 1147 / 1148 additive chroma-QP offset term for a single
 /// component: `pps_c?_qp_offset + sh_c?_qp_offset + CuQpOffsetC?`.
 ///
@@ -7210,7 +7237,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.sh.sh_cr_qp_offset,
                 cu_chroma_qp_offset,
             );
-            chroma_qp_identity(qp_y, qp_offset)
+            chroma_qp_mapped(self.sps, c_idx as usize - 1, qp_y, qp_offset)
         };
         let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
@@ -7357,7 +7384,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
             + self.sh.sh_joint_cbcr_qp_offset
             + cu_qp_offset_cbcr;
-        let qp = chroma_qp_identity(qp_y, joint_offset);
+        let qp = chroma_qp_mapped(self.sps, 2, qp_y, joint_offset);
         let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
             bit_depth,
@@ -8167,7 +8194,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     self.sh.sh_cr_qp_offset,
                     cu_offset,
                 );
-                let qp = chroma_qp_identity(self.cabac.slice_qp_y.0, qp_offset);
+                let qp = chroma_qp_mapped(
+                    self.sps,
+                    c_idx as usize - 1,
+                    self.cabac.slice_qp_y.0,
+                    qp_offset,
+                );
                 // Per-plane transform-skip: BDPCM-chroma forces it on both
                 // planes; a plain transform_skip_flag is per-component.
                 let plane_ts = match c_idx {
@@ -8439,6 +8471,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             chroma_qp_offset_cb: self.pps.pps_cb_qp_offset,
             chroma_qp_offset_cr: self.pps.pps_cr_qp_offset,
             bit_depth,
+            ctb_log2_size_y: self.layout.ctb_log2_size_y,
         };
         apply_deblocking(
             out,

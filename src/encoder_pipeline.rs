@@ -2251,6 +2251,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     let dbp = DeblockParams {
         disabled: false,
         bit_depth: 8,
+        ctb_log2_size_y: 7, // encoder SPS: sps_log2_ctu_size_minus5 = 2
         ..Default::default()
     };
     // Round-384 — §8.8.1 step 1: with LMCS on, the coding-loop

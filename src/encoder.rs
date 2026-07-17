@@ -597,7 +597,14 @@ impl VvcEncoder {
         bw.write_se(0); // qp_table_start_minus26
         bw.write_ue(0); // num_points_minus1 = 0
         bw.write_ue(0); // delta_qp_in_val_minus1[0][0]
-        bw.write_ue(0); // delta_qp_diff_val[0][0]
+                        // r415 — delta_qp_diff_val = 1 makes the §7.4.3.4
+                        // derived table the IDENTITY (qpOut steps with qpIn
+                        // through the pivot, then +1 per step above it),
+                        // matching the pipeline's QpC = QpY dequant. The
+                        // pre-r415 all-zero point derived to QpC = QpY - 1
+                        // above the table start (26): every chroma recon at
+                        // QP > 27 desynced against conforming decoders.
+        bw.write_ue(1); // delta_qp_diff_val[0][0]
                         // Round-54 — `sps_sao_enabled_flag` is gated by the encoder
                         // config knob `enable_chroma_sao_merge`. Off → wire matches
                         // round-53 (SAO is internal-only on the encoder reconstruction).
@@ -765,8 +772,20 @@ impl VvcEncoder {
         }
         // ph_intra_slice_allowed_flag == 1 (inferred) arm:
         // `if( pps_cu_qp_delta_enabled_flag )` — the round-52 PPS sets
-        // it, and the pipeline runs with QG = CTB granularity.
-        bw.write_ue(0); // ph_cu_qp_delta_subdiv_intra_slice = 0
+        // it. r415: the pipeline arms `cu_qp_delta` once per CU (every
+        // leaf CU is the first CU of its own quantization group), so
+        // the wire must say so — §7.4.3.7 QGs are the tree nodes with
+        // `cbSubdiv <= ph_cu_qp_delta_subdiv_intra_slice`, and the
+        // pre-r415 subdiv = 0 declared ONE QG per CTU, making every
+        // second-and-later `cu_qp_delta_abs` bin inside a 128x128 CTU
+        // a spurious read for conforming decoders. Signal the §7.4.3.7
+        // maximum `2 * (CtbLog2SizeY - MinQtLog2SizeIntraY +
+        // ph_max_mtt_hierarchy_depth_intra_slice_luma)` (7 / 2 / the
+        // SPS MTT depth here) so per-CU arming is exact at any depth
+        // this encoder produces.
+        let mtt_on = self.config.enable_mtt_bt_picker || self.config.enable_mtt_tt_picker;
+        let max_subdiv = 2 * (7 - 2 + u32::from(mtt_on));
+        bw.write_ue(max_subdiv); // ph_cu_qp_delta_subdiv_intra_slice
     }
 
     /// Round-387 — emit the §7.3.7 IDR slice-header bits (through
