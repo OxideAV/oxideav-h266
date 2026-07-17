@@ -808,6 +808,35 @@ pub(crate) fn derive_luma_classification(
             };
             ac_arr[s_get(sx, sy)] = ac;
 
+            // r415 — §8.8.5.5 (vbOffset = 4) + §8.8.5.6: the gradient
+            // taps of sub-blocks adjacent to the ALF virtual boundary
+            // (yCtb + CtbSizeY − 4) are PADDED at that row, not read
+            // through it. §8.8.5.5 is purely geometric: a sub-block at
+            // y4 >= CtbSizeY − 4 clips upward reads to the boundary
+            // (eq. 1507); a sub-block with 0 < CtbSizeY − 4 − y4 < 5
+            // clips downward reads to one row above it (eq. 1508). The
+            // pre-r415 classifier read raw picture-clamped samples
+            // across the boundary, mis-classifying the two 4x4
+            // sub-block rows around it (external recon mismatch on the
+            // last 8 rows of every full-height CTB).
+            let vb = y_ctb + ctb - 4;
+            let clip_top = if y4 >= ctb - 4 { Some(vb) } else { None };
+            let clip_bottom = if ctb - 4 - y4 > 0 && ctb - 4 - y4 < 5 {
+                Some(vb)
+            } else {
+                None
+            };
+            let pad_y = |cy: i32| -> i32 {
+                let mut v = cy;
+                if let Some(t) = clip_top {
+                    v = v.max(t);
+                }
+                if let Some(b) = clip_bottom {
+                    v = v.min(b - 1);
+                }
+                v
+            };
+
             // Eqs. 1454 – 1457 + 1458 – 1462.
             let mut sh = 0i32;
             let mut sv = 0i32;
@@ -822,24 +851,26 @@ pub(crate) fn derive_luma_classification(
                         continue;
                     }
                     let cx = x_ctb + x4 + i;
-                    let cy = y_ctb + y4 + j;
+                    let cy = pad_y(y_ctb + y4 + j);
+                    let cy_up = pad_y(y_ctb + y4 + j - 1);
+                    let cy_dn = pad_y(y_ctb + y4 + j + 1);
                     let centre = sample(pre, stride, pw, ph, cx, cy) as i32;
                     let centre2 = centre << 1;
                     // filtH: horizontal Laplacian.
                     let l = sample(pre, stride, pw, ph, cx - 1, cy) as i32;
                     let r = sample(pre, stride, pw, ph, cx + 1, cy) as i32;
                     sh += (centre2 - l - r).abs();
-                    // filtV: vertical Laplacian.
-                    let u = sample(pre, stride, pw, ph, cx, cy - 1) as i32;
-                    let d = sample(pre, stride, pw, ph, cx, cy + 1) as i32;
+                    // filtV: vertical Laplacian (vb-padded rows).
+                    let u = sample(pre, stride, pw, ph, cx, cy_up) as i32;
+                    let d = sample(pre, stride, pw, ph, cx, cy_dn) as i32;
                     sv += (centre2 - u - d).abs();
                     // filtD0: 135°-diagonal Laplacian (top-left ↔ bottom-right).
-                    let ul = sample(pre, stride, pw, ph, cx - 1, cy - 1) as i32;
-                    let dr = sample(pre, stride, pw, ph, cx + 1, cy + 1) as i32;
+                    let ul = sample(pre, stride, pw, ph, cx - 1, cy_up) as i32;
+                    let dr = sample(pre, stride, pw, ph, cx + 1, cy_dn) as i32;
                     sd0 += (centre2 - ul - dr).abs();
                     // filtD1: 45°-diagonal Laplacian (top-right ↔ bottom-left).
-                    let ur = sample(pre, stride, pw, ph, cx + 1, cy - 1) as i32;
-                    let dl = sample(pre, stride, pw, ph, cx - 1, cy + 1) as i32;
+                    let ur = sample(pre, stride, pw, ph, cx + 1, cy_up) as i32;
+                    let dl = sample(pre, stride, pw, ph, cx - 1, cy_dn) as i32;
                     sd1 += (centre2 - ur - dl).abs();
                 }
             }
