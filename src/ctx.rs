@@ -667,8 +667,16 @@ pub fn ctx_inc_last_sig_coeff_prefix(bin_idx: u32, c_idx: u32, log2_tb_size: u32
         let shift = (log2_tb_size + 1) >> 2;
         (off, shift)
     } else {
-        // Chroma: ctxOffset = 20, ctxShift = Clip3(0, 2, 2 * log2TbSize >> 3).
-        let shift = ((2 * log2_tb_size) >> 3).min(2);
+        // Chroma: ctxOffset = 20, ctxShift = Clip3(0, 2, 2^log2TbSize >> 3)
+        // — the spec renders the 2 with log2TbSize as a SUPERSCRIPT
+        // exponent, i.e. `(1 << log2TbSize) >> 3`. r415: this was
+        // mis-transcribed as `2 * log2TbSize >> 3` (a flat-text reading
+        // of the formula), which under-computes ctxShift for every
+        // chroma TB with log2TbSize >= 3 and mis-buckets prefix bins
+        // from binIdx 2 up — the root cause of the chroma-residual
+        // external-decoder desync (encoder and decoder shared the
+        // deviation, so internal round-trips stayed byte-exact).
+        let shift = ((1u32 << log2_tb_size) >> 3).min(2);
         (20, shift)
     };
     (bin_idx >> ctx_shift) + ctx_offset
@@ -1243,11 +1251,29 @@ mod tests {
         assert_eq!(ctx_inc_last_sig_coeff_prefix(4, 0, 5), 12);
     }
 
-    /// last_sig_coeff_prefix chroma: offset 20, shift = Clip3(0, 2, 2 * log2 >> 3).
-    /// At log2 = 4 → shift = 8 >> 3 = 1. binIdx=3 → (3>>1)+20 = 21.
+    /// last_sig_coeff_prefix chroma: offset 20, shift =
+    /// Clip3(0, 2, 2^log2TbSize >> 3) — the spec's 2-with-exponent
+    /// (r415 fix; the pre-r415 reading `2 * log2 >> 3` mis-bucketed
+    /// chroma prefix bins on TBs of log2 >= 3).
+    /// At log2 = 4 → shift = 16 >> 3 = 2. binIdx=3 → (3>>2)+20 = 20.
     #[test]
     fn last_sig_coeff_prefix_chroma_16_bin_3() {
-        assert_eq!(ctx_inc_last_sig_coeff_prefix(3, 1, 4), 21);
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(3, 1, 4), 20);
+    }
+
+    /// Chroma shift sweep of the r415 corrected formula:
+    /// log2 2 → 4>>3 = 0; log2 3 → 8>>3 = 1; log2 5 → 32>>3 clips to 2.
+    #[test]
+    fn last_sig_coeff_prefix_chroma_shift_sweep() {
+        // log2 = 2, shift 0: every bin advances the bucket.
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(2, 1, 2), 22);
+        // log2 = 3, shift 1.
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(2, 1, 3), 21);
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(1, 1, 3), 20);
+        // log2 = 5, shift clipped to 2: binIdx 2..3 stay in bucket 20.
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(2, 1, 5), 20);
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(4, 1, 5), 21);
+        assert_eq!(ctx_inc_last_sig_coeff_prefix(8, 1, 5), 22);
     }
 
     /// csbfCtx regular form: counts right/below coded flags.
