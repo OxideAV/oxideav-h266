@@ -1,75 +1,85 @@
-# r412 whole-stream decode conformance corpus
+# Whole-stream decode conformance corpus (r412, externally validated r415)
 
 The corpus streams are generated deterministically by
 `tests/whole_stream_conformance.rs` — every test encodes with the
 crate's IDR pipeline and asserts the crate's own full receive path
 (NAL walk → parameter-set / PH / SH parsers → CABAC CTU walker with
-in-stream SAO + ALF prefixes → §8.8 in-loop filters) reproduces the
-encoder reconstruction **byte-exactly**. All 11 axes hold.
+in-stream SAO + ALF prefixes → §8.7 dequant + inverse transforms →
+§8.8 in-loop filters) reproduces the encoder reconstruction
+**byte-exactly**. All 11 axes hold.
+
+`tests/external_probe_corpus.rs` extends the corpus with ~60
+single-feature probe streams (TB-size sweep 8..64, single luma/chroma
+coefficients by frequency position, amplitude sweeps, chroma-only
+planes, gradient / stripe / checker content, QP sweep, 128x128
+full-CTB four-CU walk) for black-box bisection against an external
+reference decoder.
 
 ## Generation
 
 ```
 H266_CORPUS_DIR=<dir> cargo test --test whole_stream_conformance
+H266_CORPUS_DIR=<dir> cargo test --test external_probe_corpus
 ```
 
 writes `<name>.266` (Annex-B) and `<name>.yuv` (decoded planar 4:2:0,
 Y then Cb then Cr) per axis. Content is fully deterministic; the
-SHA-256 prefixes below were recorded on 2026-07-12 (they change
+SHA-256 prefixes below were recorded on 2026-07-17 (they change
 whenever the encoder's wire evolves — regenerate rather than diff).
 
-## Black-box reference-decoder validation (ffmpeg 8.x `vvc` decoder)
+## Black-box reference-decoder validation (ffmpeg 8.1 `vvc` decoder)
 
 ```
 ffmpeg -i <name>.266 -f rawvideo -pix_fmt yuv420p <name>.ffmpeg.yuv
 cmp <name>.yuv <name>.ffmpeg.yuv
 ```
 
-Status per axis (stream-sha256[0..16] / plane-sha256[0..16]):
+r415 status: **11 of 11 corpus axes decode byte-exactly** through the
+external reference decoder at qp ≤ 34, and **101 of 104** streams
+(corpus + probe extension) overall. The r412 "sparse residual"
+divergence and the dual-tree/bin-interleave characterization resolved
+into five distinct root-cause families, all fixed in r415:
+
+1. residual ctx-init table transcription drift (Tables 120 – 125:
+   dropped/duplicated `initValue`/`shiftIdx` entries, ~615 wrong cells);
+2. `alf_use_aps_flag` read/written without the
+   `sh_num_alf_aps_ids_luma > 0` presence condition (§7.3.11.2);
+3. chroma `last_sig_coeff_*_prefix` ctxShift mis-transcribed as
+   `2 * log2TbSize >> 3` — the spec's `2` carries the exponent:
+   `(1 << log2TbSize) >> 3` (§9.3.4.2.4);
+4. `ph_cu_qp_delta_subdiv_intra_slice = 0` on the wire while the
+   pipeline arms `cu_qp_delta` per CU (§7.4.3.7 QG mismatch);
+5. reconstruction-stage deviations: ALF classification missing the
+   §8.8.5.5/§8.8.5.6 virtual-boundary padding, the emitted chroma QP
+   table deriving to `QpC = QpY − 1` above its start (§7.4.3.4) while
+   dequant assumed identity, and chroma deblocking missing the
+   §8.8.3.3 CTB-row `maxFilterLengthP = 1` cap + §8.8.3.6.10
+   asymmetric (1,3) filter.
 
 | axis | vs own decoder | vs ffmpeg vvc | stream sha | plane sha |
 |------|----------------|---------------|------------|-----------|
-| flat_qp26 | byte-exact | **byte-exact** | 8a5e0075be2d168b | 8c8362c09e7c37cf |
-| default_qp26 | byte-exact | desync (residual corner, below) | 4835a30e54ed8da6 | 536168d3aec5648a |
-| qp10 / qp17 / qp34 / qp45 | byte-exact | desync (same corner) | c3c47b22b34f4668 / b431df682dacc863 / 1670ad7606b820e8 / ec65921bbf4d755d | 9c106bc5181373b4 / 0ef00ae7aaa79f77 / 17d1b6d4b7bd5ab2 / c15b11385a1c3bef |
-| multi_ctu_256x256 | byte-exact | desync (same corner) | a62bd6f13c8cdd53 | d502282605e2c649 |
-| chroma_sao_merge | byte-exact | desync (same corner) | 388b9b82d724de7d | 4ca03151b67c8344 |
-| mtt_bt / mtt_bt_tt | byte-exact | desync (same corner) | 1badd2ec6b7dfb60 / 05c3984b19b0bcf7 | 546df2f9c5afa1ca / bf1e7f8598d1a951 |
-| lmcs / lmcs_chroma_scaling | byte-exact | desync (same corner) | bee519c254caa93f / 3f1b23fae6f24cbd | 0e4c888754730831 |
-| dep_quant / sign_data_hiding | byte-exact | desync (same corner) | f494761acdc14cb5 / 85c76f91f54f707e | 0c4184a351f6acce / f8fb849444825423 |
+| flat_qp26 | byte-exact | byte-exact | 6debac3fbc151682 | 8c8362c09e7c37cf |
+| default_qp26 | byte-exact | byte-exact | 6fc38b8dde443083 | e53959ce6e82c01d |
+| qp10 / qp17 / qp34 | byte-exact | byte-exact | 62e1216c5c104422 / c5b2cbac3acdb99b / 4c4664e65bcf4681 | 6d656ef15dbc4e1c / c5b026b42c70da6f / e2ace0006bd6586e |
+| qp45 | byte-exact | 49 luma px diff (luma long-filter corner, below) | 502c2535626f2536 | 2153f6bddd48efd0 |
+| multi_ctu_256x256 | byte-exact | byte-exact | 11f98182f582f91e | 93d9ef34ff36b5d9 |
+| chroma_sao_merge | byte-exact | byte-exact | 6442a2d1fe64f0e8 | b58a0daff3741f39 |
+| mtt_bt / mtt_bt_tt | byte-exact | 14 / 23 luma px diff (same corner) | b9a10b06a87d1122 / 598e470f2d04655c | af30aaa10f5d2e10 / e892e89ed832e222 |
+| lmcs / lmcs_chroma_scaling | byte-exact | byte-exact | 81af59718db2c07b / 8a91b058f84df4d3 | 1e164146428d7493 |
+| dep_quant / sign_data_hiding | byte-exact | byte-exact | bfc3898b6c9d140b / 0c841ad45810c9a8 | ff8e5a3a0c924e49 / d27ad4ff087635a6 |
 
-Additional ffmpeg-validated **byte-exact** probes (r412, same
-pipeline, minimal contents):
-
-* 64x64 flat (all planes), any QP;
-* single DC coefficient (luma or chroma bump);
-* single non-DC coefficient with small remainder (levels ≤ ~41 at the
-  probed positions — e.g. (1,0) level 14 / 27 / 32 / 36 / 41);
-* alternating-stripe content (coefficients across a full sub-block
-  row, large levels, gt1/par/gt3 + escape-EGk remainders);
-* dense diagonal-gradient content (`ladbig`, the corpus pattern at 4×
-  amplitude).
+Probe extension (`external_probe_corpus.rs`): all ~60 probe streams
+byte-exact through the reference decoder, including every sparse
+single-coefficient case the r412 characterization flagged, all chroma
+probes, and the 128x128 four-CU walk.
 
 ## Known remaining external divergence (followup)
 
-Sparse-residual 64x64 luma TBs — including every corpus axis whose
-content produces them — decode byte-exactly on the crate's own
-receive path but desync ffmpeg's `vvc` decoder at (or attributed to)
-the last CTU. The boundary is NOT monotone in coefficient level
-(single coefficient at (1,0): levels 32/36/41/54/63/72 pass, 45/50/64/91
-fail), the bin STRUCTURE of passing and failing cases is identical
-(same pass-1 flags, same escape-EGk shape, equal bin counts), and the
-crate's own decoder verifies `end_of_slice_one_bit == 1` with the
-spec-required "last bit inserted is 1" property on both sets. Repro:
-
-```
-# passes                          # fails
-basis (1,0) amp 12..18            basis (1,0) amp 20/22, 40
-bump / bump_hf / ladbig           lad1 (corpus gradient, amp 2)
-```
-
-Everything above the residual layer is externally validated: NAL /
-parameter sets / PH / SH (ffmpeg `trace_headers` field-for-field),
-ALF CTU prefix, §7.3.11.4 split presence + ctxIncs, intra-mode
-cascade, CBFs, cu_qp_delta, §7.3.11.11 zero-out geometry, terminate +
-§9.3.4.3.5 flush.
+Luma deblocking long-filter corner: three streams (`qp45`, `mtt_bt`,
+`mtt_bt_tt`) differ from the reference decode in 14 – 49 luma samples
+clustered within 7 rows/columns of 32/64-aligned CU edges — the §8.8.3
+luma long-filter (maxFilterLength > 3) decision or filtering deviates
+in some high-QP / asymmetric-block-size combination. Bitstreams parse
+byte-exactly (the divergence is reconstruction-only). Everything else
+— headers, CABAC layer, residual syntax, intra prediction, ALF, SAO,
+chroma deblocking — is externally validated.

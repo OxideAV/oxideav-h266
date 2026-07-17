@@ -470,9 +470,22 @@ all split bins follow the §6.4.1 – §6.4.3 presence/ctxInc rules.
 `tests/whole_stream_conformance.rs` pins 11 tool axes (QP sweep,
 multi-CTU, chroma SAO merge, MTT BT/TT, LMCS ± chroma scaling,
 dep-quant, SDH) decoding BYTE-EXACTLY through this crate's own full
-receive path; the flat axis plus a battery of residual probes decode
-byte-exactly through the external decoder too, with one remaining
-sparse-residual 64x64-TB divergence documented in
+receive path.
+
+r415 closed the external-decode gap: 101 of 104 corpus + probe
+streams (the 11 axes plus the ~60 single-feature probes of
+`tests/external_probe_corpus.rs`) decode byte-exactly through a
+conforming external decoder invoked black-box. The r412
+sparse-residual divergence resolved into five fixed root causes:
+residual ctx-init table transcription drift (Tables 120 – 125), the
+§7.3.11.2 `alf_use_aps_flag` presence condition, the §9.3.4.2.4
+chroma last-prefix ctxShift exponent, the §7.4.3.7 per-CU QG wire
+declaration, and reconstruction-stage conformance (ALF
+virtual-boundary classification padding, §7.4.3.4 chroma QP table
+identity + §8.7.1 table-mapped chroma QP, §8.8.3.3/§8.8.3.6.10
+chroma CTB-row asymmetric deblocking). The one remaining divergence
+(3 streams, 14 – 49 luma samples, reconstruction-only) is a §8.8.3
+luma long-filter corner at high QP / MTT block sizes — documented in
 `tests/WHOLE_STREAM_CORPUS.md`.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
