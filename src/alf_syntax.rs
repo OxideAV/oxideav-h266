@@ -190,9 +190,20 @@ pub fn decode_alf_ctu(
     ctb.luma_on = luma_on;
 
     if luma_on {
-        // alf_use_aps_flag — single ctx-coded bin per Table 132.
-        let use_aps_idx = init_type.min(ctxs.use_aps_flag.len() - 1);
-        let use_aps = dec.decode_decision(&mut ctxs.use_aps_flag[use_aps_idx])? == 1;
+        // alf_use_aps_flag — single ctx-coded bin per Table 132, but
+        // only PRESENT when `sh_num_alf_aps_ids_luma > 0` (§7.3.11.2).
+        // With zero luma APS ids the flag is inferred 0 and the
+        // fixed-filter branch is taken directly. r415: the
+        // unconditional read here was a matched encoder/decoder
+        // deviation — every stream whose ALF RDO turned `alf_ctb_flag`
+        // on carried a spurious bin that desynced conforming external
+        // decoders (the r412 "sparse residual" corner).
+        let use_aps = if cfg.sh_num_alf_aps_ids_luma > 0 {
+            let use_aps_idx = init_type.min(ctxs.use_aps_flag.len() - 1);
+            dec.decode_decision(&mut ctxs.use_aps_flag[use_aps_idx])? == 1
+        } else {
+            false
+        };
 
         if use_aps {
             // alf_luma_prev_filter_idx — TB bypass, cMax =
@@ -301,9 +312,18 @@ pub fn encode_alf_ctu(
     enc.encode_decision(&mut ctxs.ctb_flag[idx_y], ctb.luma_on as u32)?;
 
     if ctb.luma_on {
-        let use_aps_idx = init_type.min(ctxs.use_aps_flag.len() - 1);
         let use_aps = ctb.luma_filt_set_idx >= 16;
-        enc.encode_decision(&mut ctxs.use_aps_flag[use_aps_idx], use_aps as u32)?;
+        // §7.3.11.2 — the alf_use_aps_flag bin exists only when
+        // `sh_num_alf_aps_ids_luma > 0`; with zero luma APS ids the
+        // decoder infers 0, so an APS-referencing CTB is unencodable.
+        if cfg.sh_num_alf_aps_ids_luma > 0 {
+            let use_aps_idx = init_type.min(ctxs.use_aps_flag.len() - 1);
+            enc.encode_decision(&mut ctxs.use_aps_flag[use_aps_idx], use_aps as u32)?;
+        } else if use_aps {
+            return Err(Error::invalid(
+                "alf_syntax: luma_filt_set_idx >= 16 (APS filter set) requires sh_num_alf_aps_ids_luma > 0 (§7.3.11.2)",
+            ));
+        }
         if use_aps {
             let c_max = cfg.sh_num_alf_aps_ids_luma.saturating_sub(1) as u32;
             let prev_idx = (ctb.luma_filt_set_idx as u32).saturating_sub(16);
