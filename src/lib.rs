@@ -117,7 +117,7 @@
 //!   regression of eqs. 386 – 389, the eqs. 390 – 403 `(a, b, k)`
 //!   derivation including the `divSigTable[]` of eq. 400, and the
 //!   eq. 404 `Clip1` predictor. Wired into
-//!   [`ctu::CtuWalker::reconstruct_chroma_plane`] so chroma TBs
+//!   `ctu::CtuWalker::reconstruct_chroma_plane` so chroma TBs
 //!   flagged with `IntraPredModeC ∈ {81, 82, 83}` reconstruct end to
 //!   end through `INTRA_LT_CCLM` / `INTRA_L_CCLM` / `INTRA_T_CCLM`
 //!   instead of being collapsed to PLANAR.
@@ -149,37 +149,85 @@
 #![allow(clippy::erasing_op)]
 #![allow(clippy::same_item_push)]
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod affine;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod affine_amvp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod affine_merge;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod affine_syntax_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod alf;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod alf_aps_design;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod alf_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod alf_fixed;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod alf_syntax;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod amvp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod amvr;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod amvr_enc;
 pub mod aps;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod aps_enc;
 pub mod aud;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bcw_idx_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bdof;
 pub mod bitreader;
 pub mod buffering_period;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cabac;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cabac_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cclm;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod coding_tree;
 pub mod constrained_rasl_encoding_indication;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ctu;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ctx;
 pub mod dci;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod deblock;
 pub mod decoder;
 pub mod decoding_unit_info;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dequant;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dmvr;
 pub mod encoder;
 pub mod encoder_inter;
@@ -187,22 +235,50 @@ pub mod encoder_pipeline;
 pub mod end_of_bitstream;
 pub mod end_of_seq;
 pub mod filler_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod gpm;
 pub mod hrd;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ibc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod inter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod intra;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod isp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod leaf_cu;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod lfnst;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod lfnst_matrices;
 pub mod lmcs;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mip;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mip_tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mvd_coding_enc;
 pub mod nal;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod non_merge_inter_pre_residual_dec;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod non_merge_inter_pre_residual_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod non_merge_mvp_syntax_enc;
 pub mod opi;
 pub mod picture_header;
@@ -212,13 +288,27 @@ pub mod ptl;
 pub mod rbsp_trailing;
 pub mod reconstruct;
 pub mod ref_pic_list;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod residual;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod residual_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sao;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sao_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sao_syntax;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbtmvp;
 pub mod scaling_list;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scan;
 pub mod sei_manifest;
 pub mod sei_message;
@@ -227,9 +317,17 @@ pub mod sei_rbsp;
 pub mod slice_header;
 pub mod sps;
 pub mod subpic_level_info;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod syntax_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod transform;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod transform_fwd;
 pub mod vps;
 
