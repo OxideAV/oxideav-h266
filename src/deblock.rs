@@ -1,36 +1,41 @@
 //! VVC in-loop deblocking filter (§8.8.3).
 //!
 //! Implements the §8.8.3 deblocking filter — vertical-then-horizontal
-//! edges per CTU on a CU basis. The full §8.8.3 path is large (long
-//! 5-/7-tap filters, sub-block boundaries, virtual boundaries, LADF QP
-//! offsets) so this round focuses on the **short-filter** subset that
-//! handles every TB the round-12 CTU walker actually emits:
+//! edges per CTU on a CU basis:
 //!
 //! * §8.8.3.2 — per-direction loop, gated by
 //!   `sh_deblocking_filter_disabled_flag`.
-//! * §8.8.3.3 — transform-block edge identification: the round-12
-//!   walker emits one TB per CU, so every CU rectangle's outer edges
-//!   are TB edges. Sub-block edges (§8.8.3.4) are skipped — there are
-//!   no SBT / affine sub-blocks in the intra-only path yet.
+//! * §8.8.3.3 — transform-block edge identification: the walker emits
+//!   one TB per CU, so every CU rectangle's outer edges are TB edges.
+//!   The luma `maxFilterLength{P,Q}` derivation (either side ≤ 4 →
+//!   both 1; per side ≥ 32 → 7; else 3) and the chroma derivation
+//!   (both ≥ 8 → 3, with the CTB-row P-cap) live here. Sub-block
+//!   edges (§8.8.3.4) are skipped — no SBT / affine sub-block edge
+//!   records yet.
 //! * §8.8.3.5 — boundary-strength derivation with
-//!   `intra ? 2 : (tu_coded ? 1 : 0)` collapsed to the round-12
-//!   intra-only case (`bS = 2` when neither side is BDPCM).
-//! * §8.8.3.6.2 — luma decision `dE`: short-filter / weak / off
-//!   selection driven by `β`, `tC`, and the dpq / sp / sq / spq
-//!   metrics on the `k = 0` and `k = 3` rows.
-//! * §8.8.3.6.3 — short luma filter dispatch.
-//! * §8.8.3.6.4 / §8.8.3.6.10 — chroma decision + weak/strong filter
-//!   for cIdx = 1 / 2.
+//!   `intra ? 2 : (tu_coded ? 1 : 0)`.
+//! * §8.8.3.6.2 — the full luma decision (steps 1 – 9): short-block
+//!   dE = 0/1/2 selection, the large-block dSam derivation with the
+//!   eqs. 1290 – 1309 metrics, and the step-6 luma CTB-row rule
+//!   (EDGE_HOR on `yEdge % CtbSizeY == 0` forces `sidePisLargeBlk = 0`
+//!   → eq. 1294 caps `maxFilterLengthP` at 3, turning the boundary
+//!   into an asymmetric long filter).
+//! * §8.8.3.6.3 — luma filter dispatch (short for dE = 1/2, long for
+//!   dE = 3).
+//! * §8.8.3.6.4 / §8.8.3.6.9 / §8.8.3.6.10 — chroma decision +
+//!   weak/strong filter for cIdx = 1 / 2, including the asymmetric
+//!   (1, 3) CTB-row variant.
+//! * §8.8.3.6.6 — the per-sample decision with both threshold sets
+//!   (eqs. 1369 – 1374).
 //! * §8.8.3.6.7 — short luma sample filter (`dE = 1` weak / `dE = 2`
 //!   strong + `dEp` / `dEq` for p1 / q1).
+//! * §8.8.3.6.8 — long luma sample filter: all refMiddle arms
+//!   (symmetric eqs. 1389/1390 **and** asymmetric eqs. 1391 – 1394)
+//!   with the 7-/5-/3-deep `fi`/`tCPDi` arrays (eqs. 1397 – 1408).
 //!
-//! Out of scope this round (each gated as a no-op so the deblock pass
-//! still runs on un-tested edges):
+//! Out of scope (each gated as a no-op so the deblock pass still runs
+//! on un-tested edges):
 //!
-//! * Long luma filters (§8.8.3.6.8) — only triggered when
-//!   `maxFilterLengthP/Q > 3`, which requires a CU side ≥ 32 samples
-//!   *and* the dE-strong condition. This scaffold caps both lengths at
-//!   3, so the long-tap branch is never taken.
 //! * Sub-block boundary derivation (§8.8.3.4) — affine / SBT only.
 //! * LADF QP offset (`sps_ladf_enabled_flag`) — falls back to 0.
 //! * Virtual / subpicture boundaries — single-slice fixture only.
@@ -394,10 +399,11 @@ fn deblock_cu_left_edge(
         // must skip BDPCM (handled inside derive_bs).
         if plane.c_idx == 0 {
             // Luma: dispatch §8.8.3.6.2 + §8.8.3.6.7 (short) or
-            // §8.8.3.6.6 + §8.8.3.6.8 (long).
+            // §8.8.3.6.6 + §8.8.3.6.8 (long). EDGE_VER never triggers
+            // the §8.8.3.6.2 step-6 CTB-row rule.
             let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s);
             let (mfl_p, mfl_q) = luma_max_filter_length_v(p_cu, q_cu);
-            run_luma_filter_v(plane.plane, cx, cy + k, beta, tc, mfl_p, mfl_q);
+            run_luma_filter(plane.plane, cx, cy + k, beta, tc, mfl_p, mfl_q, true, false);
             // Move down by 4 chroma rows = 4 luma rows.
             k += luma_segment / (plane.sub_h as i32).max(1);
         } else {
@@ -448,7 +454,21 @@ fn deblock_cu_top_edge(
         if plane.c_idx == 0 {
             let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s);
             let (mfl_p, mfl_q) = luma_max_filter_length_h(p_cu, q_cu);
-            run_luma_filter_h(plane.plane, cx + k, cy, beta, tc, mfl_p, mfl_q);
+            // §8.8.3.6.2 step 6 — an EDGE_HOR edge on a luma CTB row
+            // boundary suppresses sidePisLargeBlk (the P side would
+            // reach into the CTB line buffer above).
+            let ctb_row_edge = plane.ctb_size_y > 0 && (cy as u32) % plane.ctb_size_y == 0;
+            run_luma_filter(
+                plane.plane,
+                cx + k,
+                cy,
+                beta,
+                tc,
+                mfl_p,
+                mfl_q,
+                false,
+                ctb_row_edge,
+            );
             k += luma_segment / (plane.sub_w as i32).max(1);
         } else {
             let (_qp, beta, tc) = compute_thresholds_chroma(plane, p_cu, q_cu, b_s);
@@ -509,34 +529,25 @@ fn chroma_max_filter_length_h(
     }
 }
 
-/// §8.8.3.5.5 luma `maxFilterLength{P,Q}` derivation for an EDGE_VER
-/// luma edge.
+/// §8.8.3.3 luma `maxFilterLength{P,Q}` derivation for an EDGE_VER
+/// luma edge (`cIdx == 0`):
 ///
-/// Spec rule (`cIdx == 0`):
-/// * If either CU's width on the relevant side is ≤ 4 → that side's
-///   `maxFilterLength` is 1.
-/// * Else if the side's CU width is ≥ 32 → that side's
-///   `maxFilterLength` is 7.
-/// * Else → 3.
+/// * If **either** adjacent TB's width is ≤ 4 → **both**
+///   `maxFilterLengthQ` and `maxFilterLengthP` are 1 (the spec's Q and
+///   P rules each test both sides).
+/// * Otherwise each side derives independently: TB width ≥ 32 on that
+///   side → 7, else 3.
 ///
-/// The round-12 scaffold treats one CU = one TB, so the luma TB width
+/// The walker treats one CU = one TB (multi-TB tiling only occurs
+/// above 64 samples, where every tile is ≥ 32), so the luma TB width
 /// on the P side is `p_cu.w` and on the Q side is `q_cu.w`.
 #[inline]
 fn luma_max_filter_length_v(p_cu: &DeblockCu, q_cu: &DeblockCu) -> (u32, u32) {
-    let mfl_p = if p_cu.w <= 4 {
-        1
-    } else if p_cu.w >= 32 {
-        7
-    } else {
-        3
-    };
-    let mfl_q = if q_cu.w <= 4 {
-        1
-    } else if q_cu.w >= 32 {
-        7
-    } else {
-        3
-    };
+    if p_cu.w <= 4 || q_cu.w <= 4 {
+        return (1, 1);
+    }
+    let mfl_p = if p_cu.w >= 32 { 7 } else { 3 };
+    let mfl_q = if q_cu.w >= 32 { 7 } else { 3 };
     (mfl_p, mfl_q)
 }
 
@@ -544,20 +555,11 @@ fn luma_max_filter_length_v(p_cu: &DeblockCu, q_cu: &DeblockCu) -> (u32, u32) {
 /// uses CU heights instead of widths.
 #[inline]
 fn luma_max_filter_length_h(p_cu: &DeblockCu, q_cu: &DeblockCu) -> (u32, u32) {
-    let mfl_p = if p_cu.h <= 4 {
-        1
-    } else if p_cu.h >= 32 {
-        7
-    } else {
-        3
-    };
-    let mfl_q = if q_cu.h <= 4 {
-        1
-    } else if q_cu.h >= 32 {
-        7
-    } else {
-        3
-    };
+    if p_cu.h <= 4 || q_cu.h <= 4 {
+        return (1, 1);
+    }
+    let mfl_p = if p_cu.h >= 32 { 7 } else { 3 };
+    let mfl_q = if q_cu.h >= 32 { 7 } else { 3 };
     (mfl_p, mfl_q)
 }
 
@@ -654,145 +656,222 @@ fn write(plane: &mut PicturePlane, x: i32, y: i32, v: i32, bit_depth: u32) {
     plane.samples[y as usize * plane.stride + x as usize] = clipped;
 }
 
-/// Top-level §8.8.3.6 luma filter dispatch for an EDGE_VER edge.
-///
-/// Picks between the §8.8.3.6.7 short filter (always available; handles
-/// the `dE = 0/1/2` short-block branch) and the §8.8.3.6.8 long
-/// filters (5- or 7-tap symmetric / asymmetric kernels). The long path
-/// activates when both sides report `maxFilterLength{P,Q} > 3` and the
-/// §8.8.3.6.6 long-block decision passes; otherwise the short path
-/// runs unchanged.
-///
-/// The §8.8.3.6.6 large-block decision combines the short-block `dpq`
-/// metrics with the wider sample reads (`p4..p7`, `q4..q7`). For the
-/// round-14 scaffold we implement the symmetric (`mflP == mflQ`)
-/// branch — that subsumes the most common case (neighbouring 32-tall
-/// CUs at e.g. CTU-row boundaries). Asymmetric cases (e.g. one side
-/// 32, the other 8) still need the asymmetric coefficient picks of
-/// eqs. 1391 / 1393 / 1394; until those land they fall back to the
-/// short filter.
-#[allow(clippy::too_many_arguments)]
-fn run_luma_filter_v(
-    plane: &mut PicturePlane,
-    cx: i32,
-    cy: i32,
-    beta: i32,
-    tc: i32,
-    max_filter_length_p: u32,
-    max_filter_length_q: u32,
-) {
-    if tc == 0 {
-        return;
-    }
-    let symmetric_long = max_filter_length_p > 3
-        && max_filter_length_q > 3
-        && max_filter_length_p == max_filter_length_q;
-    if symmetric_long
-        && long_luma_decision_passes_v(
-            plane,
-            cx,
-            cy,
-            beta,
-            tc,
-            max_filter_length_p,
-            max_filter_length_q,
-        )
-    {
-        for k in 0..4i32 {
-            apply_long_luma_v(
-                plane,
-                cx,
-                cy + k,
-                tc,
-                max_filter_length_p,
-                max_filter_length_q,
-            );
-        }
-        return;
-    }
-    run_luma_short_filter_v(plane, cx, cy, beta, tc);
-}
-
-/// EDGE_HOR mirror of [`run_luma_filter_v`].
-#[allow(clippy::too_many_arguments)]
-fn run_luma_filter_h(
-    plane: &mut PicturePlane,
-    cx: i32,
-    cy: i32,
-    beta: i32,
-    tc: i32,
-    max_filter_length_p: u32,
-    max_filter_length_q: u32,
-) {
-    if tc == 0 {
-        return;
-    }
-    let symmetric_long = max_filter_length_p > 3
-        && max_filter_length_q > 3
-        && max_filter_length_p == max_filter_length_q;
-    if symmetric_long
-        && long_luma_decision_passes_h(
-            plane,
-            cx,
-            cy,
-            beta,
-            tc,
-            max_filter_length_p,
-            max_filter_length_q,
-        )
-    {
-        for k in 0..4i32 {
-            apply_long_luma_h(
-                plane,
-                cx + k,
-                cy,
-                tc,
-                max_filter_length_p,
-                max_filter_length_q,
-            );
-        }
-        return;
-    }
-    run_luma_short_filter_h(plane, cx, cy, beta, tc);
-}
-
-/// §8.8.3.6.2 (long-block path) + §8.8.3.6.6 large-block decision for
-/// an EDGE_VER edge. Reads the `p2..p5` (or `p2..p7` for the 7-tap
-/// case) and `q2..q5` (`q2..q7`) sample columns on the k = 0 and k = 3
-/// rows, builds the dpq/sp/sq/spq metrics with the long-block
-/// adjustments (eqs 1290 / 1291 / 1295 / 1296 / 1299 / 1300 / 1303 /
-/// 1304), then runs the §8.8.3.6.6 thresholds. Returns true when both
-/// dSam0 and dSam3 are 1 — the spec's gate for invoking the long
-/// filter at all (otherwise the short filter applies).
-fn long_luma_decision_passes_v(
-    plane: &PicturePlane,
-    cx: i32,
-    cy: i32,
-    beta: i32,
-    tc: i32,
+/// The §8.8.3.6.2 outputs for one 4-sample luma edge segment: the
+/// filtering decision `dE` (0 = off, 1 = weak, 2 = strong-short,
+/// 3 = long), the `dEp` / `dEq` p1/q1-filtering decisions, and the
+/// (possibly modified) `maxFilterLength{P,Q}` the §8.8.3.6.3 filter
+/// dispatch consumes.
+struct LumaEdgeDecision {
+    d_e: u32,
+    d_ep: u32,
+    d_eq: u32,
     mfl_p: u32,
     mfl_q: u32,
-) -> bool {
-    long_luma_decision(plane, cx, cy, beta, tc, mfl_p, mfl_q, true)
 }
 
-fn long_luma_decision_passes_h(
+/// §8.8.3.6.2 decision process for one luma edge segment (steps 1–9),
+/// shared between EDGE_VER (`is_vertical`) and EDGE_HOR. `(cx, cy)`
+/// is the segment anchor: the edge runs between columns `cx-1 | cx`
+/// (vertical) or rows `cy-1 | cy` (horizontal). `ctb_row_edge` is the
+/// step-6 input — true iff the edge is EDGE_HOR and
+/// `(yCb + yBl) % CtbSizeY == 0` (the P side would reach into the CTB
+/// row above, i.e. the decoder's line buffer, so `sidePisLargeBlk` is
+/// forced to 0 and eq. 1294 caps `maxFilterLengthP` at 3).
+#[allow(clippy::too_many_arguments)]
+fn luma_edge_decision(
     plane: &PicturePlane,
     cx: i32,
     cy: i32,
     beta: i32,
     tc: i32,
-    mfl_p: u32,
-    mfl_q: u32,
-) -> bool {
-    long_luma_decision(plane, cx, cy, beta, tc, mfl_p, mfl_q, false)
+    mut mfl_p: u32,
+    mut mfl_q: u32,
+    is_vertical: bool,
+    ctb_row_edge: bool,
+) -> LumaEdgeDecision {
+    // Sample fetch: p_i,k / q_j,k per eqs. 1268–1271.
+    let read_p = |i: i32, k: i32| -> i32 {
+        if is_vertical {
+            read_clamped(plane, cx - i - 1, cy + k)
+        } else {
+            read_clamped(plane, cx + k, cy - i - 1)
+        }
+    };
+    let read_q = |j: i32, k: i32| -> i32 {
+        if is_vertical {
+            read_clamped(plane, cx + j, cy + k)
+        } else {
+            read_clamped(plane, cx + k, cy + j)
+        }
+    };
+
+    // Step 1 — eqs. 1280–1283.
+    let dp0 = (read_p(2, 0) - 2 * read_p(1, 0) + read_p(0, 0)).abs();
+    let dp3 = (read_p(2, 3) - 2 * read_p(1, 3) + read_p(0, 3)).abs();
+    let dq0 = (read_q(2, 0) - 2 * read_q(1, 0) + read_q(0, 0)).abs();
+    let dq3 = (read_q(2, 3) - 2 * read_q(1, 3) + read_q(0, 3)).abs();
+
+    // Step 2 — eqs. 1284–1289 (defined when both mfl >= 3; the values
+    // are only consumed on branches the spec gates accordingly).
+    let sp0 = (read_p(3, 0) - read_p(0, 0)).abs();
+    let sq0 = (read_q(0, 0) - read_q(3, 0)).abs();
+    let spq0 = (read_p(0, 0) - read_q(0, 0)).abs();
+    let sp3 = (read_p(3, 3) - read_p(0, 3)).abs();
+    let sq3 = (read_q(0, 3) - read_q(3, 3)).abs();
+    let spq3 = (read_p(0, 3) - read_q(0, 3)).abs();
+
+    // Steps 3–6 — side*isLargeBlk, including the EDGE_HOR CTB-row
+    // suppression (step 6).
+    let mut side_p_large = mfl_p > 3;
+    let side_q_large = mfl_q > 3;
+    if ctb_row_edge {
+        side_p_large = false;
+    }
+
+    // Steps 7–8 — the large-block decision (dSam0 / dSam3).
+    let mut d_sam0 = false;
+    let mut d_sam3 = false;
+    if side_p_large || side_q_large {
+        // 8.a — eqs. 1290–1294. When the P side is not large the spec
+        // caps maxFilterLengthP at 3 (eq. 1294) — this is what turns a
+        // 7-deep P side into the asymmetric (3, 7) long filter at a
+        // luma CTB row boundary.
+        let (dp0_l, dp3_l) = if side_p_large {
+            (
+                (dp0 + (read_p(5, 0) - 2 * read_p(4, 0) + read_p(3, 0)).abs() + 1) >> 1,
+                (dp3 + (read_p(5, 3) - 2 * read_p(4, 3) + read_p(3, 3)).abs() + 1) >> 1,
+            )
+        } else {
+            mfl_p = 3;
+            (dp0, dp3)
+        };
+        // 8.b — eqs. 1295–1298.
+        let (dq0_l, dq3_l) = if side_q_large {
+            (
+                (dq0 + (read_q(5, 0) - 2 * read_q(4, 0) + read_q(3, 0)).abs() + 1) >> 1,
+                (dq3 + (read_q(5, 3) - 2 * read_q(4, 3) + read_q(3, 3)).abs() + 1) >> 1,
+            )
+        } else {
+            (dq0, dq3)
+        };
+        // 8.c — eqs. 1299–1302 (uses the *modified* maxFilterLengthP).
+        let (sp0_l, sp3_l) = if mfl_p == 7 {
+            (
+                sp0 + (read_p(7, 0) - read_p(6, 0) - read_p(5, 0) + read_p(4, 0)).abs(),
+                sp3 + (read_p(7, 3) - read_p(6, 3) - read_p(5, 3) + read_p(4, 3)).abs(),
+            )
+        } else {
+            (sp0, sp3)
+        };
+        // 8.d — eqs. 1303–1306.
+        let (sq0_l, sq3_l) = if mfl_q == 7 {
+            (
+                sq0 + (read_q(4, 0) - read_q(5, 0) - read_q(6, 0) + read_q(7, 0)).abs(),
+                sq3 + (read_q(4, 3) - read_q(5, 3) - read_q(6, 3) + read_q(7, 3)).abs(),
+            )
+        } else {
+            (sq0, sq3)
+        };
+        // 8.e — eqs. 1307–1309.
+        let dl = (dp0_l + dq0_l) + (dp3_l + dq3_l);
+        // 8.f — per-row §8.8.3.6.6 invocations with the eqs. 1310–1317
+        // p0/p3/q0/q3 picks (0 on a non-large side).
+        if dl < beta {
+            let row_decision = |k: i32, dpq_l: i32, sp_l: i32, sq_l: i32, spq: i32| -> bool {
+                // §8.8.3.6.6 eqs. 1369/1370 — the sp/sq widening uses
+                // the picked p3 = p_3,k / p0 = p_mflP,k samples.
+                let sp_in = if side_p_large {
+                    (sp_l + (read_p(3, k) - read_p(mfl_p as i32, k)).abs() + 1) >> 1
+                } else {
+                    sp_l
+                };
+                let sq_in = if side_q_large {
+                    (sq_l + (read_q(3, k) - read_q(mfl_q as i32, k)).abs() + 1) >> 1
+                } else {
+                    sq_l
+                };
+                // eqs. 1371/1372 — large-block thresholds (at least one
+                // side is large on this branch).
+                let s_thr1 = (3 * beta) >> 5;
+                let s_thr2 = beta >> 4;
+                2 * dpq_l < s_thr2 && sp_in + sq_in < s_thr1 && spq < (5 * tc + 1) >> 1
+            };
+            d_sam0 = row_decision(0, dp0_l + dq0_l, sp0_l, sq0_l, spq0);
+            d_sam3 = row_decision(3, dp3_l + dq3_l, sp3_l, sq3_l, spq3);
+        }
+    }
+
+    // Step 9 — final dE / dEp / dEq.
+    if d_sam0 && d_sam3 {
+        return LumaEdgeDecision {
+            d_e: 3,
+            d_ep: 1,
+            d_eq: 1,
+            mfl_p,
+            mfl_q,
+        };
+    }
+    // 9.a — eqs. 1318–1322 (short-block metrics).
+    let dpq0 = dp0 + dq0;
+    let dpq3 = dp3 + dq3;
+    let dp = dp0 + dp3;
+    let dq = dq0 + dq3;
+    let d = dpq0 + dpq3;
+    // 9.b — reset.
+    let mut d_e = 0;
+    let mut d_ep = 0;
+    let mut d_eq = 0;
+    // 9.c — the strong-short decision runs only when d < β and both
+    // maxFilterLengths exceed 2 (§8.8.3.6.6 with all of p0/p3/q0/q3 =
+    // 0 and the small-block eqs. 1373/1374 thresholds).
+    let mut s_sam0 = false;
+    let mut s_sam3 = false;
+    if d < beta && mfl_p > 2 && mfl_q > 2 {
+        let s_thr1 = beta >> 3;
+        let s_thr2 = beta >> 2;
+        let short_row = |dpq: i32, sp: i32, sq: i32, spq: i32| -> bool {
+            2 * dpq < s_thr2 && sp + sq < s_thr1 && spq < (5 * tc + 1) >> 1
+        };
+        s_sam0 = short_row(dpq0, sp0, sq0, spq0);
+        s_sam3 = short_row(dpq3, sp3, sq3, spq3);
+    }
+    // 9.d — dE/dEp/dEq + the final maxFilterLength folds.
+    if d < beta {
+        d_e = 1;
+        if s_sam0 && s_sam3 {
+            d_e = 2;
+            mfl_p = 3;
+            mfl_q = 3;
+        }
+        if mfl_p > 1 && mfl_q > 1 {
+            if dp < (beta + (beta >> 1)) >> 3 {
+                d_ep = 1;
+            }
+            if dq < (beta + (beta >> 1)) >> 3 {
+                d_eq = 1;
+            }
+        }
+        if d_e == 1 {
+            mfl_p = 1 + d_ep;
+            mfl_q = 1 + d_eq;
+        }
+    }
+    LumaEdgeDecision {
+        d_e,
+        d_ep,
+        d_eq,
+        mfl_p,
+        mfl_q,
+    }
 }
 
-/// Shared body of [`long_luma_decision_passes_v`] / `_h`. `is_vertical`
-/// switches the sample-fetch axis; everything else is identical.
+/// §8.8.3.6.1 / §8.8.3.6.3 luma dispatch for one 4-sample edge segment:
+/// run the §8.8.3.6.2 decision, then apply the §8.8.3.6.7 short filter
+/// (dE = 1/2) or the §8.8.3.6.8 long filter (dE = 3) to each of the 4
+/// sample lines. `dE = 0` leaves the segment untouched.
 #[allow(clippy::too_many_arguments)]
-fn long_luma_decision(
-    plane: &PicturePlane,
+fn run_luma_filter(
+    plane: &mut PicturePlane,
     cx: i32,
     cy: i32,
     beta: i32,
@@ -800,113 +879,55 @@ fn long_luma_decision(
     mfl_p: u32,
     mfl_q: u32,
     is_vertical: bool,
-) -> bool {
-    // Read p[i] / q[i] at decision row k (k = 0 or 3).
-    let read_pq = |k: i32, i: i32| -> (i32, i32) {
-        if is_vertical {
-            // P side at column cx - i - 1; Q side at column cx + i.
-            let p = read_clamped(plane, cx - i - 1, cy + k);
-            let q = read_clamped(plane, cx + i, cy + k);
-            (p, q)
-        } else {
-            // P side at row cy - i - 1; Q side at row cy + i.
-            let p = read_clamped(plane, cx + k, cy - i - 1);
-            let q = read_clamped(plane, cx + k, cy + i);
-            (p, q)
-        }
-    };
-    let mut dec = [false; 2];
-    let rows = [0i32, 3];
-    for (slot, &row) in dec.iter_mut().zip(rows.iter()) {
-        let (p0, q0) = read_pq(row, 0);
-        let (p1, q1) = read_pq(row, 1);
-        let (p2, q2) = read_pq(row, 2);
-        let (p3, q3) = read_pq(row, 3);
-        // Short-block dp/dq (eqs 1280..1283).
-        let dp = (p2 - 2 * p1 + p0).abs();
-        let dq = (q2 - 2 * q1 + q0).abs();
-        // sp / sq / spq (eqs 1284..1289).
-        let sp = (p3 - p0).abs();
-        let sq = (q0 - q3).abs();
-        let spq = (p0 - q0).abs();
-        // Long-block dp / dq adjustments (eqs 1290 / 1291 / 1295 /
-        // 1296). For mflP > 3 we need p3,p4,p5; mflQ > 3 needs
-        // q3,q4,q5.
-        let (_, _) = (p3, q3);
-        let (_, _) = read_pq(row, 4);
-        let (p5, q5) = read_pq(row, 5);
-        let p4 = read_pq(row, 4).0;
-        let q4 = read_pq(row, 4).1;
-        let dp_l = if mfl_p > 3 {
-            (dp + (p5 - 2 * p4 + p3).abs() + 1) >> 1
-        } else {
-            dp
-        };
-        let dq_l = if mfl_q > 3 {
-            (dq + (q5 - 2 * q4 + q3).abs() + 1) >> 1
-        } else {
-            dq
-        };
-        // sp / sq long adjustments (eqs 1299 / 1300 / 1303 / 1304) —
-        // only when mflP / mflQ == 7.
-        let sp_l = if mfl_p == 7 {
-            let (p6, _) = read_pq(row, 6);
-            let (p7, _) = read_pq(row, 7);
-            sp + (p7 - p6 - p5 + p4).abs()
-        } else {
-            sp
-        };
-        let sq_l = if mfl_q == 7 {
-            let (_, q6) = read_pq(row, 6);
-            let (_, q7) = read_pq(row, 7);
-            sq + (q4 - q5 - q6 + q7).abs()
-        } else {
-            sq
-        };
-        // §8.8.3.6.6 — large-block thresholds (eqs 1369 / 1370 + 1371 /
-        // 1372 when at least one side is large).
-        let side_p_large = mfl_p > 3;
-        let side_q_large = mfl_q > 3;
-        let mut sp_adj = sp_l;
-        let mut sq_adj = sq_l;
-        if side_p_large {
-            // Re-pick p3 / p_mflP for the wider span (eqs 1310 / 1311):
-            // sp uses p_mflP - p3 (replacing p3 - p0 in the long path).
-            let (p_max, _) = read_pq(row, mfl_p as i32);
-            let (p3_new, _) = read_pq(row, 3);
-            sp_adj = (sp_l + (p3_new - p_max).abs() + 1) >> 1;
-        }
-        if side_q_large {
-            let (_, q_max) = read_pq(row, mfl_q as i32);
-            let (_, q3_new) = read_pq(row, 3);
-            sq_adj = (sq_l + (q3_new - q_max).abs() + 1) >> 1;
-        }
-        let dpq = 2 * (dp_l + dq_l);
-        let (s_thr1, s_thr2) = if side_p_large || side_q_large {
-            ((3 * beta) >> 5, beta >> 4)
-        } else {
-            (beta >> 3, beta >> 2)
-        };
-        *slot = dpq < s_thr2 && (sp_adj + sq_adj) < s_thr1 && spq < ((5 * tc + 1) >> 1);
+    ctb_row_edge: bool,
+) {
+    if tc == 0 {
+        // Every filter arm clips its update into [x − c·tC, x + c·tC];
+        // tC = 0 makes the whole segment a no-op.
+        return;
     }
-    dec[0] && dec[1]
+    let dec = luma_edge_decision(
+        plane,
+        cx,
+        cy,
+        beta,
+        tc,
+        mfl_p,
+        mfl_q,
+        is_vertical,
+        ctb_row_edge,
+    );
+    match dec.d_e {
+        0 => {}
+        3 => {
+            for k in 0..4i32 {
+                if is_vertical {
+                    long_luma_apply(plane, cx, cy + k, tc, dec.mfl_p, dec.mfl_q, true);
+                } else {
+                    long_luma_apply(plane, cx + k, cy, tc, dec.mfl_p, dec.mfl_q, false);
+                }
+            }
+        }
+        _ => {
+            for k in 0..4i32 {
+                if is_vertical {
+                    short_luma_apply(plane, cx, cy + k, tc, dec.d_e, dec.d_ep, dec.d_eq, true);
+                } else {
+                    short_luma_apply(plane, cx + k, cy, tc, dec.d_e, dec.d_ep, dec.d_eq, false);
+                }
+            }
+        }
+    }
 }
 
-/// §8.8.3.6.8 long luma filter (symmetric branch only) for one sample
-/// row of an EDGE_VER edge. Implements eqs 1389 (5-tap) / 1390 (7-tap)
-/// + the per-side `fi` / `gj` / `tCPDi` / `tCQDj` arrays + the eqs
-/// 1409 / 1410 update.
-fn apply_long_luma_v(plane: &mut PicturePlane, cx: i32, cy: i32, tc: i32, mfl_p: u32, mfl_q: u32) {
-    long_luma_apply(plane, cx, cy, tc, mfl_p, mfl_q, true);
-}
-
-/// EDGE_HOR mirror of [`apply_long_luma_v`].
-fn apply_long_luma_h(plane: &mut PicturePlane, cx: i32, cy: i32, tc: i32, mfl_p: u32, mfl_q: u32) {
-    long_luma_apply(plane, cx, cy, tc, mfl_p, mfl_q, false);
-}
-
-/// Shared body. Reads the full p / q arrays and writes the §8.8.3.6.8
-/// outputs.
+/// §8.8.3.6.8 long luma filter for one sample line. Implements the
+/// refMiddle derivation for every `maxFilterLength{P,Q}` combination —
+/// symmetric eqs. 1389 (5/5) and 1390 (7/7) plus the asymmetric
+/// eqs. 1391 (7/5, 5/7), 1392 (5/3, 3/5), 1393 (P=3, Q=7) and 1394
+/// (P=7, Q=3) — the eqs. 1395/1396 refP/refQ, the per-side
+/// `fi`/`gj`/`tCPDi`/`tCQDj` arrays (eqs. 1397–1408, including the
+/// 3-deep {53, 32, 11} / {6, 4, 2} pair), and the eqs. 1409/1410
+/// clipped updates.
 fn long_luma_apply(
     plane: &mut PicturePlane,
     cx: i32,
@@ -921,70 +942,120 @@ fn long_luma_apply(
     let mfl_q_u = mfl_q as usize;
 
     // Fetch p[0..=mfl_p] and q[0..=mfl_q].
-    let mut p_arr = [0i32; 8];
-    let mut q_arr = [0i32; 8];
-    for i in 0..=mfl_p_u {
-        p_arr[i] = if is_vertical {
+    let mut p = [0i32; 8];
+    let mut q = [0i32; 8];
+    for (i, slot) in p.iter_mut().enumerate().take(mfl_p_u + 1) {
+        *slot = if is_vertical {
             read_clamped(plane, cx - i as i32 - 1, cy)
         } else {
             read_clamped(plane, cx, cy - i as i32 - 1)
         };
     }
-    for j in 0..=mfl_q_u {
-        q_arr[j] = if is_vertical {
+    for (j, slot) in q.iter_mut().enumerate().take(mfl_q_u + 1) {
+        *slot = if is_vertical {
             read_clamped(plane, cx + j as i32, cy)
         } else {
             read_clamped(plane, cx, cy + j as i32)
         };
     }
 
-    // Eq. 1389 / 1390 — symmetric refMiddle.
-    let ref_middle = if mfl_p == 5 {
-        // 5/5 case (eq. 1389).
-        (p_arr[4]
-            + p_arr[3]
-            + 2 * (p_arr[2] + p_arr[1] + p_arr[0] + q_arr[0] + q_arr[1] + q_arr[2])
-            + q_arr[3]
-            + q_arr[4]
-            + 8)
-            >> 4
-    } else {
-        // 7/7 case (eq. 1390).
-        (p_arr[6]
-            + p_arr[5]
-            + p_arr[4]
-            + p_arr[3]
-            + p_arr[2]
-            + p_arr[1]
-            + 2 * (p_arr[0] + q_arr[0])
-            + q_arr[1]
-            + q_arr[2]
-            + q_arr[3]
-            + q_arr[4]
-            + q_arr[5]
-            + q_arr[6]
-            + 8)
-            >> 4
+    // refMiddle — eqs. 1389–1394 keyed on the (P, Q) length pair.
+    let ref_middle = match (mfl_p, mfl_q) {
+        // eq. 1389 — 5/5.
+        (5, 5) => {
+            (p[4] + p[3] + 2 * (p[2] + p[1] + p[0] + q[0] + q[1] + q[2]) + q[3] + q[4] + 8) >> 4
+        }
+        // eq. 1390 — equal lengths other than 5 (7/7 and 3/3).
+        (a, b) if a == b => {
+            (p[6]
+                + p[5]
+                + p[4]
+                + p[3]
+                + p[2]
+                + p[1]
+                + 2 * (p[0] + q[0])
+                + q[1]
+                + q[2]
+                + q[3]
+                + q[4]
+                + q[5]
+                + q[6]
+                + 8)
+                >> 4
+        }
+        // eq. 1391 — {7,5} / {5,7}.
+        (7, 5) | (5, 7) => {
+            (p[5]
+                + p[4]
+                + p[3]
+                + p[2]
+                + 2 * (p[1] + p[0] + q[0] + q[1])
+                + q[2]
+                + q[3]
+                + q[4]
+                + q[5]
+                + 8)
+                >> 4
+        }
+        // eq. 1392 — {5,3} / {3,5}.
+        (5, 3) | (3, 5) => (p[3] + p[2] + p[1] + p[0] + q[0] + q[1] + q[2] + q[3] + 4) >> 3,
+        // eq. 1393 — P = 3, Q = 7.
+        (3, 7) => {
+            (2 * (p[2] + p[1] + p[0] + q[0])
+                + p[0]
+                + p[1]
+                + q[1]
+                + q[2]
+                + q[3]
+                + q[4]
+                + q[5]
+                + q[6]
+                + 8)
+                >> 4
+        }
+        // eq. 1394 — P = 7, Q = 3 (the remaining arm).
+        _ => {
+            (p[6]
+                + p[5]
+                + p[4]
+                + p[3]
+                + p[2]
+                + p[1]
+                + 2 * (q[2] + q[1] + q[0] + p[0])
+                + q[0]
+                + q[1]
+                + 8)
+                >> 4
+        }
     };
 
-    // refP / refQ (eqs 1395 / 1396).
-    let ref_p = (p_arr[mfl_p_u] + p_arr[mfl_p_u - 1] + 1) >> 1;
-    let ref_q = (q_arr[mfl_q_u] + q_arr[mfl_q_u - 1] + 1) >> 1;
+    // refP / refQ (eqs. 1395 / 1396).
+    let ref_p = (p[mfl_p_u] + p[mfl_p_u - 1] + 1) >> 1;
+    let ref_q = (q[mfl_q_u] + q[mfl_q_u - 1] + 1) >> 1;
 
-    // fi / tCPDi (eqs 1397/1398 for 7-tap, 1399/1400 for 5-tap).
+    // fi / tCPDi and gj / tCQDj (eqs. 1397–1408).
     const F7: [i32; 7] = [59, 50, 41, 32, 23, 14, 5];
     const F5: [i32; 5] = [58, 45, 32, 19, 6];
+    const F3: [i32; 3] = [53, 32, 11];
     const T7: [i32; 7] = [6, 5, 4, 3, 2, 1, 1];
     const T5: [i32; 5] = [6, 5, 4, 3, 2];
-    let (fi, tcpdi): (&[i32], &[i32]) = if mfl_p == 7 { (&F7, &T7) } else { (&F5, &T5) };
-    let (gj, tcqdj): (&[i32], &[i32]) = if mfl_q == 7 { (&F7, &T7) } else { (&F5, &T5) };
+    const T3: [i32; 3] = [6, 4, 2];
+    let (fi, tcpdi): (&[i32], &[i32]) = match mfl_p {
+        7 => (&F7, &T7),
+        5 => (&F5, &T5),
+        _ => (&F3, &T3),
+    };
+    let (gj, tcqdj): (&[i32], &[i32]) = match mfl_q {
+        7 => (&F7, &T7),
+        5 => (&F5, &T5),
+        _ => (&F3, &T3),
+    };
 
-    // Eqs 1409 / 1410 — write filtered samples.
+    // Eqs. 1409 / 1410 — write filtered samples.
     for i in 0..mfl_p_u {
-        let lo = p_arr[i] - ((tc * tcpdi[i]) >> 1);
-        let hi = p_arr[i] + ((tc * tcpdi[i]) >> 1);
-        let raw = (ref_middle * fi[i] + ref_p * (64 - fi[i]) + 32) >> 6;
-        let v = raw.clamp(lo, hi);
+        let lo = p[i] - ((tc * tcpdi[i]) >> 1);
+        let hi = p[i] + ((tc * tcpdi[i]) >> 1);
+        let v = ((ref_middle * fi[i] + ref_p * (64 - fi[i]) + 32) >> 6).clamp(lo, hi);
         if is_vertical {
             write(plane, cx - i as i32 - 1, cy, v, bd);
         } else {
@@ -992,10 +1063,9 @@ fn long_luma_apply(
         }
     }
     for j in 0..mfl_q_u {
-        let lo = q_arr[j] - ((tc * tcqdj[j]) >> 1);
-        let hi = q_arr[j] + ((tc * tcqdj[j]) >> 1);
-        let raw = (ref_middle * gj[j] + ref_q * (64 - gj[j]) + 32) >> 6;
-        let v = raw.clamp(lo, hi);
+        let lo = q[j] - ((tc * tcqdj[j]) >> 1);
+        let hi = q[j] + ((tc * tcqdj[j]) >> 1);
+        let v = ((ref_middle * gj[j] + ref_q * (64 - gj[j]) + 32) >> 6).clamp(lo, hi);
         if is_vertical {
             write(plane, cx + j as i32, cy, v, bd);
         } else {
@@ -1004,229 +1074,96 @@ fn long_luma_apply(
     }
 }
 
-/// Run the §8.8.3.6.2 decision + §8.8.3.6.7 short luma filter on a
-/// single 4-sample vertical edge segment with anchor at chroma /
-/// component coordinate `(cx, cy)`. The edge sits between columns
-/// `cx-1` (P side) and `cx` (Q side).
-fn run_luma_short_filter_v(plane: &mut PicturePlane, cx: i32, cy: i32, beta: i32, tc: i32) {
-    if tc == 0 {
-        return;
-    }
-    let bd = 8u32; // luma is always 8-bit in this round (decoder emits 8-bit).
-
-    // Decision rows k ∈ {0, 3} (eq. 1280–1283).
-    let p2_0 = read_clamped(plane, cx - 3, cy);
-    let p1_0 = read_clamped(plane, cx - 2, cy);
-    let p0_0 = read_clamped(plane, cx - 1, cy);
-    let q0_0 = read_clamped(plane, cx, cy);
-    let q1_0 = read_clamped(plane, cx + 1, cy);
-    let q2_0 = read_clamped(plane, cx + 2, cy);
-    let p2_3 = read_clamped(plane, cx - 3, cy + 3);
-    let p1_3 = read_clamped(plane, cx - 2, cy + 3);
-    let p0_3 = read_clamped(plane, cx - 1, cy + 3);
-    let q0_3 = read_clamped(plane, cx, cy + 3);
-    let q1_3 = read_clamped(plane, cx + 1, cy + 3);
-    let q2_3 = read_clamped(plane, cx - 3 + 5, cy + 3); // q2 = cx+2 row 3
-
-    let dp0 = (p2_0 - 2 * p1_0 + p0_0).abs();
-    let dp3 = (p2_3 - 2 * p1_3 + p0_3).abs();
-    let dq0 = (q2_0 - 2 * q1_0 + q0_0).abs();
-    let dq3 = (q2_3 - 2 * q1_3 + q0_3).abs();
-    let d = dp0 + dp3 + dq0 + dq3;
-    if d >= beta {
-        // §8.8.3.6.2 — no filtering at all on this segment.
-        return;
-    }
-
-    // Strong / weak decision (§8.8.3.6.6 short-block branch).
-    let dpq0 = dp0 + dq0;
-    let dpq3 = dp3 + dq3;
-    let p3_0 = read_clamped(plane, cx - 4, cy);
-    let q3_0 = read_clamped(plane, cx + 3, cy);
-    let p3_3 = read_clamped(plane, cx - 4, cy + 3);
-    let q3_3 = read_clamped(plane, cx + 3, cy + 3);
-    let sp0 = (p3_0 - p0_0).abs();
-    let sq0 = (q0_0 - q3_0).abs();
-    let spq0 = (p0_0 - q0_0).abs();
-    let sp3 = (p3_3 - p0_3).abs();
-    let sq3 = (q0_3 - q3_3).abs();
-    let spq3 = (p0_3 - q0_3).abs();
-
-    let s_thr1 = beta >> 3;
-    let s_thr2 = beta >> 2;
-    let strong0 = (2 * dpq0) < s_thr2 && (sp0 + sq0) < s_thr1 && spq0 < (5 * tc + 1) >> 1;
-    let strong3 = (2 * dpq3) < s_thr2 && (sp3 + sq3) < s_thr1 && spq3 < (5 * tc + 1) >> 1;
-    let strong = strong0 && strong3;
-    let de = if strong { 2 } else { 1 };
-
-    // dEp / dEq (§8.8.3.6.2 short-block branch — eq. 1320 family).
-    // For the short-filter path: dEp = 1 iff dp0 + dp3 < (β + (β >> 1)) >> 3,
-    // similarly for dEq with dq.
-    let d_p = dp0 + dp3;
-    let d_q = dq0 + dq3;
-    let dep = if d_p < (beta + (beta >> 1)) >> 3 {
-        1
-    } else {
-        0
-    };
-    let deq = if d_q < (beta + (beta >> 1)) >> 3 {
-        1
-    } else {
-        0
-    };
-
-    // Apply the filter to each of the 4 sample rows.
-    for k in 0..4i32 {
-        let p3 = read_clamped(plane, cx - 4, cy + k);
-        let p2 = read_clamped(plane, cx - 3, cy + k);
-        let p1 = read_clamped(plane, cx - 2, cy + k);
-        let p0 = read_clamped(plane, cx - 1, cy + k);
-        let q0 = read_clamped(plane, cx, cy + k);
-        let q1 = read_clamped(plane, cx + 1, cy + k);
-        let q2 = read_clamped(plane, cx + 2, cy + k);
-        let q3 = read_clamped(plane, cx + 3, cy + k);
-        if de == 2 {
-            // Strong filter — eq. 1375–1380.
-            let p0n =
-                ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - 3 * tc, p0 + 3 * tc);
-            let p1n = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - 2 * tc, p1 + 2 * tc);
-            let p2n = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc, p2 + tc);
-            let q0n =
-                ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - 3 * tc, q0 + 3 * tc);
-            let q1n = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - 2 * tc, q1 + 2 * tc);
-            let q2n = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
-            write(plane, cx - 1, cy + k, p0n, bd);
-            write(plane, cx - 2, cy + k, p1n, bd);
-            write(plane, cx - 3, cy + k, p2n, bd);
-            write(plane, cx, cy + k, q0n, bd);
-            write(plane, cx + 1, cy + k, q1n, bd);
-            write(plane, cx + 2, cy + k, q2n, bd);
-        } else {
-            // Weak filter — eq. 1381–1388.
-            let delta_raw = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
-            if delta_raw.abs() < tc * 10 {
-                let delta = delta_raw.clamp(-tc, tc);
-                let p0n = p0 + delta;
-                let q0n = q0 - delta;
-                write(plane, cx - 1, cy + k, p0n, bd);
-                write(plane, cx, cy + k, q0n, bd);
-                if dep == 1 {
-                    let dp = (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1;
-                    let dp = dp.clamp(-tc >> 1, tc >> 1);
-                    write(plane, cx - 2, cy + k, p1 + dp, bd);
-                }
-                if deq == 1 {
-                    let dq = (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1;
-                    let dq = dq.clamp(-tc >> 1, tc >> 1);
-                    write(plane, cx + 1, cy + k, q1 + dq, bd);
-                }
-            }
-        }
-    }
-}
-
-/// Mirror of [`run_luma_short_filter_v`] for a horizontal edge between
-/// rows `cy-1` (P) and `cy` (Q), running across 4 columns starting at
-/// `cx`.
-fn run_luma_short_filter_h(plane: &mut PicturePlane, cx: i32, cy: i32, beta: i32, tc: i32) {
-    if tc == 0 {
-        return;
-    }
+/// §8.8.3.6.7 short luma filter for one sample line: strong filtering
+/// (eqs. 1375–1380) when `dE == 2`, weak filtering (eqs. 1381–1388,
+/// with the `|Δ| < tC·10` gate and the `dEp` / `dEq` p1/q1 arms)
+/// otherwise.
+#[allow(clippy::too_many_arguments)]
+fn short_luma_apply(
+    plane: &mut PicturePlane,
+    cx: i32,
+    cy: i32,
+    tc: i32,
+    d_e: u32,
+    d_ep: u32,
+    d_eq: u32,
+    is_vertical: bool,
+) {
     let bd = 8u32;
-
-    let p2_0 = read_clamped(plane, cx, cy - 3);
-    let p1_0 = read_clamped(plane, cx, cy - 2);
-    let p0_0 = read_clamped(plane, cx, cy - 1);
-    let q0_0 = read_clamped(plane, cx, cy);
-    let q1_0 = read_clamped(plane, cx, cy + 1);
-    let q2_0 = read_clamped(plane, cx, cy + 2);
-    let p2_3 = read_clamped(plane, cx + 3, cy - 3);
-    let p1_3 = read_clamped(plane, cx + 3, cy - 2);
-    let p0_3 = read_clamped(plane, cx + 3, cy - 1);
-    let q0_3 = read_clamped(plane, cx + 3, cy);
-    let q1_3 = read_clamped(plane, cx + 3, cy + 1);
-    let q2_3 = read_clamped(plane, cx + 3, cy + 2);
-
-    let dp0 = (p2_0 - 2 * p1_0 + p0_0).abs();
-    let dp3 = (p2_3 - 2 * p1_3 + p0_3).abs();
-    let dq0 = (q2_0 - 2 * q1_0 + q0_0).abs();
-    let dq3 = (q2_3 - 2 * q1_3 + q0_3).abs();
-    let d = dp0 + dp3 + dq0 + dq3;
-    if d >= beta {
-        return;
-    }
-    let dpq0 = dp0 + dq0;
-    let dpq3 = dp3 + dq3;
-    let p3_0 = read_clamped(plane, cx, cy - 4);
-    let q3_0 = read_clamped(plane, cx, cy + 3);
-    let p3_3 = read_clamped(plane, cx + 3, cy - 4);
-    let q3_3 = read_clamped(plane, cx + 3, cy + 3);
-    let sp0 = (p3_0 - p0_0).abs();
-    let sq0 = (q0_0 - q3_0).abs();
-    let spq0 = (p0_0 - q0_0).abs();
-    let sp3 = (p3_3 - p0_3).abs();
-    let sq3 = (q0_3 - q3_3).abs();
-    let spq3 = (p0_3 - q0_3).abs();
-    let s_thr1 = beta >> 3;
-    let s_thr2 = beta >> 2;
-    let strong0 = (2 * dpq0) < s_thr2 && (sp0 + sq0) < s_thr1 && spq0 < (5 * tc + 1) >> 1;
-    let strong3 = (2 * dpq3) < s_thr2 && (sp3 + sq3) < s_thr1 && spq3 < (5 * tc + 1) >> 1;
-    let de = if strong0 && strong3 { 2 } else { 1 };
-
-    let d_p = dp0 + dp3;
-    let d_q = dq0 + dq3;
-    let dep = if d_p < (beta + (beta >> 1)) >> 3 {
-        1
-    } else {
-        0
-    };
-    let deq = if d_q < (beta + (beta >> 1)) >> 3 {
-        1
-    } else {
-        0
-    };
-
-    for k in 0..4i32 {
-        let p3 = read_clamped(plane, cx + k, cy - 4);
-        let p2 = read_clamped(plane, cx + k, cy - 3);
-        let p1 = read_clamped(plane, cx + k, cy - 2);
-        let p0 = read_clamped(plane, cx + k, cy - 1);
-        let q0 = read_clamped(plane, cx + k, cy);
-        let q1 = read_clamped(plane, cx + k, cy + 1);
-        let q2 = read_clamped(plane, cx + k, cy + 2);
-        let q3 = read_clamped(plane, cx + k, cy + 3);
-        if de == 2 {
-            let p0n =
-                ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - 3 * tc, p0 + 3 * tc);
-            let p1n = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - 2 * tc, p1 + 2 * tc);
-            let p2n = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc, p2 + tc);
-            let q0n =
-                ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - 3 * tc, q0 + 3 * tc);
-            let q1n = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - 2 * tc, q1 + 2 * tc);
-            let q2n = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
-            write(plane, cx + k, cy - 1, p0n, bd);
-            write(plane, cx + k, cy - 2, p1n, bd);
-            write(plane, cx + k, cy - 3, p2n, bd);
-            write(plane, cx + k, cy, q0n, bd);
-            write(plane, cx + k, cy + 1, q1n, bd);
-            write(plane, cx + k, cy + 2, q2n, bd);
+    let read_p = |i: i32| -> i32 {
+        if is_vertical {
+            read_clamped(plane, cx - i - 1, cy)
         } else {
-            let delta_raw = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
-            if delta_raw.abs() < tc * 10 {
-                let delta = delta_raw.clamp(-tc, tc);
-                let p0n = p0 + delta;
-                let q0n = q0 - delta;
-                write(plane, cx + k, cy - 1, p0n, bd);
-                write(plane, cx + k, cy, q0n, bd);
-                if dep == 1 {
-                    let dp = (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1;
-                    let dp = dp.clamp(-tc >> 1, tc >> 1);
-                    write(plane, cx + k, cy - 2, p1 + dp, bd);
-                }
-                if deq == 1 {
-                    let dq = (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1;
-                    let dq = dq.clamp(-tc >> 1, tc >> 1);
-                    write(plane, cx + k, cy + 1, q1 + dq, bd);
+            read_clamped(plane, cx, cy - i - 1)
+        }
+    };
+    let read_q = |j: i32| -> i32 {
+        if is_vertical {
+            read_clamped(plane, cx + j, cy)
+        } else {
+            read_clamped(plane, cx, cy + j)
+        }
+    };
+    let p3 = read_p(3);
+    let p2 = read_p(2);
+    let p1 = read_p(1);
+    let p0 = read_p(0);
+    let q0 = read_q(0);
+    let q1 = read_q(1);
+    let q2 = read_q(2);
+    let q3 = read_q(3);
+    let write_p = |i: i32, v: i32, plane: &mut PicturePlane| {
+        if is_vertical {
+            write(plane, cx - i - 1, cy, v, bd);
+        } else {
+            write(plane, cx, cy - i - 1, v, bd);
+        }
+    };
+    if d_e == 2 {
+        // Strong filter — eqs. 1375–1380.
+        let p0n = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - 3 * tc, p0 + 3 * tc);
+        let p1n = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - 2 * tc, p1 + 2 * tc);
+        let p2n = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc, p2 + tc);
+        let q0n = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - 3 * tc, q0 + 3 * tc);
+        let q1n = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - 2 * tc, q1 + 2 * tc);
+        let q2n = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
+        write_p(0, p0n, plane);
+        write_p(1, p1n, plane);
+        write_p(2, p2n, plane);
+        if is_vertical {
+            write(plane, cx, cy, q0n, bd);
+            write(plane, cx + 1, cy, q1n, bd);
+            write(plane, cx + 2, cy, q2n, bd);
+        } else {
+            write(plane, cx, cy, q0n, bd);
+            write(plane, cx, cy + 1, q1n, bd);
+            write(plane, cx, cy + 2, q2n, bd);
+        }
+    } else {
+        // Weak filter — eqs. 1381–1388.
+        let delta_raw = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+        if delta_raw.abs() < tc * 10 {
+            let delta = delta_raw.clamp(-tc, tc);
+            write_p(0, p0 + delta, plane);
+            if is_vertical {
+                write(plane, cx, cy, q0 - delta, bd);
+            } else {
+                write(plane, cx, cy, q0 - delta, bd);
+            }
+            if d_ep == 1 {
+                // Eq. 1385 — the clip bound is −(tC >> 1), NOT
+                // (−tC) >> 1: the two differ by 1 for odd tC (the
+                // arithmetic right-shift rounds toward −∞).
+                let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
+                write_p(1, p1 + dp, plane);
+            }
+            if d_eq == 1 {
+                // Eq. 1387 — same −(tC >> 1) bound.
+                let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
+                if is_vertical {
+                    write(plane, cx + 1, cy, q1 + dq, bd);
+                } else {
+                    write(plane, cx, cy + 1, q1 + dq, bd);
                 }
             }
         }
@@ -1684,8 +1621,8 @@ mod tests {
         assert!(q0 < 110, "q0 row below edge should smooth, got {q0}");
     }
 
-    /// §8.8.3.5.5 luma maxFilterLength derivation: 4-tall CU forces
-    /// the 1-tap path, ≥32 → 7-tap, in-between → 3-tap.
+    /// §8.8.3.3 luma maxFilterLength derivation: **either** side ≤ 4
+    /// forces both to 1; ≥32 → 7 per side; in-between → 3.
     #[test]
     fn luma_max_filter_length_v_branches() {
         let cu_small = DeblockCu {
@@ -1703,8 +1640,12 @@ mod tests {
         };
         let cu_medium = DeblockCu { w: 16, ..cu_small };
         let cu_large = DeblockCu { w: 32, ..cu_small };
+        // A ≤4-wide TB on either side caps BOTH sides at 1 (the spec's
+        // Q and P rules each test both adjacent TB widths).
         let (mp, mq) = luma_max_filter_length_v(&cu_small, &cu_medium);
-        assert_eq!((mp, mq), (1, 3));
+        assert_eq!((mp, mq), (1, 1));
+        let (mp, mq) = luma_max_filter_length_v(&cu_large, &cu_small);
+        assert_eq!((mp, mq), (1, 1));
         let (mp, mq) = luma_max_filter_length_v(&cu_medium, &cu_large);
         assert_eq!((mp, mq), (3, 7));
         let (mp, mq) = luma_max_filter_length_v(&cu_large, &cu_large);
@@ -1798,6 +1739,148 @@ mod tests {
         // boundary samples at x = 0 and x = 63 stay clamped).
         assert_eq!(buf.luma.samples[8 * 64 + 0], 100);
         assert_eq!(buf.luma.samples[8 * 64 + 63], 110);
+    }
+
+    /// Convenience: an intra CU record with coded luma.
+    fn cu(x: u32, y: u32, w: u32, h: u32, qp_y: i32) -> DeblockCu {
+        DeblockCu {
+            x,
+            y,
+            w,
+            h,
+            qp_y,
+            intra: true,
+            tu_y_coded: true,
+            tu_cb_coded: false,
+            tu_cr_coded: false,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        }
+    }
+
+    /// Eqs. 1385 / 1387 — the weak-filter p1/q1 clip bound is
+    /// `−(tC >> 1)`, not `(−tC) >> 1`: for odd tC the arithmetic shift
+    /// rounds toward −∞ and over-widens the bound by 1 (the r418
+    /// qp45-corpus divergence root cause). QP 45 / bS 2 gives tC = 13;
+    /// a −140→100 step with flat sides drives dE = 1 with dEp = dEq =
+    /// 1 and a p1 delta that saturates the clip: p1′ must be
+    /// 140 − 6 = 134 (the buggy bound gave 133).
+    #[test]
+    fn weak_filter_p1_clip_bound_is_neg_of_half_tc() {
+        let mut buf = PictureBuffer::yuv420_filled(32, 8, 128);
+        for y in 0..8 {
+            for x in 0..16 {
+                buf.luma.samples[y * 32 + x] = 140;
+            }
+            for x in 16..32 {
+                buf.luma.samples[y * 32 + x] = 100;
+            }
+        }
+        let cus = vec![cu(0, 0, 16, 8, 45), cu(16, 0, 16, 8, 45)];
+        let params = DeblockParams {
+            disabled: false,
+            bit_depth: 8,
+            ctb_log2_size_y: 7,
+            ..Default::default()
+        };
+        apply_deblocking(&mut buf, &cus, &params, 1);
+        // Spec values (β = 52, tC = 13, Δ = −13): p0′ = 127, q0′ = 113,
+        // p1′ = 140 + Clip3(−6, 6, −7) = 134, q1′ = 106.
+        assert_eq!(buf.luma.samples[2 * 32 + 15], 127, "p0'");
+        assert_eq!(buf.luma.samples[2 * 32 + 16], 113, "q0'");
+        assert_eq!(buf.luma.samples[2 * 32 + 14], 134, "p1' (clip −(tC>>1))");
+        assert_eq!(buf.luma.samples[2 * 32 + 17], 106, "q1'");
+    }
+
+    /// §8.8.3.6.8 asymmetric long filter, maxFilterLengthP = 7 /
+    /// maxFilterLengthQ = 3 (eq. 1394): a 32-wide P CU against a
+    /// 16-wide Q CU on a vertical edge with a flat 100→104 step passes
+    /// the §8.8.3.6.6 large-block decision and must run the asymmetric
+    /// kernel — 7 filtered P columns, 3 filtered Q columns. The
+    /// pre-r418 fallback ran the short filter here.
+    #[test]
+    fn asymmetric_long_filter_7_3_vertical() {
+        let mut buf = PictureBuffer::yuv420_filled(48, 8, 128);
+        for y in 0..8 {
+            for x in 0..32 {
+                buf.luma.samples[y * 48 + x] = 100;
+            }
+            for x in 32..48 {
+                buf.luma.samples[y * 48 + x] = 104;
+            }
+        }
+        let cus = vec![cu(0, 0, 32, 8, 45), cu(32, 0, 16, 8, 45)];
+        let params = DeblockParams {
+            disabled: false,
+            bit_depth: 8,
+            ctb_log2_size_y: 7,
+            ..Default::default()
+        };
+        apply_deblocking(&mut buf, &cus, &params, 1);
+        // refMiddle (eq. 1394) = 102; p′ = [102,102,101,101,101,100,100]
+        // (i = 0..6 at columns 31..25), q′ = [102,103,104] (32..34).
+        let row = &buf.luma.samples[3 * 48..3 * 48 + 48];
+        assert_eq!(&row[25..32], &[100, 100, 101, 101, 101, 102, 102]);
+        assert_eq!(&row[32..36], &[102, 103, 104, 104]);
+        // p7 and beyond untouched.
+        assert_eq!(row[24], 100);
+    }
+
+    /// §8.8.3.6.2 step 6 — an EDGE_HOR edge on a luma CTB row boundary
+    /// forces `sidePisLargeBlk = 0`, so eq. 1294 caps
+    /// `maxFilterLengthP` at 3 and the long filter runs the asymmetric
+    /// (P = 3, Q = 7) kernel of eq. 1393: only 3 rows above the CTB
+    /// boundary are filtered (the line-buffer constraint), 7 below.
+    #[test]
+    fn ctb_row_boundary_caps_luma_p_side_at_3() {
+        // CTB size 64 (ctb_log2_size_y = 6): the 8x128 picture holds
+        // two stacked 8x64 CUs whose shared edge y = 64 IS a CTB row.
+        let mut buf = PictureBuffer::yuv420_filled(8, 128, 128);
+        for y in 0..64 {
+            for x in 0..8 {
+                buf.luma.samples[y * 8 + x] = 100;
+            }
+        }
+        for y in 64..128 {
+            for x in 0..8 {
+                buf.luma.samples[y * 8 + x] = 104;
+            }
+        }
+        let cus = vec![cu(0, 0, 8, 64, 45), cu(0, 64, 8, 64, 45)];
+        let params = DeblockParams {
+            disabled: false,
+            bit_depth: 8,
+            ctb_log2_size_y: 6,
+            ..Default::default()
+        };
+        apply_deblocking(&mut buf, &cus, &params, 1);
+        // refMiddle (eq. 1393) = 102; p′ = [102, 101, 100] on rows
+        // 63/62/61, q′ = [102,102,103,103,103,104,104] on rows 64..70.
+        let col = |y: usize| buf.luma.samples[y * 8 + 2];
+        assert_eq!(
+            [col(61), col(62), col(63)],
+            [100, 101, 102],
+            "3 filtered P rows"
+        );
+        assert_eq!(
+            [
+                col(64),
+                col(65),
+                col(66),
+                col(67),
+                col(68),
+                col(69),
+                col(70)
+            ],
+            [102, 102, 103, 103, 103, 104, 104],
+            "7 filtered Q rows"
+        );
+        // Step 6: rows 57..=60 (p3..p6 of a symmetric 7/7 filter) must
+        // stay untouched — the P side may not reach past 3 samples
+        // above a CTB row boundary.
+        for y in 57..=60 {
+            assert_eq!(col(y), 100, "row {y} above the CTB row must be untouched");
+        }
     }
 
     /// `bS = 0` (no neighbour) → no modification anywhere.

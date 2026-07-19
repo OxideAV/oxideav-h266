@@ -472,21 +472,24 @@ multi-CTU, chroma SAO merge, MTT BT/TT, LMCS ± chroma scaling,
 dep-quant, SDH) decoding BYTE-EXACTLY through this crate's own full
 receive path.
 
-r415 closed the external-decode gap: 101 of 104 corpus + probe
-streams (the 11 axes plus the ~60 single-feature probes of
-`tests/external_probe_corpus.rs`) decode byte-exactly through a
-conforming external decoder invoked black-box. The r412
-sparse-residual divergence resolved into five fixed root causes:
-residual ctx-init table transcription drift (Tables 120 – 125), the
-§7.3.11.2 `alf_use_aps_flag` presence condition, the §9.3.4.2.4
-chroma last-prefix ctxShift exponent, the §7.4.3.7 per-CU QG wire
-declaration, and reconstruction-stage conformance (ALF
+r415/r418 closed the external-decode gap completely: **104 of 104**
+corpus + probe streams (the 11 axes plus the ~60 single-feature
+probes of `tests/external_probe_corpus.rs`) decode byte-exactly
+through a conforming external decoder invoked black-box. The r412
+sparse-residual divergence resolved into five fixed root causes
+(r415): residual ctx-init table transcription drift (Tables
+120 – 125), the §7.3.11.2 `alf_use_aps_flag` presence condition, the
+§9.3.4.2.4 chroma last-prefix ctxShift exponent, the §7.4.3.7 per-CU
+QG wire declaration, and reconstruction-stage conformance (ALF
 virtual-boundary classification padding, §7.4.3.4 chroma QP table
 identity + §8.7.1 table-mapped chroma QP, §8.8.3.3/§8.8.3.6.10
-chroma CTB-row asymmetric deblocking). The one remaining divergence
-(3 streams, 14 – 49 luma samples, reconstruction-only) is a §8.8.3
-luma long-filter corner at high QP / MTT block sizes — documented in
-`tests/WHOLE_STREAM_CORPUS.md`.
+chroma CTB-row asymmetric deblocking). The r415 remainder (3
+streams, 14 – 49 luma samples) root-caused in r418 to the §8.8.3.6.7
+weak-filter p1/q1 clip bound (`−(tC >> 1)`, eqs. 1385/1387 — odd-tC
+corner); the same round landed the full §8.8.3.6.2 decision (step-6
+luma CTB-row rule, asymmetric §8.8.3.6.8 long filters eqs.
+1391 – 1394, the §8.8.3.3 either-side ≤ 4 rule, and the step-9
+gates). Validation matrix: `tests/WHOLE_STREAM_CORPUS.md`.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)

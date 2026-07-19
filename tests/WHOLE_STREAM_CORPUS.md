@@ -1,4 +1,4 @@
-# Whole-stream decode conformance corpus (r412, externally validated r415)
+# Whole-stream decode conformance corpus (r412, externally validated r415/r418)
 
 The corpus streams are generated deterministically by
 `tests/whole_stream_conformance.rs` — every test encodes with the
@@ -24,7 +24,7 @@ H266_CORPUS_DIR=<dir> cargo test --test external_probe_corpus
 
 writes `<name>.266` (Annex-B) and `<name>.yuv` (decoded planar 4:2:0,
 Y then Cb then Cr) per axis. Content is fully deterministic; the
-SHA-256 prefixes below were recorded on 2026-07-17 (they change
+SHA-256 prefixes below were recorded on 2026-07-20 (they change
 whenever the encoder's wire evolves — regenerate rather than diff).
 
 ## Black-box reference-decoder validation (ffmpeg 8.1 `vvc` decoder)
@@ -34,11 +34,27 @@ ffmpeg -i <name>.266 -f rawvideo -pix_fmt yuv420p <name>.ffmpeg.yuv
 cmp <name>.yuv <name>.ffmpeg.yuv
 ```
 
-r415 status: **11 of 11 corpus axes decode byte-exactly** through the
-external reference decoder at qp ≤ 34, and **101 of 104** streams
-(corpus + probe extension) overall. The r412 "sparse residual"
-divergence and the dual-tree/bin-interleave characterization resolved
-into five distinct root-cause families, all fixed in r415:
+r418 status: **104 of 104 streams byte-exact** (all 11 corpus axes +
+all ~60 probe streams). The r415 remainder — 3 streams (`qp45`,
+`mtt_bt`, `mtt_bt_tt`) with 14 – 49 luma-sample recon-only diffs near
+32/64-aligned CU edges — root-caused to the §8.8.3.6.7 weak-filter
+p1/q1 clip bound transcribed as `(−tC) >> 1` instead of the spec's
+`−(tC >> 1)` (eqs. 1385/1387): the arithmetic shift rounds toward −∞,
+over-widening the bound by 1 for odd tC (tC = 13 at QP 45 / bS 2 is
+the first corpus point with odd tC AND a binding clip). Root-caused
+by an independent §8.8.3.6.2/.6/.7/.8 transcription run sample-exact
+against the staged-stage dumps. The same r418 commit lands the rest
+of the §8.8.3.6.2 decision faithfully: the step-6 luma CTB-row rule
+(EDGE_HOR on a CTB row forces `sidePisLargeBlk = 0` → eq. 1294 caps
+`maxFilterLengthP` at 3), the asymmetric §8.8.3.6.8 long filters
+(eqs. 1391 – 1394 refMiddle arms + the 3-deep eq. 1401/1402
+`fi`/`tCPDi` arrays), the §8.8.3.3 either-side ≤ 4 → both-1 luma
+`maxFilterLength` rule, and the step-9 gates (strong-short only when
+both lengths > 2; `dEp`/`dEq` only when both > 1).
+
+r415 status was 101 of 104; the r412 "sparse residual" divergence and
+the dual-tree/bin-interleave characterization resolved into five
+distinct root-cause families, all fixed in r415:
 
 1. residual ctx-init table transcription drift (Tables 120 – 125:
    dropped/duplicated `initValue`/`shiftIdx` entries, ~615 wrong cells);
@@ -61,10 +77,10 @@ into five distinct root-cause families, all fixed in r415:
 | flat_qp26 | byte-exact | byte-exact | 6debac3fbc151682 | 8c8362c09e7c37cf |
 | default_qp26 | byte-exact | byte-exact | 6fc38b8dde443083 | e53959ce6e82c01d |
 | qp10 / qp17 / qp34 | byte-exact | byte-exact | 62e1216c5c104422 / c5b2cbac3acdb99b / 4c4664e65bcf4681 | 6d656ef15dbc4e1c / c5b026b42c70da6f / e2ace0006bd6586e |
-| qp45 | byte-exact | 49 luma px diff (luma long-filter corner, below) | 502c2535626f2536 | 2153f6bddd48efd0 |
+| qp45 | byte-exact | byte-exact (r418) | 502c2535626f2536 | 28e105132000b8ae |
 | multi_ctu_256x256 | byte-exact | byte-exact | 11f98182f582f91e | 93d9ef34ff36b5d9 |
 | chroma_sao_merge | byte-exact | byte-exact | 6442a2d1fe64f0e8 | b58a0daff3741f39 |
-| mtt_bt / mtt_bt_tt | byte-exact | 14 / 23 luma px diff (same corner) | b9a10b06a87d1122 / 598e470f2d04655c | af30aaa10f5d2e10 / e892e89ed832e222 |
+| mtt_bt / mtt_bt_tt | byte-exact | byte-exact (r418) | b9a10b06a87d1122 / 598e470f2d04655c | 13fe347be6c297ad / 9b7e0a8864d97aa5 |
 | lmcs / lmcs_chroma_scaling | byte-exact | byte-exact | 81af59718db2c07b / 8a91b058f84df4d3 | 1e164146428d7493 |
 | dep_quant / sign_data_hiding | byte-exact | byte-exact | bfc3898b6c9d140b / 0c841ad45810c9a8 | ff8e5a3a0c924e49 / d27ad4ff087635a6 |
 
@@ -73,13 +89,4 @@ byte-exact through the reference decoder, including every sparse
 single-coefficient case the r412 characterization flagged, all chroma
 probes, and the 128x128 four-CU walk.
 
-## Known remaining external divergence (followup)
-
-Luma deblocking long-filter corner: three streams (`qp45`, `mtt_bt`,
-`mtt_bt_tt`) differ from the reference decode in 14 – 49 luma samples
-clustered within 7 rows/columns of 32/64-aligned CU edges — the §8.8.3
-luma long-filter (maxFilterLength > 3) decision or filtering deviates
-in some high-QP / asymmetric-block-size combination. Bitstreams parse
-byte-exactly (the divergence is reconstruction-only). Everything else
-— headers, CABAC layer, residual syntax, intra prediction, ALF, SAO,
-chroma deblocking — is externally validated.
+No known external divergence remains in the corpus.
