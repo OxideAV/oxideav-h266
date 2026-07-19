@@ -425,6 +425,116 @@ mod tests {
         assert_eq!(scan.num_entry_points(&ctbs, true), 7);
     }
 
+    /// eq. 20 — single-slice-per-subpic with SPS subpicture info: two
+    /// side-by-side subpictures (5 + 3 CTB columns matching the tile
+    /// columns) each become one slice covering their tile column
+    /// (whole tiles, so the eq. 20 tiles-in-subpic loops run); a third
+    /// derivation with a subpicture shorter than its tile row takes
+    /// the `subpicHeightLessThanOneTileFlag` CTU-row arm.
+    #[test]
+    fn single_slice_per_subpic_arms() {
+        use crate::sps::{SubpicEntry, SubpicInfo};
+        let (mut sps, pps) = sps_pps_8x4_ctbs();
+        sps.sps_subpic_info_present_flag = true;
+        sps.subpic_info = Some(SubpicInfo {
+            num_subpics_minus1: 1,
+            subpics: vec![
+                SubpicEntry {
+                    ctu_top_left_x: 0,
+                    ctu_top_left_y: 0,
+                    width_minus1: 4,
+                    height_minus1: 3,
+                    ..Default::default()
+                },
+                SubpicEntry {
+                    ctu_top_left_x: 5,
+                    ctu_top_left_y: 0,
+                    width_minus1: 2,
+                    height_minus1: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let scan = TileScan::derive(&sps, &pps).unwrap();
+        assert_eq!(scan.ctb_addr_in_slice.len(), 2);
+        // Subpic 0: tile column 0 (5 wide), both tile rows = 20 CTBs,
+        // in tile order (tile (0,0) then tile (0,1)).
+        assert_eq!(scan.ctb_addr_in_slice[0].len(), 20);
+        assert_eq!(scan.ctb_addr_in_slice[0][0], 0);
+        // Subpic 1: tile column 1 (3 wide) = 12 CTBs starting at x=5.
+        assert_eq!(scan.ctb_addr_in_slice[1].len(), 12);
+        assert_eq!(scan.ctb_addr_in_slice[1][0], 5);
+        // Together they cover the picture exactly once.
+        let mut all: Vec<u32> = scan.ctb_addr_in_slice.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..32).collect::<Vec<u32>>());
+
+        // Sub-tile-height subpicture: 2 CTU rows of the 3-row top-left
+        // tile → the CTU-row arm (rows 0..2, columns 0..5).
+        let (mut sps2, pps2) = sps_pps_8x4_ctbs();
+        sps2.sps_subpic_info_present_flag = true;
+        sps2.subpic_info = Some(SubpicInfo {
+            num_subpics_minus1: 0,
+            subpics: vec![SubpicEntry {
+                ctu_top_left_x: 0,
+                ctu_top_left_y: 0,
+                width_minus1: 4,
+                height_minus1: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let scan2 = TileScan::derive(&sps2, &pps2).unwrap();
+        assert_eq!(scan2.ctb_addr_in_slice[0].len(), 10);
+        assert_eq!(&scan2.ctb_addr_in_slice[0][..5], &[0, 1, 2, 3, 4]);
+        assert_eq!(&scan2.ctb_addr_in_slice[0][5..], &[8, 9, 10, 11, 12]);
+    }
+
+    /// Explicit rectangular slices from PPS-derived geometry: a 2x2
+    /// tile grid split into a 2x1-tile top slice, one whole-tile
+    /// slice, and a bottom-right tile subdivided into two CTU-row
+    /// slices — CtbAddrInSlice must cover the picture once with the
+    /// eq. 21/22 rectangles.
+    #[test]
+    fn explicit_rect_slices_cover_picture() {
+        let (sps, mut pps) = sps_pps_8x4_ctbs();
+        pps.pps_single_slice_per_subpic_flag = false;
+        {
+            let p = pps.partition.as_mut().unwrap();
+            p.num_slices_in_pic = 4;
+            p.slice_top_left_tile_idx = vec![0, 2, 3, 3];
+            p.slice_width_in_tiles = vec![2, 1, 1, 1];
+            p.slice_height_in_tiles = vec![1, 1, 1, 1];
+            // Slice 0: both top tiles (3 CTU rows); slice 1: tile
+            // (0,1) whole (1 row); slices 2/3: tile (1,1)... its row
+            // is only 1 CTB tall, so use whole-tile heights instead:
+            // make slice 2 cover the whole tile and slice 3 empty is
+            // illegal — instead subdivide the TOP-RIGHT tile: swap
+            // layout: slice 1 = tile 1 (3 rows) split 1+2 handled as
+            // slices 1/2, slice 3 = bottom row (2 tiles wide).
+            p.slice_top_left_tile_idx = vec![0, 1, 1, 2];
+            p.slice_width_in_tiles = vec![1, 1, 1, 2];
+            p.slice_height_in_tiles = vec![1, 1, 1, 1];
+            p.slice_height_in_ctus = vec![3, 1, 2, 1];
+            p.slice_ctb_row_offset_in_tile = vec![0, 0, 1, 0];
+        }
+        let scan = TileScan::derive(&sps, &pps).unwrap();
+        assert_eq!(scan.ctb_addr_in_slice.len(), 4);
+        // Slice 0: whole tile (0,0) = 5x3 = 15 CTBs.
+        assert_eq!(scan.ctb_addr_in_slice[0].len(), 15);
+        // Slice 1: first CTU row of tile (1,0) = 3 CTBs at x 5..8.
+        assert_eq!(scan.ctb_addr_in_slice[1], vec![5, 6, 7]);
+        // Slice 2: remaining 2 CTU rows of tile (1,0).
+        assert_eq!(scan.ctb_addr_in_slice[2], vec![13, 14, 15, 21, 22, 23]);
+        // Slice 3: the bottom tile row across both tiles (tile order).
+        assert_eq!(scan.ctb_addr_in_slice[3].len(), 8);
+        assert_eq!(scan.ctb_addr_in_slice[3][0], 24);
+        let mut all: Vec<u32> = scan.ctb_addr_in_slice.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..32).collect::<Vec<u32>>());
+    }
+
     /// Raster-scan slice helper: two tiles starting at tile 1 cover
     /// tile (1,0) then tile (0,1) in tile-index order.
     #[test]
