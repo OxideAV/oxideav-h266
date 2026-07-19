@@ -325,6 +325,9 @@ pub mod syntax_enc;
 pub mod tables;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod tile_scan;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod transform;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

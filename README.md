@@ -45,6 +45,16 @@ oxideav-h266 = "0.0"
     / `map_qp`). The PPS retains the §7.4.10.6 `cu_chroma_qp_offset_list`
     triples; the §7.3.7 slice-header tail consumes the range-extension
     `sh_ts_residual_coding_rice_idx_minus1` / `sh_reverse_last_sig_coeff_flag`.
+  * **Tiles / slices layout** (r418) — the §6.5.1 tile-scan
+    derivations live in `tile_scan::TileScan`: tile boundary + CTB → 
+    tile maps (eqs. 16 – 19), `CtbAddrInSlice` for rectangular slice
+    layouts (eqs. 20 – 22, including subpicture-driven and
+    multi-slice-per-tile geometries — the PPS slice loop performs the
+    eq. 21 uniform replication and the `i += NumSlicesInTile − 1`
+    syntax advance), and the §7.4.8 eq. 141 `NumEntryPoints`
+    derivation; the slice header parses WPP / tile entry-point
+    offsets. (Slice-data walking stays single-tile — this is the
+    parse-side foundation.)
   * **APS** (§7.3.2.5) — ALF / LMCS / scaling-list type. The LMCS APS
     payload (§7.3.2.19) is decoded into a typed `lmcs::LmcsData`, with
     the BitDepth-dependent §7.4.3.19 derivations (`OrgCW`, `lmcsCW`,

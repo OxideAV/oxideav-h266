@@ -1451,6 +1451,55 @@ pub fn parse_ref_pic_list_struct(
     })
 }
 
+/// Test-only minimal SPS constructor shared by cross-module unit
+/// tests (tile scan, slice header): 4:2:0, 8-bit, permissive
+/// partition constraints, no optional blocks.
+#[cfg(test)]
+pub(crate) fn test_minimal_sps(ctb_log2_minus5: u8, pic_w: u32, pic_h: u32) -> SeqParameterSet {
+    SeqParameterSet {
+        sps_seq_parameter_set_id: 0,
+        sps_video_parameter_set_id: 0,
+        sps_max_sublayers_minus1: 0,
+        sps_chroma_format_idc: 1,
+        sps_log2_ctu_size_minus5: ctb_log2_minus5,
+        sps_ptl_dpb_hrd_params_present_flag: false,
+        profile_tier_level: None,
+        sps_gdr_enabled_flag: false,
+        sps_ref_pic_resampling_enabled_flag: false,
+        sps_res_change_in_clvs_allowed_flag: false,
+        sps_pic_width_max_in_luma_samples: pic_w,
+        sps_pic_height_max_in_luma_samples: pic_h,
+        conformance_window: None,
+        sps_subpic_info_present_flag: false,
+        sps_bitdepth_minus8: 0,
+        sps_entropy_coding_sync_enabled_flag: false,
+        sps_entry_point_offsets_present_flag: false,
+        sps_log2_max_pic_order_cnt_lsb_minus4: 4,
+        sps_poc_msb_cycle_flag: false,
+        sps_poc_msb_cycle_len_minus1: 0,
+        sps_num_extra_ph_bytes: 0,
+        sps_num_extra_sh_bytes: 0,
+        num_extra_ph_bits: 0,
+        num_extra_sh_bits: 0,
+        sps_sublayer_dpb_params_flag: false,
+        dpb_parameters: None,
+        partition_constraints: PartitionConstraints::default(),
+        tool_flags: ToolFlags::default(),
+        subpic_info: None,
+        sps_timing_hrd_params_present_flag: false,
+        general_timing_hrd: None,
+        sps_sublayer_cpb_params_present_flag: false,
+        ols_timing_hrd: None,
+        sps_field_seq_flag: false,
+        sps_vui_parameters_present_flag: false,
+        vui_payload: Vec::new(),
+        sps_extension_flag: false,
+        sps_range_extension_flag: false,
+        sps_extension_7bits: 0,
+        range_extension: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

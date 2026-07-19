@@ -520,21 +520,47 @@ pub fn parse_slice_header_stateful(
         }
     }
 
-    // Entry-point offsets (§7.4.8). Under the single-slice / single-tile
-    // assumption enforced at the top of this function (NumTilesInPic = 1,
-    // NumSlicesInSubpic = 1), NumEntryPoints is 0 whenever
-    // sps_entry_point_offsets_present_flag = 0. When the flag is set and
-    // the slice spans more than one CTU row with entropy-coding-sync, the
-    // count is non-zero — derivation needs the full CTU layout that the
-    // current scaffold does not carry. We refuse the ambiguous case so
-    // the caller can't silently consume the wrong number of bits.
-    if sps.sps_entry_point_offsets_present_flag && sps.sps_entropy_coding_sync_enabled_flag {
-        return Err(Error::unsupported(
-            "h266 SH: entry-point offsets with entropy-coding-sync are not yet walked",
-        ));
+    // Entry-point offsets (§7.4.8 eq. 141) — r418: derived through the
+    // §6.5.1 tile scan. The slice's CTB list comes from
+    // `CtbAddrInSlice[sh_slice_address]` for rectangular layouts
+    // (single-subpicture profile: the subpicture-level address IS the
+    // picture-level slice index) or from the
+    // `sh_slice_address` / `sh_num_tiles_in_slice_minus1` tile run for
+    // raster-scan layouts; NumEntryPoints counts the eq. 141 tile
+    // transitions plus, with `sps_entropy_coding_sync_enabled_flag`
+    // (WPP), every CTU-row change.
+    let num_entry_points = if sps.sps_entry_point_offsets_present_flag {
+        let scan = crate::tile_scan::TileScan::derive(sps, pps)?;
+        let ctbs: Vec<u32> = if pps.pps_rect_slice_flag || pps.partition.is_none() {
+            scan.ctb_addr_in_slice
+                .get(sh_slice_address as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid(format!(
+                        "h266 SH: sh_slice_address {sh_slice_address} has no derived CTB list"
+                    ))
+                })?
+        } else {
+            scan.raster_slice_ctbs(sh_slice_address, sh_num_tiles_in_slice_minus1 + 1)?
+        };
+        scan.num_entry_points(&ctbs, sps.sps_entropy_coding_sync_enabled_flag)
+    } else {
+        0
+    };
+    if num_entry_points > 0 {
+        let len_minus1 = br.ue()?;
+        if len_minus1 > 31 {
+            return Err(Error::invalid(format!(
+                "h266 SH: sh_entry_offset_len_minus1 out of range ({len_minus1})"
+            )));
+        }
+        out.sh_entry_offset_len = len_minus1 as u8 + 1;
+        for _ in 0..num_entry_points {
+            // u(v) with v = len_minus1 + 1 ≤ 32 bits.
+            let off = u64::from(br.u(len_minus1 + 1)?);
+            out.sh_entry_point_offsets.push(off + 1);
+        }
     }
-    // NumEntryPoints = 0 in every supported configuration → skip the
-    // entire `if( NumEntryPoints > 0 )` block.
 
     // byte_alignment() — §7.3.2.17: a single "1" bit followed by zero or
     // more "0" bits until byte aligned.
@@ -769,6 +795,92 @@ mod tests {
             partition: None,
         };
         (sps, pps)
+    }
+
+    /// r418 — §7.4.8 eq. 141: WPP entry points parsed through the
+    /// §6.5.1 tile scan. The 320x240 / 128-CTB picture spans 2 CTU
+    /// rows, so with `sps_entry_point_offsets_present_flag` +
+    /// `sps_entropy_coding_sync_enabled_flag` the single slice has
+    /// NumEntryPoints = 1 — the SH must consume
+    /// `sh_entry_offset_len_minus1` and one offset. (Pre-r418 this
+    /// configuration was refused as unsupported.)
+    #[test]
+    fn stateful_wpp_entry_point_offsets_are_parsed() {
+        let (mut sps, pps) = synthetic_sps_pps();
+        sps.sps_entry_point_offsets_present_flag = true;
+        sps.sps_entropy_coding_sync_enabled_flag = true;
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrWRadl,
+            ..Default::default()
+        };
+
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_ue(&mut bits, 7); // sh_entry_offset_len_minus1 = 7 → 8 bits
+        push_u(&mut bits, 0x2a, 8); // sh_entry_point_offset_minus1[0]
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert_eq!(sh.sh_entry_offset_len, 8);
+        assert_eq!(sh.sh_entry_point_offsets, vec![0x2a + 1]);
+    }
+
+    /// r418 — tiles without WPP: a 2x1-tile raster-scan slice covering
+    /// both tiles has one tile transition → one entry point.
+    #[test]
+    fn stateful_tile_entry_point_parsed_for_raster_slice() {
+        use crate::pps::PicPartition;
+        let (mut sps, mut pps) = synthetic_sps_pps();
+        sps.sps_entry_point_offsets_present_flag = true;
+        pps.pps_rect_slice_flag = false; // raster scan
+        pps.pps_no_pic_partition_flag = false;
+        pps.partition = Some(PicPartition {
+            log2_ctu_size_minus5: 2,
+            explicit_col_widths: vec![1, 2],
+            explicit_row_heights: vec![2],
+            col_width_ctbs: vec![1, 2],
+            row_height_ctbs: vec![2],
+            num_tile_columns: 2,
+            num_tile_rows: 1,
+            num_tiles_in_pic: 2,
+            pps_loop_filter_across_tiles_enabled_flag: false,
+            num_slices_in_pic: 1,
+            slice_top_left_tile_idx: vec![],
+            num_slices_in_subpic: vec![1],
+            tile_idx_delta_present_flag: false,
+            slice_width_in_tiles: vec![],
+            slice_height_in_tiles: vec![],
+            slice_height_in_ctus: vec![],
+            slice_ctb_row_offset_in_tile: vec![],
+        });
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrWRadl,
+            ..Default::default()
+        };
+
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_slice_address = 0 (1 bit: 2 tiles)
+        push_ue(&mut bits, 1); // sh_num_tiles_in_slice_minus1 = 1
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_ue(&mut bits, 15); // sh_entry_offset_len_minus1 = 15 → 16 bits
+        push_u(&mut bits, 0x0102, 16); // sh_entry_point_offset_minus1[0]
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert_eq!(sh.sh_slice_address, 0);
+        assert_eq!(sh.sh_num_tiles_in_slice_minus1, 1);
+        assert_eq!(sh.sh_entry_offset_len, 16);
+        assert_eq!(sh.sh_entry_point_offsets, vec![0x0102 + 1]);
     }
 
     /// Intra-only IRAP slice: ph_inter_slice_allowed = 0 → sh_slice_type
@@ -1104,6 +1216,10 @@ mod tests {
             slice_top_left_tile_idx: vec![],
             num_slices_in_subpic: vec![1],
             tile_idx_delta_present_flag: false,
+            slice_width_in_tiles: vec![],
+            slice_height_in_tiles: vec![],
+            slice_height_in_ctus: vec![],
+            slice_ctb_row_offset_in_tile: vec![],
         });
         let ph_state = PhState {
             ph_inter_slice_allowed_flag: false,

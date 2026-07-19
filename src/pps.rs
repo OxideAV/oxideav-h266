@@ -50,6 +50,21 @@ pub struct PicPartition {
     pub num_slices_in_subpic: Vec<u32>,
     /// `pps_tile_idx_delta_present_flag`.
     pub tile_idx_delta_present_flag: bool,
+    /// r418 — §6.5.1 eq. 21 fully derived at parse time, one entry per
+    /// picture-level slice (explicit rectangular layout only; empty
+    /// otherwise): `sliceWidthInTiles[i]` / `sliceHeightInTiles[i]`
+    /// (1 / 1 for the sub-tile slices).
+    pub slice_width_in_tiles: Vec<u32>,
+    pub slice_height_in_tiles: Vec<u32>,
+    /// r418 — `sliceHeightInCtus[i]`: for a slice covering one tile
+    /// (or part of one), its height in CTU rows; for multi-tile
+    /// slices the value is the covered tile-row sum (unused by the
+    /// tile-scan derivation, which walks whole tiles then).
+    pub slice_height_in_ctus: Vec<u32>,
+    /// r418 — the CTU-row offset of the slice inside its tile (0 for
+    /// whole-tile and multi-tile slices; the eq. 21 running `ctbY −
+    /// TileRowBdVal[tileY]` for sub-tile slices).
+    pub slice_ctb_row_offset_in_tile: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -308,6 +323,10 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         }
         let mut pps_tile_idx_delta_present_flag = false;
         let mut slice_top_left_tile_idx: Vec<u32> = Vec::new();
+        let mut slice_width_in_tiles: Vec<u32> = Vec::new();
+        let mut slice_height_in_tiles: Vec<u32> = Vec::new();
+        let mut slice_height_in_ctus: Vec<u32> = Vec::new();
+        let mut slice_ctb_row_offset_in_tile: Vec<u32> = Vec::new();
         let mut num_slices_in_pic: u32 = 1;
 
         if pps_rect_slice_flag {
@@ -326,72 +345,143 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
             if num_slices_in_pic > 1 {
                 pps_tile_idx_delta_present_flag = br.u1()? == 1;
             }
-            // We walk the per-slice fields enough to advance the
-            // bitreader past them — the full `CtbAddrInSlice[][]`
-            // derivation is out of scope for this round. The only
-            // derived variable we track is `SliceTopLeftTileIdx[i]`.
+            // r418 — the §7.3.2.5 slice loop interleaves with the
+            // §6.5.1 eq. 21 derivation: a 1x1-tile slice whose tile
+            // splits into multiple slices consumes NumSlicesInTile
+            // picture-level slice indices from ONE syntax iteration
+            // (`i += NumSlicesInTile − 1`), and the tile-idx-delta
+            // read keys on the POST-advance index. The pre-r418
+            // parser skipped that advance, misaligning every later
+            // field on such PPSes. Per-slice geometry
+            // (sliceWidth/HeightInTiles, sliceHeightInCtus, the
+            // sub-tile CTU-row offset) is derived here so the
+            // §6.5.1 `CtbAddrInSlice` replay in
+            // [`crate::tile_scan::TileScan`] needs no re-parse.
             let mut tile_idx: i64 = 0;
             slice_top_left_tile_idx.reserve(num_slices_in_pic as usize);
             let num_tile_cols_i = num_tile_columns as i64;
-            let mut slice_widths: Vec<u32> = Vec::with_capacity(num_slices_in_pic as usize);
-            let mut slice_heights: Vec<u32> = Vec::with_capacity(num_slices_in_pic as usize);
+            let mut prev_height_minus1: u32 = 0;
             let mut i: u32 = 0;
-            while i < pps_num_slices_in_pic_minus1 {
+            while i < num_slices_in_pic {
                 if tile_idx < 0 || tile_idx >= num_tiles_in_pic as i64 {
                     return Err(Error::invalid(format!(
                         "h266 PPS: slice tile idx {tile_idx} out of range"
                     )));
                 }
-                slice_top_left_tile_idx.push(tile_idx as u32);
                 let tile_x = (tile_idx % num_tile_cols_i) as u32;
                 let tile_y = (tile_idx / num_tile_cols_i) as u32;
-                let mut slice_w: u32 = 1;
-                let mut slice_h: u32 = 1;
+                let last_slice = i == pps_num_slices_in_pic_minus1;
                 let last_col = tile_x == num_tile_columns - 1;
                 let last_row = tile_y == num_tile_rows - 1;
-                if !last_col {
-                    slice_w = br.ue()? + 1;
+                let (slice_w, slice_h) = if last_slice {
+                    // eq. 21 — the last slice covers the remaining
+                    // tile rectangle.
+                    (num_tile_columns - tile_x, num_tile_rows - tile_y)
+                } else {
+                    let w = if !last_col { br.ue()? + 1 } else { 1 };
+                    // §7.4.3.5 — absent height infers 0 on the last
+                    // tile row, else inherits the previous slice's
+                    // value.
+                    let h = if !last_row && (pps_tile_idx_delta_present_flag || tile_x == 0) {
+                        let v = br.ue()?;
+                        prev_height_minus1 = v;
+                        v + 1
+                    } else if last_row {
+                        1
+                    } else {
+                        prev_height_minus1 + 1
+                    };
+                    (w, h)
+                };
+                if tile_x + slice_w > num_tile_columns || tile_y + slice_h > num_tile_rows {
+                    return Err(Error::invalid(
+                        "h266 PPS: slice tile rectangle exceeds the tile grid",
+                    ));
                 }
-                if !last_row && (pps_tile_idx_delta_present_flag || tile_x == 0) {
-                    slice_h = br.ue()? + 1;
-                }
-                slice_widths.push(slice_w);
-                slice_heights.push(slice_h);
                 if slice_w == 1 && slice_h == 1 && row_height_ctbs[tile_y as usize] > 1 {
-                    let pps_num_exp_slices_in_tile = br.ue()?;
-                    if pps_num_exp_slices_in_tile > row_height_ctbs[tile_y as usize] {
+                    // eq. 21 — the tile may split into CTU-row slices.
+                    // Explicit heights are only in the syntax for
+                    // non-last slices; the last slice's count infers 0
+                    // (one slice covering the whole tile).
+                    let row_h = row_height_ctbs[tile_y as usize];
+                    let num_exp = if last_slice { 0 } else { br.ue()? };
+                    if num_exp > row_h {
                         return Err(Error::invalid(format!(
-                            "h266 PPS: pps_num_exp_slices_in_tile out of range ({pps_num_exp_slices_in_tile})"
+                            "h266 PPS: pps_num_exp_slices_in_tile out of range ({num_exp})"
                         )));
                     }
-                    for _ in 0..pps_num_exp_slices_in_tile {
-                        let _h = br.ue()?;
+                    let mut heights: Vec<u32> = Vec::new();
+                    if num_exp == 0 {
+                        heights.push(row_h);
+                    } else {
+                        let mut remaining = row_h as i64;
+                        for _ in 0..num_exp {
+                            let h = br.ue()? + 1;
+                            heights.push(h);
+                            remaining -= h as i64;
+                        }
+                        if remaining < 0 {
+                            return Err(Error::invalid(
+                                "h266 PPS: explicit slice heights exceed the tile",
+                            ));
+                        }
+                        let uniform = *heights.last().unwrap() as i64;
+                        while remaining >= uniform {
+                            heights.push(uniform as u32);
+                            remaining -= uniform;
+                        }
+                        if remaining > 0 {
+                            heights.push(remaining as u32);
+                        }
                     }
-                    // §6.5.1 derivation of NumSlicesInTile would
-                    // advance `i` by `NumSlicesInTile - 1` here; for
-                    // this scaffold we treat each explicit entry as a
-                    // single slice in the loop (consumers doing full
-                    // CTU-level walk can recompute the NumSlicesInTile
-                    // from the stored pps_num_exp_slices_in_tile).
-                }
-                if pps_tile_idx_delta_present_flag && i < pps_num_slices_in_pic_minus1 {
-                    let delta = br.se()?;
-                    tile_idx += delta as i64;
+                    let num_in_tile = heights.len() as u32;
+                    if i + num_in_tile > num_slices_in_pic {
+                        return Err(Error::invalid(
+                            "h266 PPS: NumSlicesInTile overruns pps_num_slices_in_pic",
+                        ));
+                    }
+                    let mut row_off = 0u32;
+                    for h in &heights {
+                        slice_top_left_tile_idx.push(tile_idx as u32);
+                        slice_width_in_tiles.push(1);
+                        slice_height_in_tiles.push(1);
+                        slice_height_in_ctus.push(*h);
+                        slice_ctb_row_offset_in_tile.push(row_off);
+                        row_off += h;
+                    }
+                    prev_height_minus1 = 0;
+                    i += num_in_tile;
                 } else {
-                    tile_idx += slice_w as i64;
-                    if tile_idx % num_tile_cols_i == 0 {
-                        tile_idx += (slice_h as i64 - 1) * num_tile_cols_i;
+                    slice_top_left_tile_idx.push(tile_idx as u32);
+                    slice_width_in_tiles.push(slice_w);
+                    slice_height_in_tiles.push(slice_h);
+                    // Covered CTU-row sum (whole tiles).
+                    let h_ctus: u32 = (tile_y..tile_y + slice_h)
+                        .map(|ty| row_height_ctbs[ty as usize])
+                        .sum();
+                    slice_height_in_ctus.push(h_ctus);
+                    slice_ctb_row_offset_in_tile.push(0);
+                    i += 1;
+                }
+                // Tile-index advance — keyed on the POST-advance slice
+                // index per the syntax loop.
+                if i < num_slices_in_pic {
+                    if pps_tile_idx_delta_present_flag {
+                        let delta = br.se()?;
+                        if delta == 0 {
+                            return Err(Error::invalid(
+                                "h266 PPS: pps_tile_idx_delta_val must be non-zero",
+                            ));
+                        }
+                        tile_idx += delta as i64;
+                    } else {
+                        tile_idx += slice_w as i64;
+                        if tile_idx % num_tile_cols_i == 0 {
+                            tile_idx += (slice_h as i64 - 1) * num_tile_cols_i;
+                        }
                     }
                 }
-                i += 1;
             }
-            // Last slice gets the remaining top-left tile.
-            if tile_idx < 0 || tile_idx >= num_tiles_in_pic as i64 {
-                return Err(Error::invalid(format!(
-                    "h266 PPS: last slice tile idx {tile_idx} out of range"
-                )));
-            }
-            slice_top_left_tile_idx.push(tile_idx as u32);
         }
         if !pps_rect_slice_flag || pps_single_slice_per_subpic_flag || num_slices_in_pic > 1 {
             pps_loop_filter_across_slices_enabled_flag = br.u1()? == 1;
@@ -422,6 +512,10 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
             slice_top_left_tile_idx,
             num_slices_in_subpic,
             tile_idx_delta_present_flag: pps_tile_idx_delta_present_flag,
+            slice_width_in_tiles,
+            slice_height_in_tiles,
+            slice_height_in_ctus,
+            slice_ctb_row_offset_in_tile,
         });
     }
 
@@ -666,6 +760,60 @@ fn derive_tile_sizes(explicit: &[u32], pic_dim_in_ctbs: u32) -> Vec<u32> {
     out
 }
 
+/// Test-only minimal single-slice PPS constructor shared by
+/// cross-module unit tests.
+#[cfg(test)]
+pub(crate) fn test_minimal_pps(pic_w: u32, pic_h: u32) -> PicParameterSet {
+    PicParameterSet {
+        pps_pic_parameter_set_id: 0,
+        pps_seq_parameter_set_id: 0,
+        pps_mixed_nalu_types_in_pic_flag: false,
+        pps_pic_width_in_luma_samples: pic_w,
+        pps_pic_height_in_luma_samples: pic_h,
+        conformance_window: None,
+        scaling_window: None,
+        pps_output_flag_present_flag: false,
+        pps_no_pic_partition_flag: true,
+        pps_subpic_id_mapping_present_flag: false,
+        subpic_id_mapping: None,
+        pps_rect_slice_flag: true,
+        pps_single_slice_per_subpic_flag: true,
+        pps_loop_filter_across_slices_enabled_flag: false,
+        pps_cabac_init_present_flag: false,
+        pps_num_ref_idx_default_active_minus1: [0, 0],
+        pps_rpl1_idx_present_flag: false,
+        pps_weighted_pred_flag: false,
+        pps_weighted_bipred_flag: false,
+        pps_ref_wraparound_enabled_flag: false,
+        pps_pic_width_minus_wraparound_offset: 0,
+        pps_init_qp_minus26: 0,
+        pps_cu_qp_delta_enabled_flag: false,
+        pps_chroma_tool_offsets_present_flag: false,
+        pps_cb_qp_offset: 0,
+        pps_cr_qp_offset: 0,
+        pps_joint_cbcr_qp_offset_present_flag: false,
+        pps_joint_cbcr_qp_offset_value: 0,
+        pps_slice_chroma_qp_offsets_present_flag: false,
+        pps_cu_chroma_qp_offset_list_enabled_flag: false,
+        pps_cb_qp_offset_list: Vec::new(),
+        pps_cr_qp_offset_list: Vec::new(),
+        pps_joint_cbcr_qp_offset_list: Vec::new(),
+        pps_deblocking_filter_control_present_flag: false,
+        pps_deblocking_filter_override_enabled_flag: false,
+        pps_deblocking_filter_disabled_flag: false,
+        pps_dbf_info_in_ph_flag: false,
+        pps_rpl_info_in_ph_flag: true,
+        pps_sao_info_in_ph_flag: true,
+        pps_alf_info_in_ph_flag: true,
+        pps_wp_info_in_ph_flag: true,
+        pps_qp_delta_info_in_ph_flag: false,
+        pps_picture_header_extension_present_flag: false,
+        pps_slice_header_extension_present_flag: false,
+        pps_extension_flag: false,
+        partition: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +859,93 @@ mod tests {
             (value as i64 * 2 - 1) as u32
         };
         push_ue(bits, code);
+    }
+
+    /// r418 — §7.3.2.5 / §6.5.1 eq. 21: a rectangular-slice PPS where
+    /// one tile splits into multiple CTU-row slices. The syntax loop
+    /// must advance `i += NumSlicesInTile − 1` after the explicit
+    /// heights (the pre-r418 parser did not, misaligning every later
+    /// field), the uniform-replication must fill the tile, and the
+    /// per-slice geometry arrays must come out per PICTURE-level
+    /// slice. Layout: 256x1024 luma, CTB 128 → 2x8 CTBs; one tile
+    /// column (width 2), two tile rows (4 + 4 CTBs). Slice 0 = tile
+    /// row 0 (whole tile, 1x1 tiles with exp count 0); slices 1..4 =
+    /// tile row 1 split as 1 + 1 + 2 CTU rows (one explicit height,
+    /// uniform-replicated once, remainder 2).
+    #[test]
+    fn pps_rect_slices_in_tile_advance_and_geometry() {
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 6); // pps_id
+        push_u(&mut bits, 0, 4); // sps_id
+        push_u(&mut bits, 0, 1); // mixed_nalu_types
+        push_ue(&mut bits, 256); // width
+        push_ue(&mut bits, 1024); // height
+        push_u(&mut bits, 0, 1); // conformance_window_flag
+        push_u(&mut bits, 0, 1); // scaling_window
+        push_u(&mut bits, 0, 1); // output_flag_present
+        push_u(&mut bits, 0, 1); // no_pic_partition = 0 → partition block
+        push_u(&mut bits, 0, 1); // subpic_id_mapping_present
+                                 // ---- partition block ----
+        push_u(&mut bits, 2, 2); // pps_log2_ctu_size_minus5 = 2 → 128
+        push_ue(&mut bits, 0); // num_exp_tile_columns_minus1 = 0
+        push_ue(&mut bits, 0); // num_exp_tile_rows_minus1 = 0
+        push_ue(&mut bits, 1); // tile_column_width_minus1[0] = 1 → 2 CTBs
+        push_ue(&mut bits, 3); // tile_row_height_minus1[0] = 3 → 4 CTBs
+                               // 1x2 tiles → NumTilesInPic = 2 > 1:
+        push_u(&mut bits, 0, 1); // loop_filter_across_tiles
+        push_u(&mut bits, 1, 1); // rect_slice_flag = 1
+        push_u(&mut bits, 0, 1); // single_slice_per_subpic = 0
+        push_ue(&mut bits, 3); // num_slices_in_pic_minus1 = 3 → 4 slices
+        push_u(&mut bits, 0, 1); // tile_idx_delta_present = 0
+                                 // Syntax slice 0 (tile 0, 1x1 covering a 4-CTB-tall tile):
+                                 // width absent (last col), height read (tile_x == 0):
+        push_ue(&mut bits, 0); // slice_height_in_tiles_minus1 = 0
+        push_ue(&mut bits, 0); // num_exp_slices_in_tile = 0 → whole tile
+                               // Syntax slice 1 (tile 1, the LAST tile row → height absent,
+                               // inferred 0):
+        push_ue(&mut bits, 2); // num_exp_slices_in_tile = 2
+        push_ue(&mut bits, 0); // exp_slice_height_minus1[0] = 0 → 1 CTU row
+        push_ue(&mut bits, 1); // exp_slice_height_minus1[1] = 1 → 2 CTU rows
+                               // eq. 21: explicit [1, 2], remainder 1 → heights [1, 2, 1] →
+                               // NumSlicesInTile = 3; i advances past picture-level indices
+                               // 1..3 → loop ends.
+                               // ---- partition block done ----
+        push_u(&mut bits, 0, 1); // loop_filter_across_slices
+        push_u(&mut bits, 0, 1); // cabac_init_present
+        push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[0]
+        push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[1]
+        push_u(&mut bits, 0, 1); // rpl1_idx_present
+        push_u(&mut bits, 0, 1); // weighted_pred
+        push_u(&mut bits, 0, 1); // weighted_bipred
+        push_u(&mut bits, 0, 1); // ref_wraparound
+        push_se(&mut bits, 0); // init_qp_minus26
+        push_u(&mut bits, 0, 1); // cu_qp_delta_enabled
+        push_u(&mut bits, 0, 1); // chroma_tool_offsets_present
+        push_u(&mut bits, 0, 1); // deblocking_filter_control_present
+        push_u(&mut bits, 0, 1); // rpl_info_in_ph
+        push_u(&mut bits, 0, 1); // sao_info_in_ph
+        push_u(&mut bits, 0, 1); // alf_info_in_ph
+        push_u(&mut bits, 0, 1); // qp_delta_info_in_ph
+        push_u(&mut bits, 0, 1); // picture_header_ext_present
+        push_u(&mut bits, 0, 1); // slice_header_ext_present
+        push_u(&mut bits, 0, 1); // pps_extension_flag
+        let bytes = pack_bits(&bits);
+        let pps = parse_pps(&bytes).unwrap();
+        let part = pps.partition.as_ref().unwrap();
+        assert_eq!(part.num_tile_columns, 1);
+        assert_eq!(part.num_tile_rows, 2);
+        assert_eq!(part.num_slices_in_pic, 4);
+        assert_eq!(part.slice_top_left_tile_idx, vec![0, 1, 1, 1]);
+        assert_eq!(part.slice_width_in_tiles, vec![1, 1, 1, 1]);
+        assert_eq!(part.slice_height_in_tiles, vec![1, 1, 1, 1]);
+        // Slice 0 covers its whole 4-row tile; the split tile yields
+        // 1 + 2 + 1 CTU rows at offsets 0 / 1 / 3.
+        assert_eq!(part.slice_height_in_ctus, vec![4, 1, 2, 1]);
+        assert_eq!(part.slice_ctb_row_offset_in_tile, vec![0, 0, 1, 3]);
+        // The tail fields after the partition block parsed in
+        // alignment (the r418 i-advance fix): init_qp survives.
+        assert_eq!(pps.pps_init_qp_minus26, 0);
+        assert!(!pps.pps_cu_qp_delta_enabled_flag);
     }
 
     /// Minimal single-slice 320x240 PPS (no partitioning, no subpic map).
