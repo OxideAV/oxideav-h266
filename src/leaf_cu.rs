@@ -446,6 +446,14 @@ pub struct CuToolFlags {
     pub chroma_format_idc: u32,
     /// `pps_cu_qp_delta_enabled_flag` — gates `cu_qp_delta_abs` reads.
     pub cu_qp_delta_enabled: bool,
+    /// r418 — `IsCuQpDeltaCoded` carried in from the coding-tree
+    /// walker's quantization-group state (§7.3.11.4): when `true` a
+    /// prior TU **in the same QG** already carried `cu_qp_delta_abs`,
+    /// so this CU's `transform_unit()` must not read another one
+    /// (§7.3.11.10 presence condition `!IsCuQpDeltaCoded`). Default
+    /// `false` = this CU opens its QG (per-CU arming, the geometry
+    /// this crate's encoder declares via the PH maximum subdiv).
+    pub cu_qp_delta_already_coded: bool,
     /// `sh_cu_chroma_qp_offset_enabled_flag` — gates
     /// `cu_chroma_qp_offset_flag` reads.
     pub cu_chroma_qp_offset_enabled: bool,
@@ -645,6 +653,12 @@ pub struct LeafCuInfo {
     /// `CuQpDeltaVal` (signed, §7.4.11.8). 0 when `cu_qp_delta_abs == 0`
     /// or the flag was not present in the slice.
     pub cu_qp_delta_val: i32,
+    /// r418 — true iff THIS CU's `transform_unit()` read a
+    /// `cu_qp_delta_abs` bin (it set `IsCuQpDeltaCoded = 1` per
+    /// §7.4.11.8). The coding-tree walker folds this back into its
+    /// quantization-group state so later CUs in the same QG inherit
+    /// `CuQpDeltaVal` without reading another delta.
+    pub cu_qp_delta_read: bool,
     /// `cu_chroma_qp_offset_flag`.
     pub cu_chroma_qp_offset_flag: bool,
     /// `cu_chroma_qp_offset_idx` (0 when the flag is 0).
@@ -730,6 +744,7 @@ impl Default for LeafCuInfo {
             tu_cb_coded_flag: false,
             tu_cr_coded_flag: false,
             cu_qp_delta_val: 0,
+            cu_qp_delta_read: false,
             cu_chroma_qp_offset_flag: false,
             cu_chroma_qp_offset_idx: 0,
             last_sig_x: 0,
@@ -1818,8 +1833,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.tu_cb_coded_flag,
         )?;
         let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_qp_delta_enabled && chroma_cbf {
+        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && chroma_cbf {
             info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+            info.cu_qp_delta_read = true;
         }
         if self.tools.cu_chroma_qp_offset_enabled && chroma_cbf {
             let (flag, idx) = read_cu_chroma_qp_offset(
@@ -3612,8 +3628,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // cu_qp_delta — gated on (any CBF || CB > 64) + enable. CB > 64
         // is excluded by the MaxTbSizeY guard above.
         let any_cbf = info.tu_y_coded_flag || info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_qp_delta_enabled && any_cbf {
+        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && any_cbf {
             info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+            info.cu_qp_delta_read = true;
         }
         // cu_chroma_qp_offset — gated on chroma CBF + enable.
         if self.tools.cu_chroma_qp_offset_enabled && chroma_available && chroma_cbf {
@@ -3889,8 +3906,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
 
         // cu_qp_delta_abs + sign (spec gates on CB > 64 || any CBF + enable).
         let any_cbf = info.tu_y_coded_flag || info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_qp_delta_enabled && any_cbf {
+        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && any_cbf {
             info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+            info.cu_qp_delta_read = true;
         }
         // cu_chroma_qp_offset_flag + idx.
         let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
@@ -4350,8 +4368,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // Trailing per-CU reads (cu_qp_delta_*, cu_chroma_qp_offset_*,
         // joint_cbcr) — these are only signalled once per CU.
         let any_cbf = info.tu_y_coded_flag || info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_qp_delta_enabled && any_cbf {
+        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && any_cbf {
             info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+            info.cu_qp_delta_read = true;
         }
         let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
         if self.tools.cu_chroma_qp_offset_enabled && chroma && chroma_cbf {

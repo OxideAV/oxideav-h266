@@ -491,6 +491,16 @@ luma CTB-row rule, asymmetric §8.8.3.6.8 long filters eqs.
 1391 – 1394, the §8.8.3.3 either-side ≤ 4 rule, and the step-9
 gates). Validation matrix: `tests/WHOLE_STREAM_CORPUS.md`.
 
+r418 also landed the §7.3.11.4 **quantization-group** state machine in
+the single-tree walker: `cbSubdiv` / `qgOnY` threading, per-QG
+`IsCuQpDeltaCoded` arming (one `cu_qp_delta_abs` per QG, later CUs
+inherit `CuQpDeltaVal`), and the §8.7.1 `qPY_PRED` derivation
+(per-4x4 QpY map, qPY_A/qPY_B CTB-containment fall-backs,
+first-QG-in-CTB-row arm, eq. 1119/1120) — so wires whose PH signals a
+`CuQpDeltaSubdiv` smaller than this encoder's per-CU maximum decode
+correctly (`CtuWalker::set_cu_qp_delta_subdiv`), pinned by hand-built
+foreign-wire CABAC fixtures.
+
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
 provides single / dual-reference DPB, integer-pel full-search motion

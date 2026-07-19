@@ -92,6 +92,15 @@ fn decode_whole_stream(bs: &[u8]) -> PictureBuffer {
     let mut walker =
         CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &cabac).expect("begin_slice");
 
+    // r418 — §7.4.3.7 eq. 123: CuQpDeltaSubdiv for an I-slice is the
+    // PH-signalled `ph_cu_qp_delta_subdiv_intra_slice`. Driving the
+    // walker's quantization-group declarations from the wire value
+    // (instead of the per-CU-arming default) exercises the §7.3.11.4
+    // QG logic on every corpus stream.
+    if pps.pps_cu_qp_delta_enabled_flag {
+        walker.set_cu_qp_delta_subdiv(ph.ph_cu_qp_delta_subdiv_intra_slice);
+    }
+
     // §7.3.11.2 — enable the in-stream ALF CTU-prefix decode with the
     // APS-derived binarisation widths.
     if sh.sh_alf_enabled_flag {

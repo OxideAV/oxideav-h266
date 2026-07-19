@@ -1001,6 +1001,35 @@ pub struct CtuWalker<'a, 'b> {
     alf_syntax_cfg: Option<crate::alf_syntax::AlfSyntaxConfig>,
     /// r412 — context bundle for the per-CTU ALF syntax decode.
     alf_ctxs: Option<crate::alf_syntax::AlfCtxs>,
+    /// r418 — §7.4.3.7 `CuQpDeltaSubdiv` (eqs. 123 / 133). Governs the
+    /// §7.3.11.4 quantization-group declarations in `decode_ctu_full`:
+    /// a coding-tree node with `qgOnY && cbSubdiv <= CuQpDeltaSubdiv`
+    /// resets `IsCuQpDeltaCoded` / `CuQpDeltaVal` and re-derives the
+    /// §8.7.1 `qPY_PRED`. Defaults to `u32::MAX` (every node declares a
+    /// QG → per-CU arming, the geometry this crate's encoder signals
+    /// via the PH maximum subdiv); callers decoding foreign wires set
+    /// the PH-signalled value via [`Self::set_cu_qp_delta_subdiv`].
+    cu_qp_delta_subdiv: u32,
+    /// r418 — `IsCuQpDeltaCoded` (§7.3.11.4 / §7.4.11.8): true once a
+    /// `cu_qp_delta_abs` has been read inside the current QG. Gates
+    /// the §7.3.11.10 read presence.
+    qg_delta_coded: bool,
+    /// r418 — `CuQpDeltaVal` (§7.4.11.8): the current QG's signalled
+    /// delta. CUs of the QG that parse after the carrying TU inherit
+    /// it; reset to 0 at every QG declaration.
+    qg_delta_val: i32,
+    /// r418 — the §8.7.1 `qPY_PRED` shared by every CU of the current
+    /// QG, derived at QG declaration from the per-4x4 `QpY` map
+    /// (qPY_A / qPY_B neighbour average with the qPY_PREV fall-backs
+    /// and the first-QG-in-CTB-row arm).
+    qg_qp_y_pred: i32,
+    /// r418 — `QpY` of the most recently parsed CU in this slice
+    /// (`qPY_PREV` seed for the next QG); `None` before the first CU
+    /// (→ `SliceQpY`).
+    last_cu_qp_y: Option<i32>,
+    /// r418 — per-4x4 `QpY` map in decode order (the §8.7.1 qPY_A /
+    /// qPY_B source). Same grid geometry as `intra_grid`.
+    qp_y_map: Vec<i32>,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -1197,6 +1226,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             affine_cpmv_field,
             lmcs: None,
             scaling_list: None,
+            cu_qp_delta_subdiv: u32::MAX,
+            qg_delta_coded: false,
+            qg_delta_val: 0,
+            qg_qp_y_pred: slice_qp.0,
+            last_cu_qp_y: None,
+            qp_y_map: vec![slice_qp.0; (intra_grid_w * intra_grid_h) as usize],
             cu_origin_grid: vec![(0, 0); (intra_grid_w * intra_grid_h) as usize],
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
             nbr_map_chroma: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
@@ -1855,6 +1890,85 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.ph_mvd_l1_zero = enabled;
     }
 
+    /// r418 — §7.4.3.7 `CuQpDeltaSubdiv` (eq. 123 for intra slices /
+    /// eq. 133 for inter slices: the resolved
+    /// `ph_cu_qp_delta_subdiv_{intra,inter}_slice` value). Drives the
+    /// §7.3.11.4 quantization-group declarations in the single-tree
+    /// walker: a coding-tree node with `qgOnY && cbSubdiv <=
+    /// CuQpDeltaSubdiv` opens a new QG (resets `IsCuQpDeltaCoded` /
+    /// `CuQpDeltaVal`, re-derives the §8.7.1 `qPY_PRED`), and only the
+    /// first coded TU inside the QG carries `cu_qp_delta_abs` — later
+    /// CUs inherit the delta. The default (`u32::MAX`) declares a QG
+    /// at every node, i.e. per-CU arming — the geometry this crate's
+    /// encoder signals via the PH maximum subdiv — so calling this is
+    /// only required to decode wires with a smaller signalled subdiv.
+    pub fn set_cu_qp_delta_subdiv(&mut self, subdiv: u32) {
+        self.cu_qp_delta_subdiv = subdiv;
+    }
+
+    /// r418 — §8.7.1 `qPY_PRED` for the quantization group whose
+    /// top-left luma sample is `(x_qg, y_qg)` (absolute picture
+    /// coordinates). Runs at QG declaration time, when everything the
+    /// derivation reads is already decoded:
+    ///
+    /// 1. `qPY_PREV` — `SliceQpY` for the first QG in the slice (this
+    ///    walker is single-slice / single-tile), else the `QpY` of the
+    ///    last CU parsed before the declaration.
+    /// 2. `qPY_A` — the `QpY` map at `(xQg − 1, yQg)` unless that
+    ///    column is outside the picture or in a different CTB than the
+    ///    QG's own (the `(xQg − 1) >> CtbLog2SizeY` check; every CU of
+    ///    a QG shares the declaring node's CTB) → `qPY_PREV`.
+    /// 3. `qPY_B` — the map at `(xQg, yQg − 1)` with the mirrored CTB
+    ///    row check → `qPY_PREV`.
+    /// 4. The first QG in a CTB row (this walker: `xQg == 0` and
+    ///    `yQg` on a CTB row boundary) with an available above
+    ///    neighbour takes `qPY_B` directly; otherwise
+    ///    `qPY_PRED = (qPY_A + qPY_B + 1) >> 1` (eq. 1119).
+    fn derive_qp_y_pred(&self, x_qg: u32, y_qg: u32) -> i32 {
+        let slice_qp = self.cabac.slice_qp_y.0;
+        let qp_prev = self.last_cu_qp_y.unwrap_or(slice_qp);
+        let ctb_log2 = self.layout.ctb_log2_size_y;
+        let qp_at = |x: u32, y: u32| -> i32 {
+            let cx = (x / 4).min(self.intra_grid_w - 1);
+            let cy = (y / 4).min(self.intra_grid_h - 1);
+            self.qp_y_map[(cy * self.intra_grid_w + cx) as usize]
+        };
+        let avail_a = x_qg > 0 && (x_qg - 1) >> ctb_log2 == x_qg >> ctb_log2;
+        let qp_a = if avail_a {
+            qp_at(x_qg - 1, y_qg)
+        } else {
+            qp_prev
+        };
+        let avail_b_row = y_qg > 0;
+        let avail_b = avail_b_row && (y_qg - 1) >> ctb_log2 == y_qg >> ctb_log2;
+        let qp_b = if avail_b {
+            qp_at(x_qg, y_qg - 1)
+        } else {
+            qp_prev
+        };
+        // First QG in a CTB row within the tile: with availableB the
+        // prediction takes the above QG's QpY directly (the CTB row
+        // above is decoded; this is the line-buffer wavefront arm).
+        let ctb_size = 1u32 << ctb_log2;
+        if avail_b_row && x_qg == 0 && y_qg % ctb_size == 0 {
+            return qp_at(x_qg, y_qg - 1);
+        }
+        (qp_a + qp_b + 1) >> 1
+    }
+
+    /// r418 — commit a CU's derived `QpY` into the per-4x4 map (the
+    /// §8.7.1 qPY_A / qPY_B source for later QGs).
+    fn commit_qp_y(&mut self, x0: u32, y0: u32, w: u32, h: u32, qp_y: i32) {
+        let x1 = ((x0 + w).div_ceil(4)).min(self.intra_grid_w);
+        let y1 = ((y0 + h).div_ceil(4)).min(self.intra_grid_h);
+        for cy in (y0 / 4)..y1 {
+            for cx in (x0 / 4)..x1 {
+                self.qp_y_map[(cy * self.intra_grid_w + cx) as usize] = qp_y;
+            }
+        }
+        self.last_cu_qp_y = Some(qp_y);
+    }
+
     /// §8.3.5 — RefIdxSymL0 / RefIdxSymL1 for symmetric MVDs. Every
     /// [`ReferencePicture`] this walker holds is short-term (the DPB
     /// glue carries no long-term marking), so the short-term-only
@@ -2206,6 +2320,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctb_size_y: self.layout.ctb_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
             cu_qp_delta_enabled: self.pps.pps_cu_qp_delta_enabled_flag,
+            // r418 — per-CU QG snapshot; `decode_leaf_cu_syntax`
+            // overrides this from the walker's live QG state.
+            cu_qp_delta_already_coded: false,
             cu_chroma_qp_offset_enabled: self.sh.sh_cu_chroma_qp_offset_enabled_flag,
             chroma_qp_offset_list_len_minus1: 0,
             joint_cbcr_enabled: tf.joint_cbcr_enabled_flag,
@@ -2308,12 +2425,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cu: &CtuCu,
         neigh: &CuNeighbourhood,
     ) -> Result<(LeafCuInfo, LeafCuResidual)> {
-        let tools = self.cu_tool_flags();
+        let mut tools = self.cu_tool_flags();
+        // r418 — §7.3.11.4 quantization-group state: a CU whose QG
+        // already carried `cu_qp_delta_abs` must not read another one
+        // (§7.3.11.10 `!IsCuQpDeltaCoded`), and inherits the QG's
+        // `CuQpDeltaVal` (§7.4.11.8). With the default per-CU QG
+        // geometry `qg_delta_coded` is reset before every leaf, so
+        // this is the historical behaviour unless a smaller
+        // `CuQpDeltaSubdiv` is set.
+        tools.cu_qp_delta_already_coded = self.qg_delta_coded;
         let mut info = LeafCuInfo {
             x0: cu.cu.x,
             y0: cu.cu.y,
             cb_width: cu.cu.w,
             cb_height: cu.cu.h,
+            cu_qp_delta_val: self.qg_delta_val,
             ..LeafCuInfo::default()
         };
         let mut residual = LeafCuResidual::default();
@@ -2359,6 +2485,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mtt_depth: u32,
             parent_tt_ver: Option<bool>,
             part_idx: u32,
+            /// §7.3.11.4 `cbSubdiv` — the QG-declaration depth measure
+            /// (QT / TT-side children +2, BT / TT-centre children +1).
+            cb_subdiv: u32,
+            /// §7.3.11.4 `qgOnY` — false once a TT split descends past
+            /// `CuQpDeltaSubdiv` (`qgNextOnY`), permanently disabling
+            /// QG declarations in that subtree.
+            qg_on_y: bool,
         }
         // r412 — §6.4.1 – §6.4.3 allowed-split constraints from the
         // SPS partition constraints (intra vs inter slice set).
@@ -2387,8 +2520,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mtt_depth: 0,
             parent_tt_ver: None,
             part_idx: 0,
+            cb_subdiv: 0,
+            qg_on_y: true,
         }];
         while let Some(n) = stack.pop() {
+            // r418 — §7.3.11.4 quantization-group declaration: a node
+            // with `qgOnY && cbSubdiv <= CuQpDeltaSubdiv` opens a new
+            // QG — `IsCuQpDeltaCoded = 0`, `CuQpDeltaVal = 0`
+            // (§7.3.11.4), and the §8.7.1 `qPY_PRED` shared by every
+            // CU of the QG is derived from the already-decoded
+            // neighbourhood. Consumes no bins, so its position in the
+            // pre-order walk matches the syntax-table placement.
+            if self.pps.pps_cu_qp_delta_enabled_flag
+                && n.qg_on_y
+                && n.cb_subdiv <= self.cu_qp_delta_subdiv
+            {
+                self.qg_delta_coded = false;
+                self.qg_delta_val = 0;
+                self.qg_qp_y_pred = self.derive_qp_y_pred(ctu.x0 + n.x, ctu.y0 + n.y);
+            }
             let allows = constraints.allows(
                 ctu.x0 + n.x,
                 ctu.y0 + n.y,
@@ -2447,7 +2597,30 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     },
                 };
                 let neigh = self.compute_cu_neighbourhood(&ccu);
-                let (info, residual) = self.decode_leaf_cu_syntax(&ccu, &neigh)?;
+                let (mut info, residual) = self.decode_leaf_cu_syntax(&ccu, &neigh)?;
+                // r418 — fold the CU's cu_qp_delta outcome back into
+                // the QG state (§7.4.11.8: a read sets
+                // IsCuQpDeltaCoded = 1 and fixes CuQpDeltaVal for the
+                // rest of the QG).
+                if info.cu_qp_delta_read {
+                    self.qg_delta_coded = true;
+                    self.qg_delta_val = info.cu_qp_delta_val;
+                }
+                // §8.7.1 eq. 1120 — QpY from the QG's qPY_PRED + the
+                // (possibly inherited) CuQpDeltaVal, with the
+                // QpBdOffset mod-wrap. `info.cu_qp_delta_val` is then
+                // rewritten as the EFFECTIVE delta against SliceQpY so
+                // every downstream `SliceQpY + cu_qp_delta_val` site
+                // (dequant, deblock records, chroma QP) computes the
+                // derived QpY. On wires with per-CU QGs and all-zero
+                // deltas (everything this crate's encoder emits) the
+                // rewrite is the identity.
+                let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
+                let qp_y = (self.qg_qp_y_pred + info.cu_qp_delta_val + 64 + 2 * qp_bd_offset)
+                    .rem_euclid(64 + qp_bd_offset)
+                    - qp_bd_offset;
+                info.cu_qp_delta_val = qp_y - self.cabac.slice_qp_y.0;
+                self.commit_qp_y(ccu.cu.x, ccu.cu.y, ccu.cu.w, ccu.cu.h, qp_y);
                 // Round-149/406/409 — commit the parse-time neighbour
                 // grids so the NEXT CU's ctxInc + MPM derivations see
                 // this CU in coding order.
@@ -2487,6 +2660,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         mtt_depth: n.mtt_depth,
                         parent_tt_ver: None,
                         part_idx: 0,
+                        cb_subdiv: n.cb_subdiv + 2,
+                        qg_on_y: n.qg_on_y,
                     },
                     Node {
                         x: n.x + hw,
@@ -2497,6 +2672,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         mtt_depth: n.mtt_depth,
                         parent_tt_ver: None,
                         part_idx: 1,
+                        cb_subdiv: n.cb_subdiv + 2,
+                        qg_on_y: n.qg_on_y,
                     },
                     Node {
                         x: n.x,
@@ -2507,6 +2684,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         mtt_depth: n.mtt_depth,
                         parent_tt_ver: None,
                         part_idx: 2,
+                        cb_subdiv: n.cb_subdiv + 2,
+                        qg_on_y: n.qg_on_y,
                     },
                     Node {
                         x: n.x + hw,
@@ -2517,6 +2696,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         mtt_depth: n.mtt_depth,
                         parent_tt_ver: None,
                         part_idx: 3,
+                        cb_subdiv: n.cb_subdiv + 2,
+                        qg_on_y: n.qg_on_y,
                     },
                 ]
             } else {
@@ -2580,6 +2761,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: None,
                                 part_idx: 0,
+                                cb_subdiv: n.cb_subdiv + 1,
+                                qg_on_y: n.qg_on_y,
                             },
                             Node {
                                 x: n.x + hw,
@@ -2590,6 +2773,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: None,
                                 part_idx: 1,
+                                cb_subdiv: n.cb_subdiv + 1,
+                                qg_on_y: n.qg_on_y,
                             },
                         ]
                     } else {
@@ -2604,6 +2789,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: None,
                                 part_idx: 0,
+                                cb_subdiv: n.cb_subdiv + 1,
+                                qg_on_y: n.qg_on_y,
                             },
                             Node {
                                 x: n.x,
@@ -2614,10 +2801,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: None,
                                 part_idx: 1,
+                                cb_subdiv: n.cb_subdiv + 1,
+                                qg_on_y: n.qg_on_y,
                             },
                         ]
                     }
                 } else {
+                    // §7.3.11.4 — TT children propagate qgNextOnY =
+                    // qgOnY && (cbSubdiv + 2 <= CuQpDeltaSubdiv):
+                    // once a TT descends past the subdiv limit no
+                    // deeper node may declare a QG (the +1-side
+                    // centre child included).
+                    let qg_next = n.qg_on_y && n.cb_subdiv + 2 <= self.cu_qp_delta_subdiv;
                     let tt = Some(mtt_vertical == 1);
                     if mtt_vertical == 1 {
                         let q = n.w / 4;
@@ -2631,6 +2826,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: tt,
                                 part_idx: 0,
+                                cb_subdiv: n.cb_subdiv + 2,
+                                qg_on_y: qg_next,
                             },
                             Node {
                                 x: n.x + q,
@@ -2641,6 +2838,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: tt,
                                 part_idx: 1,
+                                cb_subdiv: n.cb_subdiv + 1,
+                                qg_on_y: qg_next,
                             },
                             Node {
                                 x: n.x + q * 3,
@@ -2651,6 +2850,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: tt,
                                 part_idx: 2,
+                                cb_subdiv: n.cb_subdiv + 2,
+                                qg_on_y: qg_next,
                             },
                         ]
                     } else {
@@ -2665,6 +2866,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: tt,
                                 part_idx: 0,
+                                cb_subdiv: n.cb_subdiv + 2,
+                                qg_on_y: qg_next,
                             },
                             Node {
                                 x: n.x,
@@ -2675,6 +2878,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: tt,
                                 part_idx: 1,
+                                cb_subdiv: n.cb_subdiv + 1,
+                                qg_on_y: qg_next,
                             },
                             Node {
                                 x: n.x,
@@ -2685,6 +2890,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mtt_depth: n.mtt_depth + 1,
                                 parent_tt_ver: tt,
                                 part_idx: 2,
+                                cb_subdiv: n.cb_subdiv + 2,
+                                qg_on_y: qg_next,
                             },
                         ]
                     }

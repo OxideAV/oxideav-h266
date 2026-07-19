@@ -4419,3 +4419,227 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
     assert_eq!(infos[2].intra_pred_mode_y, INTRA_PLANAR);
     assert_eq!(infos[3].intra_pred_mode_y, INTRA_PLANAR);
 }
+
+/// r418 — §7.3.11.4 quantization-group declaration with a FOREIGN
+/// subdiv pattern (`CuQpDeltaSubdiv = 0`): one QG per CTU while the
+/// tree splits into four CUs. Only the FIRST coded TU in the QG
+/// carries `cu_qp_delta_abs` (§7.3.11.10 `!IsCuQpDeltaCoded`); every
+/// later CU of the QG inherits `CuQpDeltaVal` (§7.4.11.8) without
+/// reading another delta bin. This crate's own encoder never emits
+/// this geometry (it signals the PH maximum subdiv → per-CU QGs), so
+/// the wire is hand-built: quad-split 16x16, CU0 uncoded, CU1 coded
+/// with delta +2, CU2 coded WITHOUT a delta bin, CU3 uncoded.
+#[test]
+fn qg_subdiv0_single_delta_read_spans_all_cus() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+        ctx_inc_intra_luma_not_planar_flag, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
+    };
+    use oxideav_h266::leaf_cu::LeafCuCtxs;
+    use oxideav_h266::residual::RcOpts;
+    use oxideav_h266::residual_enc::{
+        encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag,
+        write_tu_cr_coded_flag, write_tu_y_coded_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+
+    let mut enc = ArithEncoder::new();
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init(slice_qp);
+
+    // Root split_cu(1) + split_qt(1) → four 8x8 CUs.
+    let inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_n = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[inc.min(split_n)], 1)
+        .unwrap();
+    let inc = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let qt_slot = inc.min(split_qt_ctxs.len() - 1);
+    enc.encode_decision(&mut split_qt_ctxs[qt_slot], 1).unwrap();
+    let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
+    let split8_slot = split8.min(split_n);
+
+    // One sparse 8x8 luma TB: single DC-position level.
+    let mut levels = vec![0i32; 64];
+    levels[0] = 1;
+
+    // Per-CU emit: split(0) → PLANAR intra bins → DM chroma → CBFs →
+    // [cu_qp_delta if this CU carries it] → [luma residual if coded].
+    let mpm_inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    let np_inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    let chroma_inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    let mut emit_cu =
+        |enc: &mut ArithEncoder, ctxs: &mut LeafCuCtxs, coded: bool, delta: Option<i32>| {
+            enc.encode_decision(&mut split_cu_ctxs[split8_slot], 0)
+                .unwrap();
+            enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
+                .unwrap();
+            enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 0)
+                .unwrap();
+            enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[chroma_inc], 0)
+                .unwrap();
+            write_tu_cb_coded_flag(enc, &mut ctxs.residual, false, false).unwrap();
+            write_tu_cr_coded_flag(enc, &mut ctxs.residual, false, false, false).unwrap();
+            write_tu_y_coded_flag(enc, &mut ctxs.residual, coded, false, false, false).unwrap();
+            if let Some(d) = delta {
+                write_cu_qp_delta(enc, &mut ctxs.residual, d).unwrap();
+            }
+            if coded {
+                encode_tb_coefficients_opts(
+                    enc,
+                    &mut ctxs.residual,
+                    8,
+                    8,
+                    0,
+                    &levels,
+                    RcOpts::default(),
+                )
+                .unwrap();
+            }
+        };
+    emit_cu(&mut enc, &mut ctxs, false, None); // CU0 — uncoded.
+    emit_cu(&mut enc, &mut ctxs, true, Some(2)); // CU1 — carries +2.
+    emit_cu(&mut enc, &mut ctxs, true, None); // CU2 — same QG: NO delta bin.
+    emit_cu(&mut enc, &mut ctxs, false, None); // CU3 — uncoded.
+
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    let sps = dummy_sps(0, pic_w, pic_h);
+    let mut pps = dummy_pps(pic_w, pic_h);
+    pps.pps_cu_qp_delta_enabled_flag = true;
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    // §7.4.3.7 — the wire declares ONE QG per CTU.
+    walker.set_cu_qp_delta_subdiv(0);
+    let ctu0 = walker.iter_ctus().next().unwrap();
+    let (_cus, infos, _residuals) = walker.decode_ctu_full(&ctu0).unwrap();
+    assert_eq!(infos.len(), 4);
+
+    // Only CU1 read a delta bin; CU2's coded TU must NOT have.
+    assert!(!infos[0].cu_qp_delta_read);
+    assert!(
+        infos[1].cu_qp_delta_read,
+        "first coded TU carries the QG delta"
+    );
+    assert!(
+        !infos[2].cu_qp_delta_read,
+        "IsCuQpDeltaCoded must suppress the second read in the same QG"
+    );
+    assert!(!infos[3].cu_qp_delta_read);
+
+    // Effective QpY deltas vs SliceQpY (§8.7.1: the QG is the first in
+    // the slice, so qPY_PRED = SliceQpY): CU0 parses before the delta
+    // (CuQpDeltaVal still 0); CU1..3 carry/inherit +2.
+    let eff: Vec<i32> = infos.iter().map(|i| i.cu_qp_delta_val).collect();
+    assert_eq!(eff, vec![0, 2, 2, 2], "QG delta inheritance");
+}
+
+/// r418 — §8.7.1 `qPY_PRED` neighbour prediction with per-CU QGs (the
+/// default `CuQpDeltaSubdiv = MAX` geometry): each CU's QG derives
+/// `qPY_PRED` from the qPY_A / qPY_B neighbour average with the
+/// qPY_PREV fall-backs — NOT `SliceQpY + delta`. Quad-split 16x16:
+/// CU1 signals +3, CU2 signals −2, and the uncoded CU3's QpY must be
+/// the eq. 1119 average of its left (26) and above (29) neighbours,
+/// i.e. 28 = SliceQpY + 2 — distinguishable from the pre-r418
+/// slice-relative accumulation (which would give +0).
+#[test]
+fn qg_per_cu_qp_y_pred_neighbour_average() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::ctx::{
+        ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
+        ctx_inc_intra_luma_not_planar_flag, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
+    };
+    use oxideav_h266::leaf_cu::LeafCuCtxs;
+    use oxideav_h266::residual::RcOpts;
+    use oxideav_h266::residual_enc::{
+        encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag,
+        write_tu_cr_coded_flag, write_tu_y_coded_flag,
+    };
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+
+    let mut enc = ArithEncoder::new();
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut ctxs = LeafCuCtxs::init(slice_qp);
+
+    let inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_n = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[inc.min(split_n)], 1)
+        .unwrap();
+    let inc = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let qt_slot = inc.min(split_qt_ctxs.len() - 1);
+    enc.encode_decision(&mut split_qt_ctxs[qt_slot], 1).unwrap();
+    let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
+    let split8_slot = split8.min(split_n);
+
+    let mut levels = vec![0i32; 64];
+    levels[0] = 1;
+
+    let mpm_inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    let np_inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    let chroma_inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    let mut emit_cu =
+        |enc: &mut ArithEncoder, ctxs: &mut LeafCuCtxs, coded: bool, delta: Option<i32>| {
+            enc.encode_decision(&mut split_cu_ctxs[split8_slot], 0)
+                .unwrap();
+            enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[mpm_inc], 1)
+                .unwrap();
+            enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[np_inc], 0)
+                .unwrap();
+            enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[chroma_inc], 0)
+                .unwrap();
+            write_tu_cb_coded_flag(enc, &mut ctxs.residual, false, false).unwrap();
+            write_tu_cr_coded_flag(enc, &mut ctxs.residual, false, false, false).unwrap();
+            write_tu_y_coded_flag(enc, &mut ctxs.residual, coded, false, false, false).unwrap();
+            if let Some(d) = delta {
+                write_cu_qp_delta(enc, &mut ctxs.residual, d).unwrap();
+            }
+            if coded {
+                encode_tb_coefficients_opts(
+                    enc,
+                    &mut ctxs.residual,
+                    8,
+                    8,
+                    0,
+                    &levels,
+                    RcOpts::default(),
+                )
+                .unwrap();
+            }
+        };
+    emit_cu(&mut enc, &mut ctxs, false, None); // CU0 → QpY 26.
+    emit_cu(&mut enc, &mut ctxs, true, Some(3)); // CU1 → 26 + 3 = 29.
+    emit_cu(&mut enc, &mut ctxs, true, Some(-2)); // CU2 → (29+26+1)>>1 − 2 = 26.
+    emit_cu(&mut enc, &mut ctxs, false, None); // CU3 → (26+29+1)>>1 = 28.
+
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    let sps = dummy_sps(0, pic_w, pic_h);
+    let mut pps = dummy_pps(pic_w, pic_h);
+    pps.pps_cu_qp_delta_enabled_flag = true;
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let ctu0 = walker.iter_ctus().next().unwrap();
+    let (_cus, infos, _residuals) = walker.decode_ctu_full(&ctu0).unwrap();
+    assert_eq!(infos.len(), 4);
+
+    assert!(infos[1].cu_qp_delta_read && infos[2].cu_qp_delta_read);
+    // Effective QpY − SliceQpY per §8.7.1 (see the doc comment).
+    let eff: Vec<i32> = infos.iter().map(|i| i.cu_qp_delta_val).collect();
+    assert_eq!(eff, vec![0, 3, 0, 2], "qPY_PRED neighbour average");
+}
