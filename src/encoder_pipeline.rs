@@ -3028,6 +3028,16 @@ pub fn encode_idr_with_qp_picker_cfg(
                 let mut cur_y = ctb_y;
                 for cu in cus {
                     qp_state.begin_cu();
+                    // r418 — a CU smaller than the CTB in the else
+                    // branch sits below implicit picture-boundary QT
+                    // levels (§7.4.12.4 inferred splits): its spec
+                    // cqtDepth is log2(CtbSizeY) − log2(cuSize), which
+                    // feeds the §9.3.4.2.2 split_qt_flag ctxInc when
+                    // the MTT picker codes a split at that node.
+                    let (cw0, _ch0) = parent_cu_dims(cu);
+                    let implicit_cqt = (ctb_size as u32)
+                        .trailing_zeros()
+                        .saturating_sub((cw0.max(4)).trailing_zeros());
                     emit_prepared_cu(
                         &mut cabac_enc,
                         &mut tree_ctxs,
@@ -3037,7 +3047,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         cu,
                         cur_x as u32,
                         cur_y as u32,
-                        0,
+                        implicit_cqt,
                         0,
                         &mut cu_map,
                         rc_opts,

@@ -472,10 +472,12 @@ multi-CTU, chroma SAO merge, MTT BT/TT, LMCS ± chroma scaling,
 dep-quant, SDH) decoding BYTE-EXACTLY through this crate's own full
 receive path.
 
-r415/r418 closed the external-decode gap completely: **104 of 104**
-corpus + probe streams (the 11 axes plus the ~60 single-feature
-probes of `tests/external_probe_corpus.rs`) decode byte-exactly
-through a conforming external decoder invoked black-box. The r412
+r415/r418 closed the external-decode gap completely: **112 of 112**
+corpus + probe streams (the r412 axes, the r418 extension — deep-QP
+51/57/63, MTT + multi-CTU at QP 45, the 192x128 partial-CTU-column
+layout — plus the ~60 single-feature probes of
+`tests/external_probe_corpus.rs`) decode byte-exactly through a
+conforming external decoder invoked black-box. The r412
 sparse-residual divergence resolved into five fixed root causes
 (r415): residual ctx-init table transcription drift (Tables
 120 – 125), the §7.3.11.2 `alf_use_aps_flag` presence condition, the
@@ -499,7 +501,11 @@ inherit `CuQpDeltaVal`), and the §8.7.1 `qPY_PRED` derivation
 first-QG-in-CTB-row arm, eq. 1119/1120) — so wires whose PH signals a
 `CuQpDeltaSubdiv` smaller than this encoder's per-CU maximum decode
 correctly (`CtuWalker::set_cu_qp_delta_subdiv`), pinned by hand-built
-foreign-wire CABAC fixtures.
+foreign-wire CABAC fixtures. The single-tree walker also performs the
+§7.4.12.4 **picture-boundary walk** (full-CTB square, inferred splits
+at the edges, coded boundary BT, implicit-BT `depthOffset`,
+implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
+decode end-to-end.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)

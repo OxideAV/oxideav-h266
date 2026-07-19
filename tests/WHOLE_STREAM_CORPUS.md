@@ -34,8 +34,9 @@ ffmpeg -i <name>.266 -f rawvideo -pix_fmt yuv420p <name>.ffmpeg.yuv
 cmp <name>.yuv <name>.ffmpeg.yuv
 ```
 
-r418 status: **104 of 104 streams byte-exact** (all 11 corpus axes +
-all ~60 probe streams). The r415 remainder — 3 streams (`qp45`,
+r418 status: **112 of 112 streams byte-exact** (all corpus axes —
+including the 8 r418 extension streams below — plus all ~60 probe
+streams). The r415 remainder — 3 streams (`qp45`,
 `mtt_bt`, `mtt_bt_tt`) with 14 – 49 luma-sample recon-only diffs near
 32/64-aligned CU edges — root-caused to the §8.8.3.6.7 weak-filter
 p1/q1 clip bound transcribed as `(−tC) >> 1` instead of the spec's
@@ -83,6 +84,21 @@ distinct root-cause families, all fixed in r415:
 | mtt_bt / mtt_bt_tt | byte-exact | byte-exact (r418) | b9a10b06a87d1122 / 598e470f2d04655c | 13fe347be6c297ad / 9b7e0a8864d97aa5 |
 | lmcs / lmcs_chroma_scaling | byte-exact | byte-exact | 81af59718db2c07b / 8a91b058f84df4d3 | 1e164146428d7493 |
 | dep_quant / sign_data_hiding | byte-exact | byte-exact | bfc3898b6c9d140b / 0c841ad45810c9a8 | ff8e5a3a0c924e49 / d27ad4ff087635a6 |
+| qp51 / qp57 / qp63 (r418) | byte-exact | byte-exact | 471edd9fb6bb7064 / b95e46609b7d6efb / c26ea7b881e008f2 | 2e68ce6e24117003 / 25b4cd760abc6067 / 9c5d7c150f204c9f |
+| mtt_bt_qp45 / mtt_bt_tt_qp45 (r418) | byte-exact | byte-exact | 8daf4a85db40ec28 | 28e105132000b8ae |
+| multi_ctu_qp45 / multi_ctu_mtt_qp45 (r418) | byte-exact | byte-exact | b54b2fe36d3200de / 99c0790dfdfdb821 | 052997467c44de0a |
+| wide_192x128_qp45 (r418) | byte-exact | byte-exact | d162706ece057f57 | 9de6a3f26d0c8df2 |
+
+r418 extension notes: the deep-QP sweep (51 / 57 / 63) covers the
+odd-tC deblock threshold band up to the table maxima; `multi_ctu_qp45`
+exercises the §8.8.3.6.2 step-6 luma CTB-row rule externally (interior
+CTB row at y = 128 with 64-tall CUs and active long filters);
+`wide_192x128_qp45` is the first non-CTB-multiple layout — its 64-wide
+right CTB column decodes through the §7.4.12.4 boundary implicit-split
+walk. At QP 45 the MTT pickers choose no splits on this content (the
+`mtt_*_qp45` streams differ from `qp45` only in the SPS MTT signalling
+and the identical reconstruction confirms the tree parse); the QP-30
+`mtt_bt` / `mtt_bt_tt` axes remain the MTT-shape coverage.
 
 Probe extension (`external_probe_corpus.rs`): all ~60 probe streams
 byte-exact through the reference decoder, including every sparse

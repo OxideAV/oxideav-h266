@@ -2356,18 +2356,34 @@ fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     };
 
     // ---- B-slice CABAC payload synthesis ----------------------------
-    // Single 16x8 leaf CU (split_cu_flag = 0 at the top level), then
-    // cu_skip_flag = 1 + merge_idx = 0 → mergeCandList[0] = bipred
-    // zero-MV pad.
+    // r418 — the walker performs the spec §7.3.11.4 boundary walk over
+    // the FULL 32x32 CTB square: the 32x32 root and its (0, 0) 16x16
+    // quadrant both exceed the 16x8 picture, so their split_cu_flag is
+    // §7.4.12.4-inferred (no bins). At the 16x16 node the §6.4.2
+    // boundary arms still allow SPLIT_BT_HOR, so split_qt_flag IS
+    // present (coded 0 → the mtt flags infer BT_HOR at the bottom
+    // picture edge), yielding the in-picture 16x8 node whose
+    // split_cu_flag = 0 opens the CU: cu_skip_flag = 1 + merge_idx = 0
+    // → mergeCandList[0] = bipred zero-MV pad.
     let slice_qp = 26;
     let init_type = 2u8;
     let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
 
     let payload = {
+        use oxideav_h266::ctx::ctx_inc_split_qt_flag;
         let mut enc = ArithEncoder::new();
-        let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 8, 1, 1, 1, 1, 1) as usize;
+        // 16x16 boundary node (cqt_depth 1 below the implicit root):
+        // split_qt_flag = 0.
+        let qt_inc = ctx_inc_split_qt_flag(false, false, 0, 0, 1) as usize;
+        let qt_slot = qt_inc.min(split_qt_ctxs.len() - 1);
+        enc.encode_decision(&mut split_qt_ctxs[qt_slot], 0).unwrap();
+        // 16x8 in-picture leaf: split_cu_flag = 0. Allows at this BT
+        // child (mtt_depth 1): qt = 0, bt_ver = bt_hor = tt_ver = 1,
+        // tt_hor = 0 (h = 8 <= 2·minTt).
+        let split_inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 8, 1, 1, 1, 0, 0) as usize;
         let split_slot = split_inc.min(split_cu_ctxs.len() - 1);
         enc.encode_decision(&mut split_cu_ctxs[split_slot], 0)
             .unwrap();

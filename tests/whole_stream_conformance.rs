@@ -399,3 +399,83 @@ fn whole_stream_sign_data_hiding() {
     assert_byte_exact(&dec, &rec, "sign data hiding");
     dump_corpus("sign_data_hiding", &bs, &dec);
 }
+
+/// r418 — deep-QP deblocking stress: QP 51 / 57 / 63 on the
+/// structured source. QP ≥ 45 puts the §8.8.3 luma thresholds in the
+/// odd-tC band (tC′ 80 / 157 / 395 → tC 20 / 39 / 99 at 8-bit) where
+/// the eqs. 1385/1387 −(tC >> 1) weak-filter clip and the long-filter
+/// clip products exercise rounding corners the qp ≤ 45 sweep misses.
+#[test]
+fn whole_stream_deep_qp_sweep() {
+    let src = structured_source(128, 128);
+    for qp in [51, 57, 63] {
+        let (bs, rec) = encode_idr_with_residuals(&src, qp).unwrap();
+        let dec = decode_whole_stream(&bs);
+        assert_byte_exact(&dec, &rec, &format!("deep qp {qp}"));
+        dump_corpus(&format!("qp{qp}"), &bs, &dec);
+    }
+}
+
+/// r418 — MTT shapes at high QP: the BT and BT+TT pickers at QP 45
+/// combine asymmetric block pairings (16-vs-64 style edges → the
+/// §8.8.3.6.8 eqs. 1391 – 1394 asymmetric long filters) with the odd-tC
+/// threshold band. The r415 mtt streams ran at QP 30 only.
+#[test]
+fn whole_stream_mtt_high_qp() {
+    let src = structured_source(128, 128);
+    let mut cfg = EncoderConfig::new(128, 128);
+    cfg.enable_mtt_bt_picker = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 45, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "MTT BT qp45");
+    dump_corpus("mtt_bt_qp45", &bs, &dec);
+
+    let src = structured_source(128, 128);
+    let mut cfg = EncoderConfig::new(128, 128);
+    cfg.enable_mtt_bt_picker = true;
+    cfg.enable_mtt_tt_picker = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 45, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "MTT BT+TT qp45");
+    dump_corpus("mtt_bt_tt_qp45", &bs, &dec);
+}
+
+/// r418 — multi-CTU at high QP with MTT: a 256x256 picture has an
+/// interior CTB row at y = 128, so ≥32-tall CUs above it hit the
+/// §8.8.3.6.2 step-6 luma CTB-row rule (sidePisLargeBlk = 0 →
+/// eq. 1294 asymmetric (3, 7) long filter) — a path the single-CTU
+/// corpus never reaches externally. QP 45 keeps the filters active.
+#[test]
+fn whole_stream_multi_ctu_mtt_qp45() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.enable_mtt_bt_picker = true;
+    cfg.enable_mtt_tt_picker = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 45, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "256x256 MTT qp45");
+    dump_corpus("multi_ctu_mtt_qp45", &bs, &dec);
+}
+
+/// r418 — plain multi-CTU at QP 45: CTB-row deblocking (luma step-6 +
+/// the chroma CTB-row (1, 3) cap) with 64x64 CUs, no MTT.
+#[test]
+fn whole_stream_multi_ctu_qp45() {
+    let src = structured_source(256, 256);
+    let (bs, rec) = encode_idr_with_residuals(&src, 45).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "256x256 qp45");
+    dump_corpus("multi_ctu_qp45", &bs, &dec);
+}
+
+/// r418 — non-square multi-CTU layout with a partial-width CTU column
+/// (192 = 128 + 64): the right CTU column is 64 wide, exercising the
+/// boundary implicit splits + edge-clipped deblock/SAO/ALF at high QP.
+#[test]
+fn whole_stream_192x128_qp45() {
+    let src = structured_source(192, 128);
+    let (bs, rec) = encode_idr_with_residuals(&src, 45).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "192x128 qp45");
+    dump_corpus("wide_192x128_qp45", &bs, &dec);
+}

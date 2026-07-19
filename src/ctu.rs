@@ -2492,6 +2492,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             /// `CuQpDeltaSubdiv` (`qgNextOnY`), permanently disabling
             /// QG declarations in that subtree.
             qg_on_y: bool,
+            /// §7.4.12.4 `depthOffset` — incremented by boundary
+            /// implicit BT splits; raises the effective `maxMttDepth`.
+            depth_offset: u32,
         }
         // r412 — §6.4.1 – §6.4.3 allowed-split constraints from the
         // SPS partition constraints (intra vs inter slice set).
@@ -2511,17 +2514,28 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let mut cus: Vec<CtuCu> = Vec::new();
         let mut infos: Vec<LeafCuInfo> = Vec::new();
         let mut residuals: Vec<LeafCuResidual> = Vec::new();
+        // r418 — the walk covers the FULL CtbSizeY x CtbSizeY square
+        // (§7.3.11.2): a node that extends beyond the picture takes
+        // the §7.4.12.4 inferred (bin-less) splits and children lying
+        // wholly outside the picture are skipped, so every leaf is a
+        // fully-inside CU. (Pre-r418 the root was pre-clipped to the
+        // picture remainder, which mis-walked partial-CTU columns /
+        // rows — a 192-wide picture's 64-wide right CTB column read a
+        // split bin the wire never coded.)
+        let pic_w = self.layout.pic_width_luma;
+        let pic_h = self.layout.pic_height_luma;
         let mut stack = vec![Node {
             x: 0,
             y: 0,
-            w: ctu.width_luma,
-            h: ctu.height_luma,
+            w: self.layout.ctb_size_y,
+            h: self.layout.ctb_size_y,
             cqt_depth: 0,
             mtt_depth: 0,
             parent_tt_ver: None,
             part_idx: 0,
             cb_subdiv: 0,
             qg_on_y: true,
+            depth_offset: 0,
         }];
         while let Some(n) = stack.pop() {
             // r418 — §7.3.11.4 quantization-group declaration: a node
@@ -2539,7 +2553,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.qg_delta_val = 0;
                 self.qg_qp_y_pred = self.derive_qp_y_pred(ctu.x0 + n.x, ctu.y0 + n.y);
             }
-            let allows = constraints.allows(
+            let allows = constraints.allows_off(
                 ctu.x0 + n.x,
                 ctu.y0 + n.y,
                 n.w,
@@ -2548,6 +2562,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 TreeType::SingleTree,
                 n.parent_tt_ver,
                 n.part_idx,
+                n.depth_offset,
             );
             let (
                 left_avail,
@@ -2558,8 +2573,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cqt_depth_above,
             ) = self.nbr_map.neighbour_state(ctu.x0 + n.x, ctu.y0 + n.y);
             // split_cu_flag — §7.3.11.4 presence: any allowed split
-            // (interior nodes; edge CTUs are pre-clipped).
-            let split_cu = if allows.any() {
+            // AND the node fully inside the picture; otherwise the
+            // §7.4.12.4 inference (1 when the node exceeds a picture
+            // edge, 0 otherwise).
+            let in_pic = ctu.x0 + n.x + n.w <= pic_w && ctu.y0 + n.y + n.h <= pic_h;
+            let split_cu = if allows.any() && in_pic {
                 let inc = crate::ctx::ctx_inc_split_cu_flag(
                     left_avail,
                     above_avail,
@@ -2577,7 +2595,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.arith
                     .decode_decision(&mut self.cabac.tree_ctxs.split_cu[inc.min(ctx_n)])?
             } else {
-                0
+                u32::from(!in_pic)
             };
             if split_cu == 0 {
                 // Leaf — commit to the neighbour map, then decode this
@@ -2644,13 +2662,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let ctx_n = self.cabac.tree_ctxs.split_qt.len() - 1;
                 self.arith
                     .decode_decision(&mut self.cabac.tree_ctxs.split_qt[inc.min(ctx_n)])?
+            } else if !allows.any() {
+                // §7.4.12.4 — split_cu_flag == 1 with every allowed
+                // split FALSE infers split_qt_flag = 1 (the boundary
+                // implicit-QT arm).
+                1
             } else {
                 u32::from(allows.qt)
             };
             let children: Vec<Node> = if split_qt == 1 {
                 let hw = n.w / 2;
                 let hh = n.h / 2;
-                vec![
+                // §7.3.11.4 — quadrants outside the picture are not
+                // walked (x1 / y1 gates).
+                let x1_in = ctu.x0 + n.x + hw < pic_w;
+                let y1_in = ctu.y0 + n.y + hh < pic_h;
+                let all = vec![
                     Node {
                         x: n.x,
                         y: n.y,
@@ -2662,6 +2689,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 0,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        depth_offset: 0,
                     },
                     Node {
                         x: n.x + hw,
@@ -2674,6 +2702,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 1,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        depth_offset: 0,
                     },
                     Node {
                         x: n.x,
@@ -2686,6 +2715,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 2,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        depth_offset: 0,
                     },
                     Node {
                         x: n.x + hw,
@@ -2698,8 +2728,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 3,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        depth_offset: 0,
                     },
-                ]
+                ];
+                all.into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| match i {
+                        1 => x1_in,
+                        2 => y1_in,
+                        3 => x1_in && y1_in,
+                        _ => true,
+                    })
+                    .map(|(_, c)| c)
+                    .collect()
             } else {
                 // MTT split — presence-aware vertical / binary flags
                 // (§7.3.11.4 / §7.4.12.4).
@@ -2751,7 +2792,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 if mtt_binary == 1 {
                     if mtt_vertical == 1 {
                         let hw = n.w / 2;
-                        vec![
+                        // §7.3.11.4 SPLIT_BT_VER — depthOffset grows
+                        // when the parent crosses the right picture
+                        // edge; the second child exists only when
+                        // x1 < pic_w.
+                        let bt_doff = n.depth_offset + u32::from(ctu.x0 + n.x + n.w > pic_w);
+                        let x1_in = ctu.x0 + n.x + hw < pic_w;
+                        let mut v = vec![
                             Node {
                                 x: n.x,
                                 y: n.y,
@@ -2763,6 +2810,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                depth_offset: bt_doff,
                             },
                             Node {
                                 x: n.x + hw,
@@ -2775,11 +2823,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                depth_offset: bt_doff,
                             },
-                        ]
+                        ];
+                        if !x1_in {
+                            v.truncate(1);
+                        }
+                        v
                     } else {
                         let hh = n.h / 2;
-                        vec![
+                        // §7.3.11.4 SPLIT_BT_HOR — mirrored on the
+                        // bottom picture edge.
+                        let bt_doff = n.depth_offset + u32::from(ctu.y0 + n.y + n.h > pic_h);
+                        let y1_in = ctu.y0 + n.y + hh < pic_h;
+                        let mut v = vec![
                             Node {
                                 x: n.x,
                                 y: n.y,
@@ -2791,6 +2848,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                depth_offset: bt_doff,
                             },
                             Node {
                                 x: n.x,
@@ -2803,8 +2861,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                depth_offset: bt_doff,
                             },
-                        ]
+                        ];
+                        if !y1_in {
+                            v.truncate(1);
+                        }
+                        v
                     }
                 } else {
                     // §7.3.11.4 — TT children propagate qgNextOnY =
@@ -2828,6 +2891,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                depth_offset: n.depth_offset,
                             },
                             Node {
                                 x: n.x + q,
@@ -2840,6 +2904,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: qg_next,
+                                depth_offset: n.depth_offset,
                             },
                             Node {
                                 x: n.x + q * 3,
@@ -2852,6 +2917,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 2,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                depth_offset: n.depth_offset,
                             },
                         ]
                     } else {
@@ -2868,6 +2934,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                depth_offset: n.depth_offset,
                             },
                             Node {
                                 x: n.x,
@@ -2880,6 +2947,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: qg_next,
+                                depth_offset: n.depth_offset,
                             },
                             Node {
                                 x: n.x,
@@ -2892,6 +2960,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 2,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                depth_offset: n.depth_offset,
                             },
                         ]
                     }

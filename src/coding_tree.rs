@@ -333,12 +333,43 @@ impl SplitConstraints {
         parent_tt_ver: Option<bool>,
         part_idx: u32,
     ) -> bool {
+        self.allow_bt_off(
+            vertical,
+            x0,
+            y0,
+            w,
+            h,
+            mtt_depth,
+            tree,
+            parent_tt_ver,
+            part_idx,
+            0,
+        )
+    }
+
+    /// §6.4.2 with the §7.4.12.4 `depthOffset` fold: at picture
+    /// boundaries the implicit binary splits raise the effective
+    /// `maxMttDepth` to `MaxMttDepth + depthOffset`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allow_bt_off(
+        &self,
+        vertical: bool,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        mtt_depth: u32,
+        tree: TreeType,
+        parent_tt_ver: Option<bool>,
+        part_idx: u32,
+        depth_offset: u32,
+    ) -> bool {
         let cb_size = if vertical { w } else { h };
         let min_bt = 1u32 << self.min_cb_log2;
         if cb_size <= min_bt
             || w > self.max_bt_size
             || h > self.max_bt_size
-            || mtt_depth >= self.max_mtt_depth
+            || mtt_depth >= self.max_mtt_depth + depth_offset
         {
             return false;
         }
@@ -398,13 +429,30 @@ impl SplitConstraints {
         mtt_depth: u32,
         tree: TreeType,
     ) -> bool {
+        self.allow_tt_off(vertical, x0, y0, w, h, mtt_depth, tree, 0)
+    }
+
+    /// §6.4.3 with the §7.4.12.4 `depthOffset` fold (see
+    /// [`Self::allow_bt_off`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn allow_tt_off(
+        &self,
+        vertical: bool,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        mtt_depth: u32,
+        tree: TreeType,
+        depth_offset: u32,
+    ) -> bool {
         let cb_size = if vertical { w } else { h };
         let min_tt = 1u32 << self.min_cb_log2;
         let max_tt = self.max_tt_size.min(64);
         if cb_size <= 2 * min_tt
             || w > max_tt
             || h > max_tt
-            || mtt_depth >= self.max_mtt_depth
+            || mtt_depth >= self.max_mtt_depth + depth_offset
             || x0 + w > self.pic_w
             || y0 + h > self.pic_h
         {
@@ -434,12 +482,42 @@ impl SplitConstraints {
         parent_tt_ver: Option<bool>,
         part_idx: u32,
     ) -> SplitAllows {
+        self.allows_off(x0, y0, w, h, mtt_depth, tree, parent_tt_ver, part_idx, 0)
+    }
+
+    /// [`Self::allows`] with the §7.4.12.4 boundary `depthOffset`
+    /// (raises the effective `maxMttDepth` below implicit
+    /// picture-boundary binary splits).
+    #[allow(clippy::too_many_arguments)]
+    pub fn allows_off(
+        &self,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        mtt_depth: u32,
+        tree: TreeType,
+        parent_tt_ver: Option<bool>,
+        part_idx: u32,
+        depth_offset: u32,
+    ) -> SplitAllows {
         // §6.4.1 quad split keys on cbSize = cbWidth (square nodes on
         // the QT phase; MTT-phase nodes have mtt_depth != 0 → false).
         SplitAllows {
             qt: self.allow_split_qt(w.max(h), mtt_depth, tree),
-            bt_ver: self.allow_bt(true, x0, y0, w, h, mtt_depth, tree, parent_tt_ver, part_idx),
-            bt_hor: self.allow_bt(
+            bt_ver: self.allow_bt_off(
+                true,
+                x0,
+                y0,
+                w,
+                h,
+                mtt_depth,
+                tree,
+                parent_tt_ver,
+                part_idx,
+                depth_offset,
+            ),
+            bt_hor: self.allow_bt_off(
                 false,
                 x0,
                 y0,
@@ -449,9 +527,10 @@ impl SplitConstraints {
                 tree,
                 parent_tt_ver,
                 part_idx,
+                depth_offset,
             ),
-            tt_ver: self.allow_tt(true, x0, y0, w, h, mtt_depth, tree),
-            tt_hor: self.allow_tt(false, x0, y0, w, h, mtt_depth, tree),
+            tt_ver: self.allow_tt_off(true, x0, y0, w, h, mtt_depth, tree, depth_offset),
+            tt_hor: self.allow_tt_off(false, x0, y0, w, h, mtt_depth, tree, depth_offset),
         }
     }
 }
