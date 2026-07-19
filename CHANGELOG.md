@@ -4,6 +4,57 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-h266/compare/v0.0.8...v0.0.9) - 2026-07-19
+
+### Other
+
+- tile_scan coverage — eq. 20 single-slice-per-subpic arms (whole-tile subpictures + the subpicHeightLessThanOneTileFlag CTU-row arm) and the explicit rectangular-slice geometry replay (multi-slice-per-tile CtbAddrInSlice rectangles, full-picture cover pins)
+- tiles/WPP parse-side prep — §6.5.1 tile_scan (eqs. 14–22 boundary/CTB maps + CtbAddrInSlice incl. eq. 20 subpic and eq. 21 multi-slice-per-tile arms), faithful §7.3.2.5 rect-slice loop (NumSlicesInTile syntax advance + uniform replication + height-inheritance inference), §7.4.8 eq. 141 NumEntryPoints with sh_entry_point_offset parsing for WPP/tile slices
+- §7.4.12.4 picture-boundary coding-tree walk (full-CTB square, inferred edge splits, coded boundary BT, depthOffset via allows_off, implicit-level cqtDepth) + corpus extension to 112/112 external byte-exact — deep-QP 51/57/63, MTT + 256x256 at qp45 (step-6 CTB-row rule live externally), 192x128 partial-CTU column
+- §7.3.11.4 quantization-group declarations + §8.7.1 qPY_PRED in the single-tree walker — cbSubdiv/qgOnY threading (QT/TT-side +2, BT/TT-centre +1, qgNextOnY), one cu_qp_delta_abs per QG with CuQpDeltaVal inheritance, per-4x4 QpY map with qPY_A/qPY_B CTB fall-backs + first-QG-in-CTB-row arm + eq. 1119/1120; set_cu_qp_delta_subdiv takes the eq. 123/133 value; hand-built foreign-wire CABAC pins
+- 104/104 external byte-exact — §8.8.3.6.7 weak-filter clip bound −(tC>>1) (eqs. 1385/1387, the odd-tC r415 remainder) + the full §8.8.3.6.2 decision: step-6 luma CTB-row rule (eq. 1294 asymmetric (3,7) at CTB rows), asymmetric §8.8.3.6.8 long filters (eqs. 1391–1394 + eq. 1401/1402 3-deep arrays), §8.8.3.3 either-side ≤4 rule, step-9 strong/dEp/dEq gates
+- external-decoder probe corpus (~60 single-feature streams) + r415 validation matrix — 101/104 corpus+probe streams byte-exact through a conforming external decoder (black-box); corpus doc records the five fixed root-cause families and the remaining §8.8.3 luma long-filter corner (3 streams, 14-49 luma samples, recon-only)
+- wire + reconstruction conformance — §7.4.3.7 per-CU QG declaration (PH signals max ph_cu_qp_delta_subdiv_intra_slice; subdiv 0 declared one QG per CTU while the pipeline arms cu_qp_delta per CU), §7.4.3.4 chroma QP table emitted as true identity (sps_delta_qp_diff_val = 1; the all-zero point derived to QpC = QpY - 1 above QP 27) with §8.7.1 table-mapped chroma QP in the walker, and the §8.8.3.3 chroma CTB-row deblock rule (maxFilterLengthP = 1 on horizontal edges at chroma CTB boundaries; §8.8.3.6.4 p3=p2=p1 decision substitution + §8.8.3.6.10 asymmetric (1,3) filter)
+- §8.8.5.5 (vbOffset=4) + §8.8.5.6 ALF virtual-boundary padding in the luma classification — gradient taps of the two 4x4 sub-block rows around yCtb + CtbSizeY - 4 clamp at the boundary instead of reading through it; the raw picture-clamped reads mis-classified the carve-out rows (external recon mismatch on the last 8 rows of every full-height CTB)
+- §7.3.11.2 alf_use_aps_flag presence — the bin exists only when sh_num_alf_aps_ids_luma > 0 (inferred 0 -> fixed-filter branch); the unconditional read/write under alf_ctb_flag == 1 put a spurious bin on every ALF-on CTB
+- §9.3.4.2.4 chroma last_sig_coeff_*_prefix ctxShift — Clip3(0,2, 2^log2TbSize >> 3): the spec's 2 carries log2TbSize as an EXPONENT ((1 << log2TbSize) >> 3), not a factor; chroma TBs of log2 >= 3 mis-bucketed prefix bins from binIdx 2 up (every off-DC chroma residual desynced externally)
+- §9.3.2.2 residual context-init tables retranscribed — Tables 120-125 carried dropped/duplicated initValue/shiftIdx entries (~615 wrong cells, incl. shiftIdx errors inside the I-slice initType-0 blocks); wrong rate adaptation drifted the probability state off conforming decoders and flipped marginal bins content-dependently (the r412 sparse-residual desync corner)
+- doc(hidden) the 49 internal modules — stable surface is registry + NAL/parameter-set/SEI parsing + documented encoder entry points
+- h266 README + CHANGELOG: r412 — whole-stream decode conformance corpus, full §8.4.5.2 intra pipeline + decode-order availability, interleaved coding_tree + allowed-split conformance, 64-point zero-out, encoder wire-conformance
+- §6.4.1–§6.4.3 allowed-split constraints drive split-bin presence + ctxIncs; §9.3.4.3.5 termination flush; last_sig full-vs-Zo ctx split; MaxTbSizeY=64 on the wire — first whole stream byte-exact through a conforming external decoder
+- whole-stream decode conformance — §7.3.11.4 interleaved coding_tree, §7.3.11.2 in-stream ALF CTU decode, §7.3.11.11 64-point zero-out, encoder wire-conformance (intra-mode bins, DC+PDPC coding loop, end_of_slice_one_bit, signalled-only SAO) — 11-axis byte-exact corpus
+- regression pin — §6.4.4 decode-order availability on the BR-quadrant above-right reference run
+- §6.4.4 / eq. 1212 decode-order reference availability + the full §8.4.5.2 intra pipeline live in the CTU walker
+- §8.4.5.2 full intra sample prediction machinery — Table 24/25 general angular, wide-angle remap, spec-order reference substitution, [1 2 1] reference filter, PDPC
+- h266 README: r409 — P/B pred_mode_flag + intra-in-inter, IBC on P/B + dual-tree, walker AMVP cascade, dispatcher order + cu_skip ctxInc + HMVP row-reset + MPM threading fixes
+- §8.4.2 MPM candidate threading — parse-time IntraPredModeY/IntraMipFlag/CuPredMode neighbour views in the CTU walker (planar-only stub removed)
+- §7.3.11.5 non-merge inter (AMVP) cascade live in the full-CABAC walker — P/B AMVP CUs to pixels (RefIdxSym/NoBackwardPred/NumRefIdxActive slice inputs, AMVR+BCW gates, affine parse + precise recon refusal)
+- §7.3.11.5 non-merge inter dispatchers — L0-block-first spec element order (bi-pred desync fix) + ph_mvd_l1_zero_flag L1-MVD suppression arm
+- §7.3.11.5/§8.6 IBC on P/B slices + DUAL_TREE_LUMA — inter-slice prologue IBC arms, tree-aware IBC reconstruction, dual-tree IbcVirBuf maintenance + parse-grid commits
+- §7.3.11.5 pred_mode_flag on P/B slices — intra CUs inside inter slices decode to pixels (eq. 1552 ctxInc + parse-time MODE_INTRA grid + §7.4.12.5 inferences)
+- §9.3.4.2.2 cu_skip_flag ctxInc parse-time CuSkipFlag sourcing on inter slices (stale-motion-field fix) + §7.3.11.1 per-CTU-row NumHmvpCand=0 reset
+- h266 README + CHANGELOG: r406 — I-slice IBC to pixels (§7.3.11.5 / §8.6) + cu_coded_flag merge-inference conformance fix; IBC skip/merge/AMVR chain fixture
+- §8.6 IBC reconstruction to pixels — IbcVirBuf maintenance in the walker (row reset, eq. 181/182 invalidation, eq. 1207-1209 fill), §8.6.2 BV derivation with spatial A1/B1 + HmvpIbc + AMVR fold, §8.6.3 luma+chroma copy, §8.6.2.1 conformance enforcement, eqs. 1111-1118 bookkeeping
+- §7.3.11.5 I-slice IBC parse — cu_skip/pred_mode_ibc_flag prologue (Table 65 ctxs, eq. 1551 ctxInc), merge_idx IBC cMax, mvd+mvp_l0+amvr IBC arm, parse-time MODE_IBC/CuSkipFlag neighbour grids
+- §8.6.2 IBC block-vector machinery — HmvpIbcCandList, bvCandList build, 18-bit BV fold, chroma BV, IbcVirBuf with eqs. 181/182 invalidation + eqs. 1207-1209 fill + §8.6.3 reads
+- §7.3.11.5 cu_coded_flag merge-CU inference fix — no bin on merge CUs (§7.4.12.5 infers skip→0, else→1); re-shape merge fixtures + GPM fixture qp-init fix
+- h266 README + CHANGELOG: r391 — dual-tree intra decode, §8.4.4 all arms, chroma-tree LFNST, DMVR completion, encoder LMCS chroma scaling
+- §8.7.5.3 encoder LMCS chroma residual scaling — ph_chroma_residual_scale_flag on the wire
+- §7.3.11.5 chroma-tree lfnst_idx + §8.7.4.1 eq. 180 chroma inverse LFNST
+- §8.4.4 CclmEnabled 64-grid derivation — CCLM + dual-tree at CTB >= 64
+- §7.3.11.2 dual-tree intra decode — implicit QT split + DUAL_TREE_LUMA/CHROMA walks to pixels
+- §8.5.1 DMVR completion — per-sub-block BDOF + MvDmvrLX temporal-field split
+- add CI / crates.io / docs.rs / MIT-license badges
+- h266 README: r387 — dep-quant/SDH + scaling lists in decode, encoder knobs, wire-conformance sweep
+- §8.7.3 explicit scaling lists live in the CTU walker
+- §7.3.2.21 scaling_list_data() APS parse + §7.4.3.20 ScalingMatrixRec derivation
+- encoder-side sign data hiding — parity conditioner + pipeline knob
+- encoder-side dependent quantization — greedy TCQ knob through the IDR pipeline
+- §7.4.3.5 pps_*_info_in_ph_flag inference fix — PH/SH information split was inverted
+- §7.3.2.3 single-layer VPS wire conformance (vps_num_ptls_minus1 inference + vps_extension_flag)
+- §7.3.7 dep-quant + sign-data-hiding accepted by the CTU walker
+- §7.3.11.11 dependent quantization + sign data hiding in the residual reader/writer; last_sig_coeff group-index/TR-cMax fix
+
 ### Other
 
 - round 418: **external decode conformance — 104 of 104 corpus + probe streams decode byte-exactly through a conforming external decoder (black-box); the r415 luma deblocking remainder is closed**. The three remaining streams (`qp45`, `mtt_bt`, `mtt_bt_tt`; 14 – 49 luma samples each, reconstruction-only) root-caused to a §8.8.3.6.7 weak-filter transcription slip: the p1/q1 clip bound (eqs. 1385/1387) was coded `(−tC) >> 1` instead of `−(tC >> 1)` — the arithmetic right-shift rounds toward −∞, over-widening the bound by 1 exactly when tC is odd and the clip binds (tC = 13 at QP 45 / bS 2 was the first corpus point to hit it; ALF then spread each ±1 across its 7x7 diamond). Found by running an independent §8.8.3.6.2/.6/.7/.8 transcription sample-exact against per-stage filter dumps of the failing stream. The same commit lands the rest of §8.8.3.6.2 faithfully, restructured as one decision (steps 1 – 9) + one dispatch (§8.8.3.6.3):
