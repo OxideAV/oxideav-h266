@@ -48,6 +48,10 @@ use crate::tables::{init_contexts, SyntaxCtx};
 /// CABAC context bundle used by the per-CTU ALF syntax parser /
 /// emitter. Each field is the full per-syntax-element ctxIdx array
 /// from Tables 52..56.
+///
+/// `Clone` supports the §9.3.2.3 / §9.3.2.4 WPP context
+/// storage / synchronization processes.
+#[derive(Clone)]
 pub struct AlfCtxs {
     /// Table 52 — `alf_ctb_flag` (27 ctxIdx, 3 per cIdx per initType).
     pub ctb_flag: Vec<ContextModel>,

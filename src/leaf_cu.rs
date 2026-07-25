@@ -845,6 +845,10 @@ pub const INTRA_L_CCLM: u32 = 82;
 pub const INTRA_T_CCLM: u32 = 83;
 
 /// CABAC context bundle used by [`LeafCuReader`].
+///
+/// `Clone` supports the §9.3.2.3 / §9.3.2.4 WPP context
+/// storage / synchronization processes.
+#[derive(Clone)]
 pub struct LeafCuCtxs {
     pub intra_bdpcm_luma_flag: Vec<ContextModel>,
     pub intra_bdpcm_luma_dir_flag: Vec<ContextModel>,

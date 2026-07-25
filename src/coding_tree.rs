@@ -64,7 +64,12 @@ pub struct Cu {
 }
 
 /// CABAC context arrays used by the coding-tree walker.
-#[derive(Debug)]
+///
+/// `Clone` supports the §9.3.2.3 / §9.3.2.4 WPP context
+/// storage / synchronization processes (the walker snapshots every
+/// bundle after the first CTU of a CTU row and restores it at the
+/// next row start).
+#[derive(Debug, Clone)]
 pub struct TreeCtxs {
     pub split_cu: Vec<ContextModel>,
     pub split_qt: Vec<ContextModel>,
@@ -110,6 +115,13 @@ pub struct CuNeighbourMap {
     width_mcb: usize,
     height_mcb: usize,
     cells: Vec<Option<NeighbourDescriptor>>,
+    /// r429 — §6.4.4 availability region, in luma samples
+    /// (`x0, y0, x1, y1`, half-open). Look-ups outside the region
+    /// report "no neighbour" even when a cell is populated: a
+    /// neighbouring block in a different tile (or, later, slice) is
+    /// unavailable to the §9.3.4.2 ctxInc derivations despite having
+    /// been decoded. Defaults to the whole picture.
+    region: (u32, u32, u32, u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,7 +141,17 @@ impl CuNeighbourMap {
             width_mcb,
             height_mcb,
             cells: vec![None; width_mcb * height_mcb],
+            region: (0, 0, w, h),
         }
+    }
+
+    /// r429 — restrict §6.4.4 availability to the luma-sample
+    /// rectangle `[x0, x1) × [y0, y1)` (the current tile). The
+    /// tile-aware CTU walk updates this at every tile transition;
+    /// single-tile callers never need to touch it (the constructor
+    /// default is the whole picture).
+    pub fn set_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        self.region = (x0, y0, x1, y1);
     }
 
     /// Insert one CU rectangle into the map.
@@ -152,6 +174,10 @@ impl CuNeighbourMap {
 
     fn get(&self, x: i64, y: i64) -> Option<NeighbourDescriptor> {
         if x < 0 || y < 0 {
+            return None;
+        }
+        let (rx0, ry0, rx1, ry1) = self.region;
+        if x < i64::from(rx0) || y < i64::from(ry0) || x >= i64::from(rx1) || y >= i64::from(ry1) {
             return None;
         }
         let mx = (x as usize) / 4;

@@ -51,6 +51,10 @@ use crate::tables::{init_contexts, SyntaxCtx};
 /// CABAC context bundle used by the SAO syntax parser. Sized off
 /// Table 51 — both arrays carry one ctxIdx per initType but the parser
 /// only uses the slot for the current slice's initType.
+///
+/// `Clone` supports the §9.3.2.3 / §9.3.2.4 WPP context
+/// storage / synchronization processes.
+#[derive(Clone)]
 pub struct SaoCtxs {
     /// Table 57 — `sao_merge_left_flag` and `sao_merge_up_flag` share
     /// the same per-initType slots.

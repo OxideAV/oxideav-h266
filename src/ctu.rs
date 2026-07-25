@@ -1030,6 +1030,60 @@ pub struct CtuWalker<'a, 'b> {
     /// r418 — per-4x4 `QpY` map in decode order (the §8.7.1 qPY_A /
     /// qPY_B source). Same grid geometry as `intra_grid`.
     qp_y_map: Vec<i32>,
+    /// r429 — §6.5.1 tile / WPP slice-data walk plan. `None` keeps the
+    /// historical single-tile raster walk (`pps_no_pic_partition_flag`
+    /// and no entropy sync); built lazily by
+    /// [`Self::decode_picture_into`] from the SPS + PPS + slice header
+    /// via [`crate::tile_scan::TileScan`].
+    tile_walk: Option<TileWalkState>,
+    /// r429 — §6.4.4 availability region of the *current* CTU: the
+    /// containing tile's luma-sample rectangle (`x0, y0, x1, y1`,
+    /// half-open, clipped to the picture). Neighbour probes outside it
+    /// read unavailable regardless of decode order. Defaults to the
+    /// whole picture.
+    region_rect: (u32, u32, u32, u32),
+    /// r429 — exclusive luma-sample column cap for the §6.4.4 WPP arm
+    /// (`sps_entropy_coding_sync_enabled_flag == 1` makes any
+    /// neighbour with `xNbY >> CtbLog2SizeY >= (xCurr >> CtbLog2SizeY)
+    /// + 1` unavailable). `u32::MAX` when entropy sync is off.
+    region_col_cap: u32,
+    /// r429 — §7.3.11.1 `FirstCtbRowInSlice` (drives the §7.3.11.3
+    /// `upCtbAvailable` presence condition for `sao_merge_up_flag`).
+    first_ctb_row_in_slice: bool,
+    /// r429 — §9.3.2.3 `TableStateIdx0Wpp` / `TableStateIdx1Wpp`
+    /// storage: a snapshot of every context bundle, taken when the
+    /// parse of the first CTU of a CTU row (within a tile) ends, and
+    /// restored by the §9.3.2.4 synchronization at the next row start.
+    wpp_ctx_store: Option<WppCtxStore>,
+    /// r429 — Table 51 `initType` (0 = I, 1/2 from the slice type +
+    /// `sh_cabac_init_flag`), retained for the §9.3.2.2 per-tile
+    /// context re-initialization.
+    init_type: u8,
+    /// r429 — linear tile index (`tileRow * NumTileColumns + tileCol`)
+    /// of the CTU currently being walked; `qPY_PREV` resets to
+    /// `SliceQpY` at every change (§8.7.1 "first quantization group in
+    /// a tile").
+    cur_tile_idx: u32,
+}
+
+/// r429 — resolved §6.5.1 walk plan for a tiled / WPP slice.
+struct TileWalkState {
+    scan: crate::tile_scan::TileScan,
+    /// `CtbAddrInCurrSlice[]` — picture-raster CTB addresses in
+    /// decoding order.
+    slice_ctbs: Vec<u32>,
+    /// `sps_entropy_coding_sync_enabled_flag`.
+    wpp: bool,
+}
+
+/// r429 — §9.3.2.3 context-variable storage (the WPP
+/// `TableStateIdx0Wpp` / `TableStateIdx1Wpp` arrays, materialised as a
+/// clone of every live context bundle).
+struct WppCtxStore {
+    tree: TreeCtxs,
+    leaf: LeafCuCtxs,
+    sao: SaoCtxs,
+    alf: Option<crate::alf_syntax::AlfCtxs>,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -1062,12 +1116,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ph_qp_delta: i32,
         cabac_payload: &'b [u8],
     ) -> Result<Self> {
-        // Single-slice guard: the CTU iterator only knows how to walk
-        // the whole picture as one raster scan today.
-        if !pps.pps_no_pic_partition_flag {
+        // r429 — partitioned PPSes (tiles / rectangular slices) are
+        // walked via the §6.5.1 tile-scan plan `decode_picture_into`
+        // builds lazily. Subpicture layouts stay out of scope for the
+        // walker (their availability + boundary rules are a separate
+        // axis).
+        if sps.sps_subpic_info_present_flag {
             return Err(Error::unsupported(
-                "h266 CTU walker: multi-tile / multi-slice pictures not supported \
-                 (pps_no_pic_partition_flag must be 1)",
+                "h266 CTU walker: subpicture layouts not supported \
+                 (sps_subpic_info_present_flag must be 0)",
             ));
         }
         // SPS/PPS CTB size must agree (§7.4.3.5).
@@ -1235,6 +1292,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu_origin_grid: vec![(0, 0); (intra_grid_w * intra_grid_h) as usize],
             nbr_map: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
             nbr_map_chroma: CuNeighbourMap::new(layout.pic_width_luma, layout.pic_height_luma),
+            tile_walk: None,
+            region_rect: (0, 0, layout.pic_width_luma, layout.pic_height_luma),
+            region_col_cap: u32::MAX,
+            first_ctb_row_in_slice: true,
+            wpp_ctx_store: None,
+            init_type,
+            cur_tile_idx: 0,
             intra_luma_mode_grid: vec![INTRA_PLANAR as u8; (intra_grid_w * intra_grid_h) as usize],
             avail_luma: vec![false; (layout.pic_width_luma * layout.pic_height_luma) as usize],
             avail_chroma: vec![
@@ -1527,8 +1591,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let (ox, oy) = self.cu_origin_grid[(by * self.intra_grid_w + bx) as usize];
             (ox as usize, oy as usize)
         };
-        let avail_l = x_cu_cb > 0;
-        let avail_t = y_cu_cb > 0;
+        // r429 — availL / availT run §6.4.4 with the tile / WPP
+        // region on top of the picture-edge rule.
+        let avail_l = x_cu_cb > 0 && self.nb_in_region(x_cu_cb as i32 - 1, y_cu_cb as i32);
+        let avail_t = y_cu_cb > 0 && self.nb_in_region(x_cu_cb as i32, y_cu_cb as i32 - 1);
         let luma = &out.luma;
         let mut sum: u64 = 0;
         let mut cnt: usize = 0;
@@ -1595,6 +1661,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// the unrefined store.
     pub fn motion_field_for_temporal(&self) -> MotionField {
         let mut mf = self.motion_field.clone();
+        // r429 — the export is consumed by a *later* picture's
+        // temporal (collocated) derivation, which §6.4.4 does not
+        // spatially constrain to this picture's tile layout: drop any
+        // live per-CTU availability region from the clone.
+        mf.clear_region();
         for r in &self.dmvr_refined {
             let base = mf.get_at_luma(r.x as i32, r.y as i32);
             if !base.available {
@@ -1608,13 +1679,66 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         mf
     }
 
+    /// r429 — §6.4.4 tile / WPP availability region test for a
+    /// neighbouring luma-sample position. `false` when the position
+    /// lies outside the current tile's rectangle (a neighbouring block
+    /// in a different tile is unavailable even when already decoded)
+    /// or at/right of the WPP column cap (`xNbY >> CtbLog2SizeY >=
+    /// (xCurr >> CtbLog2SizeY) + 1` under
+    /// `sps_entropy_coding_sync_enabled_flag`). Positions outside the
+    /// picture also read `false`, so callers may rely on this alone
+    /// for the geometric §6.4.4 arms it covers.
+    #[inline]
+    fn nb_in_region(&self, x: i32, y: i32) -> bool {
+        let (rx0, ry0, rx1, ry1) = self.region_rect;
+        x >= rx0 as i32
+            && y >= ry0 as i32
+            && (x as i64) < i64::from(rx1)
+            && (y as i64) < i64::from(ry1)
+            && (x as i64) < i64::from(self.region_col_cap)
+    }
+
+    /// r429 — the availability region + WPP cap as `i32` bounds
+    /// `(x0, y0, x1, y1, col_cap)` for capture inside reference-fetch
+    /// closures that cannot borrow `self`.
+    #[inline]
+    fn region_bounds_i32(&self) -> (i32, i32, i32, i32, i32) {
+        let (rx0, ry0, rx1, ry1) = self.region_rect;
+        let clip = |v: u32| -> i32 { v.min(i32::MAX as u32) as i32 };
+        (
+            clip(rx0),
+            clip(ry0),
+            clip(rx1),
+            clip(ry1),
+            clip(self.region_col_cap),
+        )
+    }
+
+    /// r429 — [`Self::region_bounds_i32`] at 4:2:0 chroma resolution
+    /// (tile boundaries and the WPP column cap are CTB-aligned, hence
+    /// even in luma samples, so the halving is exact).
+    #[inline]
+    fn region_bounds_chroma_i32(&self) -> (i32, i32, i32, i32, i32) {
+        let (rx0, ry0, rx1, ry1, rcap) = self.region_bounds_i32();
+        (rx0 / 2, ry0 / 2, rx1 / 2, ry1 / 2, rcap / 2)
+    }
+
+    /// r429 — [`Self::nb_in_region`] for a chroma-resolution sample
+    /// position (4:2:0).
+    #[inline]
+    fn nb_in_region_chroma(&self, cx: i32, cy: i32) -> bool {
+        let (rx0, ry0, rx1, ry1, rcap) = self.region_bounds_chroma_i32();
+        cx >= rx0 && cy >= ry0 && cx < rx1 && cy < ry1 && cx < rcap
+    }
+
     /// Round-28 §8.5.6.7 — sample the picture-wide 4x4 intra-coded
     /// grid at picture-absolute luma `(x, y)`. Returns `false` when the
     /// position is out of bounds (matching the spec's
     /// `availableX == FALSE` → `isIntraCodedNeighbourX = FALSE`
-    /// branch) and otherwise the cell's stored mode flag.
+    /// branch) or outside the §6.4.4 tile / WPP availability region,
+    /// and otherwise the cell's stored mode flag.
     fn sample_intra_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1689,7 +1813,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// unavailable neighbour → `cond = 0`) and otherwise the cell's
     /// stored sub-block-merge flag.
     fn sample_subblock_merge_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1706,7 +1830,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// inter path is not yet parsed by the CTU walker so this is
     /// always `false` for round-149.
     fn sample_inter_affine_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1721,7 +1845,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// grid at picture-absolute luma `(x, y)`. `false` when out of
     /// bounds (§6.4.4 unavailable → cond = 0).
     fn sample_ibc_mode_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1735,7 +1859,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// Round-406 — sample the parse-time `CuSkipFlag` grid at
     /// picture-absolute luma `(x, y)`.
     fn sample_parse_cu_skip_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1749,7 +1873,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// r409 — sample the parse-time `IntraMipFlag` grid at
     /// picture-absolute luma `(x, y)`.
     fn sample_parse_mip_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1764,7 +1888,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// grid at picture-absolute luma `(x, y)`. `false` when out of
     /// bounds (§6.4.4 unavailable → cond = 0).
     fn sample_parse_intra_at_luma(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.nb_in_region(x, y) {
             return false;
         }
         let bx = (x as u32) / 4;
@@ -1933,13 +2057,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let cy = (y / 4).min(self.intra_grid_h - 1);
             self.qp_y_map[(cy * self.intra_grid_w + cx) as usize]
         };
-        let avail_a = x_qg > 0 && (x_qg - 1) >> ctb_log2 == x_qg >> ctb_log2;
+        // r429 — the §8.7.1 step-2/3 availability runs §6.4.4: a
+        // neighbour in a different tile (or beyond the WPP column cap)
+        // is unavailable even when decoded, on top of the same-CTB
+        // containment checks.
+        let avail_a = x_qg > 0
+            && self.nb_in_region(x_qg as i32 - 1, y_qg as i32)
+            && (x_qg - 1) >> ctb_log2 == x_qg >> ctb_log2;
         let qp_a = if avail_a {
             qp_at(x_qg - 1, y_qg)
         } else {
             qp_prev
         };
-        let avail_b_row = y_qg > 0;
+        let avail_b_row = y_qg > 0 && self.nb_in_region(x_qg as i32, y_qg as i32 - 1);
         let avail_b = avail_b_row && (y_qg - 1) >> ctb_log2 == y_qg >> ctb_log2;
         let qp_b = if avail_b {
             qp_at(x_qg, y_qg - 1)
@@ -1949,8 +2079,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // First QG in a CTB row within the tile: with availableB the
         // prediction takes the above QG's QpY directly (the CTB row
         // above is decoded; this is the line-buffer wavefront arm).
+        // r429 — "within a tile": the row-start column is the tile's
+        // left boundary, not picture x == 0.
         let ctb_size = 1u32 << ctb_log2;
-        if avail_b_row && x_qg == 0 && y_qg % ctb_size == 0 {
+        if avail_b_row && x_qg == self.region_rect.0 && y_qg % ctb_size == 0 {
             return qp_at(x_qg, y_qg - 1);
         }
         (qp_a + qp_b + 1) >> 1
@@ -2266,12 +2398,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             slice_type: self.sh.sh_slice_type,
             sh_cabac_init_flag: self.cabac.sh_cabac_init_flag,
         };
-        // Single-slice / single-tile fixture: the spec's
-        // `leftCtbAvailable` / `upCtbAvailable` checks (§7.3.11.3)
-        // reduce to "in the picture and not the first CTU of the
-        // current slice row".
-        let left_avail = ctu.x_ctb > 0;
-        let up_avail = ctu.y_ctb > 0;
+        // r429 — the spec's §7.3.11.3 presence conditions:
+        // `leftCtbAvailable = rx != CtbToTileColBd[rx]` and
+        // `upCtbAvailable = ry != CtbToTileRowBd[ry] &&
+        // !FirstCtbRowInSlice`. With no tile walk (single tile) the
+        // boundary maps collapse to picture edges and
+        // `FirstCtbRowInSlice` reduces to `ry == 0`.
+        let (tile_left_ctb, tile_top_ctb) = self.tile_bounds_ctb(ctu);
+        let left_avail = ctu.x_ctb != tile_left_ctb;
+        let up_avail = ctu.y_ctb != tile_top_ctb && !self.first_ctb_row_in_slice;
         let params = decode_sao_ctb(
             &mut self.arith,
             &mut self.sao_ctxs,
@@ -3734,12 +3869,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let pw = self.layout.pic_width_luma as i32;
             let ph = self.layout.pic_height_luma as i32;
             let avail = &self.avail_luma;
+            let (rx0, ry0, rx1, ry1, rcap) = self.region_bounds_i32();
             let plane = &out.luma;
             let (x0i, y0i) = (x0 as i32, y0 as i32);
             let fetch = |dx: i32, dy: i32| -> Option<i16> {
                 let x = x0i + dx;
                 let y = y0i + dy;
                 if x < 0 || y < 0 || x >= pw || y >= ph {
+                    return None;
+                }
+                // r429 — §6.4.4 tile / WPP region gate.
+                if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
                     return None;
                 }
                 if !avail[(y as usize) * (pw as usize) + x as usize] {
@@ -4685,6 +4825,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let pw = self.layout.pic_width_luma as i32;
             let ph = self.layout.pic_height_luma as i32;
             let avail = &self.avail_luma;
+            let (rx0, ry0, rx1, ry1, rcap) = self.region_bounds_i32();
             let plane = &out.luma;
             let (x0i, y0i) = (cu.cu.x as i32, cu.cu.y as i32);
             predict_intra(
@@ -4704,6 +4845,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     let x = x0i + dx;
                     let y = y0i + dy;
                     if x < 0 || y < 0 || x >= pw || y >= ph {
+                        return None;
+                    }
+                    // r429 — §6.4.4 tile / WPP region gate.
+                    if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
                         return None;
                     }
                     if !avail[(y as usize) * (pw as usize) + x as usize] {
@@ -4918,11 +5063,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bdpcm: false,
                     bit_depth: bit_depth_ciip,
                 };
+                #[allow(clippy::too_many_arguments)]
                 fn fetch_c(
                     plane: &PicturePlane,
                     avail: &[bool],
                     cw: i32,
                     chh: i32,
+                    region_c: (i32, i32, i32, i32, i32),
                     x0i: i32,
                     y0i: i32,
                     dx: i32,
@@ -4933,20 +5080,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     if x < 0 || y < 0 || x >= cw || y >= chh {
                         return None;
                     }
+                    // r429 — §6.4.4 tile / WPP region gate (chroma-
+                    // resolution bounds derived by the caller).
+                    let (rx0, ry0, rx1, ry1, rcap) = region_c;
+                    if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
+                        return None;
+                    }
                     if !avail[(y as usize) * (cw as usize) + x as usize] {
                         return None;
                     }
                     plane.get(x as usize, y as usize).map(|v| v as i16)
                 }
+                let region_c = self.region_bounds_chroma_i32();
                 let pred_cb = predict_intra(&params_c, |dx, dy| {
-                    fetch_c(&out.cb, avail, cw, chh, x0i, y0i, dx, dy)
+                    fetch_c(&out.cb, avail, cw, chh, region_c, x0i, y0i, dx, dy)
                 })?;
                 let pred_cr = predict_intra(
                     &IntraPredParams {
                         c_idx: 2,
                         ..params_c
                     },
-                    |dx, dy| fetch_c(&out.cr, avail, cw, chh, x0i, y0i, dx, dy),
+                    |dx, dy| fetch_c(&out.cr, avail, cw, chh, region_c, x0i, y0i, dx, dy),
                 )?;
                 (pred_cb, pred_cr)
             } else {
@@ -8103,12 +8257,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     let pw = self.layout.pic_width_luma as i32;
                     let ph = self.layout.pic_height_luma as i32;
                     let avail = &self.avail_luma;
+                    let (rx0, ry0, rx1, ry1, rcap) = self.region_bounds_i32();
                     let plane = &out.luma;
                     let (x0i, y0i) = (abs_x as i32, abs_y as i32);
                     let fetch = |dx: i32, dy: i32| -> Option<i16> {
                         let x = x0i + dx;
                         let y = y0i + dy;
                         if x < 0 || y < 0 || x >= pw || y >= ph {
+                            return None;
+                        }
+                        // r429 — §6.4.4 tile / WPP region gate.
+                        if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
                             return None;
                         }
                         if !avail[(y as usize) * (pw as usize) + x as usize] {
@@ -8317,12 +8476,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let cw = (self.layout.pic_width_luma / 2) as i32;
         let chh = (self.layout.pic_height_luma / 2) as i32;
         let avail = &self.avail_chroma;
+        let (crx0, cry0, crx1, cry1, crcap) = self.region_bounds_chroma_i32();
         let above_avail = y0 > 0
+            && self.nb_in_region_chroma(x0 as i32, y0 as i32 - 1)
             && avail
                 .get((y0 - 1) * cw as usize + x0)
                 .copied()
                 .unwrap_or(false);
         let left_avail = x0 > 0
+            && self.nb_in_region_chroma(x0 as i32 - 1, y0 as i32)
             && avail
                 .get(y0 * cw as usize + (x0 - 1))
                 .copied()
@@ -8334,6 +8496,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let x = x0i + dx;
                 let y = y0i + dy;
                 if x < 0 || y < 0 || x >= cw || y >= chh {
+                    return None;
+                }
+                // r429 — §6.4.4 tile / WPP region gate.
+                if x < crx0 || y < cry0 || x >= crx1 || y >= cry1 || x >= crcap {
                     return None;
                 }
                 if !avail[(y as usize) * (cw as usize) + x as usize] {
@@ -8607,11 +8773,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // luma-only and a chroma-only coding tree per node).
         let dual_tree = self.sh.sh_slice_type == SliceType::I
             && self.sps.partition_constraints.qtbtt_dual_tree_intra_flag;
-        let ctus: Vec<CtuPos> = self.iter_ctus().collect();
-        for ctu in &ctus {
-            if ctu.x_ctb == 0 {
-                self.on_ctu_row_start();
-            }
+        // r429 — resolve the §6.5.1 walk plan: `CtbAddrInCurrSlice[]`
+        // in decoding order (tile-scan for partitioned PPSes), or the
+        // historical whole-picture raster scan.
+        self.prepare_tile_walk()?;
+        let ctus: Vec<CtuPos> = match &self.tile_walk {
+            Some(tw) => tw
+                .slice_ctbs
+                .iter()
+                .map(|&rs| self.ctu_pos_from_rs(rs))
+                .collect(),
+            None => self.iter_ctus().collect(),
+        };
+        let n_ctus = ctus.len();
+        for (i, ctu) in ctus.iter().enumerate() {
+            // r429 — per-CTU region + §7.3.11.1 row-start resets
+            // (`CtbAddrX == CtbToTileColBd[CtbAddrX]`).
+            self.begin_ctu(ctu);
             // §7.3.11.2: `sao(rx, ry)` is decoded at the start of every
             // CTU (before the partition tree). The helper short-circuits
             // when both sao_*_used_flags are 0.
@@ -8623,9 +8801,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // walker never consumed these bins, desyncing on any
             // ALF-enabled stream).
             if let Some(cfg) = self.alf_syntax_cfg {
+                // r429 — the §9.3.4.2.2 ctxInc availability runs
+                // §6.4.4: the left / above CTB must be inside the
+                // current tile (left / above probes never trip the WPP
+                // column arm).
+                let (tile_left_ctb, tile_top_ctb) = self.tile_bounds_ctb(ctu);
                 let nbrs = crate::alf_syntax::AlfNeighbours {
-                    left_avail: ctu.x_ctb > 0,
-                    up_avail: ctu.y_ctb > 0,
+                    left_avail: ctu.x_ctb != tile_left_ctb,
+                    up_avail: ctu.y_ctb != tile_top_ctb,
                 };
                 let ctxs = self
                     .alf_ctxs
@@ -8643,14 +8826,264 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             if dual_tree {
                 self.decode_dual_tree_ctu(ctu, out)?;
-                continue;
+            } else {
+                let (cus, infos, residuals) = self.decode_ctu_full(ctu)?;
+                for ((ccu, info), residual) in cus.iter().zip(infos.iter()).zip(residuals.iter()) {
+                    self.reconstruct_leaf_cu(ccu, info, residual, out)?;
+                }
             }
-            let (cus, infos, residuals) = self.decode_ctu_full(ctu)?;
-            for ((ccu, info), residual) in cus.iter().zip(infos.iter()).zip(residuals.iter()) {
-                self.reconstruct_leaf_cu(ccu, info, residual, out)?;
-            }
+            // r429 — §7.3.11.1 tail: WPP context storage, the
+            // end_of_tile / end_of_subset terminate bins with their
+            // byte alignment + §9.3.2 re-initialization, and the
+            // `FirstCtbRowInSlice` update.
+            self.end_ctu(i, n_ctus, ctu)?;
         }
         Ok(())
+    }
+
+    /// r429 — build the [`TileWalkState`] for a partitioned (or
+    /// entropy-sync) stream. No-op when the PPS has no partition block
+    /// and `sps_entropy_coding_sync_enabled_flag` is 0 (the historical
+    /// raster walk), or when a plan is already installed.
+    fn prepare_tile_walk(&mut self) -> Result<()> {
+        if self.tile_walk.is_some() {
+            return Ok(());
+        }
+        let wpp = self.sps.sps_entropy_coding_sync_enabled_flag;
+        if self.pps.partition.is_none() && !wpp {
+            return Ok(());
+        }
+        let scan = crate::tile_scan::TileScan::derive(self.sps, self.pps)?;
+        // `CtbAddrInCurrSlice[]` — §7.4.8: for rectangular layouts the
+        // slice header's `sh_slice_address` is the picture-level slice
+        // index (no subpictures on this walker); for raster layouts it
+        // is the first tile index with `sh_num_tiles_in_slice_minus1`
+        // more tiles following.
+        let slice_ctbs = if scan.rect_slices {
+            let idx = self.sh.sh_slice_address as usize;
+            scan.ctb_addr_in_slice.get(idx).cloned().ok_or_else(|| {
+                Error::invalid(format!(
+                    "h266 slice_data: sh_slice_address {idx} out of range \
+                         ({} rectangular slices)",
+                    scan.ctb_addr_in_slice.len()
+                ))
+            })?
+        } else {
+            scan.raster_slice_ctbs(
+                self.sh.sh_slice_address,
+                self.sh.sh_num_tiles_in_slice_minus1 + 1,
+            )?
+        };
+        if slice_ctbs.is_empty() {
+            return Err(Error::invalid("h266 slice_data: empty slice CTB list"));
+        }
+        self.tile_walk = Some(TileWalkState {
+            scan,
+            slice_ctbs,
+            wpp,
+        });
+        Ok(())
+    }
+
+    /// r429 — [`CtuPos`] from a picture-raster CTB address (the
+    /// tile-scan plan stores raster addresses; edge CTUs clamp to the
+    /// picture like [`CtuIter`]).
+    fn ctu_pos_from_rs(&self, rs: u32) -> CtuPos {
+        let x_ctb = rs % self.layout.pic_width_in_ctbs_y;
+        let y_ctb = rs / self.layout.pic_width_in_ctbs_y;
+        let x0 = x_ctb * self.layout.ctb_size_y;
+        let y0 = y_ctb * self.layout.ctb_size_y;
+        CtuPos {
+            x_ctb,
+            y_ctb,
+            x0,
+            y0,
+            width_luma: (self.layout.pic_width_luma - x0).min(self.layout.ctb_size_y),
+            height_luma: (self.layout.pic_height_luma - y0).min(self.layout.ctb_size_y),
+            ctu_addr_rs: rs,
+        }
+    }
+
+    /// r429 — the (left, top) CTB coordinates of the tile containing
+    /// `ctu` (`CtbToTileColBd` / `CtbToTileRowBd` in CTB units);
+    /// `(0, 0)` for the single-tile walk.
+    fn tile_bounds_ctb(&self, ctu: &CtuPos) -> (u32, u32) {
+        match &self.tile_walk {
+            Some(tw) => (
+                tw.scan.ctb_to_tile_col_bd[ctu.x_ctb as usize],
+                tw.scan.ctb_to_tile_row_bd[ctu.y_ctb as usize],
+            ),
+            None => (0, 0),
+        }
+    }
+
+    /// r429 — per-CTU walk prologue: install the §6.4.4 availability
+    /// region (current tile rectangle + WPP column cap) on the walker
+    /// and its neighbour stores, track the tile index for the §8.7.1
+    /// `qPY_PREV` tile reset, and run the §7.3.11.1 row-start resets
+    /// when `CtbAddrX == CtbToTileColBd[CtbAddrX]`.
+    fn begin_ctu(&mut self, ctu: &CtuPos) {
+        let ctb_log2 = self.layout.ctb_log2_size_y;
+        let (rect, col_cap, tile_idx, at_row_start) = match &self.tile_walk {
+            Some(tw) => {
+                let scan = &tw.scan;
+                let cx = ctu.x_ctb as usize;
+                let cy = ctu.y_ctb as usize;
+                let col_idx = scan.ctb_to_tile_col_idx[cx] as usize;
+                let row_idx = scan.ctb_to_tile_row_idx[cy] as usize;
+                let x0 = scan.tile_col_bd_val[col_idx] << ctb_log2;
+                let y0 = scan.tile_row_bd_val[row_idx] << ctb_log2;
+                let x1 =
+                    (scan.tile_col_bd_val[col_idx + 1] << ctb_log2).min(self.layout.pic_width_luma);
+                let y1 = (scan.tile_row_bd_val[row_idx + 1] << ctb_log2)
+                    .min(self.layout.pic_height_luma);
+                let cap = if tw.wpp {
+                    (ctu.x_ctb + 1) << ctb_log2
+                } else {
+                    u32::MAX
+                };
+                let tile_idx = (row_idx as u32) * scan.num_tile_columns + col_idx as u32;
+                let at_row_start = scan.tile_col_bd_val[col_idx] == ctu.x_ctb;
+                ((x0, y0, x1, y1), cap, tile_idx, at_row_start)
+            }
+            None => (
+                (
+                    0,
+                    0,
+                    self.layout.pic_width_luma,
+                    self.layout.pic_height_luma,
+                ),
+                u32::MAX,
+                0,
+                ctu.x_ctb == 0,
+            ),
+        };
+        self.region_rect = rect;
+        self.region_col_cap = col_cap;
+        self.nbr_map.set_region(rect.0, rect.1, rect.2, rect.3);
+        self.nbr_map_chroma
+            .set_region(rect.0, rect.1, rect.2, rect.3);
+        self.motion_field
+            .set_region(rect.0, rect.1, rect.2, rect.3, col_cap);
+        self.affine_cpmv_field
+            .set_region(rect.0, rect.1, rect.2, rect.3, col_cap);
+        if tile_idx != self.cur_tile_idx {
+            // §8.7.1 — the first quantization group in a tile predicts
+            // from `SliceQpY` (`qPY_PREV` reset).
+            self.last_cu_qp_y = None;
+            self.cur_tile_idx = tile_idx;
+        }
+        if at_row_start {
+            self.on_ctu_row_start();
+        }
+    }
+
+    /// r429 — per-CTU walk epilogue (§7.3.11.1 tail + §9.3.1/§9.3.2):
+    ///
+    /// * WPP context storage (§9.3.2.3) when the parse of a CTU with
+    ///   `CtbAddrX == CtbToTileColBd[CtbAddrX]` ends;
+    /// * `end_of_tile_one_bit` / `end_of_subset_one_bit` (both must
+    ///   decode as 1) followed by `byte_alignment()` — the engine
+    ///   re-initializes at the next byte boundary (§9.3.2.5);
+    /// * context re-initialization (§9.3.2.2) for a tile start, or the
+    ///   §9.3.2.4 WPP synchronization for a CTU-row start (the above
+    ///   CTB inside the same tile is always available on this
+    ///   sequential walk);
+    /// * the `FirstCtbRowInSlice = 0` update.
+    fn end_ctu(&mut self, i: usize, n_ctus: usize, ctu: &CtuPos) -> Result<()> {
+        // Copy the tile geometry out of the plan before any mutation
+        // (the store / re-init below take `&mut self`).
+        let (wpp, tile_left_ctb, tile_right_ctb, tile_bottom_ctb) = match &self.tile_walk {
+            Some(tw) => {
+                let scan = &tw.scan;
+                let col_idx = scan.ctb_to_tile_col_idx[ctu.x_ctb as usize] as usize;
+                let row_idx = scan.ctb_to_tile_row_idx[ctu.y_ctb as usize] as usize;
+                (
+                    tw.wpp,
+                    scan.tile_col_bd_val[col_idx],
+                    scan.tile_col_bd_val[col_idx + 1],
+                    scan.tile_row_bd_val[row_idx + 1],
+                )
+            }
+            None => {
+                // Historical single-tile walk: no in-stream terminate
+                // bins before end_of_slice_one_bit; FirstCtbRowInSlice
+                // clears at the end of the first CTU row.
+                if ctu.x_ctb + 1 == self.layout.pic_width_in_ctbs_y {
+                    self.first_ctb_row_in_slice = false;
+                }
+                return Ok(());
+            }
+        };
+        // §9.3.1 — storage fires when ending the parse of any CTU in
+        // the first column of its tile (i.e. after the first CTU of
+        // every CTU row within a tile).
+        if wpp && ctu.x_ctb == tile_left_ctb {
+            self.wpp_ctx_store = Some(WppCtxStore {
+                tree: self.cabac.tree_ctxs.clone(),
+                leaf: self.leaf_ctxs.clone(),
+                sao: self.sao_ctxs.clone(),
+                alf: self.alf_ctxs.clone(),
+            });
+        }
+        if i + 1 == n_ctus {
+            // Last CTU in the slice — `end_of_slice_one_bit` is decoded
+            // by `finish_slice()`.
+            return Ok(());
+        }
+        // §7.3.11.1: `CtbAddrX == CtbToTileColBd[CtbAddrX + 1] − 1`,
+        // i.e. the last CTB column of the tile.
+        if ctu.x_ctb + 1 != tile_right_ctb {
+            return Ok(());
+        }
+        let last_row_in_tile = ctu.y_ctb + 1 == tile_bottom_ctb;
+        if last_row_in_tile {
+            // end_of_tile_one_bit + byte_alignment() + per-tile §9.3.2
+            // re-initialization (the next CTU is the first of a tile).
+            let bin = self.arith.decode_terminate()?;
+            if bin != 1 {
+                return Err(Error::invalid(
+                    "h266 slice_data: end_of_tile_one_bit decoded as 0 (must be 1)",
+                ));
+            }
+            self.arith.reinit_at_next_byte()?;
+            self.reinit_ctxs_for_region_start();
+        } else if wpp {
+            // end_of_subset_one_bit + byte_alignment() + the §9.3.2.4
+            // context synchronization from TableStateIdxWpp (the §6.4.4
+            // availability of the above CTB holds within the tile).
+            let bin = self.arith.decode_terminate()?;
+            if bin != 1 {
+                return Err(Error::invalid(
+                    "h266 slice_data: end_of_subset_one_bit decoded as 0 (must be 1)",
+                ));
+            }
+            self.arith.reinit_at_next_byte()?;
+            match self.wpp_ctx_store.take() {
+                Some(store) => {
+                    self.cabac.tree_ctxs = store.tree;
+                    self.leaf_ctxs = store.leaf;
+                    self.sao_ctxs = store.sao;
+                    self.alf_ctxs = store.alf;
+                }
+                None => self.reinit_ctxs_for_region_start(),
+            }
+        }
+        self.first_ctb_row_in_slice = false;
+        Ok(())
+    }
+
+    /// r429 — §9.3.2.2 context re-initialization for the first CTU of
+    /// a tile (or a WPP row whose above CTB is unavailable). Mirrors
+    /// the `begin_slice` bundle initialization exactly.
+    fn reinit_ctxs_for_region_start(&mut self) {
+        let qp = self.cabac.slice_qp_y.as_init_qp();
+        self.cabac.tree_ctxs = TreeCtxs::init(qp);
+        self.leaf_ctxs = LeafCuCtxs::init_with_init_type(qp, self.init_type);
+        self.sao_ctxs = SaoCtxs::init(qp);
+        if self.alf_ctxs.is_some() {
+            self.alf_ctxs = Some(crate::alf_syntax::AlfCtxs::init(self.cabac.slice_qp_y.0));
+        }
     }
 
     /// §7.3.11.1 — the per-CTU-row state resets. `slice_data()` runs
@@ -9052,14 +9485,124 @@ mod tests {
     }
 
     #[test]
-    fn walker_rejects_multi_slice_pictures() {
+    fn walker_accepts_partitioned_pps_rejects_subpics() {
+        // r429 — a partitioned PPS (tiles) constructs cleanly; the
+        // §6.5.1 walk plan is built by `decode_picture_into`.
         let sps = dummy_sps(2, 256, 256);
-        let pps = dummy_pps(256, 256, false); // no_partition = false
+        let mut pps = dummy_pps(256, 256, false); // no_partition = false
+        pps.partition.as_mut().unwrap().log2_ctu_size_minus5 = 2;
         let sh = intra_slice_header();
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let data = [0u8; 8];
-        let err = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap_err();
+        if let Err(e) = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data) {
+            panic!("begin_slice failed: {e:?}");
+        }
+        // Subpicture layouts stay unsupported.
+        let mut sps_sub = dummy_sps(2, 256, 256);
+        sps_sub.sps_subpic_info_present_flag = true;
+        let err = CtuWalker::begin_slice(&layout, &sps_sub, &pps, &sh, 0, &data).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    /// r429 — a 2x2-tile PPS resolves into a tile-scan-order walk plan
+    /// (`CtbAddrInCurrSlice`), and `begin_ctu` installs the containing
+    /// tile's rectangle + row-start resets as the §6.4.4 availability
+    /// region.
+    #[test]
+    fn tile_plan_walks_tiles_in_scan_order_and_gates_region() {
+        use crate::pps::PicPartition;
+        let sps = dummy_sps(2, 512, 256); // CTB 128 → 4x2 CTBs
+        let mut pps = dummy_pps(512, 256, false);
+        pps.pps_rect_slice_flag = true;
+        pps.pps_single_slice_per_subpic_flag = true;
+        pps.partition = Some(PicPartition {
+            log2_ctu_size_minus5: 2,
+            explicit_col_widths: vec![2],
+            explicit_row_heights: vec![1],
+            col_width_ctbs: vec![2, 2],
+            row_height_ctbs: vec![1, 1],
+            num_tile_columns: 2,
+            num_tile_rows: 2,
+            num_tiles_in_pic: 4,
+            pps_loop_filter_across_tiles_enabled_flag: false,
+            num_slices_in_pic: 1,
+            slice_top_left_tile_idx: Vec::new(),
+            num_slices_in_subpic: vec![1],
+            tile_idx_delta_present_flag: false,
+            slice_width_in_tiles: Vec::new(),
+            slice_height_in_tiles: Vec::new(),
+            slice_height_in_ctus: Vec::new(),
+            slice_ctb_row_offset_in_tile: Vec::new(),
+        });
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.prepare_tile_walk().unwrap();
+        let plan: Vec<u32> = walker.tile_walk.as_ref().unwrap().slice_ctbs.clone();
+        // Tile scan order: tile (0,0) → (1,0) → (0,1) → (1,1).
+        assert_eq!(plan, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // begin_ctu on the first CTU of tile (1,0) — the availability
+        // region is that tile's rectangle, so the decoded-but-foreign
+        // tile (0,0) reads unavailable.
+        let ctu = walker.ctu_pos_from_rs(2);
+        walker.begin_ctu(&ctu);
+        assert_eq!(walker.region_rect, (256, 0, 512, 128));
+        assert!(walker.nb_in_region(256, 0));
+        assert!(!walker.nb_in_region(255, 0), "left tile must be gated");
+        assert!(!walker.nb_in_region(256, 128), "tile below must be gated");
+        // The parse-grid samplers honour the gate even for cells that
+        // were populated by an earlier tile.
+        walker.parse_intra_grid.fill(true);
+        assert!(walker.sample_parse_intra_at_luma(300, 10));
+        assert!(!walker.sample_parse_intra_at_luma(255, 10));
+        // Motion-field reads are gated at the field level.
+        walker.motion_field.write_block(0, 0, 512, 128, {
+            let mut f = MvField::UNAVAILABLE;
+            f.available = true;
+            f
+        });
+        assert!(walker.motion_field.get_at_luma(300, 10).available);
+        assert!(!walker.motion_field.get_at_luma(200, 10).available);
+        // SAO / ALF prefix availability: first CTU of tile (1,0) has
+        // no left CTB in its tile.
+        let (tl, tt) = walker.tile_bounds_ctb(&ctu);
+        assert_eq!((tl, tt), (2, 0));
+    }
+
+    /// r429 — WPP (no tiles): the walk plan exists, and the §6.4.4
+    /// column cap blocks any neighbour right of the current CTB
+    /// column.
+    #[test]
+    fn wpp_plan_installs_column_cap() {
+        let mut sps = dummy_sps(2, 512, 256);
+        sps.sps_entropy_coding_sync_enabled_flag = true;
+        let pps = dummy_pps(512, 256, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.prepare_tile_walk().unwrap();
+        assert!(walker.tile_walk.as_ref().unwrap().wpp);
+        // Raster plan over the whole picture (single tile).
+        assert_eq!(walker.tile_walk.as_ref().unwrap().slice_ctbs.len(), 8);
+        let ctu = walker.ctu_pos_from_rs(5); // (x_ctb, y_ctb) = (1, 1)
+        walker.begin_ctu(&ctu);
+        assert_eq!(walker.region_col_cap, 256);
+        // Above CTB column is fine; above-right column is not.
+        assert!(walker.nb_in_region(255, 0));
+        assert!(!walker.nb_in_region(256, 0));
+        // Without entropy sync there is no cap.
+        let mut sps2 = dummy_sps(2, 512, 256);
+        sps2.sps_entropy_coding_sync_enabled_flag = false;
+        let layout2 = CtuLayout::from_sps_pps(&sps2, &pps);
+        let mut walker2 = CtuWalker::begin_slice(&layout2, &sps2, &pps, &sh, 0, &data).unwrap();
+        walker2.prepare_tile_walk().unwrap();
+        assert!(walker2.tile_walk.is_none());
+        let ctu2 = walker2.ctu_pos_from_rs(5);
+        walker2.begin_ctu(&ctu2);
+        assert_eq!(walker2.region_col_cap, u32::MAX);
+        assert!(walker2.nb_in_region(511, 0));
     }
 
     #[test]

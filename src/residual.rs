@@ -70,6 +70,7 @@ use crate::tables::{init_contexts, SyntaxCtx};
 
 /// Context array bundle used by the residual decoder + the TU-level
 /// CBF / QP-delta reads.
+#[derive(Clone)]
 pub struct ResidualCtxs {
     pub sig_coeff: Vec<ContextModel>,
     pub sb_coded: Vec<ContextModel>,

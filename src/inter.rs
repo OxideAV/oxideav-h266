@@ -181,6 +181,16 @@ pub struct MotionField {
     pub blocks_h: u32,
     /// Row-major storage; `field[y * blocks_w + x]`.
     pub field: Vec<MvField>,
+    /// r429 — §6.4.4 availability region: `(x0, y0, x1, y1, col_cap)`
+    /// in luma samples (`x0..x1` / `y0..y1` half-open, plus an
+    /// exclusive column cap for the WPP `xNbCtb >= xCurrCtb + 1` arm).
+    /// A spatial read outside the region reports `UNAVAILABLE` even
+    /// when the cell was written: a neighbouring block in a different
+    /// tile — or right of the current CTB column under
+    /// `sps_entropy_coding_sync_enabled_flag` — is unavailable to
+    /// every §8.5 spatial candidate scan despite having been decoded.
+    /// `None` (the default) keeps the whole grid readable.
+    region: Option<(u32, u32, u32, u32, u32)>,
 }
 
 impl MotionField {
@@ -191,15 +201,40 @@ impl MotionField {
             blocks_w: bw,
             blocks_h: bh,
             field: vec![MvField::UNAVAILABLE; (bw * bh) as usize],
+            region: None,
         }
+    }
+
+    /// r429 — install the §6.4.4 availability region (see the field
+    /// docs). The tile/WPP-aware CTU walk updates this per CTU.
+    pub fn set_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, col_cap: u32) {
+        self.region = Some((x0, y0, x1, y1, col_cap));
+    }
+
+    /// r429 — drop the availability region (all written cells become
+    /// readable again). The temporal-export clone uses this: the
+    /// §8.5.2.11 collocated derivation of a *later* picture is not
+    /// spatially constrained by this picture's tile layout.
+    pub fn clear_region(&mut self) {
+        self.region = None;
     }
 
     /// Sample at picture-absolute luma `(x, y)` — returns the MvField
     /// for the 4x4 block containing that sample; `UNAVAILABLE` when out
-    /// of bounds.
+    /// of bounds or outside the installed §6.4.4 availability region.
     pub fn get_at_luma(&self, x: i32, y: i32) -> MvField {
         if x < 0 || y < 0 {
             return MvField::UNAVAILABLE;
+        }
+        if let Some((rx0, ry0, rx1, ry1, cap)) = self.region {
+            if (x as u32) < rx0
+                || (y as u32) < ry0
+                || (x as u32) >= rx1
+                || (y as u32) >= ry1
+                || (x as u32) >= cap
+            {
+                return MvField::UNAVAILABLE;
+            }
         }
         let bx = (x as u32) / 4;
         let by = (y as u32) / 4;
@@ -294,6 +329,12 @@ pub struct AffineCpmvField {
     /// covering CB is not affine (the §8.5.5.7 `MotionModelIdc > 0`
     /// gate fails for a sample landing here).
     pub field: Vec<Option<AffineCbRecord>>,
+    /// r429 — §6.4.4 availability region, same convention as
+    /// [`MotionField::set_region`]: `(x0, y0, x1, y1, col_cap)` in
+    /// luma samples. Gates the §8.5.5.7 / §8.5.5.5 inherited-affine
+    /// neighbour scans at tile boundaries and under the WPP column
+    /// rule.
+    region: Option<(u32, u32, u32, u32, u32)>,
 }
 
 impl AffineCpmvField {
@@ -304,15 +345,33 @@ impl AffineCpmvField {
             blocks_w: bw,
             blocks_h: bh,
             field: vec![None; (bw * bh) as usize],
+            region: None,
         }
+    }
+
+    /// r429 — install the §6.4.4 availability region (see
+    /// [`MotionField::set_region`]).
+    pub fn set_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, col_cap: u32) {
+        self.region = Some((x0, y0, x1, y1, col_cap));
     }
 
     /// Sample at picture-absolute luma `(x, y)` — returns the
     /// [`AffineCbRecord`] of the 4x4 block containing that sample, or
-    /// `None` when out of bounds or the covering CB is not affine.
+    /// `None` when out of bounds, outside the §6.4.4 availability
+    /// region, or the covering CB is not affine.
     pub fn get_at_luma(&self, x: i32, y: i32) -> Option<AffineCbRecord> {
         if x < 0 || y < 0 {
             return None;
+        }
+        if let Some((rx0, ry0, rx1, ry1, cap)) = self.region {
+            if (x as u32) < rx0
+                || (y as u32) < ry0
+                || (x as u32) >= rx1
+                || (y as u32) >= ry1
+                || (x as u32) >= cap
+            {
+                return None;
+            }
         }
         let bx = (x as u32) / 4;
         let by = (y as u32) / 4;

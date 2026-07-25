@@ -179,6 +179,45 @@ impl<'a> ArithDecoder<'a> {
         (self.byte_pos as u64) * 8 + u64::from(self.bit_pos)
     }
 
+    /// r429 — §9.3.2.5 re-initialization at a byte-aligned subset
+    /// boundary. §7.3.11.1 codes `end_of_tile_one_bit` /
+    /// `end_of_subset_one_bit` followed by `byte_alignment()`; per the
+    /// §9.3.4.3.5 termination semantics the last bit the engine pulled
+    /// into `ivlOffset` *is* the `byte_alignment_bit_equal_to_one`, so
+    /// the next subset starts at the next byte boundary after
+    /// [`Self::bits_consumed`] (any `byte_alignment_bit_equal_to_zero`
+    /// padding bits are skipped, and the engine registers are refilled
+    /// from the fresh 9-bit read).
+    pub fn reinit_at_next_byte(&mut self) -> Result<()> {
+        if self.bit_pos != 0 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+        self.ivl_curr_range = 510;
+        self.terminated = false;
+        self.ivl_offset = self.read_bits(9)?;
+        if self.ivl_offset >= 510 {
+            return Err(Error::invalid(format!(
+                "h266 CABAC: ivlOffset={} must be <510 at subset re-init (§9.3.2.5)",
+                self.ivl_offset
+            )));
+        }
+        Ok(())
+    }
+
+    /// r429 — the byte offset (into the slice-data payload) at which the
+    /// next byte-aligned CABAC subset would begin. Valid right after a
+    /// `decode_terminate() == 1` for `end_of_tile_one_bit` /
+    /// `end_of_subset_one_bit`; used to cross-check the §7.4.8
+    /// `sh_entry_point_offset_minus1[]` subset boundaries.
+    pub fn next_subset_byte_offset(&self) -> usize {
+        if self.bit_pos != 0 {
+            self.byte_pos + 1
+        } else {
+            self.byte_pos
+        }
+    }
+
     /// Has the terminate-MPS path fired?
     pub fn is_terminated(&self) -> bool {
         self.terminated
@@ -297,6 +336,94 @@ impl<'a> ArithDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r429 — §7.3.11.1 byte-aligned subset boundaries: two CABAC
+    /// subsets (as the wire carries around `end_of_tile_one_bit` /
+    /// `end_of_subset_one_bit` + `byte_alignment()`) decode back-to-
+    /// back through `decode_terminate` + `reinit_at_next_byte`, with
+    /// `next_subset_byte_offset` landing exactly on the second
+    /// subset's first byte (the §7.4.8 entry-point anchor).
+    #[test]
+    fn subset_boundary_reinit_round_trips() {
+        use crate::cabac_enc::ArithEncoder;
+        let bins_a = [1u32, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0];
+        let bins_b = [0u32, 0, 1, 0, 1, 1, 0, 1];
+        let mut enc_a = ArithEncoder::new();
+        let mut ctx = ContextModel::init(0x20, 0, 26);
+        for &b in &bins_a {
+            enc_a.encode_decision(&mut ctx, b).unwrap();
+        }
+        enc_a.encode_terminate(1).unwrap();
+        let chunk_a = enc_a.finish();
+        // §9.3.2.2 — the second subset re-initialises its contexts.
+        let mut enc_b = ArithEncoder::new();
+        let mut ctx = ContextModel::init(0x20, 0, 26);
+        for &b in &bins_b {
+            enc_b.encode_decision(&mut ctx, b).unwrap();
+        }
+        enc_b.encode_terminate(1).unwrap();
+        let chunk_b = enc_b.finish();
+
+        let mut data = chunk_a.clone();
+        data.extend_from_slice(&chunk_b);
+        data.extend_from_slice(&[0u8; 8]);
+
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut dctx = ContextModel::init(0x20, 0, 26);
+        for &b in &bins_a {
+            assert_eq!(dec.decode_decision(&mut dctx).unwrap(), b);
+        }
+        assert_eq!(dec.decode_terminate().unwrap(), 1);
+        // The terminate consumed the alignment '1' bit; the next
+        // subset begins at the next byte boundary == |chunk A|.
+        assert_eq!(dec.next_subset_byte_offset(), chunk_a.len());
+        dec.reinit_at_next_byte().unwrap();
+        assert!(!dec.is_terminated());
+        let mut dctx = ContextModel::init(0x20, 0, 26);
+        for &b in &bins_b {
+            assert_eq!(dec.decode_decision(&mut dctx).unwrap(), b);
+        }
+        assert_eq!(dec.decode_terminate().unwrap(), 1);
+        assert_eq!(dec.next_subset_byte_offset(), chunk_a.len() + chunk_b.len());
+    }
+
+    /// r429 — bypass-heavy subsets exercise the renormalization /
+    /// bypass read positions feeding `next_subset_byte_offset`.
+    #[test]
+    fn subset_boundary_with_bypass_bins() {
+        use crate::cabac_enc::ArithEncoder;
+        let mut enc_a = ArithEncoder::new();
+        let mut ctx = ContextModel::init(0x3c, 4, 30);
+        for i in 0..40u32 {
+            enc_a.encode_bypass(i & 1).unwrap();
+            enc_a.encode_decision(&mut ctx, (i >> 1) & 1).unwrap();
+        }
+        enc_a.encode_terminate(1).unwrap();
+        let chunk_a = enc_a.finish();
+        let mut enc_b = ArithEncoder::new();
+        for i in 0..17u32 {
+            enc_b.encode_bypass(((i * 5) >> 2) & 1).unwrap();
+        }
+        enc_b.encode_terminate(1).unwrap();
+        let chunk_b = enc_b.finish();
+        let mut data = chunk_a.clone();
+        data.extend_from_slice(&chunk_b);
+        data.extend_from_slice(&[0u8; 8]);
+
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut dctx = ContextModel::init(0x3c, 4, 30);
+        for i in 0..40u32 {
+            assert_eq!(dec.decode_bypass().unwrap(), i & 1);
+            assert_eq!(dec.decode_decision(&mut dctx).unwrap(), (i >> 1) & 1);
+        }
+        assert_eq!(dec.decode_terminate().unwrap(), 1);
+        assert_eq!(dec.next_subset_byte_offset(), chunk_a.len());
+        dec.reinit_at_next_byte().unwrap();
+        for i in 0..17u32 {
+            assert_eq!(dec.decode_bypass().unwrap(), ((i * 5) >> 2) & 1);
+        }
+        assert_eq!(dec.decode_terminate().unwrap(), 1);
+    }
 
     #[test]
     fn init_bounds() {
