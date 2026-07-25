@@ -354,6 +354,15 @@ pub struct EncoderConfig {
     pub tile_columns: u8,
     /// r429 — number of tile rows; see [`Self::tile_columns`].
     pub tile_rows: u8,
+    /// r429 — emit the tile grid with a RASTER-scan slice layout
+    /// (`pps_rect_slice_flag = 0`): one slice whose header addresses
+    /// tile 0 and spans all tiles
+    /// (`sh_slice_address` + `sh_num_tiles_in_slice_minus1` go on the
+    /// wire). The CTB walk order and CABAC subsets are identical to
+    /// the rectangular single-slice layout; only the PPS / SH
+    /// signalling differs. Requires a tile grid. Default `false`
+    /// (rectangular layout).
+    pub raster_slice_layout: bool,
     /// r429 — `pps_loop_filter_across_tiles_enabled_flag`. `true`
     /// (the default) lets deblocking / SAO / ALF cross tile
     /// boundaries; `false` closes them (§8.8.3.1 edge exclusion,
@@ -388,6 +397,7 @@ impl EncoderConfig {
             sign_data_hiding: false,
             tile_columns: 1,
             tile_rows: 1,
+            raster_slice_layout: false,
             loop_filter_across_tiles: true,
             wpp: false,
         }
@@ -783,10 +793,16 @@ impl VvcEncoder {
                 // NumTilesInPic > 1 by construction (tile_grid()
                 // returns None otherwise).
                 bw.write_bit(self.config.loop_filter_across_tiles as u8); // pps_loop_filter_across_tiles_enabled_flag
-                bw.write_bit(1); // pps_rect_slice_flag = 1
-                bw.write_bit(1); // pps_single_slice_per_subpic_flag = 1 (one slice)
-                                 // rect + single-slice-per-subpic → the slice loop is
-                                 // skipped and the across-slices flag is present.
+                if self.config.raster_slice_layout {
+                    // Raster layout: no single-slice flag, no slice
+                    // loop; the slice header carries the tile run.
+                    bw.write_bit(0); // pps_rect_slice_flag = 0
+                } else {
+                    bw.write_bit(1); // pps_rect_slice_flag = 1
+                    bw.write_bit(1); // pps_single_slice_per_subpic_flag = 1 (one slice)
+                }
+                // rect + single-slice-per-subpic OR !rect → the slice
+                // loop is skipped and the across-slices flag is present.
                 bw.write_bit(1); // pps_loop_filter_across_slices_enabled_flag
             }
         }
@@ -927,9 +943,20 @@ impl VvcEncoder {
         let mut bw = BitWriter::new();
         // sh_picture_header_in_slice_header_flag = 0 (separate PH NAL).
         bw.write_bit(0);
-        // Single-slice no-partition profile: no sh_subpic_id /
-        // sh_slice_address / sh_extra_bit / tile count. With
+        // No sh_subpic_id (no subpictures) / sh_extra_bit. With
         // ph_inter_slice_allowed_flag = 0, sh_slice_type is inferred I.
+        // r429 — a raster-scan tile layout puts `sh_slice_address`
+        // (u(v), Ceil(Log2(NumTilesInPic)) bits, tile index 0) and
+        // `sh_num_tiles_in_slice_minus1` on the wire; the rectangular
+        // single-slice layout emits neither.
+        if self.config.raster_slice_layout {
+            if let Some((cols, rows)) = self.config.tile_grid() {
+                let num_tiles = (cols.len() * rows.len()) as u32;
+                let width = 32 - (num_tiles - 1).max(1).leading_zeros();
+                bw.write_bits(0, width); // sh_slice_address = 0
+                bw.write_ue(num_tiles - 1); // sh_num_tiles_in_slice_minus1
+            }
+        }
         //
         // IDR nal_unit_type → sh_no_output_of_prior_pics_flag.
         bw.write_bit(0);

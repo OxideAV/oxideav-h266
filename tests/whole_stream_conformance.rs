@@ -556,6 +556,24 @@ fn whole_stream_tiles_2x2_mtt() {
     dump_corpus("tiles_2x2_mtt_qp30", &bs, &dec);
 }
 
+/// r429 — the RASTER-scan slice layout (`pps_rect_slice_flag = 0`):
+/// the slice header carries `sh_slice_address` (tile 0) +
+/// `sh_num_tiles_in_slice_minus1`, and the decoder resolves the CTB
+/// plan through the §6.5.1 raster tile-run arm instead of
+/// `CtbAddrInSlice`.
+#[test]
+fn whole_stream_tiles_2x2_raster_layout() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.raster_slice_layout = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x2 raster layout");
+    dump_corpus("tiles_2x2_raster_256x256", &bs, &dec);
+}
+
 /// r429 — tiles with `pps_loop_filter_across_tiles_enabled_flag = 0`:
 /// deblocking skips the tile-boundary edges (§8.8.3.1), SAO forces
 /// edgeIdx = 0 on cross-tile neighbour samples (§8.8.4.2), and ALF
