@@ -366,6 +366,27 @@ pub fn iter_length_prefixed(data: &[u8], length_size: u8) -> Result<Vec<NalRef<'
 /// Strip VVC emulation-prevention bytes. Per §7.4.1, any sequence
 /// `0x00 0x00 0x03` inside NAL data is decoded by removing the `0x03`.
 /// Identical to HEVC and AVC.
+/// r429 — the on-wire (EBSP) byte length a raw RBSP span will occupy
+/// once the §7.4.1 emulation-prevention bytes are inserted: the span
+/// length plus one for every `00 00 0x` (x <= 3) pattern. The §7.4.8
+/// entry-point offsets count these EP bytes, so subset boundaries
+/// decoded from the RBSP are converted through this before comparing.
+/// Mirrors [`crate::encoder::insert_emulation_prevention`] exactly,
+/// including its end-of-span lookahead behaviour.
+pub fn emulation_prevention_len(rbsp: &[u8]) -> usize {
+    let mut extra = 0usize;
+    let mut i = 0usize;
+    while i < rbsp.len() {
+        if i + 2 < rbsp.len() && rbsp[i] == 0 && rbsp[i + 1] == 0 && rbsp[i + 2] <= 3 {
+            extra += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    rbsp.len() + extra
+}
+
 pub fn extract_rbsp(nal_payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nal_payload.len());
     let mut i = 0;
@@ -389,6 +410,31 @@ pub fn extract_rbsp(nal_payload: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r429 — `emulation_prevention_len` must agree with the actual
+    /// §7.4.1 inserter for every span, including patterns at span
+    /// edges and back-to-back zero runs.
+    #[test]
+    fn emulation_prevention_len_matches_inserter() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![0, 0, 0],
+            vec![0, 0, 1],
+            vec![0, 0, 3],
+            vec![0, 0, 4],
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 0, 0],
+            vec![1, 0, 0, 2, 0, 0, 3, 9],
+            vec![0x40, 1, 2, 3],
+            (0..255u8).map(|i| if i % 3 == 0 { 0 } else { i }).collect(),
+        ];
+        for c in cases {
+            let inserted = crate::encoder::insert_emulation_prevention(&c);
+            assert_eq!(emulation_prevention_len(&c), inserted.len(), "span {c:?}");
+        }
+    }
 
     /// 2-byte VVC header builder for tests.
     ///

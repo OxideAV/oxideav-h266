@@ -3417,17 +3417,7 @@ fn ctb_span(bds: &[usize], v: usize) -> (usize, usize) {
 /// non-zero byte — so no EP pattern spans a boundary and per-chunk
 /// counting equals the whole-RBSP count.
 fn ep_len(chunk: &[u8]) -> u32 {
-    let mut extra = 0u32;
-    let mut i = 0usize;
-    while i < chunk.len() {
-        if i + 2 < chunk.len() && chunk[i] == 0 && chunk[i + 1] == 0 && chunk[i + 2] <= 3 {
-            extra += 1;
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    chunk.len() as u32 + extra
+    crate::nal::emulation_prevention_len(chunk) as u32
 }
 
 fn build_nal(

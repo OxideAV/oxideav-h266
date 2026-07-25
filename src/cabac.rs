@@ -223,6 +223,14 @@ impl<'a> ArithDecoder<'a> {
         self.terminated
     }
 
+    /// r429 — the full slice-data payload this engine reads from
+    /// (emulation-prevention-stripped). Exposed so the §7.3.11.1
+    /// subset walk can cross-check the §7.4.8 entry-point offsets
+    /// (which count EP bytes) against the decoded subset boundaries.
+    pub fn payload(&self) -> &[u8] {
+        self.data
+    }
+
     fn read_bit(&mut self) -> Result<u32> {
         if self.byte_pos >= self.data.len() {
             // The spec's DecodeBin pulls bits one-at-a-time via

@@ -1064,6 +1064,13 @@ pub struct CtuWalker<'a, 'b> {
     /// `SliceQpY` at every change (§8.7.1 "first quantization group in
     /// a tile").
     cur_tile_idx: u32,
+    /// r429 — first payload byte of the CABAC subset currently being
+    /// decoded (RBSP domain), for the §7.4.8 entry-point cross-check.
+    subset_start_byte: usize,
+    /// r429 — index of the current subset (0-based; subset k's byte
+    /// length must equal `sh_entry_point_offset_minus1[k] + 1` when
+    /// entry points are on the wire).
+    subset_idx: usize,
 }
 
 /// r429 — resolved §6.5.1 walk plan for a tiled / WPP slice.
@@ -1299,6 +1306,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             wpp_ctx_store: None,
             init_type,
             cur_tile_idx: 0,
+            subset_start_byte: 0,
+            subset_idx: 0,
             intra_luma_mode_grid: vec![INTRA_PLANAR as u8; (intra_grid_w * intra_grid_h) as usize],
             avail_luma: vec![false; (layout.pic_width_luma * layout.pic_height_luma) as usize],
             avail_chroma: vec![
@@ -9046,6 +9055,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     "h266 slice_data: end_of_tile_one_bit decoded as 0 (must be 1)",
                 ));
             }
+            let end = self.arith.next_subset_byte_offset();
+            self.verify_entry_point_boundary(end)?;
             self.arith.reinit_at_next_byte()?;
             self.reinit_ctxs_for_region_start();
         } else if wpp {
@@ -9058,6 +9069,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     "h266 slice_data: end_of_subset_one_bit decoded as 0 (must be 1)",
                 ));
             }
+            let end = self.arith.next_subset_byte_offset();
+            self.verify_entry_point_boundary(end)?;
             self.arith.reinit_at_next_byte()?;
             match self.wpp_ctx_store.take() {
                 Some(store) => {
@@ -9070,6 +9083,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
         }
         self.first_ctb_row_in_slice = false;
+        Ok(())
+    }
+
+    /// r429 — §7.4.8 conformance cross-check at a subset boundary:
+    /// the k-th subset's on-wire byte length (its RBSP span plus the
+    /// §7.4.1 emulation-prevention bytes the span re-acquires on the
+    /// wire) must equal `sh_entry_point_offset_minus1[k] + 1`. No-op
+    /// when the slice carries no entry points
+    /// (`sps_entry_point_offsets_present_flag == 0` — the sequential
+    /// byte-alignment walk needs none). `end` is the byte offset at
+    /// which the next subset begins.
+    fn verify_entry_point_boundary(&mut self, end: usize) -> Result<()> {
+        let start = self.subset_start_byte;
+        self.subset_start_byte = end;
+        let k = self.subset_idx;
+        self.subset_idx += 1;
+        if self.sh.sh_entry_point_offsets.is_empty() {
+            return Ok(());
+        }
+        let Some(&expected) = self.sh.sh_entry_point_offsets.get(k) else {
+            return Err(Error::invalid(format!(
+                "h266 slice_data: subset boundary {k} exceeds NumEntryPoints ({})",
+                self.sh.sh_entry_point_offsets.len()
+            )));
+        };
+        let span = self.arith.payload().get(start..end).ok_or_else(|| {
+            Error::invalid("h266 slice_data: subset span exceeds the slice payload")
+        })?;
+        let ep = crate::nal::emulation_prevention_len(span) as u64;
+        if ep != expected {
+            return Err(Error::invalid(format!(
+                "h266 slice_data: subset {k} spans {ep} on-wire bytes but                  sh_entry_point_offset_minus1[{k}] + 1 == {expected} (§7.4.8)",
+            )));
+        }
         Ok(())
     }
 
@@ -9615,6 +9662,45 @@ mod tests {
         // no left CTB in its tile.
         let (tl, tt) = walker.tile_bounds_ctb(&ctu);
         assert_eq!((tl, tt), (2, 0));
+    }
+
+    /// r429 — §7.4.8 entry-point cross-check: a subset span whose
+    /// EP-aware byte length disagrees with the signalled offset is a
+    /// conformance error; matching spans advance the subset counter.
+    #[test]
+    fn entry_point_boundary_check_pins_offsets() {
+        let sps = dummy_sps(2, 512, 256);
+        let pps = dummy_pps(512, 256, true);
+        let mut sh = intra_slice_header();
+        // Two subsets: subset 0 is bytes [0, 5) with no EP patterns →
+        // on-wire length 5.
+        sh.sh_entry_point_offsets = vec![5];
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0x40u8, 1, 2, 3, 0x80, 0x40, 0, 0, 0, 0];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        walker.verify_entry_point_boundary(5).unwrap();
+        assert_eq!(walker.subset_idx, 1);
+        // A second boundary exceeds NumEntryPoints.
+        assert!(walker.verify_entry_point_boundary(8).is_err());
+
+        // Wrong span length → error.
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        assert!(walker.verify_entry_point_boundary(4).is_err());
+
+        // EP-aware length: a span containing `00 00 03`-triggering
+        // bytes counts the reinserted EP byte (§7.4.8 counts on-wire
+        // bytes). Span [0, 5) of this payload carries one pattern.
+        let ep_data = [0x40u8, 0, 0, 1, 0x80, 0, 0, 0];
+        let mut sh2 = intra_slice_header();
+        sh2.sh_entry_point_offsets = vec![6];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh2, 0, &ep_data).unwrap();
+        walker.verify_entry_point_boundary(5).unwrap();
+
+        // No entry points on the wire → the check is a no-op.
+        let sh3 = intra_slice_header();
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh3, 0, &data).unwrap();
+        walker.verify_entry_point_boundary(3).unwrap();
+        walker.verify_entry_point_boundary(7).unwrap();
     }
 
     /// r429 — WPP (no tiles): the walk plan exists, and the §6.4.4
