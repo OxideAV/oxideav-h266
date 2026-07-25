@@ -377,6 +377,21 @@ fn derive_offset_val(offset_abs: [u32; 4], offset_sign_flag: [u32; 4], bit_depth
 /// boundary, breaking the "operates on the recPicture, writes to
 /// saoPicture" semantics.
 pub fn apply_sao(out: &mut PictureBuffer, sao_pic: &SaoPicture, cfg: &SaoConfig) {
+    apply_sao_clipped(out, sao_pic, cfg, None)
+}
+
+/// r429 — [`apply_sao`] with the §8.8.4.2 tile-boundary sample gate:
+/// when `tile_bounds` is `Some((col_bd, row_bd))` (luma-sample tile
+/// boundary prefix lists including 0 and the picture extents — the
+/// `pps_loop_filter_across_tiles_enabled_flag == 0` case), any EO
+/// neighbour sample in a different tile forces `edgeIdx = 0` for the
+/// current sample.
+pub fn apply_sao_clipped(
+    out: &mut PictureBuffer,
+    sao_pic: &SaoPicture,
+    cfg: &SaoConfig,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) {
     if sao_pic.is_all_not_applied() {
         return;
     }
@@ -408,11 +423,35 @@ pub fn apply_sao(out: &mut PictureBuffer, sao_pic: &SaoPicture, cfg: &SaoConfig)
     for ry in 0..sao_pic.pic_height_in_ctbs_y {
         for rx in 0..sao_pic.pic_width_in_ctbs_y {
             let p = sao_pic.get(rx, ry);
+            // r429 — the containing tile's rectangle (luma samples),
+            // when the across-tiles gate is active.
+            let clip_y: Option<(i32, i32, i32, i32)> = tile_bounds.map(|(col_bd, row_bd)| {
+                let span = |bds: &[u32], v: u32, max: i32| -> (i32, i32) {
+                    for wnd in bds.windows(2) {
+                        if v >= wnd[0] && v < wnd[1] {
+                            return (wnd[0] as i32, (wnd[1] as i32).min(max));
+                        }
+                    }
+                    (0, max)
+                };
+                let (x0, x1) = span(col_bd, rx * ctb_size_y, out.luma.width as i32);
+                let (y0, y1) = span(row_bd, ry * ctb_size_y, out.luma.height as i32);
+                (x0, y0, x1, y1)
+            });
+            let clip_c = clip_y.map(|(x0, y0, x1, y1)| {
+                (
+                    x0 / sub_w as i32,
+                    y0 / sub_h as i32,
+                    (x1 + sub_w as i32 - 1) / sub_w as i32,
+                    (y1 + sub_h as i32 - 1) / sub_h as i32,
+                )
+            });
             if cfg.luma_used && p.luma.sao_type_idx != SaoTypeIdx::NotApplied {
                 let pre = luma_pre.as_ref().unwrap();
                 apply_sao_ctb(
                     &mut out.luma,
                     pre,
+                    clip_y,
                     rx,
                     ry,
                     ctb_size_y,
@@ -429,6 +468,7 @@ pub fn apply_sao(out: &mut PictureBuffer, sao_pic: &SaoPicture, cfg: &SaoConfig)
                     apply_sao_ctb(
                         &mut out.cb,
                         pre,
+                        clip_c,
                         rx,
                         ry,
                         n_ctb_sw,
@@ -442,6 +482,7 @@ pub fn apply_sao(out: &mut PictureBuffer, sao_pic: &SaoPicture, cfg: &SaoConfig)
                     apply_sao_ctb(
                         &mut out.cr,
                         pre,
+                        clip_c,
                         rx,
                         ry,
                         n_ctb_sw,
@@ -463,6 +504,7 @@ pub fn apply_sao(out: &mut PictureBuffer, sao_pic: &SaoPicture, cfg: &SaoConfig)
 fn apply_sao_ctb(
     plane: &mut PicturePlane,
     pre: &[u8],
+    eo_clip: Option<(i32, i32, i32, i32)>,
     rx: u32,
     ry: u32,
     n_ctb_sw: u32,
@@ -499,7 +541,7 @@ fn apply_sao_ctb(
                     let ny0 = ys + v0;
                     let nx1 = xs + h1;
                     let ny1 = ys + v1;
-                    let outside = nx0 < 0
+                    let mut outside = nx0 < 0
                         || ny0 < 0
                         || nx1 < 0
                         || ny1 < 0
@@ -507,6 +549,21 @@ fn apply_sao_ctb(
                         || ny0 >= ph
                         || nx1 >= pw
                         || ny1 >= ph;
+                    // r429 — §8.8.4.2: with
+                    // pps_loop_filter_across_tiles_enabled_flag == 0 a
+                    // neighbour sample in a different tile also forces
+                    // edgeIdx = 0.
+                    if let Some((cx0, cy0, cx1, cy1)) = eo_clip {
+                        outside = outside
+                            || nx0 < cx0
+                            || ny0 < cy0
+                            || nx1 < cx0
+                            || ny1 < cy0
+                            || nx0 >= cx1
+                            || ny0 >= cy1
+                            || nx1 >= cx1
+                            || ny1 >= cy1;
+                    }
                     if outside {
                         // edgeIdx = 0 → offset_val[0] = 0. Copy through.
                         let v = pre[(ys as usize) * stride + (xs as usize)] as i32;

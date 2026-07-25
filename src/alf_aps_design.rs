@@ -437,6 +437,7 @@ pub fn design_per_class_luma_alf_filters(
                 rec.luma.stride,
                 pw,
                 ph,
+                (0, 0, pw, ph),
                 rx,
                 ry,
                 ctb_size_y,

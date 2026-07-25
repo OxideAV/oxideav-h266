@@ -216,6 +216,22 @@ pub fn apply_alf(
     cfg: &AlfConfig,
     binding: &AlfApsBinding<'_>,
 ) {
+    apply_alf_clipped(out, alf_pic, cfg, binding, None)
+}
+
+/// r429 — [`apply_alf`] with the §8.8.5.5 tile-boundary clip positions
+/// live: when `tile_bounds` is `Some((col_bd, row_bd))` (luma-sample
+/// tile boundary prefix lists, including 0 and the picture extents —
+/// the `pps_loop_filter_across_tiles_enabled_flag == 0` case), every
+/// classification / filter / CC-ALF fetch pads at the current CTB's
+/// tile rectangle per §8.8.5.6 instead of reading across it.
+pub fn apply_alf_clipped(
+    out: &mut PictureBuffer,
+    alf_pic: &AlfPicture,
+    cfg: &AlfConfig,
+    binding: &AlfApsBinding<'_>,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) {
     if !cfg.alf_enabled {
         return;
     }
@@ -240,9 +256,23 @@ pub fn apply_alf(
         Vec::new()
     };
 
+    // r429 — per-CTB luma / chroma fetch-clip rectangles: the picture
+    // by default, the containing tile when tile_bounds is installed.
+    let (luma_w_i, luma_h_i) = (out.luma.width as i32, out.luma.height as i32);
+    let luma_rect = move |rx: u32, ry: u32| -> (i32, i32, i32, i32) {
+        clip_rect_for_ctb(rx, ry, ctb_size_y, luma_w_i, luma_h_i, tile_bounds)
+    };
+
     for ry in 0..alf_pic.pic_height_in_ctbs_y {
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
             let p = alf_pic.get(rx, ry);
+            let fetch_clip_y = luma_rect(rx, ry);
+            let fetch_clip_c = (
+                fetch_clip_y.0 / sub_w as i32,
+                fetch_clip_y.1 / sub_h as i32,
+                (fetch_clip_y.2 + sub_w as i32 - 1) / sub_w as i32,
+                (fetch_clip_y.3 + sub_h as i32 - 1) / sub_h as i32,
+            );
             if p.luma_on {
                 if let Some(filters) = resolve_luma_filter_set(p.luma_filt_set_idx, binding) {
                     // §8.8.5.3 — derive the per-4×4-sub-block (filtIdx,
@@ -253,6 +283,7 @@ pub fn apply_alf(
                         out.luma.stride,
                         out.luma.width as i32,
                         out.luma.height as i32,
+                        fetch_clip_y,
                         rx,
                         ry,
                         ctb_size_y,
@@ -261,6 +292,7 @@ pub fn apply_alf(
                     apply_alf_luma_ctb(
                         &mut out.luma,
                         &luma_pre,
+                        fetch_clip_y,
                         rx,
                         ry,
                         ctb_size_y,
@@ -279,6 +311,7 @@ pub fn apply_alf(
                             apply_alf_chroma_ctb(
                                 &mut out.cb,
                                 &cb_pre,
+                                fetch_clip_c,
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -299,6 +332,7 @@ pub fn apply_alf(
                             apply_alf_chroma_ctb(
                                 &mut out.cr,
                                 &cr_pre,
+                                fetch_clip_c,
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -322,6 +356,7 @@ pub fn apply_alf(
         for ry in 0..alf_pic.pic_height_in_ctbs_y {
             for rx in 0..alf_pic.pic_width_in_ctbs_y {
                 let p = alf_pic.get(rx, ry);
+                let fetch_clip_y = luma_rect(rx, ry);
                 if cfg.cb_enabled && p.cc_cb_idc != 0 {
                     if let Some(aps) = binding.cc_cb_aps {
                         let filt_idx = (p.cc_cb_idc - 1) as usize;
@@ -333,6 +368,7 @@ pub fn apply_alf(
                                 out.luma.stride,
                                 out.luma.width as u32,
                                 out.luma.height as u32,
+                                fetch_clip_y,
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -355,6 +391,7 @@ pub fn apply_alf(
                                 out.luma.stride,
                                 out.luma.width as u32,
                                 out.luma.height as u32,
+                                fetch_clip_y,
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -388,6 +425,7 @@ fn apply_cc_alf_ctb(
     luma_stride: usize,
     luma_w: u32,
     luma_h: u32,
+    fetch_clip: (i32, i32, i32, i32),
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -405,7 +443,7 @@ fn apply_cc_alf_ctb(
     let max_val = (1i32 << bit_depth) - 1;
     let max_val_8 = max_val.min(255);
     let half = 1i32 << (bit_depth - 1);
-    let pw = luma_w as i32;
+    let _ = luma_w;
     let ph = luma_h as i32;
 
     for y in 0..j_max {
@@ -426,21 +464,23 @@ fn apply_cc_alf_ctb(
             // Eq. 1513.
             let curr_chroma = chroma.samples[(y_ctb_c + y) * chroma.stride + (x_ctb_c + x)] as i32;
             // Centre luma sample for delta calculation.
-            let centre = sample(luma_pre, luma_stride, pw, ph, xl, yl) as i32;
+            let centre = sample(luma_pre, luma_stride, fetch_clip, xl, yl) as i32;
             // Eq. 1515 — seven luma-deltas weighted by f[0..6].
             let mut sum: i32 = 0;
+            sum += coeff[0]
+                * (sample(luma_pre, luma_stride, fetch_clip, xl, yl - y_p1) as i32 - centre);
             sum +=
-                coeff[0] * (sample(luma_pre, luma_stride, pw, ph, xl, yl - y_p1) as i32 - centre);
-            sum += coeff[1] * (sample(luma_pre, luma_stride, pw, ph, xl - 1, yl) as i32 - centre);
-            sum += coeff[2] * (sample(luma_pre, luma_stride, pw, ph, xl + 1, yl) as i32 - centre);
+                coeff[1] * (sample(luma_pre, luma_stride, fetch_clip, xl - 1, yl) as i32 - centre);
+            sum +=
+                coeff[2] * (sample(luma_pre, luma_stride, fetch_clip, xl + 1, yl) as i32 - centre);
             sum += coeff[3]
-                * (sample(luma_pre, luma_stride, pw, ph, xl - 1, yl + y_p1) as i32 - centre);
-            sum +=
-                coeff[4] * (sample(luma_pre, luma_stride, pw, ph, xl, yl + y_p1) as i32 - centre);
+                * (sample(luma_pre, luma_stride, fetch_clip, xl - 1, yl + y_p1) as i32 - centre);
+            sum += coeff[4]
+                * (sample(luma_pre, luma_stride, fetch_clip, xl, yl + y_p1) as i32 - centre);
             sum += coeff[5]
-                * (sample(luma_pre, luma_stride, pw, ph, xl + 1, yl + y_p1) as i32 - centre);
-            sum +=
-                coeff[6] * (sample(luma_pre, luma_stride, pw, ph, xl, yl + y_p2) as i32 - centre);
+                * (sample(luma_pre, luma_stride, fetch_clip, xl + 1, yl + y_p1) as i32 - centre);
+            sum += coeff[6]
+                * (sample(luma_pre, luma_stride, fetch_clip, xl, yl + y_p2) as i32 - centre);
             // Eq. 1516.
             let scaled_sum = ((sum + 64) >> 7).clamp(-half, half - 1);
             // Eq. 1517 — suppression rule for `SubHeightC == 1` rows.
@@ -588,6 +628,7 @@ pub fn resolve_clip_value(bit_depth: u32, clip_idx: u8) -> i32 {
 fn apply_alf_luma_ctb(
     plane: &mut PicturePlane,
     pre: &[u8],
+    fetch_clip: (i32, i32, i32, i32),
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -598,8 +639,6 @@ fn apply_alf_luma_ctb(
     let x_ctb = (rx * ctb_size_y) as usize;
     let y_ctb = (ry * ctb_size_y) as usize;
     let stride = plane.stride;
-    let pw = plane.width as i32;
-    let ph = plane.height as i32;
     let i_max = (ctb_size_y as usize).min(plane.width.saturating_sub(x_ctb));
     let j_max = (ctb_size_y as usize).min(plane.height.saturating_sub(y_ctb));
     let max_val = (1i32 << bit_depth) - 1;
@@ -631,12 +670,12 @@ fn apply_alf_luma_ctb(
             // row when it doesn't span CtbSizeY-4 rows past yCtb.
             let (alf_shift_y, y1, y2, y3) = table_45(j as i32, ctb_size_y as i32, true);
             // Eq. 1448.
-            let curr = sample(pre, stride, pw, ph, xs, ys) as i32;
+            let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
             // Eq. 1449.
             let mut sum: i32 = 0;
             // Helper: clipped neighbour minus curr.
             let clip = |k: usize, dx: i32, dy: i32| -> i32 {
-                let v = sample(pre, stride, pw, ph, xs + dx, ys + dy) as i32 - curr;
+                let v = sample(pre, stride, fetch_clip, xs + dx, ys + dy) as i32 - curr;
                 v.clamp(-c[idx[k]], c[idx[k]])
             };
             sum += f[idx[0]] * (clip(0, 0, y3) + clip(0, 0, -y3));
@@ -760,8 +799,9 @@ impl LumaClassification {
 pub(crate) fn derive_luma_classification(
     pre: &[u8],
     stride: usize,
-    pw: i32,
+    _pw: i32,
     ph: i32,
+    fetch_clip: (i32, i32, i32, i32),
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -854,23 +894,23 @@ pub(crate) fn derive_luma_classification(
                     let cy = pad_y(y_ctb + y4 + j);
                     let cy_up = pad_y(y_ctb + y4 + j - 1);
                     let cy_dn = pad_y(y_ctb + y4 + j + 1);
-                    let centre = sample(pre, stride, pw, ph, cx, cy) as i32;
+                    let centre = sample(pre, stride, fetch_clip, cx, cy) as i32;
                     let centre2 = centre << 1;
                     // filtH: horizontal Laplacian.
-                    let l = sample(pre, stride, pw, ph, cx - 1, cy) as i32;
-                    let r = sample(pre, stride, pw, ph, cx + 1, cy) as i32;
+                    let l = sample(pre, stride, fetch_clip, cx - 1, cy) as i32;
+                    let r = sample(pre, stride, fetch_clip, cx + 1, cy) as i32;
                     sh += (centre2 - l - r).abs();
                     // filtV: vertical Laplacian (vb-padded rows).
-                    let u = sample(pre, stride, pw, ph, cx, cy_up) as i32;
-                    let d = sample(pre, stride, pw, ph, cx, cy_dn) as i32;
+                    let u = sample(pre, stride, fetch_clip, cx, cy_up) as i32;
+                    let d = sample(pre, stride, fetch_clip, cx, cy_dn) as i32;
                     sv += (centre2 - u - d).abs();
                     // filtD0: 135°-diagonal Laplacian (top-left ↔ bottom-right).
-                    let ul = sample(pre, stride, pw, ph, cx - 1, cy_up) as i32;
-                    let dr = sample(pre, stride, pw, ph, cx + 1, cy_dn) as i32;
+                    let ul = sample(pre, stride, fetch_clip, cx - 1, cy_up) as i32;
+                    let dr = sample(pre, stride, fetch_clip, cx + 1, cy_dn) as i32;
                     sd0 += (centre2 - ul - dr).abs();
                     // filtD1: 45°-diagonal Laplacian (top-right ↔ bottom-left).
-                    let ur = sample(pre, stride, pw, ph, cx + 1, cy_up) as i32;
-                    let dl = sample(pre, stride, pw, ph, cx - 1, cy_dn) as i32;
+                    let ur = sample(pre, stride, fetch_clip, cx + 1, cy_up) as i32;
+                    let dl = sample(pre, stride, fetch_clip, cx - 1, cy_dn) as i32;
                     sd1 += (centre2 - ur - dl).abs();
                 }
             }
@@ -951,6 +991,7 @@ pub(crate) fn derive_luma_classification(
 fn apply_alf_chroma_ctb(
     plane: &mut PicturePlane,
     pre: &[u8],
+    fetch_clip: (i32, i32, i32, i32),
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -965,8 +1006,6 @@ fn apply_alf_chroma_ctb(
     let x_ctb_c = (rx as usize) * ctb_w_c;
     let y_ctb_c = (ry as usize) * ctb_h_c;
     let stride = plane.stride;
-    let pw = plane.width as i32;
-    let ph = plane.height as i32;
     let i_max = ctb_w_c.min(plane.width.saturating_sub(x_ctb_c));
     let j_max = ctb_h_c.min(plane.height.saturating_sub(y_ctb_c));
     let max_val = (1i32 << bit_depth) - 1;
@@ -980,9 +1019,9 @@ fn apply_alf_chroma_ctb(
             let xs = (x_ctb_c + i) as i32;
             let ys = (y_ctb_c + j) as i32;
             let (alf_shift_c, y1, y2) = table_46(j as i32, ctb_h_c as i32, true);
-            let curr = sample(pre, stride, pw, ph, xs, ys) as i32;
+            let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
             let clip = |k: usize, dx: i32, dy: i32| -> i32 {
-                let v = sample(pre, stride, pw, ph, xs + dx, ys + dy) as i32 - curr;
+                let v = sample(pre, stride, fetch_clip, xs + dx, ys + dy) as i32 - curr;
                 v.clamp(-c[k], c[k])
             };
             // Eq. 1490.
@@ -1003,12 +1042,47 @@ fn apply_alf_chroma_ctb(
     }
 }
 
-/// Sample read with picture-edge clipping (§8.8.5.2 / §8.8.5.4
-/// equivalents of eqs. 1446 / 1447 / 1485 / 1486).
+/// r429 — the luma-sample fetch-clip rectangle for the CTB at
+/// `(rx, ry)`: the containing tile's rectangle (from the §6.5.1
+/// boundary prefix lists) intersected with the picture, or the whole
+/// picture when no tile bounds are installed.
+fn clip_rect_for_ctb(
+    rx: u32,
+    ry: u32,
+    ctb_size_y: u32,
+    pw: i32,
+    ph: i32,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) -> (i32, i32, i32, i32) {
+    let Some((col_bd, row_bd)) = tile_bounds else {
+        return (0, 0, pw, ph);
+    };
+    let x = rx * ctb_size_y;
+    let y = ry * ctb_size_y;
+    let span = |bds: &[u32], v: u32, max: i32| -> (i32, i32) {
+        for w in bds.windows(2) {
+            if v >= w[0] && v < w[1] {
+                return (w[0] as i32, (w[1] as i32).min(max));
+            }
+        }
+        (0, max)
+    };
+    let (x0, x1) = span(col_bd, x, pw);
+    let (y0, y1) = span(row_bd, y, ph);
+    (x0, y0, x1, y1)
+}
+
+/// Sample read with boundary clipping (§8.8.5.2 / §8.8.5.4 eqs.
+/// 1446 / 1447 / 1485 / 1486 picture clamp, generalised in r429 to a
+/// half-open rectangle so the §8.8.5.5 tile-boundary positions —
+/// `pps_loop_filter_across_tiles_enabled_flag == 0` — apply the
+/// §8.8.5.6 padding: coordinates clamp at the current tile's edges
+/// exactly like at picture edges).
 #[inline]
-fn sample(buf: &[u8], stride: usize, pw: i32, ph: i32, x: i32, y: i32) -> u8 {
-    let xc = x.clamp(0, pw - 1) as usize;
-    let yc = y.clamp(0, ph - 1) as usize;
+fn sample(buf: &[u8], stride: usize, fetch_clip: (i32, i32, i32, i32), x: i32, y: i32) -> u8 {
+    let (x0, y0, x1, y1) = fetch_clip;
+    let xc = x.clamp(x0, x1 - 1) as usize;
+    let yc = y.clamp(y0, y1 - 1) as usize;
     buf[yc * stride + xc]
 }
 
@@ -1465,7 +1539,7 @@ mod tests {
     #[test]
     fn classification_flat_plane_is_class_zero() {
         let plane = vec![100u8; 32 * 32];
-        let cls = derive_luma_classification(&plane, 32, 32, 32, 0, 0, 32, 8);
+        let cls = derive_luma_classification(&plane, 32, 32, 32, (0, 0, 32, 32), 0, 0, 32, 8);
         for sy in 0..cls.sub_size() {
             for sx in 0..cls.sub_size() {
                 let (f, _t) = cls.get(sx, sy);
@@ -1485,7 +1559,7 @@ mod tests {
                 plane[y * 32 + x] = (x as u8).saturating_mul(7);
             }
         }
-        let cls = derive_luma_classification(&plane, 32, 32, 32, 0, 0, 32, 8);
+        let cls = derive_luma_classification(&plane, 32, 32, 32, (0, 0, 32, 32), 0, 0, 32, 8);
         // Far from the picture edge — sub-block (3,3) sits at pixel
         // x=12..16, y=12..16 of the CTB; its 8-pixel window i=-2..5
         // (centred on x4=12) → x=10..17, all interior. No edge effects.
@@ -1506,7 +1580,7 @@ mod tests {
                 plane[y * 32 + x] = 200;
             }
         }
-        let cls = derive_luma_classification(&plane, 32, 32, 32, 0, 0, 32, 8);
+        let cls = derive_luma_classification(&plane, 32, 32, 32, (0, 0, 32, 32), 0, 0, 32, 8);
         // Sub-blocks straddling the edge live around sy = 4 (pixels y=16..19);
         // their classification window covers y4=16, j=-2..5 → y=14..21,
         // which spans the step. Expect non-zero filtIdx and possibly
@@ -1545,6 +1619,7 @@ mod tests {
                 ctb as usize,
                 ctb as i32,
                 ctb as i32,
+                (0, 0, ctb as i32, ctb as i32),
                 0,
                 0,
                 ctb,

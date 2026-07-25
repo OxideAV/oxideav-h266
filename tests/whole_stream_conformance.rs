@@ -556,6 +556,40 @@ fn whole_stream_tiles_2x2_mtt() {
     dump_corpus("tiles_2x2_mtt_qp30", &bs, &dec);
 }
 
+/// r429 — tiles with `pps_loop_filter_across_tiles_enabled_flag = 0`:
+/// deblocking skips the tile-boundary edges (§8.8.3.1), SAO forces
+/// edgeIdx = 0 on cross-tile neighbour samples (§8.8.4.2), and ALF
+/// pads its classification / filter / CC-ALF fetches at the tile
+/// rectangle (§8.8.5.5 / §8.8.5.6) — on both the encoder
+/// reconstruction and the decode path.
+#[test]
+fn whole_stream_tiles_2x2_no_cross_tile_filters() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.loop_filter_across_tiles = false;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x2 across-tiles off");
+    dump_corpus("tiles_2x2_noxlf_256x256", &bs, &dec);
+}
+
+/// r429 — across-tiles-off at deep QP with three tile columns: strong
+/// deblocking everywhere EXCEPT the two tile boundaries, ALF padding
+/// live on every interior boundary.
+#[test]
+fn whole_stream_tiles_3x1_no_cross_tile_filters_qp45() {
+    let src = structured_source(384, 128);
+    let mut cfg = EncoderConfig::new(384, 128);
+    cfg.tile_columns = 3;
+    cfg.loop_filter_across_tiles = false;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 45, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 3x1 across-tiles off qp45");
+    dump_corpus("tiles_3x1_noxlf_qp45", &bs, &dec);
+}
+
 /// r429 — WPP (sps_entropy_coding_sync_enabled_flag): every CTU row is
 /// a byte-aligned subset (end_of_subset_one_bit), the §9.3.2.3/.4
 /// context storage/synchronization runs around each row's first CTU,

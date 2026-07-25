@@ -354,6 +354,13 @@ pub struct EncoderConfig {
     pub tile_columns: u8,
     /// r429 — number of tile rows; see [`Self::tile_columns`].
     pub tile_rows: u8,
+    /// r429 — `pps_loop_filter_across_tiles_enabled_flag`. `true`
+    /// (the default) lets deblocking / SAO / ALF cross tile
+    /// boundaries; `false` closes them (§8.8.3.1 edge exclusion,
+    /// §8.8.4.2 edgeIdx = 0, §8.8.5.5/§8.8.5.6 fetch padding) on both
+    /// the emitted wire and the encoder's own reconstruction. Only
+    /// meaningful with a tile grid configured.
+    pub loop_filter_across_tiles: bool,
     /// r429 — WPP (`sps_entropy_coding_sync_enabled_flag = 1`): each
     /// CTU row (of a tile) becomes a byte-aligned CABAC subset
     /// (`end_of_subset_one_bit`), the §9.3.2.3 / §9.3.2.4 context
@@ -381,6 +388,7 @@ impl EncoderConfig {
             sign_data_hiding: false,
             tile_columns: 1,
             tile_rows: 1,
+            loop_filter_across_tiles: true,
             wpp: false,
         }
     }
@@ -774,7 +782,7 @@ impl VvcEncoder {
                 }
                 // NumTilesInPic > 1 by construction (tile_grid()
                 // returns None otherwise).
-                bw.write_bit(1); // pps_loop_filter_across_tiles_enabled_flag
+                bw.write_bit(self.config.loop_filter_across_tiles as u8); // pps_loop_filter_across_tiles_enabled_flag
                 bw.write_bit(1); // pps_rect_slice_flag = 1
                 bw.write_bit(1); // pps_single_slice_per_subpic_flag = 1 (one slice)
                                  // rect + single-slice-per-subpic → the slice loop is

@@ -67,12 +67,12 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfPicture};
+use crate::alf::{AlfApsBinding, AlfConfig, AlfPicture};
 use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_high_precision};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, CuNeighbourMap, MttSplitRec, TreeCtxs, TreeType, TreeWalker};
-use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
+use crate::deblock::{DeblockCu, DeblockParams};
 use crate::dequant::{
     dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, log2_matrix_size,
     scaling_matrix_id, DequantParams, PredModeKind,
@@ -97,7 +97,7 @@ use crate::lmcs::{LmcsData, LmcsDerived};
 use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
 use crate::reconstruct::{clip_pixel, reconstruct_tb_into, PictureBuffer, PicturePlane};
-use crate::sao::{apply_sao, SaoConfig, SaoPicture};
+use crate::sao::{SaoConfig, SaoPicture};
 use crate::sao_syntax::{decode_sao_ctb, SaoCtxs, SaoSyntaxConfig};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
@@ -9167,6 +9167,36 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 }
             }
         }
+        // r429 — §8.8 tile-boundary gating: with a tile grid and
+        // `pps_loop_filter_across_tiles_enabled_flag == 0`, deblocking
+        // skips edges on tile boundaries (§8.8.3.1), SAO forces
+        // edgeIdx = 0 for cross-tile neighbour samples (§8.8.4.2), and
+        // ALF pads its fetches at the tile rectangle (§8.8.5.5 /
+        // §8.8.5.6). The boundary prefix lists are in luma samples and
+        // include 0 + the CTB-grid extents.
+        let tile_lf_bounds: Option<(Vec<u32>, Vec<u32>)> = match &self.pps.partition {
+            Some(part)
+                if part.num_tiles_in_pic > 1 && !part.pps_loop_filter_across_tiles_enabled_flag =>
+            {
+                let log2 = self.layout.ctb_log2_size_y;
+                let pref = |v: &[u32]| -> Vec<u32> {
+                    let mut out = vec![0u32];
+                    for x in v {
+                        out.push(out.last().unwrap() + (x << log2));
+                    }
+                    out
+                };
+                Some((pref(&part.col_width_ctbs), pref(&part.row_height_ctbs)))
+            }
+            _ => None,
+        };
+        let (no_filter_cols, no_filter_rows): (Vec<u32>, Vec<u32>) = match &tile_lf_bounds {
+            Some((c, r)) => (
+                c[1..c.len().saturating_sub(1)].to_vec(),
+                r[1..r.len().saturating_sub(1)].to_vec(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         let disabled = self.pps.pps_deblocking_filter_disabled_flag
             || self.sh.sh_deblocking_filter_disabled_flag;
         let params = DeblockParams {
@@ -9182,11 +9212,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bit_depth,
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
         };
-        apply_deblocking(
+        crate::deblock::apply_deblocking_clipped(
             out,
             &self.deblock_cus,
             &params,
             self.sps.sps_chroma_format_idc as u32,
+            &no_filter_cols,
+            &no_filter_rows,
         );
         // SAO (§8.8.4) — runs after deblocking per §8.8.4.1. Per-CTB
         // SaoTypeIdx / SaoEoClass / SaoOffsetVal arrays come from
@@ -9199,7 +9231,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
         };
-        apply_sao(out, &self.sao_picture, &sao_cfg);
+        crate::sao::apply_sao_clipped(
+            out,
+            &self.sao_picture,
+            &sao_cfg,
+            tile_lf_bounds
+                .as_ref()
+                .map(|(c, r)| (c.as_slice(), r.as_slice())),
+        );
         // ALF (§8.8.5) — runs after SAO per §8.8.5.1. Gated on
         // `sh_alf_enabled_flag`. Per-CTB on/off + filter selection
         // comes from `alf_picture`, which the round-15 walker leaves
@@ -9213,7 +9252,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
         };
-        apply_alf(out, &self.alf_picture, &alf_cfg, alf_binding);
+        crate::alf::apply_alf_clipped(
+            out,
+            &self.alf_picture,
+            &alf_cfg,
+            alf_binding,
+            tile_lf_bounds
+                .as_ref()
+                .map(|(c, r)| (c.as_slice(), r.as_slice())),
+        );
         Ok(())
     }
 }

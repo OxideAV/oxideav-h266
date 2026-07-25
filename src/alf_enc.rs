@@ -70,7 +70,7 @@
 //! pre-luma-ALF luma plane separately so each trial's `recPictureL`
 //! reads come from the correct §8.8.5.7 source.
 
-use crate::alf::{apply_alf, AlfApsBinding, AlfConfig, AlfCtb, AlfPicture};
+use crate::alf::{apply_alf_clipped, AlfApsBinding, AlfConfig, AlfCtb, AlfPicture};
 use crate::aps::AlfApsData;
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 
@@ -168,6 +168,28 @@ pub fn alf_decide_and_apply(
     bit_depth: u32,
     chroma_format_idc: u32,
 ) -> AlfPicture {
+    alf_decide_and_apply_clipped(
+        src,
+        rec,
+        ctb_log2_size_y,
+        bit_depth,
+        chroma_format_idc,
+        None,
+    )
+}
+
+/// r429 — [`alf_decide_and_apply`] with the §8.8.5.5 tile-boundary
+/// clip positions threaded through every trial / commit `apply_alf`
+/// (the `pps_loop_filter_across_tiles_enabled_flag == 0` case; the
+/// RDO must evaluate exactly what a conforming decoder reconstructs).
+pub fn alf_decide_and_apply_clipped(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    ctb_log2_size_y: u32,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) -> AlfPicture {
     let ctb_size_y = 1u32 << ctb_log2_size_y;
     let pic_w_in_ctbs = (rec.luma.width as u32).div_ceil(ctb_size_y);
     let pic_h_in_ctbs = (rec.luma.height as u32).div_ceil(ctb_size_y);
@@ -217,11 +239,12 @@ pub fn alf_decide_and_apply(
     for s in 0..NUM_FIXED_FILTER_SETS {
         let mut rec_with_alf = rec.clone();
         let trial_pic = alf_picture_all_on_fixed_set(s, pic_w_in_ctbs, pic_h_in_ctbs);
-        apply_alf(
+        apply_alf_clipped(
             &mut rec_with_alf,
             &trial_pic,
             &cfg,
             &AlfApsBinding::default(),
+            tile_bounds,
         );
         for ry in 0..pic_h_in_ctbs {
             for rx in 0..pic_w_in_ctbs {
@@ -311,6 +334,28 @@ pub fn alf_decide_and_apply_with_aps(
     bit_depth: u32,
     chroma_format_idc: u32,
 ) -> AlfPicture {
+    alf_decide_and_apply_with_aps_clipped(
+        src,
+        rec,
+        aps,
+        ctb_log2_size_y,
+        bit_depth,
+        chroma_format_idc,
+        None,
+    )
+}
+
+/// r429 — [`alf_decide_and_apply_with_aps`] with tile-boundary clip
+/// positions (see [`alf_decide_and_apply_clipped`]).
+pub fn alf_decide_and_apply_with_aps_clipped(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    aps: &AlfApsData,
+    ctb_log2_size_y: u32,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) -> AlfPicture {
     let ctb_size_y = 1u32 << ctb_log2_size_y;
     let pic_w_in_ctbs = (rec.luma.width as u32).div_ceil(ctb_size_y);
     let pic_h_in_ctbs = (rec.luma.height as u32).div_ceil(ctb_size_y);
@@ -357,11 +402,12 @@ pub fn alf_decide_and_apply_with_aps(
     for s in 0..NUM_FIXED_FILTER_SETS {
         let mut rec_with_alf = rec.clone();
         let trial_pic = alf_picture_all_on_fixed_set(s, pic_w_in_ctbs, pic_h_in_ctbs);
-        apply_alf(
+        apply_alf_clipped(
             &mut rec_with_alf,
             &trial_pic,
             &cfg,
             &AlfApsBinding::default(),
+            tile_bounds,
         );
         for ry in 0..pic_h_in_ctbs {
             for rx in 0..pic_w_in_ctbs {
@@ -405,7 +451,7 @@ pub fn alf_decide_and_apply_with_aps(
                 );
             }
         }
-        apply_alf(&mut rec_with_alf, &trial_pic, &cfg, &binding);
+        apply_alf_clipped(&mut rec_with_alf, &trial_pic, &cfg, &binding, tile_bounds);
         for ry in 0..pic_h_in_ctbs {
             for rx in 0..pic_w_in_ctbs {
                 let x0 = (rx * ctb_size_y) as usize;
@@ -559,6 +605,33 @@ pub fn chroma_alf_decide_and_apply(
     bit_depth: u32,
     chroma_format_idc: u32,
 ) {
+    chroma_alf_decide_and_apply_clipped(
+        src,
+        rec,
+        apply_pic,
+        aps,
+        component,
+        ctb_log2_size_y,
+        bit_depth,
+        chroma_format_idc,
+        None,
+    )
+}
+
+/// r429 — [`chroma_alf_decide_and_apply`] with tile-boundary clip
+/// positions (see [`alf_decide_and_apply_clipped`]).
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_alf_decide_and_apply_clipped(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    apply_pic: &mut AlfPicture,
+    aps: &AlfApsData,
+    component: CcAlfComponent,
+    ctb_log2_size_y: u32,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) {
     if chroma_format_idc == 0 {
         return; // Monochrome.
     }
@@ -646,7 +719,7 @@ pub fn chroma_alf_decide_and_apply(
     for k in 0..n_alts {
         let mut trial = rec.clone();
         let trial_pic = chroma_alf_picture_all_on(component, k as u8, pic_w_in_ctbs, pic_h_in_ctbs);
-        apply_alf(&mut trial, &trial_pic, &cfg, &binding);
+        apply_alf_clipped(&mut trial, &trial_pic, &cfg, &binding, tile_bounds);
         let chroma_src = match component {
             CcAlfComponent::Cb => &src.cb,
             CcAlfComponent::Cr => &src.cr,
@@ -836,6 +909,35 @@ pub fn cc_alf_decide_and_apply(
     bit_depth: u32,
     chroma_format_idc: u32,
 ) {
+    cc_alf_decide_and_apply_clipped(
+        src,
+        rec,
+        pre_luma_alf_samples,
+        apply_pic,
+        aps,
+        component,
+        ctb_log2_size_y,
+        bit_depth,
+        chroma_format_idc,
+        None,
+    )
+}
+
+/// r429 — [`cc_alf_decide_and_apply`] with tile-boundary clip
+/// positions (see [`alf_decide_and_apply_clipped`]).
+#[allow(clippy::too_many_arguments)]
+pub fn cc_alf_decide_and_apply_clipped(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    pre_luma_alf_samples: &[u8],
+    apply_pic: &mut AlfPicture,
+    aps: &AlfApsData,
+    component: CcAlfComponent,
+    ctb_log2_size_y: u32,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+    tile_bounds: Option<(&[u32], &[u32])>,
+) {
     if chroma_format_idc == 0 {
         return; // Monochrome: no chroma plane to refine.
     }
@@ -942,7 +1044,7 @@ pub fn cc_alf_decide_and_apply(
         trial.luma.samples.copy_from_slice(pre_luma_alf_samples);
         let trial_pic =
             cc_alf_picture_all_on(component, (k + 1) as u8, pic_w_in_ctbs, pic_h_in_ctbs);
-        apply_alf(&mut trial, &trial_pic, &cfg, &binding);
+        apply_alf_clipped(&mut trial, &trial_pic, &cfg, &binding, tile_bounds);
 
         let chroma_src = match component {
             CcAlfComponent::Cb => &src.cb,
@@ -1032,6 +1134,7 @@ pub fn cc_alf_decide_and_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alf::apply_alf;
     use crate::reconstruct::PictureBuffer;
 
     fn smooth_gradient_picture(w: usize, h: usize) -> PictureBuffer {

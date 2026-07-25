@@ -190,6 +190,24 @@ pub fn apply_deblocking(
     params: &DeblockParams,
     chroma_format_idc: u32,
 ) {
+    apply_deblocking_clipped(out, cus, params, chroma_format_idc, &[], &[])
+}
+
+/// r429 — [`apply_deblocking`] with the §8.8.3.1 tile-boundary edge
+/// exclusion: vertical edges whose luma x coincides with an entry of
+/// `no_filter_cols`, and horizontal edges whose luma y coincides with
+/// an entry of `no_filter_rows`, are not filtered (the
+/// `pps_loop_filter_across_tiles_enabled_flag == 0` /
+/// `pps_loop_filter_across_slices_enabled_flag == 0` arms; callers
+/// pass the interior tile boundary positions).
+pub fn apply_deblocking_clipped(
+    out: &mut PictureBuffer,
+    cus: &[DeblockCu],
+    params: &DeblockParams,
+    chroma_format_idc: u32,
+    no_filter_cols: &[u32],
+    no_filter_rows: &[u32],
+) {
     if params.disabled {
         return;
     }
@@ -210,8 +228,8 @@ pub fn apply_deblocking(
         bit_depth: params.bit_depth,
         ctb_size_y: 1 << params.ctb_log2_size_y,
     };
-    deblock_one_direction(&mut luma, cus, &grid, EdgeType::Vertical);
-    deblock_one_direction(&mut luma, cus, &grid, EdgeType::Horizontal);
+    deblock_one_direction(&mut luma, cus, &grid, EdgeType::Vertical, no_filter_cols);
+    deblock_one_direction(&mut luma, cus, &grid, EdgeType::Horizontal, no_filter_rows);
 
     if chroma_format_idc != 0 {
         let mut cb = PlaneCtx {
@@ -225,8 +243,8 @@ pub fn apply_deblocking(
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
         };
-        deblock_one_direction(&mut cb, cus, &grid, EdgeType::Vertical);
-        deblock_one_direction(&mut cb, cus, &grid, EdgeType::Horizontal);
+        deblock_one_direction(&mut cb, cus, &grid, EdgeType::Vertical, no_filter_cols);
+        deblock_one_direction(&mut cb, cus, &grid, EdgeType::Horizontal, no_filter_rows);
         let mut cr = PlaneCtx {
             plane: &mut out.cr,
             c_idx: 2,
@@ -238,8 +256,8 @@ pub fn apply_deblocking(
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
         };
-        deblock_one_direction(&mut cr, cus, &grid, EdgeType::Vertical);
-        deblock_one_direction(&mut cr, cus, &grid, EdgeType::Horizontal);
+        deblock_one_direction(&mut cr, cus, &grid, EdgeType::Vertical, no_filter_cols);
+        deblock_one_direction(&mut cr, cus, &grid, EdgeType::Horizontal, no_filter_rows);
     }
 }
 
@@ -308,6 +326,7 @@ fn deblock_one_direction(
     cus: &[DeblockCu],
     grid: &CuGrid,
     edge_type: EdgeType,
+    no_filter: &[u32],
 ) {
     for (idx, cu) in cus.iter().enumerate() {
         // CU rectangle in this component's coordinate system.
@@ -340,10 +359,21 @@ fn deblock_one_direction(
                 if cx == 0 {
                     continue;
                 }
+                // r429 — §8.8.3.1: edges coinciding with a tile
+                // boundary are excluded when the across-tiles gate is
+                // closed (`no_filter` carries luma positions).
+                if no_filter.contains(&cu.x) {
+                    continue;
+                }
                 deblock_cu_left_edge(plane, cus, grid, idx as u32, cu, cx, cy, cw, ch);
             }
             EdgeType::Horizontal => {
                 if cy == 0 {
+                    continue;
+                }
+                // r429 — §8.8.3.1 tile-boundary exclusion (horizontal
+                // edges at tile rows).
+                if no_filter.contains(&cu.y) {
                     continue;
                 }
                 deblock_cu_top_edge(plane, cus, grid, idx as u32, cu, cx, cy, cw, ch);

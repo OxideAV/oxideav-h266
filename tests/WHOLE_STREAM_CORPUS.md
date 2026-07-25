@@ -43,8 +43,10 @@ Each `<name>.266` is decoded to planar 4:2:0 through a conforming
 external reference decoder invoked black-box, and the output is
 `cmp`'d byte-for-byte against the crate's own `<name>.yuv`.
 
-r429 status: **120 of 120 streams byte-exact** (the 22 historical
-corpus axes + the 8 r429 tile/WPP axes + all ~90 probe streams).
+r429 status: **122 of 122 streams byte-exact** (the 22 historical
+corpus axes + the 10 r429 tile/WPP axes — including the two
+`pps_loop_filter_across_tiles_enabled_flag = 0` axes — + all ~90
+probe streams).
 
 r418 status: **112 of 112 streams byte-exact** (all corpus axes —
 including the 8 r418 extension streams below — plus all ~60 probe
@@ -105,6 +107,8 @@ distinct root-cause families, all fixed in r415:
 | wpp_256x256 (r429) | byte-exact | byte-exact | 1971e4423601d0ad | 93d9ef34ff36b5d9 |
 | wpp_128x384_qp34 (r429) | byte-exact | byte-exact | 93cfcd8548651866 | a1262fdd00b70efc |
 | tiles_2x1_wpp_256x256 (r429) | byte-exact | byte-exact | 91e8b76ef903ee3b | a36b8894f3f0e6af |
+| tiles_2x2_noxlf_256x256 (r429) | byte-exact | byte-exact | a28440cd8459eec8 | da1868ced29dbc99 |
+| tiles_3x1_noxlf_qp45 (r429) | byte-exact | byte-exact | 38ef3fc5de5ebf45 | 1b32566fc3457ad3 |
 | mtt_bt_qp45 / mtt_bt_tt_qp45 (r418) | byte-exact | byte-exact | 8daf4a85db40ec28 | 28e105132000b8ae |
 | multi_ctu_qp45 / multi_ctu_mtt_qp45 (r418) | byte-exact | byte-exact | b54b2fe36d3200de / 99c0790dfdfdb821 | 052997467c44de0a |
 | wide_192x128_qp45 (r418) | byte-exact | byte-exact | d162706ece057f57 | 9de6a3f26d0c8df2 |
@@ -130,7 +134,14 @@ against the tile-gated split-flag ctxIncs and prediction
 availability; `tiles_2x1_192x128` puts a 64-sample-wide tile over the
 partial right CTB column (tile boundary + §7.4.12.4 boundary walk
 interaction); `tiles_2x1_wpp_256x256` interleaves `end_of_subset` and
-`end_of_tile` subsets in one slice. `wpp_256x256` reconstructs
+`end_of_tile` subsets in one slice. The `*_noxlf_*` axes close the
+loop filters at tile boundaries
+(`pps_loop_filter_across_tiles_enabled_flag = 0`): deblocking skips
+the boundary edges (§8.8.3.1), SAO forces edgeIdx = 0 on cross-tile
+neighbour samples (§8.8.4.2), and ALF pads its classification /
+filter / CC-ALF fetches at the tile rectangle (§8.8.5.5 / §8.8.5.6);
+`tiles_3x1_noxlf_qp45` keeps the deep-QP long deblocking filters
+active everywhere except the two tile columns. `wpp_256x256` reconstructs
 identically to `multi_ctu_256x256` (matching plane hash) because the
 DC-only intra pipeline never reads a reference beyond the §6.4.4 WPP
 column cap — the axis therefore validates the WPP wire structure

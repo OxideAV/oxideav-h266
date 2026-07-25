@@ -59,7 +59,7 @@ use crate::coding_tree::SplitConstraints;
 use crate::ctx::{
     ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag,
 };
-use crate::deblock::{apply_deblocking, DeblockCu, DeblockParams};
+use crate::deblock::{DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
 use crate::intra::{predict_intra, IntraPredParams};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
@@ -2204,6 +2204,29 @@ pub fn encode_idr_with_qp_picker_cfg(
         }
         None => (vec![0, pic_w_ctbs], vec![0, pic_h_ctbs]),
     };
+    // r429 — §8.8 tile-boundary loop-filter gating: with a tile grid
+    // and `loop_filter_across_tiles == false`, the encoder's own
+    // deblock / SAO / ALF application (and the ALF trial RDO) run
+    // through the decoder-mirrored clipped variants. Boundary prefix
+    // lists in luma samples.
+    let lf_bounds: Option<(Vec<u32>, Vec<u32>)> =
+        if tile_grid_cfg.is_some() && !config.loop_filter_across_tiles {
+            let to_smp =
+                |v: &[usize]| -> Vec<u32> { v.iter().map(|&c| (c * ctb_size) as u32).collect() };
+            Some((to_smp(&tile_col_bd), to_smp(&tile_row_bd)))
+        } else {
+            None
+        };
+    let lf_bounds_ref: Option<(&[u32], &[u32])> = lf_bounds
+        .as_ref()
+        .map(|(c, r)| (c.as_slice(), r.as_slice()));
+    let (lf_no_filter_cols, lf_no_filter_rows): (Vec<u32>, Vec<u32>) = match &lf_bounds {
+        Some((c, r)) => (
+            c[1..c.len().saturating_sub(1)].to_vec(),
+            r[1..r.len().saturating_sub(1)].to_vec(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
 
     for ry in 0..pic_h_ctbs {
         for rx in 0..pic_w_ctbs {
@@ -2362,7 +2385,14 @@ pub fn encode_idr_with_qp_picker_cfg(
             *v = der.inverse_map_luma_sample(s32, iy) as u8;
         }
     }
-    apply_deblocking(&mut rec, &all_deblock_cus, &dbp, 1);
+    crate::deblock::apply_deblocking_clipped(
+        &mut rec,
+        &all_deblock_cus,
+        &dbp,
+        1,
+        &lf_no_filter_cols,
+        &lf_no_filter_rows,
+    );
 
     // SAO decision + apply.
     //
@@ -2410,7 +2440,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         ctb_log2_size_y: 7,
         chroma_format_idc: 1,
     };
-    crate::sao::apply_sao(&mut rec, &sao_pic, &sao_cfg);
+    crate::sao::apply_sao_clipped(&mut rec, &sao_pic, &sao_cfg, lf_bounds_ref);
 
     // Round-41 — luma ALF filter-set RDO over all 16 fixed filter
     // sets. The RDO chooses, per CTB, the lower-SSE_Y option among
@@ -2491,21 +2521,28 @@ pub fn encode_idr_with_qp_picker_cfg(
 
     // Trial 1 — fixed-only RDO on a clone of `rec`.
     let mut rec_fixed_only = rec.clone();
-    let alf_pic_fixed_only =
-        crate::alf_enc::alf_decide_and_apply(src, &mut rec_fixed_only, 7, 8, 1);
+    let alf_pic_fixed_only = crate::alf_enc::alf_decide_and_apply_clipped(
+        src,
+        &mut rec_fixed_only,
+        7,
+        8,
+        1,
+        lf_bounds_ref,
+    );
     let sse_fixed_only = total_sse_y(&src.luma, &rec_fixed_only.luma);
 
     // Trial 2 — APS + fixed RDO on a clone of `rec`. Cheap because the
     // RDO scales linearly with the number of trial sets and the test
     // pictures are at most 128×128.
     let mut rec_with_aps = rec.clone();
-    let alf_pic_with_aps = crate::alf_enc::alf_decide_and_apply_with_aps(
+    let alf_pic_with_aps = crate::alf_enc::alf_decide_and_apply_with_aps_clipped(
         src,
         &mut rec_with_aps,
         &luma_alf_aps,
         7,
         8,
         1,
+        lf_bounds_ref,
     );
     let sse_with_aps = total_sse_y(&src.luma, &rec_with_aps.luma);
 
@@ -2612,7 +2649,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     let sse_chroma_off = total_sse_y(&src.cb, &rec.cb) + total_sse_y(&src.cr, &rec.cr);
     let mut rec_with_chroma_aps = rec.clone();
     let mut alf_pic_with_chroma_aps = alf_pic.clone();
-    crate::alf_enc::chroma_alf_decide_and_apply(
+    crate::alf_enc::chroma_alf_decide_and_apply_clipped(
         src,
         &mut rec_with_chroma_aps,
         &mut alf_pic_with_chroma_aps,
@@ -2621,8 +2658,9 @@ pub fn encode_idr_with_qp_picker_cfg(
         7,
         8,
         1,
+        lf_bounds_ref,
     );
-    crate::alf_enc::chroma_alf_decide_and_apply(
+    crate::alf_enc::chroma_alf_decide_and_apply_clipped(
         src,
         &mut rec_with_chroma_aps,
         &mut alf_pic_with_chroma_aps,
@@ -2631,6 +2669,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         7,
         8,
         1,
+        lf_bounds_ref,
     );
     let sse_chroma_on = total_sse_y(&src.cb, &rec_with_chroma_aps.cb)
         + total_sse_y(&src.cr, &rec_with_chroma_aps.cr);
@@ -2714,7 +2753,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     // CC-ALF Cb trial.
     let mut rec_cc_cb = rec.clone();
     let mut alf_pic_cc_cb = alf_pic.clone();
-    crate::alf_enc::cc_alf_decide_and_apply(
+    crate::alf_enc::cc_alf_decide_and_apply_clipped(
         src,
         &mut rec_cc_cb,
         &pre_luma_alf_samples,
@@ -2724,6 +2763,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         7,
         8,
         1,
+        lf_bounds_ref,
     );
     let sse_cb_on = total_sse_y(&src.cb, &rec_cc_cb.cb);
     let cc_cb_picked_anywhere = (0..alf_pic_cc_cb.pic_height_in_ctbs_y).any(|ry| {
@@ -2733,7 +2773,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     // CC-ALF Cr trial.
     let mut rec_cc_cr = rec.clone();
     let mut alf_pic_cc_cr = alf_pic.clone();
-    crate::alf_enc::cc_alf_decide_and_apply(
+    crate::alf_enc::cc_alf_decide_and_apply_clipped(
         src,
         &mut rec_cc_cr,
         &pre_luma_alf_samples,
@@ -2743,6 +2783,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         7,
         8,
         1,
+        lf_bounds_ref,
     );
     let sse_cr_on = total_sse_y(&src.cr, &rec_cc_cr.cr);
     let cc_cr_picked_anywhere = (0..alf_pic_cc_cr.pic_height_in_ctbs_y).any(|ry| {
