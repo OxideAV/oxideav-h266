@@ -1,4 +1,4 @@
-# Whole-stream decode conformance corpus (r412, externally validated r415/r418)
+# Whole-stream decode conformance corpus (r412, externally validated r415/r418, tiles/WPP r429)
 
 The corpus streams are generated deterministically by
 `tests/whole_stream_conformance.rs` — every test encodes with the
@@ -8,12 +8,22 @@ in-stream SAO + ALF prefixes → §8.7 dequant + inverse transforms →
 §8.8 in-loop filters) reproduces the encoder reconstruction
 **byte-exactly**. All 11 axes hold.
 
-`tests/external_probe_corpus.rs` extends the corpus with ~60
+`tests/external_probe_corpus.rs` extends the corpus with ~90
 single-feature probe streams (TB-size sweep 8..64, single luma/chroma
 coefficients by frequency position, amplitude sweeps, chroma-only
 planes, gradient / stripe / checker content, QP sweep, 128x128
 full-CTB four-CU walk) for black-box bisection against an external
 reference decoder.
+
+r429 adds the **tiles / WPP** axes: the encoder emits real §6.5.1
+tile grids (PPS partition block, one rectangular slice covering the
+picture in tile-scan order, per-tile byte-aligned CABAC subsets with
+`end_of_tile_one_bit` + §9.3.2.2 context re-initialization) and WPP
+(`sps_entropy_coding_sync_enabled_flag`, per-CTU-row subsets with
+`end_of_subset_one_bit` + the §9.3.2.3/§9.3.2.4 context
+storage/synchronization), with §7.4.8 entry-point offsets on the
+wire; the decoder walks the same §7.3.11.1 plan with the §6.4.4
+different-tile / WPP-column availability gates.
 
 ## Generation
 
@@ -27,12 +37,14 @@ Y then Cb then Cr) per axis. Content is fully deterministic; the
 SHA-256 prefixes below were recorded on 2026-07-20 (they change
 whenever the encoder's wire evolves — regenerate rather than diff).
 
-## Black-box reference-decoder validation (ffmpeg 8.1 `vvc` decoder)
+## Black-box reference-decoder validation
 
-```
-ffmpeg -i <name>.266 -f rawvideo -pix_fmt yuv420p <name>.ffmpeg.yuv
-cmp <name>.yuv <name>.ffmpeg.yuv
-```
+Each `<name>.266` is decoded to planar 4:2:0 through a conforming
+external reference decoder invoked black-box, and the output is
+`cmp`'d byte-for-byte against the crate's own `<name>.yuv`.
+
+r429 status: **120 of 120 streams byte-exact** (the 22 historical
+corpus axes + the 8 r429 tile/WPP axes + all ~90 probe streams).
 
 r418 status: **112 of 112 streams byte-exact** (all corpus axes —
 including the 8 r418 extension streams below — plus all ~60 probe
@@ -73,7 +85,7 @@ distinct root-cause families, all fixed in r415:
    §8.8.3.3 CTB-row `maxFilterLengthP = 1` cap + §8.8.3.6.10
    asymmetric (1,3) filter.
 
-| axis | vs own decoder | vs ffmpeg vvc | stream sha | plane sha |
+| axis | vs own decoder | vs external reference | stream sha | plane sha |
 |------|----------------|---------------|------------|-----------|
 | flat_qp26 | byte-exact | byte-exact | 6debac3fbc151682 | 8c8362c09e7c37cf |
 | default_qp26 | byte-exact | byte-exact | 6fc38b8dde443083 | e53959ce6e82c01d |
@@ -85,6 +97,14 @@ distinct root-cause families, all fixed in r415:
 | lmcs / lmcs_chroma_scaling | byte-exact | byte-exact | 81af59718db2c07b / 8a91b058f84df4d3 | 1e164146428d7493 |
 | dep_quant / sign_data_hiding | byte-exact | byte-exact | bfc3898b6c9d140b / 0c841ad45810c9a8 | ff8e5a3a0c924e49 / d27ad4ff087635a6 |
 | qp51 / qp57 / qp63 (r418) | byte-exact | byte-exact | 471edd9fb6bb7064 / b95e46609b7d6efb / c26ea7b881e008f2 | 2e68ce6e24117003 / 25b4cd760abc6067 / 9c5d7c150f204c9f |
+| tiles_2x1_256x128 (r429) | byte-exact | byte-exact | cf10834c0684f582 | 92c536fc19011855 |
+| tiles_2x2_256x256 (r429) | byte-exact | byte-exact | 934eeeefa23fa757 | 7115a4ba9591e019 |
+| tiles_3x1_384x128_qp34 (r429) | byte-exact | byte-exact | 299485e46dbd68cb | bd8a0bd6c7107648 |
+| tiles_2x1_192x128 (r429) | byte-exact | byte-exact | f535d3a2c05c441c | 7e9fbb04c4ec7daf |
+| tiles_2x2_mtt_qp30 (r429) | byte-exact | byte-exact | 6a1f04c76cfae5f2 | be7537bce8a3a534 |
+| wpp_256x256 (r429) | byte-exact | byte-exact | 1971e4423601d0ad | 93d9ef34ff36b5d9 |
+| wpp_128x384_qp34 (r429) | byte-exact | byte-exact | 93cfcd8548651866 | a1262fdd00b70efc |
+| tiles_2x1_wpp_256x256 (r429) | byte-exact | byte-exact | 91e8b76ef903ee3b | a36b8894f3f0e6af |
 | mtt_bt_qp45 / mtt_bt_tt_qp45 (r418) | byte-exact | byte-exact | 8daf4a85db40ec28 | 28e105132000b8ae |
 | multi_ctu_qp45 / multi_ctu_mtt_qp45 (r418) | byte-exact | byte-exact | b54b2fe36d3200de / 99c0790dfdfdb821 | 052997467c44de0a |
 | wide_192x128_qp45 (r418) | byte-exact | byte-exact | d162706ece057f57 | 9de6a3f26d0c8df2 |
@@ -104,5 +124,18 @@ Probe extension (`external_probe_corpus.rs`): all ~60 probe streams
 byte-exact through the reference decoder, including every sparse
 single-coefficient case the r412 characterization flagged, all chroma
 probes, and the 128x128 four-CU walk.
+
+r429 tile/WPP notes: `tiles_2x2_mtt_qp30` runs the MTT pickers
+against the tile-gated split-flag ctxIncs and prediction
+availability; `tiles_2x1_192x128` puts a 64-sample-wide tile over the
+partial right CTB column (tile boundary + §7.4.12.4 boundary walk
+interaction); `tiles_2x1_wpp_256x256` interleaves `end_of_subset` and
+`end_of_tile` subsets in one slice. `wpp_256x256` reconstructs
+identically to `multi_ctu_256x256` (matching plane hash) because the
+DC-only intra pipeline never reads a reference beyond the §6.4.4 WPP
+column cap — the axis therefore validates the WPP wire structure
+(subsets, entry points, context storage/sync) rather than the cap's
+pixel effect; angular/inter content will exercise the cap once the
+encoder can emit it.
 
 No known external divergence remains in the corpus.

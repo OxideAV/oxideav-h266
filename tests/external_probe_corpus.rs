@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! H266_CORPUS_DIR=<dir> cargo test --test external_probe_corpus
-//! ffmpeg -i <name>.266 -f rawvideo -pix_fmt yuv420p <name>.ref.yuv
+//! <reference-decoder> -i <name>.266 → planar 4:2:0 <name>.ref.yuv
 //! cmp <name>.yuv <name>.ref.yuv
 //! ```
 //!

@@ -479,3 +479,123 @@ fn whole_stream_192x128_qp45() {
     assert_byte_exact(&dec, &rec, "192x128 qp45");
     dump_corpus("wide_192x128_qp45", &bs, &dec);
 }
+
+/// r429 — tiles: the picture splits into a §6.5.1 tile grid, the PPS
+/// carries the partition block, the slice data walks tile-scan order
+/// with per-tile CABAC subsets (end_of_tile_one_bit + byte alignment +
+/// §9.3.2.2 context re-init), the SH carries the §7.4.8 entry-point
+/// offsets, and the §6.4.4 "different tile" arm gates both sides'
+/// prediction availability.
+#[test]
+fn whole_stream_tiles_2x1() {
+    let src = structured_source(256, 128);
+    let mut cfg = EncoderConfig::new(256, 128);
+    cfg.tile_columns = 2;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x1");
+    dump_corpus("tiles_2x1_256x128", &bs, &dec);
+}
+
+/// r429 — 2x2 tile grid on a 256x256 picture (one CTB per tile): four
+/// subsets, three entry points, every interior tile boundary active in
+/// both directions.
+#[test]
+fn whole_stream_tiles_2x2() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x2");
+    dump_corpus("tiles_2x2_256x256", &bs, &dec);
+}
+
+/// r429 — 3x1 tile columns at QP 34 on 384x128: three vertical tiles,
+/// two entry points, deblocking across the tile boundaries
+/// (pps_loop_filter_across_tiles_enabled_flag = 1).
+#[test]
+fn whole_stream_tiles_3x1_qp34() {
+    let src = structured_source(384, 128);
+    let mut cfg = EncoderConfig::new(384, 128);
+    cfg.tile_columns = 3;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 34, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 3x1 qp34");
+    dump_corpus("tiles_3x1_384x128_qp34", &bs, &dec);
+}
+
+/// r429 — tiles with a partial-width right CTB column (192 = 128 +
+/// 64): tile 1 is 64 samples wide, so the tile boundary and the
+/// picture-boundary implicit-split walk interact.
+#[test]
+fn whole_stream_tiles_2x1_partial_column() {
+    let src = structured_source(192, 128);
+    let mut cfg = EncoderConfig::new(192, 128);
+    cfg.tile_columns = 2;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 30, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x1 partial column");
+    dump_corpus("tiles_2x1_192x128", &bs, &dec);
+}
+
+/// r429 — tiles + the MTT BT/TT pickers: mixed-size CUs against the
+/// tile-gated split-flag ctxIncs and prediction availability.
+#[test]
+fn whole_stream_tiles_2x2_mtt() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.enable_mtt_bt_picker = true;
+    cfg.enable_mtt_tt_picker = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 30, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x2 + MTT");
+    dump_corpus("tiles_2x2_mtt_qp30", &bs, &dec);
+}
+
+/// r429 — WPP (sps_entropy_coding_sync_enabled_flag): every CTU row is
+/// a byte-aligned subset (end_of_subset_one_bit), the §9.3.2.3/.4
+/// context storage/synchronization runs around each row's first CTU,
+/// and the §6.4.4 WPP column arm caps prediction availability.
+#[test]
+fn whole_stream_wpp_256x256() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.wpp = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "wpp 256x256");
+    dump_corpus("wpp_256x256", &bs, &dec);
+}
+
+/// r429 — WPP over three CTU rows at QP 34 (two sync generations: row
+/// 2 restores state stored after row 1's first CTU, which itself ran
+/// on state restored from row 0).
+#[test]
+fn whole_stream_wpp_three_rows() {
+    let src = structured_source(128, 384);
+    let mut cfg = EncoderConfig::new(128, 384);
+    cfg.wpp = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 34, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "wpp 128x384");
+    dump_corpus("wpp_128x384_qp34", &bs, &dec);
+}
+
+/// r429 — tiles + WPP combined (§7.3.11.1: end_of_subset fires at CTU
+/// row ends inside a tile, end_of_tile at tile ends; the WPP storage /
+/// sync and the per-tile context re-init interleave).
+#[test]
+fn whole_stream_tiles_2x1_wpp() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.wpp = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles 2x1 + wpp");
+    dump_corpus("tiles_2x1_wpp_256x256", &bs, &dec);
+}

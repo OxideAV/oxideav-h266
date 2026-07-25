@@ -309,6 +309,12 @@ struct EncAvail {
     chroma: Vec<bool>,
     w: usize,
     h: usize,
+    /// r429 — §6.4.4 availability region `(x0, y0, x1, y1, col_cap)`
+    /// in luma samples: the current tile's rectangle plus the WPP
+    /// exclusive column cap. Reference fetches outside it read
+    /// unavailable even when marked (decoder-mirrored tile / WPP
+    /// gating). Defaults to the whole picture / no cap.
+    region: (usize, usize, usize, usize, usize),
 }
 
 impl EncAvail {
@@ -318,7 +324,30 @@ impl EncAvail {
             chroma: vec![false; (w / 2) * (h / 2)],
             w,
             h,
+            region: (0, 0, w, h, usize::MAX),
         }
+    }
+
+    /// r429 — install the §6.4.4 tile / WPP availability region for
+    /// the CTU being prepared (luma-sample bounds + exclusive WPP
+    /// column cap).
+    fn set_region(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, col_cap: usize) {
+        self.region = (x0, y0, x1, y1, col_cap);
+    }
+
+    /// r429 — the region at the resolution of colour component
+    /// `c_idx` (tile bounds and the cap are CTB-aligned, hence even).
+    fn region_for(&self, c_idx: u32) -> (i32, i32, i32, i32, i32) {
+        let (x0, y0, x1, y1, cap) = self.region;
+        let clip = |v: usize| -> i32 { v.min(i32::MAX as usize) as i32 };
+        let d = if c_idx == 0 { 1 } else { 2 };
+        (
+            clip(x0) / d,
+            clip(y0) / d,
+            clip(x1) / d,
+            clip(y1) / d,
+            clip(cap) / d,
+        )
     }
 
     fn mark_luma(&mut self, x: usize, y: usize, bw: usize, bh: usize) {
@@ -348,12 +377,14 @@ fn predict_dc_block(
     avail: &[bool],
     aw: usize,
     ah: usize,
+    region: (i32, i32, i32, i32, i32),
     x0: usize,
     y0: usize,
     n_w: usize,
     n_h: usize,
     c_idx: u32,
 ) -> Result<Vec<i16>> {
+    let (rx0, ry0, rx1, ry1, rcap) = region;
     predict_intra(
         &IntraPredParams {
             mode: crate::leaf_cu::INTRA_DC,
@@ -373,6 +404,10 @@ fn predict_dc_block(
             if x < 0 || y < 0 || x >= aw as i32 || y >= ah as i32 {
                 return None;
             }
+            // r429 — §6.4.4 tile / WPP region gate (decoder-mirrored).
+            if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
+                return None;
+            }
             if !avail[(y as usize) * aw + x as usize] {
                 return None;
             }
@@ -385,6 +420,7 @@ fn predict_dc_block(
 /// second-pass CABAC emit (and the RDO bit measurement). The init
 /// tables are the same `SyntaxCtx` entries the decoder's `LeafCuCtxs`
 /// uses, so encoder and decoder context state stay in lockstep.
+#[derive(Clone)]
 struct IntraModeCtxs {
     mpm_flag: Vec<ContextModel>,
     not_planar: Vec<ContextModel>,
@@ -451,6 +487,7 @@ fn prepare_luma_tb(
         &avail.luma,
         avail.w,
         avail.h,
+        avail.region_for(0),
         x,
         y,
         n_tb_w,
@@ -692,6 +729,7 @@ fn prepare_chroma_tb(
         &avail.chroma,
         avail.w / 2,
         avail.h / 2,
+        avail.region_for(c_idx),
         cx,
         cy,
         n_tb_c_w,
@@ -794,17 +832,22 @@ fn lmcs_forward_scale_chroma_residuals(res: &mut [i32], var_scale: u32) {
 /// neighbours, eq. 1217 mid-grey fallback, then the pivot inverse-index
 /// + `ChromaScaleCoeff` lookup). The encoder's CU grid is 64-aligned so
 /// the eq. 1215 sizeY-aligned corner is the CU origin itself.
+#[allow(clippy::too_many_arguments)]
 fn lmcs_chroma_var_scale_enc(
     rec_luma: &PicturePlane,
     cu_x: usize,
     cu_y: usize,
     size_y: usize,
+    region: (usize, usize, usize, usize, usize),
     der: &crate::lmcs::LmcsDerived,
     min_bin: u8,
     max_bin: u8,
 ) -> u32 {
-    let avail_l = cu_x > 0;
-    let avail_t = cu_y > 0;
+    // r429 — §6.4.4 availL / availT with the tile / WPP region on top
+    // of the picture-edge rule (decoder-mirrored; the left / top
+    // probes never trip the WPP column cap).
+    let avail_l = cu_x > region.0;
+    let avail_t = cu_y > region.1;
     let mut sum: u64 = 0;
     let mut cnt: usize = 0;
     if avail_l {
@@ -1588,6 +1631,10 @@ struct CuStateMap {
     /// not its top-left, since lookups are in terms of "find the CU
     /// containing this sample" which only needs the descriptor.
     cells: Vec<Option<CuDescriptor>>,
+    /// r429 — §6.4.4 availability region in luma samples (current
+    /// tile rectangle); look-ups outside it report "no neighbour"
+    /// (decoder-mirrored `CuNeighbourMap::set_region`).
+    region: (u32, u32, u32, u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1607,7 +1654,15 @@ impl CuStateMap {
             width_mcb,
             height_mcb,
             cells: vec![None; width_mcb * height_mcb],
+            region: (0, 0, w, h),
         }
+    }
+
+    /// r429 — install the §6.4.4 tile availability region (luma-sample
+    /// bounds; the WPP column arm never applies to the left / above
+    /// probes this map serves).
+    fn set_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        self.region = (x0, y0, x1, y1);
     }
 
     /// Insert one CU rectangle into the map. All cells inside the
@@ -1634,6 +1689,10 @@ impl CuStateMap {
     /// CU-in-row case) or when `(x, y)` falls outside the picture.
     fn get(&self, x: i64, y: i64) -> Option<CuDescriptor> {
         if x < 0 || y < 0 {
+            return None;
+        }
+        let (rx0, ry0, rx1, ry1) = self.region;
+        if x < i64::from(rx0) || y < i64::from(ry0) || x >= i64::from(rx1) || y >= i64::from(ry1) {
             return None;
         }
         let mx = (x as usize) / 4;
@@ -2125,10 +2184,44 @@ pub fn encode_idr_with_qp_picker_cfg(
         .map(|_| (0..pic_w_ctbs).map(|_| Vec::new()).collect())
         .collect();
 
+    // r429 — §6.5.1 tile geometry (CTB units; single tile when the
+    // config has no grid) + WPP knob. The prepare pass stays in raster
+    // order — within a tile that matches the tile-scan decode order,
+    // and everything across a tile (or right of the WPP column cap)
+    // is unavailable to both sides via the region gates.
+    let tile_grid_cfg = config.tile_grid();
+    let wpp = config.wpp;
+    let (tile_col_bd, tile_row_bd): (Vec<usize>, Vec<usize>) = match &tile_grid_cfg {
+        Some((cols, rows)) => {
+            let pref = |v: &[u32]| -> Vec<usize> {
+                let mut out = vec![0usize];
+                for x in v {
+                    out.push(out.last().unwrap() + *x as usize);
+                }
+                out
+            };
+            (pref(cols), pref(rows))
+        }
+        None => (vec![0, pic_w_ctbs], vec![0, pic_h_ctbs]),
+    };
+
     for ry in 0..pic_h_ctbs {
         for rx in 0..pic_w_ctbs {
             let ctb_x = rx * ctb_size;
             let ctb_y = ry * ctb_size;
+            // r429 — §6.4.4 availability region of this CTU (tile
+            // rectangle + WPP column cap), decoder-mirrored.
+            {
+                let (tlx, trx) = ctb_span(&tile_col_bd, rx);
+                let (tty, tby) = ctb_span(&tile_row_bd, ry);
+                avail.set_region(
+                    tlx * ctb_size,
+                    tty * ctb_size,
+                    (trx * ctb_size).min(w as usize),
+                    (tby * ctb_size).min(h as usize),
+                    if wpp { (rx + 1) * ctb_size } else { usize::MAX },
+                );
+            }
             let ctb_w = ctb_size.min(w as usize - ctb_x);
             let ctb_h = ctb_size.min(h as usize - ctb_y);
 
@@ -2186,6 +2279,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                                     tb_x,
                                     tb_y,
                                     64,
+                                    avail.region,
                                     der,
                                     data.lmcs_min_bin_idx,
                                     data.lmcs_max_bin_idx(),
@@ -2775,26 +2869,26 @@ pub fn encode_idr_with_qp_picker_cfg(
     // sh_lmcs_used_flag + sh_qp_delta (SliceQpY = 26 + sh_qp_delta on
     // the wire, so the slice-level QP is now signalled instead of
     // being implicitly pinned at 26) + SAO used flags.
-    let slice_header_bytes = vvc_enc.emit_idr_slice_header_bytes(
-        &crate::encoder::AlfPhChain {
-            num_alf_aps_ids_luma: ph_num_alf_aps_ids_luma,
-            luma_aps_id: 2,
-            ph_alf_cb_enabled_flag: ship_chroma_aps,
-            ph_alf_cr_enabled_flag: ship_chroma_aps,
-            ph_alf_aps_id_chroma: 0,
-            ph_alf_cc_cb_enabled_flag: ship_cc_cb,
-            ph_alf_cc_cb_aps_id: 1,
-            ph_alf_cc_cr_enabled_flag: ship_cc_cr,
-            ph_alf_cc_cr_aps_id: 1,
-            // Round-54 — SAO used flags are emitted only when
-            // `EncoderConfig::enable_chroma_sao_merge` flips on
-            // `sps_sao_enabled_flag`. Luma SAO stays internal-only on
-            // this path.
-            ph_sao_luma_enabled_flag: false,
-            ph_sao_chroma_enabled_flag: config.enable_chroma_sao_merge,
-        },
-        slice_qp_y - 26,
-    );
+    // r429 — the slice header is emitted AFTER the CABAC pass so the
+    // §7.4.8 entry-point offsets (per-subset byte lengths) can go on
+    // the wire; only the ALF/SAO chain values are pinned here.
+    let alf_ph_chain = crate::encoder::AlfPhChain {
+        num_alf_aps_ids_luma: ph_num_alf_aps_ids_luma,
+        luma_aps_id: 2,
+        ph_alf_cb_enabled_flag: ship_chroma_aps,
+        ph_alf_cr_enabled_flag: ship_chroma_aps,
+        ph_alf_aps_id_chroma: 0,
+        ph_alf_cc_cb_enabled_flag: ship_cc_cb,
+        ph_alf_cc_cb_aps_id: 1,
+        ph_alf_cc_cr_enabled_flag: ship_cc_cr,
+        ph_alf_cc_cr_aps_id: 1,
+        // Round-54 — SAO used flags are emitted only when
+        // `EncoderConfig::enable_chroma_sao_merge` flips on
+        // `sps_sao_enabled_flag`. Luma SAO stays internal-only on
+        // this path.
+        ph_sao_luma_enabled_flag: false,
+        ph_sao_chroma_enabled_flag: config.enable_chroma_sao_merge,
+    };
 
     // ------------------------------------------------------------------
     // Round-46 — second CABAC pass: walk every CTU emitting the ALF
@@ -2880,8 +2974,48 @@ pub fn encode_idr_with_qp_picker_cfg(
         sh_cabac_init_flag: false,
     };
 
-    for ry in 0..pic_h_ctbs {
-        for rx in 0..pic_w_ctbs {
+    // r429 — §6.5.1 tile-scan walk plan + subset state: each tile
+    // (and, under WPP, each CTU row of a tile) is its own byte-aligned
+    // CABAC subset produced by an independent ArithEncoder (the
+    // terminate flush ends on the byte_alignment stop bit, so plain
+    // byte concatenation is the spec wire).
+    let ctu_order: Vec<(usize, usize)> = {
+        let mut v = Vec::with_capacity(pic_w_ctbs * pic_h_ctbs);
+        for tr in tile_row_bd.windows(2) {
+            for tc in tile_col_bd.windows(2) {
+                for ry in tr[0]..tr[1] {
+                    for rx in tc[0]..tc[1] {
+                        v.push((rx, ry));
+                    }
+                }
+            }
+        }
+        v
+    };
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut first_ctb_row_in_slice = true;
+    type EncCtxSnapshot = (
+        crate::coding_tree::TreeCtxs,
+        ResidualCtxs,
+        IntraModeCtxs,
+        crate::sao_syntax::SaoCtxs,
+        crate::alf_syntax::AlfCtxs,
+    );
+    let mut wpp_enc_store: Option<EncCtxSnapshot> = None;
+    for (ctu_idx, &(rx, ry)) in ctu_order.iter().enumerate() {
+        {
+            // r429 — the containing tile's CTB bounds drive the §6.4.4
+            // availability of the SAO / ALF prefixes and the split-flag
+            // ctxIncs (cu_map region), plus the subset boundaries in
+            // the loop tail.
+            let (tlx_ctb, trx_ctb) = ctb_span(&tile_col_bd, rx);
+            let (tty_ctb, tby_ctb) = ctb_span(&tile_row_bd, ry);
+            cu_map.set_region(
+                (tlx_ctb * ctb_size) as u32,
+                (tty_ctb * ctb_size) as u32,
+                ((trx_ctb * ctb_size).min(w as usize)) as u32,
+                ((tby_ctb * ctb_size).min(h as usize)) as u32,
+            );
             // Round-54 — `sao(rx, ry)` emits ahead of the ALF / coding
             // tree per §7.3.11.2 `coding_tree_unit()` ordering. Gated
             // by `EncoderConfig::enable_chroma_sao_merge` (which also
@@ -2889,8 +3023,11 @@ pub fn encode_idr_with_qp_picker_cfg(
             // `ph_sao_chroma_enabled_flag = 1`); when off, the second-
             // pass walk emits no SAO bins so the wire matches round-53.
             if config.enable_chroma_sao_merge {
-                let left_avail = rx > 0;
-                let up_avail = ry > 0;
+                // r429 — §7.3.11.3: `leftCtbAvailable = rx !=
+                // CtbToTileColBd[rx]`, `upCtbAvailable = ry !=
+                // CtbToTileRowBd[ry] && !FirstCtbRowInSlice`.
+                let left_avail = rx != tlx_ctb;
+                let up_avail = ry != tty_ctb && !first_ctb_row_in_slice;
                 crate::sao_syntax::encode_sao_ctb(
                     &mut cabac_enc,
                     &mut sao_ctxs,
@@ -2904,12 +3041,12 @@ pub fn encode_idr_with_qp_picker_cfg(
                 )?;
             }
 
-            // ALF CABAC bins for this CTU (§7.3.11.2 prefix). Neighbours
-            // are picture-edge derived because we run with a single
-            // slice + single tile.
+            // ALF CABAC bins for this CTU (§7.3.11.2 prefix). The
+            // §9.3.4.2.2 ctxInc availability runs §6.4.4: the left /
+            // above CTB must be inside the current tile.
             let nbrs = crate::alf_syntax::AlfNeighbours {
-                left_avail: rx > 0,
-                up_avail: ry > 0,
+                left_avail: rx != tlx_ctb,
+                up_avail: ry != tty_ctb,
             };
             crate::alf_syntax::encode_alf_ctu(
                 &mut cabac_enc,
@@ -3068,21 +3205,82 @@ pub fn encode_idr_with_qp_picker_cfg(
             // `prev_qp_in_qg`.
             qp_state.pending = qp_state.enabled;
 
-            // §7.3.11.1 — in a single-tile slice the ONLY in-stream
-            // terminate bin is `end_of_slice_one_bit /* equal to 1 */`
-            // after the LAST CTU (r412 conformance fix: the pipeline
-            // previously emitted an end_of_slice_segment-style
-            // terminate-0 bin after every CTU, a bin §7.3.11.1 never
-            // codes — desyncing any conforming decoder on multi-CTU
-            // pictures).
-            let is_last_ctu = ry == pic_h_ctbs - 1 && rx == pic_w_ctbs - 1;
+            // r429 — §7.3.11.1 / §9.3.1 subset tail. WPP stores the
+            // context tables when the parse of a row-in-tile's first
+            // CTU ends; the end_of_slice / end_of_tile / end_of_subset
+            // terminate bins close the subsets, each flushed to its
+            // own byte-aligned chunk.
+            if wpp && rx == tlx_ctb {
+                wpp_enc_store = Some((
+                    tree_ctxs.clone(),
+                    residual_ctxs.clone(),
+                    intra_ctxs.clone(),
+                    sao_ctxs.clone(),
+                    alf_ctxs.clone(),
+                ));
+            }
+            let is_last_ctu = ctu_idx + 1 == ctu_order.len();
             if is_last_ctu {
+                // §7.3.11.1 end_of_slice_one_bit (r412 conformance
+                // fix: exactly one, after the LAST CTU of the slice).
                 cabac_enc.encode_terminate(1)?;
+                chunks.push(cabac_enc.finish());
+            } else if rx + 1 == trx_ctb {
+                if ry + 1 == tby_ctb {
+                    // end_of_tile_one_bit + byte_alignment(); the next
+                    // tile re-initializes every context bundle
+                    // (§9.3.2.2) on a fresh byte-aligned engine.
+                    cabac_enc.encode_terminate(1)?;
+                    chunks.push(cabac_enc.finish());
+                    cabac_enc = ArithEncoder::new();
+                    tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
+                    residual_ctxs = ResidualCtxs::init(slice_qp_y);
+                    intra_ctxs = IntraModeCtxs::init(slice_qp_y);
+                    sao_ctxs = crate::sao_syntax::SaoCtxs::init(slice_qp_y);
+                    alf_ctxs = crate::alf_syntax::AlfCtxs::init(slice_qp_y);
+                    // §8.7.1 — the first QG in a tile predicts from
+                    // SliceQpY.
+                    qp_state.prev_qp_in_qg = slice_qp_y;
+                    wpp_enc_store = None;
+                } else if wpp {
+                    // end_of_subset_one_bit + byte_alignment(); the
+                    // next CTU row synchronizes from the stored tables
+                    // (§9.3.2.4 — within a tile the above CTB is
+                    // always available on this sequential walk).
+                    cabac_enc.encode_terminate(1)?;
+                    chunks.push(cabac_enc.finish());
+                    cabac_enc = ArithEncoder::new();
+                    if let Some((t, r, i, sa, a)) = wpp_enc_store.clone() {
+                        tree_ctxs = t;
+                        residual_ctxs = r;
+                        intra_ctxs = i;
+                        sao_ctxs = sa;
+                        alf_ctxs = a;
+                    }
+                }
+                first_ctb_row_in_slice = false;
             }
         }
     }
-    let cabac_bytes = cabac_enc.finish();
+    // r429 — §7.4.8 entry-point offsets: the EP-aware byte length of
+    // every subset but the last (subset boundaries fall on alignment
+    // stop bytes, so no emulation-prevention pattern spans one and
+    // per-chunk counting equals the whole-RBSP count).
+    let entry_point_offsets: Vec<u32> = chunks
+        .iter()
+        .take(chunks.len().saturating_sub(1))
+        .map(|c| ep_len(c))
+        .collect();
+    let cabac_bytes: Vec<u8> = chunks.concat();
     let _ = alf_pic;
+
+    // §7.3.7 slice-header bytes (ALF chain + sh_lmcs_used_flag +
+    // sh_qp_delta + SAO used flags + the r429 entry-point offsets).
+    let slice_header_bytes = vvc_enc.emit_idr_slice_header_bytes_with_entry_points(
+        &alf_ph_chain,
+        slice_qp_y - 26,
+        &entry_point_offsets,
+    );
 
     // Build the IDR slice NAL: header bytes + interleaved CABAC bytes.
     // The single-stream invariant lives in `cabac_bytes`: ALF and
@@ -3159,6 +3357,38 @@ fn build_cc_alf_aps() -> crate::aps::AlfApsData {
 }
 
 /// Build a NAL unit from raw RBSP bytes (add header + emulation prevention).
+/// r429 — the half-open CTB span `[lo, hi)` of the tile containing CTB
+/// coordinate `v`, from the §6.5.1 boundary prefix list.
+fn ctb_span(bds: &[usize], v: usize) -> (usize, usize) {
+    for w in bds.windows(2) {
+        if v >= w[0] && v < w[1] {
+            return (w[0], w[1]);
+        }
+    }
+    (0, *bds.last().unwrap_or(&0))
+}
+
+/// r429 — the on-wire byte length of one CABAC subset: RBSP bytes plus
+/// the §7.4.1 emulation-prevention insertions the NAL wrap will add
+/// (mirrors [`crate::encoder::insert_emulation_prevention`] exactly;
+/// entry-point offsets count EP bytes per §7.4.8). Subset boundaries
+/// always land on the byte containing the alignment stop bit — a
+/// non-zero byte — so no EP pattern spans a boundary and per-chunk
+/// counting equals the whole-RBSP count.
+fn ep_len(chunk: &[u8]) -> u32 {
+    let mut extra = 0u32;
+    let mut i = 0usize;
+    while i < chunk.len() {
+        if i + 2 < chunk.len() && chunk[i] == 0 && chunk[i + 1] == 0 && chunk[i + 2] <= 3 {
+            extra += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    chunk.len() as u32 + extra
+}
+
 fn build_nal(
     nut: crate::nal::NalUnitType,
     layer_id: u8,

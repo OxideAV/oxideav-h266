@@ -338,6 +338,30 @@ pub struct EncoderConfig {
     /// parity, and signals `sps_sign_data_hiding_enabled_flag = 1` +
     /// the SH bit. Default `false`.
     pub sign_data_hiding: bool,
+    /// r429 — number of tile columns (§6.5.1). `0` or `1` keeps the
+    /// single-tile `pps_no_pic_partition_flag = 1` profile. With a
+    /// grid configured (`tile_columns * tile_rows > 1`) the PPS emits
+    /// the §7.3.2.5 partition block (near-uniform explicit column
+    /// widths / row heights, `pps_rect_slice_flag = 1`,
+    /// `pps_single_slice_per_subpic_flag = 1` — one slice covering
+    /// the picture in tile-scan order,
+    /// `pps_loop_filter_across_tiles_enabled_flag = 1`), the SPS
+    /// signals `sps_entry_point_offsets_present_flag = 1`, the slice
+    /// header carries the §7.4.8 entry-point offsets, and the
+    /// pipeline codes each tile as its own byte-aligned CABAC subset
+    /// (per-tile §9.3.2.2 context re-initialization +
+    /// `end_of_tile_one_bit`) with §6.4.4 tile-gated availability.
+    pub tile_columns: u8,
+    /// r429 — number of tile rows; see [`Self::tile_columns`].
+    pub tile_rows: u8,
+    /// r429 — WPP (`sps_entropy_coding_sync_enabled_flag = 1`): each
+    /// CTU row (of a tile) becomes a byte-aligned CABAC subset
+    /// (`end_of_subset_one_bit`), the §9.3.2.3 / §9.3.2.4 context
+    /// storage / synchronization runs around the first CTU of every
+    /// row, entry-point offsets go on the wire, and the §6.4.4
+    /// `xNbCtb >= xCurrCtb + 1` availability arm gates the encoder's
+    /// prediction references. Default `false`.
+    pub wpp: bool,
 }
 
 impl EncoderConfig {
@@ -355,7 +379,34 @@ impl EncoderConfig {
             lmcs_chroma_scaling: false,
             dep_quant: false,
             sign_data_hiding: false,
+            tile_columns: 1,
+            tile_rows: 1,
+            wpp: false,
         }
+    }
+
+    /// r429 — the configured §6.5.1 tile grid as explicit per-tile CTB
+    /// column widths / row heights (near-uniform split of the CTB
+    /// grid), or `None` for the single-tile profile. CTB size is the
+    /// emitted SPS's 128.
+    pub fn tile_grid(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        let cols = u32::from(self.tile_columns.max(1));
+        let rows = u32::from(self.tile_rows.max(1));
+        if cols * rows <= 1 {
+            return None;
+        }
+        let pic_w_ctbs = self.width.div_ceil(128);
+        let pic_h_ctbs = self.height.div_ceil(128);
+        let split = |total: u32, n: u32| -> Vec<u32> {
+            // Near-uniform: the first (total % n) tiles get one extra
+            // CTB. Every entry stays >= 1 (validate() bounds n).
+            let base = total / n;
+            let extra = total % n;
+            (0..n)
+                .map(|i| base + u32::from(i < extra))
+                .collect::<Vec<u32>>()
+        };
+        Some((split(pic_w_ctbs, cols), split(pic_h_ctbs, rows)))
     }
 
     fn validate(&self) -> Result<()> {
@@ -384,6 +435,17 @@ impl EncoderConfig {
             return Err(Error::unsupported(
                 "h266 encoder: only 4:2:0 (chroma_format_idc = 1) is supported",
             ));
+        }
+        // r429 — tile grid bounds: every tile column / row must be at
+        // least one CTB wide / tall (CTB = 128 on the emitted SPS).
+        let cols = u32::from(self.tile_columns.max(1));
+        let rows = u32::from(self.tile_rows.max(1));
+        if cols > self.width.div_ceil(128) || rows > self.height.div_ceil(128) {
+            return Err(Error::invalid(format!(
+                "h266 encoder: tile grid {cols}x{rows} exceeds the {}x{} CTB grid",
+                self.width.div_ceil(128),
+                self.height.div_ceil(128),
+            )));
         }
         Ok(())
     }
@@ -553,8 +615,12 @@ impl VvcEncoder {
         bw.write_bit(0); // sps_conformance_window_flag
         bw.write_bit(0); // sps_subpic_info_present_flag
         bw.write_ue((self.config.bit_depth - 8) as u32); // sps_bitdepth_minus8 = 0
-        bw.write_bit(0); // sps_entropy_coding_sync_enabled_flag
-        bw.write_bit(0); // sps_entry_point_offsets_present_flag
+                                                         // r429 — WPP + entry points: entropy sync mirrors the config
+                                                         // knob; entry-point offsets go on the wire whenever the slice
+                                                         // data splits into byte-aligned subsets (tiles and/or WPP).
+        bw.write_bit(self.config.wpp as u8); // sps_entropy_coding_sync_enabled_flag
+        let subsets = self.config.tile_grid().is_some() || self.config.wpp;
+        bw.write_bit(subsets as u8); // sps_entry_point_offsets_present_flag
         bw.write_bits(4, 4); // sps_log2_max_pic_order_cnt_lsb_minus4 = 4 → 8-bit POC LSB
         bw.write_bit(0); // sps_poc_msb_cycle_flag
         bw.write_bits(0, 2); // sps_num_extra_ph_bytes = 0
@@ -686,8 +752,36 @@ impl VvcEncoder {
         bw.write_bit(0); // pps_conformance_window_flag
         bw.write_bit(0); // pps_scaling_window_explicit_signalling_flag
         bw.write_bit(0); // pps_output_flag_present_flag
-        bw.write_bit(1); // pps_no_pic_partition_flag = 1
-        bw.write_bit(0); // pps_subpic_id_mapping_present_flag
+                         // r429 — §7.3.2.5 partition block for the configured tile
+                         // grid. Single-tile keeps the historical
+                         // `pps_no_pic_partition_flag = 1` profile bit-for-bit.
+        match self.config.tile_grid() {
+            None => {
+                bw.write_bit(1); // pps_no_pic_partition_flag = 1
+                bw.write_bit(0); // pps_subpic_id_mapping_present_flag
+            }
+            Some((cols, rows)) => {
+                bw.write_bit(0); // pps_no_pic_partition_flag = 0
+                bw.write_bit(0); // pps_subpic_id_mapping_present_flag
+                bw.write_bits(2, 2); // pps_log2_ctu_size_minus5 = 2 (CTB 128)
+                bw.write_ue(cols.len() as u32 - 1); // pps_num_exp_tile_columns_minus1
+                bw.write_ue(rows.len() as u32 - 1); // pps_num_exp_tile_rows_minus1
+                for w in &cols {
+                    bw.write_ue(w - 1); // pps_tile_column_width_minus1[i]
+                }
+                for h in &rows {
+                    bw.write_ue(h - 1); // pps_tile_row_height_minus1[i]
+                }
+                // NumTilesInPic > 1 by construction (tile_grid()
+                // returns None otherwise).
+                bw.write_bit(1); // pps_loop_filter_across_tiles_enabled_flag
+                bw.write_bit(1); // pps_rect_slice_flag = 1
+                bw.write_bit(1); // pps_single_slice_per_subpic_flag = 1 (one slice)
+                                 // rect + single-slice-per-subpic → the slice loop is
+                                 // skipped and the across-slices flag is present.
+                bw.write_bit(1); // pps_loop_filter_across_slices_enabled_flag
+            }
+        }
         bw.write_bit(0); // pps_cabac_init_present_flag
         bw.write_ue(0); // pps_num_ref_idx_default_active_minus1[0]
         bw.write_ue(0); // pps_num_ref_idx_default_active_minus1[1]
@@ -705,6 +799,17 @@ impl VvcEncoder {
         bw.write_bit(1); // pps_cu_qp_delta_enabled_flag
         bw.write_bit(0); // pps_chroma_tool_offsets_present_flag
         bw.write_bit(0); // pps_deblocking_filter_control_present_flag
+        if self.config.tile_grid().is_some() {
+            // §7.3.2.5 — with `pps_no_pic_partition_flag = 0` the
+            // `pps_*_info_in_ph_flag` gates are transmitted; all 0
+            // keeps the RPL / SAO / ALF / QP-delta info in the slice
+            // header exactly like the single-tile profile (the WP
+            // flag is absent: weighted pred is off).
+            bw.write_bit(0); // pps_rpl_info_in_ph_flag
+            bw.write_bit(0); // pps_sao_info_in_ph_flag
+            bw.write_bit(0); // pps_alf_info_in_ph_flag
+            bw.write_bit(0); // pps_qp_delta_info_in_ph_flag
+        }
         bw.write_bit(0); // pps_picture_header_extension_present_flag
         bw.write_bit(0); // pps_slice_header_extension_present_flag
         bw.write_bit(0); // pps_extension_flag
@@ -796,6 +901,21 @@ impl VvcEncoder {
     /// `sh_qp_delta` (`SliceQpY = 26 + pps_init_qp_minus26 + sh_qp_delta`,
     /// so callers pass `slice_qp_y − 26`) and the SAO used flags.
     pub fn emit_idr_slice_header_bytes(&self, chain: &AlfPhChain, sh_qp_delta: i32) -> Vec<u8> {
+        self.emit_idr_slice_header_bytes_with_entry_points(chain, sh_qp_delta, &[])
+    }
+
+    /// r429 — [`Self::emit_idr_slice_header_bytes`] with the §7.4.8
+    /// entry-point offsets (`sh_entry_point_offset_minus1[i] + 1`, in
+    /// bytes of the coded slice data *including* emulation-prevention
+    /// bytes). The caller passes one offset per subset boundary
+    /// (tiles / WPP CTU rows); the derived `NumEntryPoints` on the
+    /// receive side must match `offsets.len()`.
+    pub fn emit_idr_slice_header_bytes_with_entry_points(
+        &self,
+        chain: &AlfPhChain,
+        sh_qp_delta: i32,
+        entry_point_offsets: &[u32],
+    ) -> Vec<u8> {
         let mut bw = BitWriter::new();
         // sh_picture_header_in_slice_header_flag = 0 (separate PH NAL).
         bw.write_bit(0);
@@ -857,6 +977,20 @@ impl VvcEncoder {
             // sps_sign_data_hiding_enabled_flag == 1 and (by config
             // validation) sh_dep_quant_used_flag == 0.
             bw.write_bit(1); // sh_sign_data_hiding_used_flag = 1
+        }
+        // r429 — §7.4.8 entry-point offsets (NumEntryPoints > 0 is
+        // derived by the receiver from the tile / WPP geometry; it
+        // must equal `entry_point_offsets.len()`).
+        if !entry_point_offsets.is_empty() {
+            let max = entry_point_offsets.iter().copied().max().unwrap_or(1);
+            // offset_minus1 = offset - 1 needs `len` bits.
+            let len = 32 - (max - 1).max(1).leading_zeros();
+            let len = len.max(1);
+            bw.write_ue(len - 1); // sh_entry_offset_len_minus1
+            for &off in entry_point_offsets {
+                debug_assert!(off >= 1);
+                bw.write_bits(off - 1, len); // sh_entry_point_offset_minus1[i]
+            }
         }
         //
         // byte_alignment() — stop bit + zero pad; CABAC starts after.

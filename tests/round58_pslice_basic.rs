@@ -81,9 +81,9 @@ fn pslice_decoder_roundtrip_byte_identical() {
 }
 
 /// Round-58 — synthetic 2-frame fixture: a single 16×16 bright square
-/// that translates 4 px horizontally between frames. Stands in for an
-/// `ffmpeg -c:v libvvenc -an -frames:v 2` external fixture (not
-/// available without a libvvenc binary in the test env).
+/// that translates 4 px horizontally between frames. Stands in for a
+/// black-box externally-encoded 2-frame fixture (no external encoder
+/// binary is available in the test env).
 #[test]
 fn pslice_synthetic_moving_square_two_frame() {
     let make = |dx: i32| {
