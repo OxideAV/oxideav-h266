@@ -43,10 +43,11 @@ Each `<name>.266` is decoded to planar 4:2:0 through a conforming
 external reference decoder invoked black-box, and the output is
 `cmp`'d byte-for-byte against the crate's own `<name>.yuv`.
 
-r429 status: **123 of 123 streams byte-exact** (the 22 historical
-corpus axes + the 11 r429 tile/WPP axes — including the two
-`pps_loop_filter_across_tiles_enabled_flag = 0` axes and the
-raster-scan slice layout — + all ~90 probe streams).
+r429 status: **124 of 124 streams byte-exact** (the 22 historical
+corpus axes + the 12 r429 tile/WPP axes — including the
+`pps_loop_filter_across_tiles_enabled_flag = 0` axes, the raster-scan
+slice layout, and the tiles+WPP+across-off combination — + all ~90
+probe streams).
 
 r418 status: **112 of 112 streams byte-exact** (all corpus axes —
 including the 8 r418 extension streams below — plus all ~60 probe
@@ -110,6 +111,7 @@ distinct root-cause families, all fixed in r415:
 | tiles_2x2_noxlf_256x256 (r429) | byte-exact | byte-exact | a28440cd8459eec8 | da1868ced29dbc99 |
 | tiles_3x1_noxlf_qp45 (r429) | byte-exact | byte-exact | 38ef3fc5de5ebf45 | 1b32566fc3457ad3 |
 | tiles_2x2_raster_256x256 (r429) | byte-exact | byte-exact | d588efca23ed6aa7 | 7115a4ba9591e019 |
+| tiles_2x1_wpp_noxlf_qp34 (r429) | byte-exact | byte-exact | 3188d3d560f8909d | ec4a9d6d0f040232 |
 | mtt_bt_qp45 / mtt_bt_tt_qp45 (r418) | byte-exact | byte-exact | 8daf4a85db40ec28 | 28e105132000b8ae |
 | multi_ctu_qp45 / multi_ctu_mtt_qp45 (r418) | byte-exact | byte-exact | b54b2fe36d3200de / 99c0790dfdfdb821 | 052997467c44de0a |
 | wide_192x128_qp45 (r418) | byte-exact | byte-exact | d162706ece057f57 | 9de6a3f26d0c8df2 |

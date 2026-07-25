@@ -637,6 +637,23 @@ fn whole_stream_wpp_three_rows() {
     dump_corpus("wpp_128x384_qp34", &bs, &dec);
 }
 
+/// r429 — everything combined: tiles + WPP + across-tiles filters
+/// off at QP 34 (end_of_subset / end_of_tile interleave, WPP context
+/// storage/sync across per-tile re-inits, §6.4.4 tile rect + column
+/// cap, and the §8.8 boundary gates all in one slice).
+#[test]
+fn whole_stream_tiles_wpp_noxlf_combined() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.wpp = true;
+    cfg.loop_filter_across_tiles = false;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 34, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "tiles + wpp + across-tiles off");
+    dump_corpus("tiles_2x1_wpp_noxlf_qp34", &bs, &dec);
+}
+
 /// r429 — tiles + WPP combined (§7.3.11.1: end_of_subset fires at CTU
 /// row ends inside a tile, end_of_tile at tile ends; the WPP storage /
 /// sync and the per-tile context re-init interleave).

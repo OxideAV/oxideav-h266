@@ -492,8 +492,8 @@ multi-CTU, chroma SAO merge, MTT BT/TT, LMCS ± chroma scaling,
 dep-quant, SDH) decoding BYTE-EXACTLY through this crate's own full
 receive path.
 
-r415/r418/r429 closed the external-decode gap completely: **123 of
-123** corpus + probe streams (the r412 axes, the r418 extension —
+r415/r418/r429 closed the external-decode gap completely: **124 of
+124** corpus + probe streams (the r412 axes, the r418 extension —
 deep-QP 51/57/63, MTT + multi-CTU at QP 45, the 192x128
 partial-CTU-column layout —, the r429 tiles/WPP axes below, plus the
 ~90 single-feature probes of `tests/external_probe_corpus.rs`) decode
@@ -509,12 +509,12 @@ wire; the decoder walks the same §7.3.11.1 plan. The
 `pps_loop_filter_across_tiles_enabled_flag = 0` arm is live on both
 sides (§8.8.3.1 deblock edge exclusion, §8.8.4.2 SAO edgeIdx = 0,
 §8.8.5.5/§8.8.5.6 ALF tile-rectangle padding —
-`EncoderConfig::loop_filter_across_tiles`). Eleven axes — tiles 2x1 /
+`EncoderConfig::loop_filter_across_tiles`). Twelve axes — tiles 2x1 /
 2x2 / 3x1 / partial-right-column / 2x2+MTT, WPP 2-row / 3-row,
 tiles+WPP combined, 2x2 / 3x1-deep-QP with the across-tiles filters
-off, and the 2x2 raster-scan slice layout — decode byte-exactly
-through both this crate's own receive path and the external
-reference decoder. The r412
+off, the 2x2 raster-scan slice layout, and the
+tiles+WPP+across-off combination — decode byte-exactly through both
+this crate's own receive path and the external reference decoder. The r412
 sparse-residual divergence resolved into five fixed root causes
 (r415): residual ctx-init table transcription drift (Tables
 120 – 125), the §7.3.11.2 `alf_use_aps_flag` presence condition, the
