@@ -2995,6 +2995,58 @@ mod tests {
         MotionField::new(w, h)
     }
 
+    /// r429 — the §6.4.4 WPP column cap (`xNbCtb >= xCurrCtb + 1`
+    /// unavailable under `sps_entropy_coding_sync_enabled_flag`)
+    /// gates the §8.5.2.3 B0 (above-right) spatial-merge scan: the
+    /// neighbour cell is written and decoded, but a region whose
+    /// column cap sits on the CTB boundary hides it, while the same
+    /// scan without the cap picks it up. The tile-rectangle arm is
+    /// pinned the same way via the region x-bounds.
+    #[test]
+    fn merge_scan_honours_wpp_column_cap_and_tile_rect() {
+        let mut mvf = empty_field(256, 256);
+        // The current CU: 32x32 at the top-right corner of CTB (0, 1)
+        // (CTB size 128) → B0 probes (xCb + cbW, yCb - 1) = (128, 127),
+        // which lies in CTB column 1.
+        let (xcb, ycb, w, h) = (96i32, 128i32, 32i32, 32i32);
+        let mut nb = MvField::UNAVAILABLE;
+        nb.available = true;
+        nb.pred_flag_l0 = true;
+        nb.ref_idx_l0 = 0;
+        nb.mode_inter = true;
+        nb.mv_l0 = MotionVector::from_int_pel(4, 2);
+        mvf.write_block(128, 124, 8, 8, nb);
+        // A distinct B1 cell at (127, 127) so the B0 ↔ B1 duplicate
+        // suppression does not fire and B1's own availability can be
+        // asserted under the cap.
+        let mut nb_b1 = nb;
+        nb_b1.mv_l0 = MotionVector::from_int_pel(-2, 6);
+        mvf.write_block(124, 124, 4, 4, nb_b1);
+
+        // No region: B0 is available.
+        let cands = derive_spatial_merge_candidates(xcb, ycb, w, h, &mvf, 2);
+        assert!(cands[2].available, "B0 must be available without a cap");
+
+        // WPP cap at the CTB-column boundary (current CTB column 0 →
+        // cap = 128 luma samples): B0 reads unavailable.
+        mvf.set_region(0, 0, 256, 256, 128);
+        let cands = derive_spatial_merge_candidates(xcb, ycb, w, h, &mvf, 2);
+        assert!(!cands[2].available, "B0 must be gated by the WPP cap");
+        // B1 (above, same column) stays available.
+        assert!(cands[0].available, "B1 must survive the cap");
+
+        // Tile rectangle covering only CTB column 0: same outcome via
+        // the x-bounds arm.
+        mvf.set_region(0, 0, 128, 256, u32::MAX);
+        let cands = derive_spatial_merge_candidates(xcb, ycb, w, h, &mvf, 2);
+        assert!(!cands[2].available, "B0 must be gated by the tile rect");
+
+        // Clearing the region restores the read.
+        mvf.clear_region();
+        let cands = derive_spatial_merge_candidates(xcb, ycb, w, h, &mvf, 2);
+        assert!(cands[2].available);
+    }
+
     #[test]
     fn motion_vector_int_pel_helpers() {
         let mv = MotionVector::from_int_pel(3, -7);

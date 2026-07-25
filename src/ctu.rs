@@ -3306,7 +3306,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.cabac.sh_cabac_init_flag
     }
 
-    /// CTU iterator in slice order. Single-slice raster scan today.
+    /// CTU iterator in raster order over the whole picture — the
+    /// single-tile walk order. Tiled / WPP slices are walked through
+    /// the §6.5.1 plan `decode_picture_into` resolves instead.
     pub fn iter_ctus(&self) -> CtuIter<'_> {
         CtuIter::raster(self.layout)
     }
@@ -9134,9 +9136,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     }
 
     /// §7.3.11.1 — the per-CTU-row state resets. `slice_data()` runs
-    /// this whenever `CtbAddrX == CtbToTileColBd[CtbAddrX]` — with this
-    /// walker's single-tile layout, exactly at the start of every CTU
-    /// row (`CtbAddrX == 0`):
+    /// this whenever `CtbAddrX == CtbToTileColBd[CtbAddrX]` — at the
+    /// start of every CTU row *within a tile* (r429: `begin_ctu`
+    /// evaluates the condition against the live tile geometry; the
+    /// single-tile walk keeps the historical `CtbAddrX == 0`
+    /// behaviour):
     ///
     /// * `NumHmvpCand = 0` — the §8.5.2.16 regular HMVP candidate
     ///   list empties (r409 conformance fix: pre-r409 the table
