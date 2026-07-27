@@ -294,6 +294,7 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         },
         DeblockCu {
             x: 16,
@@ -307,6 +308,7 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         },
     ];
     let params = DeblockParams {

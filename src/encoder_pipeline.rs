@@ -204,6 +204,57 @@ struct PreparedLumaTb {
     cu_qp_local: i32,
 }
 
+/// r431 — one palette CU prepared by the first pass (§7.3.11.6 /
+/// §8.4.5.3). The prepare pass fixes the colour table CONTENT and the
+/// escape samples (reconstruction is predictor-independent); the
+/// second-pass CABAC emit derives the wire-level entry ORDER (which
+/// predictor entries are reused, and in which slots) from the live
+/// predictor mirror at emit time.
+struct PreparedPaletteCu {
+    /// CU width in luma samples.
+    n_w: usize,
+    /// CU height in luma samples.
+    n_h: usize,
+    /// Table colours `[Y, Cb, Cr]` in first-appearance order.
+    colors: Vec<[u16; 3]>,
+    /// Per luma-position colour id (row-major `n_w * n_h`);
+    /// `PALETTE_ESCAPE_ID` marks an escape sample.
+    ids: Vec<u8>,
+    /// Quantized escape values per component (row-major at luma
+    /// resolution; chroma rows carry values only at even/even
+    /// positions per the §7.3.11.6 sub-sampling gate).
+    escape_vals: [Vec<u16>; 3],
+    /// Whether any escape sample exists.
+    escape_present: bool,
+    /// Local CU QP (escape quantisation ran at
+    /// `max(QpPrimeTsMin, cu_qp_local)`).
+    cu_qp_local: i32,
+}
+
+/// Sentinel colour id marking an escape position in
+/// [`PreparedPaletteCu::ids`].
+const PALETTE_ESCAPE_ID: u8 = 0xFF;
+
+/// r431 — the second-pass palette emit state: the CABAC contexts
+/// (Tables 67 / 99 / 100 / 101) and the decoder-mirrored predictor
+/// palette. Reset per tile (§9.3.2.1/§9.3.2.2) and stored /
+/// synchronized on the WPP arms (§9.3.2.6 / §9.3.2.7) alongside the
+/// other context bundles.
+#[derive(Clone)]
+struct EncPalette {
+    ctxs: crate::palette::PaletteCtxs,
+    pred: crate::palette::PalettePredictor,
+}
+
+impl EncPalette {
+    fn init(slice_qp_y: i32) -> Self {
+        Self {
+            ctxs: crate::palette::PaletteCtxs::init(slice_qp_y, 0),
+            pred: crate::palette::PalettePredictor::new(),
+        }
+    }
+}
+
 /// Round-56 — encoded representation of one CU before the second-pass
 /// CABAC emit. A `Leaf` carries one [`PreparedLumaTb`] (the round-55
 /// behaviour); a `BtSplit` is the result of the round-56 BT picker,
@@ -216,6 +267,8 @@ struct PreparedLumaTb {
 /// CU is a `Leaf`).
 enum PreparedCu {
     Leaf(PreparedLumaTb),
+    /// r431 — a palette CU (`pred_mode_plt_flag = 1`).
+    Palette(PreparedPaletteCu),
     BtSplit {
         /// Direction of the binary split (`Vertical` halves width,
         /// `Horizontal` halves height).
@@ -260,6 +313,9 @@ impl PreparedCu {
     fn for_each_leaf<F: FnMut(&PreparedLumaTb)>(&self, f: &mut F) {
         match self {
             PreparedCu::Leaf(tb) => f(tb),
+            // Palette CUs carry no transform blocks; the deblock
+            // collection has its own arm in `accumulate_deblock_cus`.
+            PreparedCu::Palette(_) => {}
             PreparedCu::BtSplit { sub_a, sub_b, .. } => {
                 sub_a.for_each_leaf(f);
                 sub_b.for_each_leaf(f);
@@ -873,6 +929,157 @@ fn lmcs_chroma_var_scale_enc(
     der.chroma_var_scale(idx_y_inv)
 }
 
+/// r431 — try to prepare one CU as a palette CU (§7.3.11.6 /
+/// §8.4.5.3).
+///
+/// The source block's colour set is gathered at luma-position
+/// granularity (`(Y, Cb, Cr)` with chroma sampled at the containing
+/// 2x2 cell). When the distinct count fits `maxNumPaletteEntries`
+/// (31) the CU is coded losslessly from the table; when it exceeds 31
+/// by a small margin (≤ 6 — enough to exercise the escape arm without
+/// palette-coding natural content) the 31 most frequent colours form
+/// the table and the remainder become quantized escape samples at
+/// `max(QpPrimeTsMin, cu_qp)`. Anything busier returns `None` and the
+/// caller falls back to the transform path.
+///
+/// The reconstruction (exact table colours + eq. 442 escape dequant)
+/// is written into `rec` here; it is independent of the predictor
+/// palette, whose wire-level reuse split happens at emit time.
+#[allow(clippy::too_many_arguments)]
+fn try_prepare_palette_cu(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    n_w: usize,
+    n_h: usize,
+    cu_qp: i32,
+) -> Option<PreparedPaletteCu> {
+    if n_w * n_h <= 16 || n_w > 64 || n_h > 64 {
+        // §7.3.11.5 pred_mode_plt_flag area / size gates.
+        return None;
+    }
+    if x + n_w > src.luma.width || y + n_h > src.luma.height {
+        return None;
+    }
+    // Gather the colour set in first-appearance order.
+    let mut colors: Vec<[u16; 3]> = Vec::new();
+    let mut counts: Vec<u32> = Vec::new();
+    let mut ids = vec![0u8; n_w * n_h];
+    for dy in 0..n_h {
+        for dx in 0..n_w {
+            let ly = y + dy;
+            let lx = x + dx;
+            let yv = u16::from(src.luma.samples[ly * src.luma.stride + lx]);
+            let cbv = u16::from(src.cb.samples[(ly / 2) * src.cb.stride + lx / 2]);
+            let crv = u16::from(src.cr.samples[(ly / 2) * src.cr.stride + lx / 2]);
+            let triple = [yv, cbv, crv];
+            let ci = match colors.iter().position(|c| *c == triple) {
+                Some(ci) => {
+                    counts[ci] += 1;
+                    ci
+                }
+                None => {
+                    if colors.len() >= 256 {
+                        return None;
+                    }
+                    colors.push(triple);
+                    counts.push(1);
+                    colors.len() - 1
+                }
+            };
+            ids[dy * n_w + dx] = ci as u8;
+        }
+    }
+    let max_entries = crate::palette::MAX_ENTRIES_SINGLE;
+    let escape_present = colors.len() > max_entries;
+    if colors.len() > max_entries + 6 {
+        return None;
+    }
+    let mut escape_vals = [vec![], vec![], vec![]];
+    if escape_present {
+        // Keep the 31 most frequent colours (ties: earlier first
+        // appearance); the rest escape.
+        let mut order: Vec<usize> = (0..colors.len()).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(counts[i]), i));
+        let kept: Vec<usize> = {
+            let mut k = order[..max_entries].to_vec();
+            k.sort_unstable(); // preserve first-appearance order
+            k
+        };
+        let mut remap = vec![PALETTE_ESCAPE_ID; colors.len()];
+        for (new_i, &old_i) in kept.iter().enumerate() {
+            remap[old_i] = new_i as u8;
+        }
+        let table: Vec<[u16; 3]> = kept.iter().map(|&i| colors[i]).collect();
+        // §8.4.5.3 eqs. 439 – 443 quantisation at the CU QP.
+        const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
+        let qp = cu_qp.max(4); // QpPrimeTsMin = 4 (sps_min_qp_prime_ts = 0)
+        let scale = LEVEL_SCALE[(qp % 6) as usize] << (qp / 6);
+        let quant = |v: u16| -> u16 {
+            let q = ((i32::from(v) << 6) + scale / 2) / scale;
+            q.clamp(0, 255) as u16
+        };
+        escape_vals = [
+            vec![0u16; n_w * n_h],
+            vec![0u16; n_w * n_h],
+            vec![0u16; n_w * n_h],
+        ];
+        for (pos, id) in ids.iter_mut().enumerate() {
+            let old = *id as usize;
+            *id = remap[old];
+            if *id == PALETTE_ESCAPE_ID {
+                let (dx, dy) = (pos % n_w, pos / n_w);
+                escape_vals[0][pos] = quant(colors[old][0]);
+                if dx % 2 == 0 && dy % 2 == 0 {
+                    escape_vals[1][pos] = quant(colors[old][1]);
+                    escape_vals[2][pos] = quant(colors[old][2]);
+                }
+            }
+        }
+        colors = table;
+    }
+    // Reconstruction — exact table colours; eq. 442 for escapes.
+    const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
+    let qp = cu_qp.max(4);
+    let (ls, shift) = (LEVEL_SCALE[(qp % 6) as usize], qp / 6);
+    let deq = |q: u16| -> u8 { ((((i32::from(q) * ls) << shift) + 32) >> 6).clamp(0, 255) as u8 };
+    for dy in 0..n_h {
+        for dx in 0..n_w {
+            let pos = dy * n_w + dx;
+            let id = ids[pos];
+            let (ly, lx) = (y + dy, x + dx);
+            if id != PALETTE_ESCAPE_ID {
+                rec.luma.samples[ly * rec.luma.stride + lx] = colors[id as usize][0] as u8;
+            } else {
+                rec.luma.samples[ly * rec.luma.stride + lx] = deq(escape_vals[0][pos]);
+            }
+            if dx % 2 == 0 && dy % 2 == 0 {
+                let (cy, cx) = (ly / 2, lx / 2);
+                let (cbv, crv) = if id != PALETTE_ESCAPE_ID {
+                    (colors[id as usize][1] as u8, colors[id as usize][2] as u8)
+                } else {
+                    (deq(escape_vals[1][pos]), deq(escape_vals[2][pos]))
+                };
+                rec.cb.samples[cy * rec.cb.stride + cx] = cbv;
+                rec.cr.samples[cy * rec.cr.stride + cx] = crv;
+            }
+        }
+    }
+    avail.mark_luma(x, y, n_w, n_h);
+    avail.mark_chroma(x / 2, y / 2, n_w / 2, n_h / 2);
+    Some(PreparedPaletteCu {
+        n_w,
+        n_h,
+        colors,
+        ids,
+        escape_vals,
+        escape_present,
+        cu_qp_local: cu_qp,
+    })
+}
+
 /// Round-56 — prepare one leaf CU at `(x, y)` of size `n_tb_w × n_tb_h`
 /// luma samples. Runs the round-49 luma + chroma DCT / quant / dequant /
 /// IDCT pipeline and returns a [`PreparedCu::Leaf`]. The chroma TB is
@@ -1006,6 +1213,12 @@ fn measure_cu_bits_recurse(
     y: u32,
 ) -> Result<()> {
     match cu {
+        // r431 — unreachable: EncoderConfig::validate() bars the MTT
+        // pickers (the only measure_cu_bits caller) when palette
+        // coding is on.
+        PreparedCu::Palette(_) => Err(Error::unsupported(
+            "h266 encoder: palette CUs cannot be bit-measured (MTT pickers are barred)",
+        )),
         PreparedCu::Leaf(tb) => {
             qp_state.begin_cu();
             let allows = constraints.allows(
@@ -1185,6 +1398,7 @@ fn bt_cu_h(sub_a: &PreparedCu, _sub_b: &PreparedCu, dir: crate::syntax_enc::MttS
 fn leaf_dims(cu: &PreparedCu) -> (usize, usize) {
     match cu {
         PreparedCu::Leaf(tb) => (tb.n_tb_w, tb.n_tb_h),
+        PreparedCu::Palette(p) => (p.n_w, p.n_h),
         PreparedCu::BtSplit { sub_a, .. } => leaf_dims(sub_a),
         PreparedCu::TtSplit { sub_a, .. } => leaf_dims(sub_a),
     }
@@ -1729,6 +1943,7 @@ fn build_tree_neighbours(map: &CuStateMap, x: u32, y: u32) -> TreeNeighbours {
 fn parent_cu_dims(cu: &PreparedCu) -> (usize, usize) {
     match cu {
         PreparedCu::Leaf(tb) => (tb.n_tb_w, tb.n_tb_h),
+        PreparedCu::Palette(p) => (p.n_w, p.n_h),
         PreparedCu::BtSplit { dir, sub_a, .. } => {
             let (aw, ah) = leaf_dims(sub_a);
             match dir {
@@ -1744,6 +1959,107 @@ fn parent_cu_dims(cu: &PreparedCu) -> (usize, usize) {
             }
         }
     }
+}
+
+/// r431 — emit one palette CU body: `pred_mode_plt_flag = 1` followed
+/// by the §7.3.11.6 `palette_coding()` payload. The wire-level entry
+/// order is derived here from the live predictor mirror (reused
+/// predictor entries first, in predictor order, then the remaining
+/// prepared colours as `new_palette_entries`); the §8.4.5.3 predictor
+/// maintenance then runs on the mirror exactly as the decoder will.
+fn emit_palette_cu(
+    e: &mut crate::cabac_enc::ArithEncoder,
+    ps: &mut EncPalette,
+    residual_ctxs: &mut ResidualCtxs,
+    qp_state: &mut QpDeltaState,
+    pcu: &PreparedPaletteCu,
+) -> Result<()> {
+    e.encode_decision(&mut ps.ctxs.pred_mode_plt_flag[0], 1)?;
+    // Split the colour table into predictor-reused + newly signalled.
+    let pred_size = ps.pred.size[0];
+    let mut reuse = vec![false; pred_size];
+    let mut slot_of_color: Vec<Option<usize>> = vec![None; pcu.colors.len()];
+    let mut n_reused = 0usize;
+    for i in 0..pred_size {
+        let triple = [
+            ps.pred.entries[0][i],
+            ps.pred.entries[1][i],
+            ps.pred.entries[2][i],
+        ];
+        if let Some(ci) = pcu
+            .colors
+            .iter()
+            .position(|c| *c == triple)
+            .filter(|&ci| slot_of_color[ci].is_none())
+        {
+            reuse[i] = true;
+            slot_of_color[ci] = Some(n_reused);
+            n_reused += 1;
+        }
+    }
+    let mut new_entries: [Vec<u16>; 3] = [vec![], vec![], vec![]];
+    let mut n_new = 0usize;
+    for (ci, c) in pcu.colors.iter().enumerate() {
+        if slot_of_color[ci].is_none() {
+            slot_of_color[ci] = Some(n_reused + n_new);
+            new_entries[0].push(c[0]);
+            new_entries[1].push(c[1]);
+            new_entries[2].push(c[2]);
+            n_new += 1;
+        }
+    }
+    let table_size = n_reused + n_new;
+    let max_palette_index = table_size + usize::from(pcu.escape_present) - 1;
+    // Remap the prepared colour ids to wire-order indices.
+    let index_map: Vec<u8> = pcu
+        .ids
+        .iter()
+        .map(|&id| {
+            if id == PALETTE_ESCAPE_ID {
+                max_palette_index as u8
+            } else {
+                slot_of_color[id as usize].expect("every colour has a slot") as u8
+            }
+        })
+        .collect();
+    let params = crate::palette::PaletteParams {
+        tree: crate::coding_tree::TreeType::SingleTree,
+        chroma_format_idc: 1,
+        bit_depth: 8,
+        bw: pcu.n_w as u32,
+        bh: pcu.n_h as u32,
+        local_dual_tree: false,
+        cu_qp_delta_enabled: qp_state.enabled,
+        cu_qp_delta_already_coded: !qp_state.pending,
+        cu_chroma_qp_offset_enabled: false,
+        cu_chroma_qp_offset_already_coded: false,
+        chroma_qp_offset_list_len_minus1: 0,
+    };
+    let plan = crate::palette::PalettePlan {
+        reuse,
+        new_entries,
+        escape_present: pcu.escape_present,
+        transpose: false,
+        index_map,
+        escape_vals: pcu.escape_vals.clone(),
+        cu_qp_delta: pcu.cu_qp_local - qp_state.prev_qp_in_qg,
+        cu_chroma_qp_offset_flag: false,
+        cu_chroma_qp_offset_idx: 0,
+    };
+    let cu = crate::palette::write_palette_coding(
+        e,
+        &mut ps.ctxs,
+        residual_ctxs,
+        &ps.pred,
+        &params,
+        &plan,
+    )?;
+    if cu.cu_qp_delta_read {
+        qp_state.prev_qp_in_qg = pcu.cu_qp_local;
+        qp_state.pending = false;
+    }
+    crate::palette::update_predictor(&mut ps.pred, &cu, &params, false);
+    Ok(())
 }
 
 /// Round-56 — emit one prepared CU through the second-pass CABAC
@@ -1767,9 +2083,38 @@ fn emit_prepared_cu(
     cu_map: &mut CuStateMap,
     rc_opts: crate::residual::RcOpts,
     constraints: &SplitConstraints,
+    pal: &mut Option<EncPalette>,
 ) -> Result<()> {
     let nbrs = build_tree_neighbours(cu_map, x, y);
     match cu {
+        PreparedCu::Palette(pcu) => {
+            let allows = constraints.allows(
+                x,
+                y,
+                pcu.n_w as u32,
+                pcu.n_h as u32,
+                mtt_depth,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
+            crate::syntax_enc::encode_coding_tree_leaf_iframe(
+                enc,
+                tree_ctxs,
+                pcu.n_w as u32,
+                pcu.n_h as u32,
+                nbrs,
+                allows,
+                |e| {
+                    let ps = pal.as_mut().ok_or_else(|| {
+                        Error::invalid("h266 encoder: palette CU without palette state")
+                    })?;
+                    emit_palette_cu(e, ps, residual_ctxs, qp_state, pcu)
+                },
+            )?;
+            cu_map.insert(x, y, pcu.n_w as u32, pcu.n_h as u32, cqt_depth);
+            Ok(())
+        }
         PreparedCu::Leaf(tb) => {
             // r412 — the leaf's split_cu_flag = 0 is emitted only when
             // §6.4.1 – §6.4.3 allow a split here (e.g. an MTT child at
@@ -1791,7 +2136,18 @@ fn emit_prepared_cu(
                 tb.n_tb_h as u32,
                 nbrs,
                 allows,
-                |e| emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts),
+                |e| {
+                    // r431 — with sps_palette_enabled_flag on, every
+                    // intra CU behind the §7.3.11.5 gate carries a
+                    // pred_mode_plt_flag; a transform-coded CU emits 0.
+                    if let Some(ps) = pal.as_mut() {
+                        let area = (tb.n_tb_w * tb.n_tb_h) as u32;
+                        if tb.n_tb_w <= 64 && tb.n_tb_h <= 64 && area > 16 {
+                            e.encode_decision(&mut ps.ctxs.pred_mode_plt_flag[0], 0)?;
+                        }
+                    }
+                    emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts)
+                },
             )?;
             // r412 — record the leaf IMMEDIATELY (decoding-order
             // semantics): the §9.3.4.2.2 split ctxIncs of the NEXT
@@ -1865,6 +2221,7 @@ fn emit_prepared_cu(
                         &mut *cu_map,
                         rc_opts,
                         constraints,
+                        &mut *pal,
                     )
                 },
             )
@@ -1934,6 +2291,7 @@ fn emit_prepared_cu(
                         &mut *cu_map,
                         rc_opts,
                         constraints,
+                        &mut *pal,
                     )
                 },
             )
@@ -1947,6 +2305,25 @@ fn emit_prepared_cu(
 /// real sub-CU rectangles, not the parent CU.
 fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<DeblockCu>) {
     match cu {
+        // r431 — §8.8.3.5: MODE_PLT is not MODE_INTRA and a palette CU
+        // has no coded transform blocks; bS along its edges is 2 only
+        // from an intra neighbour side (decoder-mirrored).
+        PreparedCu::Palette(p) => {
+            out.push(DeblockCu {
+                x: x as u32,
+                y: y as u32,
+                w: p.n_w as u32,
+                h: p.n_h as u32,
+                qp_y: p.cu_qp_local,
+                intra: false,
+                tu_y_coded: false,
+                tu_cb_coded: false,
+                tu_cr_coded: false,
+                bdpcm_luma: false,
+                bdpcm_chroma: false,
+                plt: true,
+            });
+        }
         PreparedCu::Leaf(tb) => {
             let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
             let cbf_cr = tb.cr_levels.iter().any(|&l| l != 0);
@@ -1962,6 +2339,7 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 tu_cr_coded: cbf_cr,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             });
         }
         PreparedCu::BtSplit {
@@ -2312,7 +2690,20 @@ pub fn encode_idr_with_qp_picker_cfg(
                         None
                     };
 
-                    let cu = if mtt_eligible {
+                    // r431 — palette-first: a CU whose source block
+                    // draws from a small colour set codes as a
+                    // palette CU (config-gated; validate() bars the
+                    // MTT pickers alongside).
+                    let palette_cu = if config.palette {
+                        try_prepare_palette_cu(
+                            coding_src, &mut rec, &mut avail, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp,
+                        )
+                    } else {
+                        None
+                    };
+                    let cu = if let Some(p) = palette_cu {
+                        PreparedCu::Palette(p)
+                    } else if mtt_eligible {
                         prepare_cu_with_mtt_picker(
                             coding_src,
                             &mut rec,
@@ -2998,6 +3389,13 @@ pub fn encode_idr_with_qp_picker_cfg(
     // runs with QG = CTB granularity (no PH-signalled `cu_qp_delta_subdiv`
     // or `cu_chroma_qp_offset_subdiv`), so the QG resets at every new CTB.
     let mut qp_state = QpDeltaState::new(/*enabled=*/ true, slice_qp_y);
+    // r431 — palette emit state (contexts + decoder-mirrored
+    // predictor); None when the config leaves palette off.
+    let mut enc_palette: Option<EncPalette> = if config.palette {
+        Some(EncPalette::init(slice_qp_y))
+    } else {
+        None
+    };
     // Round-54 — SAO CABAC contexts + per-slice config. Only used when
     // the encoder config opts in via `enable_chroma_sao_merge`; when off
     // the pipeline matches round-53 (no SAO bins on the wire because
@@ -3041,6 +3439,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         IntraModeCtxs,
         crate::sao_syntax::SaoCtxs,
         crate::alf_syntax::AlfCtxs,
+        Option<EncPalette>,
     );
     let mut wpp_enc_store: Option<EncCtxSnapshot> = None;
     for (ctu_idx, &(rx, ry)) in ctu_order.iter().enumerate() {
@@ -3191,6 +3590,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                             &mut cu_map,
                             rc_opts,
                             &split_constraints,
+                            &mut enc_palette,
                         )?;
                         Ok(())
                     },
@@ -3230,6 +3630,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                         &mut cu_map,
                         rc_opts,
                         &split_constraints,
+                        &mut enc_palette,
                     )?;
                     // Advance position for the next CU in raster order.
                     let (cw, ch) = parent_cu_dims(cu);
@@ -3258,6 +3659,9 @@ pub fn encode_idr_with_qp_picker_cfg(
                     intra_ctxs.clone(),
                     sao_ctxs.clone(),
                     alf_ctxs.clone(),
+                    // §9.3.2.6 — the palette predictor (and contexts)
+                    // store alongside the context variables.
+                    enc_palette.clone(),
                 ));
             }
             let is_last_ctu = ctu_idx + 1 == ctu_order.len();
@@ -3279,6 +3683,11 @@ pub fn encode_idr_with_qp_picker_cfg(
                     intra_ctxs = IntraModeCtxs::init(slice_qp_y);
                     sao_ctxs = crate::sao_syntax::SaoCtxs::init(slice_qp_y);
                     alf_ctxs = crate::alf_syntax::AlfCtxs::init(slice_qp_y);
+                    // §9.3.2.1/§9.3.2.2 — palette contexts re-init and
+                    // the predictor palette resets with them.
+                    if let Some(ps) = enc_palette.as_mut() {
+                        *ps = EncPalette::init(slice_qp_y);
+                    }
                     // §8.7.1 — the first QG in a tile predicts from
                     // SliceQpY.
                     qp_state.prev_qp_in_qg = slice_qp_y;
@@ -3291,12 +3700,14 @@ pub fn encode_idr_with_qp_picker_cfg(
                     cabac_enc.encode_terminate(1)?;
                     chunks.push(cabac_enc.finish());
                     cabac_enc = ArithEncoder::new();
-                    if let Some((t, r, i, sa, a)) = wpp_enc_store.clone() {
+                    if let Some((t, r, i, sa, a, pl)) = wpp_enc_store.clone() {
                         tree_ctxs = t;
                         residual_ctxs = r;
                         intra_ctxs = i;
                         sao_ctxs = sa;
                         alf_ctxs = a;
+                        // §9.3.2.7 — palette predictor sync.
+                        enc_palette = pl;
                     }
                 }
                 first_ctb_row_in_slice = false;

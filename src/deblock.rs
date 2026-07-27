@@ -72,6 +72,11 @@ pub struct DeblockCu {
     pub bdpcm_luma: bool,
     /// `intra_bdpcm_chroma_flag` — disables chroma deblock per §8.8.3.1.
     pub bdpcm_chroma: bool,
+    /// r431 — `pred_mode_plt_flag` of the CU. §8.8.3.6.7 (nDp/nDq →
+    /// 0), §8.8.3.6.8 and §8.8.3.6.10 substitute the input samples for
+    /// every filtered sample on a palette-coded side: the deblocker
+    /// reads across the edge but never modifies palette samples.
+    pub plt: bool,
 }
 
 /// Offsets and disable flags that govern the deblock pass.
@@ -433,14 +438,37 @@ fn deblock_cu_left_edge(
             // the §8.8.3.6.2 step-6 CTB-row rule.
             let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s);
             let (mfl_p, mfl_q) = luma_max_filter_length_v(p_cu, q_cu);
-            run_luma_filter(plane.plane, cx, cy + k, beta, tc, mfl_p, mfl_q, true, false);
+            run_luma_filter(
+                plane.plane,
+                cx,
+                cy + k,
+                beta,
+                tc,
+                mfl_p,
+                mfl_q,
+                true,
+                false,
+                p_cu.plt,
+                q_cu.plt,
+            );
             // Move down by 4 chroma rows = 4 luma rows.
             k += luma_segment / (plane.sub_h as i32).max(1);
         } else {
             // Chroma: dispatch §8.8.3.6.4 + §8.8.3.6.10.
             let (_qp, beta, tc) = compute_thresholds_chroma(plane, p_cu, q_cu, b_s);
             let (mfl_p, mfl_q) = chroma_max_filter_length_v(p_cu, q_cu, plane.sub_w);
-            run_chroma_filter_v(plane.plane, cx, cy + k, beta, tc, b_s, mfl_p, mfl_q);
+            run_chroma_filter_v(
+                plane.plane,
+                cx,
+                cy + k,
+                beta,
+                tc,
+                b_s,
+                mfl_p,
+                mfl_q,
+                p_cu.plt,
+                q_cu.plt,
+            );
             k += step;
         }
     }
@@ -498,13 +526,26 @@ fn deblock_cu_top_edge(
                 mfl_q,
                 false,
                 ctb_row_edge,
+                p_cu.plt,
+                q_cu.plt,
             );
             k += luma_segment / (plane.sub_w as i32).max(1);
         } else {
             let (_qp, beta, tc) = compute_thresholds_chroma(plane, p_cu, q_cu, b_s);
             let ctb_h_c = plane.ctb_size_y / plane.sub_h.max(1);
             let (mfl_p, mfl_q) = chroma_max_filter_length_h(p_cu, q_cu, plane.sub_h, cy, ctb_h_c);
-            run_chroma_filter_h(plane.plane, cx + k, cy, beta, tc, b_s, mfl_p, mfl_q);
+            run_chroma_filter_h(
+                plane.plane,
+                cx + k,
+                cy,
+                beta,
+                tc,
+                b_s,
+                mfl_p,
+                mfl_q,
+                p_cu.plt,
+                q_cu.plt,
+            );
             k += step;
         }
     }
@@ -910,6 +951,8 @@ fn run_luma_filter(
     mfl_q: u32,
     is_vertical: bool,
     ctb_row_edge: bool,
+    plt_p: bool,
+    plt_q: bool,
 ) {
     if tc == 0 {
         // Every filter arm clips its update into [x − c·tC, x + c·tC];
@@ -932,18 +975,60 @@ fn run_luma_filter(
         3 => {
             for k in 0..4i32 {
                 if is_vertical {
-                    long_luma_apply(plane, cx, cy + k, tc, dec.mfl_p, dec.mfl_q, true);
+                    long_luma_apply(
+                        plane,
+                        cx,
+                        cy + k,
+                        tc,
+                        dec.mfl_p,
+                        dec.mfl_q,
+                        true,
+                        plt_p,
+                        plt_q,
+                    );
                 } else {
-                    long_luma_apply(plane, cx + k, cy, tc, dec.mfl_p, dec.mfl_q, false);
+                    long_luma_apply(
+                        plane,
+                        cx + k,
+                        cy,
+                        tc,
+                        dec.mfl_p,
+                        dec.mfl_q,
+                        false,
+                        plt_p,
+                        plt_q,
+                    );
                 }
             }
         }
         _ => {
             for k in 0..4i32 {
                 if is_vertical {
-                    short_luma_apply(plane, cx, cy + k, tc, dec.d_e, dec.d_ep, dec.d_eq, true);
+                    short_luma_apply(
+                        plane,
+                        cx,
+                        cy + k,
+                        tc,
+                        dec.d_e,
+                        dec.d_ep,
+                        dec.d_eq,
+                        true,
+                        plt_p,
+                        plt_q,
+                    );
                 } else {
-                    short_luma_apply(plane, cx + k, cy, tc, dec.d_e, dec.d_ep, dec.d_eq, false);
+                    short_luma_apply(
+                        plane,
+                        cx + k,
+                        cy,
+                        tc,
+                        dec.d_e,
+                        dec.d_ep,
+                        dec.d_eq,
+                        false,
+                        plt_p,
+                        plt_q,
+                    );
                 }
             }
         }
@@ -958,6 +1043,7 @@ fn run_luma_filter(
 /// `fi`/`gj`/`tCPDi`/`tCQDj` arrays (eqs. 1397–1408, including the
 /// 3-deep {53, 32, 11} / {6, 4, 2} pair), and the eqs. 1409/1410
 /// clipped updates.
+#[allow(clippy::too_many_arguments)]
 fn long_luma_apply(
     plane: &mut PicturePlane,
     cx: i32,
@@ -966,6 +1052,8 @@ fn long_luma_apply(
     mfl_p: u32,
     mfl_q: u32,
     is_vertical: bool,
+    plt_p: bool,
+    plt_q: bool,
 ) {
     let bd = 8u32;
     let mfl_p_u = mfl_p as usize;
@@ -1081,8 +1169,13 @@ fn long_luma_apply(
         _ => (&F3, &T3),
     };
 
-    // Eqs. 1409 / 1410 — write filtered samples.
+    // Eqs. 1409 / 1410 — write filtered samples. §8.8.3.6.8: a
+    // palette-coded side keeps its input samples (the substitution
+    // realised as a write skip; the cross-edge reads are unchanged).
     for i in 0..mfl_p_u {
+        if plt_p {
+            break;
+        }
         let lo = p[i] - ((tc * tcpdi[i]) >> 1);
         let hi = p[i] + ((tc * tcpdi[i]) >> 1);
         let v = ((ref_middle * fi[i] + ref_p * (64 - fi[i]) + 32) >> 6).clamp(lo, hi);
@@ -1093,6 +1186,9 @@ fn long_luma_apply(
         }
     }
     for j in 0..mfl_q_u {
+        if plt_q {
+            break;
+        }
         let lo = q[j] - ((tc * tcqdj[j]) >> 1);
         let hi = q[j] + ((tc * tcqdj[j]) >> 1);
         let v = ((ref_middle * gj[j] + ref_q * (64 - gj[j]) + 32) >> 6).clamp(lo, hi);
@@ -1118,6 +1214,8 @@ fn short_luma_apply(
     d_ep: u32,
     d_eq: u32,
     is_vertical: bool,
+    plt_p: bool,
+    plt_q: bool,
 ) {
     let bd = 8u32;
     let read_p = |i: i32| -> i32 {
@@ -1150,44 +1248,49 @@ fn short_luma_apply(
         }
     };
     if d_e == 2 {
-        // Strong filter — eqs. 1375–1380.
+        // Strong filter — eqs. 1375–1380. §8.8.3.6.7: nDp / nDq drop
+        // to 0 when the containing CU is palette-coded.
         let p0n = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - 3 * tc, p0 + 3 * tc);
         let p1n = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - 2 * tc, p1 + 2 * tc);
         let p2n = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc, p2 + tc);
         let q0n = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - 3 * tc, q0 + 3 * tc);
         let q1n = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - 2 * tc, q1 + 2 * tc);
         let q2n = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
-        write_p(0, p0n, plane);
-        write_p(1, p1n, plane);
-        write_p(2, p2n, plane);
-        if is_vertical {
-            write(plane, cx, cy, q0n, bd);
-            write(plane, cx + 1, cy, q1n, bd);
-            write(plane, cx + 2, cy, q2n, bd);
-        } else {
-            write(plane, cx, cy, q0n, bd);
-            write(plane, cx, cy + 1, q1n, bd);
-            write(plane, cx, cy + 2, q2n, bd);
+        if !plt_p {
+            write_p(0, p0n, plane);
+            write_p(1, p1n, plane);
+            write_p(2, p2n, plane);
+        }
+        if !plt_q {
+            if is_vertical {
+                write(plane, cx, cy, q0n, bd);
+                write(plane, cx + 1, cy, q1n, bd);
+                write(plane, cx + 2, cy, q2n, bd);
+            } else {
+                write(plane, cx, cy, q0n, bd);
+                write(plane, cx, cy + 1, q1n, bd);
+                write(plane, cx, cy + 2, q2n, bd);
+            }
         }
     } else {
         // Weak filter — eqs. 1381–1388.
         let delta_raw = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
         if delta_raw.abs() < tc * 10 {
             let delta = delta_raw.clamp(-tc, tc);
-            write_p(0, p0 + delta, plane);
-            if is_vertical {
-                write(plane, cx, cy, q0 - delta, bd);
-            } else {
+            if !plt_p {
+                write_p(0, p0 + delta, plane);
+            }
+            if !plt_q {
                 write(plane, cx, cy, q0 - delta, bd);
             }
-            if d_ep == 1 {
+            if d_ep == 1 && !plt_p {
                 // Eq. 1385 — the clip bound is −(tC >> 1), NOT
                 // (−tC) >> 1: the two differ by 1 for odd tC (the
                 // arithmetic right-shift rounds toward −∞).
                 let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
                 write_p(1, p1 + dp, plane);
             }
-            if d_eq == 1 {
+            if d_eq == 1 && !plt_q {
                 // Eq. 1387 — same −(tC >> 1) bound.
                 let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
                 if is_vertical {
@@ -1234,6 +1337,8 @@ fn run_chroma_filter_v(
     _b_s: i32,
     max_filter_length_p: u32,
     max_filter_length_q: u32,
+    plt_p: bool,
+    plt_q: bool,
 ) {
     if tc == 0 {
         return;
@@ -1254,22 +1359,27 @@ fn run_chroma_filter_v(
         if dec0 && dec1 {
             // Strong filter on the full 2-row stripe.
             for k in 0..=max_k {
-                chroma_strong_apply_v(plane, cx, cy + k, tc, bd);
+                chroma_strong_apply_v(plane, cx, cy + k, tc, bd, plt_p, plt_q);
             }
             return;
         }
         // Decision failed → fall through to the weak filter.
     }
 
-    // Weak filter (eqs 1421 – 1423).
+    // Weak filter (eqs 1421 – 1423) — §8.8.3.6.10 palette
+    // substitution realised as per-side write skips.
     for k in 0..2i32 {
         let p1 = read_clamped(plane, cx - 2, cy + k);
         let p0 = read_clamped(plane, cx - 1, cy + k);
         let q0 = read_clamped(plane, cx, cy + k);
         let q1 = read_clamped(plane, cx + 1, cy + k);
         let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
-        write(plane, cx - 1, cy + k, p0 + delta, bd);
-        write(plane, cx, cy + k, q0 - delta, bd);
+        if !plt_p {
+            write(plane, cx - 1, cy + k, p0 + delta, bd);
+        }
+        if !plt_q {
+            write(plane, cx, cy + k, q0 - delta, bd);
+        }
     }
 }
 
@@ -1284,6 +1394,8 @@ fn run_chroma_filter_h(
     _b_s: i32,
     max_filter_length_p: u32,
     max_filter_length_q: u32,
+    plt_p: bool,
+    plt_q: bool,
 ) {
     if tc == 0 {
         return;
@@ -1309,7 +1421,7 @@ fn run_chroma_filter_h(
         let dec1 = chroma_strong_decision_h(plane, cx + max_k, cy, beta, tc, short_p);
         if dec0 && dec1 {
             for k in 0..=max_k {
-                chroma_strong_apply_h(plane, cx + k, cy, tc, bd, short_p);
+                chroma_strong_apply_h(plane, cx + k, cy, tc, bd, short_p, plt_p, plt_q);
             }
             return;
         }
@@ -1321,8 +1433,12 @@ fn run_chroma_filter_h(
         let q0 = read_clamped(plane, cx + k, cy);
         let q1 = read_clamped(plane, cx + k, cy + 1);
         let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
-        write(plane, cx + k, cy - 1, p0 + delta, bd);
-        write(plane, cx + k, cy, q0 - delta, bd);
+        if !plt_p {
+            write(plane, cx + k, cy - 1, p0 + delta, bd);
+        }
+        if !plt_q {
+            write(plane, cx + k, cy, q0 - delta, bd);
+        }
     }
 }
 
@@ -1384,7 +1500,15 @@ fn chroma_strong_decision_h(
 
 /// §8.8.3.6.10 strong chroma filter for a single sample row of an
 /// EDGE_VER edge (eqs 1411 – 1416).
-fn chroma_strong_apply_v(plane: &mut PicturePlane, cx: i32, cy: i32, tc: i32, bd: u32) {
+fn chroma_strong_apply_v(
+    plane: &mut PicturePlane,
+    cx: i32,
+    cy: i32,
+    tc: i32,
+    bd: u32,
+    plt_p: bool,
+    plt_q: bool,
+) {
     let p3 = read_clamped(plane, cx - 4, cy);
     let p2 = read_clamped(plane, cx - 3, cy);
     let p1 = read_clamped(plane, cx - 2, cy);
@@ -1399,17 +1523,22 @@ fn chroma_strong_apply_v(plane: &mut PicturePlane, cx: i32, cy: i32, tc: i32, bd
     let q0n = ((p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) >> 3).clamp(q0 - tc, q0 + tc);
     let q1n = ((p1 + p0 + q0 + 2 * q1 + q2 + 2 * q3 + 4) >> 3).clamp(q1 - tc, q1 + tc);
     let q2n = ((p0 + q0 + q1 + 2 * q2 + 3 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
-    write(plane, cx - 1, cy, p0n, bd);
-    write(plane, cx - 2, cy, p1n, bd);
-    write(plane, cx - 3, cy, p2n, bd);
-    write(plane, cx, cy, q0n, bd);
-    write(plane, cx + 1, cy, q1n, bd);
-    write(plane, cx + 2, cy, q2n, bd);
+    if !plt_p {
+        write(plane, cx - 1, cy, p0n, bd);
+        write(plane, cx - 2, cy, p1n, bd);
+        write(plane, cx - 3, cy, p2n, bd);
+    }
+    if !plt_q {
+        write(plane, cx, cy, q0n, bd);
+        write(plane, cx + 1, cy, q1n, bd);
+        write(plane, cx + 2, cy, q2n, bd);
+    }
 }
 
 /// Mirror of [`chroma_strong_apply_v`] for an EDGE_HOR edge. With
 /// `short_p` the §8.8.3.6.10 asymmetric (P = 1, Q = 3) filter applies
 /// (eqs. 1417 - 1420): only p0 is modified on the P side.
+#[allow(clippy::too_many_arguments)]
 fn chroma_strong_apply_h(
     plane: &mut PicturePlane,
     cx: i32,
@@ -1417,6 +1546,8 @@ fn chroma_strong_apply_h(
     tc: i32,
     bd: u32,
     short_p: bool,
+    plt_p: bool,
+    plt_q: bool,
 ) {
     let p1 = read_clamped(plane, cx, cy - 2);
     let p0 = read_clamped(plane, cx, cy - 1);
@@ -1429,10 +1560,14 @@ fn chroma_strong_apply_h(
         let q0n = ((2 * p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) >> 3).clamp(q0 - tc, q0 + tc);
         let q1n = ((p1 + p0 + q0 + 2 * q1 + q2 + 2 * q3 + 4) >> 3).clamp(q1 - tc, q1 + tc);
         let q2n = ((p0 + q0 + q1 + 2 * q2 + 3 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
-        write(plane, cx, cy - 1, p0n, bd);
-        write(plane, cx, cy, q0n, bd);
-        write(plane, cx, cy + 1, q1n, bd);
-        write(plane, cx, cy + 2, q2n, bd);
+        if !plt_p {
+            write(plane, cx, cy - 1, p0n, bd);
+        }
+        if !plt_q {
+            write(plane, cx, cy, q0n, bd);
+            write(plane, cx, cy + 1, q1n, bd);
+            write(plane, cx, cy + 2, q2n, bd);
+        }
         return;
     }
     let p3 = read_clamped(plane, cx, cy - 4);
@@ -1443,12 +1578,16 @@ fn chroma_strong_apply_h(
     let q0n = ((p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) >> 3).clamp(q0 - tc, q0 + tc);
     let q1n = ((p1 + p0 + q0 + 2 * q1 + q2 + 2 * q3 + 4) >> 3).clamp(q1 - tc, q1 + tc);
     let q2n = ((p0 + q0 + q1 + 2 * q2 + 3 * q3 + 4) >> 3).clamp(q2 - tc, q2 + tc);
-    write(plane, cx, cy - 1, p0n, bd);
-    write(plane, cx, cy - 2, p1n, bd);
-    write(plane, cx, cy - 3, p2n, bd);
-    write(plane, cx, cy, q0n, bd);
-    write(plane, cx, cy + 1, q1n, bd);
-    write(plane, cx, cy + 2, q2n, bd);
+    if !plt_p {
+        write(plane, cx, cy - 1, p0n, bd);
+        write(plane, cx, cy - 2, p1n, bd);
+        write(plane, cx, cy - 3, p2n, bd);
+    }
+    if !plt_q {
+        write(plane, cx, cy, q0n, bd);
+        write(plane, cx, cy + 1, q1n, bd);
+        write(plane, cx, cy + 2, q2n, bd);
+    }
 }
 
 #[cfg(test)]
@@ -1513,6 +1652,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
             DeblockCu {
                 x: 8,
@@ -1526,6 +1666,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
         ];
         let params = DeblockParams {
@@ -1565,6 +1706,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
             DeblockCu {
                 x: 8,
@@ -1578,6 +1720,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
         ];
         let params = DeblockParams {
@@ -1624,6 +1767,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
             DeblockCu {
                 x: 0,
@@ -1637,6 +1781,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
         ];
         let params = DeblockParams {
@@ -1667,6 +1812,7 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         };
         let cu_medium = DeblockCu { w: 16, ..cu_small };
         let cu_large = DeblockCu { w: 32, ..cu_small };
@@ -1698,6 +1844,7 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         };
         let cu_16 = DeblockCu { w: 16, ..cu_8 };
         // 4:2:0: SubWidthC = 2 → chroma w = luma_w / 2.
@@ -1737,6 +1884,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
             DeblockCu {
                 x: 32,
@@ -1750,6 +1898,7 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                plt: false,
             },
         ];
         let params = DeblockParams {
@@ -1785,6 +1934,7 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         }
     }
 
@@ -1930,6 +2080,7 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         }];
         let params = DeblockParams {
             disabled: false,

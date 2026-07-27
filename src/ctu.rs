@@ -3805,7 +3805,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         // §8.8.3 deblock record — MODE_PLT is not MODE_INTRA and a
         // palette CU has no coded transform blocks; with a palette
-        // neighbour on both sides every implemented bS arm yields 0.
+        // neighbour on both sides every implemented bS arm yields 0,
+        // and §8.8.3.6.7/.6.8/.6.10 never modify palette-side samples
+        // (the `plt` flag suppresses the writes).
         self.deblock_cus.push(DeblockCu {
             x: x0,
             y: y0,
@@ -3818,6 +3820,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: true,
         });
         self.write_intra_block(x0, y0, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -3996,6 +3999,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 tu_cr_coded: info.tu_cr_coded_flag,
                 bdpcm_luma: info.intra_bdpcm_luma,
                 bdpcm_chroma: false,
+                plt: false,
             });
             self.write_intra_block(
                 cu.cu.x,
@@ -4271,6 +4275,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: info.intra_bdpcm_luma,
             bdpcm_chroma: false,
+            plt: false,
         });
         // Round-28 §8.5.6.7 — record this CU's prediction mode in the
         // 4x4 intra-coded grid so subsequent CIIP CUs see the correct
@@ -4485,6 +4490,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         });
         self.write_intra_block(x_cb, y_cb, cb_w, cb_h, false);
         self.write_parse_mode_block(
@@ -5457,6 +5463,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         });
         // Round-28 §8.5.6.7 — inter CUs record MODE_INTER in the
         // intra-coded grid.
@@ -7144,6 +7151,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -7482,6 +7490,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -8314,6 +8323,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            plt: false,
         });
         self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);
         // Round-149 — GPM CUs always carry `merge_subblock_flag = 0`

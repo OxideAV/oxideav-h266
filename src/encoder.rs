@@ -378,6 +378,21 @@ pub struct EncoderConfig {
     /// `xNbCtb >= xCurrCtb + 1` availability arm gates the encoder's
     /// prediction references. Default `false`.
     pub wpp: bool,
+    /// r431 — opt-in **palette coding** (§7.3.11.6 / §8.4.5.3). The
+    /// SPS signals `sps_palette_enabled_flag = 1` (+ the
+    /// `sps_min_qp_prime_ts` field its presence condition opens), and
+    /// the pipeline codes any CU whose source block draws from a
+    /// small colour set as a palette CU: exact table colours when the
+    /// distinct count fits `maxNumPaletteEntries` (31), the
+    /// most-frequent 31 plus quantized escape samples when slightly
+    /// over. Every remaining intra CU carries the now-mandatory
+    /// `pred_mode_plt_flag = 0` bin. The predictor palette mirrors
+    /// the decoder's §8.4.5.3 maintenance, including the per-tile
+    /// §9.3.2.1 reset and the WPP §9.3.2.6 / §9.3.2.7 storage /
+    /// synchronization. Mutually exclusive with the MTT pickers
+    /// (their trial re-encodes would fork the predictor state).
+    /// Default `false`.
+    pub palette: bool,
 }
 
 impl EncoderConfig {
@@ -400,6 +415,7 @@ impl EncoderConfig {
             raster_slice_layout: false,
             loop_filter_across_tiles: true,
             wpp: false,
+            palette: false,
         }
     }
 
@@ -452,6 +468,12 @@ impl EncoderConfig {
         if self.chroma_format_idc != 1 {
             return Err(Error::unsupported(
                 "h266 encoder: only 4:2:0 (chroma_format_idc = 1) is supported",
+            ));
+        }
+        if self.palette && (self.enable_mtt_bt_picker || self.enable_mtt_tt_picker) {
+            return Err(Error::unsupported(
+                "h266 encoder: palette coding and the MTT pickers are mutually exclusive \
+                 (the pickers' trial re-encodes would fork the predictor-palette state)",
             ));
         }
         // r429 — tile grid bounds: every tile column / row must be at
@@ -738,7 +760,13 @@ impl VvcEncoder {
                          // chroma_format_idc == 1 → chroma-collocated flags.
         bw.write_bit(0); // chroma_horizontal_collocated
         bw.write_bit(0); // chroma_vertical_collocated
-        bw.write_bit(0); // palette
+        bw.write_bit(self.config.palette as u8); // sps_palette_enabled_flag
+        if self.config.palette {
+            // §7.3.2.4 — `sps_transform_skip_enabled_flag ||
+            // sps_palette_enabled_flag` opens `sps_min_qp_prime_ts`;
+            // 0 keeps the §7.4.3.4 eq. 61 floor at QpPrimeTsMin = 4.
+            bw.write_ue(0); // sps_min_qp_prime_ts
+        }
         bw.write_bit(0); // ibc
         bw.write_bit(0); // ladf
         bw.write_bit(0); // explicit_scaling_list

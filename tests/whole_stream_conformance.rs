@@ -668,3 +668,129 @@ fn whole_stream_tiles_2x1_wpp() {
     assert_byte_exact(&dec, &rec, "tiles 2x1 + wpp");
     dump_corpus("tiles_2x1_wpp_256x256", &bs, &dec);
 }
+
+/// r431 — screen-content source: flat colour cells aligned to the
+/// 4:2:0 chroma grid. `cell` is the square cell size in luma samples
+/// (even, ≥ 2); `ncolors` bounds the per-64x64-region colour count so
+/// the palette gate (≤ 31 distinct triples per CU) is controllable.
+fn screen_source(w: usize, h: usize, cell: usize, ncolors: usize) -> PictureBuffer {
+    let mut src = PictureBuffer::yuv420_filled(w, h, 128);
+    // Deterministic colour list — distinct (Y, Cb, Cr) triples.
+    let color = |i: usize| -> (u8, u8, u8) {
+        (
+            (17 + (i * 41) % 224) as u8,
+            (32 + (i * 29) % 192) as u8,
+            (24 + (i * 53) % 200) as u8,
+        )
+    };
+    for cy in 0..h.div_ceil(cell) {
+        for cx in 0..w.div_ceil(cell) {
+            // Cell colour keyed inside the containing 64x64 region so
+            // every CU sees at most `ncolors` distinct triples.
+            let (rx, ry) = (cx * cell / 64, cy * cell / 64);
+            let key = (cx * 7 + cy * 13 + rx + ry * 3) % ncolors;
+            let (yv, cbv, crv) = color(key);
+            for dy in 0..cell.min(h - cy * cell) {
+                for dx in 0..cell.min(w - cx * cell) {
+                    let (px, py) = (cx * cell + dx, cy * cell + dy);
+                    src.luma.samples[py * src.luma.stride + px] = yv;
+                    if px % 2 == 0 && py % 2 == 0 {
+                        src.cb.samples[(py / 2) * src.cb.stride + px / 2] = cbv;
+                        src.cr.samples[(py / 2) * src.cr.stride + px / 2] = crv;
+                    }
+                }
+            }
+        }
+    }
+    src
+}
+
+/// r431 — pure screen content: every CU palette-codes losslessly (≤ 16
+/// colours per 64x64 CU), exercising predictor reuse across the four
+/// CUs of each 128 CTB and across CTBs.
+#[test]
+fn whole_stream_palette_screen() {
+    let src = screen_source(128, 128, 8, 16);
+    let mut cfg = EncoderConfig::new(128, 128);
+    cfg.palette = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "palette screen");
+    dump_corpus("palette_screen_128x128", &bs, &dec);
+}
+
+/// r431 — mixed content: the left half is flat colour cells (palette
+/// CUs), the right half is the corpus gradient (transform CUs carrying
+/// `pred_mode_plt_flag = 0`); the two CU kinds interleave inside the
+/// picture and the predictor palette must survive the transform CUs
+/// unchanged.
+#[test]
+fn whole_stream_palette_mixed_content() {
+    let grad = structured_source(256, 128);
+    let cells = screen_source(256, 128, 4, 12);
+    let mut src = grad;
+    for y in 0..128 {
+        for x in 0..128 {
+            src.luma.samples[y * src.luma.stride + x] =
+                cells.luma.samples[y * cells.luma.stride + x];
+        }
+    }
+    for y in 0..64 {
+        for x in 0..64 {
+            src.cb.samples[y * src.cb.stride + x] = cells.cb.samples[y * cells.cb.stride + x];
+            src.cr.samples[y * src.cr.stride + x] = cells.cr.samples[y * cells.cr.stride + x];
+        }
+    }
+    let mut cfg = EncoderConfig::new(256, 128);
+    cfg.palette = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "palette mixed");
+    dump_corpus("palette_mixed_256x128", &bs, &dec);
+}
+
+/// r431 — escape samples: 34 distinct colours per 64x64 CU exceed
+/// `maxNumPaletteEntries` (31), so the three least frequent become
+/// EG5-coded escapes quantized at the CU QP (eq. 442 dequant on both
+/// sides).
+#[test]
+fn whole_stream_palette_escape() {
+    let src = screen_source(64, 64, 4, 34);
+    let mut cfg = EncoderConfig::new(64, 64);
+    cfg.palette = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 30, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "palette escape");
+    dump_corpus("palette_escape_64x64_qp30", &bs, &dec);
+}
+
+/// r431 — palette + 2x2 tile grid: the predictor palette resets at
+/// every tile start (§9.3.2.1) on both sides, and each tile's first
+/// palette CU re-signals its entries from scratch.
+#[test]
+fn whole_stream_palette_tiles_2x2() {
+    let src = screen_source(256, 256, 8, 20);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.palette = true;
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "palette tiles 2x2");
+    dump_corpus("palette_tiles_2x2_256x256", &bs, &dec);
+}
+
+/// r431 — palette + WPP: the predictor palette stores after each CTU
+/// row's first CTU and synchronizes at the next row start (§9.3.2.6 /
+/// §9.3.2.7), alongside the context tables.
+#[test]
+fn whole_stream_palette_wpp() {
+    let src = screen_source(256, 256, 8, 20);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.palette = true;
+    cfg.wpp = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "palette wpp");
+    dump_corpus("palette_wpp_256x256", &bs, &dec);
+}
