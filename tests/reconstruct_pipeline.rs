@@ -4659,3 +4659,310 @@ fn qg_per_cu_qp_y_pred_neighbour_average() {
     let eff: Vec<i32> = infos.iter().map(|i| i.cu_qp_delta_val).collect();
     assert_eq!(eff, vec![0, 3, 0, 2], "qPY_PRED neighbour average");
 }
+
+/// r431 — §7.3.11.6 / §8.4.5.3 palette CU end-to-end through the CTU
+/// walker on a hand-built wire: one 16x16 SINGLE_TREE palette CU with
+/// two signalled entries (vertical stripes) reconstructs the exact
+/// table colours into all three planes.
+#[test]
+fn palette_cu_reconstructs_planes_through_walker() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::coding_tree::TreeType;
+    use oxideav_h266::ctx::ctx_inc_split_cu_flag;
+    use oxideav_h266::palette::{
+        write_palette_coding, PaletteCtxs, PaletteParams, PalettePlan, PalettePredictor,
+    };
+    use oxideav_h266::residual::ResidualCtxs;
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+
+    let mut enc = ArithEncoder::new();
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut pctx = PaletteCtxs::init(slice_qp, 0);
+    let mut rctx = ResidualCtxs::init(slice_qp);
+
+    // split_cu_flag = 0 at the in-picture 16x16 node.
+    let inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let n = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[inc.min(n)], 0)
+        .unwrap();
+    // pred_mode_plt_flag = 1.
+    enc.encode_decision(&mut pctx.pred_mode_plt_flag[0], 1)
+        .unwrap();
+    let p = PaletteParams {
+        tree: TreeType::SingleTree,
+        chroma_format_idc: 1,
+        bit_depth: 8,
+        bw: 16,
+        bh: 16,
+        local_dual_tree: false,
+        cu_qp_delta_enabled: false,
+        cu_qp_delta_already_coded: false,
+        cu_chroma_qp_offset_enabled: false,
+        cu_chroma_qp_offset_already_coded: false,
+        chroma_qp_offset_list_len_minus1: 0,
+    };
+    let mut map = vec![0u8; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            map[y * 16 + x] = u8::from(x >= 8);
+        }
+    }
+    let plan = PalettePlan {
+        reuse: vec![],
+        new_entries: [vec![90, 200], vec![60, 160], vec![200, 40]],
+        escape_present: false,
+        transpose: false,
+        index_map: map,
+        escape_vals: [vec![], vec![], vec![]],
+        cu_qp_delta: 0,
+        cu_chroma_qp_offset_flag: false,
+        cu_chroma_qp_offset_idx: 0,
+    };
+    let pred = PalettePredictor::new();
+    write_palette_coding(&mut enc, &mut pctx, &mut rctx, &pred, &p, &plan).unwrap();
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.palette_enabled_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let ctu0 = walker.iter_ctus().next().unwrap();
+    let (cus, infos, residuals) = walker.decode_ctu_full(&ctu0).unwrap();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(
+        infos[0].pred_mode,
+        oxideav_h266::leaf_cu::CuPredMode::Plt,
+        "the CU must parse as MODE_PLT"
+    );
+    let mut out = PictureBuffer::yuv420_filled(16, 16, 0);
+    walker
+        .reconstruct_leaf_cu(&cus[0], &infos[0], &residuals[0], &mut out)
+        .unwrap();
+    // Left stripe = entry 0, right stripe = entry 1, all planes.
+    assert_eq!(out.luma.samples[0], 90);
+    assert_eq!(out.luma.samples[7], 90);
+    assert_eq!(out.luma.samples[8], 200);
+    assert_eq!(out.luma.samples[15 * 16 + 15], 200);
+    assert_eq!(out.cb.samples[0], 60);
+    assert_eq!(out.cb.samples[3], 60);
+    assert_eq!(out.cb.samples[4], 160);
+    assert_eq!(out.cr.samples[0], 200);
+    assert_eq!(out.cr.samples[7], 40);
+}
+
+/// r431 — predictor palette maintenance across CUs (§8.4.5.3 eq. 450)
+/// on a hand-built quad-split wire: CU0 signals two entries, CU1
+/// reuses both from the predictor (no new entries on the wire), CU2
+/// adds a third colour plus an escape sample, CU3 reuses out of the
+/// re-ordered predictor. The escape dequantises per eq. 442 at the
+/// slice QP.
+#[test]
+fn palette_predictor_propagates_across_cus_through_walker() {
+    use oxideav_h266::cabac_enc::ArithEncoder;
+    use oxideav_h266::coding_tree::TreeType;
+    use oxideav_h266::ctx::{ctx_inc_split_cu_flag, ctx_inc_split_qt_flag};
+    use oxideav_h266::palette::{
+        update_predictor, write_palette_coding, PaletteCtxs, PaletteParams, PalettePlan,
+        PalettePredictor,
+    };
+    use oxideav_h266::residual::ResidualCtxs;
+    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+
+    let pic_w = 16u32;
+    let pic_h = 16u32;
+    let slice_qp = 26;
+
+    let mut enc = ArithEncoder::new();
+    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut pctx = PaletteCtxs::init(slice_qp, 0);
+    let mut rctx = ResidualCtxs::init(slice_qp);
+
+    // Root split_cu(1) + split_qt(1) → four 8x8 CUs.
+    let inc = ctx_inc_split_cu_flag(false, false, 0, 0, 16, 16, 1, 1, 1, 1, 1) as usize;
+    let split_n = split_cu_ctxs.len() - 1;
+    enc.encode_decision(&mut split_cu_ctxs[inc.min(split_n)], 1)
+        .unwrap();
+    let inc = ctx_inc_split_qt_flag(false, false, 0, 0, 0) as usize;
+    let qt_slot = inc.min(split_qt_ctxs.len() - 1);
+    enc.encode_decision(&mut split_qt_ctxs[qt_slot], 1).unwrap();
+    let split8 = ctx_inc_split_cu_flag(false, false, 0, 0, 8, 8, 1, 1, 0, 0, 1) as usize;
+    let split8_slot = split8.min(split_n);
+
+    let p8 = PaletteParams {
+        tree: TreeType::SingleTree,
+        chroma_format_idc: 1,
+        bit_depth: 8,
+        bw: 8,
+        bh: 8,
+        local_dual_tree: false,
+        cu_qp_delta_enabled: false,
+        cu_qp_delta_already_coded: false,
+        cu_chroma_qp_offset_enabled: false,
+        cu_chroma_qp_offset_already_coded: false,
+        chroma_qp_offset_list_len_minus1: 0,
+    };
+    let mut epred = PalettePredictor::new();
+    let mut emit_palette_cu = |enc: &mut ArithEncoder,
+                               pctx: &mut PaletteCtxs,
+                               rctx: &mut ResidualCtxs,
+                               epred: &mut PalettePredictor,
+                               plan: &PalettePlan| {
+        enc.encode_decision(&mut split_cu_ctxs[split8_slot], 0)
+            .unwrap();
+        enc.encode_decision(&mut pctx.pred_mode_plt_flag[0], 1)
+            .unwrap();
+        let cu = write_palette_coding(enc, pctx, rctx, epred, &p8, plan).unwrap();
+        update_predictor(epred, &cu, &p8, false);
+    };
+
+    // CU0 — two signalled colours, horizontal halves.
+    let mut map0 = vec![0u8; 64];
+    for (i, m) in map0.iter_mut().enumerate() {
+        *m = u8::from(i / 8 >= 4);
+    }
+    emit_palette_cu(
+        &mut enc,
+        &mut pctx,
+        &mut rctx,
+        &mut epred,
+        &PalettePlan {
+            reuse: vec![],
+            new_entries: [vec![30, 220], vec![100, 120], vec![140, 90]],
+            escape_present: false,
+            transpose: false,
+            index_map: map0.clone(),
+            escape_vals: [vec![], vec![], vec![]],
+            cu_qp_delta: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+        },
+    );
+    assert_eq!(epred.size, [2, 2]);
+
+    // CU1 — pure predictor reuse (both entries), vertical stripes.
+    let mut map1 = vec![0u8; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            map1[y * 8 + x] = u8::from(x >= 4);
+        }
+    }
+    emit_palette_cu(
+        &mut enc,
+        &mut pctx,
+        &mut rctx,
+        &mut epred,
+        &PalettePlan {
+            reuse: vec![true, true],
+            new_entries: [vec![], vec![], vec![]],
+            escape_present: false,
+            transpose: false,
+            index_map: map1.clone(),
+            escape_vals: [vec![], vec![], vec![]],
+            cu_qp_delta: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+        },
+    );
+
+    // CU2 — reuse entry 0, signal a new colour, plus an escape at
+    // (0, 0) (maxIdx = 2 with escape present).
+    let mut map2 = vec![0u8; 64];
+    map2[0] = 2;
+    for (i, m) in map2.iter_mut().enumerate().skip(1) {
+        *m = u8::from(i % 2 == 0);
+    }
+    let mut esc = [vec![0u16; 64], vec![0u16; 64], vec![0u16; 64]];
+    esc[0][0] = 10;
+    esc[1][0] = 6;
+    esc[2][0] = 4;
+    emit_palette_cu(
+        &mut enc,
+        &mut pctx,
+        &mut rctx,
+        &mut epred,
+        &PalettePlan {
+            reuse: vec![true, false],
+            new_entries: [vec![55], vec![65], vec![75]],
+            escape_present: true,
+            transpose: false,
+            index_map: map2.clone(),
+            escape_vals: esc,
+            cu_qp_delta: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+        },
+    );
+    // Eq. 450 — current palette (30, 55) first, then the unused 220.
+    assert_eq!(epred.size, [3, 3]);
+    assert_eq!(epred.entries[0][..3], [30, 55, 220]);
+
+    // CU3 — reuse the re-ordered predictor entries 1 and 2 (55, 220).
+    let mut map3 = vec![0u8; 64];
+    for (i, m) in map3.iter_mut().enumerate() {
+        *m = u8::from(i / 8 % 2 == 1);
+    }
+    emit_palette_cu(
+        &mut enc,
+        &mut pctx,
+        &mut rctx,
+        &mut epred,
+        &PalettePlan {
+            reuse: vec![false, true, true],
+            new_entries: [vec![], vec![], vec![]],
+            escape_present: false,
+            transpose: false,
+            index_map: map3.clone(),
+            escape_vals: [vec![], vec![], vec![]],
+            cu_qp_delta: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+        },
+    );
+
+    enc.encode_terminate(1).unwrap();
+    let mut payload = enc.finish();
+    payload.extend_from_slice(&[0u8; 32]);
+
+    let mut sps = dummy_sps(0, pic_w, pic_h);
+    sps.tool_flags.palette_enabled_flag = true;
+    let pps = dummy_pps(pic_w, pic_h);
+    let sh = intra_slice_header();
+    let layout = CtuLayout::from_sps_pps(&sps, &pps);
+    let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &payload).unwrap();
+    let ctu0 = walker.iter_ctus().next().unwrap();
+    let (cus, infos, residuals) = walker.decode_ctu_full(&ctu0).unwrap();
+    assert_eq!(infos.len(), 4);
+    let mut out = PictureBuffer::yuv420_filled(16, 16, 0);
+    for ((ccu, info), residual) in cus.iter().zip(infos.iter()).zip(residuals.iter()) {
+        assert_eq!(info.pred_mode, oxideav_h266::leaf_cu::CuPredMode::Plt);
+        walker
+            .reconstruct_leaf_cu(ccu, info, residual, &mut out)
+            .unwrap();
+    }
+    // CU0 (0,0): top half 30, bottom half 220.
+    assert_eq!(out.luma.samples[0], 30);
+    assert_eq!(out.luma.samples[7 * 16], 220);
+    // CU1 (8,0): reused colours in vertical stripes.
+    assert_eq!(out.luma.samples[8], 30);
+    assert_eq!(out.luma.samples[12], 220);
+    // CU2 (0,8): escape at its (0,0) — eq. 442 at qP 26:
+    // ((10 * 51) << 4) + 32 >> 6 = 128; parity pattern elsewhere.
+    assert_eq!(out.luma.samples[8 * 16], 128);
+    assert_eq!(out.luma.samples[8 * 16 + 1], 30);
+    assert_eq!(out.luma.samples[8 * 16 + 2], 55);
+    // CU2 chroma escape at chroma (0, 4): ((6 * 51) << 4) + 32 >> 6.
+    let cb_esc = (((6 * 51) << 4) + 32) >> 6;
+    assert_eq!(out.cb.samples[4 * 8], cb_esc as u8);
+    // CU3 (8,8): rows alternate 55 / 220.
+    assert_eq!(out.luma.samples[8 * 16 + 8], 55);
+    assert_eq!(out.luma.samples[9 * 16 + 8], 220);
+}

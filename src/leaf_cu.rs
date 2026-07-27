@@ -444,6 +444,13 @@ pub struct CuToolFlags {
     pub ctb_size_y: u32,
     /// `sps_chroma_format_idc` (0 = monochrome).
     pub chroma_format_idc: u32,
+    /// r431 — `BitDepth` (§7.4.3.4 eq. 59). Drives the FL width of
+    /// `new_palette_entries` and the palette escape range check.
+    pub bit_depth: u32,
+    /// r431 — `sps_qtbtt_dual_tree_intra_flag`; with the slice type it
+    /// derives the eq. 184 `LocalDualTreeFlag` and gates the eq. 451
+    /// predictor-size mirror.
+    pub qtbtt_dual_tree_intra: bool,
     /// `pps_cu_qp_delta_enabled_flag` — gates `cu_qp_delta_abs` reads.
     pub cu_qp_delta_enabled: bool,
     /// r418 — `IsCuQpDeltaCoded` carried in from the coding-tree
@@ -829,6 +836,9 @@ pub struct LeafCuResidual {
     pub cb_levels: Vec<i32>,
     /// Chroma Cr coefficient levels (row-major, chroma-plane size).
     pub cr_levels: Vec<i32>,
+    /// r431 — the parsed §7.3.11.6 `palette_coding()` payload when
+    /// `pred_mode_plt_flag == 1` (`info.pred_mode == CuPredMode::Plt`).
+    pub palette: Option<crate::palette::PaletteCuInfo>,
 }
 
 /// §7.3.11.5 syntax values for the intra-mode constants (Table 19).
@@ -1383,6 +1393,12 @@ pub struct LeafCuReader<'a, 'b> {
     /// (no chroma syntax) and its chroma tree with `DualTreeChroma`
     /// (chroma-only syntax via [`Self::decode_dual_chroma`]).
     tree: TreeType,
+    /// r431 — the slice's running §7.4.12.6 predictor palette. The
+    /// §7.3.11.6 reuse loop reads it and the §8.4.5.3 maintenance
+    /// (parse-order state — the NEXT palette CU's reuse loop needs it)
+    /// mutates it. `None` when the caller has no palette state bound
+    /// (a stream with `sps_palette_enabled_flag == 1` then refuses).
+    palette_pred: Option<&'a mut crate::palette::PalettePredictor>,
 }
 
 impl<'a, 'b> LeafCuReader<'a, 'b> {
@@ -1396,12 +1412,23 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             ctxs,
             tools,
             tree: TreeType::SingleTree,
+            palette_pred: None,
         }
     }
 
     /// §7.3.11.4 — select the component tree this reader parses.
     pub fn with_tree_type(mut self, tree: TreeType) -> Self {
         self.tree = tree;
+        self
+    }
+
+    /// r431 — bind the slice's predictor palette (§7.4.12.6) so
+    /// `pred_mode_plt_flag == 1` CUs can parse `palette_coding()`.
+    pub fn with_palette_predictor(
+        mut self,
+        pred: &'a mut crate::palette::PalettePredictor,
+    ) -> Self {
+        self.palette_pred = Some(pred);
         self
     }
 
@@ -1498,13 +1525,29 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     ) -> Result<()> {
         info.pred_mode = CuPredMode::Intra;
 
-        if self.tools.palette {
-            return Err(Error::unsupported(
-                "h266 leaf CU: palette coding (sps_palette_enabled_flag) not supported",
-            ));
+        // r431 — §7.3.11.5 `pred_mode_plt_flag` gate: CuPredMode ==
+        // MODE_INTRA (this body), sps_palette_enabled_flag, cbWidth /
+        // cbHeight <= 64, cu_skip_flag == 0 (skip never reaches the
+        // intra body), modeType != MODE_TYPE_INTER (this walker has no
+        // local dual trees → MODE_TYPE_ALL), and cbWidth * cbHeight >
+        // 16 for the non-chroma trees. Table 131 ctxInc 0; Table 67
+        // init values via `PaletteCtxs`.
+        if self.tools.palette
+            && info.cb_width <= 64
+            && info.cb_height <= 64
+            && info.cb_width * info.cb_height > 16
+        {
+            let idx =
+                (self.ctxs.init_type as usize).min(self.ctxs.palette.pred_mode_plt_flag.len() - 1);
+            let plt = self
+                .dec
+                .decode_decision(&mut self.ctxs.palette.pred_mode_plt_flag[idx])?
+                == 1;
+            if plt {
+                return self.decode_palette_cu(info, residual);
+            }
         }
 
-        // pred_mode_plt_flag: ignored for now (palette disabled above).
         // cu_act_enabled_flag: only present when sps_act_enabled_flag &&
         // treeType == SINGLE_TREE. We gate it similarly.
         if self.tools.act {
@@ -1740,6 +1783,84 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     /// The chroma-tree `lfnst_idx` (with its `/ SubWidthC` size
     /// scaling and `treeType != SINGLE_TREE` ctxInc) is parsed after
     /// the residuals; `mts_idx` is never present on this tree.
+    /// r431 — the `pred_mode_plt_flag == 1` arm of §7.3.11.5: parse
+    /// `palette_coding()` (§7.3.11.6) against the slice's running
+    /// predictor palette, run the §8.4.5.3 predictor maintenance in
+    /// parse order (the NEXT palette CU's reuse loop reads the updated
+    /// state), and record the payload on `residual.palette` for the
+    /// reconstruction pass.
+    fn decode_palette_cu(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+    ) -> Result<()> {
+        info.pred_mode = CuPredMode::Plt;
+        // §8.4.3 / §8.7.4 — a later CU reading this CU's collocated
+        // luma mode (chroma DM, LFNST predModeIntra) resolves MODE_PLT
+        // to INTRA_DC; the §8.4.2 MPM candidates gate on `CuPredMode
+        // != MODE_INTRA` first (→ PLANAR), so the grid value never
+        // reaches them.
+        info.intra_pred_mode_y = INTRA_DC;
+        info.intra_pred_mode_c = INTRA_DC;
+        let Some(pred) = self.palette_pred.as_deref_mut() else {
+            return Err(Error::unsupported(
+                "h266 leaf CU: palette CU parsed without a bound predictor palette",
+            ));
+        };
+        let (bw, bh) = if self.tree == TreeType::DualTreeChroma {
+            // §7.3.11.5 — palette_coding( x0, y0, cbWidth / SubWidthC,
+            // cbHeight / SubHeightC, treeType ); this walker is 4:2:0.
+            (info.cb_width / 2, info.cb_height / 2)
+        } else {
+            (info.cb_width, info.cb_height)
+        };
+        let p = crate::palette::PaletteParams {
+            tree: self.tree,
+            chroma_format_idc: self.tools.chroma_format_idc,
+            bit_depth: self.tools.bit_depth.max(8),
+            bw,
+            bh,
+            // Eq. 184.
+            local_dual_tree: self.tree != TreeType::SingleTree
+                && (self.tools.slice_is_inter || !self.tools.qtbtt_dual_tree_intra),
+            cu_qp_delta_enabled: self.tools.cu_qp_delta_enabled,
+            cu_qp_delta_already_coded: self.tools.cu_qp_delta_already_coded,
+            cu_chroma_qp_offset_enabled: self.tools.cu_chroma_qp_offset_enabled,
+            cu_chroma_qp_offset_already_coded: false,
+            chroma_qp_offset_list_len_minus1: self.tools.chroma_qp_offset_list_len_minus1,
+        };
+        let cu = crate::palette::read_palette_coding(
+            self.dec,
+            &mut self.ctxs.palette,
+            &mut self.ctxs.residual,
+            pred,
+            &p,
+        )?;
+        // Fold the in-CU QP side elements into the same `info` fields
+        // the transform path uses, so the walker's quantization-group
+        // state machine applies unchanged. When nothing was read the
+        // seeded QG inheritance in `info.cu_qp_delta_val` stands.
+        if cu.cu_qp_delta_read {
+            info.cu_qp_delta_val = cu.cu_qp_delta_val;
+            info.cu_qp_delta_read = true;
+        }
+        if cu.cu_chroma_qp_offset_read {
+            info.cu_chroma_qp_offset_flag = cu.cu_chroma_qp_offset_flag;
+            info.cu_chroma_qp_offset_idx = cu.cu_chroma_qp_offset_idx;
+        }
+        // §8.4.5.3 predictor maintenance (eq. 450 / 451) — the eq. 451
+        // mirror is gated on the picture actually walking separate
+        // luma / chroma trees.
+        crate::palette::update_predictor(
+            pred,
+            &cu,
+            &p,
+            !self.tools.slice_is_inter && self.tools.qtbtt_dual_tree_intra,
+        );
+        residual.palette = Some(crate::palette::PaletteCuInfo { params: p, cu });
+        Ok(())
+    }
+
     pub fn decode_dual_chroma(
         &mut self,
         info: &mut LeafCuInfo,
@@ -1753,17 +1874,34 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                                             // DUAL_TREE_CHROMA`, and §7.4.12.5 infers `pred_mode_ibc_flag
                                             // = 0` for a DUAL_TREE_CHROMA CU — the chroma tree is always
                                             // intra (r409; the pre-r409 reader refused the whole slice).
-        if self.tools.palette {
-            return Err(Error::unsupported(
-                "h266 leaf CU (dual-tree chroma): palette coding not supported",
-            ));
-        }
         if self.tools.chroma_format_idc != 1 {
             return Err(Error::unsupported(
                 "h266 leaf CU (dual-tree chroma): only 4:2:0 is walked",
             ));
         }
         let (sub_w, sub_h) = (2u32, 2u32);
+
+        // r431 — §7.3.11.5 `pred_mode_plt_flag` on the chroma tree:
+        // the area gate reads `cbWidth * cbHeight > 16 * SubWidthC *
+        // SubHeightC` (luma units), and the `(modeType !=
+        // MODE_TYPE_INTRA || treeType != DUAL_TREE_CHROMA)` arm passes
+        // because this walker's full dual-tree walk runs with
+        // MODE_TYPE_ALL (no local dual trees).
+        if self.tools.palette
+            && info.cb_width <= 64
+            && info.cb_height <= 64
+            && info.cb_width * info.cb_height > 16 * sub_w * sub_h
+        {
+            let idx =
+                (self.ctxs.init_type as usize).min(self.ctxs.palette.pred_mode_plt_flag.len() - 1);
+            let plt = self
+                .dec
+                .decode_decision(&mut self.ctxs.palette.pred_mode_plt_flag[idx])?
+                == 1;
+            if plt {
+                return self.decode_palette_cu(info, residual);
+            }
+        }
 
         // intra_bdpcm_chroma_flag — §7.3.11.5 gate:
         // cbWidth / SubWidthC <= MaxTsSize && cbHeight / SubHeightC <=
@@ -5305,11 +5443,18 @@ mod tests {
     }
 
     #[test]
-    fn palette_tool_surfaces_unsupported() {
-        // Round-409: IBC is live on every reachable tree/slice
-        // combination (single-tree, DUAL_TREE_LUMA, P/B); palette
-        // coding remains the precise-Unsupported arm.
-        let data = [0u8; 32];
+    fn palette_flag_one_without_predictor_surfaces_unsupported() {
+        // r431 — `pred_mode_plt_flag` is parsed live. A wire whose flag
+        // decodes to 1 while the caller bound no predictor palette
+        // surfaces the precise Unsupported; a flag decoding to 0 falls
+        // through to the intra cascade (covered by the whole-stream
+        // paths, which bind the predictor).
+        let mut enc = crate::cabac_enc::ArithEncoder::new();
+        let mut ectx = crate::palette::PaletteCtxs::init(26, 0);
+        enc.encode_decision(&mut ectx.pred_mode_plt_flag[0], 1)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let data = enc.finish();
         let mut dec = ArithDecoder::new(&data).unwrap();
         let mut ctxs = LeafCuCtxs::init(26);
         let mut info = LeafCuInfo {
@@ -5329,6 +5474,7 @@ mod tests {
             max_ts_size: 32,
             ts_residual_coding_rice_idx: 1,
             palette: true,
+            bit_depth: 8,
             ..CuToolFlags::default()
         };
         let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools);
@@ -5336,6 +5482,166 @@ mod tests {
             reader.decode(&mut info, &mut residual, &neigh),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn palette_cu_parses_through_leaf_reader_with_predictor() {
+        // r431 — end-to-end leaf parse: pred_mode_plt_flag = 1 +
+        // palette_coding() through `LeafCuReader::decode`, with the
+        // §8.4.5.3 predictor maintenance running in parse order.
+        let p = crate::palette::PaletteParams {
+            tree: TreeType::SingleTree,
+            chroma_format_idc: 1,
+            bit_depth: 8,
+            bw: 16,
+            bh: 16,
+            local_dual_tree: false,
+            cu_qp_delta_enabled: false,
+            cu_qp_delta_already_coded: false,
+            cu_chroma_qp_offset_enabled: false,
+            cu_chroma_qp_offset_already_coded: false,
+            chroma_qp_offset_list_len_minus1: 0,
+        };
+        let mut map = vec![0u8; 256];
+        for (i, m) in map.iter_mut().enumerate() {
+            *m = ((i / 16) % 2) as u8;
+        }
+        let plan = crate::palette::PalettePlan {
+            reuse: vec![],
+            new_entries: [vec![50, 200], vec![60, 90], vec![70, 80]],
+            escape_present: false,
+            transpose: false,
+            index_map: map.clone(),
+            escape_vals: [vec![], vec![], vec![]],
+            cu_qp_delta: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+        };
+        let mut enc = crate::cabac_enc::ArithEncoder::new();
+        let mut ectx = crate::palette::PaletteCtxs::init(26, 0);
+        let mut erctx = ResidualCtxs::init(26);
+        enc.encode_decision(&mut ectx.pred_mode_plt_flag[0], 1)
+            .unwrap();
+        let epred = crate::palette::PalettePredictor::new();
+        crate::palette::write_palette_coding(&mut enc, &mut ectx, &mut erctx, &epred, &p, &plan)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let data = enc.finish();
+
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = LeafCuCtxs::init(26);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let neigh = CuNeighbourhood::default();
+        let tools = CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
+            palette: true,
+            bit_depth: 8,
+            ..CuToolFlags::default()
+        };
+        let mut pred = crate::palette::PalettePredictor::new();
+        let mut reader =
+            LeafCuReader::new(&mut dec, &mut ctxs, tools).with_palette_predictor(&mut pred);
+        reader.decode(&mut info, &mut residual, &neigh).unwrap();
+        assert_eq!(info.pred_mode, CuPredMode::Plt);
+        assert_eq!(info.intra_pred_mode_y, INTRA_DC);
+        let pal = residual.palette.expect("palette payload");
+        assert_eq!(pal.cu.index_map, map);
+        assert_eq!(pal.cu.entries[0][..2], [50, 200]);
+        // Parse-order predictor maintenance ran (eq. 450).
+        assert_eq!(pred.size, [2, 2]);
+        assert_eq!(pred.entries[0][..2], [50, 200]);
+    }
+
+    #[test]
+    fn palette_cu_parses_on_dual_tree_chroma() {
+        // r431 — §7.3.11.5 chroma-tree arm: pred_mode_plt_flag under
+        // the `cbWidth * cbHeight > 16 * SubWidthC * SubHeightC` gate,
+        // then palette_coding( cbWidth / 2, cbHeight / 2,
+        // DUAL_TREE_CHROMA ).
+        let p = crate::palette::PaletteParams {
+            tree: TreeType::DualTreeChroma,
+            chroma_format_idc: 1,
+            bit_depth: 8,
+            bw: 8,
+            bh: 8,
+            local_dual_tree: false,
+            cu_qp_delta_enabled: false,
+            cu_qp_delta_already_coded: false,
+            cu_chroma_qp_offset_enabled: false,
+            cu_chroma_qp_offset_already_coded: false,
+            chroma_qp_offset_list_len_minus1: 0,
+        };
+        let mut map = vec![0u8; 64];
+        for (i, m) in map.iter_mut().enumerate() {
+            *m = (i % 2) as u8;
+        }
+        let plan = crate::palette::PalettePlan {
+            reuse: vec![],
+            new_entries: [vec![], vec![80, 170], vec![170, 80]],
+            escape_present: false,
+            transpose: false,
+            index_map: map.clone(),
+            escape_vals: [vec![], vec![], vec![]],
+            cu_qp_delta: 0,
+            cu_chroma_qp_offset_flag: false,
+            cu_chroma_qp_offset_idx: 0,
+        };
+        let mut enc = crate::cabac_enc::ArithEncoder::new();
+        let mut ectx = crate::palette::PaletteCtxs::init(26, 0);
+        let mut erctx = ResidualCtxs::init(26);
+        enc.encode_decision(&mut ectx.pred_mode_plt_flag[0], 1)
+            .unwrap();
+        let epred = crate::palette::PalettePredictor::new();
+        crate::palette::write_palette_coding(&mut enc, &mut ectx, &mut erctx, &epred, &p, &plan)
+            .unwrap();
+        enc.encode_terminate(1).unwrap();
+        let data = enc.finish();
+
+        let mut dec = ArithDecoder::new(&data).unwrap();
+        let mut ctxs = LeafCuCtxs::init(26);
+        let mut info = LeafCuInfo {
+            cb_width: 16,
+            cb_height: 16,
+            ..LeafCuInfo::default()
+        };
+        let mut residual = LeafCuResidual::default();
+        let tools = CuToolFlags {
+            chroma_format_idc: 1,
+            ctb_size_y: 128,
+            max_tb_size_y: 64,
+            min_tb_size_y: 4,
+            max_ts_size: 32,
+            ts_residual_coding_rice_idx: 1,
+            palette: true,
+            bit_depth: 8,
+            qtbtt_dual_tree_intra: true,
+            ..CuToolFlags::default()
+        };
+        let mut pred = crate::palette::PalettePredictor::new();
+        let mut reader = LeafCuReader::new(&mut dec, &mut ctxs, tools)
+            .with_tree_type(TreeType::DualTreeChroma)
+            .with_palette_predictor(&mut pred);
+        reader
+            .decode_dual_chroma(&mut info, &mut residual, INTRA_PLANAR, false)
+            .unwrap();
+        assert_eq!(info.pred_mode, CuPredMode::Plt);
+        let pal = residual.palette.expect("palette payload");
+        assert_eq!(pal.params.bw, 8);
+        assert_eq!(pal.cu.index_map, map);
+        assert_eq!(pal.cu.entries[1][..2], [80, 170]);
+        // DUAL_TREE_CHROMA maintenance updates chType 1 only (the
+        // dual-tree-structure arm skips the eq. 451 mirror).
+        assert_eq!(pred.size, [0, 2]);
     }
 
     #[test]

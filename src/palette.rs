@@ -167,12 +167,24 @@ impl PaletteCtxs {
     }
 }
 
+/// A parsed palette CU bundled with the invocation parameters it was
+/// parsed under — carried on [`crate::leaf_cu::LeafCuResidual`] so the
+/// reconstruction pass can re-derive `startComp` / `numComps` and the
+/// escape sub-sampling without replaying the CABAC reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteCuInfo {
+    /// The `palette_coding()` invocation parameters.
+    pub params: PaletteParams,
+    /// The parsed CU payload.
+    pub cu: PaletteCu,
+}
+
 /// Invocation parameters for `palette_coding( x0, y0, cbWidth,
 /// cbHeight, treeType )`. `bw` / `bh` are the block dimensions at the
 /// invocation resolution — luma samples for SINGLE_TREE /
 /// DUAL_TREE_LUMA, chroma samples (`cbWidth / SubWidthC`) for
 /// DUAL_TREE_CHROMA (§7.3.11.5).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaletteParams {
     /// `treeType`.
     pub tree: TreeType,
@@ -247,7 +259,7 @@ impl PaletteParams {
 
 /// One parsed (or planned) palette CU: everything §8.4.5.3 needs to
 /// reconstruct the block and update the predictor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaletteCu {
     /// `palette_transpose_flag`.
     pub transpose: bool,

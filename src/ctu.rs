@@ -1055,6 +1055,10 @@ pub struct CtuWalker<'a, 'b> {
     /// parse of the first CTU of a CTU row (within a tile) ends, and
     /// restored by the §9.3.2.4 synchronization at the next row start.
     wpp_ctx_store: Option<WppCtxStore>,
+    /// r431 — the §7.4.12.6 predictor palette (`PredictorPaletteSize`
+    /// + `PredictorPaletteEntries`). Reset per §9.3.2.1 with the
+    /// context bundles; stored / synchronized on the WPP arms.
+    palette_pred: crate::palette::PalettePredictor,
     /// r429 — Table 51 `initType` (0 = I, 1/2 from the slice type +
     /// `sh_cabac_init_flag`), retained for the §9.3.2.2 per-tile
     /// context re-initialization.
@@ -1091,6 +1095,8 @@ struct WppCtxStore {
     leaf: LeafCuCtxs,
     sao: SaoCtxs,
     alf: Option<crate::alf_syntax::AlfCtxs>,
+    /// §9.3.2.6 — `TablePaletteSizeWpp` / `TablePaletteEntriesWpp`.
+    palette: crate::palette::PalettePredictor,
 }
 
 impl std::fmt::Debug for CtuWalker<'_, '_> {
@@ -1304,6 +1310,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             region_col_cap: u32::MAX,
             first_ctb_row_in_slice: true,
             wpp_ctx_store: None,
+            palette_pred: crate::palette::PalettePredictor::new(),
             init_type,
             cur_tile_idx: 0,
             subset_start_byte: 0,
@@ -2463,6 +2470,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ts_residual_coding_rice_idx: self.sh.sh_ts_residual_coding_rice_idx_minus1 as u32 + 1,
             ctb_size_y: self.layout.ctb_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
+            bit_depth: self.sps.sps_bitdepth_minus8 as u32 + 8,
+            qtbtt_dual_tree_intra: self.sps.partition_constraints.qtbtt_dual_tree_intra_flag,
             cu_qp_delta_enabled: self.pps.pps_cu_qp_delta_enabled_flag,
             // r418 — per-CU QG snapshot; `decode_leaf_cu_syntax`
             // overrides this from the walker's live QG state.
@@ -2587,7 +2596,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ..LeafCuInfo::default()
         };
         let mut residual = LeafCuResidual::default();
-        let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools);
+        let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+            .with_palette_predictor(&mut self.palette_pred);
         reader.decode(&mut info, &mut residual, neigh)?;
         Ok((info, residual))
     }
@@ -3489,7 +3499,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             };
             let mut residual = LeafCuResidual::default();
             let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
-                .with_tree_type(TreeType::DualTreeLuma);
+                .with_tree_type(TreeType::DualTreeLuma)
+                .with_palette_predictor(&mut self.palette_pred);
             reader.decode(&mut info, &mut residual, &neigh)?;
             // Commit IntraPredModeY so this node's chroma tree (and any
             // later chroma CU) can run the §8.4.3 DM derivation. A MIP
@@ -3590,7 +3601,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             };
             let mut residual = LeafCuResidual::default();
             let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
-                .with_tree_type(TreeType::DualTreeChroma);
+                .with_tree_type(TreeType::DualTreeChroma)
+                .with_palette_predictor(&mut self.palette_pred);
             reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
             chroma_infos.push(info);
             chroma_residuals.push(residual);
@@ -3625,6 +3637,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return Err(Error::unsupported(
                 "h266 dual-tree chroma reconstruction: only 4:2:0 is walked",
             ));
+        }
+        // r431 — a chroma-tree palette CU writes its planes directly
+        // (§8.4.5.3); no intra prediction / residual path applies.
+        if matches!(info.pred_mode, CuPredMode::Plt) {
+            return self.reconstruct_leaf_cu_palette(
+                cu,
+                info,
+                residual,
+                out,
+                TreeType::DualTreeChroma,
+            );
         }
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         // §8.7.4.1 eq. 1157 — predModeIntra for the chroma LFNST set:
@@ -3670,6 +3693,134 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu.cu.w.div_ceil(2),
             cu.cu.h.div_ceil(2),
         );
+        Ok(())
+    }
+
+    /// r431 — §8.4.5.3 palette-mode reconstruction: current-palette
+    /// table lookups + escape dequantisation written straight into the
+    /// picture planes (the trailing §8.7.5.1 invocation runs with an
+    /// all-zero `resSamples`, and §8.7.5.2 exempts MODE_PLT from the
+    /// LMCS forward mapping — palette samples live in the same domain
+    /// intra reconstruction does), plus the walker bookkeeping: the
+    /// deblock CU record (`intra = false`, no coded TBs — §8.8.3.5
+    /// yields bS 2 only from an intra neighbour side), the CIIP /
+    /// LMCS `cu_origin` grid, and the parse grids (committed with
+    /// `CuPredMode::Plt`, which resolves to "not intra, not IBC" for
+    /// every §9.3.4.2.2 / §8.4.2 consumer while the luma-mode grid
+    /// carries the §8.4.3 INTRA_DC substitution).
+    fn reconstruct_leaf_cu_palette(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+        tree: TreeType,
+    ) -> Result<()> {
+        let Some(pal) = residual.palette.as_ref() else {
+            return Err(Error::invalid(
+                "h266 palette reconstruction: MODE_PLT CU without a parsed palette payload",
+            ));
+        };
+        let p = &pal.params;
+        let pcu = &pal.cu;
+        // §7.4.3.4 eq. 61.
+        let qp_prime_ts_min = 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32;
+        let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
+        // §8.7.1 — QpY was resolved by the parse-time QG fold
+        // (`info.cu_qp_delta_val` is the effective delta against
+        // SliceQpY); Qp′Y adds QpBdOffset.
+        let qp_y = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
+        let qp_prime_y = qp_y + qp_bd_offset;
+        let (x0, y0) = (cu.cu.x, cu.cu.y);
+        if tree != TreeType::DualTreeChroma {
+            let plane = &mut out.luma;
+            let (stride, pw, ph) = (plane.stride, plane.width, plane.height);
+            pcu.reconstruct_component(
+                p,
+                0,
+                cu.cu.w,
+                cu.cu.h,
+                qp_prime_y,
+                qp_prime_ts_min,
+                |x, y, s| {
+                    let px = (x0 + x) as usize;
+                    let py = (y0 + y) as usize;
+                    if px < pw && py < ph {
+                        plane.samples[py * stride + px] = s.min(255) as u8;
+                    }
+                },
+            );
+        }
+        if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
+            for c_idx in 1..=2u32 {
+                // §7.4.10.6 eqs. 193 / 194 + §8.7.1 eqs. 1147 / 1148.
+                let cu_offset = cu_chroma_qp_offset(
+                    c_idx,
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                    &self.pps.pps_cb_qp_offset_list,
+                    &self.pps.pps_cr_qp_offset_list,
+                );
+                let qp_offset = chroma_qp_offset_sum(
+                    c_idx,
+                    self.pps.pps_cb_qp_offset,
+                    self.pps.pps_cr_qp_offset,
+                    self.sh.sh_cb_qp_offset,
+                    self.sh.sh_cr_qp_offset,
+                    cu_offset,
+                );
+                let qp_prime_c =
+                    chroma_qp_mapped(self.sps, c_idx as usize - 1, qp_y, qp_offset) + qp_bd_offset;
+                let (cx0, cy0) = (x0 / 2, y0 / 2);
+                let plane = if c_idx == 1 { &mut out.cb } else { &mut out.cr };
+                let (stride, pw, ph) = (plane.stride, plane.width, plane.height);
+                pcu.reconstruct_component(
+                    p,
+                    c_idx as usize,
+                    cu.cu.w / 2,
+                    cu.cu.h / 2,
+                    qp_prime_c,
+                    qp_prime_ts_min,
+                    |x, y, s| {
+                        let px = (cx0 + x) as usize;
+                        let py = (cy0 + y) as usize;
+                        if px < pw && py < ph {
+                            plane.samples[py * stride + px] = s.min(255) as u8;
+                        }
+                    },
+                );
+            }
+        }
+        if tree == TreeType::DualTreeChroma {
+            // §8.7.5.1 eq. 1212 — chroma-tree CUs mark the chroma
+            // planes (the dual-chroma caller does not run the shared
+            // epilogue).
+            self.mark_reconstructed_chroma(
+                x0 / 2,
+                y0 / 2,
+                cu.cu.w.div_ceil(2),
+                cu.cu.h.div_ceil(2),
+            );
+            return Ok(());
+        }
+        // §8.8.3 deblock record — MODE_PLT is not MODE_INTRA and a
+        // palette CU has no coded transform blocks; with a palette
+        // neighbour on both sides every implemented bS arm yields 0.
+        self.deblock_cus.push(DeblockCu {
+            x: x0,
+            y: y0,
+            w: cu.cu.w,
+            h: cu.cu.h,
+            qp_y: qp_y.clamp(0, 63),
+            intra: false,
+            tu_y_coded: false,
+            tu_cb_coded: false,
+            tu_cr_coded: false,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+        });
+        self.write_intra_block(x0, y0, cu.cu.w, cu.cu.h, false);
+        self.commit_subblock_neighbour_state(cu, info);
         Ok(())
     }
 
@@ -3774,6 +3925,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         if matches!(info.pred_mode, CuPredMode::Ibc) {
             return self.reconstruct_leaf_cu_ibc(cu, info, residual, out, tree);
+        }
+        // r431 — §8.4.1: a `pred_mode_plt_flag == 1` CU routes through
+        // the §8.4.5.3 palette decoding process instead of the intra
+        // prediction + transform pipeline.
+        if matches!(info.pred_mode, CuPredMode::Plt) {
+            return self.reconstruct_leaf_cu_palette(cu, info, residual, out, tree);
         }
 
         // MIP (§8.4.5.2.2) is wired below through [`crate::mip`]; the
@@ -9035,6 +9192,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 leaf: self.leaf_ctxs.clone(),
                 sao: self.sao_ctxs.clone(),
                 alf: self.alf_ctxs.clone(),
+                // §9.3.2.6 — the palette predictor stores alongside
+                // the context variables (§9.3.1).
+                palette: self.palette_pred.clone(),
             });
         }
         if i + 1 == n_ctus {
@@ -9080,6 +9240,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     self.leaf_ctxs = store.leaf;
                     self.sao_ctxs = store.sao;
                     self.alf_ctxs = store.alf;
+                    // §9.3.2.7 — palette predictor synchronization.
+                    self.palette_pred = store.palette;
                 }
                 None => self.reinit_ctxs_for_region_start(),
             }
@@ -9133,6 +9295,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if self.alf_ctxs.is_some() {
             self.alf_ctxs = Some(crate::alf_syntax::AlfCtxs::init(self.cabac.slice_qp_y.0));
         }
+        // §9.3.2.1 — PredictorPaletteSize[chType] re-initializes to 0
+        // with the context variables.
+        self.palette_pred.reset();
     }
 
     /// §7.3.11.1 — the per-CTU-row state resets. `slice_data()` runs
