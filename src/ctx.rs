@@ -295,6 +295,40 @@ pub fn ctx_inc_general_merge_flag() -> u32 {
     0
 }
 
+/// ctxInc for `run_copy_flag` per §9.3.4.2.11 / Table 134.
+///
+/// `binDist = curPos − PreviousRunPosition − 1`; the row selected by
+/// `PreviousRunType` maps `binDist ∈ {0, 1, 2, 3, >=4}` to
+/// `{0, 1, 2, 3, 4}` (PreviousRunType == 0) or `{5, 6, 6, 7, 7}`
+/// (PreviousRunType == 1).
+pub fn ctx_inc_run_copy_flag(previous_run_type: bool, bin_dist: u32) -> u32 {
+    if previous_run_type {
+        match bin_dist {
+            0 => 5,
+            1 | 2 => 6,
+            _ => 7,
+        }
+    } else {
+        bin_dist.min(4)
+    }
+}
+
+/// ctxInc for `pred_mode_plt_flag` — fixed 0 per Table 131.
+pub fn ctx_inc_pred_mode_plt_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `palette_transpose_flag` — fixed 0 per Table 131.
+pub fn ctx_inc_palette_transpose_flag() -> u32 {
+    0
+}
+
+/// ctxInc for `copy_above_palette_indices_flag` — fixed 0 per
+/// Table 131.
+pub fn ctx_inc_copy_above_palette_indices_flag() -> u32 {
+    0
+}
+
 /// ctxInc for `regular_merge_flag[x0][y0]` per Table 132 — yields 0
 /// when `cu_skip_flag` is 1 and 1 otherwise.
 pub fn ctx_inc_regular_merge_flag(cu_skip_flag: bool) -> u32 {

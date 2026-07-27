@@ -1016,6 +1016,10 @@ pub struct LeafCuCtxs {
     /// (0..3) per Table 132. Indexed at parse time as
     /// `init_type * 4 + ctxInc`.
     pub mts_idx: Vec<ContextModel>,
+    /// r431 — the §7.3.11.6 palette contexts (`pred_mode_plt_flag`,
+    /// `palette_transpose_flag`, `copy_above_palette_indices_flag`,
+    /// `run_copy_flag` — Tables 67 / 99 / 100 / 101).
+    pub palette: crate::palette::PaletteCtxs,
     /// Slice initialisation type (§9.3.2.2 / Table 51) — 0 for I,
     /// 1 / 2 for P / B based on `sh_cabac_init_flag`. Used by the
     /// inter-syntax reads to pick the right slot inside the
@@ -1119,6 +1123,7 @@ impl LeafCuCtxs {
             amvr_precision_idx: init_contexts(SyntaxCtx::AmvrPrecisionIdx, slice_qp_y),
             lfnst_idx: init_contexts(SyntaxCtx::LfnstIdx, slice_qp_y),
             mts_idx: init_contexts(SyntaxCtx::MtsIdx, slice_qp_y),
+            palette: crate::palette::PaletteCtxs::init(slice_qp_y, init_type),
             init_type,
             residual: ResidualCtxs::init(slice_qp_y),
         }

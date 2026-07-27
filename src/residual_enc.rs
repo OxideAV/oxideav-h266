@@ -827,7 +827,10 @@ fn encode_abs_remainder(enc: &mut ArithEncoder, rice_param: u32, value: u32) -> 
 ///
 /// Decoder: `log` leading 1-bits, one terminating 0-bit, then `log+k` suffix
 /// bits (MSB first). `value = ((1<<log) - 1) * (1<<k) + suffix`.
-fn encode_exp_golomb_k(enc: &mut ArithEncoder, value: u32, k: u32) -> Result<()> {
+/// Shared with the §7.3.11.6 palette emitters (`palette_predictor_run`
+/// / `num_signalled_palette_entries` EG0, `palette_escape_val` EG5).
+#[doc(hidden)]
+pub fn encode_exp_golomb_k(enc: &mut ArithEncoder, value: u32, k: u32) -> Result<()> {
     // Find log: the largest value such that ((1<<log)-1)*(1<<k) <= value.
     // i.e. (1<<log) <= value/(1<<k) + 1
     // i.e. log = floor_log2(value/(1<<k) + 1) but only if that gives

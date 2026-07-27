@@ -132,6 +132,18 @@ pub enum SyntaxCtx {
     CuSkipFlag,
     /// Table 65 — `pred_mode_ibc_flag` (9 ctxIdx, 3 per initType).
     PredModeIbcFlag,
+    /// Table 67 — `pred_mode_plt_flag` (3 ctxIdx, one per initType;
+    /// ctxInc = 0 per Table 131).
+    PredModePltFlag,
+    /// Table 99 — `copy_above_palette_indices_flag` (3 ctxIdx, one per
+    /// initType; ctxInc = 0 per Table 131).
+    CopyAbovePaletteIndicesFlag,
+    /// Table 100 — `palette_transpose_flag` (3 ctxIdx, one per
+    /// initType; ctxInc = 0 per Table 131).
+    PaletteTransposeFlag,
+    /// Table 101 — `run_copy_flag` (24 ctxIdx, 8 per initType; ctxInc
+    /// 0..7 per §9.3.4.2.11 / Table 134).
+    RunCopyFlag,
     /// Table 82 — `general_merge_flag` (3 ctxIdx, one per initType).
     GeneralMergeFlag,
     /// Table 102 — `regular_merge_flag` (4 ctxIdx, two per initType for the
@@ -306,6 +318,46 @@ pub const MTT_SPLIT_CU_BINARY_FLAG_SHIFT: &[u8] = &[12, 13, 12, 13, 12, 13, 12, 
 /// Table 66 — `pred_mode_flag` (4 ctxIdx).
 pub const PRED_MODE_FLAG_INIT: &[u8] = &[40, 35, 40, 35];
 pub const PRED_MODE_FLAG_SHIFT: &[u8] = &[5, 1, 5, 1];
+
+/// Table 67 — `pred_mode_plt_flag` (3 ctxIdx, one per initType ∈
+/// {0, 1, 2}). From the spec table:
+///   initType  | 0  | 1 | 2  |
+///   initValue | 25 | 0 | 17 |
+///   shiftIdx  |  1 | 1 |  1 |
+pub const PRED_MODE_PLT_FLAG_INIT: &[u8] = &[25, 0, 17];
+pub const PRED_MODE_PLT_FLAG_SHIFT: &[u8] = &[1, 1, 1];
+
+/// Table 99 — `copy_above_palette_indices_flag` (3 ctxIdx, one per
+/// initType ∈ {0, 1, 2}). From the spec table:
+///   initType  | 0  | 1  | 2  |
+///   initValue | 42 | 59 | 50 |
+///   shiftIdx  |  9 |  9 |  9 |
+pub const COPY_ABOVE_PALETTE_INDICES_FLAG_INIT: &[u8] = &[42, 59, 50];
+pub const COPY_ABOVE_PALETTE_INDICES_FLAG_SHIFT: &[u8] = &[9, 9, 9];
+
+/// Table 100 — `palette_transpose_flag` (3 ctxIdx, one per initType ∈
+/// {0, 1, 2}). From the spec table:
+///   initType  | 0  | 1  | 2  |
+///   initValue | 42 | 42 | 35 |
+///   shiftIdx  |  5 |  5 |  5 |
+pub const PALETTE_TRANSPOSE_FLAG_INIT: &[u8] = &[42, 42, 35];
+pub const PALETTE_TRANSPOSE_FLAG_SHIFT: &[u8] = &[5, 5, 5];
+
+/// Table 101 — `run_copy_flag` (24 ctxIdx, 8 per initType). The
+/// ctxIdx layout is `init_type * 8 + ctxInc` with the ctxInc derived
+/// per §9.3.4.2.11 / Table 134 from `binDist` and `PreviousRunType`.
+/// The spec table rows (initType 0 → ctxIdx 0..7, initType 1 → 8..15,
+/// initType 2 → 16..23) share one shiftIdx pattern.
+pub const RUN_COPY_FLAG_INIT: &[u8] = &[
+    50, 37, 45, 30, 46, 45, 38, 46, // initType 0
+    51, 30, 30, 38, 23, 38, 53, 46, // initType 1
+    58, 45, 45, 30, 38, 45, 38, 46, // initType 2
+];
+pub const RUN_COPY_FLAG_SHIFT: &[u8] = &[
+    9, 6, 9, 10, 5, 0, 9, 5, // initType 0
+    9, 6, 9, 10, 5, 0, 9, 5, // initType 1
+    9, 6, 9, 10, 5, 0, 9, 5, // initType 2
+];
 
 /// Table 69 — `intra_bdpcm_luma_flag` (3 ctxIdx, one per initType).
 pub const INTRA_BDPCM_LUMA_FLAG_INIT: &[u8] = &[19, 40, 19];
@@ -857,6 +909,15 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::ParLevelFlag => (PAR_LEVEL_FLAG_INIT, PAR_LEVEL_FLAG_SHIFT),
         SyntaxCtx::LfnstIdx => (LFNST_IDX_INIT, LFNST_IDX_SHIFT),
         SyntaxCtx::MtsIdx => (MTS_IDX_INIT, MTS_IDX_SHIFT),
+        SyntaxCtx::PredModePltFlag => (PRED_MODE_PLT_FLAG_INIT, PRED_MODE_PLT_FLAG_SHIFT),
+        SyntaxCtx::CopyAbovePaletteIndicesFlag => (
+            COPY_ABOVE_PALETTE_INDICES_FLAG_INIT,
+            COPY_ABOVE_PALETTE_INDICES_FLAG_SHIFT,
+        ),
+        SyntaxCtx::PaletteTransposeFlag => {
+            (PALETTE_TRANSPOSE_FLAG_INIT, PALETTE_TRANSPOSE_FLAG_SHIFT)
+        }
+        SyntaxCtx::RunCopyFlag => (RUN_COPY_FLAG_INIT, RUN_COPY_FLAG_SHIFT),
         SyntaxCtx::SaoMergeFlag => (SAO_MERGE_FLAG_INIT, SAO_MERGE_FLAG_SHIFT),
         SyntaxCtx::SaoTypeIdx => (SAO_TYPE_IDX_INIT, SAO_TYPE_IDX_SHIFT),
         SyntaxCtx::CuSkipFlag => (CU_SKIP_FLAG_INIT, CU_SKIP_FLAG_SHIFT),
@@ -954,6 +1015,10 @@ mod tests {
             SyntaxCtx::SaoTypeIdx,
             SyntaxCtx::CuSkipFlag,
             SyntaxCtx::PredModeIbcFlag,
+            SyntaxCtx::PredModePltFlag,
+            SyntaxCtx::CopyAbovePaletteIndicesFlag,
+            SyntaxCtx::PaletteTransposeFlag,
+            SyntaxCtx::RunCopyFlag,
             SyntaxCtx::GeneralMergeFlag,
             SyntaxCtx::RegularMergeFlag,
             SyntaxCtx::MmvdMergeFlag,

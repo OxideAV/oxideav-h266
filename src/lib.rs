@@ -281,6 +281,7 @@ pub mod non_merge_inter_pre_residual_enc;
 #[doc(hidden)]
 pub mod non_merge_mvp_syntax_enc;
 pub mod opi;
+pub mod palette;
 pub mod picture_header;
 pub mod picture_timing;
 pub mod pps;
