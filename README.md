@@ -64,7 +64,18 @@ oxideav-h266 = "0.0"
     WPP column-cap availability arms gating every spatial neighbour
     read (intra reference masks, parse-time mode grids, motion /
     affine field scans, split-flag ctxIncs, `qPY_PRED`, the SAO / ALF
-    CTU-prefix conditions). Subpicture layouts remain out of scope.
+    CTU-prefix conditions). **r431 — multi-slice pictures decode
+    end-to-end**: `CtuWalker::continue_slice` walks each further
+    slice of the picture on the same walker — fresh §9.3.2.2 CABAC
+    initialisation at the new slice's SliceQpY, the §7.3.11.1
+    first-CTU-in-slice resets (HMVP / IBC / predictor palette /
+    `FirstCtbRowInSlice`), the §6.4.4 different-slice availability
+    (rectangular slices as region-rect intersection, raster slices
+    through the different-tile arm, a per-CTB slice map for the SAO /
+    ALF prefix availability), and the
+    `pps_loop_filter_across_slices_enabled_flag = 0` deblock / SAO /
+    ALF gates (composable with the across-tiles gates). Subpicture
+    layouts remain out of scope.
   * **APS** (§7.3.2.5) — ALF / LMCS / scaling-list type. The LMCS APS
     payload (§7.3.2.19) is decoded into a typed `lmcs::LmcsData`, with
     the BitDepth-dependent §7.4.3.19 derivations (`OrgCW`, `lmcsCW`,
@@ -128,8 +139,23 @@ oxideav-h266 = "0.0"
 ## Decode support
 
 The reconstruction pipeline is built incrementally and currently covers
-the **intra-only single-tile single-slice subset** plus a substantial
-P + B-slice merge subset:
+the **intra-only subset across tiles / WPP / multi-slice layouts**
+plus a substantial P + B-slice merge subset:
+
+* **Palette mode** (r431 — §7.3.11.6 / §8.4.5.3) — the full
+  `palette_coding()` parse (predictor-run reuse loop, eq. 185
+  `CurrentPaletteEntries` incl. the LocalDualTreeFlag arm, the
+  §9.3.3.13 truncated-binary `palette_idx_idc` with the eq. 186 / 187
+  `adjustedRefPaletteIndex` fold, §9.3.4.2.11 run_copy ctxIncs, EG5
+  escape values with the SINGLE_TREE chroma sub-sampling gate, in-CU
+  `cu_qp_delta` / `cu_chroma_qp_offset`), predictor palette
+  maintenance in parse order (eq. 450, the eqs. 444 – 449
+  local-dual-tree fold, the eq. 451 chType mirror) with the §9.3.2.1
+  per-slice/per-tile resets and §9.3.2.6 / §9.3.2.7 WPP
+  storage/synchronization, §8.4.5.3 reconstruction (eq. 438 lookups +
+  eqs. 439 – 443 escape dequantisation with the `QpPrimeTsMin`
+  floor), the §8.8.3.6.7/.6.8/.6.10 palette-side deblock write
+  suppression, and the dual-tree luma / chroma arms.
 
 * **Intra** (r412 — the full §8.4.5.2 pipeline) — PLANAR / DC and the
   complete general angular range (§8.4.5.2.13: Table 24 angles
@@ -447,7 +473,17 @@ P + B-slice merge subset:
 
 An IDR-frame encoder pipeline (`encode_idr_with_residuals_cfg`) builds
 an Annex-B bitstream with real coded residuals, deblock, SAO, ALF, and
-CC-ALF, plus opt-in partitioning tools: an MTT BT picker
+CC-ALF. Opt-in **palette coding** (`EncoderConfig::palette`, r431):
+CUs whose source block draws from ≤ 31 distinct colours palette-code
+losslessly (up to 37 with EG5 escape samples quantized at the CU QP),
+with the wire-level predictor-reuse split derived from a
+decoder-mirrored predictor palette; opt-in **multi-slice layouts**
+(r431): `EncoderConfig::slice_per_tile` (rectangular one-slice-per-tile
+— the §7.3.2.5 slice loop + `sh_slice_address`),
+`EncoderConfig::raster_slice_count` (raster tile runs) and
+`EncoderConfig::loop_filter_across_slices`, each slice its own VCL NAL
+with full per-slice CABAC / predictor re-initialisation and
+slice-local entry points. Plus opt-in partitioning tools: an MTT BT picker
 (`EncoderConfig::enable_mtt_bt_picker`, `{leaf, BT_VERT, BT_HORZ}` on
 `cost = SSE_Y + λ·bits`) and an MTT TT picker
 (`EncoderConfig::enable_mtt_tt_picker`, adding `TT_VERT` / `TT_HORZ`),
