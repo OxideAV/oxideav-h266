@@ -1,4 +1,4 @@
-# Whole-stream decode conformance corpus (r412, externally validated r415/r418, tiles/WPP r429, palette r431)
+# Whole-stream decode conformance corpus (r412, externally validated r415/r418, tiles/WPP r429, palette + multi-slice r431)
 
 The corpus streams are generated deterministically by
 `tests/whole_stream_conformance.rs` — every test encodes with the
@@ -43,8 +43,8 @@ Each `<name>.266` is decoded to planar 4:2:0 through a conforming
 external reference decoder invoked black-box, and the output is
 `cmp`'d byte-for-byte against the crate's own `<name>.yuv`.
 
-r431 status: **129 of 129 streams byte-exact** (the 124 r429 streams
-+ the 5 palette axes below). The palette axes validated on the first
+r431 status: **136 of 136 streams byte-exact** (the 124 r429 streams
++ the 5 palette axes + the 7 multi-slice axes below). The palette axes validated on the first
 run except `palette_mixed_256x128`, whose 133-sample divergence
 root-caused to the §8.8.3.6.7/.6.8/.6.10 palette-side deblock
 suppression (a palette CU's samples are never modified by the
@@ -126,6 +126,13 @@ distinct root-cause families, all fixed in r415:
 | palette_escape_64x64_qp30 (r431) | byte-exact | byte-exact | 2c529c7a279d4abe | 7424f81bd738c6b4 |
 | palette_tiles_2x2_256x256 (r431) | byte-exact | byte-exact | 44dbffca4fa2413e | 89b53f359d0a972b |
 | palette_wpp_256x256 (r431) | byte-exact | byte-exact | 26de0befec4d5ade | 89b53f359d0a972b |
+| slices_rect_2x2_256x256 (r431) | byte-exact | byte-exact | 62292d12500e2a33 | 7115a4ba9591e019 |
+| slices_rect_3x1_384x128_qp34 (r431) | byte-exact | byte-exact | 4795b3a6250f7922 | bd8a0bd6c7107648 |
+| slices_raster_2_256x256 (r431) | byte-exact | byte-exact | 7fe8bd3849eaa102 | 7115a4ba9591e019 |
+| slices_rect_noxlf_2x2_256x256 (r431) | byte-exact | byte-exact | b72c2d13c1ee23f9 | da1868ced29dbc99 |
+| slices_raster_noxlf_3rows_128x384_qp45 (r431) | byte-exact | byte-exact | 9590aa3993caff82 | f6b5a6d1e6aed23d |
+| slices_rect_wpp_128x384 (r431) | byte-exact | byte-exact | 22336d8cdea60f62 | cdf27191c1f2fb6d |
+| palette_slices_rect_2x2_256x256 (r431) | byte-exact | byte-exact | 0d06a3ac18eb8b24 | 89b53f359d0a972b |
 | mtt_bt_qp45 / mtt_bt_tt_qp45 (r418) | byte-exact | byte-exact | 8daf4a85db40ec28 | 28e105132000b8ae |
 | multi_ctu_qp45 / multi_ctu_mtt_qp45 (r418) | byte-exact | byte-exact | b54b2fe36d3200de / 99c0790dfdfdb821 | 052997467c44de0a |
 | wide_192x128_qp45 (r418) | byte-exact | byte-exact | d162706ece057f57 | 9de6a3f26d0c8df2 |
@@ -185,5 +192,28 @@ tile start and `palette_wpp_256x256` runs the §9.3.2.6/§9.3.2.7
 predictor storage/sync — their plane hashes are EQUAL (the palette
 content is lossless, so only the wire structure differs), pinning
 that the reset/sync arms produce the identical reconstruction.
+
+r431 multi-slice notes: `slices_rect_2x2_256x256` codes one
+rectangular slice per tile (four VCL NALs, per-slice §9.3.2 CABAC
+initialisation, `sh_slice_address` on the wire) — its plane hash
+equals `tiles_2x2_256x256`'s, pinning that only the slice
+structuring differs from the single-slice tile layout;
+`slices_rect_3x1_384x128_qp34` matches `tiles_3x1_384x128_qp34` the
+same way (deblocking crosses the slice boundaries with
+`pps_loop_filter_across_slices_enabled_flag = 1`).
+`slices_raster_2_256x256` re-signals the 2x2 grid as a raster layout
+with TWO slices of two tiles each (`sh_slice_address` +
+`sh_num_tiles_in_slice_minus1` per slice).
+`slices_rect_noxlf_2x2_256x256` closes the SLICE boundaries while
+across-tiles stays enabled — its plane hash equals
+`tiles_2x2_noxlf_256x256`'s, pinning that the slice-map-derived
+filter gating reproduces the tile gating on the same geometry.
+`slices_raster_noxlf_3rows_128x384_qp45` keeps the deep-QP long
+deblocking filters active everywhere except the two slice-row
+boundaries. `slices_rect_wpp_128x384` runs WPP subsets inside each
+slice with slice-local entry-point lists.
+`palette_slices_rect_2x2_256x256` resets the predictor palette at
+every slice start (plane hash equal to the palette tile/WPP axes —
+lossless content, only the wire structure differs).
 
 No known external divergence remains in the corpus.

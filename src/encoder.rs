@@ -393,6 +393,29 @@ pub struct EncoderConfig {
     /// (their trial re-encodes would fork the predictor state).
     /// Default `false`.
     pub palette: bool,
+    /// r431 — rectangular multi-slice layout: one slice per tile
+    /// (`pps_rect_slice_flag = 1`, `pps_single_slice_per_subpic_flag
+    /// = 0`, `pps_num_slices_in_pic_minus1 = NumTilesInPic − 1`, the
+    /// §7.3.2.5 slice loop with 1x1-tile slices in tile-scan order).
+    /// Each slice is its own VCL NAL with a fresh §9.3.2 CABAC
+    /// initialisation at the slice QP, its own `sh_slice_address`,
+    /// and per-slice entry points. Requires a tile grid; mutually
+    /// exclusive with the raster layout knobs. Default `false`.
+    pub slice_per_tile: bool,
+    /// r431 — number of raster-scan slices (`pps_rect_slice_flag =
+    /// 0`): the tile list splits into this many near-uniform runs,
+    /// each emitted as its own VCL NAL (`sh_slice_address` = first
+    /// tile index + `sh_num_tiles_in_slice_minus1`). `0` / `1` keeps
+    /// a single slice; `> 1` implies the raster layout
+    /// (`raster_slice_layout` may stay false). Default `1`.
+    pub raster_slice_count: u8,
+    /// r431 — `pps_loop_filter_across_slices_enabled_flag`. `true`
+    /// (the default) lets deblocking / SAO / ALF cross slice
+    /// boundaries; `false` closes them on both the emitted wire and
+    /// the encoder's own reconstruction (§8.8.3.1 edge exclusion,
+    /// §8.8.4.2 edgeIdx = 0, §8.8.5.5/§8.8.5.6 fetch padding). Only
+    /// meaningful with a multi-slice layout.
+    pub loop_filter_across_slices: bool,
 }
 
 impl EncoderConfig {
@@ -416,7 +439,47 @@ impl EncoderConfig {
             loop_filter_across_tiles: true,
             wpp: false,
             palette: false,
+            slice_per_tile: false,
+            raster_slice_count: 1,
+            loop_filter_across_slices: true,
         }
+    }
+
+    /// r431 — the raster layout is active when either the r429
+    /// single-slice knob or a multi-slice raster count asks for it.
+    pub fn raster_layout(&self) -> bool {
+        self.raster_slice_layout || self.raster_slice_count > 1
+    }
+
+    /// r431 — number of tiles in the configured grid (1 without one).
+    pub fn num_tiles(&self) -> u32 {
+        self.tile_grid()
+            .map(|(c, r)| (c.len() * r.len()) as u32)
+            .unwrap_or(1)
+    }
+
+    /// r431 — tile-scan tile index → slice index, plus the slice
+    /// count. Identity-per-tile for `slice_per_tile`; near-uniform
+    /// runs for `raster_slice_count > 1`; all-zero otherwise.
+    pub fn slice_of_tile(&self) -> (Vec<u32>, u32) {
+        let t = self.num_tiles() as usize;
+        if self.slice_per_tile {
+            return ((0..t as u32).collect(), t as u32);
+        }
+        let n = usize::from(self.raster_slice_count.max(1)).min(t);
+        if n <= 1 {
+            return (vec![0; t], 1);
+        }
+        let base = t / n;
+        let extra = t % n;
+        let mut map = Vec::with_capacity(t);
+        for s in 0..n {
+            let run = base + usize::from(s < extra);
+            for _ in 0..run {
+                map.push(s as u32);
+            }
+        }
+        (map, n as u32)
     }
 
     /// r429 — the configured §6.5.1 tile grid as explicit per-tile CTB
@@ -469,6 +532,43 @@ impl EncoderConfig {
             return Err(Error::unsupported(
                 "h266 encoder: only 4:2:0 (chroma_format_idc = 1) is supported",
             ));
+        }
+        if self.slice_per_tile && (self.raster_slice_layout || self.raster_slice_count > 1) {
+            return Err(Error::invalid(
+                "h266 encoder: slice_per_tile and the raster slice layout are mutually \
+                 exclusive",
+            ));
+        }
+        if (self.slice_per_tile || self.raster_slice_count > 1) && self.num_tiles() <= 1 {
+            return Err(Error::invalid(
+                "h266 encoder: a multi-slice layout requires a tile grid",
+            ));
+        }
+        if !self.loop_filter_across_slices {
+            let (map, n) = self.slice_of_tile();
+            if n <= 1 {
+                return Err(Error::invalid(
+                    "h266 encoder: loop_filter_across_slices = false requires a \
+                     multi-slice layout",
+                ));
+            }
+            // The loop-filter gating realises slice boundaries as full
+            // grid lines; raster slice splits must align to tile-row
+            // boundaries (a per-tile rectangular grid always does).
+            if self.raster_slice_count > 1 {
+                let cols = usize::from(self.tile_columns.max(1));
+                for w in map.windows(2) {
+                    if w[0] != w[1] {
+                        let boundary_tile = map.iter().position(|&s| s == w[1]).unwrap();
+                        if boundary_tile % cols != 0 {
+                            return Err(Error::unsupported(
+                                "h266 encoder: loop_filter_across_slices = false needs \
+                                 raster slice splits aligned to tile-row boundaries",
+                            ));
+                        }
+                    }
+                }
+            }
         }
         if self.palette && (self.enable_mtt_bt_picker || self.enable_mtt_tt_picker) {
             return Err(Error::unsupported(
@@ -821,17 +921,51 @@ impl VvcEncoder {
                 // NumTilesInPic > 1 by construction (tile_grid()
                 // returns None otherwise).
                 bw.write_bit(self.config.loop_filter_across_tiles as u8); // pps_loop_filter_across_tiles_enabled_flag
-                if self.config.raster_slice_layout {
+                if self.config.raster_layout() {
                     // Raster layout: no single-slice flag, no slice
                     // loop; the slice header carries the tile run.
                     bw.write_bit(0); // pps_rect_slice_flag = 0
+                } else if self.config.slice_per_tile {
+                    // r431 — rectangular one-slice-per-tile layout:
+                    // the §7.3.2.5 slice loop walks the tiles in scan
+                    // order with 1x1-tile slices
+                    // (pps_tile_idx_delta_present_flag = 0; the last
+                    // slice's geometry is inferred).
+                    bw.write_bit(1); // pps_rect_slice_flag = 1
+                    bw.write_bit(0); // pps_single_slice_per_subpic_flag = 0
+                    let num_tile_cols = cols.len() as u32;
+                    let num_tile_rows = rows.len() as u32;
+                    let num_slices = num_tile_cols * num_tile_rows;
+                    bw.write_ue(num_slices - 1); // pps_num_slices_in_pic_minus1
+                    if num_slices > 1 {
+                        bw.write_bit(0); // pps_tile_idx_delta_present_flag
+                    }
+                    for i in 0..num_slices - 1 {
+                        let tile_x = i % num_tile_cols;
+                        let tile_y = i / num_tile_cols;
+                        if tile_x != num_tile_cols - 1 {
+                            bw.write_ue(0); // pps_slice_width_in_tiles_minus1
+                        }
+                        // Height is only coded off the last tile row
+                        // when the delta flag is set or tile_x == 0
+                        // (§7.3.2.5); later columns inherit.
+                        if tile_y != num_tile_rows - 1 && tile_x == 0 {
+                            bw.write_ue(0); // pps_slice_height_in_tiles_minus1
+                        }
+                        // A 1x1-tile slice whose tile is taller than
+                        // one CTU row opens pps_num_exp_slices_in_tile
+                        // (0 → the slice covers the whole tile).
+                        if rows[tile_y as usize] > 1 {
+                            bw.write_ue(0); // pps_num_exp_slices_in_tile
+                        }
+                    }
                 } else {
                     bw.write_bit(1); // pps_rect_slice_flag = 1
                     bw.write_bit(1); // pps_single_slice_per_subpic_flag = 1 (one slice)
                 }
-                // rect + single-slice-per-subpic OR !rect → the slice
-                // loop is skipped and the across-slices flag is present.
-                bw.write_bit(1); // pps_loop_filter_across_slices_enabled_flag
+                // Present when !rect || single-slice-per-subpic ||
+                // NumSlicesInPic > 1 (§7.3.2.5) — every arm above.
+                bw.write_bit(self.config.loop_filter_across_slices as u8); // pps_loop_filter_across_slices_enabled_flag
             }
         }
         bw.write_bit(0); // pps_cabac_init_present_flag
@@ -968,21 +1102,52 @@ impl VvcEncoder {
         sh_qp_delta: i32,
         entry_point_offsets: &[u32],
     ) -> Vec<u8> {
+        let tiles = self.config.num_tiles();
+        self.emit_idr_slice_header_bytes_for_slice(
+            chain,
+            sh_qp_delta,
+            entry_point_offsets,
+            0,
+            tiles,
+        )
+    }
+
+    /// r431 — per-slice variant: `slice_address` is the rectangular
+    /// slice index (rect layouts) or the first tile index (raster
+    /// layouts); `tiles_in_slice` is the raster tile-run length.
+    pub fn emit_idr_slice_header_bytes_for_slice(
+        &self,
+        chain: &AlfPhChain,
+        sh_qp_delta: i32,
+        entry_point_offsets: &[u32],
+        slice_address: u32,
+        tiles_in_slice: u32,
+    ) -> Vec<u8> {
         let mut bw = BitWriter::new();
         // sh_picture_header_in_slice_header_flag = 0 (separate PH NAL).
         bw.write_bit(0);
         // No sh_subpic_id (no subpictures) / sh_extra_bit. With
         // ph_inter_slice_allowed_flag = 0, sh_slice_type is inferred I.
-        // r429 — a raster-scan tile layout puts `sh_slice_address`
-        // (u(v), Ceil(Log2(NumTilesInPic)) bits, tile index 0) and
-        // `sh_num_tiles_in_slice_minus1` on the wire; the rectangular
-        // single-slice layout emits neither.
-        if self.config.raster_slice_layout {
-            if let Some((cols, rows)) = self.config.tile_grid() {
-                let num_tiles = (cols.len() * rows.len()) as u32;
+        // §7.3.7 sh_slice_address — raster layouts code the first tile
+        // index (u(v), Ceil(Log2(NumTilesInPic)) bits) followed by
+        // `sh_num_tiles_in_slice_minus1` when more than one tile
+        // remains; rectangular multi-slice layouts code the
+        // picture-level slice index (u(v),
+        // Ceil(Log2(NumSlicesInPic)) bits).
+        if self.config.raster_layout() {
+            let num_tiles = self.config.num_tiles();
+            if num_tiles > 1 {
                 let width = 32 - (num_tiles - 1).max(1).leading_zeros();
-                bw.write_bits(0, width); // sh_slice_address = 0
-                bw.write_ue(num_tiles - 1); // sh_num_tiles_in_slice_minus1
+                bw.write_bits(slice_address, width); // sh_slice_address
+                if num_tiles - slice_address > 1 {
+                    bw.write_ue(tiles_in_slice - 1); // sh_num_tiles_in_slice_minus1
+                }
+            }
+        } else if self.config.slice_per_tile {
+            let (_, num_slices) = self.config.slice_of_tile();
+            if num_slices > 1 {
+                let width = 32 - (num_slices - 1).max(1).leading_zeros();
+                bw.write_bits(slice_address, width); // sh_slice_address
             }
         }
         //

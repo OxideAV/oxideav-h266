@@ -1059,6 +1059,15 @@ pub struct CtuWalker<'a, 'b> {
     /// + `PredictorPaletteEntries`). Reset per §9.3.2.1 with the
     /// context bundles; stored / synchronized on the WPP arms.
     palette_pred: crate::palette::PalettePredictor,
+    /// r431 — per-CTB slice index (decode order across
+    /// `continue_slice` calls; `u16::MAX` = not yet decoded). Drives
+    /// the §6.4.4 different-slice availability of the SAO / ALF
+    /// CTU-prefix reads and the
+    /// `pps_loop_filter_across_slices_enabled_flag == 0` boundary
+    /// derivation.
+    slice_ctb_id: Vec<u16>,
+    /// r431 — index of the slice currently being decoded.
+    cur_slice_id: u16,
     /// r429 — Table 51 `initType` (0 = I, 1/2 from the slice type +
     /// `sh_cabac_init_flag`), retained for the §9.3.2.2 per-tile
     /// context re-initialization.
@@ -1085,6 +1094,14 @@ struct TileWalkState {
     slice_ctbs: Vec<u32>,
     /// `sps_entropy_coding_sync_enabled_flag`.
     wpp: bool,
+    /// r431 — the current slice's bounding CTB rectangle
+    /// `(x0, y0, x1, y1)` for rectangular slice layouts (§6.4.4: a
+    /// neighbour in a different slice is unavailable — every
+    /// rectangular slice is a CTB rectangle, so the region intersect
+    /// realises the arm). `None` for raster layouts, whose slices are
+    /// unions of complete tiles (the different-tile arm already
+    /// blocks every cross-slice neighbour).
+    slice_rect_ctb: Option<(u32, u32, u32, u32)>,
 }
 
 /// r429 — §9.3.2.3 context-variable storage (the WPP
@@ -1311,6 +1328,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             first_ctb_row_in_slice: true,
             wpp_ctx_store: None,
             palette_pred: crate::palette::PalettePredictor::new(),
+            slice_ctb_id: vec![
+                u16::MAX;
+                (layout.pic_width_in_ctbs_y * layout.pic_height_in_ctbs_y) as usize
+            ],
+            cur_slice_id: 0,
             init_type,
             cur_tile_idx: 0,
             subset_start_byte: 0,
@@ -1324,6 +1346,109 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             alf_syntax_cfg: None,
             alf_ctxs: None,
         })
+    }
+
+    /// r431 — continue this picture with its NEXT slice (multi-slice
+    /// pictures, §7.3.11.1). Keeps every picture-level store (the
+    /// reconstruction-availability masks, parse grids, QpY map,
+    /// deblock CU records, SAO / ALF pictures, motion field, IBC
+    /// buffer content) and re-initialises the per-slice state:
+    ///
+    /// * CABAC — a fresh engine over `cabac_payload` and the §9.3.2.2
+    ///   context initialisation at the NEW slice's SliceQpY /
+    ///   `sh_cabac_init_flag` (per-slice QP deltas are honoured);
+    /// * §7.3.11.1 first-CTU-in-slice resets: HMVP / IBC-HMVP /
+    ///   `ResetIbcBuf`, the §9.3.2.1 predictor-palette reset,
+    ///   `FirstCtbRowInSlice = 1`, the WPP storage cleared;
+    /// * §8.7.1 — the first quantization group predicts from the new
+    ///   SliceQpY;
+    /// * the §6.5.1 walk plan re-derives from the new
+    ///   `sh_slice_address` on the next [`Self::decode_picture_into`].
+    ///
+    /// Loop-filter-relevant slice-header fields must match the prior
+    /// slice's (the §8.8 pass runs once per picture off the LAST
+    /// header); a divergent header surfaces `Unsupported` instead of
+    /// silently filtering with the wrong parameters.
+    pub fn continue_slice(
+        &mut self,
+        sh: &'a StatefulSliceHeader,
+        ph_qp_delta: i32,
+        cabac_payload: &'b [u8],
+    ) -> Result<()> {
+        let old = self.sh;
+        let filter_params_match = old.sh_sao_luma_used_flag == sh.sh_sao_luma_used_flag
+            && old.sh_sao_chroma_used_flag == sh.sh_sao_chroma_used_flag
+            && old.sh_alf_enabled_flag == sh.sh_alf_enabled_flag
+            && old.sh_alf_aps_id_luma == sh.sh_alf_aps_id_luma
+            && old.sh_alf_cb_enabled_flag == sh.sh_alf_cb_enabled_flag
+            && old.sh_alf_cr_enabled_flag == sh.sh_alf_cr_enabled_flag
+            && old.sh_alf_aps_id_chroma == sh.sh_alf_aps_id_chroma
+            && old.sh_alf_cc_cb_enabled_flag == sh.sh_alf_cc_cb_enabled_flag
+            && old.sh_alf_cc_cb_aps_id == sh.sh_alf_cc_cb_aps_id
+            && old.sh_alf_cc_cr_enabled_flag == sh.sh_alf_cc_cr_enabled_flag
+            && old.sh_alf_cc_cr_aps_id == sh.sh_alf_cc_cr_aps_id
+            && old.sh_lmcs_used_flag == sh.sh_lmcs_used_flag
+            && old.sh_explicit_scaling_list_used_flag == sh.sh_explicit_scaling_list_used_flag
+            && old.sh_cb_qp_offset == sh.sh_cb_qp_offset
+            && old.sh_cr_qp_offset == sh.sh_cr_qp_offset
+            && old.sh_deblocking_filter_disabled_flag == sh.sh_deblocking_filter_disabled_flag
+            && old.sh_luma_beta_offset_div2 == sh.sh_luma_beta_offset_div2
+            && old.sh_luma_tc_offset_div2 == sh.sh_luma_tc_offset_div2
+            && old.sh_cb_beta_offset_div2 == sh.sh_cb_beta_offset_div2
+            && old.sh_cb_tc_offset_div2 == sh.sh_cb_tc_offset_div2
+            && old.sh_cr_beta_offset_div2 == sh.sh_cr_beta_offset_div2
+            && old.sh_cr_tc_offset_div2 == sh.sh_cr_tc_offset_div2;
+        if !filter_params_match {
+            return Err(Error::unsupported(
+                "h266 CTU walker: per-slice loop-filter parameter divergence within one                  picture is not walked yet (the §8.8 pass runs once per picture)",
+            ));
+        }
+        if self.cur_slice_id == u16::MAX - 1 {
+            return Err(Error::invalid("h266 CTU walker: slice index overflow"));
+        }
+        self.sh = sh;
+        self.cur_slice_id += 1;
+        let slice_qp = SliceQpY::derive(self.sps, self.pps, sh, ph_qp_delta);
+        self.cabac = SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag);
+        self.arith = ArithDecoder::new(cabac_payload)?;
+        self.init_type = match sh.sh_slice_type {
+            SliceType::I => 0,
+            SliceType::P => {
+                if sh.sh_cabac_init_flag {
+                    2
+                } else {
+                    1
+                }
+            }
+            SliceType::B => {
+                if sh.sh_cabac_init_flag {
+                    1
+                } else {
+                    2
+                }
+            }
+        };
+        self.leaf_ctxs = LeafCuCtxs::init_with_init_type(slice_qp.as_init_qp(), self.init_type);
+        self.sao_ctxs = SaoCtxs::init(slice_qp.as_init_qp());
+        if self.alf_ctxs.is_some() {
+            self.alf_ctxs = Some(crate::alf_syntax::AlfCtxs::init(slice_qp.0));
+        }
+        self.palette_pred.reset();
+        self.hmvp.reset();
+        if let Some(ibc) = self.ibc.as_mut() {
+            ibc.hmvp.reset();
+            ibc.virbuf.mark_reset();
+        }
+        self.first_ctb_row_in_slice = true;
+        self.wpp_ctx_store = None;
+        self.tile_walk = None;
+        self.subset_start_byte = 0;
+        self.subset_idx = 0;
+        self.qg_delta_coded = false;
+        self.qg_delta_val = 0;
+        self.qg_qp_y_pred = slice_qp.0;
+        self.last_cu_qp_y = None;
+        Ok(())
     }
 
     /// r412 — enable the §7.3.11.2 per-CTU ALF syntax decode. `cfg`
@@ -8964,6 +9089,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             None => self.iter_ctus().collect(),
         };
         let n_ctus = ctus.len();
+        // r431 — stamp the per-CTB slice index (multi-slice loop
+        // filter gating + the SAO / ALF prefix availability).
+        for ctu in &ctus {
+            let idx = (ctu.y_ctb * self.layout.pic_width_in_ctbs_y + ctu.x_ctb) as usize;
+            if let Some(cell) = self.slice_ctb_id.get_mut(idx) {
+                if *cell != u16::MAX && *cell != self.cur_slice_id {
+                    return Err(Error::invalid(
+                        "h266 slice_data: CTB covered by more than one slice",
+                    ));
+                }
+                *cell = self.cur_slice_id;
+            }
+        }
         for (i, ctu) in ctus.iter().enumerate() {
             // r429 — per-CTU region + §7.3.11.1 row-start resets
             // (`CtbAddrX == CtbToTileColBd[CtbAddrX]`).
@@ -8984,9 +9122,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // current tile (left / above probes never trip the WPP
                 // column arm).
                 let (tile_left_ctb, tile_top_ctb) = self.tile_bounds_ctb(ctu);
+                // r431 — §6.4.4 different-slice arm: the above CTB may
+                // sit in the same tile but a prior slice
+                // (multi-slice-per-tile rectangular layouts).
+                let same_slice_above = ctu.y_ctb == 0
+                    || self
+                        .slice_ctb_id
+                        .get(
+                            ((ctu.y_ctb - 1) * self.layout.pic_width_in_ctbs_y + ctu.x_ctb)
+                                as usize,
+                        )
+                        .copied()
+                        == Some(self.cur_slice_id);
                 let nbrs = crate::alf_syntax::AlfNeighbours {
                     left_avail: ctu.x_ctb != tile_left_ctb,
-                    up_avail: ctu.y_ctb != tile_top_ctb,
+                    up_avail: ctu.y_ctb != tile_top_ctb && same_slice_above,
                 };
                 let ctxs = self
                     .alf_ctxs
@@ -9055,10 +9205,34 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if slice_ctbs.is_empty() {
             return Err(Error::invalid("h266 slice_data: empty slice CTB list"));
         }
+        // r431 — derive the slice's bounding CTB rectangle for
+        // rectangular layouts (the per-CTB slice stamping happens in
+        // `decode_picture_into`, which also covers the single-tile
+        // walk).
+        let w_ctbs = self.layout.pic_width_in_ctbs_y;
+        let slice_rect_ctb = if scan.rect_slices {
+            let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+            for &rs in &slice_ctbs {
+                let (x, y) = (rs % w_ctbs, rs / w_ctbs);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+            if (x1 - x0) * (y1 - y0) != slice_ctbs.len() as u32 {
+                return Err(Error::invalid(
+                    "h266 slice_data: rectangular slice CTB set is not a rectangle",
+                ));
+            }
+            Some((x0, y0, x1, y1))
+        } else {
+            None
+        };
         self.tile_walk = Some(TileWalkState {
             scan,
             slice_ctbs,
             wpp,
+            slice_rect_ctb,
         });
         Ok(())
     }
@@ -9122,6 +9296,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 };
                 let tile_idx = (row_idx as u32) * scan.num_tile_columns + col_idx as u32;
                 let at_row_start = scan.tile_col_bd_val[col_idx] == ctu.x_ctb;
+                // r431 — §6.4.4 different-slice arm: intersect the
+                // tile rectangle with the (rectangular) slice's
+                // bounding rectangle.
+                let (x0, y0, x1, y1) = match tw.slice_rect_ctb {
+                    Some((sx0, sy0, sx1, sy1)) => (
+                        x0.max(sx0 << ctb_log2),
+                        y0.max(sy0 << ctb_log2),
+                        x1.min((sx1 << ctb_log2).min(self.layout.pic_width_luma)),
+                        y1.min((sy1 << ctb_log2).min(self.layout.pic_height_luma)),
+                    ),
+                    None => (x0, y0, x1, y1),
+                };
                 ((x0, y0, x1, y1), cap, tile_idx, at_row_start)
             }
             None => (
@@ -9333,6 +9519,60 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
     }
 
+    /// r431 — derive the slice-boundary grid lines (luma samples)
+    /// from the per-CTB slice map, verifying the full-line property:
+    /// every adjacent CTB pair differs in slice exactly when the line
+    /// between them is in the returned set. Slice maps whose
+    /// boundaries are not picture-spanning lines (possible for
+    /// raster layouts with mid-row splits) surface `Unsupported`.
+    fn derive_slice_boundary_lines(&self) -> Result<(Vec<u32>, Vec<u32>)> {
+        let w = self.layout.pic_width_in_ctbs_y as usize;
+        let h = self.layout.pic_height_in_ctbs_y as usize;
+        let id = |x: usize, y: usize| self.slice_ctb_id[y * w + x];
+        let mut cols: Vec<usize> = Vec::new();
+        for x in 1..w {
+            if (0..h).any(|y| id(x - 1, y) != id(x, y)) {
+                cols.push(x);
+            }
+        }
+        let mut rows: Vec<usize> = Vec::new();
+        for y in 1..h {
+            if (0..w).any(|x| id(x, y - 1) != id(x, y)) {
+                rows.push(y);
+            }
+        }
+        // Full-line verification: a pair on a gated line must differ,
+        // a pair off every gated line must match.
+        for y in 0..h {
+            for x in 1..w {
+                let differs = id(x - 1, y) != id(x, y);
+                // `cols` contains x by construction whenever any pair
+                // differs; only the same-slice-on-a-gated-line case
+                // can fail.
+                if cols.contains(&x) && !differs {
+                    return Err(Error::unsupported(
+                        "h266 CTU walker: slice boundaries are not full grid lines                          (pps_loop_filter_across_slices_enabled_flag == 0 gating                          needs a line-expressible slice map)",
+                    ));
+                }
+            }
+        }
+        for x in 0..w {
+            for y in 1..h {
+                let differs = id(x, y - 1) != id(x, y);
+                if rows.contains(&y) && !differs {
+                    return Err(Error::unsupported(
+                        "h266 CTU walker: slice boundaries are not full grid lines                          (pps_loop_filter_across_slices_enabled_flag == 0 gating                          needs a line-expressible slice map)",
+                    ));
+                }
+            }
+        }
+        let log2 = self.layout.ctb_log2_size_y;
+        Ok((
+            cols.into_iter().map(|x| (x as u32) << log2).collect(),
+            rows.into_iter().map(|y| (y as u32) << log2).collect(),
+        ))
+    }
+
     /// Apply the §8.8 in-loop filters to a partially-reconstructed
     /// picture. Runs deblocking (§8.8.3) followed by SAO (§8.8.4) and
     /// then ALF (§8.8.5). Wraps [`Self::apply_in_loop_filters_with_alf`]
@@ -9416,12 +9656,53 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             _ => None,
         };
-        let (no_filter_cols, no_filter_rows): (Vec<u32>, Vec<u32>) = match &tile_lf_bounds {
+        let (mut no_filter_cols, mut no_filter_rows): (Vec<u32>, Vec<u32>) = match &tile_lf_bounds {
             Some((c, r)) => (
                 c[1..c.len().saturating_sub(1)].to_vec(),
                 r[1..r.len().saturating_sub(1)].to_vec(),
             ),
             None => (Vec::new(), Vec::new()),
+        };
+        // r431 — §8.8 slice-boundary gating: with
+        // `pps_loop_filter_across_slices_enabled_flag == 0` and a
+        // multi-slice picture, deblocking skips edges on slice
+        // boundaries (§8.8.3.1), SAO forces edgeIdx = 0 for
+        // cross-slice neighbour samples (§8.8.4.2), and ALF pads its
+        // fetches at the slice boundary (§8.8.5.5 / §8.8.5.6). The
+        // grid-line realisation requires the decoded slice map's
+        // boundaries to be full picture-spanning lines (true for
+        // every slice grid this crate emits: one-slice-per-tile
+        // rectangular layouts and tile-row-aligned raster layouts);
+        // an inexpressible map surfaces Unsupported instead of
+        // silently over- or under-filtering.
+        let slice_gating =
+            !self.pps.pps_loop_filter_across_slices_enabled_flag && self.cur_slice_id > 0;
+        if slice_gating {
+            let (sc, sr) = self.derive_slice_boundary_lines()?;
+            no_filter_cols.extend(sc);
+            no_filter_rows.extend(sr);
+            no_filter_cols.sort_unstable();
+            no_filter_cols.dedup();
+            no_filter_rows.sort_unstable();
+            no_filter_rows.dedup();
+        }
+        // Combined SAO / ALF clip bounds: 0 + every gated interior
+        // line + the picture extents (the r429 tile-only path passed
+        // the tile prefix lists; the union keeps that shape).
+        let clip_bounds: Option<(Vec<u32>, Vec<u32>)> = if tile_lf_bounds.is_some()
+            || (slice_gating && !(no_filter_cols.is_empty() && no_filter_rows.is_empty()))
+        {
+            let mut c = vec![0u32];
+            c.extend(no_filter_cols.iter().copied());
+            c.push(self.layout.pic_width_luma);
+            c.dedup();
+            let mut r = vec![0u32];
+            r.extend(no_filter_rows.iter().copied());
+            r.push(self.layout.pic_height_luma);
+            r.dedup();
+            Some((c, r))
+        } else {
+            None
         };
         let disabled = self.pps.pps_deblocking_filter_disabled_flag
             || self.sh.sh_deblocking_filter_disabled_flag;
@@ -9461,7 +9742,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             out,
             &self.sao_picture,
             &sao_cfg,
-            tile_lf_bounds
+            clip_bounds
                 .as_ref()
                 .map(|(c, r)| (c.as_slice(), r.as_slice())),
         );
@@ -9483,7 +9764,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             &self.alf_picture,
             &alf_cfg,
             alf_binding,
-            tile_lf_bounds
+            clip_bounds
                 .as_ref()
                 .map(|(c, r)| (c.as_slice(), r.as_slice())),
         );

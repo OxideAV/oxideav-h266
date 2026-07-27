@@ -31,8 +31,11 @@ use oxideav_h266::reconstruct::PictureBuffer;
 use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
 use oxideav_h266::sps::parse_sps;
 
-/// Decode one single-slice IDR Annex-B stream end-to-end through the
-/// crate's own parsers + CTU walker + in-loop filters.
+/// Decode one IDR Annex-B stream (single- or multi-slice) end-to-end
+/// through the crate's own parsers + CTU walker + in-loop filters.
+/// Multi-slice pictures walk slice 0 via `begin_slice` and every
+/// further slice via `continue_slice` (r431), with the §8.8 filter
+/// pass running once after the last slice.
 fn decode_whole_stream(bs: &[u8]) -> PictureBuffer {
     let nals: Vec<_> = iter_annex_b(bs).collect();
     let find = |t: NalUnitType| {
@@ -83,14 +86,29 @@ fn decode_whole_stream(bs: &[u8]) -> PictureBuffer {
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
     };
-    let slice_rbsp = extract_rbsp(find(NalUnitType::IdrNLp).payload());
-    let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state).expect("SH parses");
+    // r431 — every VCL NAL of the picture, in decode order.
+    let slice_headers: Vec<_> = nals
+        .iter()
+        .filter(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
+        .map(|n| {
+            parse_slice_header_stateful(&extract_rbsp(n.payload()), &sps, &pps, &ph_state)
+                .expect("SH parses")
+        })
+        .collect();
+    assert!(!slice_headers.is_empty(), "stream carries no VCL NAL");
+    let cabacs: Vec<Vec<u8>> = slice_headers
+        .iter()
+        .map(|sh| {
+            let mut c = sh.trailing_bits.clone();
+            c.extend_from_slice(&[0u8; 64]);
+            c
+        })
+        .collect();
+    let sh = &slice_headers[0];
 
     let layout = CtuLayout::from_sps_pps(&sps, &pps);
-    let mut cabac = sh.trailing_bits.clone();
-    cabac.extend_from_slice(&[0u8; 64]);
     let mut walker =
-        CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &cabac).expect("begin_slice");
+        CtuWalker::begin_slice(&layout, &sps, &pps, sh, 0, &cabacs[0]).expect("begin_slice");
 
     // r418 — §7.4.3.7 eq. 123: CuQpDeltaSubdiv for an I-slice is the
     // PH-signalled `ph_cu_qp_delta_subdiv_intra_slice`. Driving the
@@ -140,11 +158,18 @@ fn decode_whole_stream(bs: &[u8]) -> PictureBuffer {
     let w = sps.cropped_width() as usize;
     let h = sps.cropped_height() as usize;
     let mut out = PictureBuffer::yuv420_filled(w, h, 0);
-    walker
-        .decode_picture_into(&mut out)
-        .expect("decode_picture_into");
-    // §7.3.11.1 — the stream must end on end_of_slice_one_bit == 1.
-    walker.finish_slice().expect("end_of_slice_one_bit");
+    for (i, sh_i) in slice_headers.iter().enumerate() {
+        if i > 0 {
+            walker
+                .continue_slice(sh_i, 0, &cabacs[i])
+                .expect("continue_slice");
+        }
+        walker
+            .decode_picture_into(&mut out)
+            .expect("decode_picture_into");
+        // §7.3.11.1 — each slice ends on end_of_slice_one_bit == 1.
+        walker.finish_slice().expect("end_of_slice_one_bit");
+    }
 
     // §8.8 in-loop filters with the SH-referenced ALF APS bindings.
     let luma_slots: Vec<Option<&oxideav_h266::aps::AlfApsData>> = sh
@@ -793,4 +818,120 @@ fn whole_stream_palette_wpp() {
     let dec = decode_whole_stream(&bs);
     assert_byte_exact(&dec, &rec, "palette wpp");
     dump_corpus("palette_wpp_256x256", &bs, &dec);
+}
+
+/// r431 — rectangular multi-slice: one slice per tile on a 2x2 grid.
+/// Four VCL NALs, per-slice §9.3.2 CABAC initialisation +
+/// `sh_slice_address`, HMVP / predictor resets at each slice start,
+/// and the §8.8 filters crossing the slice boundaries
+/// (`pps_loop_filter_across_slices_enabled_flag = 1`).
+#[test]
+fn whole_stream_slices_rect_per_tile_2x2() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.slice_per_tile = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "slices rect per tile 2x2");
+    dump_corpus("slices_rect_2x2_256x256", &bs, &dec);
+}
+
+/// r431 — rectangular multi-slice at QP 34: stronger deblocking
+/// activity across the slice boundaries while each slice runs its own
+/// CABAC state.
+#[test]
+fn whole_stream_slices_rect_per_tile_3x1_qp34() {
+    let src = structured_source(384, 128);
+    let mut cfg = EncoderConfig::new(384, 128);
+    cfg.tile_columns = 3;
+    cfg.slice_per_tile = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 34, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "slices rect 3x1 qp34");
+    dump_corpus("slices_rect_3x1_384x128_qp34", &bs, &dec);
+}
+
+/// r431 — raster-scan multi-slice: a 2x2 tile grid split into two
+/// slices of two tiles each (`pps_rect_slice_flag = 0`,
+/// `sh_slice_address` = first tile index + tile run length).
+#[test]
+fn whole_stream_slices_raster_2_of_2x2() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.raster_slice_count = 2;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "slices raster 2 of 2x2");
+    dump_corpus("slices_raster_2_256x256", &bs, &dec);
+}
+
+/// r431 — `pps_loop_filter_across_slices_enabled_flag = 0` on the
+/// rectangular per-tile layout while the across-TILES flag stays 1:
+/// the filters must gate on the slice map alone (§8.8.3.1 edge
+/// exclusion, §8.8.4.2 edgeIdx = 0, §8.8.5.5/§8.8.5.6 padding).
+#[test]
+fn whole_stream_slices_rect_noxlf_2x2() {
+    let src = structured_source(256, 256);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.slice_per_tile = true;
+    cfg.loop_filter_across_slices = false;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "slices rect noxlf 2x2");
+    dump_corpus("slices_rect_noxlf_2x2_256x256", &bs, &dec);
+}
+
+/// r431 — raster multi-slice with closed slice boundaries at deep QP:
+/// three tile rows, three slices, the long deblocking filters active
+/// everywhere except the two slice-row boundaries.
+#[test]
+fn whole_stream_slices_raster_noxlf_3rows_qp45() {
+    let src = structured_source(128, 384);
+    let mut cfg = EncoderConfig::new(128, 384);
+    cfg.tile_rows = 3;
+    cfg.raster_slice_count = 3;
+    cfg.loop_filter_across_slices = false;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 45, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "slices raster noxlf 3 rows qp45");
+    dump_corpus("slices_raster_noxlf_3rows_128x384_qp45", &bs, &dec);
+}
+
+/// r431 — multi-slice + WPP: each slice-tile codes its CTU rows as
+/// byte-aligned subsets with the §9.3.2.3/§9.3.2.4 storage/sync, and
+/// the per-slice `sh_entry_point_offset` lists stay slice-local.
+#[test]
+fn whole_stream_slices_rect_wpp() {
+    let src = structured_source(128, 384);
+    let mut cfg = EncoderConfig::new(128, 384);
+    cfg.tile_rows = 3;
+    cfg.slice_per_tile = true;
+    cfg.wpp = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "slices rect wpp");
+    dump_corpus("slices_rect_wpp_128x384", &bs, &dec);
+}
+
+/// r431 — palette + rectangular multi-slice: the predictor palette
+/// resets at every slice start on both sides (§9.3.2.1 rides the
+/// slice-initialisation arm, not just the tile arm).
+#[test]
+fn whole_stream_palette_slices_rect_2x2() {
+    let src = screen_source(256, 256, 8, 20);
+    let mut cfg = EncoderConfig::new(256, 256);
+    cfg.palette = true;
+    cfg.tile_columns = 2;
+    cfg.tile_rows = 2;
+    cfg.slice_per_tile = true;
+    let (bs, rec) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
+    let dec = decode_whole_stream(&bs);
+    assert_byte_exact(&dec, &rec, "palette slices rect 2x2");
+    dump_corpus("palette_slices_rect_2x2_256x256", &bs, &dec);
 }

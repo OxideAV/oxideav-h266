@@ -2587,14 +2587,46 @@ pub fn encode_idr_with_qp_picker_cfg(
     // deblock / SAO / ALF application (and the ALF trial RDO) run
     // through the decoder-mirrored clipped variants. Boundary prefix
     // lists in luma samples.
-    let lf_bounds: Option<(Vec<u32>, Vec<u32>)> =
-        if tile_grid_cfg.is_some() && !config.loop_filter_across_tiles {
-            let to_smp =
-                |v: &[usize]| -> Vec<u32> { v.iter().map(|&c| (c * ctb_size) as u32).collect() };
+    // r431 — slice plan: tile-scan tile index → slice id.
+    let (slice_of_tile, num_slices) = config.slice_of_tile();
+    let num_tile_cols_cfg = tile_col_bd.len() - 1;
+    let lf_bounds: Option<(Vec<u32>, Vec<u32>)> = {
+        let to_smp =
+            |v: &[usize]| -> Vec<u32> { v.iter().map(|&c| (c * ctb_size) as u32).collect() };
+        let tiles_gated = tile_grid_cfg.is_some() && !config.loop_filter_across_tiles;
+        let slices_gated = num_slices > 1 && !config.loop_filter_across_slices;
+        if tiles_gated {
+            // Every slice boundary of the emitted layouts lies on a
+            // tile boundary, so the tile prefix lists subsume the
+            // slice gating.
             Some((to_smp(&tile_col_bd), to_smp(&tile_row_bd)))
+        } else if slices_gated {
+            if config.slice_per_tile {
+                // One slice per tile — every interior tile line is a
+                // slice boundary.
+                Some((to_smp(&tile_col_bd), to_smp(&tile_row_bd)))
+            } else {
+                // Raster slices with row-aligned splits (validate()):
+                // the gated lines are the tile-row boundaries where
+                // the slice id changes.
+                let mut rows: Vec<u32> = vec![0];
+                for r in 1..tile_row_bd.len() - 1 {
+                    let tile_before = (r - 1) * num_tile_cols_cfg;
+                    let tile_after = r * num_tile_cols_cfg;
+                    if slice_of_tile[tile_before] != slice_of_tile[tile_after] {
+                        rows.push((tile_row_bd[r] * ctb_size) as u32);
+                    }
+                }
+                rows.push((tile_row_bd[tile_row_bd.len() - 1] * ctb_size) as u32);
+                Some((
+                    vec![0, (tile_col_bd[tile_col_bd.len() - 1] * ctb_size) as u32],
+                    rows,
+                ))
+            }
         } else {
             None
-        };
+        }
+    };
     let lf_bounds_ref: Option<(&[u32], &[u32])> = lf_bounds
         .as_ref()
         .map(|(c, r)| (c.as_slice(), r.as_slice()));
@@ -3418,20 +3450,41 @@ pub fn encode_idr_with_qp_picker_cfg(
     // CABAC subset produced by an independent ArithEncoder (the
     // terminate flush ends on the byte_alignment stop bit, so plain
     // byte concatenation is the spec wire).
-    let ctu_order: Vec<(usize, usize)> = {
+    let (ctu_order, tile_of_ctu): (Vec<(usize, usize)>, Vec<usize>) = {
         let mut v = Vec::with_capacity(pic_w_ctbs * pic_h_ctbs);
+        let mut t = Vec::with_capacity(pic_w_ctbs * pic_h_ctbs);
+        let mut tile_idx = 0usize;
         for tr in tile_row_bd.windows(2) {
             for tc in tile_col_bd.windows(2) {
                 for ry in tr[0]..tr[1] {
                     for rx in tc[0]..tc[1] {
                         v.push((rx, ry));
+                        t.push(tile_idx);
                     }
                 }
+                tile_idx += 1;
             }
         }
-        v
+        (v, t)
     };
+    let slice_of_ctu =
+        |i: usize| -> u32 { slice_of_tile.get(tile_of_ctu[i]).copied().unwrap_or(0) };
+    // Per-slice signalling: (slice_address, tiles_in_slice).
+    let slice_signalling: Vec<(u32, u32)> = (0..num_slices)
+        .map(|sid| {
+            let first_tile = slice_of_tile.iter().position(|&s| s == sid).unwrap_or(0) as u32;
+            let count = slice_of_tile.iter().filter(|&&s| s == sid).count() as u32;
+            if config.raster_layout() {
+                (first_tile, count)
+            } else {
+                (sid, count)
+            }
+        })
+        .collect();
     let mut chunks: Vec<Vec<u8>> = Vec::new();
+    // r431 — per-slice CABAC chunk lists (each slice becomes its own
+    // VCL NAL with its own entry points).
+    let mut slice_chunks: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut first_ctb_row_in_slice = true;
     type EncCtxSnapshot = (
         crate::coding_tree::TreeCtxs,
@@ -3665,11 +3718,29 @@ pub fn encode_idr_with_qp_picker_cfg(
                 ));
             }
             let is_last_ctu = ctu_idx + 1 == ctu_order.len();
-            if is_last_ctu {
-                // §7.3.11.1 end_of_slice_one_bit (r412 conformance
-                // fix: exactly one, after the LAST CTU of the slice).
+            // r431 — §7.3.11.1: end_of_slice_one_bit fires after the
+            // LAST CTU of every slice (a slice-final CTU that also
+            // ends a tile codes only the slice bit); the next slice
+            // starts a fresh VCL NAL with full §9.3.2 initialisation.
+            let slice_ends_here = is_last_ctu || slice_of_ctu(ctu_idx + 1) != slice_of_ctu(ctu_idx);
+            if slice_ends_here {
                 cabac_enc.encode_terminate(1)?;
                 chunks.push(cabac_enc.finish());
+                slice_chunks.push(std::mem::take(&mut chunks));
+                if !is_last_ctu {
+                    cabac_enc = ArithEncoder::new();
+                    tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
+                    residual_ctxs = ResidualCtxs::init(slice_qp_y);
+                    intra_ctxs = IntraModeCtxs::init(slice_qp_y);
+                    sao_ctxs = crate::sao_syntax::SaoCtxs::init(slice_qp_y);
+                    alf_ctxs = crate::alf_syntax::AlfCtxs::init(slice_qp_y);
+                    if let Some(ps) = enc_palette.as_mut() {
+                        *ps = EncPalette::init(slice_qp_y);
+                    }
+                    qp_state = QpDeltaState::new(qp_state.enabled, slice_qp_y);
+                    wpp_enc_store = None;
+                    first_ctb_row_in_slice = true;
+                }
             } else if rx + 1 == trx_ctb {
                 if ry + 1 == tby_ctb {
                     // end_of_tile_one_bit + byte_alignment(); the next
@@ -3714,34 +3785,39 @@ pub fn encode_idr_with_qp_picker_cfg(
             }
         }
     }
-    // r429 — §7.4.8 entry-point offsets: the EP-aware byte length of
-    // every subset but the last (subset boundaries fall on alignment
-    // stop bytes, so no emulation-prevention pattern spans one and
-    // per-chunk counting equals the whole-RBSP count).
-    let entry_point_offsets: Vec<u32> = chunks
-        .iter()
-        .take(chunks.len().saturating_sub(1))
-        .map(|c| ep_len(c))
-        .collect();
-    let cabac_bytes: Vec<u8> = chunks.concat();
+    // r429/r431 — one VCL NAL per slice: §7.4.8 entry-point offsets
+    // are the EP-aware byte lengths of every subset but the slice's
+    // last (subset boundaries fall on alignment stop bytes, so no
+    // emulation-prevention pattern spans one and per-chunk counting
+    // equals the whole-RBSP count).
     let _ = alf_pic;
-
-    // §7.3.7 slice-header bytes (ALF chain + sh_lmcs_used_flag +
-    // sh_qp_delta + SAO used flags + the r429 entry-point offsets).
-    let slice_header_bytes = vvc_enc.emit_idr_slice_header_bytes_with_entry_points(
-        &alf_ph_chain,
-        slice_qp_y - 26,
-        &entry_point_offsets,
-    );
-
-    // Build the IDR slice NAL: header bytes + interleaved CABAC bytes.
-    // The single-stream invariant lives in `cabac_bytes`: ALF and
-    // residual bins are no longer two separate sub-blocks but a single
-    // §7.3.11.2 walk.
-    let mut slice_rbsp = slice_header_bytes;
-    slice_rbsp.extend_from_slice(&cabac_bytes);
-    let slice_nal = build_nal(NalUnitType::IdrNLp, 0, 1, &slice_rbsp);
-    annex_b(&mut bitstream, &slice_nal);
+    debug_assert_eq!(slice_chunks.len(), num_slices as usize);
+    for (sid, s_chunks) in slice_chunks.iter().enumerate() {
+        let entry_point_offsets: Vec<u32> = s_chunks
+            .iter()
+            .take(s_chunks.len().saturating_sub(1))
+            .map(|c| ep_len(c))
+            .collect();
+        let cabac_bytes: Vec<u8> = s_chunks.concat();
+        let (addr, tiles_in_slice) = slice_signalling
+            .get(sid)
+            .copied()
+            .unwrap_or((sid as u32, 1));
+        // §7.3.7 slice-header bytes (ALF chain + sh_lmcs_used_flag +
+        // sh_qp_delta + SAO used flags + entry-point offsets +
+        // the per-slice address signalling).
+        let slice_header_bytes = vvc_enc.emit_idr_slice_header_bytes_for_slice(
+            &alf_ph_chain,
+            slice_qp_y - 26,
+            &entry_point_offsets,
+            addr,
+            tiles_in_slice,
+        );
+        let mut slice_rbsp = slice_header_bytes;
+        slice_rbsp.extend_from_slice(&cabac_bytes);
+        let slice_nal = build_nal(NalUnitType::IdrNLp, 0, 1, &slice_rbsp);
+        annex_b(&mut bitstream, &slice_nal);
+    }
 
     Ok((bitstream, rec))
 }
