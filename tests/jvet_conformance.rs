@@ -250,3 +250,426 @@ fn corpus_headers_parse() {
     }
     assert!(bad.is_empty(), "header parse failures: {bad:?}");
 }
+
+// ---------------------------------------------------------------------
+// Decode triage — StreamDecoder vs the .opl per-picture plane MD5s.
+// ---------------------------------------------------------------------
+
+/// Minimal RFC-1321-shape MD5 (the conformance sidecars are MD5-based;
+/// no new dependency). The 64 round constants are derived at run time
+/// as `floor(|sin(i + 1)| * 2^32)`.
+mod md5 {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, //
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, //
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, //
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+
+    fn k_table() -> [u32; 64] {
+        let mut k = [0u32; 64];
+        for (i, slot) in k.iter_mut().enumerate() {
+            *slot = (((i as f64 + 1.0).sin().abs()) * 4294967296.0) as u32;
+        }
+        k
+    }
+
+    pub struct Md5 {
+        state: [u32; 4],
+        buf: Vec<u8>,
+        len: u64,
+        k: [u32; 64],
+    }
+
+    impl Md5 {
+        pub fn new() -> Self {
+            Self {
+                state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476],
+                buf: Vec::new(),
+                len: 0,
+                k: k_table(),
+            }
+        }
+
+        pub fn update(&mut self, data: &[u8]) {
+            self.len = self.len.wrapping_add(data.len() as u64);
+            self.buf.extend_from_slice(data);
+            let blocks = self.buf.len() / 64;
+            for b in 0..blocks {
+                let block: [u8; 64] = self.buf[b * 64..b * 64 + 64].try_into().unwrap();
+                self.process(&block);
+            }
+            self.buf.drain(..blocks * 64);
+        }
+
+        fn process(&mut self, block: &[u8; 64]) {
+            let mut m = [0u32; 16];
+            for (i, slot) in m.iter_mut().enumerate() {
+                *slot = u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+            let (mut a, mut b, mut c, mut d) =
+                (self.state[0], self.state[1], self.state[2], self.state[3]);
+            #[allow(clippy::needless_range_loop)] // i indexes S, K and drives g
+            for i in 0..64 {
+                let (f, g) = match i / 16 {
+                    0 => ((b & c) | (!b & d), i),
+                    1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                    2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                    _ => (c ^ (b | !d), (7 * i) % 16),
+                };
+                let tmp = d;
+                d = c;
+                c = b;
+                let sum = a.wrapping_add(f).wrapping_add(self.k[i]).wrapping_add(m[g]);
+                b = b.wrapping_add(sum.rotate_left(S[i]));
+                a = tmp;
+            }
+            self.state[0] = self.state[0].wrapping_add(a);
+            self.state[1] = self.state[1].wrapping_add(b);
+            self.state[2] = self.state[2].wrapping_add(c);
+            self.state[3] = self.state[3].wrapping_add(d);
+        }
+
+        pub fn finish_hex(mut self) -> String {
+            let bit_len = self.len.wrapping_mul(8);
+            self.update(&[0x80]);
+            while self.buf.len() % 64 != 56 {
+                self.buf.push(0);
+            }
+            let mut tail = self.buf.split_off(0);
+            tail.extend_from_slice(&bit_len.to_le_bytes());
+            for b in 0..tail.len() / 64 {
+                let block: [u8; 64] = tail[b * 64..b * 64 + 64].try_into().unwrap();
+                self.process(&block);
+            }
+            let mut out = String::with_capacity(32);
+            for s in self.state {
+                for byte in s.to_le_bytes() {
+                    out.push_str(&format!("{byte:02x}"));
+                }
+            }
+            out
+        }
+    }
+
+    pub fn md5_hex(data: &[u8]) -> String {
+        let mut h = Md5::new();
+        h.update(data);
+        h.finish_hex()
+    }
+
+    #[test]
+    fn known_vectors() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5_hex(b"The quick brown fox jumps over the lazy dog"),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+        // Multi-block + 56-byte-boundary shapes.
+        let long = vec![0xa5u8; 200];
+        let mut h = Md5::new();
+        h.update(&long[..3]);
+        h.update(&long[3..]);
+        assert_eq!(h.finish_hex(), md5_hex(&long));
+    }
+}
+
+/// One `.opl` row.
+#[derive(Debug)]
+struct OplRow {
+    poc: i32,
+    hashes: Vec<String>,
+}
+
+fn parse_opl(path: &std::path::Path) -> Vec<OplRow> {
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let cols: Vec<&str> = l.split(',').map(str::trim).collect();
+            OplRow {
+                poc: cols[1].parse().unwrap(),
+                hashes: cols[4..].iter().map(|s| s.to_lowercase()).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Cropped-plane MD5s for one decoded picture (output bit depth 8).
+fn picture_hashes(pic: &oxideav_h266::stream::DecodedPicture) -> Vec<String> {
+    let (cx, cy, cw, ch) = pic.crop;
+    let plane_md5 =
+        |p: &oxideav_h266::reconstruct::PicturePlane, x0: usize, y0: usize, w: usize, h: usize| {
+            let mut hasher = md5::Md5::new();
+            for y in y0..y0 + h {
+                hasher.update(&p.samples[y * p.stride + x0..y * p.stride + x0 + w]);
+            }
+            hasher.finish_hex()
+        };
+    let mut out = vec![plane_md5(&pic.frame.luma, cx, cy, cw, ch)];
+    if pic.chroma_format_idc != 0 {
+        out.push(plane_md5(&pic.frame.cb, cx / 2, cy / 2, cw / 2, ch / 2));
+        out.push(plane_md5(&pic.frame.cr, cx / 2, cy / 2, cw / 2, ch / 2));
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum Verdict {
+    /// Every output picture's every plane hash matches its `.opl` row.
+    Pass,
+    /// Decoded end-to-end but at least one plane hash (or the output
+    /// picture count) differs. Payload: short diagnosis.
+    Fail(String),
+    /// The stream needs a tool the pipeline does not implement yet.
+    Unsupported(String),
+    /// Hard decode error (parse failure, missing reference, panic).
+    Error(String),
+}
+
+fn triage_stream(dir: &std::path::Path, name: &str) -> Verdict {
+    use oxideav_h266::stream::StreamDecoder;
+    let bs = std::fs::read(dir.join(format!("{name}.bit"))).unwrap();
+    let opl = parse_opl(&dir.join(format!("{name}.opl")));
+
+    let outputs: std::sync::Mutex<Vec<(u32, i32, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
+    let decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut dec = StreamDecoder::new();
+        dec.decode_annex_b(&bs, &mut |pic| {
+            if pic.output_flag {
+                let hashes = picture_hashes(&pic);
+                outputs.lock().unwrap().push((pic.cvs_idx, pic.poc, hashes));
+            }
+        })
+    }));
+    match decode {
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "opaque panic".into());
+            return Verdict::Error(format!("panic: {msg}"));
+        }
+        Ok(Err(e)) => {
+            let msg = format!("{e}");
+            return if msg.contains("nsupported") {
+                Verdict::Unsupported(msg)
+            } else {
+                Verdict::Error(msg)
+            };
+        }
+        Ok(Ok(())) => {}
+    }
+
+    // Output order: ascending POC within each CVS, CVSs in decode
+    // order (each conformance stream decodes a CVS completely before
+    // the next begins).
+    let mut outs = outputs.into_inner().unwrap();
+    outs.sort_by_key(|(cvs, poc, _)| (*cvs, *poc));
+
+    if outs.len() != opl.len() {
+        return Verdict::Fail(format!(
+            "output picture count {} != .opl rows {}",
+            outs.len(),
+            opl.len()
+        ));
+    }
+    let mut bad_rows = 0usize;
+    let mut first_bad: Option<String> = None;
+    for ((_, poc, hashes), row) in outs.iter().zip(&opl) {
+        let row_ok = *poc == row.poc && hashes == &row.hashes;
+        if !row_ok {
+            bad_rows += 1;
+            if first_bad.is_none() {
+                let plane = if *poc != row.poc {
+                    format!("poc {} != opl poc {}", poc, row.poc)
+                } else {
+                    let idx = hashes
+                        .iter()
+                        .zip(&row.hashes)
+                        .position(|(a, b)| a != b)
+                        .map(|i| ["Y", "Cb", "Cr"][i.min(2)])
+                        .unwrap_or("count");
+                    format!("poc {poc} plane {idx}")
+                };
+                first_bad = Some(plane);
+            }
+        }
+    }
+    if bad_rows == 0 {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(format!(
+            "{bad_rows}/{} pictures diverge; first at {}",
+            opl.len(),
+            first_bad.unwrap()
+        ))
+    }
+}
+
+/// Full-corpus decode triage. Prints the scorecard; asserts the
+/// verdict of every stream matches the tracked baseline below so any
+/// regression (or unrecorded improvement) fails loudly.
+#[test]
+fn corpus_decode_triage() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("jvet corpus not present — skipping");
+        return;
+    };
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            (p.extension().map(|x| x == "bit") == Some(true))
+                .then(|| p.file_stem().unwrap().to_string_lossy().to_string())
+        })
+        .collect();
+    names.sort();
+    let mut counts = [0usize; 4];
+    let mut lines = Vec::new();
+    for name in &names {
+        let v = triage_stream(&dir, name);
+        let (idx, tag) = match &v {
+            Verdict::Pass => (0, "PASS".to_string()),
+            Verdict::Fail(m) => (1, format!("FAIL {m}")),
+            Verdict::Unsupported(m) => (2, format!("UNSUPPORTED {m}")),
+            Verdict::Error(m) => (3, format!("ERROR {m}")),
+        };
+        counts[idx] += 1;
+        println!("{name}: {tag}");
+        lines.push((name.clone(), v));
+    }
+    println!(
+        "== scorecard: {} pass / {} fail / {} unsupported / {} error (of {})",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        names.len()
+    );
+
+    // Ratchet against the tracked baseline.
+    let expected: std::collections::HashMap<&str, char> =
+        EXPECTED_VERDICTS.iter().copied().collect();
+    let mut drift = Vec::new();
+    for (name, v) in &lines {
+        let tag = match v {
+            Verdict::Pass => 'P',
+            Verdict::Fail(_) => 'F',
+            Verdict::Unsupported(_) => 'U',
+            Verdict::Error(_) => 'E',
+        };
+        match expected.get(name.as_str()) {
+            Some(&e) if e == tag => {}
+            Some(&e) => drift.push(format!("{name}: expected {e}, got {tag} ({v:?})")),
+            None => drift.push(format!("{name}: not in EXPECTED_VERDICTS (got {tag})")),
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "triage verdicts drifted from the tracked baseline:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// Tracked triage baseline — one row per stream, updated alongside
+/// every family fix so both regressions AND unrecorded improvements
+/// fail the harness. Classes: P = pass (byte-exact vs .opl),
+/// F = fail (decodes, diverges), U = unsupported tool, E = error.
+const EXPECTED_VERDICTS: &[(&str, char)] = &[
+    ("10b422_B_5", 'U'),          // 10-bit + 4:2:2
+    ("8b400_A_2", 'E'),           // residual sub-block panic (family: monochrome walk)
+    ("8b420_A_2", 'E'),           // residual sub-block panic
+    ("8b420_B_2", 'U'),           // dual-tree chroma JCCR parse not plumbed
+    ("8b444_A_2", 'U'),           // 4:4:4
+    ("AFF_A_2", 'U'),             // 10-bit
+    ("ALF_A_3", 'U'),             // 10-bit
+    ("ALF_B_3", 'U'),             // 10-bit
+    ("ALF_C_3", 'U'),             // 10-bit
+    ("AMVR_A_3", 'U'),            // 10-bit
+    ("BDOF_A_4", 'U'),            // 10-bit
+    ("BDPCM_A_2", 'U'),           // 10-bit
+    ("CCLM_A_2", 'U'),            // 10-bit
+    ("CST_A_4", 'U'),             // 10-bit
+    ("CodingToolsSets_A_2", 'U'), // dual-tree chroma JCCR parse not plumbed
+    ("CodingToolsSets_B_2", 'U'), // dual-tree chroma JCCR parse not plumbed
+    ("CodingToolsSets_C_2", 'U'), // 10-bit
+    ("CodingToolsSets_D_2", 'U'), // 10-bit
+    ("CodingToolsSets_E_1", 'U'), // 10-bit (+ subpictures + WP)
+    ("DEBLOCKING_A_3", 'U'),      // 10-bit
+    ("DEBLOCKING_C_3", 'U'),      // 10-bit
+    ("DEBLOCKING_E_3", 'U'),      // 10-bit
+    ("DMVR_A_3", 'U'),            // 10-bit
+    ("DMVR_B_4", 'U'),            // 10-bit
+    ("GDR_A_2", 'U'),             // 10-bit (+ virtual boundaries)
+    ("GPM_A_3", 'U'),             // 10-bit
+    ("IBC_A_2", 'U'),             // 10-bit
+    ("ISP_A_3", 'U'),             // 10-bit
+    ("JCCR_A_2", 'U'),            // 10-bit
+    ("JCCR_C_3", 'U'),            // 10-bit
+    ("LFNST_A_4", 'U'),           // 10-bit
+    ("LFNST_B_4", 'U'),           // 10-bit
+    ("LMCS_A_3", 'U'),            // 10-bit
+    ("LMCS_B_2", 'U'),            // 10-bit (+ subpictures)
+    ("LMCS_C_1", 'U'),            // 10-bit
+    ("LOSSLESS_B_3", 'U'),        // 10-bit
+    ("MERGE_A_2", 'U'),           // 10-bit
+    ("MIP_A_3", 'U'),             // 10-bit
+    ("MIP_B_3", 'U'),             // 10-bit
+    ("MMVD_A_3", 'U'),            // 10-bit
+    ("MTS_A_4", 'U'),             // 10-bit
+    ("PROF_B_3", 'U'),            // 10-bit
+    ("QUANT_A_2", 'U'),           // 10-bit
+    ("QUANT_B_2", 'U'),           // 10-bit
+    ("RAP_A_1", 'U'),             // 10-bit
+    ("RAP_B_1", 'U'),             // 10-bit
+    ("SAO_A_3", 'U'),             // 10-bit
+    ("SBT_A_2", 'U'),             // 10-bit
+    ("SLICES_A_3", 'U'),          // 10-bit
+    ("SMVD_A_2", 'U'),            // 10-bit
+    ("SUBPIC_C_1", 'U'),          // 10-bit (+ subpictures)
+    ("SbTMVP_A_3", 'U'),          // 10-bit
+    ("TILE_A_2", 'U'),            // 10-bit
+    ("TMVP_A_3", 'U'),            // 10-bit
+    ("WPP_A_3", 'U'),             // 10-bit
+    ("WP_A_3", 'U'),              // 10-bit (+ explicit weighted prediction)
+];
+
+/// CI-runnable (no corpus needed): the stream driver must decode this
+/// crate's own encoder output byte-exactly through the same glue the
+/// conformance triage uses.
+#[test]
+fn stream_decoder_decodes_own_idr_stream() {
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::reconstruct::PictureBuffer;
+    use oxideav_h266::stream::StreamDecoder;
+
+    let mut src = PictureBuffer::yuv420_filled(128, 128, 128);
+    for y in 0..128 {
+        for x in 0..128 {
+            let v = 40 + ((x * 3 + y * 2) % 160) + if (x / 16 + y / 16) % 2 == 0 { 20 } else { 0 };
+            src.luma.samples[y * src.luma.stride + x] = v as u8;
+        }
+    }
+    for y in 0..64 {
+        for x in 0..64 {
+            src.cb.samples[y * src.cb.stride + x] = (96 + x) as u8;
+            src.cr.samples[y * src.cr.stride + x] = (160 - y) as u8;
+        }
+    }
+    let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();
+    let mut frames = Vec::new();
+    StreamDecoder::new()
+        .decode_annex_b(&bs, &mut |p| frames.push(p))
+        .unwrap();
+    assert_eq!(frames.len(), 1, "one coded picture");
+    let f = &frames[0];
+    assert_eq!(f.poc, 0);
+    assert!(f.output_flag);
+    assert_eq!(f.crop, (0, 0, 128, 128));
+    assert_eq!(f.frame.luma.samples, rec.luma.samples, "luma diverged");
+    assert_eq!(f.frame.cb.samples, rec.cb.samples, "cb diverged");
+    assert_eq!(f.frame.cr.samples, rec.cr.samples, "cr diverged");
+}

@@ -317,6 +317,8 @@ pub mod sei_prefix_indication;
 pub mod sei_rbsp;
 pub mod slice_header;
 pub mod sps;
+// r434 — stream-level decode driver (AU assembly, POC, RPL/DPB, walker wiring)
+pub mod stream;
 pub mod subpic_level_info;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
