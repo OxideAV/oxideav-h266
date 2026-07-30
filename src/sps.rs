@@ -1206,6 +1206,18 @@ fn parse_tool_flags(
         }
         t.ref_pic_lists[i] = lists;
     }
+    // §7.4.3.4 — under `sps_rpl1_same_as_rpl0_flag`,
+    // `sps_num_ref_pic_lists[1]` is inferred equal to
+    // `sps_num_ref_pic_lists[0]` and every list-1 candidate mirrors its
+    // list-0 counterpart. Materialise the inference so header-level
+    // `ref_pic_lists()` parsing (rpl_sps_flag / rpl_idx inference,
+    // candidate lookup) sees the spec-defined counts (r434 — leaving
+    // these at 0 sent every non-IDR slice header down the inline
+    // ref_pic_list_struct branch and desynced the parse).
+    if t.rpl1_same_as_rpl0_flag {
+        t.num_ref_pic_lists[1] = t.num_ref_pic_lists[0];
+        t.ref_pic_lists[1] = t.ref_pic_lists[0].clone();
+    }
 
     // -- inter / motion tools --
     t.ref_wraparound_enabled_flag = br.u1()? == 1;
@@ -2253,10 +2265,14 @@ mod tests {
 
         let bytes = pack(&bits);
         let sps = parse_sps(&bytes).unwrap();
-        assert_eq!(sps.tool_flags.num_ref_pic_lists, [1, 0]);
+        // r434 — §7.4.3.4: under sps_rpl1_same_as_rpl0_flag the list-1
+        // count and candidates are inferred equal to list 0.
+        assert_eq!(sps.tool_flags.num_ref_pic_lists, [1, 1]);
         let l0 = &sps.tool_flags.ref_pic_lists[0];
         assert_eq!(l0.len(), 1);
         assert_eq!(l0[0].entries.len(), 2);
+        assert_eq!(sps.tool_flags.ref_pic_lists[1].len(), 1);
+        assert_eq!(sps.tool_flags.ref_pic_lists[1][0].entries.len(), 2);
         // When LT refs are disabled the inferred ltrp_in_header_flag is 0.
         assert!(!l0[0].ltrp_in_header_flag);
         match l0[0].entries[0] {

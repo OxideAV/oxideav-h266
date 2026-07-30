@@ -499,6 +499,7 @@ fn encoder_pipeline_ph_alf_chain_round_trip() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let sh = parse_slice_header_stateful(&extract_rbsp(slice_nal.payload()), &sps, &pps, &ph_state)
         .expect("SH parse");
@@ -592,6 +593,7 @@ fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     // r387 — the PH no longer carries the ALF chain; the SH does.
     assert!(!ph_state.ph_alf_enabled_flag);
@@ -717,6 +719,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()
@@ -885,6 +888,7 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()
@@ -1195,6 +1199,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()
@@ -1388,6 +1393,7 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()
@@ -1570,6 +1576,7 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()

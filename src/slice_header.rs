@@ -27,8 +27,12 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::nal::NalUnitType;
-use crate::picture_header::{parse_picture_header, PictureHeaderLead};
+use crate::picture_header::{
+    parse_picture_header, parse_picture_header_stateful, parse_pred_weight_table_sh, PictureHeader,
+    PictureHeaderLead, PredWeightTable,
+};
 use crate::pps::PicParameterSet;
+use crate::ref_pic_list::{parse_ref_pic_lists, HeaderRefPicList};
 use crate::sps::SeqParameterSet;
 
 #[derive(Clone, Debug)]
@@ -74,6 +78,19 @@ pub struct PhState {
     /// NAL unit type of the slice NAL — controls whether
     /// `sh_no_output_of_prior_pics_flag` is transmitted.
     pub nal_unit_type: NalUnitType,
+    /// r434 — `num_ref_entries[i][RplsIdx[i]]` of the PH-selected RPLs
+    /// when `pps_rpl_info_in_ph_flag == 1` (the slice header still
+    /// gates its `sh_num_ref_idx_active_override_flag` block on these
+    /// counts even though `ref_pic_lists()` itself lives in the PH).
+    /// Leave at `[0, 0]` for I-only callers.
+    pub num_ref_entries: [u32; 2],
+    /// r434 — `ph_collocated_from_l0_flag` (§7.4.3.7), consulted by the
+    /// §7.4.8 `sh_collocated_from_l0_flag` inference for B slices.
+    pub ph_collocated_from_l0_flag: bool,
+    /// r434 — `ph_collocated_ref_idx`, consulted by the §7.4.8
+    /// `sh_collocated_ref_idx` inference when
+    /// `pps_rpl_info_in_ph_flag == 1`.
+    pub ph_collocated_ref_idx: u32,
 }
 
 impl Default for PhState {
@@ -89,6 +106,9 @@ impl Default for PhState {
             ph_sao_chroma_enabled_flag: false,
             num_extra_sh_bits: 0,
             nal_unit_type: NalUnitType::TrailNut,
+            num_ref_entries: [0, 0],
+            ph_collocated_from_l0_flag: true,
+            ph_collocated_ref_idx: 0,
         }
     }
 }
@@ -134,6 +154,13 @@ pub struct StatefulSliceHeader {
     /// `sh_slice_address` (§7.4.8). 0 when not transmitted (single-slice
     /// / single-tile case).
     pub sh_slice_address: u32,
+    /// r434 — `CurrSubpicIdx` (§7.4.8): the subpicture index resolved
+    /// from `sh_subpic_id` via eq. 75; 0 without subpicture info.
+    pub curr_subpic_idx: u32,
+    /// r434 — the picture-level slice index (§3.103): for rectangular
+    /// layouts, `sh_slice_address` mapped through the §6.5.1 eq. 23
+    /// lists; equals the raster `sh_slice_address` otherwise.
+    pub pic_level_slice_idx: u32,
     /// `sh_num_tiles_in_slice_minus1` — emitted only under raster-scan
     /// multi-tile slices.
     pub sh_num_tiles_in_slice_minus1: u32,
@@ -152,6 +179,31 @@ pub struct StatefulSliceHeader {
     pub sh_alf_cc_cr_aps_id: u8,
     pub sh_lmcs_used_flag: bool,
     pub sh_explicit_scaling_list_used_flag: bool,
+    /// r434 — the slice-header-carried `ref_pic_lists()` block
+    /// (§7.3.9), present when `pps_rpl_info_in_ph_flag == 0` and the
+    /// slice is not an IDR without `sps_idr_rpl_present_flag`.
+    pub sh_ref_pic_lists: Option<[HeaderRefPicList; 2]>,
+    /// r434 — `sh_num_ref_idx_active_override_flag` (§7.4.8; inferred
+    /// to 1 when the enclosing block is absent).
+    pub sh_num_ref_idx_active_override_flag: bool,
+    /// r434 — transmitted / inferred `sh_num_ref_idx_active_minus1[i]`.
+    pub sh_num_ref_idx_active_minus1: [u32; 2],
+    /// r434 — `NumRefIdxActive[i]` per §7.4.8 eq. 139.
+    pub num_ref_idx_active: [u32; 2],
+    /// r434 — `sh_collocated_from_l0_flag` with the §7.4.8 inferences
+    /// applied (B: `ph_collocated_from_l0_flag`; P: 1).
+    pub sh_collocated_from_l0_flag: bool,
+    /// r434 — `sh_collocated_ref_idx` with the §7.4.8 inferences
+    /// applied.
+    pub sh_collocated_ref_idx: u32,
+    /// r434 — slice-header-carried `pred_weight_table()` (§7.3.8),
+    /// present under `!pps_wp_info_in_ph_flag` for weighted P/B slices.
+    pub sh_pred_weight_table: Option<PredWeightTable>,
+    /// r434 — fully parsed embedded `picture_header_structure()` when
+    /// `sh_picture_header_in_slice_header_flag == 1` (the legacy
+    /// [`Self::embedded_picture_header`] lead is kept alongside for
+    /// earlier-round callers).
+    pub embedded_ph: Option<Box<PictureHeader>>,
     pub sh_cabac_init_flag: bool,
     /// sh_qp_delta (§7.4.8). Only transmitted when
     /// `pps_qp_delta_info_in_ph_flag == 0`; inferred to 0 otherwise.
@@ -266,17 +318,67 @@ pub fn parse_slice_header_stateful(
     }
     let mut br = BitReader::new(rbsp);
     let sh_picture_header_in_slice_header_flag = br.u1()? == 1;
-    let embedded_picture_header = if sh_picture_header_in_slice_header_flag {
+    // r434 — an embedded `picture_header_structure()` is parsed in
+    // FULL through the stateful PH parser (the pre-r434 lead-only parse
+    // desynced every stream whose PH carries more than the lead
+    // fields, which is all real PH-in-SH wires). The legacy lead
+    // projection is kept for earlier-round callers.
+    let embedded_ph: Option<Box<PictureHeader>> = if sh_picture_header_in_slice_header_flag {
         let bit_pos = br.bit_position();
         let tail = collect_bits(rbsp, bit_pos)?;
-        let ph = parse_picture_header(&tail)?;
+        let ph = parse_picture_header_stateful(&tail, sps, pps)?;
         for _ in 0..ph.consumed_bits {
             br.u1()?;
         }
-        Some(ph)
+        Some(Box::new(ph))
     } else {
         None
     };
+    let embedded_picture_header = embedded_ph.as_ref().map(|ph| PictureHeaderLead {
+        ph_gdr_or_irap_pic_flag: ph.ph_gdr_or_irap_pic_flag,
+        ph_non_ref_pic_flag: ph.ph_non_ref_pic_flag,
+        ph_gdr_pic_flag: ph.ph_gdr_pic_flag,
+        ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+        ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+        ph_pic_parameter_set_id: ph.ph_pic_parameter_set_id,
+        payload_tail: ph.payload_tail.clone(),
+        payload_tail_bit_offset: ph.payload_tail_bit_offset,
+        consumed_bits: ph.consumed_bits,
+    });
+
+    // r434 — the slice-header syntax below gates on PH state. When the
+    // PH is embedded in this very slice header the caller cannot have
+    // known it in advance, so the effective projection is rebuilt from
+    // the just-parsed PH (keeping the caller's NAL type + extra-bit
+    // count, which come from the NAL header / SPS respectively).
+    let eff: PhState = match embedded_ph.as_deref() {
+        Some(ph) => PhState {
+            ph_inter_slice_allowed_flag: ph.ph_inter_slice_allowed_flag,
+            ph_intra_slice_allowed_flag: ph.ph_intra_slice_allowed_flag,
+            ph_alf_enabled_flag: ph.ph_alf_enabled_flag,
+            ph_lmcs_enabled_flag: ph.ph_lmcs_enabled_flag,
+            ph_explicit_scaling_list_enabled_flag: ph.ph_explicit_scaling_list_enabled_flag,
+            ph_temporal_mvp_enabled_flag: ph.ph_temporal_mvp_enabled_flag,
+            ph_sao_luma_enabled_flag: ph.ph_sao_luma_enabled_flag,
+            ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
+            num_extra_sh_bits: ph_state.num_extra_sh_bits,
+            nal_unit_type: ph_state.nal_unit_type,
+            num_ref_entries: [
+                ph.ref_pic_lists
+                    .as_ref()
+                    .map(|r| r[0].rpls.entries.len() as u32)
+                    .unwrap_or(0),
+                ph.ref_pic_lists
+                    .as_ref()
+                    .map(|r| r[1].rpls.entries.len() as u32)
+                    .unwrap_or(0),
+            ],
+            ph_collocated_from_l0_flag: ph.ph_collocated_from_l0_flag,
+            ph_collocated_ref_idx: ph.ph_collocated_ref_idx,
+        },
+        None => *ph_state,
+    };
+    let ph_state = &eff;
 
     // sh_subpic_id — present iff sps_subpic_info_present_flag. Width =
     // sps_subpic_id_len_minus1 + 1 per §7.4.8 (inherits the SPS width).
@@ -292,22 +394,56 @@ pub fn parse_slice_header_stateful(
         None
     };
 
-    // sh_slice_address width (§7.4.8): Ceil(Log2(NumSlicesInSubpic)) when
-    // rect-slice, Ceil(Log2(NumTilesInPic)) otherwise. The field is only
-    // emitted when the relevant count is > 1.
+    // sh_slice_address width (§7.4.8): Ceil(Log2(NumSlicesInSubpic
+    // [CurrSubpicIdx])) when rect-slice, Ceil(Log2(NumTilesInPic))
+    // otherwise. The field is only emitted when the relevant count
+    // is > 1. r434 — CurrSubpicIdx resolves `sh_subpic_id` against the
+    // §7.4.3.4 eq. 75 `SubpicIdVal[]`, and NumSlicesInSubpic comes
+    // from the §6.5.1 eq. 23 lists (multi-subpicture layouts
+    // previously read the whole-picture slice count here and
+    // desynced).
     let num_tiles_in_pic = pps
         .partition
         .as_ref()
         .map(|p| p.num_tiles_in_pic)
         .unwrap_or(1);
-    // NumSlicesInSubpic[CurrSubpicIdx]. CurrSubpicIdx = 0 when subpic
-    // info is absent (§9075 of the spec). Full subpic-aware lookup is
-    // future work; with a single-subpic stream the first entry is
-    // always correct.
-    let num_slices_in_subpic = pps
-        .partition
-        .as_ref()
-        .and_then(|p| p.num_slices_in_subpic.first().copied())
+    let scan = crate::tile_scan::TileScan::derive(sps, pps)?;
+    let curr_subpic_idx = match (sh_subpic_id, sps.subpic_info.as_ref()) {
+        (Some(id), Some(info)) => {
+            let n = info.num_subpics_minus1 + 1;
+            let mut found = None;
+            for i in 0..n {
+                let val = if info.subpic_id_mapping_explicitly_signalled_flag {
+                    if pps.pps_subpic_id_mapping_present_flag {
+                        pps.subpic_id_mapping
+                            .as_ref()
+                            .and_then(|m| m.pps_subpic_id.get(i as usize).copied())
+                            .ok_or_else(|| {
+                                Error::invalid("h266 SH: PPS subpic id mapping too short")
+                            })?
+                    } else {
+                        info.subpic_ids.get(i as usize).copied().ok_or_else(|| {
+                            Error::invalid("h266 SH: SPS subpic id mapping too short")
+                        })?
+                    }
+                } else {
+                    i
+                };
+                if val == id {
+                    found = Some(i);
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                Error::invalid(format!("h266 SH: sh_subpic_id {id} matches no SubpicIdVal"))
+            })?
+        }
+        _ => 0,
+    };
+    let num_slices_in_subpic = scan
+        .num_slices_in_subpic
+        .get(curr_subpic_idx as usize)
+        .copied()
         .unwrap_or(1);
     let emit_slice_address = (pps.pps_rect_slice_flag && num_slices_in_subpic > 1)
         || (!pps.pps_rect_slice_flag && num_tiles_in_pic > 1);
@@ -320,6 +456,13 @@ pub fn parse_slice_header_stateful(
         };
         sh_slice_address = br.u(width)?;
     }
+    // Picture-level slice index (§3.103) — identity for
+    // single-subpicture rectangular layouts, eq. 23-mapped otherwise.
+    let pic_level_slice_idx = if pps.pps_rect_slice_flag || pps.partition.is_none() {
+        scan.pic_level_slice_idx(curr_subpic_idx, sh_slice_address)?
+    } else {
+        sh_slice_address
+    };
 
     // sh_extra_bit loop (SPS-side count).
     for _ in 0..ph_state.num_extra_sh_bits {
@@ -352,8 +495,11 @@ pub fn parse_slice_header_stateful(
     let mut out = StatefulSliceHeader::default();
     out.sh_picture_header_in_slice_header_flag = sh_picture_header_in_slice_header_flag;
     out.embedded_picture_header = embedded_picture_header;
+    out.embedded_ph = embedded_ph;
     out.sh_subpic_id = sh_subpic_id;
     out.sh_slice_address = sh_slice_address;
+    out.curr_subpic_idx = curr_subpic_idx;
+    out.pic_level_slice_idx = pic_level_slice_idx;
     out.sh_num_tiles_in_slice_minus1 = sh_num_tiles_in_slice_minus1;
     out.sh_slice_type = sh_slice_type;
     out.sh_no_output_of_prior_pics_flag = sh_no_output_of_prior_pics_flag;
@@ -404,19 +550,119 @@ pub fn parse_slice_header_stateful(
             && ph_state.ph_explicit_scaling_list_enabled_flag;
     }
 
-    // ref_pic_lists() — skipped because pps_rpl_info_in_ph_flag = 1 in
-    // our single-slice scenario. sh_num_ref_idx_active_override_flag is
-    // also skipped (num_ref_entries[0/1] are known from the PH-level RPL
-    // and resolved by the RefPicList builder).
+    // §7.3.7 — `ref_pic_lists()` in the slice header: present when the
+    // PPS keeps RPL info out of the PH and the slice is not an IDR
+    // without `sps_idr_rpl_present_flag`.
+    let is_idr = matches!(
+        ph_state.nal_unit_type,
+        NalUnitType::IdrWRadl | NalUnitType::IdrNLp
+    );
+    if !pps.pps_rpl_info_in_ph_flag && (!is_idr || sps.tool_flags.idr_rpl_present_flag) {
+        out.sh_ref_pic_lists = Some(parse_ref_pic_lists(&mut br, sps, pps)?);
+    }
 
-    // `if( sh_slice_type != I )` block — skipped (cabac_init /
-    // collocated / pred_weight_table). With pps_rpl_info_in_ph_flag = 1
-    // the collocated fields live in the PH. Weighted pred table is also
-    // handled via pps_wp_info_in_ph_flag = 1.
+    // `num_ref_entries[i][RplsIdx[i]]` — from the SH-carried RPLs when
+    // present, else from the PH-carried ones the caller projected in.
+    let num_ref_entries: [u32; 2] = match out.sh_ref_pic_lists.as_ref() {
+        Some(rpls) => [
+            rpls[0].rpls.entries.len() as u32,
+            rpls[1].rpls.entries.len() as u32,
+        ],
+        None => ph_state.num_ref_entries,
+    };
+
+    // §7.3.7 — the sh_num_ref_idx_active_override block. The flag is
+    // inferred to 1 when the block is absent; the per-list minus1
+    // values are inferred to 0 when absent within the block (§7.4.8).
+    out.sh_num_ref_idx_active_override_flag = true;
+    out.sh_num_ref_idx_active_minus1 = [0, 0];
+    if (sh_slice_type != SliceType::I && num_ref_entries[0] > 1)
+        || (sh_slice_type == SliceType::B && num_ref_entries[1] > 1)
+    {
+        out.sh_num_ref_idx_active_override_flag = br.u1()? == 1;
+        if out.sh_num_ref_idx_active_override_flag {
+            let lists = if sh_slice_type == SliceType::B { 2 } else { 1 };
+            for i in 0..lists {
+                if num_ref_entries[i] > 1 {
+                    let v = br.ue()?;
+                    if v > 14 {
+                        return Err(Error::invalid(format!(
+                            "h266 SH: sh_num_ref_idx_active_minus1[{i}] = {v} out of range 0..=14"
+                        )));
+                    }
+                    out.sh_num_ref_idx_active_minus1[i] = v;
+                }
+            }
+        }
+    }
+
+    // §7.4.8 eq. 139 — NumRefIdxActive[i].
+    for i in 0..2 {
+        out.num_ref_idx_active[i] =
+            if sh_slice_type == SliceType::B || (sh_slice_type == SliceType::P && i == 0) {
+                if out.sh_num_ref_idx_active_override_flag {
+                    out.sh_num_ref_idx_active_minus1[i] + 1
+                } else {
+                    let default_active = pps.pps_num_ref_idx_default_active_minus1[i] + 1;
+                    if num_ref_entries[i] >= default_active {
+                        default_active
+                    } else {
+                        num_ref_entries[i]
+                    }
+                }
+            } else {
+                0
+            };
+    }
+
+    // §7.3.7 `if( sh_slice_type != I )` block — cabac_init /
+    // collocated / pred_weight_table.
     //
-    // Honour the few elements that *are* still emitted:
-    if sh_slice_type != SliceType::I && pps.pps_cabac_init_present_flag {
-        out.sh_cabac_init_flag = br.u1()? == 1;
+    // §7.4.8 inference defaults first (P: collocated from L0; B:
+    // inherit the PH values; idx: PH value when rpl-in-PH else 0).
+    out.sh_collocated_from_l0_flag = if sh_slice_type == SliceType::B {
+        ph_state.ph_collocated_from_l0_flag
+    } else {
+        true
+    };
+    out.sh_collocated_ref_idx = if pps.pps_rpl_info_in_ph_flag {
+        ph_state.ph_collocated_ref_idx
+    } else {
+        0
+    };
+    if sh_slice_type != SliceType::I {
+        if pps.pps_cabac_init_present_flag {
+            out.sh_cabac_init_flag = br.u1()? == 1;
+        }
+        if ph_state.ph_temporal_mvp_enabled_flag && !pps.pps_rpl_info_in_ph_flag {
+            if sh_slice_type == SliceType::B {
+                out.sh_collocated_from_l0_flag = br.u1()? == 1;
+            }
+            if (out.sh_collocated_from_l0_flag && out.num_ref_idx_active[0] > 1)
+                || (!out.sh_collocated_from_l0_flag && out.num_ref_idx_active[1] > 1)
+            {
+                out.sh_collocated_ref_idx = br.ue()?;
+            }
+        }
+        if !pps.pps_wp_info_in_ph_flag
+            && ((pps.pps_weighted_pred_flag && sh_slice_type == SliceType::P)
+                || (pps.pps_weighted_bipred_flag && sh_slice_type == SliceType::B))
+        {
+            // §7.4.7 eqs. 144 / 145 — NumWeightsL0 = NumRefIdxActive[0];
+            // NumWeightsL1 = NumRefIdxActive[1] for weighted-bipred B
+            // slices, 0 otherwise.
+            let n_l1 = if pps.pps_weighted_bipred_flag && sh_slice_type == SliceType::B {
+                out.num_ref_idx_active[1]
+            } else {
+                0
+            };
+            out.sh_pred_weight_table = Some(parse_pred_weight_table_sh(
+                &mut br,
+                sps.sps_chroma_format_idc != 0,
+                out.num_ref_idx_active[0],
+                n_l1,
+            )?);
+        }
     }
 
     if !pps.pps_qp_delta_info_in_ph_flag {
@@ -530,14 +776,13 @@ pub fn parse_slice_header_stateful(
     // transitions plus, with `sps_entropy_coding_sync_enabled_flag`
     // (WPP), every CTU-row change.
     let num_entry_points = if sps.sps_entry_point_offsets_present_flag {
-        let scan = crate::tile_scan::TileScan::derive(sps, pps)?;
         let ctbs: Vec<u32> = if pps.pps_rect_slice_flag || pps.partition.is_none() {
             scan.ctb_addr_in_slice
-                .get(sh_slice_address as usize)
+                .get(pic_level_slice_idx as usize)
                 .cloned()
                 .ok_or_else(|| {
                     Error::invalid(format!(
-                        "h266 SH: sh_slice_address {sh_slice_address} has no derived CTB list"
+                        "h266 SH: slice index {pic_level_slice_idx} has no derived CTB list"
                     ))
                 })?
         } else {
@@ -922,48 +1167,68 @@ mod tests {
     /// `sh_picture_header_in_slice_header_flag ? ph_*_enabled_flag : 0`.
     #[test]
     fn stateful_ph_in_sh_infers_lmcs_and_scaling_list_flags() {
-        let (sps, pps) = synthetic_sps_pps();
+        // r434 — the embedded PH is now parsed in FULL, so the fixture
+        // must carry a complete `picture_header_structure()` and the
+        // inference reads the EMBEDDED PH's enables (the caller-side
+        // PhState no longer matters for a PH-in-SH slice).
+        let (mut sps, pps) = synthetic_sps_pps();
+        sps.tool_flags.lmcs_enabled_flag = true;
+        sps.tool_flags.explicit_scaling_list_enabled_flag = true;
         let ph_state = PhState {
             ph_inter_slice_allowed_flag: false,
             ph_intra_slice_allowed_flag: true,
-            ph_lmcs_enabled_flag: true,
-            ph_explicit_scaling_list_enabled_flag: true,
             num_extra_sh_bits: 0,
             nal_unit_type: NalUnitType::IdrWRadl,
             ..Default::default()
         };
 
-        // sh_ph_in_sh_flag = 1 followed by a minimal embedded PH lead:
-        // ph_gdr_or_irap = 1, ph_non_ref = 0, ph_gdr_pic = 0,
-        // ph_inter_slice_allowed = 0, ph_pic_parameter_set_id ue(0).
-        let mut bits: Vec<u8> = Vec::new();
-        push_u(&mut bits, 1, 1); // sh_picture_header_in_slice_header_flag
-        push_u(&mut bits, 1, 1); // ph_gdr_or_irap_pic_flag
-        push_u(&mut bits, 0, 1); // ph_non_ref_pic_flag
-        push_u(&mut bits, 0, 1); // ph_gdr_pic_flag
-        push_u(&mut bits, 0, 1); // ph_inter_slice_allowed_flag
-        push_ue(&mut bits, 0); // ph_pic_parameter_set_id
-        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
-                                 // sh_lmcs_used_flag NOT transmitted (PH in SH) — inferred 1.
-                                 // sh_explicit_scaling_list_used_flag — same inference.
-        push_byte_align(&mut bits);
-        let bytes = pack(&bits);
+        // Build one full embedded PH; `enables` toggles the LMCS +
+        // scaling-list PH flags.
+        let build = |enables: bool| -> Vec<u8> {
+            let mut bits: Vec<u8> = Vec::new();
+            push_u(&mut bits, 1, 1); // sh_picture_header_in_slice_header_flag
+            push_u(&mut bits, 1, 1); // ph_gdr_or_irap_pic_flag
+            push_u(&mut bits, 0, 1); // ph_non_ref_pic_flag
+            push_u(&mut bits, 0, 1); // ph_gdr_pic_flag
+            push_u(&mut bits, 0, 1); // ph_inter_slice_allowed_flag
+            push_ue(&mut bits, 0); // ph_pic_parameter_set_id
+            push_u(&mut bits, 0, 8); // ph_pic_order_cnt_lsb (u(8))
+            if enables {
+                push_u(&mut bits, 1, 1); // ph_lmcs_enabled_flag = 1
+                push_u(&mut bits, 0, 2); // ph_lmcs_aps_id
+                push_u(&mut bits, 0, 1); // ph_chroma_residual_scale_flag
+                push_u(&mut bits, 1, 1); // ph_explicit_scaling_list_enabled_flag = 1
+                push_u(&mut bits, 0, 3); // ph_scaling_list_aps_id
+            } else {
+                push_u(&mut bits, 0, 1); // ph_lmcs_enabled_flag = 0
+                push_u(&mut bits, 0, 1); // ph_explicit_scaling_list_enabled_flag = 0
+            }
+            // ref_pic_lists() — pps_rpl_info_in_ph = 1 in the fixture;
+            // sps_num_ref_pic_lists = [0, 0] → both lists are inline
+            // empty ref_pic_list_struct()s (one ue(0) each).
+            push_ue(&mut bits, 0);
+            push_ue(&mut bits, 0);
+            push_se(&mut bits, 0); // ph_qp_delta (pps_qp_delta_info_in_ph = 1)
+            push_u(&mut bits, 0, 1); // ph_deblocking_params_present_flag = 0
+                                     // — PH ends; slice header resumes.
+            push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+            push_byte_align(&mut bits);
+            pack(&bits)
+        };
 
-        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        let sh = parse_slice_header_stateful(&build(true), &sps, &pps, &ph_state).unwrap();
         assert!(sh.sh_picture_header_in_slice_header_flag);
-        assert!(sh.sh_lmcs_used_flag, "inferred from ph_lmcs_enabled_flag");
+        let emb = sh.embedded_ph.as_ref().expect("full embedded PH parsed");
+        assert!(emb.ph_lmcs_enabled_flag);
+        assert!(emb.ph_explicit_scaling_list_enabled_flag);
+        assert!(sh.sh_lmcs_used_flag, "inferred from embedded ph_lmcs");
         assert!(
             sh.sh_explicit_scaling_list_used_flag,
-            "inferred from ph_explicit_scaling_list_enabled_flag"
+            "inferred from embedded ph_explicit_scaling_list"
         );
 
-        // Same stream with the PH enables off — both infer to 0.
-        let ph_state_off = PhState {
-            ph_lmcs_enabled_flag: false,
-            ph_explicit_scaling_list_enabled_flag: false,
-            ..ph_state
-        };
-        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state_off).unwrap();
+        // Same slice with the embedded PH enables off — both infer 0.
+        let sh = parse_slice_header_stateful(&build(false), &sps, &pps, &ph_state).unwrap();
         assert!(!sh.sh_lmcs_used_flag);
         assert!(!sh.sh_explicit_scaling_list_used_flag);
     }
@@ -1204,10 +1469,13 @@ mod tests {
         pps.pps_rect_slice_flag = false; // raster scan
         pps.partition = Some(PicPartition {
             log2_ctu_size_minus5: 2,
-            explicit_col_widths: vec![1, 1],
-            explicit_row_heights: vec![1],
-            col_width_ctbs: vec![1, 1],
-            row_height_ctbs: vec![1],
+            // r434 — geometry must actually cover the 320x240 picture
+            // (3x2 CTBs at CtbSizeY = 128): the §6.5.1 tile-scan
+            // derivation now runs in the SH parser and validates it.
+            explicit_col_widths: vec![1, 2],
+            explicit_row_heights: vec![2],
+            col_width_ctbs: vec![1, 2],
+            row_height_ctbs: vec![2],
             num_tile_columns: 2,
             num_tile_rows: 1,
             num_tiles_in_pic: 2,

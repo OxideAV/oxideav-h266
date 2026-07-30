@@ -88,6 +88,7 @@ fn dep_quant_pipeline_signals_sps_and_sh_flags() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()
@@ -211,6 +212,7 @@ fn sdh_pipeline_signals_flags_and_holds_psnr() {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     let slice_nal = nals
         .iter()

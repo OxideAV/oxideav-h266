@@ -756,55 +756,7 @@ pub fn parse_pred_weight_table(
         // no-op here.
         pwt.l0.num_weights = 0;
     }
-    let n_l0 = pwt.l0.num_weights as usize;
-    pwt.l0.luma_weight_flag.resize(n_l0, false);
-    for slot in pwt.l0.luma_weight_flag.iter_mut().take(n_l0) {
-        *slot = br.u1()? == 1;
-    }
-    if chroma_present {
-        pwt.l0.chroma_weight_flag.resize(n_l0, false);
-        for slot in pwt.l0.chroma_weight_flag.iter_mut().take(n_l0) {
-            *slot = br.u1()? == 1;
-        }
-    }
-    for i in 0..n_l0 {
-        if pwt.l0.luma_weight_flag[i] {
-            let dlw = br.se()?;
-            let lo = br.se()?;
-            if !(-128..=127).contains(&dlw) || !(-128..=127).contains(&lo) {
-                return Err(Error::invalid(format!(
-                    "h266 pred_weight_table: L0 luma weight ({dlw}, {lo}) at i={i} \
-                     out of spec range -128..=127",
-                )));
-            }
-            pwt.l0.luma.push(LumaWeight {
-                ref_idx: i as u32,
-                delta_luma_weight: dlw,
-                luma_offset: lo,
-            });
-        }
-        if chroma_present && pwt.l0.chroma_weight_flag.get(i).copied().unwrap_or(false) {
-            let cb_dw = br.se()?;
-            let cb_do = br.se()?;
-            let cr_dw = br.se()?;
-            let cr_do = br.se()?;
-            for v in [cb_dw, cb_do, cr_dw, cr_do] {
-                if !(-128..=127).contains(&v) {
-                    return Err(Error::invalid(format!(
-                        "h266 pred_weight_table: L0 chroma value {v} at i={i} \
-                         out of spec range -128..=127",
-                    )));
-                }
-            }
-            pwt.l0.chroma.push(ChromaWeight {
-                ref_idx: i as u32,
-                delta_chroma_weight_cb: cb_dw,
-                delta_chroma_offset_cb: cb_do,
-                delta_chroma_weight_cr: cr_dw,
-                delta_chroma_offset_cr: cr_do,
-            });
-        }
-    }
+    read_pwt_list(br, chroma_present, &mut pwt.l0, "L0")?;
     // L1 walk -----------------------------------------------------------
     let l1_gate = pps_weighted_bipred_flag && pps_wp_info_in_ph_flag && num_ref_entries_l1 > 0;
     if l1_gate {
@@ -815,56 +767,108 @@ pub fn parse_pred_weight_table(
                 pwt.l1.num_weights
             )));
         }
-        let n_l1 = pwt.l1.num_weights as usize;
-        pwt.l1.luma_weight_flag.resize(n_l1, false);
-        for slot in pwt.l1.luma_weight_flag.iter_mut().take(n_l1) {
+        read_pwt_list(br, chroma_present, &mut pwt.l1, "L1")?;
+    }
+    Ok(pwt)
+}
+
+/// Shared §7.3.8 per-list walk: `luma_weight_lN_flag[]`,
+/// `chroma_weight_lN_flag[]` and the weight/offset pairs for
+/// `NumWeightsLN` entries. `list.num_weights` must already hold
+/// `NumWeightsLN`; the flag vectors and sparse weight records are
+/// populated in place.
+fn read_pwt_list(
+    br: &mut BitReader<'_>,
+    chroma_present: bool,
+    list: &mut PredWeightTableList,
+    label: &str,
+) -> Result<()> {
+    let n = list.num_weights as usize;
+    list.luma_weight_flag.resize(n, false);
+    for slot in list.luma_weight_flag.iter_mut().take(n) {
+        *slot = br.u1()? == 1;
+    }
+    if chroma_present {
+        list.chroma_weight_flag.resize(n, false);
+        for slot in list.chroma_weight_flag.iter_mut().take(n) {
             *slot = br.u1()? == 1;
         }
-        if chroma_present {
-            pwt.l1.chroma_weight_flag.resize(n_l1, false);
-            for slot in pwt.l1.chroma_weight_flag.iter_mut().take(n_l1) {
-                *slot = br.u1()? == 1;
+    }
+    for i in 0..n {
+        if list.luma_weight_flag[i] {
+            let dlw = br.se()?;
+            let lo = br.se()?;
+            if !(-128..=127).contains(&dlw) || !(-128..=127).contains(&lo) {
+                return Err(Error::invalid(format!(
+                    "h266 pred_weight_table: {label} luma weight ({dlw}, {lo}) at i={i} \
+                     out of spec range -128..=127",
+                )));
             }
+            list.luma.push(LumaWeight {
+                ref_idx: i as u32,
+                delta_luma_weight: dlw,
+                luma_offset: lo,
+            });
         }
-        for i in 0..n_l1 {
-            if pwt.l1.luma_weight_flag[i] {
-                let dlw = br.se()?;
-                let lo = br.se()?;
-                if !(-128..=127).contains(&dlw) || !(-128..=127).contains(&lo) {
+        if chroma_present && list.chroma_weight_flag.get(i).copied().unwrap_or(false) {
+            let cb_dw = br.se()?;
+            let cb_do = br.se()?;
+            let cr_dw = br.se()?;
+            let cr_do = br.se()?;
+            for v in [cb_dw, cb_do, cr_dw, cr_do] {
+                if !(-128..=127).contains(&v) {
                     return Err(Error::invalid(format!(
-                        "h266 pred_weight_table: L1 luma weight ({dlw}, {lo}) at i={i} \
+                        "h266 pred_weight_table: {label} chroma value {v} at i={i} \
                          out of spec range -128..=127",
                     )));
                 }
-                pwt.l1.luma.push(LumaWeight {
-                    ref_idx: i as u32,
-                    delta_luma_weight: dlw,
-                    luma_offset: lo,
-                });
             }
-            if chroma_present && pwt.l1.chroma_weight_flag.get(i).copied().unwrap_or(false) {
-                let cb_dw = br.se()?;
-                let cb_do = br.se()?;
-                let cr_dw = br.se()?;
-                let cr_do = br.se()?;
-                for v in [cb_dw, cb_do, cr_dw, cr_do] {
-                    if !(-128..=127).contains(&v) {
-                        return Err(Error::invalid(format!(
-                            "h266 pred_weight_table: L1 chroma value {v} at i={i} \
-                             out of spec range -128..=127",
-                        )));
-                    }
-                }
-                pwt.l1.chroma.push(ChromaWeight {
-                    ref_idx: i as u32,
-                    delta_chroma_weight_cb: cb_dw,
-                    delta_chroma_offset_cb: cb_do,
-                    delta_chroma_weight_cr: cr_dw,
-                    delta_chroma_offset_cr: cr_do,
-                });
-            }
+            list.chroma.push(ChromaWeight {
+                ref_idx: i as u32,
+                delta_chroma_weight_cb: cb_dw,
+                delta_chroma_offset_cb: cb_do,
+                delta_chroma_weight_cr: cr_dw,
+                delta_chroma_offset_cr: cr_do,
+            });
         }
     }
+    Ok(())
+}
+
+/// Parse a slice-header-carried `pred_weight_table()` (§7.3.8 with
+/// `pps_wp_info_in_ph_flag == 0`). In this shape neither
+/// `num_l0_weights` nor `num_l1_weights` is on the wire: §7.4.7
+/// eq. 144 / eq. 145 set `NumWeightsL0 = NumRefIdxActive[0]` and
+/// `NumWeightsL1 = pps_weighted_bipred_flag ? NumRefIdxActive[1] : 0`,
+/// which the caller threads in as `num_weights_l0` / `num_weights_l1`.
+pub fn parse_pred_weight_table_sh(
+    br: &mut BitReader<'_>,
+    chroma_present: bool,
+    num_weights_l0: u32,
+    num_weights_l1: u32,
+) -> Result<PredWeightTable> {
+    let mut pwt = PredWeightTable::default();
+    pwt.luma_log2_weight_denom = br.ue()?;
+    if pwt.luma_log2_weight_denom > 7 {
+        return Err(Error::invalid(format!(
+            "h266 pred_weight_table: luma_log2_weight_denom {} exceeds spec max 7",
+            pwt.luma_log2_weight_denom
+        )));
+    }
+    if chroma_present {
+        pwt.delta_chroma_log2_weight_denom = br.se()?;
+        let chroma_denom = pwt.luma_log2_weight_denom as i32 + pwt.delta_chroma_log2_weight_denom;
+        if !(0..=7).contains(&chroma_denom) {
+            return Err(Error::invalid(format!(
+                "h266 pred_weight_table: ChromaLog2WeightDenom {chroma_denom} \
+                 out of spec range 0..=7",
+            )));
+        }
+    }
+    pwt.l0.num_weights = num_weights_l0;
+    read_pwt_list(br, chroma_present, &mut pwt.l0, "L0")?;
+    pwt.l1.num_weights = num_weights_l1;
+    read_pwt_list(br, chroma_present, &mut pwt.l1, "L1")?;
     Ok(pwt)
 }
 

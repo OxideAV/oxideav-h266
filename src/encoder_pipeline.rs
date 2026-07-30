@@ -4973,6 +4973,7 @@ mod tests {
             ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
             num_extra_sh_bits: 0,
             nal_unit_type: slice_nal.header.nal_unit_type,
+            ..Default::default()
         };
         let sh =
             parse_slice_header_stateful(&extract_rbsp(slice_nal.payload()), &sps, &pps, &ph_state)

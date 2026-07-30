@@ -1558,6 +1558,7 @@ mod tests {
             ph_sao_chroma_enabled_flag: false,
             num_extra_sh_bits: 0,
             nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
         };
         let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state)
             .expect("slice header must parse");
@@ -1628,6 +1629,7 @@ mod tests {
             ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
             num_extra_sh_bits: 0,
             nal_unit_type: NalUnitType::IdrNLp,
+            ..Default::default()
         };
         let sh = parse_slice_header_stateful(&slice_rbsp, &sps, &pps, &ph_state)
             .expect("slice header round-trip");

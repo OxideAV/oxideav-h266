@@ -57,6 +57,13 @@ pub struct TileScan {
     /// True iff the PPS uses rectangular slices (or has no partition
     /// block at all — the single-slice degenerate case).
     pub rect_slices: bool,
+    /// eq. 23 — `NumSlicesInSubpic[i]` (length = number of subpictures;
+    /// `[num_slices]` when the SPS carries no subpicture info).
+    pub num_slices_in_subpic: Vec<u32>,
+    /// eq. 23 — `SubpicLevelSliceIdx[j]` per picture-level slice index.
+    pub subpic_level_slice_idx: Vec<u32>,
+    /// eq. 23 — `SubpicIdxForSlice[j]` per picture-level slice index.
+    pub subpic_idx_for_slice: Vec<u32>,
 }
 
 impl TileScan {
@@ -133,13 +140,70 @@ impl TileScan {
             ctb_to_tile_row_idx,
             ctb_addr_in_slice: Vec::new(),
             rect_slices: pps.pps_rect_slice_flag || pps.partition.is_none(),
+            num_slices_in_subpic: Vec::new(),
+            subpic_level_slice_idx: Vec::new(),
+            subpic_idx_for_slice: Vec::new(),
         };
 
         // CtbAddrInSlice — rectangular layouts only.
         if scan.rect_slices {
             scan.derive_rect_slices(sps, pps)?;
         }
+
+        // eq. 23 — NumSlicesInSubpic[] / SubpicLevelSliceIdx[] /
+        // SubpicIdxForSlice[] from the first CTB of every rectangular
+        // slice against the SPS subpicture rectangles. Raster-scan
+        // layouts have no picture-level slice index (§3.103) — the
+        // lists collapse to the single-subpic shape.
+        let n_slices = scan.ctb_addr_in_slice.len().max(1);
+        match sps.subpic_info.as_ref() {
+            Some(info) if scan.rect_slices => {
+                let n_subpics = info.subpics.len();
+                scan.num_slices_in_subpic = vec![0; n_subpics];
+                scan.subpic_level_slice_idx = vec![0; n_slices];
+                scan.subpic_idx_for_slice = vec![0; n_slices];
+                for (i, sp) in info.subpics.iter().enumerate() {
+                    for j in 0..scan.ctb_addr_in_slice.len() {
+                        let first = *scan.ctb_addr_in_slice[j].first().ok_or_else(|| {
+                            Error::invalid("h266 tile scan: empty CtbAddrInSlice entry")
+                        })?;
+                        let pos_x = first % scan.pic_width_in_ctbs;
+                        let pos_y = first / scan.pic_width_in_ctbs;
+                        if pos_x >= sp.ctu_top_left_x
+                            && pos_x < sp.ctu_top_left_x + sp.width_minus1 + 1
+                            && pos_y >= sp.ctu_top_left_y
+                            && pos_y < sp.ctu_top_left_y + sp.height_minus1 + 1
+                        {
+                            scan.subpic_idx_for_slice[j] = i as u32;
+                            scan.subpic_level_slice_idx[j] = scan.num_slices_in_subpic[i];
+                            scan.num_slices_in_subpic[i] += 1;
+                        }
+                    }
+                }
+            }
+            _ => {
+                scan.num_slices_in_subpic = vec![n_slices as u32];
+                scan.subpic_level_slice_idx = (0..n_slices as u32).collect();
+                scan.subpic_idx_for_slice = vec![0; n_slices];
+            }
+        }
         Ok(scan)
+    }
+
+    /// Map a `(CurrSubpicIdx, sh_slice_address)` pair to the
+    /// picture-level slice index (§7.4.8: for rectangular layouts the
+    /// slice address is the subpicture-level slice index).
+    pub fn pic_level_slice_idx(&self, curr_subpic_idx: u32, sh_slice_address: u32) -> Result<u32> {
+        for j in 0..self.subpic_idx_for_slice.len() {
+            if self.subpic_idx_for_slice[j] == curr_subpic_idx
+                && self.subpic_level_slice_idx[j] == sh_slice_address
+            {
+                return Ok(j as u32);
+            }
+        }
+        Err(Error::invalid(format!(
+            "h266 tile scan: no slice with subpic idx {curr_subpic_idx} / address {sh_slice_address}"
+        )))
     }
 
     /// `AddCtbsToSlice` (eq. 22): append the CTB rectangle

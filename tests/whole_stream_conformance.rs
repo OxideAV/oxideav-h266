@@ -85,6 +85,7 @@ fn decode_whole_stream(bs: &[u8]) -> PictureBuffer {
         ph_sao_chroma_enabled_flag: ph.ph_sao_chroma_enabled_flag,
         num_extra_sh_bits: 0,
         nal_unit_type: NalUnitType::IdrNLp,
+        ..Default::default()
     };
     // r431 — every VCL NAL of the picture, in decode order.
     let slice_headers: Vec<_> = nals
