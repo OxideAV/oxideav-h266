@@ -580,6 +580,41 @@ at the edges, coded boundary BT, implicit-BT `depthOffset`,
 implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
 decode end-to-end.
 
+## JVET conformance triage (r434)
+
+The staged JVET FDIS-r1 conformance corpus (56 official bitstreams,
+`docs/video/h266/conformance/` in the workspace) now runs through a
+stream-level decoder: the new `stream::StreamDecoder` adds the glue an
+Annex-B elementary stream needs on top of the CTU walker — parameter-set
+/ APS pools, access-unit assembly (PH NAL, PH-in-SH, multi-slice),
+§8.3.1 POC, §8.3.2 reference-picture-list resolution against a DPB,
+§8.3.3-style retention, CLVSS / RASL handling across concatenated CVSs,
+per-slice walker wiring and conformance-crop propagation.
+`tests/jvet_conformance.rs` (a no-op without the docs tree) decodes
+every stream, hashes each output picture's cropped planes against the
+official `.opl` sidecars, and pins a per-stream verdict baseline.
+
+Corpus-driven r434 conformance fixes: full §7.3.7 slice-header parse
+for foreign wires (SH-carried `ref_pic_lists()`, `NumRefIdxActive`,
+collocated, SH `pred_weight_table()`, full embedded-PH parse, eq. 23
+subpicture slice addressing, `sps_rpl1_same_as_rpl0_flag` inference),
+the §7.3.11.11 thin-TB sub-block shapes (2x8 / 8x2 / 2x2), intra joint
+Cb-Cr parse + §8.7.2 reconstruction on all three intra TU paths, the
+dual-tree coding-tree walk rebuilt in the spec's interleaved bin order
+with the §7.4.12.4 picture-boundary walk + luma-tree QG arming (and
+the §7.3.11.10 chroma-tree `cu_qp_delta` exclusion), and the §7.4.8
+deblocking-parameter inheritance chain (PPS β / tC offsets were
+previously discarded). Current scorecard: **0 / 56 byte-exact** — 51
+streams gate on named unsupported tools (49 need the >8-bit
+reconstruction pipeline, the largest single family; plus 4:2:2 / 4:4:4,
+subpictures, explicit weighted prediction, intra multi-TB tiling,
+virtual boundaries), 1 stream decodes bin-exactly with a localized
+reconstruction divergence, 4 desync mid-stream (all 8-bit dual-tree
+RA streams; root-cause narrowed to a context-selection divergence in
+the intra-mode cascade that shifts the bypass-bin alignment without
+breaking termination). The corpus triage is the priority pick list for
+the next rounds.
+
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
 provides single / dual-reference DPB, integer-pel full-search motion
