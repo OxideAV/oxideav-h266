@@ -181,6 +181,15 @@ pub struct PicParameterSet {
     pub pps_deblocking_filter_control_present_flag: bool,
     pub pps_deblocking_filter_override_enabled_flag: bool,
     pub pps_deblocking_filter_disabled_flag: bool,
+    /// r434 — PPS-level deblocking β / tC offsets (§7.4.3.5). These are
+    /// the §7.4.8 inheritance source for slices that do not carry their
+    /// own deblocking parameters. 0 when not transmitted.
+    pub pps_luma_beta_offset_div2: i32,
+    pub pps_luma_tc_offset_div2: i32,
+    pub pps_cb_beta_offset_div2: i32,
+    pub pps_cb_tc_offset_div2: i32,
+    pub pps_cr_beta_offset_div2: i32,
+    pub pps_cr_tc_offset_div2: i32,
     pub pps_dbf_info_in_ph_flag: bool,
     /// Present only when `pps_no_pic_partition_flag == 0`; inferred to
     /// `false` otherwise (§7.4.3.5: every absent `pps_*_info_in_ph_flag`
@@ -578,6 +587,12 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
     // desynchronising every emitted / parsed PH + SH against conforming
     // implementations whenever pps_no_pic_partition_flag == 1.)
     let mut pps_dbf_info_in_ph_flag = false;
+    let mut pps_luma_beta_offset_div2 = 0i32;
+    let mut pps_luma_tc_offset_div2 = 0i32;
+    let mut pps_cb_beta_offset_div2 = 0i32;
+    let mut pps_cb_tc_offset_div2 = 0i32;
+    let mut pps_cr_beta_offset_div2 = 0i32;
+    let mut pps_cr_tc_offset_div2 = 0i32;
     if pps_deblocking_filter_control_present_flag {
         pps_deblocking_filter_override_enabled_flag = br.u1()? == 1;
         pps_deblocking_filter_disabled_flag = br.u1()? == 1;
@@ -587,13 +602,20 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
             pps_dbf_info_in_ph_flag = br.u1()? == 1;
         }
         if !pps_deblocking_filter_disabled_flag {
-            let _ = br.se()?; // pps_luma_beta_offset_div2
-            let _ = br.se()?; // pps_luma_tc_offset_div2
+            pps_luma_beta_offset_div2 = br.se()?;
+            pps_luma_tc_offset_div2 = br.se()?;
             if pps_chroma_tool_offsets_present_flag {
-                let _ = br.se()?;
-                let _ = br.se()?;
-                let _ = br.se()?;
-                let _ = br.se()?;
+                pps_cb_beta_offset_div2 = br.se()?;
+                pps_cb_tc_offset_div2 = br.se()?;
+                pps_cr_beta_offset_div2 = br.se()?;
+                pps_cr_tc_offset_div2 = br.se()?;
+            } else {
+                // §7.4.3.5 — chroma offsets inherit the luma pair when
+                // pps_chroma_tool_offsets_present_flag == 0.
+                pps_cb_beta_offset_div2 = pps_luma_beta_offset_div2;
+                pps_cb_tc_offset_div2 = pps_luma_tc_offset_div2;
+                pps_cr_beta_offset_div2 = pps_luma_beta_offset_div2;
+                pps_cr_tc_offset_div2 = pps_luma_tc_offset_div2;
             }
         }
     }
@@ -667,6 +689,12 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         pps_deblocking_filter_control_present_flag,
         pps_deblocking_filter_override_enabled_flag,
         pps_deblocking_filter_disabled_flag,
+        pps_luma_beta_offset_div2,
+        pps_luma_tc_offset_div2,
+        pps_cb_beta_offset_div2,
+        pps_cb_tc_offset_div2,
+        pps_cr_beta_offset_div2,
+        pps_cr_tc_offset_div2,
         pps_dbf_info_in_ph_flag,
         pps_rpl_info_in_ph_flag,
         pps_sao_info_in_ph_flag,
@@ -801,6 +829,12 @@ pub(crate) fn test_minimal_pps(pic_w: u32, pic_h: u32) -> PicParameterSet {
         pps_deblocking_filter_control_present_flag: false,
         pps_deblocking_filter_override_enabled_flag: false,
         pps_deblocking_filter_disabled_flag: false,
+        pps_luma_beta_offset_div2: 0,
+        pps_luma_tc_offset_div2: 0,
+        pps_cb_beta_offset_div2: 0,
+        pps_cb_tc_offset_div2: 0,
+        pps_cr_beta_offset_div2: 0,
+        pps_cr_tc_offset_div2: 0,
         pps_dbf_info_in_ph_flag: false,
         pps_rpl_info_in_ph_flag: true,
         pps_sao_info_in_ph_flag: true,

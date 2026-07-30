@@ -384,9 +384,29 @@ impl StreamDecoder {
 
     fn decode_picture(
         &mut self,
-        pic: PictureUnit,
+        mut pic: PictureUnit,
         sink: &mut dyn FnMut(DecodedPicture),
     ) -> Result<()> {
+        // §7.4.8 — when the PPS routes deblocking parameters through a
+        // separate PH NAL, absent slice-level parameters inherit the
+        // PH-carried values (the SH parser handles the embedded-PH and
+        // PPS arms itself).
+        if let Some(pps) = self.ppss.get(&(pic.ph.ph_pic_parameter_set_id as u8)) {
+            if pps.pps_dbf_info_in_ph_flag && pic.ph.deblocking.present_flag {
+                let d = pic.ph.deblocking;
+                for sh in &mut pic.slices {
+                    if !sh.sh_deblocking_params_present_flag && sh.embedded_ph.is_none() {
+                        sh.sh_deblocking_filter_disabled_flag = d.filter_disabled_flag;
+                        sh.sh_luma_beta_offset_div2 = d.luma_beta_offset_div2;
+                        sh.sh_luma_tc_offset_div2 = d.luma_tc_offset_div2;
+                        sh.sh_cb_beta_offset_div2 = d.cb_beta_offset_div2;
+                        sh.sh_cb_tc_offset_div2 = d.cb_tc_offset_div2;
+                        sh.sh_cr_beta_offset_div2 = d.cr_beta_offset_div2;
+                        sh.sh_cr_tc_offset_div2 = d.cr_tc_offset_div2;
+                    }
+                }
+            }
+        }
         let ph = &pic.ph;
         let (sps, pps) = self.resolve_ps(ph.ph_pic_parameter_set_id)?;
         let sps = sps.clone();

@@ -709,6 +709,44 @@ pub fn parse_slice_header_stateful(
                 out.sh_cb_tc_offset_div2 = br.se()?;
                 out.sh_cr_beta_offset_div2 = br.se()?;
                 out.sh_cr_tc_offset_div2 = br.se()?;
+            } else {
+                out.sh_cb_beta_offset_div2 = out.sh_luma_beta_offset_div2;
+                out.sh_cb_tc_offset_div2 = out.sh_luma_tc_offset_div2;
+                out.sh_cr_beta_offset_div2 = out.sh_luma_beta_offset_div2;
+                out.sh_cr_tc_offset_div2 = out.sh_luma_tc_offset_div2;
+            }
+        }
+    } else {
+        // r434 — §7.4.8 inheritance: absent slice deblocking parameters
+        // take the PH-carried values (when `pps_dbf_info_in_ph_flag`
+        // routes them there and the PH transmitted them) else the
+        // PPS-level values. Pre-r434 they silently stayed at 0 /
+        // enabled, mis-filtering every wire with non-default PPS
+        // offsets.
+        let ph_deb = out
+            .embedded_ph
+            .as_ref()
+            .filter(|_| pps.pps_dbf_info_in_ph_flag)
+            .map(|ph| ph.deblocking)
+            .filter(|d| d.present_flag);
+        match ph_deb {
+            Some(d) => {
+                out.sh_deblocking_filter_disabled_flag = d.filter_disabled_flag;
+                out.sh_luma_beta_offset_div2 = d.luma_beta_offset_div2;
+                out.sh_luma_tc_offset_div2 = d.luma_tc_offset_div2;
+                out.sh_cb_beta_offset_div2 = d.cb_beta_offset_div2;
+                out.sh_cb_tc_offset_div2 = d.cb_tc_offset_div2;
+                out.sh_cr_beta_offset_div2 = d.cr_beta_offset_div2;
+                out.sh_cr_tc_offset_div2 = d.cr_tc_offset_div2;
+            }
+            None => {
+                out.sh_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
+                out.sh_luma_beta_offset_div2 = pps.pps_luma_beta_offset_div2;
+                out.sh_luma_tc_offset_div2 = pps.pps_luma_tc_offset_div2;
+                out.sh_cb_beta_offset_div2 = pps.pps_cb_beta_offset_div2;
+                out.sh_cb_tc_offset_div2 = pps.pps_cb_tc_offset_div2;
+                out.sh_cr_beta_offset_div2 = pps.pps_cr_beta_offset_div2;
+                out.sh_cr_tc_offset_div2 = pps.pps_cr_tc_offset_div2;
             }
         }
     }
@@ -1028,6 +1066,12 @@ mod tests {
             pps_deblocking_filter_control_present_flag: false,
             pps_deblocking_filter_override_enabled_flag: false,
             pps_deblocking_filter_disabled_flag: false,
+            pps_luma_beta_offset_div2: 0,
+            pps_luma_tc_offset_div2: 0,
+            pps_cb_beta_offset_div2: 0,
+            pps_cb_tc_offset_div2: 0,
+            pps_cr_beta_offset_div2: 0,
+            pps_cr_tc_offset_div2: 0,
             pps_dbf_info_in_ph_flag: true,
             pps_rpl_info_in_ph_flag: true,
             pps_sao_info_in_ph_flag: true,
@@ -1231,6 +1275,48 @@ mod tests {
         let sh = parse_slice_header_stateful(&build(false), &sps, &pps, &ph_state).unwrap();
         assert!(!sh.sh_lmcs_used_flag);
         assert!(!sh.sh_explicit_scaling_list_used_flag);
+    }
+
+    /// r434 — §7.4.8: a slice without its own deblocking parameters
+    /// inherits the PPS-level β / tC offsets and disabled flag (they
+    /// previously stayed at 0 / enabled, mis-filtering every wire with
+    /// non-default PPS offsets).
+    #[test]
+    fn stateful_deblock_params_inherit_pps() {
+        let (sps, mut pps) = synthetic_sps_pps();
+        pps.pps_deblocking_filter_control_present_flag = true;
+        pps.pps_luma_beta_offset_div2 = 3;
+        pps.pps_luma_tc_offset_div2 = -2;
+        pps.pps_cb_beta_offset_div2 = 1;
+        pps.pps_cb_tc_offset_div2 = 2;
+        pps.pps_cr_beta_offset_div2 = -1;
+        pps.pps_cr_tc_offset_div2 = 4;
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrWRadl,
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(!sh.sh_deblocking_params_present_flag);
+        assert!(!sh.sh_deblocking_filter_disabled_flag);
+        assert_eq!(sh.sh_luma_beta_offset_div2, 3);
+        assert_eq!(sh.sh_luma_tc_offset_div2, -2);
+        assert_eq!(sh.sh_cb_beta_offset_div2, 1);
+        assert_eq!(sh.sh_cb_tc_offset_div2, 2);
+        assert_eq!(sh.sh_cr_beta_offset_div2, -1);
+        assert_eq!(sh.sh_cr_tc_offset_div2, 4);
+
+        // Disabled at PPS level → the slice inherits the disable.
+        pps.pps_deblocking_filter_disabled_flag = true;
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(sh.sh_deblocking_filter_disabled_flag);
     }
 
     /// §7.3.7 — without an embedded PH the two flags ARE transmitted
