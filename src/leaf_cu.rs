@@ -1980,10 +1980,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.tu_cb_coded_flag,
         )?;
         let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && chroma_cbf {
-            info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
-            info.cu_qp_delta_read = true;
-        }
+        // r434 — §7.3.11.10: `cu_qp_delta_abs` is gated on
+        // `treeType != DUAL_TREE_CHROMA`; the chroma tree never carries
+        // the luma QP delta (the pre-r434 read here desynced every
+        // dual-tree wire with `pps_cu_qp_delta_enabled_flag`).
         if self.tools.cu_chroma_qp_offset_enabled && chroma_cbf {
             let (flag, idx) = read_cu_chroma_qp_offset(
                 self.dec,

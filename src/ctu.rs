@@ -3584,68 +3584,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             return Ok(());
         }
-        // Clip the node to the picture (the scaffold's boundary model —
-        // the single-tree walker clips the CTU the same way).
-        let w = cb_size.min(pic_w - x0);
-        let h = cb_size.min(pic_h - y0);
+        // r434 — the component trees walk the FULL node square in the
+        // spec bin order (split bins interleaved with each leaf's
+        // coding_unit() bins) with §7.4.12.4 picture-boundary inferred
+        // splits; the §7.3.11.2 implicit-QT levels seed cqtDepth.
+        let ctb_log2 = self.layout.ctb_size_y.trailing_zeros();
+        let cqt_depth0 = ctb_log2.saturating_sub(cb_size.trailing_zeros());
 
         // ---- DUAL_TREE_LUMA ------------------------------------------------
-        let luma_local = TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
-            .with_neighbour_map_rebased(&mut self.nbr_map, x0, y0)
-            .with_tree_type(TreeType::DualTreeLuma)
-            .with_constraints(crate::coding_tree::SplitConstraints::intra_luma(
-                self.sps,
-                self.layout.pic_width_luma,
-                self.layout.pic_height_luma,
-            ))
-            .walk(0, 0, w, h)?;
-        let luma_cus: Vec<CtuCu> = luma_local
-            .into_iter()
-            .map(|c| CtuCu {
-                ctu_addr_rs,
-                cu: Cu {
-                    x: c.x + x0,
-                    y: c.y + y0,
-                    ..c
-                },
-            })
-            .collect();
-        let mut luma_infos = Vec::with_capacity(luma_cus.len());
-        let mut luma_residuals = Vec::with_capacity(luma_cus.len());
-        for ccu in &luma_cus {
-            let neigh = self.compute_cu_neighbourhood(ccu);
-            let tools = self.cu_tool_flags();
-            let mut info = LeafCuInfo {
-                x0: ccu.cu.x,
-                y0: ccu.cu.y,
-                cb_width: ccu.cu.w,
-                cb_height: ccu.cu.h,
-                ..LeafCuInfo::default()
-            };
-            let mut residual = LeafCuResidual::default();
-            let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
-                .with_tree_type(TreeType::DualTreeLuma)
-                .with_palette_predictor(&mut self.palette_pred);
-            reader.decode(&mut info, &mut residual, &neigh)?;
-            // Commit IntraPredModeY so this node's chroma tree (and any
-            // later chroma CU) can run the §8.4.3 DM derivation. A MIP
-            // CU's stored `intra_pred_mode_y` is 0 == INTRA_PLANAR,
-            // which is exactly the §8.4.3 IntraMipFlag arm for 4:2:0.
-            self.write_luma_mode_block(
-                ccu.cu.x,
-                ccu.cu.y,
-                ccu.cu.w,
-                ccu.cu.h,
-                info.intra_pred_mode_y,
-            );
-            // r409 — commit the parse-time CuPredMode / CuSkipFlag (+
-            // merge-side) grids in coding order so the next luma-tree
-            // CU's cu_skip_flag / pred_mode_ibc_flag ctxIncs see this
-            // CU (the dual-tree IBC prologue reads them).
-            self.commit_subblock_neighbour_state(ccu, &info);
-            luma_infos.push(info);
-            luma_residuals.push(residual);
-        }
+        let (luma_cus, luma_infos, luma_residuals, _) = self.walk_dual_tree_component(
+            ctu_addr_rs,
+            x0,
+            y0,
+            cb_size,
+            cqt_depth0,
+            TreeType::DualTreeLuma,
+            None,
+            None,
+        )?;
         for ((ccu, info), residual) in luma_cus
             .iter()
             .zip(luma_infos.iter())
@@ -3676,62 +3632,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return Ok(());
         }
         let cclm_simple = self.cclm_enabled_dual_tree_simple();
-        let (chroma_local, chroma_mtt_log) =
-            TreeWalker::new(&mut self.arith, &mut self.cabac.tree_ctxs)
-                .with_neighbour_map_rebased(&mut self.nbr_map_chroma, x0, y0)
-                .with_tree_type(TreeType::DualTreeChroma)
-                .with_constraints(crate::coding_tree::SplitConstraints::intra_chroma(
-                    self.sps,
-                    self.layout.pic_width_luma,
-                    self.layout.pic_height_luma,
-                ))
-                .walk_logged(0, 0, w, h)?;
-        let chroma_cus: Vec<CtuCu> = chroma_local
-            .into_iter()
-            .map(|c| CtuCu {
-                ctu_addr_rs,
-                cu: Cu {
-                    x: c.x + x0,
-                    y: c.y + y0,
-                    ..c
-                },
-            })
-            .collect();
-        let mut chroma_infos = Vec::with_capacity(chroma_cus.len());
-        let mut chroma_residuals = Vec::with_capacity(chroma_cus.len());
-        for ccu in &chroma_cus {
-            // §8.4.3 — collocated luma mode at the CB centre.
-            let dm_mode = self.luma_mode_at(ccu.cu.x + ccu.cu.w / 2, ccu.cu.y + ccu.cu.h / 2);
-            // §8.4.4 — CclmEnabled: the simple arms, or the per-CB
-            // 64-grid derivation against this node's two trees.
-            let cclm_enabled = cclm_simple.unwrap_or_else(|| {
-                cclm_enabled_64_grid(
-                    x0,
-                    y0,
-                    &chroma_cus,
-                    &chroma_mtt_log,
-                    &luma_cus,
-                    &luma_infos,
-                    ccu.cu.x,
-                    ccu.cu.y,
-                )
-            });
-            let tools = self.cu_tool_flags();
-            let mut info = LeafCuInfo {
-                x0: ccu.cu.x,
-                y0: ccu.cu.y,
-                cb_width: ccu.cu.w,
-                cb_height: ccu.cu.h,
-                ..LeafCuInfo::default()
-            };
-            let mut residual = LeafCuResidual::default();
-            let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
-                .with_tree_type(TreeType::DualTreeChroma)
-                .with_palette_predictor(&mut self.palette_pred);
-            reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
-            chroma_infos.push(info);
-            chroma_residuals.push(residual);
-        }
+        let (chroma_cus, chroma_infos, chroma_residuals, _) = self.walk_dual_tree_component(
+            ctu_addr_rs,
+            x0,
+            y0,
+            cb_size,
+            cqt_depth0,
+            TreeType::DualTreeChroma,
+            Some((&luma_cus, &luma_infos)),
+            cclm_simple,
+        )?;
         for ((ccu, info), residual) in chroma_cus
             .iter()
             .zip(chroma_infos.iter())
@@ -3740,6 +3650,442 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             self.reconstruct_leaf_cu_dual_chroma(ccu, info, residual, out)?;
         }
         Ok(())
+    }
+
+    /// r434 — one component coding_tree() of a dual-tree node, walked
+    /// in the SPEC bin order: the §7.3.11.4 recursion interleaves each
+    /// leaf's `coding_unit()` bins with the split bins (the pre-r434
+    /// TreeWalker batched all splits first, desyncing any multi-CU
+    /// node), and picture-boundary nodes take the §7.4.12.4 inferred
+    /// (bin-less) splits over the FULL node square instead of a
+    /// clipped rectangle. Mirrors [`Self::decode_ctu_full`], with the
+    /// dual-tree specifics: per-tree constraints + neighbour map, the
+    /// implicit-QT `cqtDepth` seed, luma-tree quantization-group
+    /// declarations (§7.3.11.4 — the chroma tree never reads
+    /// `cu_qp_delta_abs` per §7.3.11.10), the chroma-tree §8.4.3 DM /
+    /// §8.4.4 CclmEnabled inputs, and the MttSplitMode log (node-local
+    /// coordinates) the 64-grid CCLM derivation consumes.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn walk_dual_tree_component(
+        &mut self,
+        ctu_addr_rs: u32,
+        node_x: u32,
+        node_y: u32,
+        node_size: u32,
+        cqt_depth0: u32,
+        tree: TreeType,
+        luma_ctx: Option<(&[CtuCu], &[LeafCuInfo])>,
+        cclm_simple: Option<bool>,
+    ) -> Result<(
+        Vec<CtuCu>,
+        Vec<LeafCuInfo>,
+        Vec<LeafCuResidual>,
+        Vec<crate::coding_tree::MttSplitRec>,
+    )> {
+        struct Node {
+            x: u32,
+            y: u32,
+            w: u32,
+            h: u32,
+            cqt_depth: u32,
+            mtt_depth: u32,
+            parent_tt_ver: Option<bool>,
+            part_idx: u32,
+            cb_subdiv: u32,
+            qg_on_y: bool,
+            depth_offset: u32,
+        }
+        let is_luma = tree == TreeType::DualTreeLuma;
+        let constraints = if is_luma {
+            crate::coding_tree::SplitConstraints::intra_luma(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            )
+        } else {
+            crate::coding_tree::SplitConstraints::intra_chroma(
+                self.sps,
+                self.layout.pic_width_luma,
+                self.layout.pic_height_luma,
+            )
+        };
+        let pic_w = self.layout.pic_width_luma;
+        let pic_h = self.layout.pic_height_luma;
+        let mut cus: Vec<CtuCu> = Vec::new();
+        let mut infos: Vec<LeafCuInfo> = Vec::new();
+        let mut residuals: Vec<LeafCuResidual> = Vec::new();
+        let mut mtt_log: Vec<crate::coding_tree::MttSplitRec> = Vec::new();
+        let mut stack = vec![Node {
+            x: 0,
+            y: 0,
+            w: node_size,
+            h: node_size,
+            cqt_depth: cqt_depth0,
+            mtt_depth: 0,
+            parent_tt_ver: None,
+            part_idx: 0,
+            cb_subdiv: 0,
+            qg_on_y: true,
+            depth_offset: 0,
+        }];
+        while let Some(n) = stack.pop() {
+            // §7.3.11.4 luma-tree QG declaration (r434 — dual-tree QG
+            // arming: previously the dual walk never armed QGs).
+            if is_luma
+                && self.pps.pps_cu_qp_delta_enabled_flag
+                && n.qg_on_y
+                && n.cb_subdiv <= self.cu_qp_delta_subdiv
+            {
+                self.qg_delta_coded = false;
+                self.qg_delta_val = 0;
+                self.qg_qp_y_pred = self.derive_qp_y_pred(node_x + n.x, node_y + n.y);
+            }
+            let allows = constraints.allows_off(
+                node_x + n.x,
+                node_y + n.y,
+                n.w,
+                n.h,
+                n.mtt_depth,
+                tree,
+                n.parent_tt_ver,
+                n.part_idx,
+                n.depth_offset,
+            );
+            let nbr_map = if is_luma {
+                &self.nbr_map
+            } else {
+                &self.nbr_map_chroma
+            };
+            let (
+                left_avail,
+                above_avail,
+                cb_height_left,
+                cb_width_above,
+                cqt_depth_left,
+                cqt_depth_above,
+            ) = nbr_map.neighbour_state(node_x + n.x, node_y + n.y);
+            let in_pic = node_x + n.x + n.w <= pic_w && node_y + n.y + n.h <= pic_h;
+            let split_cu = if allows.any() && in_pic {
+                let inc = crate::ctx::ctx_inc_split_cu_flag(
+                    left_avail,
+                    above_avail,
+                    cb_height_left,
+                    cb_width_above,
+                    n.w,
+                    n.h,
+                    allows.bt_ver as u32,
+                    allows.bt_hor as u32,
+                    allows.tt_ver as u32,
+                    allows.tt_hor as u32,
+                    allows.qt as u32,
+                ) as usize;
+                let ctx_n = self.cabac.tree_ctxs.split_cu.len() - 1;
+                self.arith
+                    .decode_decision(&mut self.cabac.tree_ctxs.split_cu[inc.min(ctx_n)])?
+            } else {
+                u32::from(!in_pic)
+            };
+            if split_cu == 0 {
+                let abs_x = node_x + n.x;
+                let abs_y = node_y + n.y;
+                if is_luma {
+                    self.nbr_map.insert(abs_x, abs_y, n.w, n.h, n.cqt_depth);
+                } else {
+                    self.nbr_map_chroma
+                        .insert(abs_x, abs_y, n.w, n.h, n.cqt_depth);
+                }
+                let ccu = CtuCu {
+                    ctu_addr_rs,
+                    cu: Cu {
+                        x: abs_x,
+                        y: abs_y,
+                        w: n.w,
+                        h: n.h,
+                        cqt_depth: n.cqt_depth,
+                        mtt_depth: n.mtt_depth,
+                    },
+                };
+                let (info, residual) = if is_luma {
+                    let neigh = self.compute_cu_neighbourhood(&ccu);
+                    let mut tools = self.cu_tool_flags();
+                    tools.cu_qp_delta_already_coded = self.qg_delta_coded;
+                    let mut info = LeafCuInfo {
+                        x0: ccu.cu.x,
+                        y0: ccu.cu.y,
+                        cb_width: ccu.cu.w,
+                        cb_height: ccu.cu.h,
+                        cu_qp_delta_val: self.qg_delta_val,
+                        ..LeafCuInfo::default()
+                    };
+                    let mut residual = LeafCuResidual::default();
+                    let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+                        .with_tree_type(TreeType::DualTreeLuma)
+                        .with_palette_predictor(&mut self.palette_pred);
+                    reader.decode(&mut info, &mut residual, &neigh)?;
+                    // r418-shape QG fold (§7.4.11.8 + §8.7.1 eq. 1120).
+                    if self.pps.pps_cu_qp_delta_enabled_flag {
+                        if info.cu_qp_delta_read {
+                            self.qg_delta_coded = true;
+                            self.qg_delta_val = info.cu_qp_delta_val;
+                        }
+                        let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
+                        let qp_y =
+                            (self.qg_qp_y_pred + info.cu_qp_delta_val + 64 + 2 * qp_bd_offset)
+                                .rem_euclid(64 + qp_bd_offset)
+                                - qp_bd_offset;
+                        info.cu_qp_delta_val = qp_y - self.cabac.slice_qp_y.0;
+                        self.commit_qp_y(ccu.cu.x, ccu.cu.y, ccu.cu.w, ccu.cu.h, qp_y);
+                    }
+                    // Commit parse-order state: IntraPredModeY for the
+                    // sibling chroma tree's DM + the r409 grids.
+                    self.write_luma_mode_block(
+                        ccu.cu.x,
+                        ccu.cu.y,
+                        ccu.cu.w,
+                        ccu.cu.h,
+                        info.intra_pred_mode_y,
+                    );
+                    self.commit_subblock_neighbour_state(&ccu, &info);
+                    (info, residual)
+                } else {
+                    // §8.4.3 — collocated luma mode at the CB centre.
+                    let dm_mode =
+                        self.luma_mode_at(ccu.cu.x + ccu.cu.w / 2, ccu.cu.y + ccu.cu.h / 2);
+                    // §8.4.4 CclmEnabled — the simple arms, or the
+                    // per-CB 64-grid derivation. The grid consumes the
+                    // chroma CUs/splits decoded SO FAR plus this CB
+                    // (its coverers precede it in decode order).
+                    let (luma_cus, luma_infos) = luma_ctx.unwrap_or((&[], &[]));
+                    let cclm_enabled = cclm_simple.unwrap_or_else(|| {
+                        let mut with_self = cus.clone();
+                        with_self.push(ccu);
+                        cclm_enabled_64_grid(
+                            node_x, node_y, &with_self, &mtt_log, luma_cus, luma_infos, ccu.cu.x,
+                            ccu.cu.y,
+                        )
+                    });
+                    let tools = self.cu_tool_flags();
+                    let mut info = LeafCuInfo {
+                        x0: ccu.cu.x,
+                        y0: ccu.cu.y,
+                        cb_width: ccu.cu.w,
+                        cb_height: ccu.cu.h,
+                        ..LeafCuInfo::default()
+                    };
+                    let mut residual = LeafCuResidual::default();
+                    let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+                        .with_tree_type(TreeType::DualTreeChroma)
+                        .with_palette_predictor(&mut self.palette_pred);
+                    reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
+                    (info, residual)
+                };
+                cus.push(ccu);
+                infos.push(info);
+                residuals.push(residual);
+                continue;
+            }
+            let split_qt = if allows.qt && allows.any_mtt() {
+                let inc = crate::ctx::ctx_inc_split_qt_flag(
+                    left_avail,
+                    above_avail,
+                    cqt_depth_left,
+                    cqt_depth_above,
+                    n.cqt_depth,
+                ) as usize;
+                let ctx_n = self.cabac.tree_ctxs.split_qt.len() - 1;
+                self.arith
+                    .decode_decision(&mut self.cabac.tree_ctxs.split_qt[inc.min(ctx_n)])?
+            } else if !allows.any() {
+                1
+            } else {
+                u32::from(allows.qt)
+            };
+            let children: Vec<Node> = if split_qt == 1 {
+                let hw = n.w / 2;
+                let hh = n.h / 2;
+                let x1_in = node_x + n.x + hw < pic_w;
+                let y1_in = node_y + n.y + hh < pic_h;
+                let mk = |x, y, part_idx| Node {
+                    x,
+                    y,
+                    w: hw,
+                    h: hh,
+                    cqt_depth: n.cqt_depth + 1,
+                    mtt_depth: n.mtt_depth,
+                    parent_tt_ver: None,
+                    part_idx,
+                    cb_subdiv: n.cb_subdiv + 2,
+                    qg_on_y: n.qg_on_y,
+                    depth_offset: 0,
+                };
+                let all = vec![
+                    mk(n.x, n.y, 0),
+                    mk(n.x + hw, n.y, 1),
+                    mk(n.x, n.y + hh, 2),
+                    mk(n.x + hw, n.y + hh, 3),
+                ];
+                all.into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| match i {
+                        1 => x1_in,
+                        2 => y1_in,
+                        3 => x1_in && y1_in,
+                        _ => true,
+                    })
+                    .map(|(_, c)| c)
+                    .collect()
+            } else {
+                let mtt_vertical =
+                    if (allows.bt_hor || allows.tt_hor) && (allows.bt_ver || allows.tt_ver) {
+                        let inc = crate::ctx::ctx_inc_mtt_split_cu_vertical_flag(
+                            left_avail,
+                            above_avail,
+                            cb_height_left,
+                            cb_width_above,
+                            n.w,
+                            n.h,
+                            allows.bt_ver as u32,
+                            allows.bt_hor as u32,
+                            allows.tt_ver as u32,
+                            allows.tt_hor as u32,
+                        ) as usize;
+                        let mtt_v_n = self.cabac.tree_ctxs.mtt_split_vertical.len() - 1;
+                        self.arith.decode_decision(
+                            &mut self.cabac.tree_ctxs.mtt_split_vertical[inc.min(mtt_v_n)],
+                        )?
+                    } else if allows.bt_hor || allows.tt_hor {
+                        0
+                    } else {
+                        1
+                    };
+                let bin_coded = if mtt_vertical == 1 {
+                    allows.bt_ver && allows.tt_ver
+                } else {
+                    allows.bt_hor && allows.tt_hor
+                };
+                let mtt_binary = if bin_coded {
+                    let inc =
+                        crate::ctx::ctx_inc_mtt_split_cu_binary_flag(mtt_vertical, n.mtt_depth)
+                            as usize;
+                    let mtt_b_n = self.cabac.tree_ctxs.mtt_split_binary.len() - 1;
+                    self.arith.decode_decision(
+                        &mut self.cabac.tree_ctxs.mtt_split_binary[inc.min(mtt_b_n)],
+                    )?
+                } else if !allows.bt_ver && !allows.bt_hor {
+                    0
+                } else if !allows.tt_ver && !allows.tt_hor {
+                    1
+                } else if allows.bt_hor && allows.tt_ver {
+                    1 - mtt_vertical
+                } else {
+                    mtt_vertical
+                };
+                // MttSplitMode log (node-local coordinates) for the
+                // §8.4.4 64-grid derivation.
+                mtt_log.push(crate::coding_tree::MttSplitRec {
+                    x: n.x,
+                    y: n.y,
+                    mtt_depth: n.mtt_depth,
+                    vertical: mtt_vertical == 1,
+                    binary: mtt_binary == 1,
+                });
+                if mtt_binary == 1 {
+                    if mtt_vertical == 1 {
+                        let hw = n.w / 2;
+                        let bt_doff = n.depth_offset + u32::from(node_x + n.x + n.w > pic_w);
+                        let x1_in = node_x + n.x + hw < pic_w;
+                        let mk = |x, part_idx| Node {
+                            x,
+                            y: n.y,
+                            w: hw,
+                            h: n.h,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                            parent_tt_ver: None,
+                            part_idx,
+                            cb_subdiv: n.cb_subdiv + 1,
+                            qg_on_y: n.qg_on_y,
+                            depth_offset: bt_doff,
+                        };
+                        let mut v = vec![mk(n.x, 0), mk(n.x + hw, 1)];
+                        if !x1_in {
+                            v.truncate(1);
+                        }
+                        v
+                    } else {
+                        let hh = n.h / 2;
+                        let bt_doff = n.depth_offset + u32::from(node_y + n.y + n.h > pic_h);
+                        let y1_in = node_y + n.y + hh < pic_h;
+                        let mk = |y, part_idx| Node {
+                            x: n.x,
+                            y,
+                            w: n.w,
+                            h: hh,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                            parent_tt_ver: None,
+                            part_idx,
+                            cb_subdiv: n.cb_subdiv + 1,
+                            qg_on_y: n.qg_on_y,
+                            depth_offset: bt_doff,
+                        };
+                        let mut v = vec![mk(n.y, 0), mk(n.y + hh, 1)];
+                        if !y1_in {
+                            v.truncate(1);
+                        }
+                        v
+                    }
+                } else {
+                    let qg_next = n.qg_on_y && n.cb_subdiv + 2 <= self.cu_qp_delta_subdiv;
+                    let tt = Some(mtt_vertical == 1);
+                    if mtt_vertical == 1 {
+                        let q = n.w / 4;
+                        let mk = |x, w, part_idx, sub| Node {
+                            x,
+                            y: n.y,
+                            w,
+                            h: n.h,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                            parent_tt_ver: tt,
+                            part_idx,
+                            cb_subdiv: n.cb_subdiv + sub,
+                            qg_on_y: qg_next,
+                            depth_offset: n.depth_offset,
+                        };
+                        vec![
+                            mk(n.x, q, 0, 2),
+                            mk(n.x + q, q * 2, 1, 1),
+                            mk(n.x + q * 3, q, 2, 2),
+                        ]
+                    } else {
+                        let q = n.h / 4;
+                        let mk = |y, h, part_idx, sub| Node {
+                            x: n.x,
+                            y,
+                            w: n.w,
+                            h,
+                            cqt_depth: n.cqt_depth,
+                            mtt_depth: n.mtt_depth + 1,
+                            parent_tt_ver: tt,
+                            part_idx,
+                            cb_subdiv: n.cb_subdiv + sub,
+                            qg_on_y: qg_next,
+                            depth_offset: n.depth_offset,
+                        };
+                        vec![
+                            mk(n.y, q, 0, 2),
+                            mk(n.y + q, q * 2, 1, 1),
+                            mk(n.y + q * 3, q, 2, 2),
+                        ]
+                    }
+                }
+            };
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        Ok((cus, infos, residuals, mtt_log))
     }
 
     /// Reconstruct a DUAL_TREE_CHROMA leaf CU — the Cb + Cr planes only,
