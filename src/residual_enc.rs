@@ -374,13 +374,17 @@ pub fn encode_tb_coefficients_opts(
 
     let (num_sb_w, num_sb_h) = sb_grid(zo_w, zo_h);
     let sb_origins = sb_scan_positions(zo_w, zo_h);
+    // §7.3.11.11 — sub-block shape (r434: thin TBs stretch the other
+    // dimension; sub-blocks are NOT always 4x4 / 16 coefficients).
+    let (sb_dim_w, sb_dim_h) = crate::scan::sb_coeff_dims(zo_w, zo_h);
+    let nsc = sb_dim_w * sb_dim_h;
 
     // Find the sub-block that contains the last-sig position.
     let mut last_sb_idx = 0usize;
     let mut last_scan_pos_in_sb = 0usize;
     for sb_idx in 0..(num_sb_w * num_sb_h) {
-        let start = sb_idx * 16;
-        let end = (start + 16).min(positions.len());
+        let start = sb_idx * nsc;
+        let end = (start + nsc).min(positions.len());
         for (k, &(xc, yc)) in positions[start..end].iter().enumerate() {
             if xc == last_x && yc == last_y {
                 last_sb_idx = sb_idx;
@@ -398,8 +402,8 @@ pub fn encode_tb_coefficients_opts(
         // have the parity of the `QState > 1` offset.
         let mut q: i32 = 0;
         for sb_idx in (0..=last_sb_idx).rev() {
-            let start = sb_idx * 16;
-            let end = (start + 16).min(positions.len());
+            let start = sb_idx * nsc;
+            let end = (start + nsc).min(positions.len());
             for k in (0..(end - start)).rev() {
                 let (xc, yc) = positions[start + k];
                 let idx = (yc as usize) * n_tb_w + (xc as usize);
@@ -430,15 +434,18 @@ pub fn encode_tb_coefficients_opts(
     // Walk sub-blocks in reverse diagonal scan order starting at last_sb_idx.
     for sb_idx in (0..=last_sb_idx).rev() {
         let sb_origin = sb_origins[sb_idx];
-        let (xs, ys) = ((sb_origin.0 >> 2) as usize, (sb_origin.1 >> 2) as usize);
+        let (xs, ys) = (
+            sb_origin.0 as usize / sb_dim_w,
+            sb_origin.1 as usize / sb_dim_h,
+        );
 
         let right = xs + 1 < num_sb_w && sb_coded[ys * num_sb_w + (xs + 1)];
         let below = ys + 1 < num_sb_h && sb_coded[(ys + 1) * num_sb_w + xs];
         let csbf = csbf_ctx_regular(right, below);
 
         // Determine if this sub-block is coded (has any non-zero coeff).
-        let start = sb_idx * 16;
-        let end = (start + 16).min(positions.len());
+        let start = sb_idx * nsc;
+        let end = (start + nsc).min(positions.len());
         let sb_has_nonzero = positions[start..end]
             .iter()
             .any(|&(xc, yc)| abs_level[(yc as usize) * n_tb_w + (xc as usize)] != 0);
@@ -720,10 +727,11 @@ pub fn condition_levels_for_sdh(levels: &mut [i32], n_tb_w: usize, n_tb_h: usize
     debug_assert_eq!(levels.len(), n_tb_w * n_tb_h);
     let positions = coeff_scan_positions(n_tb_w, n_tb_h);
     let (num_sb_w, num_sb_h) = sb_grid(n_tb_w, n_tb_h);
+    let nsc = crate::scan::num_sb_coeff(n_tb_w, n_tb_h);
     let mut adjusted = 0usize;
     for sb_idx in 0..(num_sb_w * num_sb_h) {
-        let start = sb_idx * 16;
-        let end = (start + 16).min(positions.len());
+        let start = sb_idx * nsc;
+        let end = (start + nsc).min(positions.len());
         let mut first_sig: i32 = (end - start) as i32;
         let mut last_sig: i32 = -1;
         let mut sum_abs: u64 = 0;

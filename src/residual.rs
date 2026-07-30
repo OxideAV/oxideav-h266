@@ -599,14 +599,18 @@ pub fn decode_tb_coefficients_opts(
     let (num_sb_w, num_sb_h) = sb_grid(zo_w, zo_h);
     let positions = coeff_scan_positions(zo_w, zo_h);
     let sb_origins = crate::scan::sb_scan_positions(zo_w, zo_h);
+    // §7.3.11.11 — sub-block shape (r434: thin TBs stretch the other
+    // dimension; sub-blocks are NOT always 4x4 / 16 coefficients).
+    let (sb_dim_w, sb_dim_h) = crate::scan::sb_coeff_dims(zo_w, zo_h);
+    let nsc = sb_dim_w * sb_dim_h;
 
     // Find the sub-block that contains the last-sig position plus the
     // within-sub-block scan index of that position.
     let mut last_sb_idx = 0usize;
     let mut last_scan_pos_in_sb = 0usize;
     for sb_idx in 0..(num_sb_w * num_sb_h) {
-        let start = sb_idx * 16;
-        let end = (start + 16).min(positions.len());
+        let start = sb_idx * nsc;
+        let end = (start + nsc).min(positions.len());
         for (k, &(xc, yc)) in positions[start..end].iter().enumerate() {
             if xc == last.x && yc == last.y {
                 last_sb_idx = sb_idx;
@@ -654,7 +658,10 @@ pub fn decode_tb_coefficients_opts(
     // last_sb_idx. Sub-block 0 and `last_sb_idx` are inferred coded.
     for sb_idx in (0..=last_sb_idx).rev() {
         let sb_origin = sb_origins[sb_idx];
-        let (xs, ys) = ((sb_origin.0 >> 2) as usize, (sb_origin.1 >> 2) as usize);
+        let (xs, ys) = (
+            sb_origin.0 as usize / sb_dim_w,
+            sb_origin.1 as usize / sb_dim_h,
+        );
         let right = xs + 1 < num_sb_w && sb_coded[ys * num_sb_w + (xs + 1)];
         let below = ys + 1 < num_sb_h && sb_coded[(ys + 1) * num_sb_w + xs];
         let csbf = csbf_ctx_regular(right, below);
@@ -687,8 +694,8 @@ pub fn decode_tb_coefficients_opts(
             continue;
         }
 
-        let start = sb_idx * 16;
-        let end = (start + 16).min(positions.len());
+        let start = sb_idx * nsc;
+        let end = (start + nsc).min(positions.len());
         let num_sb_coeff = end - start;
 
         // §7.3.11.11 `firstSigScanPosSb` / `lastSigScanPosSb` — the
@@ -1092,9 +1099,11 @@ pub fn decode_ts_tb_coefficients(
     let positions = coeff_scan_positions(n_tb_w, n_tb_h);
     let sb_origins = crate::scan::sb_scan_positions(n_tb_w, n_tb_h);
     // Sub-block-grid coordinates in scan order (xS, yS), in sub-block units.
+    let (sb_dim_w, sb_dim_h) = crate::scan::sb_coeff_dims(n_tb_w, n_tb_h);
+    let nsc = sb_dim_w * sb_dim_h;
     let sb_grid_coords: Vec<(u32, u32)> = sb_origins
         .iter()
-        .map(|&(ox, oy)| (ox / 4, oy / 4))
+        .map(|&(ox, oy)| (ox / sb_dim_w as u32, oy / sb_dim_h as u32))
         .collect();
     // sb_coded_flag indexed by sub-block grid coordinate.
     let mut sb_coded = vec![false; num_sb_w * num_sb_h];
@@ -1120,8 +1129,8 @@ pub fn decode_ts_tb_coefficients(
         }
 
         // Positions of this sub-block in scan order (already TB-clipped).
-        let sb_start = i * 16;
-        let sb_end = (sb_start + 16).min(positions.len());
+        let sb_start = i * nsc;
+        let sb_end = (sb_start + nsc).min(positions.len());
         let sb_positions = &positions[sb_start..sb_end];
         let num_sb_coeff = sb_positions.len();
 

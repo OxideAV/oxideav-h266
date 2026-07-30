@@ -580,8 +580,8 @@ fn corpus_decode_triage() {
 /// F = fail (decodes, diverges), U = unsupported tool, E = error.
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("10b422_B_5", 'U'),          // 10-bit + 4:2:2
-    ("8b400_A_2", 'E'),           // residual sub-block panic (family: monochrome walk)
-    ("8b420_A_2", 'E'),           // residual sub-block panic
+    ("8b400_A_2", 'U'),           // intra multi-TB-per-CU tiling (128x128 CU) not wired
+    ("8b420_A_2", 'U'),           // dual-tree chroma JCCR parse not plumbed
     ("8b420_B_2", 'U'),           // dual-tree chroma JCCR parse not plumbed
     ("8b444_A_2", 'U'),           // 4:4:4
     ("AFF_A_2", 'U'),             // 10-bit
