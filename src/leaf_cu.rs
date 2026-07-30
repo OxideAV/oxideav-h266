@@ -1993,12 +1993,22 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
         }
+        // §7.3.11.10 — tu_joint_cbcr_residual_flag (dual-tree chroma
+        // CUs are MODE_INTRA, so the presence condition reduces to any
+        // chroma CBF). §7.4.12.11 then derives TuCResMode.
         if self.tools.joint_cbcr_enabled && chroma_cbf {
-            return Err(Error::unsupported(
-                "h266 leaf CU (dual-tree chroma): tu_joint_cbcr_residual_flag parsing \
-                 not plumbed yet",
-            ));
+            info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+            )?;
         }
+        info.tu_c_res_mode = derive_tu_c_res_mode(
+            info.tu_joint_cbcr_residual_flag,
+            info.tu_cb_coded_flag,
+            info.tu_cr_coded_flag,
+        );
         let cw = cb_w / sub_w as usize;
         let ch = cb_h / sub_h as usize;
         // §7.3.11.5 — LfnstDcOnly / LfnstZeroOutSigCoeffFlag accumulate
@@ -2010,7 +2020,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 let coded = if c_idx == 1 {
                     info.tu_cb_coded_flag
                 } else {
+                    // §7.3.11.10 — the Cr block (transform_skip_flag +
+                    // residual coding) is absent when the joint flag
+                    // says Cb's coded TB carries both components.
                     info.tu_cr_coded_flag
+                        && !(info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag)
                 };
                 if !coded {
                     continue;
@@ -4068,17 +4082,26 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
         }
-        // joint_cbcr_residual_flag — gate exists but parsing not
-        // plumbed; surface Unsupported when it would actually fire.
+        // §7.3.11.10 — tu_joint_cbcr_residual_flag: read for intra CUs
+        // with any chroma CBF, and for others when both CBFs are set.
+        // §7.4.12.11 then derives TuCResMode.
         if self.tools.joint_cbcr_enabled
             && chroma
             && ((info.pred_mode == CuPredMode::Intra && chroma_cbf)
                 || (info.tu_cb_coded_flag && info.tu_cr_coded_flag))
         {
-            return Err(Error::unsupported(
-                "h266 leaf CU: tu_joint_cbcr_residual_flag parsing not plumbed yet",
-            ));
+            info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+            )?;
         }
+        info.tu_c_res_mode = derive_tu_c_res_mode(
+            info.tu_joint_cbcr_residual_flag,
+            info.tu_cb_coded_flag,
+            info.tu_cr_coded_flag,
+        );
 
         // Residual decode per plane.
         if info.tu_y_coded_flag {
@@ -4187,7 +4210,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 residual.cb_levels = levels;
             }
         }
-        if info.tu_cr_coded_flag && chroma {
+        if info.tu_cr_coded_flag
+            && chroma
+            && !(info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag)
+        {
             let cw = cb_w / sub_w;
             let ch = cb_h / sub_h;
             if cw >= 2 && ch >= 2 {
@@ -4529,15 +4555,25 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
         }
+        // §7.3.11.10 — tu_joint_cbcr_residual_flag on the ISP path
+        // (ISP CUs are MODE_INTRA); §7.4.12.11 TuCResMode derivation.
         if self.tools.joint_cbcr_enabled
             && chroma
             && ((info.pred_mode == CuPredMode::Intra && chroma_cbf)
                 || (info.tu_cb_coded_flag && info.tu_cr_coded_flag))
         {
-            return Err(Error::unsupported(
-                "h266 leaf CU ISP: tu_joint_cbcr_residual_flag parsing not plumbed yet",
-            ));
+            info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+            )?;
         }
+        info.tu_c_res_mode = derive_tu_c_res_mode(
+            info.tu_joint_cbcr_residual_flag,
+            info.tu_cb_coded_flag,
+            info.tu_cr_coded_flag,
+        );
 
         // Chroma residuals (single-pass at the CU level — chroma is
         // not split for ISP per eqs. 251 – 254).
@@ -4556,7 +4592,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 .0;
             }
         }
-        if info.tu_cr_coded_flag && chroma {
+        if info.tu_cr_coded_flag
+            && chroma
+            && !(info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag)
+        {
             let cw = (cb_w / sub_w) as usize;
             let ch = (cb_h / sub_h) as usize;
             if cw >= 2 && ch >= 2 {

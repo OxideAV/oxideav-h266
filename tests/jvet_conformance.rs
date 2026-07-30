@@ -581,8 +581,8 @@ fn corpus_decode_triage() {
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("10b422_B_5", 'U'),          // 10-bit + 4:2:2
     ("8b400_A_2", 'U'),           // intra multi-TB-per-CU tiling (128x128 CU) not wired
-    ("8b420_A_2", 'U'),           // dual-tree chroma JCCR parse not plumbed
-    ("8b420_B_2", 'U'),           // dual-tree chroma JCCR parse not plumbed
+    ("8b420_A_2", 'E'),           // dual-tree walk: batched split/CU bin order + boundary clip
+    ("8b420_B_2", 'E'),           // dual-tree walk: batched split/CU bin order + boundary clip
     ("8b444_A_2", 'U'),           // 4:4:4
     ("AFF_A_2", 'U'),             // 10-bit
     ("ALF_A_3", 'U'),             // 10-bit
@@ -593,8 +593,8 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("BDPCM_A_2", 'U'),           // 10-bit
     ("CCLM_A_2", 'U'),            // 10-bit
     ("CST_A_4", 'U'),             // 10-bit
-    ("CodingToolsSets_A_2", 'U'), // dual-tree chroma JCCR parse not plumbed
-    ("CodingToolsSets_B_2", 'U'), // dual-tree chroma JCCR parse not plumbed
+    ("CodingToolsSets_A_2", 'E'), // dual-tree walk: batched split/CU bin order + boundary clip
+    ("CodingToolsSets_B_2", 'E'), // dual-tree walk: batched split/CU bin order + boundary clip
     ("CodingToolsSets_C_2", 'U'), // 10-bit
     ("CodingToolsSets_D_2", 'U'), // 10-bit
     ("CodingToolsSets_E_1", 'U'), // 10-bit (+ subpictures + WP)

@@ -3791,26 +3791,53 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         } else {
             None
         };
-        self.reconstruct_chroma_plane_lfnst(
-            /*c_idx=*/ 1,
-            cu,
-            info,
-            &residual.cb_levels,
-            info.tu_cb_coded_flag,
-            bit_depth,
-            out,
-            lfnst_pm,
-        )?;
-        self.reconstruct_chroma_plane_lfnst(
-            /*c_idx=*/ 2,
-            cu,
-            info,
-            &residual.cr_levels,
-            info.tu_cr_coded_flag,
-            bit_depth,
-            out,
-            lfnst_pm,
-        )?;
+        if info.tu_c_res_mode != 0 {
+            // §8.7.2 joint Cb-Cr: write both predictions (zero
+            // residual), then derive + add both residuals from the
+            // single coded TB.
+            self.reconstruct_chroma_plane_lfnst(
+                /*c_idx=*/ 1,
+                cu,
+                info,
+                &[],
+                false,
+                bit_depth,
+                out,
+                lfnst_pm,
+            )?;
+            self.reconstruct_chroma_plane_lfnst(
+                /*c_idx=*/ 2,
+                cu,
+                info,
+                &[],
+                false,
+                bit_depth,
+                out,
+                lfnst_pm,
+            )?;
+            self.add_intra_joint_cbcr_residual(cu, info, residual, bit_depth, lfnst_pm, out)?;
+        } else {
+            self.reconstruct_chroma_plane_lfnst(
+                /*c_idx=*/ 1,
+                cu,
+                info,
+                &residual.cb_levels,
+                info.tu_cb_coded_flag,
+                bit_depth,
+                out,
+                lfnst_pm,
+            )?;
+            self.reconstruct_chroma_plane_lfnst(
+                /*c_idx=*/ 2,
+                cu,
+                info,
+                &residual.cr_levels,
+                info.tu_cr_coded_flag,
+                bit_depth,
+                out,
+                lfnst_pm,
+            )?;
+        }
         // §8.7.5.1 eq. 1212 — chroma-tree CUs mark the chroma planes.
         self.mark_reconstructed_chroma(
             cu.cu.x / 2,
@@ -4092,24 +4119,32 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // The luma plane is fully written by the ISP walker so the
             // single-TB luma block (steps 1 – 5) is skipped.
             if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
-                self.reconstruct_chroma_plane(
-                    /*c_idx=*/ 1,
-                    cu,
-                    info,
-                    &residual.cb_levels,
-                    info.tu_cb_coded_flag,
-                    bit_depth,
-                    out,
-                )?;
-                self.reconstruct_chroma_plane(
-                    /*c_idx=*/ 2,
-                    cu,
-                    info,
-                    &residual.cr_levels,
-                    info.tu_cr_coded_flag,
-                    bit_depth,
-                    out,
-                )?;
+                if info.tu_c_res_mode != 0 {
+                    // §8.7.2 joint Cb-Cr (intra): predictions first,
+                    // then both residuals from the single coded TB.
+                    self.reconstruct_chroma_plane(1, cu, info, &[], false, bit_depth, out)?;
+                    self.reconstruct_chroma_plane(2, cu, info, &[], false, bit_depth, out)?;
+                    self.add_intra_joint_cbcr_residual(cu, info, residual, bit_depth, None, out)?;
+                } else {
+                    self.reconstruct_chroma_plane(
+                        /*c_idx=*/ 1,
+                        cu,
+                        info,
+                        &residual.cb_levels,
+                        info.tu_cb_coded_flag,
+                        bit_depth,
+                        out,
+                    )?;
+                    self.reconstruct_chroma_plane(
+                        /*c_idx=*/ 2,
+                        cu,
+                        info,
+                        &residual.cr_levels,
+                        info.tu_cr_coded_flag,
+                        bit_depth,
+                        out,
+                    )?;
+                }
             }
             let qp_y = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
             self.deblock_cus.push(DeblockCu {
@@ -4364,24 +4399,32 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // chroma intra-mode mapping already baked into
         // `info.intra_pred_mode_c`.
         if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
-            self.reconstruct_chroma_plane(
-                /*c_idx=*/ 1,
-                cu,
-                info,
-                &residual.cb_levels,
-                info.tu_cb_coded_flag,
-                bit_depth,
-                out,
-            )?;
-            self.reconstruct_chroma_plane(
-                /*c_idx=*/ 2,
-                cu,
-                info,
-                &residual.cr_levels,
-                info.tu_cr_coded_flag,
-                bit_depth,
-                out,
-            )?;
+            if info.tu_c_res_mode != 0 {
+                // §8.7.2 joint Cb-Cr (intra): predictions first, then
+                // both residuals from the single coded TB.
+                self.reconstruct_chroma_plane(1, cu, info, &[], false, bit_depth, out)?;
+                self.reconstruct_chroma_plane(2, cu, info, &[], false, bit_depth, out)?;
+                self.add_intra_joint_cbcr_residual(cu, info, residual, bit_depth, None, out)?;
+            } else {
+                self.reconstruct_chroma_plane(
+                    /*c_idx=*/ 1,
+                    cu,
+                    info,
+                    &residual.cb_levels,
+                    info.tu_cb_coded_flag,
+                    bit_depth,
+                    out,
+                )?;
+                self.reconstruct_chroma_plane(
+                    /*c_idx=*/ 2,
+                    cu,
+                    info,
+                    &residual.cr_levels,
+                    info.tu_cr_coded_flag,
+                    bit_depth,
+                    out,
+                )?;
+            }
         }
 
         // Record this leaf for the §8.8.3 deblocking pass. The
@@ -8185,6 +8228,162 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             if c_x + c_w > stride || c_y + c_h > height {
                 return Err(Error::invalid(
                     "h266 inter JCCR residual: chroma TB does not fit in destination plane",
+                ));
+            }
+            let up = bit_depth.saturating_sub(8);
+            for row in 0..c_h {
+                for col in 0..c_w {
+                    let idx = (c_y + row) * stride + (c_x + col);
+                    let pred = (plane.samples[idx] as i32) << up;
+                    let v = clip_pixel(pred + res[row * c_w + col], bit_depth);
+                    plane.samples[idx] = if bit_depth > 8 {
+                        (v >> up) as u8
+                    } else {
+                        v as u8
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// r434 — §8.7.2 joint Cb-Cr residual for INTRA CUs. The caller
+    /// must already have written both chroma predictions into `out`
+    /// (via the pure-prediction path); this derives both components'
+    /// residuals from the single coded chroma TB (Cb for TuCResMode
+    /// 1 / 2, Cr for mode 3) and adds them with the §8.7.5.1 clip.
+    /// `lfnst_pred_mode` is the eq. 1157 chroma LFNST mode — `Some`
+    /// only on the DUAL_TREE_CHROMA path when `lfnst_idx > 0`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_intra_joint_cbcr_residual(
+        &self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        bit_depth: u32,
+        lfnst_pred_mode: Option<u32>,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
+        let c_w = (cu.cu.w as usize) / 2;
+        let c_h = (cu.cu.h as usize) / 2;
+        let c_x = (cu.cu.x as usize) / 2;
+        let c_y = (cu.cu.y as usize) / 2;
+        if c_w == 0 || c_h == 0 {
+            return Ok(());
+        }
+        let mode = TuCResMode::from_raw(info.tu_c_res_mode)?;
+        let (coded_levels, coded_ts_flag, coded_c_idx) = match mode {
+            TuCResMode::CrCoded => (&residual.cr_levels, info.transform_skip_cr, 2u32),
+            _ => (&residual.cb_levels, info.transform_skip_cb, 1u32),
+        };
+        if coded_levels.len() != c_w * c_h {
+            // No coded coefficients captured (degenerate TB) — the
+            // predictions already in the planes stand.
+            return Ok(());
+        }
+        // §8.7.5.3 — chroma residual scaling applies to the §8.7.2
+        // derived residuals of BOTH components. Derive varScale before
+        // any plane is borrowed mutably.
+        let lmcs_cvs = if c_w * c_h > 4 {
+            self.lmcs_chroma_var_scale_for_cu(cu, out)
+        } else {
+            None
+        };
+        // §8.7.3 dequant — joint Cb-Cr QP: ChromaQpTable index 2 with
+        // the additive `pps_joint_cbcr_qp_offset_value +
+        // sh_joint_cbcr_qp_offset + CuQpOffsetCbCr` term (§7.4.10.6
+        // eq. 195 — the CU-level offset indexes the JOINT list).
+        let cu_offset_cbcr = if info.cu_chroma_qp_offset_flag {
+            self.pps
+                .pps_joint_cbcr_qp_offset_list
+                .get(info.cu_chroma_qp_offset_idx as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
+            + self.sh.sh_joint_cbcr_qp_offset
+            + cu_offset_cbcr;
+        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
+        let qp = chroma_qp_mapped(self.sps, 2, qp_y, joint_offset);
+        let transform_skip = info.intra_bdpcm_chroma || coded_ts_flag;
+        let log2_tr_range = self.log2_transform_range();
+        let params = DequantParams {
+            bit_depth,
+            log2_transform_range: log2_tr_range,
+            n_tb_w: c_w as u32,
+            n_tb_h: c_h as u32,
+            qp,
+            dep_quant: self.sh.sh_dep_quant_used_flag,
+            transform_skip,
+            bdpcm: info.intra_bdpcm_chroma,
+            bdpcm_dir: info.intra_bdpcm_chroma_dir,
+        };
+        // §8.7.4.1 eq. 180 — chroma LFNST fires only on the dual-tree
+        // chroma path and never on a transform-skip TB.
+        let apply_lfnst = lfnst_pred_mode.is_some() && info.lfnst_idx > 0 && !transform_skip;
+        let mut d = self.dequantize_tb(
+            coded_levels,
+            &params,
+            PredModeKind::Intra,
+            coded_c_idx,
+            apply_lfnst,
+        )?;
+        if apply_lfnst {
+            let pm = lfnst_pred_mode.unwrap_or(INTRA_PLANAR);
+            let max_c = (1i32 << log2_tr_range) - 1;
+            crate::lfnst::apply_inverse_lfnst(
+                &mut d,
+                c_w,
+                c_h,
+                pm as i32,
+                info.lfnst_idx,
+                -(max_c + 1),
+                max_c,
+            )?;
+        }
+        let coded = if transform_skip {
+            CodedTransform::Skip
+        } else {
+            let (non_zero_w, non_zero_h) = if apply_lfnst {
+                let nz = if c_w == 4 || c_h == 4 { 4 } else { 8 };
+                (c_w.min(nz), c_h.min(nz))
+            } else {
+                (c_w.min(32), c_h.min(32))
+            };
+            CodedTransform::Transform {
+                non_zero_w,
+                non_zero_h,
+                tr_type_hor: TrType::DctII,
+                tr_type_ver: TrType::DctII,
+            }
+        };
+        for c_idx in [1u32, 2u32] {
+            let mut res = scaling_and_transformation(
+                c_idx,
+                mode,
+                self.ph_joint_cbcr_sign,
+                c_w,
+                c_h,
+                &d,
+                coded,
+                bit_depth,
+                log2_tr_range,
+            )?;
+            if let Some(vs) = lmcs_cvs {
+                lmcs_scale_chroma_residuals(&mut res, vs, bit_depth);
+            }
+            let plane = match c_idx {
+                1 => &mut out.cb,
+                _ => &mut out.cr,
+            };
+            let stride = plane.stride;
+            let height = plane.height;
+            if c_x + c_w > stride || c_y + c_h > height {
+                return Err(Error::invalid(
+                    "h266 intra JCCR residual: chroma TB does not fit in destination plane",
                 ));
             }
             let up = bit_depth.saturating_sub(8);
