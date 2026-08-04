@@ -55,7 +55,7 @@ fn fade_fixture(
                 let tile_y = y / 32;
                 let parity = (tile_x + tile_y) & 1;
                 let tile_val = if parity == 0 { 60 } else { 180 };
-                let v = (tile_val + seed).clamp(0, 255) as u8;
+                let v = (tile_val + seed).clamp(0, 255) as u16;
                 buf.luma.samples[y * buf.luma.stride + x] = v;
             }
         }
@@ -119,7 +119,7 @@ fn round63_bslice_no_fade_keeps_wp_off_and_matches_round61() {
     let mut c = PictureBuffer::yuv420_filled(64, 64, 100);
     for y in 0..64 {
         for x in 0..64 {
-            let v = if (x / 8) % 2 == 0 { 80u8 } else { 180u8 };
+            let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
             a.luma.samples[y * a.luma.stride + x] = v;
             b.luma.samples[y * b.luma.stride + x] = v;
             c.luma.samples[y * c.luma.stride + x] = v;
@@ -150,7 +150,7 @@ fn round63_bslice_weighted_decoder_byte_identical() {
         let mut buf = PictureBuffer::yuv420_filled(64, 64, 100);
         for y in 0..64 {
             for x in 0..64 {
-                let v = (100 + seed + ((x as i32) % 32 - 16)).clamp(0, 255) as u8;
+                let v = (100 + seed + ((x as i32) % 32 - 16)).clamp(0, 255) as u16;
                 buf.luma.samples[y * buf.luma.stride + x] = v;
             }
         }

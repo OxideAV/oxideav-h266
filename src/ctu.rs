@@ -144,7 +144,7 @@ fn apply_ciip_combine_to_plane(
     for y in 0..n_h {
         let plane_row = (y0 + y) * stride;
         for x in 0..n_w {
-            plane.samples[plane_row + x0 + x] = combined[y * n_w + x] as u8;
+            plane.samples[plane_row + x0 + x] = combined[y * n_w + x] as u16;
         }
     }
 }
@@ -1665,7 +1665,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         let l = self.lmcs.as_ref().expect("lmcs_active checked is_some");
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
-        let up = bit_depth.saturating_sub(8);
         let hi = (1i64 << bit_depth) - 1;
         let plane = &mut out.luma;
         let y1 = (y0 + h).min(plane.height);
@@ -1673,9 +1672,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         for row in y0..y1 {
             for col in x0..x1 {
                 let idx = row * plane.stride + col;
-                let s = u32::from(plane.samples[idx]) << up;
+                let s = u32::from(plane.samples[idx]);
                 let m = l.derived.forward_map_luma_sample(s).clamp(0, hi) as u32;
-                plane.samples[idx] = (m >> up) as u8;
+                plane.samples[idx] = m as u16;
             }
         }
     }
@@ -4244,7 +4243,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     let px = (x0 + x) as usize;
                     let py = (y0 + y) as usize;
                     if px < pw && py < ph {
-                        plane.samples[py * stride + px] = s.min(255) as u8;
+                        plane.samples[py * stride + px] = s;
                     }
                 },
             );
@@ -4283,7 +4282,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         let px = (cx0 + x) as usize;
                         let py = (cy0 + y) as usize;
                         if px < pw && py < ph {
-                            plane.samples[py * stride + px] = s.min(255) as u8;
+                            plane.samples[py * stride + px] = s;
                         }
                     },
                 );
@@ -4950,7 +4949,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 for dx in 0..cb_w {
                     let v = ibc.virbuf.luma_at(x_cb + dx, y_cb + dy, bv)?;
                     let idx = (y_cb + dy) as usize * out.luma.stride + (x_cb + dx) as usize;
-                    out.luma.samples[idx] = v as u8;
+                    out.luma.samples[idx] = v as u16;
                 }
             }
             if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
@@ -4965,8 +4964,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         let vcb = ibc.virbuf.chroma_at(1, cx + dx, cy + dy, bv_c)?;
                         let vcr = ibc.virbuf.chroma_at(2, cx + dx, cy + dy, bv_c)?;
                         let idx = (cy + dy) as usize * out.cb.stride + (cx + dx) as usize;
-                        out.cb.samples[idx] = vcb as u8;
-                        out.cr.samples[idx] = vcr as u8;
+                        out.cb.samples[idx] = vcb as u16;
+                        out.cr.samples[idx] = vcr as u16;
                     }
                 }
             }
@@ -8096,7 +8095,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let ai = (dy as usize + r) * a.stride + (dx as usize + c);
                 let bi = (dy as usize + r) * b.stride + (dx as usize + c);
                 let v = (a.samples[ai] as u32 + b.samples[bi] as u32 + 1) >> 1;
-                out.samples[idx] = v as u8;
+                out.samples[idx] = v as u16;
             }
         }
     }
@@ -8134,7 +8133,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let ai = (dy as usize + r) * a.stride + (dx as usize + c);
                 let bi = (dy as usize + r) * b.stride + (dx as usize + c);
                 let blended = (w0 * a.samples[ai] as i32 + w1 * b.samples[bi] as i32 + 4) >> 3;
-                out.samples[idx] = blended.clamp(0, 255) as u8;
+                out.samples[idx] = blended.clamp(0, (1i32 << out.bit_depth) - 1) as u16;
             }
         }
     }
@@ -8438,17 +8437,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 "h266 inter residual: TB does not fit in destination plane",
             ));
         }
-        let up = bit_depth.saturating_sub(8);
         for row in 0..n_tb_h {
             for col in 0..n_tb_w {
                 let idx = (y0 + row) * stride + (x0 + col);
-                let pred = (plane.samples[idx] as i32) << up;
+                let pred = plane.samples[idx] as i32;
                 let v = clip_pixel(pred + res[row * n_tb_w + col], bit_depth);
-                plane.samples[idx] = if bit_depth > 8 {
-                    (v >> up) as u8
-                } else {
-                    v as u8
-                };
+                plane.samples[idx] = v as u16;
             }
         }
         Ok(())
@@ -8576,17 +8570,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     "h266 inter JCCR residual: chroma TB does not fit in destination plane",
                 ));
             }
-            let up = bit_depth.saturating_sub(8);
             for row in 0..c_h {
                 for col in 0..c_w {
                     let idx = (c_y + row) * stride + (c_x + col);
-                    let pred = (plane.samples[idx] as i32) << up;
+                    let pred = plane.samples[idx] as i32;
                     let v = clip_pixel(pred + res[row * c_w + col], bit_depth);
-                    plane.samples[idx] = if bit_depth > 8 {
-                        (v >> up) as u8
-                    } else {
-                        v as u8
-                    };
+                    plane.samples[idx] = v as u16;
                 }
             }
         }
@@ -8732,17 +8721,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     "h266 intra JCCR residual: chroma TB does not fit in destination plane",
                 ));
             }
-            let up = bit_depth.saturating_sub(8);
             for row in 0..c_h {
                 for col in 0..c_w {
                     let idx = (c_y + row) * stride + (c_x + col);
-                    let pred = (plane.samples[idx] as i32) << up;
+                    let pred = plane.samples[idx] as i32;
                     let v = clip_pixel(pred + res[row * c_w + col], bit_depth);
-                    plane.samples[idx] = if bit_depth > 8 {
-                        (v >> up) as u8
-                    } else {
-                        v as u8
-                    };
+                    plane.samples[idx] = v as u16;
                 }
             }
         }
@@ -9301,7 +9285,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             None
         };
         let is_cclm = matches!(mode_c, INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM);
-        let luma_samples_snapshot: Option<Vec<u8>> = if is_cclm {
+        let luma_samples_snapshot: Option<Vec<u16>> = if is_cclm {
             Some(out.luma.samples.clone())
         } else {
             None
@@ -10166,15 +10150,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // arm makes the pass an identity, i.e. it is skipped).
         if self.lmcs_active() {
             let l = self.lmcs.as_ref().expect("lmcs_active checked is_some");
-            let up = bit_depth.saturating_sub(8);
             let plane = &mut out.luma;
             for row in 0..plane.height {
                 for col in 0..plane.width {
                     let idx = row * plane.stride + col;
-                    let s = u32::from(plane.samples[idx]) << up;
+                    let s = u32::from(plane.samples[idx]);
                     let iy = l.derived.idx_y_inv(s, l.min_bin_idx, l.max_bin_idx);
                     let v = l.derived.inverse_map_luma_sample(s, iy);
-                    plane.samples[idx] = (v >> up) as u8;
+                    plane.samples[idx] = v as u16;
                 }
             }
         }
@@ -10797,7 +10780,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -10913,7 +10896,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u16;
             }
         }
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
@@ -11103,7 +11086,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u16;
             }
         }
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
@@ -11201,7 +11184,7 @@ mod tests {
                     let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
                     let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
                     let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
-                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u16;
                     f.luma.samples[y * f.luma.stride + x] = v;
                 }
             }
@@ -11330,7 +11313,7 @@ mod tests {
                     let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
                     let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
                     let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
-                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u16;
                     f.luma.samples[y * f.luma.stride + x] = v;
                 }
             }
@@ -11459,7 +11442,7 @@ mod tests {
                     let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
                     let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
                     let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
-                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u16;
                     f.luma.samples[y * f.luma.stride + x] = v;
                 }
             }
@@ -11567,7 +11550,7 @@ mod tests {
                     let xs = (x as i32 - off).clamp(0, pic_w as i32 - 1);
                     let phx = (xs as f64) / (pic_w as f64) * 3.0 * std::f64::consts::PI;
                     let phy = (y as f64) / (pic_h as f64) * 1.5 * std::f64::consts::PI;
-                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u8;
+                    let v = (128.0 + 50.0 * phx.sin() + 30.0 * phy.cos()).clamp(0.0, 255.0) as u16;
                     f.luma.samples[y * f.luma.stride + x] = v;
                 }
             }
@@ -12183,11 +12166,11 @@ mod tests {
         let data = [0u8; 32];
         let walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
 
-        // Horizontal-ramp reference: luma[x] = (x & 63) as u8.
+        // Horizontal-ramp reference: luma[x] = (x & 63) as u16.
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -12241,7 +12224,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -12312,13 +12295,13 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         for cy in 0..(pic_h / 2) as usize {
             for cx in 0..(pic_w / 2) as usize {
-                ref_frame.cb.samples[cy * ref_frame.cb.stride + cx] = ((cx * 2) & 63) as u8;
-                ref_frame.cr.samples[cy * ref_frame.cr.stride + cx] = ((cy * 2) & 63) as u8;
+                ref_frame.cb.samples[cy * ref_frame.cb.stride + cx] = ((cx * 2) & 63) as u16;
+                ref_frame.cr.samples[cy * ref_frame.cr.stride + cx] = ((cy * 2) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -12425,7 +12408,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -12499,7 +12482,7 @@ mod tests {
                     expect.luma.samples[y * expect.luma.stride + x],
                     "affine AMVP bi-pred fuse luma must match the folded-CPMV bi recon at ({x},{y})"
                 );
-                if got != ((x + y) & 63) as u8 {
+                if got != ((x + y) & 63) as u16 {
                     any = true;
                 }
             }
@@ -12625,7 +12608,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -12817,7 +12800,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -12990,7 +12973,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x * 2 + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x * 2 + y) & 63) as u16;
             }
         }
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
@@ -13100,7 +13083,7 @@ mod tests {
         // (0, 16) covering the A1 sample (15, 31), zero CPMVs (so the
         // inherited projection is zero-MV and the per-list MC is a
         // verbatim copy of each constant reference).
-        let recon_with_bcw = |bcw: u8| -> u8 {
+        let recon_with_bcw = |bcw: u8| -> u16 {
             let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
             walker.set_ref_pic_list_l0(vec![ref_l0.clone()]);
             walker.set_ref_pic_list_l1(vec![ref_l1.clone()]);
@@ -13171,7 +13154,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         let mut mf = MotionField::new(pic_w, pic_h);
@@ -13274,7 +13257,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x * 3 + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x * 3 + y) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -13404,13 +13387,13 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = ((x + y) & 63) as u16;
             }
         }
         for cy in 0..(pic_h / 2) as usize {
             for cx in 0..(pic_w / 2) as usize {
-                ref_frame.cb.samples[cy * ref_frame.cb.stride + cx] = ((cx * 2) & 63) as u8;
-                ref_frame.cr.samples[cy * ref_frame.cr.stride + cx] = ((cy * 2) & 63) as u8;
+                ref_frame.cb.samples[cy * ref_frame.cb.stride + cx] = ((cx * 2) & 63) as u16;
+                ref_frame.cr.samples[cy * ref_frame.cr.stride + cx] = ((cy * 2) & 63) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -13458,7 +13441,7 @@ mod tests {
                     got, expect,
                     "affine bi-pred luma of identical lists must equal the per-list prediction at ({x},{y})"
                 );
-                if got != ((x + y) & 63) as u8 {
+                if got != ((x + y) & 63) as u16 {
                     any = true;
                 }
             }
@@ -14284,7 +14267,7 @@ mod tests {
 
         let mut out = PictureBuffer::yuv420_filled(64, 64, 128);
         for (i, s) in out.luma.samples.iter_mut().enumerate() {
-            *s = (i % 251) as u8;
+            *s = (i % 251) as u16;
         }
         let cb_before = out.cb.samples.clone();
         let luma_before = out.luma.samples.clone();
@@ -14296,7 +14279,7 @@ mod tests {
         for (idx, (&got, &before)) in out.luma.samples.iter().zip(luma_before.iter()).enumerate() {
             let s = u32::from(before);
             let iy = derived.idx_y_inv(s, min_bin, max_bin);
-            let expect = derived.inverse_map_luma_sample(s, iy) as u8;
+            let expect = derived.inverse_map_luma_sample(s, iy) as u16;
             assert_eq!(got, expect, "luma sample {idx}");
             if got != before {
                 changed = true;
@@ -14320,7 +14303,7 @@ mod tests {
 
         let mut out = PictureBuffer::yuv420_filled(64, 64, 128);
         for (i, s) in out.luma.samples.iter_mut().enumerate() {
-            *s = (i % 251) as u8;
+            *s = (i % 251) as u16;
         }
         let luma_before = out.luma.samples.clone();
         w.apply_in_loop_filters(&mut out).unwrap();
@@ -14354,7 +14337,7 @@ mod tests {
         let mut ref_frame = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
         for y in 0..pic_h as usize {
             for x in 0..pic_w as usize {
-                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u8;
+                ref_frame.luma.samples[y * ref_frame.luma.stride + x] = (x * 3) as u16;
             }
         }
         let ref_pic = ReferencePicture {
@@ -14395,12 +14378,12 @@ mod tests {
         // Stage 1 — the reconstruction is the forward-mapped MC
         // prediction (zero-MV copy of the reference block).
         let derived = lmcs.derive(8).unwrap();
-        let mut mapped_expect = vec![0u8; 16 * 16];
+        let mut mapped_expect = vec![0u16; 16 * 16];
         for row in 0..16usize {
             for col in 0..16usize {
                 let pred =
                     u32::from(ref_frame.luma.samples[row * ref_frame.luma.stride + 16 + col]);
-                let m = derived.forward_map_luma_sample(pred).clamp(0, 255) as u8;
+                let m = derived.forward_map_luma_sample(pred).clamp(0, 255) as u16;
                 mapped_expect[row * 16 + col] = m;
                 assert_eq!(
                     out.luma.samples[row * out.luma.stride + 16 + col],
@@ -14425,7 +14408,7 @@ mod tests {
             for col in 0..16usize {
                 let m = u32::from(mapped_expect[row * 16 + col]);
                 let iy = derived.idx_y_inv(m, min_bin, max_bin);
-                let expect = derived.inverse_map_luma_sample(m, iy) as u8;
+                let expect = derived.inverse_map_luma_sample(m, iy) as u16;
                 let got = out.luma.samples[row * out.luma.stride + 16 + col];
                 assert_eq!(got, expect, "inverse-mapped luma at ({col}, {row})");
                 let orig = ref_frame.luma.samples[row * ref_frame.luma.stride + 16 + col];
@@ -14523,7 +14506,7 @@ mod tests {
                 );
                 let mag = ((res.unsigned_abs() * var_scale) + 1024) >> 11;
                 let scaled = if res < 0 { -(mag as i64) } else { mag as i64 };
-                let expect = (128 + scaled).clamp(0, 255) as u8;
+                let expect = (128 + scaled).clamp(0, 255) as u16;
                 let got = out_on.cb.samples[row * stride + col];
                 assert_eq!(got, expect, "scaled Cb at ({col}, {row})");
                 if got != out_off.cb.samples[row * stride + col] {
@@ -14637,7 +14620,7 @@ mod tests {
                 let res = off - 128;
                 let mag = ((res.unsigned_abs() * var_scale) + 1024) >> 11;
                 let scaled = if res < 0 { -(mag as i64) } else { mag as i64 };
-                let expect = (128 + scaled).clamp(0, 255) as u8;
+                let expect = (128 + scaled).clamp(0, 255) as u16;
                 let got = out_on.cb.samples[row * stride + c_x + col];
                 assert_eq!(got, expect, "scaled Cb at ({col}, {row})");
                 if got != out_off.cb.samples[row * stride + c_x + col] {
@@ -14746,10 +14729,10 @@ mod tests {
         for row in 0..16usize {
             for col in 0..16usize {
                 let intra = i64::from(intra_expect[row * 16 + col]);
-                let expect = ((intra + 3 * mapped_inter + 2) >> 2).clamp(0, 255) as u8;
+                let expect = ((intra + 3 * mapped_inter + 2) >> 2).clamp(0, 255) as u16;
                 let got = out.luma.samples[row * stride + 16 + col];
                 assert_eq!(got, expect, "CIIP blend at ({col}, {row})");
-                let unmapped = ((intra + 3 * 40 + 2) >> 2).clamp(0, 255) as u8;
+                let unmapped = ((intra + 3 * 40 + 2) >> 2).clamp(0, 255) as u16;
                 if got != unmapped {
                     differs_from_unmapped = true;
                 }
@@ -14763,7 +14746,7 @@ mod tests {
 
     #[test]
     fn lmcs_inverse_map_pass_bd10_uses_lifted_samples() {
-        // Main10 — the u8 plane stores narrowed samples; the §8.8.2
+        // Main10 — the u16 plane stores narrowed samples; the §8.8.2
         // pass must lift by `BitDepth − 8`, run the 10-bit fold, and
         // narrow back. BD-10 payload: OrgCW = 64, bin 0 shrunk by 8
         // (lmcsCW[0] = 56, Σ = 1016 <= 1023). A narrowed sample 10
@@ -14894,7 +14877,7 @@ mod tests {
                 let res = off - 128;
                 let mag = ((res.unsigned_abs() * var_scale) + 1024) >> 11;
                 let scaled = if res < 0 { -(mag as i64) } else { mag as i64 };
-                let expect = (128 + scaled).clamp(0, 255) as u8;
+                let expect = (128 + scaled).clamp(0, 255) as u16;
                 let got = out_on.cb.samples[idx];
                 assert_eq!(got, expect, "scaled Cb at ({col}, {row})");
                 if got != out_off.cb.samples[idx] {
@@ -15521,8 +15504,8 @@ mod tests {
         // replicates above[x] down each column. With no above samples
         // available (picture-edge), §8.4.5.2.8 substitutes mid-grey
         // (1 << (BitDepth-1) = 512 at 10-bit). The destination plane
-        // is u8 so the value is shifted down 2 bits → 128.
-        let mid_u8: u8 = 128;
+        // is u16 so the value is shifted down 2 bits → 128.
+        let mid_u8: u16 = 128;
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(out.luma.samples[y * 128 + x], mid_u8);
@@ -15568,8 +15551,8 @@ mod tests {
             .unwrap();
         // Same picture-edge mid-grey behaviour as the vertical case —
         // there are no real prior samples so both directions collapse
-        // to the constant fill (10-bit mid-grey 512 → u8 128).
-        let mid_u8: u8 = 128;
+        // to the constant fill (10-bit mid-grey 512 → u16 128).
+        let mid_u8: u16 = 128;
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(out.luma.samples[y * 128 + x], mid_u8);
@@ -15635,7 +15618,7 @@ mod tests {
             .reconstruct_leaf_cu(&ccu, &info, &residual, &mut out)
             .expect("ISP HOR split path should succeed");
         // At the picture edge, the first partition reads mid-grey
-        // (10-bit 1<<9 = 512 → u8 128) substitution for both above
+        // (10-bit 1<<9 = 512 → u16 128) substitution for both above
         // and left. Each subsequent partition reads its top row
         // from the freshly-written prior partition, so PLANAR's
         // row+column blend slowly drifts away from a flat 128. The
@@ -16317,13 +16300,13 @@ mod tests {
         let mut out = PictureBuffer::yuv420_filled(64, 32, 0);
         for y in 0..32usize {
             for x in 0..64usize {
-                out.luma.samples[y * out.luma.stride + x] = ((x * 3 + y * 5) & 0xff) as u8;
+                out.luma.samples[y * out.luma.stride + x] = ((x * 3 + y * 5) & 0xff) as u16;
             }
         }
         for y in 0..16usize {
             for x in 0..32usize {
-                out.cb.samples[y * out.cb.stride + x] = (40 + x + y) as u8;
-                out.cr.samples[y * out.cr.stride + x] = (200 - x - y) as u8;
+                out.cb.samples[y * out.cb.stride + x] = (40 + x + y) as u16;
+                out.cr.samples[y * out.cr.stride + x] = (200 - x - y) as u16;
             }
         }
 
@@ -16433,7 +16416,7 @@ mod tests {
         let mut out = PictureBuffer::yuv420_filled(64, 32, 0);
         for y in 0..32usize {
             for x in 0..64usize {
-                out.luma.samples[y * out.luma.stride + x] = ((x * 7 + y * 3) & 0xff) as u8;
+                out.luma.samples[y * out.luma.stride + x] = ((x * 7 + y * 3) & 0xff) as u16;
             }
         }
 

@@ -34,22 +34,22 @@ use oxideav_h266::reconstruct::PictureBuffer;
 fn subpel_yuv_pair(w: usize, h: usize, dx_q16: i32) -> (PictureBuffer, PictureBuffer) {
     let os = 16usize;
     let big_w = w * os;
-    let lum = |x_q16: i32| -> u8 {
+    let lum = |x_q16: i32| -> u16 {
         let phase = (x_q16 as f64) / (big_w as f64) * (5.0 * std::f64::consts::PI);
         let v = 125.0 + 55.0 * phase.sin();
-        v.clamp(0.0, 255.0) as u8
+        v.clamp(0.0, 255.0) as u16
     };
     // Chroma sinusoid at a different frequency to make sure chroma is
     // not just inheriting luma's pattern.
-    let cb = |x_q16: i32| -> u8 {
+    let cb = |x_q16: i32| -> u16 {
         let phase = (x_q16 as f64) / ((big_w as f64) / 2.0) * (3.0 * std::f64::consts::PI);
         let v = 128.0 + 60.0 * phase.sin();
-        v.clamp(0.0, 255.0) as u8
+        v.clamp(0.0, 255.0) as u16
     };
-    let cr = |x_q16: i32| -> u8 {
+    let cr = |x_q16: i32| -> u16 {
         let phase = (x_q16 as f64) / ((big_w as f64) / 2.0) * (3.0 * std::f64::consts::PI);
         let v = 128.0 + 60.0 * phase.cos();
-        v.clamp(0.0, 255.0) as u8
+        v.clamp(0.0, 255.0) as u16
     };
     let mut a = PictureBuffer::yuv420_filled(w, h, 100);
     let mut b = PictureBuffer::yuv420_filled(w, h, 100);
@@ -165,10 +165,10 @@ fn round63_chroma_constant_plane_preserved_through_subpel() {
     // pinned to 137.
     for y in 0..64 {
         for x in 0..64 {
-            let v = if (x / 8) % 2 == 0 { 60u8 } else { 200u8 };
+            let v = if (x / 8) % 2 == 0 { 60u16 } else { 200u16 };
             frame_i.luma.samples[y * frame_i.luma.stride + x] = v;
             let sx = ((x as i32 - 4).rem_euclid(64)) as usize;
-            let v2 = if (sx / 8) % 2 == 0 { 60u8 } else { 200u8 };
+            let v2 = if (sx / 8) % 2 == 0 { 60u16 } else { 200u16 };
             frame_p.luma.samples[y * frame_p.luma.stride + x] = v2;
         }
     }

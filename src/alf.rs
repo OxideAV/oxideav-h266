@@ -421,7 +421,7 @@ pub fn apply_alf_clipped(
 #[allow(clippy::too_many_arguments)]
 fn apply_cc_alf_ctb(
     chroma: &mut PicturePlane,
-    luma_pre: &[u8],
+    luma_pre: &[u16],
     luma_stride: usize,
     luma_w: u32,
     luma_h: u32,
@@ -441,7 +441,6 @@ fn apply_cc_alf_ctb(
     let i_max = cc_alf_width.min(chroma.width.saturating_sub(x_ctb_c));
     let j_max = cc_alf_height.min(chroma.height.saturating_sub(y_ctb_c));
     let max_val = (1i32 << bit_depth) - 1;
-    let max_val_8 = max_val.min(255);
     let half = 1i32 << (bit_depth - 1);
     let _ = luma_w;
     let ph = luma_h as i32;
@@ -492,7 +491,7 @@ fn apply_cc_alf_ctb(
                 curr_chroma + scaled_sum
             };
             // Eq. 1518.
-            let new = new.clamp(0, max_val).min(max_val_8) as u8;
+            let new = new.clamp(0, max_val) as u16;
             chroma.samples[(y_ctb_c + y) * chroma.stride + (x_ctb_c + x)] = new;
         }
     }
@@ -627,7 +626,7 @@ pub fn resolve_clip_value(bit_depth: u32, clip_idx: u8) -> i32 {
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_luma_ctb(
     plane: &mut PicturePlane,
-    pre: &[u8],
+    pre: &[u16],
     fetch_clip: (i32, i32, i32, i32),
     rx: u32,
     ry: u32,
@@ -642,7 +641,6 @@ fn apply_alf_luma_ctb(
     let i_max = (ctb_size_y as usize).min(plane.width.saturating_sub(x_ctb));
     let j_max = (ctb_size_y as usize).min(plane.height.saturating_sub(y_ctb));
     let max_val = (1i32 << bit_depth) - 1;
-    let max_val_8 = max_val.min(255);
 
     for j in 0..j_max {
         for i in 0..i_max {
@@ -694,7 +692,7 @@ fn apply_alf_luma_ctb(
             let bias = 1i32 << (alf_shift_y - 1);
             let new = curr + ((sum + bias) >> alf_shift_y);
             // Eq. 1451.
-            let new = new.clamp(0, max_val).min(max_val_8) as u8;
+            let new = new.clamp(0, max_val) as u16;
             plane.samples[(ys as usize) * stride + (xs as usize)] = new;
         }
     }
@@ -797,7 +795,7 @@ impl LumaClassification {
 /// `minY=-2, maxY=5, ac=2` row everywhere.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn derive_luma_classification(
-    pre: &[u8],
+    pre: &[u16],
     stride: usize,
     _pw: i32,
     ph: i32,
@@ -990,7 +988,7 @@ pub(crate) fn derive_luma_classification(
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_chroma_ctb(
     plane: &mut PicturePlane,
-    pre: &[u8],
+    pre: &[u16],
     fetch_clip: (i32, i32, i32, i32),
     rx: u32,
     ry: u32,
@@ -1009,7 +1007,6 @@ fn apply_alf_chroma_ctb(
     let i_max = ctb_w_c.min(plane.width.saturating_sub(x_ctb_c));
     let j_max = ctb_h_c.min(plane.height.saturating_sub(y_ctb_c));
     let max_val = (1i32 << bit_depth) - 1;
-    let max_val_8 = max_val.min(255);
     let mut c = [0i32; ALF_CHROMA_NUM_COEFF];
     for k in 0..ALF_CHROMA_NUM_COEFF {
         c[k] = resolve_clip_value(bit_depth, clip_idx[k]);
@@ -1036,7 +1033,7 @@ fn apply_alf_chroma_ctb(
             let bias = 1i32 << (alf_shift_c - 1);
             let new = curr + ((sum + bias) >> alf_shift_c);
             // Eq. 1492.
-            let new = new.clamp(0, max_val).min(max_val_8) as u8;
+            let new = new.clamp(0, max_val) as u16;
             plane.samples[(ys as usize) * stride + (xs as usize)] = new;
         }
     }
@@ -1079,7 +1076,7 @@ fn clip_rect_for_ctb(
 /// §8.8.5.6 padding: coordinates clamp at the current tile's edges
 /// exactly like at picture edges).
 #[inline]
-fn sample(buf: &[u8], stride: usize, fetch_clip: (i32, i32, i32, i32), x: i32, y: i32) -> u8 {
+fn sample(buf: &[u16], stride: usize, fetch_clip: (i32, i32, i32, i32), x: i32, y: i32) -> u16 {
     let (x0, y0, x1, y1) = fetch_clip;
     let xc = x.clamp(x0, x1 - 1) as usize;
     let yc = y.clamp(y0, y1 - 1) as usize;
@@ -1136,7 +1133,7 @@ mod tests {
     use super::*;
     use crate::aps::AlfApsData;
 
-    fn fresh_buf(w: usize, h: usize, seed: u8) -> PictureBuffer {
+    fn fresh_buf(w: usize, h: usize, seed: u16) -> PictureBuffer {
         PictureBuffer {
             luma: PicturePlane::filled(w, h, seed),
             cb: PicturePlane::filled(w / 2, h / 2, 128),
@@ -1538,7 +1535,7 @@ mod tests {
     /// inert. We therefore only assert on `filtIdx`.
     #[test]
     fn classification_flat_plane_is_class_zero() {
-        let plane = vec![100u8; 32 * 32];
+        let plane = vec![100u16; 32 * 32];
         let cls = derive_luma_classification(&plane, 32, 32, 32, (0, 0, 32, 32), 0, 0, 32, 8);
         for sy in 0..cls.sub_size() {
             for sx in 0..cls.sub_size() {
@@ -1553,10 +1550,10 @@ mod tests {
     /// class 0 in the interior.
     #[test]
     fn classification_linear_gradient_interior_is_class_zero() {
-        let mut plane = vec![0u8; 32 * 32];
+        let mut plane = vec![0u16; 32 * 32];
         for y in 0..32 {
             for x in 0..32 {
-                plane[y * 32 + x] = (x as u8).saturating_mul(7);
+                plane[y * 32 + x] = (x as u16).saturating_mul(7);
             }
         }
         let cls = derive_luma_classification(&plane, 32, 32, 32, (0, 0, 32, 32), 0, 0, 32, 8);
@@ -1574,7 +1571,7 @@ mod tests {
     #[test]
     fn classification_vertical_edge_picks_directional_class() {
         // 32×32 picture: top half = 0, bottom half = 200. Edge at row 16.
-        let mut plane = vec![0u8; 32 * 32];
+        let mut plane = vec![0u16; 32 * 32];
         for y in 16..32 {
             for x in 0..32 {
                 plane[y * 32 + x] = 200;
@@ -1613,7 +1610,7 @@ mod tests {
     fn classification_grid_size_matches_ctb_size() {
         for log2 in 4..=6u32 {
             let ctb = 1u32 << log2;
-            let plane = vec![100u8; (ctb * ctb) as usize];
+            let plane = vec![100u16; (ctb * ctb) as usize];
             let cls = derive_luma_classification(
                 &plane,
                 ctb as usize,

@@ -254,15 +254,15 @@ fn structured_source(w: usize, h: usize) -> PictureBuffer {
     for y in 0..h {
         for x in 0..w {
             let v = 40
-                + ((x * 3 + y * 2) % 160) as u8
+                + ((x * 3 + y * 2) % 160) as u16
                 + if (x / 16 + y / 16) % 2 == 0 { 20 } else { 0 };
             src.luma.samples[y * src.luma.stride + x] = v;
         }
     }
     for y in 0..h / 2 {
         for x in 0..w / 2 {
-            src.cb.samples[y * src.cb.stride + x] = (96 + (x % 64)) as u8;
-            src.cr.samples[y * src.cr.stride + x] = (160 - (y % 64)) as u8;
+            src.cb.samples[y * src.cb.stride + x] = (96 + (x % 64)) as u16;
+            src.cr.samples[y * src.cr.stride + x] = (160 - (y % 64)) as u16;
         }
     }
     src
@@ -280,11 +280,11 @@ fn dump_corpus(name: &str, bs: &[u8], dec: &PictureBuffer) {
     let base = std::path::Path::new(&dir);
     std::fs::create_dir_all(base).expect("corpus dir");
     std::fs::write(base.join(format!("{name}.266")), bs).expect("write stream");
-    let mut yuv =
+    let mut yuv: Vec<u8> =
         Vec::with_capacity(dec.luma.samples.len() + dec.cb.samples.len() + dec.cr.samples.len());
-    yuv.extend_from_slice(&dec.luma.samples);
-    yuv.extend_from_slice(&dec.cb.samples);
-    yuv.extend_from_slice(&dec.cr.samples);
+    for plane in [&dec.luma, &dec.cb, &dec.cr] {
+        yuv.extend(plane.samples.iter().map(|&v| v as u8));
+    }
     std::fs::write(base.join(format!("{name}.yuv")), yuv).expect("write planes");
 }
 
@@ -702,11 +702,11 @@ fn whole_stream_tiles_2x1_wpp() {
 fn screen_source(w: usize, h: usize, cell: usize, ncolors: usize) -> PictureBuffer {
     let mut src = PictureBuffer::yuv420_filled(w, h, 128);
     // Deterministic colour list — distinct (Y, Cb, Cr) triples.
-    let color = |i: usize| -> (u8, u8, u8) {
+    let color = |i: usize| -> (u16, u16, u16) {
         (
-            (17 + (i * 41) % 224) as u8,
-            (32 + (i * 29) % 192) as u8,
-            (24 + (i * 53) % 200) as u8,
+            (17 + (i * 41) % 224) as u16,
+            (32 + (i * 29) % 192) as u16,
+            (24 + (i * 53) % 200) as u16,
         )
     };
     for cy in 0..h.div_ceil(cell) {

@@ -22,10 +22,10 @@ fn translation_pair(dx: i32) -> (PictureBuffer, PictureBuffer) {
     let mut b = PictureBuffer::yuv420_filled(w, h, 100);
     for y in 0..h {
         for x in 0..w {
-            let v = if (x / 8) % 2 == 0 { 80u8 } else { 180u8 };
+            let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
             a.luma.samples[y * a.luma.stride + x] = v;
             let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-            let v2 = if (sx / 8) % 2 == 0 { 80u8 } else { 180u8 };
+            let v2 = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
             b.luma.samples[y * b.luma.stride + x] = v2;
         }
     }

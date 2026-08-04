@@ -40,7 +40,7 @@ fn sym_bipred_plane(w: usize, h: usize, shift: i32) -> PicturePlane {
             let phx = (xs as f64) / (w as f64) * 3.0 * std::f64::consts::PI;
             let phy = (y as f64) / (h as f64) * 1.5 * std::f64::consts::PI;
             let v = 128.0 + 50.0 * phx.sin() + 30.0 * phy.cos();
-            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u8;
+            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u16;
         }
     }
     p

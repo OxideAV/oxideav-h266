@@ -396,14 +396,26 @@ fn parse_opl(path: &std::path::Path) -> Vec<OplRow> {
         .collect()
 }
 
-/// Cropped-plane MD5s for one decoded picture (output bit depth 8).
+/// Cropped-plane MD5s for one decoded picture. Per the conformance
+/// convention, 8-bit streams hash one byte per sample and >8-bit
+/// streams hash two bytes per sample, little-endian.
 fn picture_hashes(pic: &oxideav_h266::stream::DecodedPicture) -> Vec<String> {
     let (cx, cy, cw, ch) = pic.crop;
+    let wide = pic.bit_depth > 8;
     let plane_md5 =
         |p: &oxideav_h266::reconstruct::PicturePlane, x0: usize, y0: usize, w: usize, h: usize| {
             let mut hasher = md5::Md5::new();
+            let mut row: Vec<u8> = Vec::with_capacity(w * 2);
             for y in y0..y0 + h {
-                hasher.update(&p.samples[y * p.stride + x0..y * p.stride + x0 + w]);
+                row.clear();
+                for &v in &p.samples[y * p.stride + x0..y * p.stride + x0 + w] {
+                    if wide {
+                        row.extend_from_slice(&v.to_le_bytes());
+                    } else {
+                        row.push(v as u8);
+                    }
+                }
+                hasher.update(&row);
             }
             hasher.finish_hex()
         };
@@ -650,13 +662,13 @@ fn stream_decoder_decodes_own_idr_stream() {
     for y in 0..128 {
         for x in 0..128 {
             let v = 40 + ((x * 3 + y * 2) % 160) + if (x / 16 + y / 16) % 2 == 0 { 20 } else { 0 };
-            src.luma.samples[y * src.luma.stride + x] = v as u8;
+            src.luma.samples[y * src.luma.stride + x] = v as u16;
         }
     }
     for y in 0..64 {
         for x in 0..64 {
-            src.cb.samples[y * src.cb.stride + x] = (96 + x) as u8;
-            src.cr.samples[y * src.cr.stride + x] = (160 - y) as u8;
+            src.cb.samples[y * src.cb.stride + x] = (96 + x) as u16;
+            src.cr.samples[y * src.cr.stride + x] = (160 - y) as u16;
         }
     }
     let (bs, rec) = encode_idr_with_residuals(&src, 26).unwrap();

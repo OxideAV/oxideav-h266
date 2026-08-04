@@ -619,6 +619,8 @@ pub fn predict_luma_subblock_affine(
     let pic_w = src.width as i32;
     let pic_h = src.height as i32;
     let d_stride = dst.stride;
+    let bd = src.bit_depth;
+    let shift1 = std::cmp::min(4, bd as i32 - 8).max(0);
 
     // Integer-pel fast path mirrors the §8.5.6.3 eq. 932 shortcut.
     if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
@@ -639,10 +641,10 @@ pub fn predict_luma_subblock_affine(
         for r in 0..sb_h as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..sb_w as i32 {
-                let intermediate = h_tap(table, src, x_int_base + c, yi, x_frac);
+                let intermediate = h_tap(table, src, x_int_base + c, yi, x_frac) >> shift1;
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
-                    pb_clip_8bit(intermediate);
+                    pb_clip(intermediate, bd);
             }
         }
         return Ok(());
@@ -653,10 +655,10 @@ pub fn predict_luma_subblock_affine(
         for c in 0..sb_w as i32 {
             let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
             for r in 0..sb_h as i32 {
-                let intermediate = v_only_tap(table, src, xi, y_int_base + r, y_frac);
+                let intermediate = v_only_tap(table, src, xi, y_int_base + r, y_frac) >> shift1;
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
-                    pb_clip_8bit(intermediate);
+                    pb_clip(intermediate, bd);
             }
         }
         return Ok(());
@@ -669,7 +671,7 @@ pub fn predict_luma_subblock_affine(
         let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
         for c in 0..sb_w as i32 {
             intermediate[r as usize * sb_w as usize + c as usize] =
-                h_tap(table, src, x_int_base + c, yi, x_frac);
+                h_tap(table, src, x_int_base + c, yi, x_frac) >> shift1;
         }
     }
     let mut col = [0i32; 8];
@@ -680,7 +682,7 @@ pub fn predict_luma_subblock_affine(
             }
             let v = v_tap(table, &col, y_frac);
             dst.samples[(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
-                pb_clip_8bit(v);
+                pb_clip(v, bd);
         }
     }
     Ok(())
@@ -734,11 +736,14 @@ fn v_only_tap(
     acc
 }
 
-/// §8.5.6.6.2 default uni-pred clamp at BitDepth = 8.
+/// §8.5.6.6.2 default uni-pred clamp (eq. 978): `shift1 = Max(2, 14 −
+/// BitDepth)`, `offset1 = 1 << (shift1 − 1)`, clip to the bit-depth
+/// range. At BitDepth 8 this is `(v + 32) >> 6` clipped to 255.
 #[inline]
-fn pb_clip_8bit(intermediate: i32) -> u8 {
-    let v = (intermediate + 32) >> 6;
-    v.clamp(0, 255) as u8
+fn pb_clip(intermediate: i32, bit_depth: u32) -> u16 {
+    let shift1 = (14 - bit_depth as i32).max(2);
+    let v = (intermediate + (1 << (shift1 - 1))) >> shift1;
+    v.clamp(0, (1i32 << bit_depth) - 1) as u16
 }
 
 // ---------------------------------------------------------------------
@@ -1046,39 +1051,40 @@ pub fn predict_luma_subblock_affine_high_precision(
     let out_h = sb_h as usize + 2;
     let mut out = vec![0i32; out_w * out_h];
 
+    let bd = src.bit_depth;
+    let shift1 = std::cmp::min(4, bd as i32 - 8).max(0);
+    let lift = 14 - bd as i32;
     let fill = |c: i32, r: i32| -> i32 {
         // Local pixel offset from sub-block top-left in luma samples.
         // r = 0 / r = sb_h + 1 are halo rows.
         let local_x = c - 1;
         let local_y = r - 1;
         if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
-            // Integer-pel fast path: lift `<< 6` to BitDepth + 6
-            // precision at BD = 8 (eq. 932: `<< (14 - BitDepth) = << 6`).
+            // Integer-pel fast path: lift to BitDepth + 6 precision
+            // (eq. 932: `<< (14 - BitDepth)`).
             let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
             let xi = (x_int_base + local_x).clamp(0, pic_w - 1) as usize;
-            return (src.samples[yi * src.stride + xi] as i32) << 6;
+            return (src.samples[yi * src.stride + xi] as i32) << lift;
         }
         if y_frac == 0 {
             let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
-            // Horizontal-only filter — shift1 = 0 at BD = 8, so the
-            // H-pass output is already at BitDepth + 6 precision.
-            return h_tap(table, src, x_int_base + local_x, yi, x_frac);
+            // Horizontal-only filter — the `>> shift1` H pass lands
+            // at BitDepth + 6 precision.
+            return h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
         }
         if x_frac == 0 {
             let xi = (x_int_base + local_x).clamp(0, pic_w - 1) as usize;
-            return v_only_tap(table, src, xi, y_int_base + local_y, y_frac);
+            return v_only_tap(table, src, xi, y_int_base + local_y, y_frac) >> shift1;
         }
         // 2D — H pass at column `local_x`, V pass over an 8-row column.
         let mut col = [0i32; 8];
         for i in 0..8 {
             let yi = (y_int_base + local_y - 3 + i as i32).clamp(0, pic_h - 1) as usize;
-            col[i] = h_tap(table, src, x_int_base + local_x, yi, x_frac);
+            col[i] = h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
         }
         // v_tap applies `>> 6 = shift2 = 6`. After the H pass at
-        // shift1 = 0 the intermediate sits at BitDepth + 6 + 6 = BD +
-        // 12 (the 14-bit + 6-bit accumulator), and `>> 6` lands the V
-        // output at BitDepth + 6 — exactly the spec's predSamplesLN
-        // precision.
+        // `>> shift1` the V output lands at BitDepth + 6 — exactly
+        // the spec's predSamplesLN precision.
         v_tap(table, &col, y_frac)
     };
 
@@ -1171,15 +1177,16 @@ pub fn apply_prof_to_subblock(
     Ok(out)
 }
 
-/// Per-pixel BitDepth=8 uni-pred clamp shared with
-/// [`predict_luma_subblock_affine`]'s `pb_clip_8bit`. Exposed here so
+/// Per-pixel uni-pred clamp shared with
+/// [`predict_luma_subblock_affine`]'s `pb_clip`. Exposed here so
 /// the PROF driver can convert the per-sub-block refined
-/// `sbSamplesLXL` (BitDepth + 6 precision i32) into final 8-bit
-/// samples consistently with the non-PROF path.
+/// `sbSamplesLXL` (BitDepth + 6 precision i32) into final samples at
+/// the picture bit depth consistently with the non-PROF path.
 #[inline]
-fn pb_clip_8bit_from_hp(intermediate: i32) -> u8 {
-    let v = (intermediate + 32) >> 6;
-    v.clamp(0, 255) as u8
+fn pb_clip_from_hp(intermediate: i32, bit_depth: u32) -> u16 {
+    let shift1 = (14 - bit_depth as i32).max(2);
+    let v = (intermediate + (1 << (shift1 - 1))) >> shift1;
+    v.clamp(0, (1i32 << bit_depth) - 1) as u16
 }
 
 /// Full-CU driver — `predict_luma_block_affine` + the §8.5.6.4 PROF
@@ -1259,11 +1266,11 @@ pub fn predict_luma_block_affine_prof(
                 sb_x, sb_y, sb_w, sb_h, src, mv, filter_set,
             )?;
             if let Some(diff_mv) = &diff_mv {
-                let refined = apply_prof_to_subblock(&block, diff_mv, 8)?;
+                let refined = apply_prof_to_subblock(&block, diff_mv, src.bit_depth)?;
                 for r in 0..sb_h as usize {
                     for c in 0..sb_w as usize {
                         dst.samples[(sb_y as usize + r) * dst.stride + sb_x as usize + c] =
-                            pb_clip_8bit_from_hp(refined[r * sb_w as usize + c]);
+                            pb_clip_from_hp(refined[r * sb_w as usize + c], src.bit_depth);
                     }
                 }
             } else {
@@ -1274,7 +1281,7 @@ pub fn predict_luma_block_affine_prof(
                     for c in 0..sb_w as usize {
                         let centre = block.samples[(r + 1) * stride + (c + 1)];
                         dst.samples[(sb_y as usize + r) * dst.stride + sb_x as usize + c] =
-                            pb_clip_8bit_from_hp(centre);
+                            pb_clip_from_hp(centre, src.bit_depth);
                     }
                 }
             }
@@ -1538,7 +1545,7 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src.samples[y * 16 + x] = ((y * 17 + x * 3) % 251) as u8;
+                src.samples[y * 16 + x] = ((y * 17 + x * 3) % 251) as u16;
             }
         }
         let mut dst = PicturePlane::filled(16, 16, 99);
@@ -1571,7 +1578,7 @@ mod tests {
         let mut src = PicturePlane::filled(32, 32, 0);
         for y in 0..32 {
             for x in 0..32 {
-                src.samples[y * 32 + x] = ((y * 5 + x * 7) % 251) as u8;
+                src.samples[y * 32 + x] = ((y * 5 + x * 7) % 251) as u16;
             }
         }
         let mut dst = PicturePlane::filled(32, 32, 0);
@@ -1791,7 +1798,7 @@ mod tests {
         let mut src = PicturePlane::filled(32, 32, 0);
         for y in 0..32usize {
             for x in 0..32usize {
-                src.samples[y * 32 + x] = ((x * 13 + y * 7) % 251) as u8;
+                src.samples[y * 32 + x] = ((x * 13 + y * 7) % 251) as u16;
             }
         }
         let cp = MotionVector::from_int_pel(0, 0);
@@ -1841,7 +1848,7 @@ mod tests {
         for y in 0..64usize {
             for x in 0..64usize {
                 // Simple gradient — gives non-zero gradH everywhere.
-                src.samples[y * 64 + x] = (x * 3 + y * 2).min(255) as u8;
+                src.samples[y * 64 + x] = (x * 3 + y * 2).min(255) as u16;
             }
         }
         let cp0 = MotionVector { x: 0, y: 0 };
@@ -1885,14 +1892,14 @@ mod tests {
     /// PROF round-trip parity: PROF with cbProfFlagLX *forced off*
     /// (`ph_prof_disabled_flag = true`) must match the affine-only
     /// driver for the same CPMVs — the centre HP cell with the final
-    /// `(v + 32) >> 6 → u8` clamp is bit-identical to
+    /// `(v + 32) >> 6 → u16` clamp is bit-identical to
     /// `predict_luma_subblock_affine`'s output.
     #[test]
     fn predict_affine_prof_disabled_matches_no_prof() {
         let mut src = PicturePlane::filled(64, 64, 0);
         for y in 0..64usize {
             for x in 0..64usize {
-                src.samples[y * 64 + x] = ((y * 7 + x * 11) % 251) as u8;
+                src.samples[y * 64 + x] = ((y * 7 + x * 11) % 251) as u16;
             }
         }
         let cp0 = MotionVector { x: 0, y: 0 };
@@ -2021,7 +2028,7 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16usize {
             for x in 0..16usize {
-                src.samples[y * 16 + x] = ((x * 17 + y * 5) % 251) as u8;
+                src.samples[y * 16 + x] = ((x * 17 + y * 5) % 251) as u16;
             }
         }
         // Half-pel MV — exercises a real 2D filter pass.
@@ -2043,7 +2050,7 @@ mod tests {
         for r in 0..4usize {
             for c in 0..4usize {
                 let centre = block.samples[(r + 1) * stride + (c + 1)];
-                let centre_clipped = pb_clip_8bit_from_hp(centre);
+                let centre_clipped = pb_clip_from_hp(centre, 8);
                 let non_hp_value = dst.samples[(4 + r) * 16 + (4 + c)];
                 assert_eq!(
                     centre_clipped, non_hp_value,

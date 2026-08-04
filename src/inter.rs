@@ -60,7 +60,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::reconstruct::{PictureBuffer, PicturePlane, PicturePlane16};
+use crate::reconstruct::{PictureBuffer, PicturePlane};
 
 /// 1/16-pel motion vector (§8.5.2 fractional-sample accuracy).
 ///
@@ -1980,13 +1980,17 @@ fn luma_v_only_8tap(plane: &PicturePlane, x_clamped: usize, y_int: i32, y_frac: 
     acc
 }
 
-/// Apply the §8.5.6.6.2 default uni-pred clamp (eq. 978) at BitDepth
-/// 8 — the closing stage that turns a §8.5.6.3.x intermediate value
-/// back into an 8-bit `pbSample`. shift1 = 6, offset1 = 32.
+/// Apply the §8.5.6.6.2 default uni-pred clamp (eq. 978) — the
+/// closing stage that turns a §8.5.6.3.x intermediate value back into
+/// a `pbSample` at the picture bit depth. `shift1 = Max(2, 14 −
+/// BitDepth)`, `offset1 = 1 << (shift1 − 1)`, clip to `[0,
+/// (1 << BitDepth) − 1]`. At BitDepth 8: shift1 = 6, offset1 = 32.
 #[inline]
-fn pb_clip_8bit(intermediate: i32) -> u8 {
-    let v = (intermediate + 32) >> 6;
-    v.clamp(0, 255) as u8
+fn pb_clip(intermediate: i32, bit_depth: u32) -> u16 {
+    let shift1 = (14 - bit_depth as i32).max(2);
+    let offset1 = 1i32 << (shift1 - 1);
+    let v = (intermediate + offset1) >> shift1;
+    v.clamp(0, (1i32 << bit_depth) - 1) as u16
 }
 
 /// §8.5.6.3 horizontal-pass shift1 = `Min(4, BitDepth - 8)`. The H
@@ -2045,16 +2049,18 @@ pub fn predict_luma_block(
     let pic_w = src.width as i32;
     let pic_h = src.height as i32;
     let d_stride = dst.stride;
+    let bd = src.bit_depth;
+    let shift1 = shift1_for_bd(bd);
 
     if y_frac == 0 {
         // Horizontal-only filter (eq. 933).
         for r in 0..h as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..w as i32 {
-                let intermediate = luma_h_8tap(src, x_int_base + c, yi, x_frac);
+                let intermediate = luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
-                    pb_clip_8bit(intermediate);
+                    pb_clip(intermediate, bd);
             }
         }
         return Ok(());
@@ -2065,17 +2071,17 @@ pub fn predict_luma_block(
         for c in 0..w as i32 {
             let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
             for r in 0..h as i32 {
-                let intermediate = luma_v_only_8tap(src, xi, y_int_base + r, y_frac);
+                let intermediate = luma_v_only_8tap(src, xi, y_int_base + r, y_frac) >> shift1;
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
-                    pb_clip_8bit(intermediate);
+                    pb_clip(intermediate, bd);
             }
         }
         return Ok(());
     }
 
     // Two-dimensional case (eqs. 935 + 936). Build an
-    // (h + 7) × w intermediate first.
+    // (h + 7) × w intermediate first (H pass at `>> shift1`).
     let inter_h = h as usize + 7;
     let mut intermediate = vec![0i32; inter_h * w as usize];
     for r in 0..inter_h as i32 {
@@ -2085,7 +2091,7 @@ pub fn predict_luma_block(
         let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
         for c in 0..w as i32 {
             intermediate[r as usize * w as usize + c as usize] =
-                luma_h_8tap(src, x_int_base + c, yi, x_frac);
+                luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
         }
     }
     // Vertical pass — pull 8 rows out of the intermediate column.
@@ -2097,7 +2103,7 @@ pub fn predict_luma_block(
             }
             let v = luma_v_8tap(&col, y_frac);
             dst.samples[(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
-                pb_clip_8bit(v);
+                pb_clip(v, bd);
         }
     }
     Ok(())
@@ -2217,135 +2223,26 @@ pub fn predict_luma_block_high_precision(
     Ok(out)
 }
 
-/// HBD twin of [`luma_h_8tap`] reading u16 samples (Main10 / Main12).
-fn luma_h_8tap_u16(plane: &PicturePlane16, x_int: i32, y_clamped: usize, x_frac: usize) -> i32 {
-    let coeffs = &LUMA_FILTER_HPEL0[x_frac];
-    let pic_w = plane.width as i32;
-    let mut acc = 0i32;
-    let row_base = y_clamped * plane.stride;
-    for (i, c) in coeffs.iter().enumerate() {
-        let xi = (x_int + (i as i32) - 3).clamp(0, pic_w - 1) as usize;
-        acc += c * (plane.samples[row_base + xi] as i32);
-    }
-    acc
-}
-
-/// HBD twin of [`luma_v_only_8tap`] reading u16 samples.
-fn luma_v_only_8tap_u16(
-    plane: &PicturePlane16,
-    x_clamped: usize,
-    y_int: i32,
-    y_frac: usize,
-) -> i32 {
-    let coeffs = &LUMA_FILTER_HPEL0[y_frac];
-    let pic_h = plane.height as i32;
-    let mut acc = 0i32;
-    for i in 0..8 {
-        let yi = (y_int + (i as i32) - 3).clamp(0, pic_h - 1) as usize;
-        acc += coeffs[i] * (plane.samples[yi * plane.stride + x_clamped] as i32);
-    }
-    acc
-}
-
-/// HBD twin of [`predict_luma_block_high_precision`] — reads `u16`
-/// reference samples from a [`PicturePlane16`] so the §8.5.6.3
-/// separable 8-tap filter sees the full Main10 / Main12 dynamic range
-/// rather than the 8-bit-truncated value the legacy `u8` plane would
-/// expose. Output layout, output precision, and the per-bit-depth
-/// `shift1 / shift2` tracking are byte-identical to the existing 8-bit
-/// HP helper at `bit_depth == 8`; tests cover the parity.
-///
-/// The returned `Vec<i32>` of length `w * h` (row-major) carries the
-/// spec's `BitDepth + 6` precision intermediate values, ready to feed
-/// into the round-32 BDOF / PROF / bi-pred composition stages without
-/// the per-list clip + right-shift the §8.5.6.6.2 closing stage
-/// applies.
+/// Historical `_u16` name for [`predict_luma_block_high_precision`]
+/// — the plane type is now `u16`-storage at every bit depth, so the
+/// twin is a delegating alias that additionally validates the
+/// reference plane's own declared bit depth.
 pub fn predict_luma_block_high_precision_u16(
     dst_x: u32,
     dst_y: u32,
     w: u32,
     h: u32,
-    src: &PicturePlane16,
+    src: &PicturePlane,
     mv: MotionVector,
     bit_depth: u32,
 ) -> Result<Vec<i32>> {
-    if !(8..=16).contains(&bit_depth) {
-        return Err(Error::invalid(format!(
-            "h266 luma MC HP u16: bit_depth {bit_depth} out of supported range 8..=16",
-        )));
-    }
     if src.bit_depth != bit_depth {
         return Err(Error::invalid(format!(
             "h266 luma MC HP u16: ref plane bit_depth {} != requested {}",
             src.bit_depth, bit_depth
         )));
     }
-    let x_int_base = dst_x as i32 + (mv.x >> 4);
-    let y_int_base = dst_y as i32 + (mv.y >> 4);
-    let x_frac = (mv.x & 15) as usize;
-    let y_frac = (mv.y & 15) as usize;
-
-    let pic_w = src.width as i32;
-    let pic_h = src.height as i32;
-    let w_us = w as usize;
-    let h_us = h as usize;
-    let mut out = vec![0i32; w_us * h_us];
-    let shift1 = shift1_for_bd(bit_depth);
-    let lift = 14 - bit_depth as i32;
-
-    if x_frac == 0 && y_frac == 0 {
-        for r in 0..h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
-            for c in 0..w as i32 {
-                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
-                out[r as usize * w_us + c as usize] =
-                    (src.samples[yi * src.stride + xi] as i32) << lift;
-            }
-        }
-        return Ok(out);
-    }
-
-    if y_frac == 0 {
-        for r in 0..h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
-            for c in 0..w as i32 {
-                let acc = luma_h_8tap_u16(src, x_int_base + c, yi, x_frac);
-                out[r as usize * w_us + c as usize] = acc >> shift1;
-            }
-        }
-        return Ok(out);
-    }
-
-    if x_frac == 0 {
-        for c in 0..w as i32 {
-            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
-            for r in 0..h as i32 {
-                let acc = luma_v_only_8tap_u16(src, xi, y_int_base + r, y_frac);
-                out[r as usize * w_us + c as usize] = acc >> shift1;
-            }
-        }
-        return Ok(out);
-    }
-
-    let inter_h = h_us + 7;
-    let mut intermediate = vec![0i32; inter_h * w_us];
-    for r in 0..inter_h as i32 {
-        let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
-        for c in 0..w as i32 {
-            intermediate[r as usize * w_us + c as usize] =
-                luma_h_8tap_u16(src, x_int_base + c, yi, x_frac) >> shift1;
-        }
-    }
-    let mut col = [0i32; 8];
-    for r in 0..h as i32 {
-        for c in 0..w as i32 {
-            for i in 0..8 {
-                col[i] = intermediate[(r as usize + i) * w_us + c as usize];
-            }
-            out[r as usize * w_us + c as usize] = luma_v_8tap(&col, y_frac);
-        }
-    }
-    Ok(out)
+    predict_luma_block_high_precision(dst_x, dst_y, w, h, src, mv, bit_depth)
 }
 
 /// Chroma 4-tap horizontal filter (eq. 953). `x_int` is the chroma
@@ -2438,16 +2335,18 @@ pub fn predict_chroma_block(
     let pic_w = src.width as i32;
     let pic_h = src.height as i32;
     let d_stride = dst.stride;
+    let bd = src.bit_depth;
+    let shift1 = shift1_for_bd(bd);
 
     if y_frac == 0 {
         // Horizontal-only chroma filter (eq. 951).
         for r in 0..h_c as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..w_c as i32 {
-                let v = chroma_h_4tap(src, x_int_base + c, yi, x_frac);
+                let v = chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
                 dst.samples
                     [(dst_y_c as usize + r as usize) * d_stride + dst_x_c as usize + c as usize] =
-                    pb_clip_8bit(v);
+                    pb_clip(v, bd);
             }
         }
         return Ok(());
@@ -2456,10 +2355,10 @@ pub fn predict_chroma_block(
         for c in 0..w_c as i32 {
             let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
             for r in 0..h_c as i32 {
-                let v = chroma_v_only_4tap(src, xi, y_int_base + r, y_frac);
+                let v = chroma_v_only_4tap(src, xi, y_int_base + r, y_frac) >> shift1;
                 dst.samples
                     [(dst_y_c as usize + r as usize) * d_stride + dst_x_c as usize + c as usize] =
-                    pb_clip_8bit(v);
+                    pb_clip(v, bd);
             }
         }
         return Ok(());
@@ -2471,7 +2370,7 @@ pub fn predict_chroma_block(
         let yi = (y_int_base - 1 + r).clamp(0, pic_h - 1) as usize;
         for c in 0..w_c as i32 {
             intermediate[r as usize * w_c as usize + c as usize] =
-                chroma_h_4tap(src, x_int_base + c, yi, x_frac);
+                chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
         }
     }
     let mut col = [0i32; 4];
@@ -2483,7 +2382,7 @@ pub fn predict_chroma_block(
             let v = chroma_v_4tap(&col, y_frac);
             dst.samples
                 [(dst_y_c as usize + r as usize) * d_stride + dst_x_c as usize + c as usize] =
-                pb_clip_8bit(v);
+                pb_clip(v, bd);
         }
     }
     Ok(())
@@ -2549,7 +2448,7 @@ pub fn bi_pred_avg_8bit(
             let v0 = pred_l0.samples[r * pred_l0.stride + c] as u32;
             let v1 = pred_l1.samples[r * pred_l1.stride + c] as u32;
             // (a + b + 1) >> 1 — rounding halve.
-            let avg = ((v0 + v1 + 1) >> 1) as u8;
+            let avg = ((v0 + v1 + 1) >> 1) as u16;
             dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
         }
     }
@@ -2596,7 +2495,7 @@ pub fn predict_luma_block_bipred(
             let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
             let v0 = tmp_l0.samples[off_src] as u32;
             let v1 = tmp_l1.samples[off_src] as u32;
-            let avg = ((v0 + v1 + 1) >> 1) as u8;
+            let avg = ((v0 + v1 + 1) >> 1) as u16;
             dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
         }
     }
@@ -2628,7 +2527,7 @@ pub fn predict_chroma_block_bipred(
             let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
             let v0 = tmp_l0.samples[off_src] as u32;
             let v1 = tmp_l1.samples[off_src] as u32;
-            let avg = ((v0 + v1 + 1) >> 1) as u8;
+            let avg = ((v0 + v1 + 1) >> 1) as u16;
             dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
         }
     }
@@ -2718,7 +2617,7 @@ pub fn bi_pred_avg_8bit_bcw(
             let v1 = pred_l1.samples[r * pred_l1.stride + c] as i32;
             // pbSamples = Clip1((w0*v0 + w1*v1 + 4) >> 3)
             let blended = (w0 * v0 + w1 * v1 + 4) >> 3;
-            let clamped = blended.clamp(0, 255) as u8;
+            let clamped = blended.clamp(0, (1i32 << dst.bit_depth) - 1) as u16;
             dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = clamped;
         }
     }
@@ -2754,7 +2653,7 @@ pub fn predict_luma_block_bipred_bcw(
                 let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
                 let v0 = tmp_l0.samples[off_src] as u32;
                 let v1 = tmp_l1.samples[off_src] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                let avg = ((v0 + v1 + 1) >> 1) as u16;
                 dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
             }
         }
@@ -2773,7 +2672,8 @@ pub fn predict_luma_block_bipred_bcw(
             let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
             let v0 = tmp_l0.samples[off_src] as i32;
             let v1 = tmp_l1.samples[off_src] as i32;
-            let blended = ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, 255) as u8;
+            let blended =
+                ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, (1i32 << dst.bit_depth) - 1) as u16;
             dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = blended;
         }
     }
@@ -2806,7 +2706,7 @@ pub fn predict_chroma_block_bipred_bcw(
                 let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
                 let v0 = tmp_l0.samples[off_src] as u32;
                 let v1 = tmp_l1.samples[off_src] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                let avg = ((v0 + v1 + 1) >> 1) as u16;
                 dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
             }
         }
@@ -2825,7 +2725,8 @@ pub fn predict_chroma_block_bipred_bcw(
             let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
             let v0 = tmp_l0.samples[off_src] as i32;
             let v1 = tmp_l1.samples[off_src] as i32;
-            let blended = ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, 255) as u8;
+            let blended =
+                ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, (1i32 << dst.bit_depth) - 1) as u16;
             dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = blended;
         }
     }
@@ -3190,7 +3091,7 @@ mod tests {
         let mut src = PicturePlane::filled(8, 8, 0);
         for y in 0..8 {
             for x in 0..8 {
-                src.samples[y * 8 + x] = ((y * 8 + x) as u8).wrapping_add(1);
+                src.samples[y * 8 + x] = ((y * 8 + x) as u16).wrapping_add(1);
             }
         }
         let mut dst = PicturePlane::filled(8, 8, 0);
@@ -3206,7 +3107,7 @@ mod tests {
         let mut src = PicturePlane::filled(4, 4, 0);
         for x in 0..4 {
             for y in 0..4 {
-                src.samples[y * 4 + x] = (x * 10 + y) as u8;
+                src.samples[y * 4 + x] = (x * 10 + y) as u16;
             }
         }
         let mut dst = PicturePlane::filled(4, 4, 0);
@@ -3252,7 +3153,7 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src.samples[y * 16 + x] = ((y * 16 + x) as u8).wrapping_add(7);
+                src.samples[y * 16 + x] = ((y * 16 + x) as u16).wrapping_add(7);
             }
         }
         let mut dst = PicturePlane::filled(16, 16, 0);
@@ -3320,7 +3221,7 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src.samples[y * 16 + x] = x as u8;
+                src.samples[y * 16 + x] = x as u16;
             }
         }
         let mv = MotionVector { x: 5, y: 0 }; // xFrac = 5
@@ -3341,7 +3242,7 @@ mod tests {
         // output is xc.
         for r in 0..8 {
             for c in 0..8 {
-                let expected = 4 + c as u8;
+                let expected = 4 + c as u16;
                 assert_eq!(
                     dst.samples[(4 + r) * 16 + (4 + c)],
                     expected,
@@ -3366,7 +3267,7 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src.samples[y * 16 + x] = x as u8;
+                src.samples[y * 16 + x] = x as u16;
             }
         }
         let mv = MotionVector { x: 8, y: 0 }; // xFrac = 8
@@ -3381,7 +3282,7 @@ mod tests {
         // Output: (xc*64 + 32 + 32) >> 6 = (64*xc + 64) >> 6 = xc + 1.
         for r in 0..4 {
             for c in 0..4 {
-                let expected = 4 + c as u8 + 1;
+                let expected = 4 + c as u16 + 1;
                 assert_eq!(
                     dst.samples[(4 + r) * 16 + (4 + c)],
                     expected,
@@ -3416,7 +3317,7 @@ mod tests {
         let mut src = PicturePlane::filled(8, 8, 0);
         for y in 0..8 {
             for x in 0..8 {
-                src.samples[y * 8 + x] = y as u8;
+                src.samples[y * 8 + x] = y as u16;
             }
         }
         let mv = MotionVector { x: 0, y: 16 }; // y_frac for chroma = 16 (mid)
@@ -3428,7 +3329,7 @@ mod tests {
         // 6 = yc + 1.
         for r in 0..4 {
             for c in 0..4 {
-                let expected = 2 + r as u8 + 1;
+                let expected = 2 + r as u16 + 1;
                 assert_eq!(
                     dst.samples[(2 + r) * 8 + (2 + c)],
                     expected,
@@ -3461,7 +3362,7 @@ mod tests {
         for y in 0..32 {
             for x in 0..32 {
                 let v = (x as i32 + y as i32 * 2) % 256;
-                src.samples[y * 32 + x] = v as u8;
+                src.samples[y * 32 + x] = v as u16;
             }
         }
         // Pick a non-trivial sub-pel MV: x_frac = 7, y_frac = 11 — a
@@ -3499,7 +3400,7 @@ mod tests {
         let mut src = PicturePlane::filled(32, 32, 0);
         for y in 0..32 {
             for x in 0..32 {
-                src.samples[y * 32 + x] = x as u8;
+                src.samples[y * 32 + x] = x as u16;
             }
         }
         for x_frac in 0..16i32 {
@@ -3517,7 +3418,7 @@ mod tests {
                 for c in 0..8 {
                     let xc = 8 + c as i32;
                     let expected_i = (xc * 64 + lin + 32) >> 6;
-                    let expected = expected_i.clamp(0, 255) as u8;
+                    let expected = expected_i.clamp(0, 255) as u16;
                     let got = dst.samples[(8 + r as usize) * 32 + (8 + c as usize)];
                     assert_eq!(
                         got, expected,
@@ -3535,7 +3436,7 @@ mod tests {
         let mut src = PicturePlane::filled(32, 32, 0);
         for y in 0..32 {
             for x in 0..32 {
-                src.samples[y * 32 + x] = y as u8;
+                src.samples[y * 32 + x] = y as u16;
             }
         }
         for y_frac in 0..16i32 {
@@ -3552,7 +3453,7 @@ mod tests {
                 for c in 0..8 {
                     let yc = 8 + r as i32;
                     let expected_i = (yc * 64 + lin + 32) >> 6;
-                    let expected = expected_i.clamp(0, 255) as u8;
+                    let expected = expected_i.clamp(0, 255) as u16;
                     let got = dst.samples[(8 + r as usize) * 32 + (8 + c as usize)];
                     assert_eq!(
                         got, expected,
@@ -3572,7 +3473,7 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src.samples[y * 16 + x] = ((x * 7) ^ (y * 13)) as u8;
+                src.samples[y * 16 + x] = ((x * 7) ^ (y * 13)) as u16;
             }
         }
         let mv = MotionVector::from_int_pel(2, -1);
@@ -3625,7 +3526,7 @@ mod tests {
     /// (DC preserving). Verified across all 256 sample values.
     #[test]
     fn bi_pred_avg_dc_preserving_for_equal_inputs() {
-        for v in 0..=255u8 {
+        for v in 0..=255u16 {
             let p0 = PicturePlane::filled(4, 4, v);
             let p1 = PicturePlane::filled(4, 4, v);
             let mut dst = PicturePlane::filled(4, 4, 0);
@@ -3642,7 +3543,7 @@ mod tests {
     /// case (even sum).
     #[test]
     fn bi_pred_avg_rounding_matches_spec_formula() {
-        let cases: &[(u8, u8, u8)] = &[
+        let cases: &[(u16, u16, u16)] = &[
             (0, 0, 0),
             (255, 255, 255),
             (10, 20, 15),    // (30+1)/2 = 15 (truncated) — exact
@@ -3695,8 +3596,8 @@ mod tests {
         let mut src_l1 = PicturePlane::filled(32, 32, 0);
         for y in 0..32 {
             for x in 0..32 {
-                src_l0.samples[y * 32 + x] = ((x * 9) ^ (y * 5)) as u8;
-                src_l1.samples[y * 32 + x] = ((x * 3) ^ (y * 11)) as u8;
+                src_l0.samples[y * 32 + x] = ((x * 9) ^ (y * 5)) as u16;
+                src_l1.samples[y * 32 + x] = ((x * 3) ^ (y * 11)) as u16;
             }
         }
         let mv_l0 = MotionVector { x: 16, y: 0 }; // integer-pel +1
@@ -3723,7 +3624,7 @@ mod tests {
                 let off = (8 + r) * 32 + (8 + c);
                 let v0 = dst_l0.samples[off] as u32;
                 let v1 = dst_l1.samples[off] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                let avg = ((v0 + v1 + 1) >> 1) as u16;
                 assert_eq!(
                     dst_bipred.samples[off], avg,
                     "bipred mismatch at ({r},{c}): l0={v0} l1={v1}",
@@ -3740,8 +3641,8 @@ mod tests {
         let mut src_l1 = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src_l0.samples[y * 16 + x] = (50 + x + y * 2) as u8;
-                src_l1.samples[y * 16 + x] = (200 - x - y * 2) as u8;
+                src_l0.samples[y * 16 + x] = (50 + x + y * 2) as u16;
+                src_l1.samples[y * 16 + x] = (200 - x - y * 2) as u16;
             }
         }
         let mv_l0 = MotionVector { x: 8, y: 0 }; // half-pel chroma x
@@ -3758,7 +3659,7 @@ mod tests {
                 let off = (2 + r) * 16 + (2 + c);
                 let v0 = dst_l0.samples[off] as u32;
                 let v1 = dst_l1.samples[off] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                let avg = ((v0 + v1 + 1) >> 1) as u16;
                 assert_eq!(dst_bipred.samples[off], avg);
             }
         }
@@ -5224,8 +5125,8 @@ mod tests {
         let mut src_l1 = PicturePlane::filled(16, 16, 0);
         for r in 0..16usize {
             for c in 0..16usize {
-                src_l0.samples[r * 16 + c] = ((r * 17 + c) & 0xff) as u8;
-                src_l1.samples[r * 16 + c] = (255u8).wrapping_sub((r * 7 + c) as u8);
+                src_l0.samples[r * 16 + c] = ((r * 17 + c) & 0xff) as u16;
+                src_l1.samples[r * 16 + c] = (255u16).wrapping_sub((r * 7 + c) as u16);
             }
         }
         let mv_l0 = MotionVector::from_int_pel(0, 0);
@@ -5326,17 +5227,17 @@ mod tests {
     }
 
     /// At `bit_depth == 8`, the HBD u16 MC HP path produces a
-    /// bit-identical intermediate to the legacy u8 HP path for the
-    /// same sample values lifted into a `PicturePlane16`.
+    /// bit-identical intermediate to the legacy u16 HP path for the
+    /// same sample values lifted into a `PicturePlane`.
     #[test]
     fn predict_luma_hp_u16_bit8_matches_u8() {
         // Build a non-trivial 16x16 reference and clone it into a
         // bit_depth=8 u16 plane.
         let mut src8 = PicturePlane::filled(16, 16, 0);
-        let mut src16 = PicturePlane16::filled(16, 16, 0, 8);
+        let mut src16 = PicturePlane::filled_bd(16, 16, 0, 8);
         for y in 0..16 {
             for x in 0..16 {
-                let v = (((x * 13 + y * 7) ^ 0x55) & 0xff) as u8;
+                let v = (((x * 13 + y * 7) ^ 0x55) & 0xff) as u16;
                 src8.samples[y * 16 + x] = v;
                 src16.samples[y * 16 + x] = v as u16;
             }
@@ -5349,7 +5250,7 @@ mod tests {
             let got = predict_luma_block_high_precision_u16(2, 2, 8, 8, &src16, mv, 8).unwrap();
             assert_eq!(
                 got, want,
-                "u16 / u8 HP MC must match at BD=8 for mv=({mx},{my})",
+                "u16 / u16 HP MC must match at BD=8 for mv=({mx},{my})",
             );
         }
     }
@@ -5362,7 +5263,7 @@ mod tests {
     /// invariant.
     #[test]
     fn predict_luma_hp_u16_main10_uses_full_range() {
-        let src = PicturePlane16::filled(16, 16, 1023, 10);
+        let src = PicturePlane::filled_bd(16, 16, 1023, 10);
         let mv = MotionVector::ZERO;
         let out = predict_luma_block_high_precision_u16(2, 2, 8, 8, &src, mv, 10).unwrap();
         // Integer-pel HP lift = src << (14 - bit_depth) = 1023 << 4
@@ -5384,7 +5285,7 @@ mod tests {
     /// supported bit depths.
     #[test]
     fn predict_luma_hp_u16_main12_lift() {
-        let src = PicturePlane16::filled(16, 16, 4095, 12);
+        let src = PicturePlane::filled_bd(16, 16, 4095, 12);
         let mv = MotionVector::ZERO;
         let out = predict_luma_block_high_precision_u16(2, 2, 8, 8, &src, mv, 12).unwrap();
         // 4095 << 2 = 16380.
@@ -5397,7 +5298,7 @@ mod tests {
     /// and the requested precision.
     #[test]
     fn predict_luma_hp_u16_bit_depth_mismatch_errors() {
-        let src = PicturePlane16::filled(16, 16, 0, 10);
+        let src = PicturePlane::filled_bd(16, 16, 0, 10);
         assert!(
             predict_luma_block_high_precision_u16(0, 0, 8, 8, &src, MotionVector::ZERO, 8).is_err()
         );

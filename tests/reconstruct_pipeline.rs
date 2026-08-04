@@ -244,7 +244,7 @@ fn decode_picture_into_zero_stream_with_lmcs_inverse_maps_in_loop() {
         .enumerate()
     {
         let iy = derived.idx_y_inv(u32::from(pre), 0, 15);
-        let expect = derived.inverse_map_luma_sample(u32::from(pre), iy) as u8;
+        let expect = derived.inverse_map_luma_sample(u32::from(pre), iy) as u16;
         assert_eq!(got, expect, "inverse-mapped luma sample {i}");
         if got != pre {
             changed = true;
@@ -439,7 +439,7 @@ fn ctu_walker_apply_sao_band_offset_luma() {
         0,
         0,
         SaoCtbParams {
-            luma: SaoCtb::band_offset(centre_band, [20, 0, 0, 0], [0, 0, 0, 0], 8),
+            luma: SaoCtb::band_offset(centre_band as u8, [20, 0, 0, 0], [0, 0, 0, 0], 8),
             ..Default::default()
         },
     );
@@ -667,13 +667,13 @@ fn decode_p_slice_all_skip_matches_reference() {
     let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_buf.luma.samples[y * 8 + x] = (10 + (y * 8 + x)) as u8;
+            ref_buf.luma.samples[y * 8 + x] = (10 + (y * 8 + x)) as u16;
         }
     }
     for y in 0..(pic_h / 2) as usize {
         for x in 0..(pic_w / 2) as usize {
-            ref_buf.cb.samples[y * 4 + x] = (90 + y * 4 + x) as u8;
-            ref_buf.cr.samples[y * 4 + x] = (170 + y * 4 + x) as u8;
+            ref_buf.cb.samples[y * 4 + x] = (90 + y * 4 + x) as u16;
+            ref_buf.cr.samples[y * 4 + x] = (170 + y * 4 + x) as u16;
         }
     }
     let ref_pic = ReferencePicture {
@@ -876,16 +876,16 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
     let mut ref_l1_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_l0_buf.luma.samples[y * 8 + x] = (10 + (y * 8 + x)) as u8;
-            ref_l1_buf.luma.samples[y * 8 + x] = (200 - (y * 8 + x)) as u8;
+            ref_l0_buf.luma.samples[y * 8 + x] = (10 + (y * 8 + x)) as u16;
+            ref_l1_buf.luma.samples[y * 8 + x] = (200 - (y * 8 + x)) as u16;
         }
     }
     for y in 0..(pic_h / 2) as usize {
         for x in 0..(pic_w / 2) as usize {
-            ref_l0_buf.cb.samples[y * 4 + x] = (90 + y * 4 + x) as u8;
-            ref_l0_buf.cr.samples[y * 4 + x] = (170 + y * 4 + x) as u8;
-            ref_l1_buf.cb.samples[y * 4 + x] = (160 - y * 4 - x) as u8;
-            ref_l1_buf.cr.samples[y * 4 + x] = (200 - y * 4 - x) as u8;
+            ref_l0_buf.cb.samples[y * 4 + x] = (90 + y * 4 + x) as u16;
+            ref_l0_buf.cr.samples[y * 4 + x] = (170 + y * 4 + x) as u16;
+            ref_l1_buf.cb.samples[y * 4 + x] = (160 - y * 4 - x) as u16;
+            ref_l1_buf.cr.samples[y * 4 + x] = (200 - y * 4 - x) as u16;
         }
     }
     let ref_l0 = ReferencePicture {
@@ -950,26 +950,26 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
     walker.apply_in_loop_filters(&mut out).unwrap();
 
     // ---- Build expected output: byte-exact (L0 + L1 + 1) >> 1 -----------
-    let expected_y: Vec<u8> = ref_l0_buf
+    let expected_y: Vec<u16> = ref_l0_buf
         .luma
         .samples
         .iter()
         .zip(&ref_l1_buf.luma.samples)
-        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u16)
         .collect();
-    let expected_cb: Vec<u8> = ref_l0_buf
+    let expected_cb: Vec<u16> = ref_l0_buf
         .cb
         .samples
         .iter()
         .zip(&ref_l1_buf.cb.samples)
-        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u16)
         .collect();
-    let expected_cr: Vec<u8> = ref_l0_buf
+    let expected_cr: Vec<u16> = ref_l0_buf
         .cr
         .samples
         .iter()
         .zip(&ref_l1_buf.cr.samples)
-        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u16)
         .collect();
 
     assert_eq!(
@@ -1447,13 +1447,13 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
     let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 2) as u8;
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 2) as u16;
         }
     }
     for y in 0..(pic_h / 2) as usize {
         for x in 0..(pic_w / 2) as usize {
-            ref_buf.cb.samples[y * (pic_w / 2) as usize + x] = (90 + y + x) as u8;
-            ref_buf.cr.samples[y * (pic_w / 2) as usize + x] = (170 + y + x) as u8;
+            ref_buf.cb.samples[y * (pic_w / 2) as usize + x] = (90 + y + x) as u16;
+            ref_buf.cr.samples[y * (pic_w / 2) as usize + x] = (170 + y + x) as u16;
         }
     }
 
@@ -1556,7 +1556,7 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
     // ---- Build expected output: reference translated by (-2, 0) ------
     // mc_copy_block_int with src = ref, src_x = -2, src_y = 0:
     //   dst[y][x] = src[clamp(y+0, 0, h-1)][clamp(x-2, 0, w-1)]
-    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    let mut expected_y = vec![0u16; (pic_w * pic_h) as usize];
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
             let sx = (x as i32 - 2).max(0) as usize;
@@ -1685,7 +1685,7 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
         for x in 0..pic_w as usize {
             // Distinctive per-pixel pattern so the per-quadrant MC
             // translation can be verified bit-exactly.
-            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 3) as u8;
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 3) as u16;
         }
     }
 
@@ -1842,14 +1842,14 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
     //   CU1 (TR) MV = (-1, 0):       dst[y][8+x] = ref[y][7+x]
     //   CU2 (BL) MV = (-3, 0):       dst[8+y][x] = ref[8+y][clamp(x-3)]
     //   CU3 (BR) MV = (-2, 0) (PAIRWISE!): dst[8+y][8+x] = ref[8+y][6+x]
-    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    let mut expected_y = vec![0u16; (pic_w * pic_h) as usize];
     let stride = pic_w as usize;
-    let read_clamped = |src_x: i32, src_y: i32| -> u8 {
+    let read_clamped = |src_x: i32, src_y: i32| -> u16 {
         let sx = src_x.clamp(0, pic_w as i32 - 1) as usize;
         let sy = src_y.clamp(0, pic_h as i32 - 1) as usize;
         ref_buf.luma.samples[sy * stride + sx]
     };
-    let translate_quad = |expected: &mut [u8], qx: usize, qy: usize, mv_int_x: i32| {
+    let translate_quad = |expected: &mut [u16], qx: usize, qy: usize, mv_int_x: i32| {
         for y in 0..8 {
             for x in 0..8 {
                 expected[(qy + y) * stride + (qx + x)] =
@@ -1949,7 +1949,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 5) as u8;
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x + y * 5) as u16;
         }
     }
     let ref_pic = ReferencePicture {
@@ -2039,7 +2039,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     //
     // → dst[y][x] = ref[y][min(x + 1, W - 1)].
     let stride = pic_w as usize;
-    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    let mut expected_y = vec![0u16; (pic_w * pic_h) as usize];
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
             let sx = (x + 1).min(pic_w as usize - 1);
@@ -2145,7 +2145,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_buf.luma.samples[y * pic_w as usize + x] = (40 + (x * 7) + (y * 11)) as u8;
+            ref_buf.luma.samples[y * pic_w as usize + x] = (40 + (x * 7) + (y * 11)) as u16;
         }
     }
     let ref_pic = ReferencePicture {
@@ -2260,12 +2260,12 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     //
     //   predSamplesComb[x][y] = (1 * 128 + 3 * ref[y][x] + 2) >> 2.
     let stride = pic_w as usize;
-    let mut expected_y = vec![0u8; (pic_w * pic_h) as usize];
+    let mut expected_y = vec![0u16; (pic_w * pic_h) as usize];
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
             let inter = ref_buf.luma.samples[y * stride + x] as i32;
             let intra = 128i32;
-            expected_y[y * stride + x] = ((intra + 3 * inter + 2) >> 2) as u8;
+            expected_y[y * stride + x] = ((intra + 3 * inter + 2) >> 2) as u16;
         }
     }
     assert_eq!(
@@ -2344,10 +2344,10 @@ fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     let mut ref_l1_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            let v0 = (10 + x * 8 + y * 2) as u8;
+            let v0 = (10 + x * 8 + y * 2) as u16;
             ref_l0_buf.luma.samples[y * pic_w as usize + x] = v0;
             let xp = x.saturating_sub(1);
-            ref_l1_buf.luma.samples[y * pic_w as usize + x] = (10 + xp * 8 + y * 2) as u8;
+            ref_l1_buf.luma.samples[y * pic_w as usize + x] = (10 + xp * 8 + y * 2) as u16;
         }
     }
     // Chroma planes left at the mid-grey fill — BDOF must not touch
@@ -2443,12 +2443,12 @@ fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     // ---- Compare ----------------------------------------------------
     // The eq. 980 reference is the byte-exact average across the
     // whole CU rectangle.
-    let expected_avg: Vec<u8> = ref_l0_buf
+    let expected_avg: Vec<u16> = ref_l0_buf
         .luma
         .samples
         .iter()
         .zip(&ref_l1_buf.luma.samples)
-        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8)
+        .map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u16)
         .collect();
     assert_eq!(
         out_off.luma.samples, expected_avg,
@@ -3821,14 +3821,14 @@ fn decode_p_slice_ibc_cu_copies_inter_ctu() {
     let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_buf.luma.samples[y * pic_w as usize + x] = (16 + x * 2 + y) as u8;
+            ref_buf.luma.samples[y * pic_w as usize + x] = (16 + x * 2 + y) as u16;
         }
     }
     for y in 0..(pic_h / 2) as usize {
         for x in 0..(pic_w / 2) as usize {
-            ref_buf.cb.samples[y * (pic_w / 2) as usize + x] = (80 + x + y) as u8;
+            ref_buf.cb.samples[y * (pic_w / 2) as usize + x] = (80 + x + y) as u16;
             ref_buf.cr.samples[y * (pic_w / 2) as usize + x] =
-                (160u16.wrapping_add((x + 2 * y) as u16) & 0xff) as u8;
+                160u16.wrapping_add((x + 2 * y) as u16) & 0xff;
         }
     }
     let ref_pic = ReferencePicture {
@@ -4135,7 +4135,7 @@ fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
     let mut ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
     for y in 0..pic_h as usize {
         for x in 0..pic_w as usize {
-            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x * 5) as u8;
+            ref_buf.luma.samples[y * pic_w as usize + x] = (10 + x * 5) as u16;
         }
     }
     let ref_pic = ReferencePicture {
@@ -4969,7 +4969,7 @@ fn palette_predictor_propagates_across_cus_through_walker() {
     assert_eq!(out.luma.samples[8 * 16 + 2], 55);
     // CU2 chroma escape at chroma (0, 4): ((6 * 51) << 4) + 32 >> 6.
     let cb_esc = (((6 * 51) << 4) + 32) >> 6;
-    assert_eq!(out.cb.samples[4 * 8], cb_esc as u8);
+    assert_eq!(out.cb.samples[4 * 8], cb_esc as u16);
     // CU3 (8,8): rows alternate 55 / 220.
     assert_eq!(out.luma.samples[8 * 16 + 8], 55);
     assert_eq!(out.luma.samples[9 * 16 + 8], 220);

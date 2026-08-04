@@ -235,7 +235,7 @@ pub fn alf_decide_and_apply_clipped(
     // H` luma bytes — for a 128×128 CTU CTU-grid picture that's
     // <0.5 MiB at the test sizes used in this crate.
     let mut per_set_sse = vec![[0u64; NUM_FIXED_FILTER_SETS as usize]; n_ctbs];
-    let mut per_set_luma: Vec<Vec<u8>> = Vec::with_capacity(NUM_FIXED_FILTER_SETS as usize);
+    let mut per_set_luma: Vec<Vec<u16>> = Vec::with_capacity(NUM_FIXED_FILTER_SETS as usize);
     for s in 0..NUM_FIXED_FILTER_SETS {
         let mut rec_with_alf = rec.clone();
         let trial_pic = alf_picture_all_on_fixed_set(s, pic_w_in_ctbs, pic_h_in_ctbs);
@@ -396,7 +396,7 @@ pub fn alf_decide_and_apply_with_aps_clipped(
     // stage below can treat the search uniformly.
     const N_TRIALS: usize = NUM_FIXED_FILTER_SETS as usize + 1;
     let mut per_trial_sse = vec![[0u64; N_TRIALS]; n_ctbs];
-    let mut per_trial_luma: Vec<Vec<u8>> = Vec::with_capacity(N_TRIALS);
+    let mut per_trial_luma: Vec<Vec<u16>> = Vec::with_capacity(N_TRIALS);
 
     // Fixed sets 0..16.
     for s in 0..NUM_FIXED_FILTER_SETS {
@@ -715,7 +715,7 @@ pub fn chroma_alf_decide_and_apply_clipped(
     // plane so the chosen-CTB commit step can copy without re-running
     // apply_alf.
     let mut per_alt_sse = vec![vec![0u64; n_alts]; n_ctbs];
-    let mut per_alt_chroma: Vec<Vec<u8>> = Vec::with_capacity(n_alts);
+    let mut per_alt_chroma: Vec<Vec<u16>> = Vec::with_capacity(n_alts);
     for k in 0..n_alts {
         let mut trial = rec.clone();
         let trial_pic = chroma_alf_picture_all_on(component, k as u8, pic_w_in_ctbs, pic_h_in_ctbs);
@@ -901,7 +901,7 @@ fn cc_alf_picture_all_on(
 pub fn cc_alf_decide_and_apply(
     src: &PictureBuffer,
     rec: &mut PictureBuffer,
-    pre_luma_alf_samples: &[u8],
+    pre_luma_alf_samples: &[u16],
     apply_pic: &mut AlfPicture,
     aps: &AlfApsData,
     component: CcAlfComponent,
@@ -929,7 +929,7 @@ pub fn cc_alf_decide_and_apply(
 pub fn cc_alf_decide_and_apply_clipped(
     src: &PictureBuffer,
     rec: &mut PictureBuffer,
-    pre_luma_alf_samples: &[u8],
+    pre_luma_alf_samples: &[u16],
     apply_pic: &mut AlfPicture,
     aps: &AlfApsData,
     component: CcAlfComponent,
@@ -1034,7 +1034,7 @@ pub fn cc_alf_decide_and_apply_clipped(
     // plane so the chosen-CTB commit step can copy from it without a
     // redundant re-run.
     let mut per_filter_sse = vec![vec![0u64; n_filters]; n_ctbs];
-    let mut per_filter_chroma: Vec<Vec<u8>> = Vec::with_capacity(n_filters);
+    let mut per_filter_chroma: Vec<Vec<u16>> = Vec::with_capacity(n_filters);
     for k in 0..n_filters {
         let mut trial = rec.clone();
         // Restore the pre-luma-ALF luma plane so apply_alf's internal
@@ -1141,7 +1141,7 @@ mod tests {
         let mut buf = PictureBuffer::yuv420_filled(w, h, 128);
         for y in 0..h {
             for x in 0..w {
-                let v = (32 + (x as f32 / w.max(1) as f32 * 191.0) as i32) as u8;
+                let v = (32 + (x as f32 / w.max(1) as f32 * 191.0) as i32) as u16;
                 buf.luma.samples[y * buf.luma.stride + x] = v;
             }
         }
@@ -1210,7 +1210,7 @@ mod tests {
         // filter set should be able to partially mitigate.
         let mut rec = src.clone();
         for (i, sample) in rec.luma.samples.iter_mut().enumerate() {
-            let noise = ((i.wrapping_mul(2654435761)) & 0x1f) as u8;
+            let noise = ((i.wrapping_mul(2654435761)) & 0x1f) as u16;
             *sample = sample.wrapping_add(noise).wrapping_sub(0x10);
         }
         // Branch A — round-40 single-set baseline (set 0 only).
@@ -1300,7 +1300,7 @@ mod tests {
         // Right CTB — slowly-varying 4-LSB diagonal stripe pattern.
         for y in 0..128 {
             for x in 128..256 {
-                let v = (((x + y) >> 4) & 0x07) as u8;
+                let v = (((x + y) >> 4) & 0x07) as u16;
                 let stride = rec.luma.stride;
                 rec.luma.samples[y * stride + x] = rec.luma.samples[y * stride + x].wrapping_add(v);
             }
@@ -1332,7 +1332,7 @@ mod tests {
             // Add some noise so RDO can find a winning set.
             let mut r = src.clone();
             for (i, sample) in r.luma.samples.iter_mut().enumerate() {
-                let n = ((i.wrapping_mul(0xdeadbeef)) & 0x07) as u8;
+                let n = ((i.wrapping_mul(0xdeadbeef)) & 0x07) as u16;
                 *sample = sample.wrapping_add(n);
             }
             r
@@ -1380,7 +1380,7 @@ mod tests {
         let src = smooth_gradient_picture(128, 128);
         let mut rec = src.clone();
         for (i, sample) in rec.luma.samples.iter_mut().enumerate() {
-            let n = ((i.wrapping_mul(0xc6a4a793_u64 as usize)) & 0x0f) as u8;
+            let n = ((i.wrapping_mul(0xc6a4a793_u64 as usize)) & 0x0f) as u16;
             *sample = sample.wrapping_add(n);
         }
         let pre_sse = total_sse_y(&src, &rec);
@@ -1420,7 +1420,7 @@ mod tests {
         // Smooth gradient source.
         for y in 0..h {
             for x in 0..w {
-                let v = (32 + (x as u32 * 192 / w as u32)) as u8;
+                let v = (32 + (x as u32 * 192 / w as u32)) as u16;
                 src.luma.samples[y * src.luma.stride + x] = v;
             }
         }
@@ -1435,7 +1435,7 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let noise = ((bits >> 56) & 0x1f) as i32 - 16;
-                let v = (base + noise).clamp(0, 255) as u8;
+                let v = (base + noise).clamp(0, 255) as u16;
                 rec.luma.samples[y * rec.luma.stride + x] = v;
             }
         }
@@ -1488,7 +1488,7 @@ mod tests {
         let pre = {
             let mut r = src.clone();
             for (i, sample) in r.luma.samples.iter_mut().enumerate() {
-                let n = ((i.wrapping_mul(0xdeadbeef)) & 0x07) as u8;
+                let n = ((i.wrapping_mul(0xdeadbeef)) & 0x07) as u16;
                 *sample = sample.wrapping_add(n);
             }
             r
@@ -1931,7 +1931,7 @@ mod tests {
         // Inject high-frequency chroma noise so RDO has a reason to
         // flip CTBs on.
         for (i, v) in rec.cb.samples.iter_mut().enumerate() {
-            let n = ((i.wrapping_mul(2654435761)) & 0x0f) as u8;
+            let n = ((i.wrapping_mul(2654435761)) & 0x0f) as u16;
             *v = v.wrapping_add(n).wrapping_sub(8);
         }
         let pre_sse = total_sse_cb(&src, &rec);
@@ -2003,7 +2003,7 @@ mod tests {
         let src = PictureBuffer::yuv420_filled(64, 64, 100);
         let mut rec = src.clone();
         for (i, v) in rec.cr.samples.iter_mut().enumerate() {
-            let n = ((i.wrapping_mul(0xdeadbeef)) & 0x0f) as u8;
+            let n = ((i.wrapping_mul(0xdeadbeef)) & 0x0f) as u16;
             *v = v.wrapping_add(n);
         }
         let baseline_cb = rec.cb.samples.clone();
@@ -2033,7 +2033,7 @@ mod tests {
         let mut rec = src.clone();
         // Inject patterned chroma noise so RDO finds a winning alt.
         for (i, v) in rec.cb.samples.iter_mut().enumerate() {
-            let n = ((i.wrapping_mul(0x9e3779b9)) & 0x0f) as u8;
+            let n = ((i.wrapping_mul(0x9e3779b9)) & 0x0f) as u16;
             *v = v.wrapping_add(n).wrapping_sub(7);
         }
         let pre_chroma = rec.cb.samples.clone();
@@ -2083,11 +2083,11 @@ mod tests {
         let mut rec = src.clone();
         // Distort both chroma planes.
         for (i, v) in rec.cb.samples.iter_mut().enumerate() {
-            let n = ((i.wrapping_mul(2654435761)) & 0x0f) as u8;
+            let n = ((i.wrapping_mul(2654435761)) & 0x0f) as u16;
             *v = v.wrapping_add(n).wrapping_sub(8);
         }
         for (i, v) in rec.cr.samples.iter_mut().enumerate() {
-            let n = ((i.wrapping_mul(0xdeadbeef)) & 0x0f) as u8;
+            let n = ((i.wrapping_mul(0xdeadbeef)) & 0x0f) as u16;
             *v = v.wrapping_add(n).wrapping_sub(8);
         }
         let aps = chroma_aps_two_alts();

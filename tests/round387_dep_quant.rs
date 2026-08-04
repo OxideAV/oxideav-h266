@@ -24,13 +24,13 @@ fn gradient_source(n: usize) -> PictureBuffer {
     for y in 0..n {
         for x in 0..n {
             src.luma.samples[y * src.luma.stride + x] =
-                ((x * 3 + y * 2 + (x * y) / 7) % 200 + 20) as u8;
+                ((x * 3 + y * 2 + (x * y) / 7) % 200 + 20) as u16;
         }
     }
     for y in 0..n / 2 {
         for x in 0..n / 2 {
-            src.cb.samples[y * src.cb.stride + x] = (100 + x * 2) as u8;
-            src.cr.samples[y * src.cr.stride + x] = (150 - y) as u8;
+            src.cb.samples[y * src.cb.stride + x] = (100 + x * 2) as u16;
+            src.cr.samples[y * src.cr.stride + x] = (150 - y) as u16;
         }
     }
     src

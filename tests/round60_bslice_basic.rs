@@ -22,10 +22,10 @@ fn translation_pair(dx: i32) -> (PictureBuffer, PictureBuffer) {
     let mut b = PictureBuffer::yuv420_filled(w, h, 100);
     for y in 0..h {
         for x in 0..w {
-            let v = if (x / 8) % 2 == 0 { 80u8 } else { 180u8 };
+            let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
             a.luma.samples[y * a.luma.stride + x] = v;
             let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-            let v2 = if (sx / 8) % 2 == 0 { 80u8 } else { 180u8 };
+            let v2 = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
             b.luma.samples[y * b.luma.stride + x] = v2;
         }
     }
@@ -96,7 +96,7 @@ fn bslice_decoder_roundtrip_byte_identical() {
     let (bs_b, enc_rec) = encode_b_slice(&frame_b, &rec_i, &rec_i, 26, 1, 8).unwrap();
     let dec_rec = decode_b_slice(&bs_b, &rec_i, &rec_i).unwrap();
     let mut diff_count = 0usize;
-    let mut first: Option<(usize, usize, u8, u8)> = None;
+    let mut first: Option<(usize, usize, u16, u16)> = None;
     for y in 0..frame_b.luma.height {
         for x in 0..frame_b.luma.width {
             let e = enc_rec.luma.samples[y * enc_rec.luma.stride + x];

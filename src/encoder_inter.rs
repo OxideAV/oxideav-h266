@@ -438,7 +438,7 @@ pub fn mc_predict_int(
 /// MV (1/16-pel units) through the spec §8.5.6.3 luma interpolation
 /// filter. Writes the prediction into a `w*h` row-major buffer.
 fn mc_predict_subpel(
-    pred: &mut [u8],
+    pred: &mut [u16],
     ref_p: &PicturePlane,
     cx: usize,
     cy: usize,
@@ -484,7 +484,7 @@ fn mc_predict_subpel(
 ///     (`mv >> 5` integer chroma offset, `mv & 31` chroma frac index).
 ///     [`predict_chroma_block`] handles the conversion internally.
 fn mc_predict_chroma_subpel(
-    pred_c: &mut [u8],
+    pred_c: &mut [u16],
     ref_c: &PicturePlane,
     cx_c: usize,
     cy_c: usize,
@@ -534,14 +534,14 @@ fn mc_predict_chroma_subpel_bi(
     cy_c: usize,
     w_c: usize,
     h_c: usize,
-) -> Result<Vec<u8>> {
-    let mut p0 = vec![0u8; w_c * h_c];
-    let mut p1 = vec![0u8; w_c * h_c];
+) -> Result<Vec<u16>> {
+    let mut p0 = vec![0u16; w_c * h_c];
+    let mut p1 = vec![0u16; w_c * h_c];
     mc_predict_chroma_subpel(&mut p0, ref_c_l0, cx_c, cy_c, w_c, h_c, mv_l0_q16)?;
     mc_predict_chroma_subpel(&mut p1, ref_c_l1, cx_c, cy_c, w_c, h_c, mv_l1_q16)?;
-    let mut out = vec![0u8; w_c * h_c];
+    let mut out = vec![0u16; w_c * h_c];
     for i in 0..w_c * h_c {
-        out[i] = (((p0[i] as u16) + (p1[i] as u16) + 1) >> 1) as u8;
+        out[i] = ((p0[i] + p1[i] + 1) >> 1) as u16;
     }
     Ok(out)
 }
@@ -700,13 +700,13 @@ fn decode_ref_idx(dec: &mut ArithDecoder<'_>, num_active: usize) -> Result<u8> {
 ///     what the decoder will reconstruct).
 fn prepare_inter_tb(
     src: &PicturePlane,
-    pred: &[u8],
+    pred: &[u16],
     cx: usize,
     cy: usize,
     n_tb_w: usize,
     n_tb_h: usize,
     qp: i32,
-) -> Result<(Vec<i32>, Vec<u8>)> {
+) -> Result<(Vec<i32>, Vec<u16>)> {
     debug_assert_eq!(pred.len(), n_tb_w * n_tb_h);
     let mut residual = vec![0i32; n_tb_w * n_tb_h];
     for ty in 0..n_tb_h {
@@ -735,11 +735,11 @@ fn prepare_inter_tb(
             8,
             15,
         )?;
-        let mut recon = vec![0u8; n_tb_w * n_tb_h];
+        let mut recon = vec![0u16; n_tb_w * n_tb_h];
         for ty in 0..n_tb_h {
             for tx in 0..n_tb_w {
                 let p = pred[ty * n_tb_w + tx] as i32;
-                let v = (p + r[ty * n_tb_w + tx]).clamp(0, 255) as u8;
+                let v = (p + r[ty * n_tb_w + tx]).clamp(0, 255) as u16;
                 recon[ty * n_tb_w + tx] = v;
             }
         }
@@ -756,11 +756,11 @@ fn prepare_inter_tb(
 /// `pred` and writes the reconstructed samples into `out_block`.
 fn reconstruct_inter_tb_from_levels(
     levels: &[i32],
-    pred: &[u8],
+    pred: &[u16],
     n_tb_w: usize,
     n_tb_h: usize,
     qp: i32,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u16>> {
     debug_assert_eq!(pred.len(), n_tb_w * n_tb_h);
     if levels.iter().all(|&l| l == 0) {
         return Ok(pred.to_vec());
@@ -778,11 +778,11 @@ fn reconstruct_inter_tb_from_levels(
         8,
         15,
     )?;
-    let mut out = vec![0u8; n_tb_w * n_tb_h];
+    let mut out = vec![0u16; n_tb_w * n_tb_h];
     for ty in 0..n_tb_h {
         for tx in 0..n_tb_w {
             let p = pred[ty * n_tb_w + tx] as i32;
-            let v = (p + r[ty * n_tb_w + tx]).clamp(0, 255) as u8;
+            let v = (p + r[ty * n_tb_w + tx]).clamp(0, 255) as u16;
             out[ty * n_tb_w + tx] = v;
         }
     }
@@ -1019,7 +1019,7 @@ pub fn encode_p_slice_multi_ref(
             mv_field.set(bx, by, best_mv_q16);
 
             // --- MC prediction (sub-pel-aware) ---
-            let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+            let mut pred = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred,
                 &ref_p.luma,
@@ -1038,9 +1038,9 @@ pub fn encode_p_slice_multi_ref(
             const CH: usize = INTER_BLOCK_H / 2;
             let cx_c = cx / 2;
             let cy_c = cy / 2;
-            let mut pred_cb = vec![0u8; CW * CH];
+            let mut pred_cb = vec![0u16; CW * CH];
             mc_predict_chroma_subpel(&mut pred_cb, &ref_p.cb, cx_c, cy_c, CW, CH, best_mv_q16)?;
-            let mut pred_cr = vec![0u8; CW * CH];
+            let mut pred_cr = vec![0u16; CW * CH];
             mc_predict_chroma_subpel(&mut pred_cr, &ref_p.cr, cx_c, cy_c, CW, CH, best_mv_q16)?;
             for r in 0..CH {
                 for c in 0..CW {
@@ -1250,7 +1250,7 @@ pub fn decode_p_slice_multi_ref(
             let cbf_y = read_tu_y_coded_flag(&mut dec, &mut ctxs.residual, false, false, false)?;
             // Predict the block from the reference + sub-pel MV.
             let ref_p = ref_list_l0[ref_idx_l0 as usize];
-            let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+            let mut pred = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred,
                 &ref_p.luma,
@@ -1290,9 +1290,9 @@ pub fn decode_p_slice_multi_ref(
             const CH: usize = INTER_BLOCK_H / 2;
             let cx_c = cx / 2;
             let cy_c = cy / 2;
-            let mut pred_cb = vec![0u8; CW * CH];
+            let mut pred_cb = vec![0u16; CW * CH];
             mc_predict_chroma_subpel(&mut pred_cb, &ref_p.cb, cx_c, cy_c, CW, CH, mv_q16)?;
-            let mut pred_cr = vec![0u8; CW * CH];
+            let mut pred_cr = vec![0u16; CW * CH];
             mc_predict_chroma_subpel(&mut pred_cr, &ref_p.cr, cx_c, cy_c, CW, CH, mv_q16)?;
             for r in 0..CH {
                 for c in 0..CW {
@@ -1502,7 +1502,7 @@ fn read_bslice_header(bytes: &[u8]) -> Result<BSliceHeader> {
 }
 
 /// Per-block SSE between the source luma and a candidate prediction.
-fn sse_block(src: &PicturePlane, cx: usize, cy: usize, pred: &[u8], w: usize, h: usize) -> u32 {
+fn sse_block(src: &PicturePlane, cx: usize, cy: usize, pred: &[u16], w: usize, h: usize) -> u32 {
     let mut sse: u32 = 0;
     for r in 0..h {
         for c in 0..w {
@@ -1516,12 +1516,12 @@ fn sse_block(src: &PicturePlane, cx: usize, cy: usize, pred: &[u8], w: usize, h:
 }
 
 /// Average two predictions per §8.5.6.4 — `(p0 + p1 + 1) >> 1`.
-fn average_bi(p0: &[u8], p1: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
+fn average_bi(p0: &[u16], p1: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let mut out = vec![0u16; w * h];
     for i in 0..w * h {
-        let a = p0[i] as u16;
-        let b = p1[i] as u16;
-        out[i] = ((a + b + 1) >> 1) as u8;
+        let a = p0[i] as u32;
+        let b = p1[i] as u32;
+        out[i] = ((a + b + 1) >> 1) as u16;
     }
     out
 }
@@ -1539,17 +1539,17 @@ fn average_bi(p0: &[u8], p1: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// 14-bit precision is folded out because both inputs are already
 /// 8-bit clamped). The default-weighted shape (`w0 = w1 = (1 << log2WD),
 /// o0 = o1 = 0`) collapses to `(p0 + p1 + 1) >> 1` byte-for-byte.
-fn weighted_bi(p0: &[u8], p1: &[u8], w: usize, h: usize, pwt: &PredWeightTable) -> Vec<u8> {
+fn weighted_bi(p0: &[u16], p1: &[u16], w: usize, h: usize, pwt: &PredWeightTable) -> Vec<u16> {
     let log2_wd = pwt.log2_weight_denom_y;
     let shift = log2_wd + 1;
     let off = ((pwt.o_l0_y + pwt.o_l1_y + 1) as i64) << log2_wd;
     let w0 = pwt.w_l0_y as i64;
     let w1 = pwt.w_l1_y as i64;
-    let mut out = vec![0u8; w * h];
+    let mut out = vec![0u16; w * h];
     for i in 0..w * h {
         let v = (p0[i] as i64) * w0 + (p1[i] as i64) * w1 + off;
         let r = v >> shift;
-        out[i] = r.clamp(0, 255) as u8;
+        out[i] = r.clamp(0, 255) as u16;
     }
     out
 }
@@ -1813,7 +1813,7 @@ pub fn encode_b_slice_multi_ref(
             let ref_l1_p = ref_list_l1[best_ref_idx_l1 as usize];
 
             // ----- Form three candidate predictions -----
-            let mut pred_l0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+            let mut pred_l0 = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred_l0,
                 &ref_l0_p.luma,
@@ -1823,7 +1823,7 @@ pub fn encode_b_slice_multi_ref(
                 INTER_BLOCK_H,
                 mv_l0_q16,
             )?;
-            let mut pred_l1 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+            let mut pred_l1 = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
             mc_predict_subpel(
                 &mut pred_l1,
                 &ref_l1_p.luma,
@@ -1931,15 +1931,15 @@ pub fn encode_b_slice_multi_ref(
             let cy_c = cy / 2;
             let (pred_cb, pred_cr) = match idc {
                 InterPredIdc::L0 => {
-                    let mut cb = vec![0u8; CW * CH];
-                    let mut cr = vec![0u8; CW * CH];
+                    let mut cb = vec![0u16; CW * CH];
+                    let mut cr = vec![0u16; CW * CH];
                     mc_predict_chroma_subpel(&mut cb, &ref_l0_p.cb, cx_c, cy_c, CW, CH, mv_l0_q16)?;
                     mc_predict_chroma_subpel(&mut cr, &ref_l0_p.cr, cx_c, cy_c, CW, CH, mv_l0_q16)?;
                     (cb, cr)
                 }
                 InterPredIdc::L1 => {
-                    let mut cb = vec![0u8; CW * CH];
-                    let mut cr = vec![0u8; CW * CH];
+                    let mut cb = vec![0u16; CW * CH];
+                    let mut cr = vec![0u16; CW * CH];
                     mc_predict_chroma_subpel(&mut cb, &ref_l1_p.cb, cx_c, cy_c, CW, CH, mv_l1_q16)?;
                     mc_predict_chroma_subpel(&mut cr, &ref_l1_p.cr, cx_c, cy_c, CW, CH, mv_l1_q16)?;
                     (cb, cr)
@@ -2200,7 +2200,7 @@ pub fn decode_b_slice_multi_ref(
             let pred = match idc {
                 InterPredIdc::L0 => {
                     let ref_p = ref_list_l0[ref_idx_l0 as usize];
-                    let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    let mut pred = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut pred,
                         &ref_p.luma,
@@ -2214,7 +2214,7 @@ pub fn decode_b_slice_multi_ref(
                 }
                 InterPredIdc::L1 => {
                     let ref_p = ref_list_l1[ref_idx_l1 as usize];
-                    let mut pred = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    let mut pred = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut pred,
                         &ref_p.luma,
@@ -2229,7 +2229,7 @@ pub fn decode_b_slice_multi_ref(
                 InterPredIdc::Bi => {
                     let ref_l0_p = ref_list_l0[ref_idx_l0 as usize];
                     let ref_l1_p = ref_list_l1[ref_idx_l1 as usize];
-                    let mut p0 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    let mut p0 = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut p0,
                         &ref_l0_p.luma,
@@ -2239,7 +2239,7 @@ pub fn decode_b_slice_multi_ref(
                         INTER_BLOCK_H,
                         mv_l0_q16,
                     )?;
-                    let mut p1 = vec![0u8; INTER_BLOCK_W * INTER_BLOCK_H];
+                    let mut p1 = vec![0u16; INTER_BLOCK_W * INTER_BLOCK_H];
                     mc_predict_subpel(
                         &mut p1,
                         &ref_l1_p.luma,
@@ -2292,16 +2292,16 @@ pub fn decode_b_slice_multi_ref(
             let (pred_cb, pred_cr) = match idc {
                 InterPredIdc::L0 => {
                     let ref_p = ref_list_l0[ref_idx_l0 as usize];
-                    let mut cb = vec![0u8; CW * CH];
-                    let mut cr = vec![0u8; CW * CH];
+                    let mut cb = vec![0u16; CW * CH];
+                    let mut cr = vec![0u16; CW * CH];
                     mc_predict_chroma_subpel(&mut cb, &ref_p.cb, cx_c, cy_c, CW, CH, mv_l0_q16)?;
                     mc_predict_chroma_subpel(&mut cr, &ref_p.cr, cx_c, cy_c, CW, CH, mv_l0_q16)?;
                     (cb, cr)
                 }
                 InterPredIdc::L1 => {
                     let ref_p = ref_list_l1[ref_idx_l1 as usize];
-                    let mut cb = vec![0u8; CW * CH];
-                    let mut cr = vec![0u8; CW * CH];
+                    let mut cb = vec![0u16; CW * CH];
+                    let mut cr = vec![0u16; CW * CH];
                     mc_predict_chroma_subpel(&mut cb, &ref_p.cb, cx_c, cy_c, CW, CH, mv_l1_q16)?;
                     mc_predict_chroma_subpel(&mut cr, &ref_p.cr, cx_c, cy_c, CW, CH, mv_l1_q16)?;
                     (cb, cr)
@@ -2360,10 +2360,10 @@ mod tests {
         // Stripe pattern in the luma plane.
         for y in 0..h {
             for x in 0..w {
-                let v = if (x / 8) % 2 == 0 { 80u8 } else { 180u8 };
+                let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
                 a.luma.samples[y * a.luma.stride + x] = v;
                 let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-                let v2 = if (sx / 8) % 2 == 0 { 80u8 } else { 180u8 };
+                let v2 = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
                 b.luma.samples[y * b.luma.stride + x] = v2;
             }
         }
@@ -2420,7 +2420,7 @@ mod tests {
         let (bs_p, enc_rec) = encode_p_slice(&frame_p, &rec_i, 26, 1, 8).unwrap();
         let dec_rec = decode_p_slice(&bs_p, &rec_i).unwrap();
         let mut diff_count = 0usize;
-        let mut first_diff: Option<(usize, usize, u8, u8)> = None;
+        let mut first_diff: Option<(usize, usize, u16, u16)> = None;
         for y in 0..frame_p.luma.height {
             for x in 0..frame_p.luma.width {
                 let e = enc_rec.luma.samples[y * enc_rec.luma.stride + x];
@@ -2628,13 +2628,13 @@ mod tests {
         // Generate a smooth source: a gentle linear ramp with a few
         // band edges. Sub-pel-displacements of such a band-limited
         // signal can be reconstructed by an 8-tap filter to high PSNR.
-        let big = |x_q16: i32| -> u8 {
+        let big = |x_q16: i32| -> u16 {
             // Use a smoothly-varying brightness in the q16 axis.
             // Pattern: a sinusoid mixed with a low-amplitude offset so
             // dynamic range is healthy (~ 70 .. 180).
             let phase = (x_q16 as f64) / (big_w as f64) * (5.0 * std::f64::consts::PI);
             let v = 125.0 + 55.0 * phase.sin();
-            v.clamp(0.0, 255.0) as u8
+            v.clamp(0.0, 255.0) as u16
         };
         let mut a = PictureBuffer::yuv420_filled(w, h, 100);
         let mut b = PictureBuffer::yuv420_filled(w, h, 100);
@@ -2768,9 +2768,9 @@ mod tests {
     /// §8.5.6.4 / round-60 `average_bi`.
     #[test]
     fn round63_weighted_bi_default_shape_matches_simple_average() {
-        let p0: Vec<u8> = (0..16).map(|i: u8| i.wrapping_mul(15)).collect();
-        let p1: Vec<u8> = (0..16)
-            .map(|i: u8| 200u8.wrapping_sub(i.wrapping_mul(7)))
+        let p0: Vec<u16> = (0..16).map(|i: u16| i.wrapping_mul(15)).collect();
+        let p1: Vec<u16> = (0..16)
+            .map(|i: u16| 200u16.wrapping_sub(i.wrapping_mul(7)))
             .collect();
         let avg = average_bi(&p0, &p1, 4, 4);
         for log2_wd in 0..=5 {
@@ -2794,10 +2794,10 @@ mod tests {
     /// the slice-level offset estimator targets.
     #[test]
     fn round63_weighted_bi_constant_offset_recovers_target() {
-        let target: Vec<u8> = (0..16).map(|i| 50 + i * 4).collect();
+        let target: Vec<u16> = (0..16).map(|i| 50 + i * 4).collect();
         // L0 = target - 20, L1 = target - 40 (both intensities lower).
-        let p0: Vec<u8> = target.iter().map(|&v| v.saturating_sub(20)).collect();
-        let p1: Vec<u8> = target.iter().map(|&v| v.saturating_sub(40)).collect();
+        let p0: Vec<u16> = target.iter().map(|&v| v.saturating_sub(20)).collect();
+        let p1: Vec<u16> = target.iter().map(|&v| v.saturating_sub(40)).collect();
         let pwt = PredWeightTable {
             log2_weight_denom_y: 2,
             w_l0_y: 4,
@@ -2810,7 +2810,7 @@ mod tests {
             // Expected: ((p0+20)+(p1+40))/2 ≈ ((target-20+20)+(target-40+40))/2 = target.
             // Eq. 994 introduces a +1 rounding constant inside the
             // offset term: (p0*4 + p1*4 + (60+1)*4) >> 3 = (p0+p1+61)/2.
-            let want = (((p0[i] as i32) + (p1[i] as i32) + 61) >> 1) as u8;
+            let want = (((p0[i] as i32) + (p1[i] as i32) + 61) >> 1) as u16;
             assert_eq!(w[i], want, "constant-offset WP mismatch at i={i}");
         }
     }
@@ -2862,11 +2862,11 @@ mod tests {
     #[test]
     fn round60_average_bi_matches_spec_8_5_6_4() {
         // pred = (a + b + 1) >> 1 per §8.5.6.4 (simple-average bi-pred).
-        let p0: Vec<u8> = (0..16).map(|i| i * 8).collect();
-        let p1: Vec<u8> = (0..16).map(|i| 128 + i).collect();
+        let p0: Vec<u16> = (0..16).map(|i| i * 8).collect();
+        let p1: Vec<u16> = (0..16).map(|i| 128 + i).collect();
         let avg = average_bi(&p0, &p1, 4, 4);
         for i in 0..16 {
-            let expected = ((p0[i] as u16 + p1[i] as u16 + 1) >> 1) as u8;
+            let expected = ((p0[i] as u16 + p1[i] as u16 + 1) >> 1) as u16;
             assert_eq!(avg[i], expected, "mismatch at i={i}");
         }
     }
@@ -2967,12 +2967,12 @@ mod tests {
         let mut src = PicturePlane::filled(8, 8, 0);
         for y in 0..8 {
             for x in 0..8 {
-                src.samples[y * src.stride + x] = (10 + x as u8 * 7 + y as u8 * 3) & 0xFF;
+                src.samples[y * src.stride + x] = (10 + x as u16 * 7 + y as u16 * 3) & 0xFF;
             }
         }
-        let mut dst = vec![0u8; 4];
+        let mut dst = vec![0u16; 4];
         mc_predict_chroma_subpel(&mut dst, &src, 2, 2, 2, 2, (0, 0)).unwrap();
-        let mut expected: Vec<u8> = Vec::with_capacity(4);
+        let mut expected: Vec<u16> = Vec::with_capacity(4);
         for r in 0..2 {
             for c in 0..2 {
                 expected.push(src.samples[(2 + r) * src.stride + (2 + c)]);
@@ -2989,13 +2989,13 @@ mod tests {
         let mut src = PicturePlane::filled(16, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
-                src.samples[y * src.stride + x] = (x as u8) ^ ((y as u8) << 1);
+                src.samples[y * src.stride + x] = (x as u16) ^ ((y as u16) << 1);
             }
         }
         // mv = (+2 chroma px, -1 chroma px) in luma 1/16 units (chroma
         // 1/32 = 2 luma 1/16 ⇒ +2 chroma px = +64 luma 1/16).
         let mv_q16 = (2 * 32, -32);
-        let mut dst = vec![0u8; 9];
+        let mut dst = vec![0u16; 9];
         mc_predict_chroma_subpel(&mut dst, &src, 4, 4, 3, 3, mv_q16).unwrap();
         for r in 0..3 {
             for c in 0..3 {
@@ -3020,7 +3020,7 @@ mod tests {
         for x_frac in 0..32 {
             for y_frac in 0..32 {
                 let mv_q16 = (x_frac, y_frac);
-                let mut dst = vec![0u8; 4];
+                let mut dst = vec![0u16; 4];
                 mc_predict_chroma_subpel(&mut dst, &src, 4, 4, 2, 2, mv_q16).unwrap();
                 for &v in &dst {
                     assert_eq!(
@@ -3039,16 +3039,16 @@ mod tests {
         let mut s0 = PicturePlane::filled(8, 8, 0);
         let mut s1 = PicturePlane::filled(8, 8, 0);
         for i in 0..64 {
-            s0.samples[i] = (i * 3) as u8;
-            s1.samples[i] = (255 - i * 2) as u8;
+            s0.samples[i] = (i * 3) as u16;
+            s1.samples[i] = (255 - i * 2) as u16;
         }
-        let mut p0 = vec![0u8; 4];
-        let mut p1 = vec![0u8; 4];
+        let mut p0 = vec![0u16; 4];
+        let mut p1 = vec![0u16; 4];
         mc_predict_chroma_subpel(&mut p0, &s0, 2, 2, 2, 2, (0, 0)).unwrap();
         mc_predict_chroma_subpel(&mut p1, &s1, 2, 2, 2, 2, (0, 0)).unwrap();
         let bi = mc_predict_chroma_subpel_bi(&s0, (0, 0), &s1, (0, 0), 2, 2, 2, 2).unwrap();
         for i in 0..4 {
-            let want = (((p0[i] as u16) + (p1[i] as u16) + 1) >> 1) as u8;
+            let want = (((p0[i] as u16) + (p1[i] as u16) + 1) >> 1) as u16;
             assert_eq!(bi[i], want, "BI chroma average mismatch at i={i}");
         }
     }

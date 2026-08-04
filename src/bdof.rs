@@ -56,7 +56,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::reconstruct::{PicturePlane, PicturePlane16};
+use crate::reconstruct::PicturePlane;
 
 /// `mvRefineThres = 1 << 4` (spec, top of §8.5.6.5). Caps the per-sub-
 /// block refinement at `±(2/16)` luma pel.
@@ -484,21 +484,21 @@ pub fn bdof_refine_into(
         ext_w,
         |x, y, clamped| {
             let dst_off = (dst_y_us + y as usize) * dst_stride + (dst_x_us + x as usize);
-            dst.samples[dst_off] = clamped as u8;
+            dst.samples[dst_off] = clamped as u16;
         },
     );
     Ok(())
 }
 
 /// HBD twin of [`bdof_refine_into`] — writes the eq. 977 `pbSamples`
-/// values into a [`PicturePlane16`] at `bit_depth` precision instead
+/// values into a [`PicturePlane`] at `bit_depth` precision instead
 /// of narrowing to 8 bits. Algorithmics are byte-identical to the u8
 /// path (both delegate to the shared `bdof_apply_kernel`); only the
 /// destination type and clip range differ. The `dst.bit_depth` must
 /// equal `bit_depth`.
 #[allow(clippy::too_many_arguments)]
 pub fn bdof_refine_into_u16(
-    dst: &mut PicturePlane16,
+    dst: &mut PicturePlane,
     dst_x: u32,
     dst_y: u32,
     n_cb_w: u32,
@@ -667,7 +667,7 @@ mod tests {
         let mut pred_8bit = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
         for y in 0..n_cb_h as usize {
             for x in 0..n_cb_w as usize {
-                pred_8bit.samples[y * pred_8bit.stride + x] = (10 + x * 4) as u8;
+                pred_8bit.samples[y * pred_8bit.stride + x] = (10 + x * 4) as u16;
             }
         }
         let ext_l0 = build_extended_pred_8bit(&pred_8bit, n_cb_w, n_cb_h).unwrap();
@@ -700,11 +700,11 @@ mod tests {
         let mut p1 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
         for y in 0..n_cb_h as usize {
             for x in 0..n_cb_w as usize {
-                let v0 = (10 + x * 8 + y * 2) as u8;
+                let v0 = (10 + x * 8 + y * 2) as u16;
                 p0.samples[y * p0.stride + x] = v0;
                 // L1 = L0 shifted right by one sample (clamped at edge).
                 let xp = x.saturating_sub(1);
-                p1.samples[y * p1.stride + x] = (10 + xp * 8 + y * 2) as u8;
+                p1.samples[y * p1.stride + x] = (10 + xp * 8 + y * 2) as u16;
             }
         }
         let ext_l0 = build_extended_pred_8bit(&p0, n_cb_w, n_cb_h).unwrap();
@@ -720,7 +720,7 @@ mod tests {
             for x in 0..n_cb_w as usize {
                 let v0 = p0.samples[y * p0.stride + x] as u32;
                 let v1 = p1.samples[y * p1.stride + x] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u8;
+                let avg = ((v0 + v1 + 1) >> 1) as u16;
                 let got = dst.samples[y * dst.stride + x];
                 if got != avg {
                     differs_somewhere = true;
@@ -763,7 +763,7 @@ mod tests {
         let mut p = PicturePlane::filled(4, 4, 0);
         for y in 0..4 {
             for x in 0..4 {
-                p.samples[y * p.stride + x] = (10 + x + y * 4) as u8;
+                p.samples[y * p.stride + x] = (10 + x + y * 4) as u16;
             }
         }
         let ext = build_extended_pred_8bit(&p, 4, 4).unwrap();
@@ -842,9 +842,9 @@ mod tests {
         let mut ref_l1 = PicturePlane::filled(ref_w, ref_h, 0);
         for y in 0..ref_h {
             for x in 0..ref_w {
-                ref_l0.samples[y * ref_w + x] = (40 + x * 3 + y * 2).min(255) as u8;
+                ref_l0.samples[y * ref_w + x] = (40 + x * 3 + y * 2).min(255) as u16;
                 // L1 is slightly different so BDOF refinement is non-zero.
-                ref_l1.samples[y * ref_w + x] = (38 + x * 3 + y * 2).min(255) as u8;
+                ref_l1.samples[y * ref_w + x] = (38 + x * 3 + y * 2).min(255) as u16;
             }
         }
         // Use the same source-origin for both paths: dst_x=0, dst_y=0,
@@ -956,8 +956,8 @@ mod tests {
         let mut ref_l1 = PicturePlane::filled(ref_w, ref_h, 0);
         for y in 0..ref_h {
             for x in 0..ref_w {
-                ref_l0.samples[y * ref_w + x] = (40 + x * 3 + y * 2).min(255) as u8;
-                ref_l1.samples[y * ref_w + x] = (38 + x * 3 + y * 2).min(255) as u8;
+                ref_l0.samples[y * ref_w + x] = (40 + x * 3 + y * 2).min(255) as u16;
+                ref_l1.samples[y * ref_w + x] = (38 + x * 3 + y * 2).min(255) as u16;
             }
         }
         // ½-pel horizontal + integer vertical (xFrac = 8, yFrac = 0)
@@ -1003,7 +1003,7 @@ mod tests {
     #[test]
     fn hp_path_precision_scales_with_bit_depth() {
         use crate::inter::{predict_luma_block_high_precision, MotionVector};
-        // Build a tiny "10-bit" reference: PicturePlane stores u8 so
+        // Build a tiny "10-bit" reference: PicturePlane stores u16 so
         // values are capped at 255, but the lift is `<< 4` for BD=10
         // so 255 lands at `255 * 16 = 4080`, still in 16-bit range.
         let ref_p = PicturePlane::filled(16, 16, 200);
@@ -1048,7 +1048,7 @@ mod tests {
     }
 
     /// At `bit_depth == 8`, `bdof_refine_into_u16` produces a
-    /// bit-identical result to the legacy u8 path for the same
+    /// bit-identical result to the legacy u16 path for the same
     /// extended predictors (samples just live in u16 cells).
     #[test]
     fn bdof_u16_bit8_matches_u8() {
@@ -1060,15 +1060,15 @@ mod tests {
         let mut p1 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
         for y in 0..n_cb_h as usize {
             for x in 0..n_cb_w as usize {
-                p0.samples[y * p0.stride + x] = (10 + x * 8 + y * 2) as u8;
+                p0.samples[y * p0.stride + x] = (10 + x * 8 + y * 2) as u16;
                 let xp = x.saturating_sub(1);
-                p1.samples[y * p1.stride + x] = (10 + xp * 8 + y * 2) as u8;
+                p1.samples[y * p1.stride + x] = (10 + xp * 8 + y * 2) as u16;
             }
         }
         let ext_l0 = build_extended_pred_8bit(&p0, n_cb_w, n_cb_h).unwrap();
         let ext_l1 = build_extended_pred_8bit(&p1, n_cb_w, n_cb_h).unwrap();
         let mut dst_u8 = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 0);
-        let mut dst_u16 = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 0, 8);
+        let mut dst_u16 = PicturePlane::filled_bd(n_cb_w as usize, n_cb_h as usize, 0, 8);
         bdof_refine_into(&mut dst_u8, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).unwrap();
         bdof_refine_into_u16(&mut dst_u16, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).unwrap();
         for i in 0..dst_u8.samples.len() {
@@ -1085,14 +1085,14 @@ mod tests {
         use crate::inter::{predict_luma_block_high_precision_u16, MotionVector};
         let n_cb_w: u32 = 8;
         let n_cb_h: u32 = 16;
-        let ref_p = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 900, 10);
+        let ref_p = PicturePlane::filled_bd(n_cb_w as usize, n_cb_h as usize, 900, 10);
         let mv = MotionVector::ZERO;
         let hp_l0 =
             predict_luma_block_high_precision_u16(0, 0, n_cb_w, n_cb_h, &ref_p, mv, 10).unwrap();
         let hp_l1 = hp_l0.clone();
         let ext_l0 = build_extended_pred_high_precision(&hp_l0, n_cb_w, n_cb_h).unwrap();
         let ext_l1 = build_extended_pred_high_precision(&hp_l1, n_cb_w, n_cb_h).unwrap();
-        let mut dst = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 0, 10);
+        let mut dst = PicturePlane::filled_bd(n_cb_w as usize, n_cb_h as usize, 0, 10);
         bdof_refine_into_u16(&mut dst, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 10).unwrap();
         for &s in &dst.samples {
             assert_eq!(
@@ -1111,7 +1111,7 @@ mod tests {
         let ext_w = (n_cb_w as usize + 2) * (n_cb_h as usize + 2);
         let ext_l0 = vec![0i32; ext_w];
         let ext_l1 = vec![0i32; ext_w];
-        let mut dst = PicturePlane16::filled(n_cb_w as usize, n_cb_h as usize, 0, 10);
+        let mut dst = PicturePlane::filled_bd(n_cb_w as usize, n_cb_h as usize, 0, 10);
         assert!(bdof_refine_into_u16(&mut dst, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).is_err());
     }
 }

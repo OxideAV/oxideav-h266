@@ -503,7 +503,7 @@ pub fn apply_sao_clipped(
 #[allow(clippy::too_many_arguments)]
 fn apply_sao_ctb(
     plane: &mut PicturePlane,
-    pre: &[u8],
+    pre: &[u16],
     eo_clip: Option<(i32, i32, i32, i32)>,
     rx: u32,
     ry: u32,
@@ -523,7 +523,6 @@ fn apply_sao_ctb(
     let i_max = (n_ctb_sw as usize).min(plane.width.saturating_sub(x_ctb));
     let j_max = (n_ctb_sh as usize).min(plane.height.saturating_sub(y_ctb));
     let max_val = (1i32 << bit_depth) - 1;
-    let max_val_8 = max_val.min(255);
 
     match params.sao_type_idx {
         SaoTypeIdx::NotApplied => {}
@@ -568,7 +567,7 @@ fn apply_sao_ctb(
                         // edgeIdx = 0 → offset_val[0] = 0. Copy through.
                         let v = pre[(ys as usize) * stride + (xs as usize)] as i32;
                         plane.samples[(ys as usize) * stride + (xs as usize)] =
-                            v.clamp(0, max_val_8) as u8;
+                            v.clamp(0, max_val) as u16;
                         continue;
                     }
                     // Eq. 1431: edgeIdx = 2 + sign(p − n0) + sign(p − n1).
@@ -587,8 +586,7 @@ fn apply_sao_ctb(
                         0
                     };
                     let new = (p + off).clamp(0, max_val);
-                    plane.samples[(ys as usize) * stride + (xs as usize)] =
-                        new.min(max_val_8) as u8;
+                    plane.samples[(ys as usize) * stride + (xs as usize)] = new as u16;
                 }
             }
         }
@@ -620,7 +618,7 @@ fn apply_sao_ctb(
                         0
                     };
                     let new = (p + off).clamp(0, max_val);
-                    plane.samples[ys * stride + xs] = new.min(max_val_8) as u8;
+                    plane.samples[ys * stride + xs] = new as u16;
                 }
             }
         }
@@ -642,7 +640,7 @@ fn sign(x: i32) -> i32 {
 mod tests {
     use super::*;
 
-    fn fresh_buf(w: usize, h: usize, seed: u8) -> PictureBuffer {
+    fn fresh_buf(w: usize, h: usize, seed: u16) -> PictureBuffer {
         PictureBuffer {
             luma: PicturePlane::filled(w, h, seed),
             cb: PicturePlane::filled(w / 2, h / 2, 128),

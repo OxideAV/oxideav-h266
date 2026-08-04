@@ -80,7 +80,7 @@ fn sample_grid(w: usize, h: usize) -> PicturePlane {
     for y in 0..h {
         for x in 0..w {
             let v = source_value(x as f64, y as f64, wf, hf);
-            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u8;
+            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u16;
         }
     }
     p
@@ -111,7 +111,7 @@ fn sample_affine_grid(
             let sx = a * (x as f64) + b * (y as f64) + tx;
             let sy = c * (x as f64) + d * (y as f64) + ty;
             let v = source_value(sx, sy, wf, hf);
-            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u8;
+            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u16;
         }
     }
     p
@@ -361,7 +361,7 @@ fn round65_identity_cpmvs_byte_identical_to_translational_int_pel() {
     let mut r0 = PicturePlane::filled(w, h, 0);
     for y in 0..h {
         for x in 0..w {
-            r0.samples[y * w + x] = ((y * 11 + x * 13) % 251) as u8;
+            r0.samples[y * w + x] = ((y * 11 + x * 13) % 251) as u16;
         }
     }
 

@@ -100,7 +100,7 @@ pub struct CclmInputs<'a> {
 /// own substitution has been applied conservatively.
 #[derive(Debug)]
 pub struct LumaPlane<'a> {
-    pub samples: &'a [u8],
+    pub samples: &'a [u16],
     pub stride: usize,
     pub width: usize,
     pub height: usize,
@@ -537,7 +537,7 @@ fn sign_i32(v: i32) -> i32 {
 mod tests {
     use super::*;
 
-    fn flat_luma_plane(value: u8, w: usize, h: usize) -> Vec<u8> {
+    fn flat_luma_plane(value: u16, w: usize, h: usize) -> Vec<u16> {
         vec![value; w * h]
     }
 
@@ -738,10 +738,10 @@ mod tests {
         // at 255). The chroma TB sits at chroma-(8, 8) → luma-(16, 16).
         let w = 32usize;
         let h = 32usize;
-        let mut plane = vec![0u8; w * h];
+        let mut plane = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
-                plane[y * w + x] = x.min(255) as u8;
+                plane[y * w + x] = x.min(255) as u16;
             }
         }
         // Chroma neighbours: top row sits at chroma-y=7, x=8..11. The
@@ -807,7 +807,7 @@ mod tests {
     /// the caller's substituted plane numerically defined.
     #[test]
     fn luma_plane_read_clamps_edges() {
-        let samples = (0..16u8).collect::<Vec<_>>();
+        let samples = (0..16u16).collect::<Vec<_>>();
         let plane = LumaPlane {
             samples: &samples,
             stride: 4,

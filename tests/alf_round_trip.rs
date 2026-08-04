@@ -356,7 +356,7 @@ fn encoder_pipeline_per_class_luma_aps_round_trips_when_shipped() {
         for x in 0..128 {
             let tile_x = (x / 16) & 1;
             let tile_y = (y / 16) & 1;
-            let v = if tile_x ^ tile_y == 1 { 200u8 } else { 60u8 };
+            let v = if tile_x ^ tile_y == 1 { 200u16 } else { 60u16 };
             src.luma.samples[y * src.luma.stride + x] = v;
         }
     }
@@ -1517,8 +1517,8 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
     let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
     for y in 0..64 {
         for x in 0..64 {
-            src.cb.samples[y * src.cb.stride + x] = 96 + x as u8;
-            src.cr.samples[y * src.cr.stride + x] = 160 - y as u8;
+            src.cb.samples[y * src.cb.stride + x] = 96 + x as u16;
+            src.cr.samples[y * src.cr.stride + x] = 160 - y as u16;
         }
     }
     let mut cfg = EncoderConfig::new(128, 128);
@@ -1611,7 +1611,7 @@ fn round55_forced_qt_128x128_reconstruction_psnr_matches_baseline() {
     for y in 0..128 {
         for x in 0..128 {
             // Smooth gradient mirroring round-52's gradient_frame helper.
-            let v = (64 + (x * 127) / 128) as u8;
+            let v = (64 + (x * 127) / 128) as u16;
             src.luma.samples[y * src.luma.stride + x] = v;
         }
     }
@@ -1635,7 +1635,7 @@ fn round55_forced_qt_128x128_qp0_high_psnr() {
     let mut src = PictureBuffer::yuv420_filled(128, 128, 128);
     for y in 0..128 {
         for x in 0..128 {
-            let v = (64 + (x * 127) / 128) as u8;
+            let v = (64 + (x * 127) / 128) as u16;
             src.luma.samples[y * src.luma.stride + x] = v;
         }
     }

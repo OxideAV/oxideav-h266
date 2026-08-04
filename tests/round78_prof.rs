@@ -77,7 +77,7 @@ fn sample_grid(w: usize, h: usize) -> PicturePlane {
     for y in 0..h {
         for x in 0..w {
             let v = source_value(x as f64, y as f64, w as f64, h as f64);
-            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u8;
+            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u16;
         }
     }
     p
@@ -99,7 +99,7 @@ fn sample_affine_grid(
             let sx = a * (x as f64) + b * (y as f64) + tx;
             let sy = c * (x as f64) + d * (y as f64) + ty;
             let v = source_value(sx, sy, w as f64, h as f64);
-            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u8;
+            p.samples[y * p.stride + x] = v.clamp(0.0, 255.0) as u16;
         }
     }
     p

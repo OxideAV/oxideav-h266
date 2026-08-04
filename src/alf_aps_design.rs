@@ -902,7 +902,7 @@ mod tests {
         let mut rec = src.clone();
         for y in 0..h {
             for x in 0..w {
-                let v = (32 + (x as u32 * 192 / w as u32)) as u8;
+                let v = (32 + (x as u32 * 192 / w as u32)) as u16;
                 src.luma.samples[y * src.luma.stride + x] = v;
                 rec.luma.samples[y * rec.luma.stride + x] = v.saturating_add(2);
             }
@@ -977,7 +977,7 @@ mod tests {
         // Source: smooth horizontal gradient.
         for y in 0..h {
             for x in 0..w {
-                let v = (32 + (x as u32 * 192 / w as u32)) as u8;
+                let v = (32 + (x as u32 * 192 / w as u32)) as u16;
                 src.luma.samples[y * src.luma.stride + x] = v;
             }
         }
@@ -994,7 +994,7 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let noise = ((bits >> 56) & 0x1f) as i32 - 16; // -16..=15
-                let v = (base + noise).clamp(0, 255) as u8;
+                let v = (base + noise).clamp(0, 255) as u16;
                 rec.luma.samples[y * rec.luma.stride + x] = v;
             }
         }
@@ -1060,7 +1060,7 @@ mod tests {
                 } else {
                     v as u16
                 };
-                rec.luma.samples[y * rec.luma.stride + x] = blur as u8;
+                rec.luma.samples[y * rec.luma.stride + x] = blur as u16;
             }
         }
         let designed = design_per_class_luma_alf_filters(&src, &rec);
@@ -1125,7 +1125,7 @@ mod tests {
         // Sharp 4-pixel-wide vertical stripes (high contrast).
         for y in 0..h {
             for x in 0..w {
-                let v = if (x / 4) % 2 == 0 { 16u8 } else { 240u8 };
+                let v = if (x / 4) % 2 == 0 { 16u16 } else { 240u16 };
                 src.luma.samples[y * src.luma.stride + x] = v;
             }
         }
@@ -1140,7 +1140,7 @@ mod tests {
                     .wrapping_add(1442695040888963407);
                 let noise = ((bits >> 56) & 0x1f) as i32 - 16;
                 let v =
-                    (src.luma.samples[y * src.luma.stride + x] as i32 + noise).clamp(0, 255) as u8;
+                    (src.luma.samples[y * src.luma.stride + x] as i32 + noise).clamp(0, 255) as u16;
                 rec.luma.samples[y * rec.luma.stride + x] = v;
             }
         }

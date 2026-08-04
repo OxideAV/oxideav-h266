@@ -384,8 +384,8 @@ pub fn blend_gpm_into_plane(
     y0: u32,
     cb_w: u32,
     cb_h: u32,
-    pred_a: &[u8],
-    pred_b: &[u8],
+    pred_a: &[u16],
+    pred_b: &[u16],
     ctx: &GpmContext,
     c_idx: u32,
     bit_depth: u32,
@@ -397,20 +397,22 @@ pub fn blend_gpm_into_plane(
             let a = pred_a[y as usize * stride_a + x as usize] as i32;
             let b = pred_b[y as usize * stride_a + x as usize] as i32;
             // Eq. 1016 takes pre-clip intermediates from §8.5.6.3,
-            // not 8-bit clipped samples. For the round-40 scaffold we
-            // re-lift the 8-bit samples back to the §8.5.6.6.2
-            // intermediate domain by scaling — at BitDepth = 8 the
-            // round-22 wrapper applies `(intermediate + 32) >> 6` to
-            // get the 8-bit value, so the inverse is `<< 6`. The
-            // round-trip stays bit-identical for partitions where
-            // wValue is 0 or 8 (since a single source survives).
-            let a_pre = a << 6;
-            let b_pre = b << 6;
+            // not clipped pixel samples. For the round-40 scaffold we
+            // re-lift the clipped samples back to the §8.5.6.6.2
+            // intermediate domain by scaling — the per-list wrapper
+            // applies `(intermediate + offset1) >> shift1` with
+            // `shift1 = Max(2, 14 − BitDepth)`, so the inverse lift is
+            // `<< shift1`. The round-trip stays bit-identical for
+            // partitions where wValue is 0 or 8 (since a single
+            // source survives).
+            let lift = (14 - bit_depth as i32).max(2);
+            let a_pre = a << lift;
+            let b_pre = b << lift;
             let pix = ctx.blend_at(x, y, c_idx, a_pre, b_pre, bit_depth);
             let yi = (y0 as usize) + y as usize;
             let xi = (x0 as usize) + x as usize;
             if yi < dst.height && xi < dst.width {
-                dst.samples[yi * dst_stride + xi] = pix as u8;
+                dst.samples[yi * dst_stride + xi] = pix as u16;
             }
         }
     }
@@ -546,8 +548,8 @@ mod tests {
         // and checking that the dst values cluster bimodally around
         // those endpoints once clipped to 8-bit.
         let ctx = GpmContext::new(8, 8, 0, 1, 0, 8, 1, 1);
-        let pred_a = vec![200u8; 64];
-        let pred_b = vec![50u8; 64];
+        let pred_a = vec![200u16; 64];
+        let pred_b = vec![50u16; 64];
         let mut plane = PicturePlane::filled(8, 8, 0);
         blend_gpm_into_plane(&mut plane, 0, 0, 8, 8, &pred_a, &pred_b, &ctx, 0, 8);
         let mut hits_left = 0;

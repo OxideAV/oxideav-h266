@@ -617,7 +617,7 @@ fn prepare_luma_tb(
             let ry = y + ty;
             if rx < rec_plane.width && ry < rec_plane.height {
                 let s = pred[ty * n_tb_w + tx] as i32 + rec_res[ty * n_tb_w + tx];
-                rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, 255) as u8;
+                rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, 255) as u16;
             }
         }
     }
@@ -856,7 +856,7 @@ fn prepare_chroma_tb(
             let ry = cy + ty;
             if rx < chroma_rec.width && ry < chroma_rec.height {
                 let s = pred[ty * n_tb_c_w + tx] as i32 + rec_res[ty * n_tb_c_w + tx];
-                chroma_rec.samples[ry * chroma_rec.stride + rx] = s.clamp(0, 255) as u8;
+                chroma_rec.samples[ry * chroma_rec.stride + rx] = s.clamp(0, 255) as u16;
             }
         }
     }
@@ -971,9 +971,9 @@ fn try_prepare_palette_cu(
         for dx in 0..n_w {
             let ly = y + dy;
             let lx = x + dx;
-            let yv = u16::from(src.luma.samples[ly * src.luma.stride + lx]);
-            let cbv = u16::from(src.cb.samples[(ly / 2) * src.cb.stride + lx / 2]);
-            let crv = u16::from(src.cr.samples[(ly / 2) * src.cr.stride + lx / 2]);
+            let yv = src.luma.samples[ly * src.luma.stride + lx];
+            let cbv = src.cb.samples[(ly / 2) * src.cb.stride + lx / 2];
+            let crv = src.cr.samples[(ly / 2) * src.cr.stride + lx / 2];
             let triple = [yv, cbv, crv];
             let ci = match colors.iter().position(|c| *c == triple) {
                 Some(ci) => {
@@ -1044,21 +1044,21 @@ fn try_prepare_palette_cu(
     const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
     let qp = cu_qp.max(4);
     let (ls, shift) = (LEVEL_SCALE[(qp % 6) as usize], qp / 6);
-    let deq = |q: u16| -> u8 { ((((i32::from(q) * ls) << shift) + 32) >> 6).clamp(0, 255) as u8 };
+    let deq = |q: u16| -> u16 { ((((i32::from(q) * ls) << shift) + 32) >> 6).clamp(0, 255) as u16 };
     for dy in 0..n_h {
         for dx in 0..n_w {
             let pos = dy * n_w + dx;
             let id = ids[pos];
             let (ly, lx) = (y + dy, x + dx);
             if id != PALETTE_ESCAPE_ID {
-                rec.luma.samples[ly * rec.luma.stride + lx] = colors[id as usize][0] as u8;
+                rec.luma.samples[ly * rec.luma.stride + lx] = colors[id as usize][0];
             } else {
                 rec.luma.samples[ly * rec.luma.stride + lx] = deq(escape_vals[0][pos]);
             }
             if dx % 2 == 0 && dy % 2 == 0 {
                 let (cy, cx) = (ly / 2, lx / 2);
                 let (cbv, crv) = if id != PALETTE_ESCAPE_ID {
-                    (colors[id as usize][1] as u8, colors[id as usize][2] as u8)
+                    (colors[id as usize][1], colors[id as usize][2])
                 } else {
                     (deq(escape_vals[1][pos]), deq(escape_vals[2][pos]))
                 };
@@ -1490,9 +1490,9 @@ fn prepare_cu_with_mtt_picker(
     fn restore(
         rec: &mut PictureBuffer,
         avail: &mut EncAvail,
-        snap_luma: &[u8],
-        snap_cb: &[u8],
-        snap_cr: &[u8],
+        snap_luma: &[u16],
+        snap_cb: &[u16],
+        snap_cr: &[u16],
         snap_av_l: &[bool],
         snap_av_c: &[bool],
     ) {
@@ -1510,9 +1510,9 @@ fn prepare_cu_with_mtt_picker(
     struct Trial {
         cu: PreparedCu,
         cost: f64,
-        snap_luma: Vec<u8>,
-        snap_cb: Vec<u8>,
-        snap_cr: Vec<u8>,
+        snap_luma: Vec<u16>,
+        snap_cb: Vec<u16>,
+        snap_cr: Vec<u16>,
         snap_av_l: Vec<bool>,
         snap_av_c: Vec<bool>,
     }
@@ -2480,7 +2480,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     let coding_src: &PictureBuffer = if let Some(der) = lmcs_derived.as_ref() {
         let mut mapped = src.clone();
         for v in mapped.luma.samples.iter_mut() {
-            *v = der.forward_map_luma_sample(u32::from(*v)).clamp(0, 255) as u8;
+            *v = der.forward_map_luma_sample(u32::from(*v)).clamp(0, 255) as u16;
         }
         coding_src_owned = mapped;
         &coding_src_owned
@@ -2805,7 +2805,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         for v in rec.luma.samples.iter_mut() {
             let s32 = u32::from(*v);
             let iy = der.idx_y_inv(s32, min_bin, max_bin);
-            *v = der.inverse_map_luma_sample(s32, iy) as u8;
+            *v = der.inverse_map_luma_sample(s32, iy) as u16;
         }
     }
     crate::deblock::apply_deblocking_clipped(
@@ -3936,7 +3936,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 // Smooth horizontal gradient 64..191.
-                let v = (64 + (x * 127) / w.max(1)) as u8;
+                let v = (64 + (x * 127) / w.max(1)) as u16;
                 buf.luma.samples[y * buf.luma.stride + x] = v;
             }
         }
@@ -4173,8 +4173,8 @@ mod tests {
         // copy version).
         for y in 0..64 {
             for x in 0..64 {
-                src.cb.samples[y * src.cb.stride + x] = (96 + (x as u16 * 64 / 64)) as u8;
-                src.cr.samples[y * src.cr.stride + x] = (160 - (y as u16 * 64 / 64)) as u8;
+                src.cb.samples[y * src.cb.stride + x] = (96 + (x as u16 * 64 / 64)) as u16;
+                src.cr.samples[y * src.cr.stride + x] = (160 - (y as u16 * 64 / 64)) as u16;
             }
         }
         let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
@@ -4293,8 +4293,8 @@ mod tests {
         let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
         for y in 0..64 {
             for x in 0..64 {
-                src.cb.samples[y * src.cb.stride + x] = (96 + (x as u16 * 64 / 64)) as u8;
-                src.cr.samples[y * src.cr.stride + x] = (160 - (y as u16 * 64 / 64)) as u8;
+                src.cb.samples[y * src.cb.stride + x] = (96 + (x as u16 * 64 / 64)) as u16;
+                src.cr.samples[y * src.cr.stride + x] = (160 - (y as u16 * 64 / 64)) as u16;
             }
         }
         let (_, rec) = encode_idr_with_residuals(&src, 26).unwrap();
@@ -4453,8 +4453,8 @@ mod tests {
         let mut src = PictureBuffer::yuv420_filled(128, 128, 100);
         for y in 0..64 {
             for x in 0..64 {
-                src.cb.samples[y * src.cb.stride + x] = (96 + x as u8) as u8;
-                src.cr.samples[y * src.cr.stride + x] = (160 - y as u8) as u8;
+                src.cb.samples[y * src.cb.stride + x] = (96 + x as u16) as u16;
+                src.cr.samples[y * src.cr.stride + x] = (160 - y as u16) as u16;
             }
         }
         let mut cfg = crate::encoder::EncoderConfig::new(128, 128);
@@ -4587,7 +4587,7 @@ mod tests {
         let mut src = PictureBuffer::yuv420_filled(128, 128, 0);
         for y in 0..128 {
             for x in 0..128 {
-                let v = if (y % 64) < 32 { 0u8 } else { 255u8 };
+                let v = if (y % 64) < 32 { 0u16 } else { 255u16 };
                 src.luma.samples[y * src.luma.stride + x] = v;
             }
         }
@@ -4776,11 +4776,11 @@ mod tests {
             for x in 0..128 {
                 let col = x % 64;
                 let v = if col < 16 {
-                    30u8
+                    30u16
                 } else if col < 48 {
-                    200u8
+                    200u16
                 } else {
-                    30u8
+                    30u16
                 };
                 src.luma.samples[y * src.luma.stride + x] = v;
             }
@@ -4827,7 +4827,7 @@ mod tests {
         let mut src = PictureBuffer::yuv420_filled(128, 128, 0);
         for y in 0..128 {
             for x in 0..128 {
-                let v = if (y % 64) < 32 { 0u8 } else { 255u8 };
+                let v = if (y % 64) < 32 { 0u16 } else { 255u16 };
                 src.luma.samples[y * src.luma.stride + x] = v;
             }
         }
@@ -5048,8 +5048,8 @@ mod tests {
         let mut src = gradient_frame(64, 64);
         for y in 0..32usize {
             for x in 0..32usize {
-                src.cb.samples[y * src.cb.stride + x] = 90 + ((x + y) % 64) as u8;
-                src.cr.samples[y * src.cr.stride + x] = 170 - ((x * 2 + y) % 64) as u8;
+                src.cb.samples[y * src.cb.stride + x] = 90 + ((x + y) % 64) as u16;
+                src.cr.samples[y * src.cr.stride + x] = 170 - ((x * 2 + y) % 64) as u16;
             }
         }
 

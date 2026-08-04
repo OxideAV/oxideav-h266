@@ -30,10 +30,10 @@ fn dump(name: &str, bs: &[u8], dec: &PictureBuffer) {
     let base = std::path::Path::new(&dir);
     std::fs::create_dir_all(base).unwrap();
     std::fs::write(base.join(format!("{name}.266")), bs).unwrap();
-    let mut yuv = Vec::new();
-    yuv.extend_from_slice(&dec.luma.samples);
-    yuv.extend_from_slice(&dec.cb.samples);
-    yuv.extend_from_slice(&dec.cr.samples);
+    let mut yuv: Vec<u8> = Vec::new();
+    for plane in [&dec.luma, &dec.cb, &dec.cr] {
+        yuv.extend(plane.samples.iter().map(|&v| v as u8));
+    }
     std::fs::write(base.join(format!("{name}.yuv")), yuv).unwrap();
 }
 
@@ -52,7 +52,7 @@ fn probe_luma_gradient_flat_chroma() {
         for y in 0..64 {
             for x in 0..64 {
                 src.luma.samples[y * src.luma.stride + x] =
-                    (40 + ((x * 3 + y * 2) * amp) % 160) as u8;
+                    (40 + ((x * 3 + y * 2) * amp) % 160) as u16;
             }
         }
         probe(&format!("p_{tag}"), &src, 26);
@@ -65,8 +65,8 @@ fn probe_flat_luma_chroma_ramps() {
     let mut src = PictureBuffer::yuv420_filled(64, 64, 128);
     for y in 0..32 {
         for x in 0..32 {
-            src.cb.samples[y * src.cb.stride + x] = (96 + (x % 32)) as u8;
-            src.cr.samples[y * src.cr.stride + x] = (160 - (y % 32)) as u8;
+            src.cb.samples[y * src.cb.stride + x] = (96 + (x % 32)) as u16;
+            src.cr.samples[y * src.cr.stride + x] = (160 - (y % 32)) as u16;
         }
     }
     probe("p_chroma_only", &src, 26);
@@ -80,7 +80,7 @@ fn probe_luma_bump_sweep() {
         for y in 0..8 {
             for x in 0..8 {
                 let v = 128 + amp * (((x + y) % 2) as i32 * 2 - 1);
-                src.luma.samples[y * src.luma.stride + x] = v.clamp(0, 255) as u8;
+                src.luma.samples[y * src.luma.stride + x] = v.clamp(0, 255) as u16;
             }
         }
         probe(&format!("p_bump{amp}"), &src, 26);
@@ -108,7 +108,7 @@ fn probe_small_16x16() {
     let mut src = PictureBuffer::yuv420_filled(16, 16, 128);
     for y in 0..16 {
         for x in 0..16 {
-            src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u8;
+            src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u16;
         }
     }
     probe("p_16x16", &src, 26);
@@ -120,7 +120,7 @@ fn probe_small_32x32() {
     let mut src = PictureBuffer::yuv420_filled(32, 32, 128);
     for y in 0..32 {
         for x in 0..32 {
-            src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u8;
+            src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u16;
         }
     }
     probe("p_32x32", &src, 26);
@@ -133,7 +133,7 @@ fn probe_gradient_qp_sweep() {
         let mut src = PictureBuffer::yuv420_filled(64, 64, 128);
         for y in 0..64 {
             for x in 0..64 {
-                src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u8;
+                src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u16;
             }
         }
         probe(&format!("p_gradqp{qp}"), &src, qp);
@@ -147,7 +147,7 @@ fn probe_series_a_tb_size() {
         let mut src = PictureBuffer::yuv420_filled(n, n, 128);
         for y in 0..n {
             for x in 0..n {
-                src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u8;
+                src.luma.samples[y * src.luma.stride + x] = (40 + (x * 3 + y * 2) % 160) as u16;
             }
         }
         probe(&format!("pa_n{n}"), &src, 26);
@@ -162,7 +162,7 @@ fn probe_series_b_extent() {
         let mut src = PictureBuffer::yuv420_filled(32, 32, 128);
         for y in 0..k {
             for x in 0..k {
-                src.luma.samples[y * src.luma.stride + x] = (40 + (x * 5 + y * 3) % 160) as u8;
+                src.luma.samples[y * src.luma.stride + x] = (40 + (x * 5 + y * 3) % 160) as u16;
             }
         }
         probe(&format!("pb_k{k}"), &src, 26);
@@ -179,7 +179,7 @@ fn probe_series_c_freq_x() {
             for x in 0..32 {
                 let arg = std::f64::consts::PI * (k as f64) * (2.0 * x as f64 + 1.0) / 64.0;
                 let v = 128.0 + 24.0 * arg.cos();
-                src.luma.samples[y * src.luma.stride + x] = v.round().clamp(0.0, 255.0) as u8;
+                src.luma.samples[y * src.luma.stride + x] = v.round().clamp(0.0, 255.0) as u16;
             }
         }
         probe(&format!("pc_fx{k}"), &src, 26);
@@ -195,7 +195,7 @@ fn probe_series_d_freq_y() {
             for x in 0..32 {
                 let arg = std::f64::consts::PI * (k as f64) * (2.0 * y as f64 + 1.0) / 64.0;
                 let v = 128.0 + 24.0 * arg.cos();
-                src.luma.samples[y * src.luma.stride + x] = v.round().clamp(0.0, 255.0) as u8;
+                src.luma.samples[y * src.luma.stride + x] = v.round().clamp(0.0, 255.0) as u16;
             }
         }
         probe(&format!("pd_fy{k}"), &src, 26);
@@ -210,7 +210,7 @@ fn probe_series_e_chroma() {
         let mut src = PictureBuffer::yuv420_filled(64, 64, 128);
         for y in 0..4 {
             for x in 0..4 {
-                src.cb.samples[y * src.cb.stride + x] = (128 + amp).clamp(0, 255) as u8;
+                src.cb.samples[y * src.cb.stride + x] = (128 + amp).clamp(0, 255) as u16;
             }
         }
         probe(&format!("pe_cbdc{amp}"), &src, 26);
@@ -220,7 +220,7 @@ fn probe_series_e_chroma() {
         let mut src = PictureBuffer::yuv420_filled(64, 64, 128);
         for y in 0..k {
             for x in 0..k {
-                src.cb.samples[y * src.cb.stride + x] = (96 + x * 2) as u8;
+                src.cb.samples[y * src.cb.stride + x] = (96 + x * 2) as u16;
             }
         }
         probe(&format!("pe_cbramp{k}"), &src, 26);
@@ -231,10 +231,10 @@ fn probe_series_e_chroma() {
         for y in 0..32 {
             for x in 0..32 {
                 if cb {
-                    src.cb.samples[y * src.cb.stride + x] = (96 + x) as u8;
+                    src.cb.samples[y * src.cb.stride + x] = (96 + x) as u16;
                 }
                 if cr {
-                    src.cr.samples[y * src.cr.stride + x] = (160 - y) as u8;
+                    src.cr.samples[y * src.cr.stride + x] = (160 - y) as u16;
                 }
             }
         }
@@ -247,7 +247,7 @@ fn probe_series_e_chroma() {
     let mut src = PictureBuffer::yuv420_filled(32, 32, 128);
     for y in 0..16 {
         for x in 0..16 {
-            src.cb.samples[y * src.cb.stride + x] = (96 + x * 2) as u8;
+            src.cb.samples[y * src.cb.stride + x] = (96 + x * 2) as u16;
         }
     }
     probe("pe_small_cb", &src, 26);
@@ -260,7 +260,7 @@ fn probe_series_f_chroma_dc() {
         let mut src = PictureBuffer::yuv420_filled(64, 64, 128);
         for y in 0..32 {
             for x in 0..32 {
-                src.cb.samples[y * src.cb.stride + x] = (128 + off) as u8;
+                src.cb.samples[y * src.cb.stride + x] = (128 + off) as u16;
             }
         }
         probe(&format!("pf_cboff{off}"), &src, 26);
@@ -276,7 +276,7 @@ fn probe_series_g_chroma_freq() {
             for x in 0..32 {
                 let arg = std::f64::consts::PI * (k as f64) * (2.0 * x as f64 + 1.0) / 64.0;
                 let v = 128.0 + 12.0 * arg.cos();
-                src.cb.samples[y * src.cb.stride + x] = v.round().clamp(0.0, 255.0) as u8;
+                src.cb.samples[y * src.cb.stride + x] = v.round().clamp(0.0, 255.0) as u16;
             }
         }
         probe(&format!("pg_cbfx{k}"), &src, 26);
@@ -294,7 +294,7 @@ fn probe_series_h_chroma_disc() {
                 let ax = std::f64::consts::PI * (kx as f64) * (2.0 * x as f64 + 1.0) / 64.0;
                 let ay = std::f64::consts::PI * (ky as f64) * (2.0 * y as f64 + 1.0) / 64.0;
                 let v = 128.0 + 14.0 * ax.cos() * ay.cos();
-                src.cb.samples[y * src.cb.stride + x] = v.round().clamp(0.0, 255.0) as u8;
+                src.cb.samples[y * src.cb.stride + x] = v.round().clamp(0.0, 255.0) as u16;
             }
         }
         probe(name, &src, 26);
@@ -319,14 +319,14 @@ fn probe_series_i_128() {
                 if blocks && (x / 16 + y / 16) % 2 == 0 {
                     v += 20;
                 }
-                src.luma.samples[y * src.luma.stride + x] = v as u8;
+                src.luma.samples[y * src.luma.stride + x] = v as u16;
             }
         }
         if chroma {
             for y in 0..64 {
                 for x in 0..64 {
-                    src.cb.samples[y * src.cb.stride + x] = (96 + (x % 64)) as u8;
-                    src.cr.samples[y * src.cr.stride + x] = (160 - (y % 64)) as u8;
+                    src.cb.samples[y * src.cb.stride + x] = (96 + (x % 64)) as u16;
+                    src.cr.samples[y * src.cr.stride + x] = (160 - (y % 64)) as u16;
                 }
             }
         }
@@ -344,13 +344,13 @@ fn probe_series_i_128() {
             if (x / 16 + y / 16) % 2 == 0 {
                 v += 20;
             }
-            src.luma.samples[y * src.luma.stride + x] = v as u8;
+            src.luma.samples[y * src.luma.stride + x] = v as u16;
         }
     }
     for y in 0..32 {
         for x in 0..32 {
-            src.cb.samples[y * src.cb.stride + x] = (96 + x) as u8;
-            src.cr.samples[y * src.cr.stride + x] = (160 - y) as u8;
+            src.cb.samples[y * src.cb.stride + x] = (96 + x) as u16;
+            src.cr.samples[y * src.cr.stride + x] = (160 - y) as u16;
         }
     }
     probe("pi_full64", &src, 26);

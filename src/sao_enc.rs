@@ -346,7 +346,7 @@ fn sao_decide_ctb_constrained(
 /// |    -1    |    2     |  concave (one neighbour larger, one equal)
 /// |    -2    |    1     |  local minimum
 #[inline]
-fn eo_category(r: u8, n0: u8, n1: u8) -> usize {
+fn eo_category(r: u16, n0: u16, n1: u16) -> usize {
     let r = r as i32;
     // Sign: positive if r > n, negative if r < n, 0 if equal.
     let sign0 = if r > n0 as i32 {
@@ -758,7 +758,7 @@ mod tests {
     use crate::reconstruct::{PictureBuffer, PicturePlane};
     use crate::sao::SaoTypeIdx;
 
-    fn flat_plane(width: usize, height: usize, val: u8) -> PicturePlane {
+    fn flat_plane(width: usize, height: usize, val: u16) -> PicturePlane {
         PicturePlane::filled(width, height, val)
     }
 
@@ -903,7 +903,7 @@ mod tests {
         let src = PictureBuffer::yuv420_filled(w, h, 100);
         let mut rec = src.clone();
         for (i, s) in rec.cb.samples.iter_mut().enumerate() {
-            *s = (*s as i32 + ((i as i32 % 11) - 5)).clamp(0, 255) as u8;
+            *s = (*s as i32 + ((i as i32 % 11) - 5)).clamp(0, 255) as u16;
         }
         // Two CTBs horizontally so merge-left is in play.
         let indep = sao_decide_picture(&src, &rec, 5, 8, false, true);

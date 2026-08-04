@@ -723,7 +723,7 @@ fn write(plane: &mut PicturePlane, x: i32, y: i32, v: i32, bit_depth: u32) {
         return;
     }
     let max = (1i32 << bit_depth) - 1;
-    let clipped = v.clamp(0, max) as u8;
+    let clipped = v.clamp(0, max) as u16;
     plane.samples[y as usize * plane.stride + x as usize] = clipped;
 }
 

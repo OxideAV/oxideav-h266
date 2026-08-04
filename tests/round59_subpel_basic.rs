@@ -19,12 +19,12 @@ use oxideav_h266::reconstruct::PictureBuffer;
 fn subpel_translation_pair(w: usize, h: usize, dx_q16: i32) -> (PictureBuffer, PictureBuffer) {
     let os = 16usize;
     let big_w = w * os;
-    let big = |x_q16: i32| -> u8 {
+    let big = |x_q16: i32| -> u16 {
         // Smooth sinusoid: representable by the spec 8-tap filter to
         // high accuracy at fractional positions.
         let phase = (x_q16 as f64) / (big_w as f64) * (5.0 * std::f64::consts::PI);
         let v = 125.0 + 55.0 * phase.sin();
-        v.clamp(0.0, 255.0) as u8
+        v.clamp(0.0, 255.0) as u16
     };
     let mut a = PictureBuffer::yuv420_filled(w, h, 100);
     let mut b = PictureBuffer::yuv420_filled(w, h, 100);
@@ -80,10 +80,10 @@ fn round59_integer_pel_regression_holds() {
         let mut b = PictureBuffer::yuv420_filled(w, h, 100);
         for y in 0..h {
             for x in 0..w {
-                let v = if (x / 8) % 2 == 0 { 80u8 } else { 180u8 };
+                let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
                 a.luma.samples[y * a.luma.stride + x] = v;
                 let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-                let v2 = if (sx / 8) % 2 == 0 { 80u8 } else { 180u8 };
+                let v2 = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
                 b.luma.samples[y * b.luma.stride + x] = v2;
             }
         }
