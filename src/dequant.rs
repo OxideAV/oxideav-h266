@@ -446,6 +446,95 @@ pub fn dequantize_tb_with_scaling_list(
 mod tests {
     use super::*;
 
+    /// r437 — Qp′-domain invariant: the same coefficient levels at
+    /// `Qp′(10-bit) = Qp′(8-bit) + QpBdOffset(12)` dequantise to the
+    /// SAME scaled coefficients — the eq. 1143 `bdShift` grows by 2
+    /// while the eq. 1152 ladder gains `<< 2`, cancelling exactly.
+    #[test]
+    fn qp_prime_domain_10bit_matches_8bit() {
+        let mut levels = vec![0i32; 16];
+        levels[0] = 7;
+        levels[5] = -3;
+        let p8 = DequantParams {
+            bit_depth: 8,
+            log2_transform_range: 15,
+            n_tb_w: 4,
+            n_tb_h: 4,
+            qp: 27,
+            qp_prime_ts_min: 4,
+            dep_quant: false,
+            transform_skip: false,
+            bdpcm: false,
+            bdpcm_dir: false,
+        };
+        let p10 = DequantParams {
+            bit_depth: 10,
+            qp: 27 + 12,
+            ..p8
+        };
+        assert_eq!(
+            dequantize_tb_flat(&levels, &p8).unwrap(),
+            dequantize_tb_flat(&levels, &p10).unwrap(),
+        );
+    }
+
+    /// r437 — the eq. 1141 clip runs INSIDE the dequant: a negative
+    /// qP (conformance-violating input) clamps to 0, an oversized one
+    /// to `63 + QpBdOffset`.
+    #[test]
+    fn qp_clip_eq_1141() {
+        let mut levels = vec![0i32; 16];
+        levels[0] = 5;
+        let base = DequantParams {
+            bit_depth: 10,
+            log2_transform_range: 15,
+            n_tb_w: 4,
+            n_tb_h: 4,
+            qp: -4,
+            qp_prime_ts_min: 4,
+            dep_quant: false,
+            transform_skip: false,
+            bdpcm: false,
+            bdpcm_dir: false,
+        };
+        let clamped_lo = DequantParams { qp: 0, ..base };
+        assert_eq!(
+            dequantize_tb_flat(&levels, &base).unwrap(),
+            dequantize_tb_flat(&levels, &clamped_lo).unwrap(),
+        );
+        let over = DequantParams { qp: 90, ..base };
+        let clamped_hi = DequantParams { qp: 75, ..base };
+        assert_eq!(
+            dequantize_tb_flat(&levels, &over).unwrap(),
+            dequantize_tb_flat(&levels, &clamped_hi).unwrap(),
+        );
+    }
+
+    /// r437 — the eq. 1144 transform-skip floor: qP below
+    /// `QpPrimeTsMin` clamps up to it.
+    #[test]
+    fn transform_skip_qp_floor_eq_1144() {
+        let mut levels = vec![0i32; 16];
+        levels[0] = 5;
+        let base = DequantParams {
+            bit_depth: 8,
+            log2_transform_range: 15,
+            n_tb_w: 4,
+            n_tb_h: 4,
+            qp: 1,
+            qp_prime_ts_min: 10,
+            dep_quant: false,
+            transform_skip: true,
+            bdpcm: false,
+            bdpcm_dir: false,
+        };
+        let floored = DequantParams { qp: 10, ..base };
+        assert_eq!(
+            dequantize_tb_flat(&levels, &base).unwrap(),
+            dequantize_tb_flat(&levels, &floored).unwrap(),
+        );
+    }
+
     /// With qP = 26 (the Qp′Y offset used elsewhere in the crate),
     /// bit_depth = 8, dep_quant = 0, on a square 4×4 TB (log2 sum = 4
     /// → rectNonTsFlag = 0):

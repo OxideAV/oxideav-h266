@@ -1639,6 +1639,19 @@ mod tests {
         assert_eq!(scale_tc_for_bit_depth(10, 8), (10 + 2) >> 2);
     }
 
+    /// r437 — eqs. 1276 / 1278 / 1279 at 10-bit: β scales by
+    /// `<< (BitDepth − 8)` and tC passes through at BitDepth 10
+    /// (`tC' * (1 << (10 − 10)) = tC'`); at 12-bit tC gains `<< 2`.
+    #[test]
+    fn bit_depth_scaling_10_and_12_bit() {
+        assert_eq!(scale_beta_for_bit_depth(26, 10), 26 << 2);
+        assert_eq!(scale_tc_for_bit_depth(10, 10), 10);
+        assert_eq!(scale_beta_for_bit_depth(26, 12), 26 << 4);
+        assert_eq!(scale_tc_for_bit_depth(10, 12), 10 << 2);
+        // BitDepth 9 rounds per eq. 1278: (tc' + 1) >> 1.
+        assert_eq!(scale_tc_for_bit_depth(9, 9), (9 + 1) >> 1);
+    }
+
     /// Disabling the deblocker leaves the picture untouched.
     #[test]
     fn disabled_does_not_modify_picture() {

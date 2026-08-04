@@ -10492,6 +10492,64 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r437 — §8.4.5.2.14 numTopRight / numLeftBelow: the CCLM
+    /// neighbour extensions stop at the FIRST cell the §6.4.4 probe
+    /// reports unavailable; the base sides are unaffected.
+    #[test]
+    fn cclm_neighbour_extensions_stop_at_unavailable_cell() {
+        let mut plane = crate::reconstruct::PicturePlane::filled(32, 32, 0);
+        for y in 0..32 {
+            for x in 0..32 {
+                plane.samples[y * 32 + x] = (100 + x + y) as u16;
+            }
+        }
+        // TB at (8, 8) 4x4. T-CCLM wants top 4 + up to 4 top-right
+        // cells; mark cells decoded only up to x = 13 on the top row.
+        let avail = |x: usize, y: usize| -> bool { !(y == 7 && x >= 14) };
+        let (top, left) = cclm_chroma_neighbours(
+            &plane,
+            8,
+            8,
+            4,
+            4,
+            true,
+            true,
+            crate::cclm::INTRA_T_CCLM,
+            &avail,
+        );
+        // Base 4 + extension cells 12, 13 → 6 samples total.
+        assert_eq!(top.len(), 6);
+        assert!(left.is_empty() || left.len() == 4);
+        // L-CCLM below-left: mark rows >= 14 undecoded in column 7.
+        let avail_l = |x: usize, y: usize| -> bool { !(x == 7 && y >= 14) };
+        let (_top, left) = cclm_chroma_neighbours(
+            &plane,
+            8,
+            8,
+            4,
+            4,
+            true,
+            true,
+            crate::cclm::INTRA_L_CCLM,
+            &avail_l,
+        );
+        assert_eq!(left.len(), 6);
+        // Fully-available probes keep the full spec extension lengths.
+        let all = |_: usize, _: usize| -> bool { true };
+        let (top, _) = cclm_chroma_neighbours(
+            &plane,
+            8,
+            8,
+            4,
+            4,
+            true,
+            true,
+            crate::cclm::INTRA_T_CCLM,
+            &all,
+        );
+        assert_eq!(top.len(), 8);
+    }
     use crate::pps::{PicParameterSet, PicPartition};
     use crate::slice_header::{SliceType, StatefulSliceHeader};
     use crate::sps::{PartitionConstraints, SeqParameterSet};
