@@ -174,6 +174,7 @@ fn cclm_chroma_neighbours(
     above_avail: bool,
     left_avail: bool,
     mode: u32,
+    cell_avail: &dyn Fn(usize, usize) -> bool,
 ) -> (Vec<i16>, Vec<i16>) {
     let stride = plane.stride;
     let plane_w = plane.width;
@@ -184,13 +185,20 @@ fn cclm_chroma_neighbours(
             INTRA_T_CCLM => n_tb_w + n_tb_h,
             _ => n_tb_w,
         };
-        // Limit to what's actually inside the plane (the spec's
-        // numTopRight loop walks until availTR goes false; for the
-        // single-slice scaffold, "outside the picture" is the only way
-        // to lose availability).
+        // The §8.4.5.2.14 numTopRight loop probes §6.4.4 availability
+        // per extension cell and stops at the FIRST unavailable one —
+        // a top-right neighbour still to be decoded (dual-tree chroma
+        // walks lag the picture), outside the picture, or outside the
+        // tile / WPP region contributes nothing.
         let max_x = plane_w.saturating_sub(x0);
-        let actual = want.min(max_x);
+        let mut actual = want.min(max_x);
         let yref = y0.saturating_sub(1);
+        for i in n_tb_w..actual {
+            if !cell_avail(x0 + i, yref) {
+                actual = i;
+                break;
+            }
+        }
         (0..actual)
             .map(|i| {
                 let xi = x0 + i;
@@ -211,8 +219,16 @@ fn cclm_chroma_neighbours(
             _ => n_tb_h,
         };
         let max_y = plane_h.saturating_sub(y0);
-        let actual = want.min(max_y);
+        let mut actual = want.min(max_y);
         let xref = x0.saturating_sub(1);
+        // §8.4.5.2.14 numLeftBelow — same per-cell probe on the
+        // below-left extension.
+        for i in n_tb_h..actual {
+            if !cell_avail(xref, y0 + i) {
+                actual = i;
+                break;
+            }
+        }
         (0..actual)
             .map(|i| {
                 let yi = y0 + i;
@@ -9504,6 +9520,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // Build the 4:2:0 chroma neighbour rows. Both `INTRA_T_CCLM`
             // and `INTRA_L_CCLM` extend the corresponding side; the
             // helper caps the lengths at the plane boundary.
+            let cclm_cell_avail = |x: usize, y: usize| -> bool {
+                let (crx0, cry0, crx1, cry1, crcap) = self.region_bounds_chroma_i32();
+                let (xi, yi) = (x as i32, y as i32);
+                if xi < crx0 || yi < cry0 || xi >= crx1 || yi >= cry1 || xi >= crcap {
+                    return false;
+                }
+                self.avail_chroma
+                    .get(y * (self.layout.pic_width_luma as usize / 2) + x)
+                    .copied()
+                    .unwrap_or(false)
+            };
             let (top, left) = cclm_chroma_neighbours(
                 plane,
                 x0,
@@ -9513,6 +9540,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 above_avail,
                 left_avail,
                 mode_c,
+                &cclm_cell_avail,
             );
             let luma_samples = luma_samples_snapshot.as_deref().unwrap_or(&[]);
             // §8.4.5.2.14 honours bCTUboundary on the top side. CTU

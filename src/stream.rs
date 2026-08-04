@@ -660,7 +660,12 @@ impl StreamDecoder {
                 None
             },
         };
-        walker.apply_in_loop_filters_with_alf(&mut out, &binding)?;
+        // `H266_DBG_NO_LF` (debug aid): skip the §8.8 in-loop filter
+        // stack so the raw reconstruction can be diffed sample-level
+        // against an oracle away from filtered edges.
+        if std::env::var_os("H266_DBG_NO_LF").is_none() {
+            walker.apply_in_loop_filters_with_alf(&mut out, &binding)?;
+        }
 
         let motion = walker.motion_field_for_temporal();
         drop(walker);
