@@ -18,9 +18,9 @@
 //!
 //! Current fail-fast gates (surfaced as `Error::Unsupported` with a
 //! precise reason, so a conformance triage can classify streams):
-//! bit depths above 8 (the reconstruction planes are `u8`), 4:2:2 /
-//! 4:4:4 chroma formats, subpicture layouts, explicit weighted
-//! prediction, and §8.8.1 explicit virtual boundaries.
+//! 4:2:2 / 4:4:4 chroma formats, subpicture layouts, explicit
+//! weighted prediction, and §8.8.1 explicit virtual boundaries.
+//! Reconstruction runs on BitDepth-parametric `u16` planes (8..=16).
 
 use std::collections::HashMap;
 
@@ -61,7 +61,7 @@ pub struct DecodedPicture {
     pub crop: (usize, usize, usize, usize),
     /// `sps_chroma_format_idc`.
     pub chroma_format_idc: u8,
-    /// Luma/chroma bit depth (8 for the current pipeline).
+    /// Luma/chroma bit depth (from the SPS).
     pub bit_depth: u32,
 }
 
@@ -413,12 +413,6 @@ impl StreamDecoder {
         let pps = pps.clone();
 
         // --- fail-fast tool gates -----------------------------------
-        if sps.bit_depth_y() > 8 {
-            return Err(Error::unsupported(format!(
-                "h266 stream: {}-bit reconstruction not supported (u8 pipeline)",
-                sps.bit_depth_y()
-            )));
-        }
         if sps.sps_chroma_format_idc >= 2 {
             return Err(Error::unsupported(format!(
                 "h266 stream: chroma format idc {} (4:2:2/4:4:4) not supported",
@@ -589,7 +583,7 @@ impl StreamDecoder {
 
         let w = pps.pps_pic_width_in_luma_samples as usize;
         let h = pps.pps_pic_height_in_luma_samples as usize;
-        let mut out = PictureBuffer::yuv420_filled(w, h, 0);
+        let mut out = PictureBuffer::yuv420_filled_bd(w, h, 0, sps.bit_depth_y());
 
         // Union of all RPL entries as (poc, lsb_only) match specs —
         // the §8.3.3 retention sweep must match the same way the
@@ -628,7 +622,16 @@ impl StreamDecoder {
                 walker.set_temporal_mvp(poc, false, true, 0);
             }
             walker.decode_picture_into(&mut out)?;
-            walker.finish_slice()?;
+            // `H266_DBG_IGNORE_EOS` (debug aid): downgrade a slice-end
+            // marker mismatch to a warning so the reconstructed picture
+            // can still be inspected against the conformance sidecars.
+            if std::env::var_os("H266_DBG_IGNORE_EOS").is_some() {
+                if let Err(e) = walker.finish_slice() {
+                    eprintln!("finish_slice: {e}");
+                }
+            } else {
+                walker.finish_slice()?;
+            }
         }
 
         // §8.8 in-loop filters (ALF APS bindings from the last slice —

@@ -1337,6 +1337,18 @@ pub struct CuNeighbourhood {
     pub above_available: bool,
     pub left: Option<IntraNeighbour>,
     pub above: Option<IntraNeighbour>,
+    /// §8.4.2 candidate-A neighbour — sampled at `(xCb − 1,
+    /// yCb + cbHeight − 1)` (the ctxInc neighbours above use the
+    /// §9.3.4.2.2 `(x0 − 1, y0)` cell instead; the two positions
+    /// differ for any CU taller than 4).
+    pub mpm_left: Option<IntraNeighbour>,
+    /// §8.4.2 candidate-B neighbour — sampled at `(xCb + cbWidth − 1,
+    /// yCb − 1)`.
+    pub mpm_above: Option<IntraNeighbour>,
+    /// §6.4.4 availability of the candidate-A position.
+    pub mpm_left_available: bool,
+    /// §6.4.4 availability of the candidate-B position.
+    pub mpm_above_available: bool,
     /// `CuSkipFlag[xNbL][yNbL]` — used by §9.3.4.2.2 cu_skip_flag
     /// context derivation.
     pub left_cu_skip: bool,
@@ -1717,14 +1729,14 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.y0 == ctb_row
         };
         let cand_a = cand_intra_mode_for_side(
-            neigh.left_available,
-            neigh.left,
+            neigh.mpm_left_available,
+            neigh.mpm_left,
             /*side_b=*/ false,
             /*crosses_ctb_row=*/ false,
         );
         let cand_b = cand_intra_mode_for_side(
-            neigh.above_available,
-            neigh.above,
+            neigh.mpm_above_available,
+            neigh.mpm_above,
             /*side_b=*/ true,
             crosses_ctb,
         );

@@ -2811,6 +2811,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     crate::deblock::apply_deblocking_clipped(
         &mut rec,
         &all_deblock_cus,
+        None,
         &dbp,
         1,
         &lf_no_filter_cols,

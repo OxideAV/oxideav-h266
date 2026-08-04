@@ -115,6 +115,15 @@ use crate::transform::{inverse_transform_2d, TrType};
 /// plane rectangle, clipping into the bit-depth range. The `w`
 /// argument is the §8.5.6.7 intra-prediction weight in `{1, 2, 3}`
 /// — see [`crate::inter::ciip_intra_weight`].
+/// Debug aid: `H266_DBG_CU=1` prints one line per reconstructed CU
+/// (geometry, tree, mode, residual switches). Cached so the hot path
+/// pays one atomic load per CU.
+fn dbg_cu_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("H266_DBG_CU").is_some())
+}
+
 fn apply_ciip_combine_to_plane(
     plane: &mut crate::reconstruct::PicturePlane,
     x0: usize,
@@ -735,6 +744,10 @@ pub struct CtuWalker<'a, 'b> {
     /// every time a fresh walker is constructed; consumed by
     /// [`Self::apply_in_loop_filters`].
     deblock_cus: Vec<DeblockCu>,
+    /// §8.8.3.2 — chroma-edge records from the DUAL_TREE_CHROMA walk.
+    /// Empty on single-tree slices (the chroma passes then share
+    /// `deblock_cus`).
+    deblock_cus_chroma: Vec<DeblockCu>,
     /// Per-CTB SAO parameters consumed by [`Self::apply_in_loop_filters`].
     /// Defaults to "all CTBs not applied". The round-14 walker can
     /// optionally invoke [`Self::decode_sao_for_ctu`] before
@@ -1281,6 +1294,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             arith,
             leaf_ctxs,
             deblock_cus: Vec::new(),
+            deblock_cus_chroma: Vec::new(),
             sao_picture,
             sao_ctxs,
             alf_picture,
@@ -3380,11 +3394,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 pred_mode: Some(pred_mode),
             })
         };
+        // §8.4.2 candidate positions differ from the §9.3.4.2.2 ctxInc
+        // cells: A = (xCb − 1, yCb + cbHeight − 1), B = (xCb + cbWidth
+        // − 1, yCb − 1). Availability runs the §6.4.4 region gates.
+        let w = ccu.cu.w as i32;
+        let h = ccu.cu.h as i32;
+        let (ax, ay) = (x - 1, y + h - 1);
+        let (bx, by) = (x + w - 1, y - 1);
+        let mpm_left_available = ax >= 0 && self.nb_in_region(ax, ay);
+        let mpm_above_available = by >= 0 && self.nb_in_region(bx, by);
         CuNeighbourhood {
             left_available: x > 0,
             above_available: y > 0,
             left: intra_nb(self, x - 1, y),
             above: intra_nb(self, x, y - 1),
+            mpm_left: intra_nb(self, ax, ay),
+            mpm_above: intra_nb(self, bx, by),
+            mpm_left_available,
+            mpm_above_available,
             left_cu_skip,
             above_cu_skip,
             left_merge_subblock,
@@ -4090,12 +4117,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// Reconstruct a DUAL_TREE_CHROMA leaf CU — the Cb + Cr planes only,
     /// through the same §8.4 / §8.7 chroma pipeline the single-tree path
     /// uses (`reconstruct_chroma_plane` handles CCLM / BDPCM-chroma /
-    /// transform-skip / the chroma QP chain). Deblocking-edge records
-    /// are NOT pushed for chroma-tree CUs: the scaffold's [`DeblockCu`]
-    /// list drives both luma and chroma edge classification from one
-    /// geometry, and the luma-tree records already cover this area — a
-    /// documented approximation (the spec derives chroma edges from the
-    /// chroma tree on dual-tree slices, §8.8.3.2).
+    /// transform-skip / the chroma QP chain). Per §8.8.3.2 the chroma
+    /// deblocking edges on a dual-tree slice derive from the CHROMA
+    /// coding tree — every chroma-tree CU pushes a record onto
+    /// `deblock_cus_chroma` (in luma coordinates), and the §8.8 pass
+    /// classifies the chroma planes against that list.
     fn reconstruct_leaf_cu_dual_chroma(
         &mut self,
         cu: &CtuCu,
@@ -4103,6 +4129,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        if dbg_cu_enabled() {
+            eprintln!(
+                "CU DualTreeChroma ({},{}) {}x{} modeCraw={} modeC={} cbf_cb={} cbf_cr={} jcbcr={}",
+                cu.cu.x,
+                cu.cu.y,
+                cu.cu.w,
+                cu.cu.h,
+                info.intra_chroma_pred_mode,
+                info.intra_pred_mode_c,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+                info.tu_joint_cbcr_residual_flag,
+            );
+        }
         if self.sps.sps_chroma_format_idc != 1 {
             return Err(Error::unsupported(
                 "h266 dual-tree chroma reconstruction: only 4:2:0 is walked",
@@ -4190,6 +4230,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu.cu.w.div_ceil(2),
             cu.cu.h.div_ceil(2),
         );
+        // §8.8.3.2 — chroma-edge record for the §8.8 deblock pass
+        // (chroma-tree geometry, in luma coordinates). QpY of a
+        // chroma-tree CU is the slice QP (the §7.3.11.10 chroma tree
+        // codes no cu_qp_delta).
+        let qp_y = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
+        self.deblock_cus_chroma.push(DeblockCu {
+            x: cu.cu.x,
+            y: cu.cu.y,
+            w: cu.cu.w,
+            h: cu.cu.h,
+            qp_y: qp_y.clamp(0, 63),
+            intra: true,
+            tu_y_coded: false,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
+            bdpcm_luma: false,
+            bdpcm_chroma: info.intra_bdpcm_chroma,
+            plt: false,
+        });
         Ok(())
     }
 
@@ -4298,6 +4357,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cu.cu.w.div_ceil(2),
                 cu.cu.h.div_ceil(2),
             );
+            // §8.8.3.2 — chroma-tree edge record (palette CU: no coded
+            // TBs, writes suppressed on the palette side).
+            self.deblock_cus_chroma.push(DeblockCu {
+                x: x0,
+                y: y0,
+                w: cu.cu.w,
+                h: cu.cu.h,
+                qp_y: qp_y.clamp(0, 63),
+                intra: false,
+                tu_y_coded: false,
+                tu_cb_coded: false,
+                tu_cr_coded: false,
+                bdpcm_luma: false,
+                bdpcm_chroma: false,
+                plt: true,
+            });
             return Ok(());
         }
         // §8.8.3 deblock record — MODE_PLT is not MODE_INTRA and a
@@ -4415,6 +4490,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
         tree: TreeType,
     ) -> Result<()> {
+        if dbg_cu_enabled() {
+            eprintln!(
+                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} qpd={}",
+                tree,
+                cu.cu.x,
+                cu.cu.y,
+                cu.cu.w,
+                cu.cu.h,
+                info.pred_mode,
+                info.intra_pred_mode_y,
+                info.intra_mip_flag,
+                info.isp_split,
+                info.lfnst_idx,
+                info.mts_idx,
+                info.tu_y_coded_flag,
+                info.cu_qp_delta_val,
+            );
+        }
         // Round-21 inter dispatch — runs the §8.5.2 spatial-merge
         // derivation, picks `mergeCandList[merge_idx]`, and writes the
         // MC'd block into the output buffer (luma + chroma). The
@@ -4611,8 +4704,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // is implicitly zero, eq. 1426 still applies).
         let residual_samples: Vec<i32> = if info.tu_y_coded_flag && !residual.luma_levels.is_empty()
         {
-            let qp = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
-            let qp = qp.clamp(0, 63);
+            // §8.7.1 — the dequant consumes Qp′Y = QpY + QpBdOffset
+            // (the eq. 1141 / 1144 clip lives inside the dequant).
+            let qp = self.cabac.slice_qp_y.0
+                + info.cu_qp_delta_val
+                + 6 * self.sps.sps_bitdepth_minus8 as i32;
             // BDPCM forces transform-skip and the eq. 1153 / 1154
             // accumulation pass; the inverse transform is bypassed
             // (the dz post-accumulation IS the residual). A plain
@@ -4627,6 +4723,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 n_tb_w: n_tb_w as u32,
                 n_tb_h: n_tb_h as u32,
                 qp,
+                qp_prime_ts_min: 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32,
                 dep_quant: self.sh.sh_dep_quant_used_flag,
                 transform_skip,
                 bdpcm: info.intra_bdpcm_luma,
@@ -6167,6 +6264,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu_qp_delta,
                     bit_depth,
                     cu_off_cbcr,
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
                     info.transform_skip_cb,
                     info.transform_skip_cr,
                     lmcs_cvs,
@@ -8340,25 +8439,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.7.3 — QP for this component. Luma is slice QP + cu_qp_delta;
         // chroma maps through `chroma_qp_identity` (QpC = QpY + offset,
         // clamped) mirroring the intra chroma reconstruction path.
-        let qp_y = (self.cabac.slice_qp_y.0 + cu_qp_delta).clamp(0, 63);
-        let qp = if c_idx == 0 {
-            qp_y
-        } else {
-            // §8.7.1 eqs. 1147 / 1148 — PPS + slice chroma offset for this
-            // component, plus the §7.4.10.6 CU-level `CuQpOffsetC?` term
-            // (`cu_chroma_qp_offset`, indexed from the PPS offset list by
-            // the caller when `cu_chroma_qp_offset_flag == 1`; 0 otherwise),
-            // now matching the intra chroma reconstruction path.
-            let qp_offset = chroma_qp_offset_sum(
-                c_idx,
-                self.pps.pps_cb_qp_offset,
-                self.pps.pps_cr_qp_offset,
-                self.sh.sh_cb_qp_offset,
-                self.sh.sh_cr_qp_offset,
-                cu_chroma_qp_offset,
-            );
-            chroma_qp_mapped(self.sps, c_idx as usize - 1, qp_y, qp_offset)
-        };
+        let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
+        let qp_y = self.cabac.slice_qp_y.0 + cu_qp_delta;
+        let qp = qp_bd_offset
+            + if c_idx == 0 {
+                qp_y
+            } else {
+                // §8.7.1 eqs. 1147 / 1148 — PPS + slice chroma offset for this
+                // component, plus the §7.4.10.6 CU-level `CuQpOffsetC?` term
+                // (`cu_chroma_qp_offset`, indexed from the PPS offset list by
+                // the caller when `cu_chroma_qp_offset_flag == 1`; 0 otherwise),
+                // now matching the intra chroma reconstruction path.
+                let qp_offset = chroma_qp_offset_sum(
+                    c_idx,
+                    self.pps.pps_cb_qp_offset,
+                    self.pps.pps_cr_qp_offset,
+                    self.sh.sh_cb_qp_offset,
+                    self.sh.sh_cr_qp_offset,
+                    cu_chroma_qp_offset,
+                );
+                chroma_qp_mapped(self.sps, c_idx as usize - 1, qp_y, qp_offset)
+            };
         let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
             bit_depth,
@@ -8366,6 +8467,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_w: n_tb_w as u32,
             n_tb_h: n_tb_h as u32,
             qp,
+            qp_prime_ts_min: 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32,
             dep_quant: self.sh.sh_dep_quant_used_flag,
             transform_skip,
             bdpcm: false,
@@ -8467,6 +8569,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cu_qp_delta: i32,
         bit_depth: u32,
         cu_qp_offset_cbcr: i32,
+        cu_chroma_qp_offset_flag: bool,
+        cu_chroma_qp_offset_idx: u32,
         coded_transform_skip_cb: bool,
         coded_transform_skip_cr: bool,
         lmcs_chroma_var_scale: Option<u32>,
@@ -8490,16 +8594,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // nothing to add.
             return Ok(());
         }
-        // §8.7.3 dequant — joint Cb-Cr QP (eq. 1149): the additive term is
-        // `pps_joint_cbcr_qp_offset_value + sh_joint_cbcr_qp_offset +
-        // CuQpOffsetCbCr` rather than the per-component Cb/Cr offsets.
-        // `CuQpOffsetCbCr` is the §7.4.10.6 CU-level joint offset (indexed
-        // from `pps_joint_cbcr_qp_offset_list` by the caller).
-        let qp_y = (self.cabac.slice_qp_y.0 + cu_qp_delta).clamp(0, 63);
-        let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
-            + self.sh.sh_joint_cbcr_qp_offset
-            + cu_qp_offset_cbcr;
-        let qp = chroma_qp_mapped(self.sps, 2, qp_y, joint_offset);
+        // §8.7.3 dequant — eqs. 1135 – 1139 qP selection: Qp′CbCr only
+        // for TuCResMode 2; modes 1 / 3 use the coded component's own
+        // Qp′Cb / Qp′Cr. (The caller-supplied `cu_qp_offset_cbcr` is
+        // the JOINT-list §7.4.10.6 offset; the per-component arms
+        // index the Cb / Cr lists directly.)
+        let qp_y = self.cabac.slice_qp_y.0 + cu_qp_delta;
+        let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
+        let qp = if matches!(mode, TuCResMode::CbCrCoded) {
+            let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
+                + self.sh.sh_joint_cbcr_qp_offset
+                + cu_qp_offset_cbcr;
+            chroma_qp_mapped(self.sps, 2, qp_y, joint_offset) + qp_bd_offset
+        } else {
+            let coded_c_idx = match mode {
+                TuCResMode::CrCoded => 2u32,
+                _ => 1u32,
+            };
+            let cu_offset = cu_chroma_qp_offset(
+                coded_c_idx,
+                cu_chroma_qp_offset_flag,
+                cu_chroma_qp_offset_idx,
+                &self.pps.pps_cb_qp_offset_list,
+                &self.pps.pps_cr_qp_offset_list,
+            );
+            let qp_offset = chroma_qp_offset_sum(
+                coded_c_idx,
+                self.pps.pps_cb_qp_offset,
+                self.pps.pps_cr_qp_offset,
+                self.sh.sh_cb_qp_offset,
+                self.sh.sh_cr_qp_offset,
+                cu_offset,
+            );
+            chroma_qp_mapped(self.sps, coded_c_idx as usize - 1, qp_y, qp_offset) + qp_bd_offset
+        };
         let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
             bit_depth,
@@ -8507,6 +8635,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_w: c_w as u32,
             n_tb_h: c_h as u32,
             qp,
+            qp_prime_ts_min: 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32,
             dep_quant: self.sh.sh_dep_quant_used_flag,
             transform_skip: coded_ts,
             bdpcm: false,
@@ -8625,24 +8754,44 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         } else {
             None
         };
-        // §8.7.3 dequant — joint Cb-Cr QP: ChromaQpTable index 2 with
-        // the additive `pps_joint_cbcr_qp_offset_value +
-        // sh_joint_cbcr_qp_offset + CuQpOffsetCbCr` term (§7.4.10.6
-        // eq. 195 — the CU-level offset indexes the JOINT list).
-        let cu_offset_cbcr = if info.cu_chroma_qp_offset_flag {
-            self.pps
-                .pps_joint_cbcr_qp_offset_list
-                .get(info.cu_chroma_qp_offset_idx as usize)
-                .copied()
-                .unwrap_or(0)
+        // §8.7.3 dequant — the qP selection follows eqs. 1135 – 1139:
+        // Qp′CbCr applies ONLY when TuCResMode == 2; modes 1 / 3
+        // dequantise the coded TB at the coded component's own Qp′Cb /
+        // Qp′Cr (per-component ChromaQpTable + offsets).
+        let qp_y = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
+        let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
+        let qp = if matches!(mode, TuCResMode::CbCrCoded) {
+            let cu_offset_cbcr = if info.cu_chroma_qp_offset_flag {
+                self.pps
+                    .pps_joint_cbcr_qp_offset_list
+                    .get(info.cu_chroma_qp_offset_idx as usize)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
+                + self.sh.sh_joint_cbcr_qp_offset
+                + cu_offset_cbcr;
+            chroma_qp_mapped(self.sps, 2, qp_y, joint_offset) + qp_bd_offset
         } else {
-            0
+            let cu_offset = cu_chroma_qp_offset(
+                coded_c_idx,
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+                &self.pps.pps_cb_qp_offset_list,
+                &self.pps.pps_cr_qp_offset_list,
+            );
+            let qp_offset = chroma_qp_offset_sum(
+                coded_c_idx,
+                self.pps.pps_cb_qp_offset,
+                self.pps.pps_cr_qp_offset,
+                self.sh.sh_cb_qp_offset,
+                self.sh.sh_cr_qp_offset,
+                cu_offset,
+            );
+            chroma_qp_mapped(self.sps, coded_c_idx as usize - 1, qp_y, qp_offset) + qp_bd_offset
         };
-        let joint_offset = self.pps.pps_joint_cbcr_qp_offset_value
-            + self.sh.sh_joint_cbcr_qp_offset
-            + cu_offset_cbcr;
-        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
-        let qp = chroma_qp_mapped(self.sps, 2, qp_y, joint_offset);
         let transform_skip = info.intra_bdpcm_chroma || coded_ts_flag;
         let log2_tr_range = self.log2_transform_range();
         let params = DequantParams {
@@ -8651,6 +8800,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             n_tb_w: c_w as u32,
             n_tb_h: c_h as u32,
             qp,
+            qp_prime_ts_min: 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32,
             dep_quant: self.sh.sh_dep_quant_used_flag,
             transform_skip,
             bdpcm: info.intra_bdpcm_chroma,
@@ -9149,8 +9299,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
             // 3. Dequant + IDCT for the per-subpartition residual.
             let residual_samples: Vec<i32> = if sub.tu_y_coded_flag && !sub.levels.is_empty() {
-                let qp = self.cabac.slice_qp_y.0 + info.cu_qp_delta_val;
-                let qp = qp.clamp(0, 63);
+                // Qp′Y = QpY + QpBdOffset (§8.7.1).
+                let qp = self.cabac.slice_qp_y.0
+                    + info.cu_qp_delta_val
+                    + 6 * self.sps.sps_bitdepth_minus8 as i32;
                 let log2_tr_range = self.log2_transform_range();
                 let params = DequantParams {
                     bit_depth,
@@ -9158,6 +9310,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_w: p.n_w,
                     n_tb_h: p.n_h,
                     qp,
+                    qp_prime_ts_min: 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32,
                     dep_quant: self.sh.sh_dep_quant_used_flag,
                     transform_skip: false,
                     bdpcm: false,
@@ -9468,12 +9621,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     self.sh.sh_cr_qp_offset,
                     cu_offset,
                 );
+                // QpY includes the CU's QG delta; the dequant consumes
+                // Qp′C = QpC + QpBdOffset (§8.7.1 eqs. 1134 / 1135).
                 let qp = chroma_qp_mapped(
                     self.sps,
                     c_idx as usize - 1,
-                    self.cabac.slice_qp_y.0,
+                    self.cabac.slice_qp_y.0 + info.cu_qp_delta_val,
                     qp_offset,
-                );
+                ) + 6 * self.sps.sps_bitdepth_minus8 as i32;
                 // Per-plane transform-skip: BDPCM-chroma forces it on both
                 // planes; a plain transform_skip_flag is per-component.
                 let plane_ts = match c_idx {
@@ -9489,6 +9644,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     n_tb_w: n_tb_w as u32,
                     n_tb_h: n_tb_h as u32,
                     qp,
+                    qp_prime_ts_min: 4 + 6 * self.sps.tool_flags.min_qp_prime_ts as i32,
                     dep_quant: self.sh.sh_dep_quant_used_flag,
                     transform_skip,
                     bdpcm: info.intra_bdpcm_chroma,
@@ -10250,6 +10406,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         crate::deblock::apply_deblocking_clipped(
             out,
             &self.deblock_cus,
+            if self.deblock_cus_chroma.is_empty() {
+                None
+            } else {
+                Some(&self.deblock_cus_chroma)
+            },
             &params,
             self.sps.sps_chroma_format_idc as u32,
             &no_filter_cols,

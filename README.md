@@ -580,7 +580,7 @@ at the edges, coded boundary BT, implicit-BT `depthOffset`,
 implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
 decode end-to-end.
 
-## JVET conformance triage (r434)
+## JVET conformance triage (r434, re-triaged r437)
 
 The staged JVET FDIS-r1 conformance corpus (56 official bitstreams,
 `docs/video/h266/conformance/` in the workspace) now runs through a
@@ -604,16 +604,37 @@ dual-tree coding-tree walk rebuilt in the spec's interleaved bin order
 with the §7.4.12.4 picture-boundary walk + luma-tree QG arming (and
 the §7.3.11.10 chroma-tree `cu_qp_delta` exclusion), and the §7.4.8
 deblocking-parameter inheritance chain (PPS β / tC offsets were
-previously discarded). Current scorecard: **0 / 56 byte-exact** — 51
-streams gate on named unsupported tools (49 need the >8-bit
-reconstruction pipeline, the largest single family; plus 4:2:2 / 4:4:4,
-subpictures, explicit weighted prediction, intra multi-TB tiling,
-virtual boundaries), 1 stream decodes bin-exactly with a localized
-reconstruction divergence, 4 desync mid-stream (all 8-bit dual-tree
-RA streams; root-cause narrowed to a context-selection divergence in
-the intra-mode cascade that shifts the bypass-bin alignment without
-breaking termination). The corpus triage is the priority pick list for
-the next rounds.
+previously discarded).
+
+**r437 — the >8-bit reconstruction pipeline is live.** `PicturePlane`
+stores `u16` samples at an explicit BitDepth (8..=16); every
+BitDepth-specialized arm was generalized to the spec derivations (the
+§8.5.6.6.2 closing clamps, §8.5.6.3 MC shift1/lift, §8.5.6.4 PROF,
+GPM re-lift, SAO/ALF/deblock/palette/IBC/LMCS clips, deblock β/tC
+eqs. 1276 – 1279 / 1345 – 1348, DMVR), and the stream driver decodes
+Main10 wires end-to-end (conformance hashing at 2-byte LE per the
+corpus convention). Corpus-driven r437 conformance fixes, validated
+sample-level against a black-box reference decoder: the §8.4.2 MPM
+candidate positions (`A = (xCb − 1, yCb + cbHeight − 1)`, `B =
+(xCb + cbWidth − 1, yCb − 1)` — the parse previously sampled the
+§9.3.4.2.2 ctxInc cells, the r434 "mode 11 vs 7" root cause), the
+§8.7.3 dequant Qp′ domain (`+ QpBdOffset` at every site + the
+eq. 1141 / 1144 clips and TS floor in `DequantParams`), the
+eqs. 1135 – 1139 JCCR qP selection (joint QP only for TuCResMode 2),
+and §8.8.3 chroma deblocking (chroma-tree edge records on dual-tree
+slices per §8.8.3.2, and the §8.8.3.1 chroma 8×8-grid exclusion in
+chroma-sample units). Scorecard: `CodingToolsSets_A_2` decodes its
+full **luma plane byte-exactly** (both pictures; a CCLM chroma
+divergence remains), its 10-bit twin `CodingToolsSets_C_2` is
+bin-exact with the same remaining class, 8 streams gate on named
+tools (subpictures, 4:2:2 / 4:4:4, explicit weighted prediction,
+intra multi-TB tiling), and the remaining 46 — which now all decode
+pictures (previously hard-gated on 10-bit) — share a CTC-toolset
+desync family (first divergence is a localized ±1 reconstruction
+drift that later shifts the parse; per-stream notes in the tracked
+baseline). `examples/triage_dbg` decodes one corpus stream against
+its `.opl` sidecar with optional plane dumps for oracle diffing. The
+corpus triage remains the priority pick list.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)

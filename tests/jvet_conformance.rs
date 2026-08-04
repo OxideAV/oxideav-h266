@@ -524,18 +524,31 @@ fn triage_stream(dir: &std::path::Path, name: &str) -> Verdict {
 /// Full-corpus decode triage. Prints the scorecard; asserts the
 /// verdict of every stream matches the tracked baseline below so any
 /// regression (or unrecorded improvement) fails loudly.
+///
+/// `H266_CONFORMANCE_FILTER` (comma-separated substrings) restricts
+/// the run to matching stream names — a development aid; the baseline
+/// ratchet only applies to the streams actually run.
 #[test]
 fn corpus_decode_triage() {
     let Some(dir) = corpus_dir() else {
         eprintln!("jvet corpus not present — skipping");
         return;
     };
+    let filter: Option<Vec<String>> = std::env::var("H266_CONFORMANCE_FILTER")
+        .ok()
+        .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| {
             let p = e.unwrap().path();
             (p.extension().map(|x| x == "bit") == Some(true))
                 .then(|| p.file_stem().unwrap().to_string_lossy().to_string())
+        })
+        .filter(|n| {
+            filter
+                .as_ref()
+                .map(|f| f.iter().any(|s| n.contains(s.as_str())))
+                .unwrap_or(true)
         })
         .collect();
     names.sort();
@@ -591,62 +604,62 @@ fn corpus_decode_triage() {
 /// fail the harness. Classes: P = pass (byte-exact vs .opl),
 /// F = fail (decodes, diverges), U = unsupported tool, E = error.
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
-    ("10b422_B_5", 'U'),          // 10-bit + 4:2:2
+    ("10b422_B_5", 'U'),          // 10-bit 4:2:2 chroma format
     ("8b400_A_2", 'U'),           // intra multi-TB-per-CU tiling (128x128 CU) not wired
-    ("8b420_A_2", 'E'),           // desync remains past the dual-tree interleave fix (CTB-128 RA)
-    ("8b420_B_2", 'E'),           // desync remains past the dual-tree interleave fix (CTB-128 RA)
-    ("8b444_A_2", 'U'),           // 4:4:4
-    ("AFF_A_2", 'U'),             // 10-bit
-    ("ALF_A_3", 'U'),             // 10-bit
-    ("ALF_B_3", 'U'),             // 10-bit
-    ("ALF_C_3", 'U'),             // 10-bit
-    ("AMVR_A_3", 'U'),            // 10-bit
-    ("BDOF_A_4", 'U'),            // 10-bit
-    ("BDPCM_A_2", 'U'),           // 10-bit
-    ("CCLM_A_2", 'U'),            // 10-bit
-    ("CST_A_4", 'U'),             // 10-bit
-    ("CodingToolsSets_A_2", 'F'), // bin-exact; residual/prediction corner diverges (per-CU localized)
-    ("CodingToolsSets_B_2", 'E'), // desync in the inter pictures past the I-picture
-    ("CodingToolsSets_C_2", 'U'), // 10-bit
-    ("CodingToolsSets_D_2", 'U'), // 10-bit
-    ("CodingToolsSets_E_1", 'U'), // 10-bit (+ subpictures + WP)
-    ("DEBLOCKING_A_3", 'U'),      // 10-bit
-    ("DEBLOCKING_C_3", 'U'),      // 10-bit
-    ("DEBLOCKING_E_3", 'U'),      // 10-bit
-    ("DMVR_A_3", 'U'),            // 10-bit
-    ("DMVR_B_4", 'U'),            // 10-bit
-    ("GDR_A_2", 'U'),             // 10-bit (+ virtual boundaries)
-    ("GPM_A_3", 'U'),             // 10-bit
-    ("IBC_A_2", 'U'),             // 10-bit
-    ("ISP_A_3", 'U'),             // 10-bit
-    ("JCCR_A_2", 'U'),            // 10-bit
-    ("JCCR_C_3", 'U'),            // 10-bit
-    ("LFNST_A_4", 'U'),           // 10-bit
-    ("LFNST_B_4", 'U'),           // 10-bit
-    ("LMCS_A_3", 'U'),            // 10-bit
-    ("LMCS_B_2", 'U'),            // 10-bit (+ subpictures)
-    ("LMCS_C_1", 'U'),            // 10-bit
-    ("LOSSLESS_B_3", 'U'),        // 10-bit
-    ("MERGE_A_2", 'U'),           // 10-bit
-    ("MIP_A_3", 'U'),             // 10-bit
-    ("MIP_B_3", 'U'),             // 10-bit
-    ("MMVD_A_3", 'U'),            // 10-bit
-    ("MTS_A_4", 'U'),             // 10-bit
-    ("PROF_B_3", 'U'),            // 10-bit
-    ("QUANT_A_2", 'U'),           // 10-bit
-    ("QUANT_B_2", 'U'),           // 10-bit
-    ("RAP_A_1", 'U'),             // 10-bit
-    ("RAP_B_1", 'U'),             // 10-bit
-    ("SAO_A_3", 'U'),             // 10-bit
-    ("SBT_A_2", 'U'),             // 10-bit
-    ("SLICES_A_3", 'U'),          // 10-bit
-    ("SMVD_A_2", 'U'),            // 10-bit
-    ("SUBPIC_C_1", 'U'),          // 10-bit (+ subpictures)
-    ("SbTMVP_A_3", 'U'),          // 10-bit
-    ("TILE_A_2", 'U'),            // 10-bit
-    ("TMVP_A_3", 'U'),            // 10-bit
-    ("WPP_A_3", 'U'),             // 10-bit
-    ("WP_A_3", 'U'),              // 10-bit (+ explicit weighted prediction)
+    ("8b420_A_2", 'E'), // CTC-toolset desync family (r437: recon-level ±1 drift feeds a late parse desync)
+    ("8b420_B_2", 'E'), // CTC-toolset desync family
+    ("8b444_A_2", 'U'), // 4:4:4
+    ("AFF_A_2", 'E'),   // CTC-toolset desync family
+    ("ALF_A_3", 'E'),   // CTC-toolset desync family
+    ("ALF_B_3", 'E'),   // CTC-toolset desync family
+    ("ALF_C_3", 'E'),   // CTC-toolset desync family
+    ("AMVR_A_3", 'E'),  // CTC-toolset desync family
+    ("BDOF_A_4", 'E'),  // CTC-toolset desync family
+    ("BDPCM_A_2", 'E'), // CTC-toolset desync family
+    ("CCLM_A_2", 'E'),  // CTC-toolset desync family
+    ("CST_A_4", 'E'),   // CTC-toolset desync family
+    ("CodingToolsSets_A_2", 'F'), // r437: LUMA byte-exact both pictures; CCLM chroma prediction diverges
+    ("CodingToolsSets_B_2", 'E'), // desync in the inter pictures (inter-tool parse family; no SAO/ALF/LMCS)
+    ("CodingToolsSets_C_2", 'F'), // 10-bit twin of A_2 — same remaining divergence class
+    ("CodingToolsSets_D_2", 'E'), // desync surfaces as a spurious IBC BV-conformance error
+    ("CodingToolsSets_E_1", 'U'), // subpictures
+    ("DEBLOCKING_A_3", 'E'),      // CTC-toolset desync family
+    ("DEBLOCKING_C_3", 'E'),      // CTC-toolset desync family
+    ("DEBLOCKING_E_3", 'U'),      // intra multi-TB-per-CU tiling (128x128 CU) not wired
+    ("DMVR_A_3", 'U'),            // explicit weighted prediction
+    ("DMVR_B_4", 'E'),            // CTC-toolset desync family
+    ("GDR_A_2", 'E'),             // CTC-toolset desync family (+ virtual boundaries later)
+    ("GPM_A_3", 'E'),             // CTC-toolset desync family
+    ("IBC_A_2", 'E'),             // desync surfaces as a spurious IBC BV-conformance error
+    ("ISP_A_3", 'E'),             // CTC-toolset desync family
+    ("JCCR_A_2", 'E'),            // CTC-toolset desync family
+    ("JCCR_C_3", 'E'),            // CTC-toolset desync family
+    ("LFNST_A_4", 'E'),           // CTC-toolset desync family
+    ("LFNST_B_4", 'E'),           // CTC-toolset desync family
+    ("LMCS_A_3", 'E'),            // CTC-toolset desync family
+    ("LMCS_B_2", 'U'),            // subpictures
+    ("LMCS_C_1", 'E'),            // CTC-toolset desync family
+    ("LOSSLESS_B_3", 'E'),        // desync surfaces as a spurious IBC BV-conformance error
+    ("MERGE_A_2", 'E'),           // CTC-toolset desync family
+    ("MIP_A_3", 'E'),             // CTC-toolset desync family
+    ("MIP_B_3", 'E'),             // CTC-toolset desync family
+    ("MMVD_A_3", 'E'),            // CTC-toolset desync family
+    ("MTS_A_4", 'E'),             // CTC-toolset desync family
+    ("PROF_B_3", 'E'),            // CTC-toolset desync family
+    ("QUANT_A_2", 'E'),           // CTC-toolset desync family
+    ("QUANT_B_2", 'E'),           // CTC-toolset desync family
+    ("RAP_A_1", 'E'), // CTC-toolset desync family (r437: exact until x=58 of row 0, then ±1 drift)
+    ("RAP_B_1", 'E'), // CTC-toolset desync family
+    ("SAO_A_3", 'E'), // CTC-toolset desync family
+    ("SBT_A_2", 'E'), // CTC-toolset desync family
+    ("SLICES_A_3", 'E'), // CTC-toolset desync family
+    ("SMVD_A_2", 'E'), // CTC-toolset desync family
+    ("SUBPIC_C_1", 'U'), // subpictures
+    ("SbTMVP_A_3", 'E'), // CTC-toolset desync family
+    ("TILE_A_2", 'E'), // CTC-toolset desync family
+    ("TMVP_A_3", 'E'), // CTC-toolset desync family
+    ("WPP_A_3", 'E'), // CTC-toolset desync family
+    ("WP_A_3", 'E'),  // CTC-toolset desync family
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this

@@ -552,7 +552,7 @@ pub fn apply_dmvr(
         mv_l1_init,
         ref_l0,
         ref_l1,
-        8,
+        ref_l0.bit_depth,
     )
 }
 

@@ -195,7 +195,7 @@ pub fn apply_deblocking(
     params: &DeblockParams,
     chroma_format_idc: u32,
 ) {
-    apply_deblocking_clipped(out, cus, params, chroma_format_idc, &[], &[])
+    apply_deblocking_clipped(out, cus, None, params, chroma_format_idc, &[], &[])
 }
 
 /// r429 — [`apply_deblocking`] with the §8.8.3.1 tile-boundary edge
@@ -208,6 +208,7 @@ pub fn apply_deblocking(
 pub fn apply_deblocking_clipped(
     out: &mut PictureBuffer,
     cus: &[DeblockCu],
+    chroma_cus: Option<&[DeblockCu]>,
     params: &DeblockParams,
     chroma_format_idc: u32,
     no_filter_cols: &[u32],
@@ -220,6 +221,11 @@ pub fn apply_deblocking_clipped(
     // boundary-strength derivation can find the CU on either side of an
     // edge in O(1). Stores indexes into `cus`.
     let grid = CuGrid::build(out.luma.width, out.luma.height, cus);
+    // §8.8.3.2 — on a dual-tree slice the chroma edges derive from the
+    // CHROMA coding tree's CB geometry, not the luma tree's. Callers
+    // pass the chroma-tree records via `chroma_cus`; `None` (single
+    // tree) shares the luma records.
+    let chroma_grid = chroma_cus.map(|cc| CuGrid::build(out.luma.width, out.luma.height, cc));
 
     // Vertical edges first (eq. EDGE_VER pass per §8.8.3.1).
     let mut luma = PlaneCtx {
@@ -237,6 +243,10 @@ pub fn apply_deblocking_clipped(
     deblock_one_direction(&mut luma, cus, &grid, EdgeType::Horizontal, no_filter_rows);
 
     if chroma_format_idc != 0 {
+        let (c_cus, c_grid) = match (chroma_cus, chroma_grid.as_ref()) {
+            (Some(cc), Some(cg)) => (cc, cg),
+            _ => (cus, &grid),
+        };
         let mut cb = PlaneCtx {
             plane: &mut out.cb,
             c_idx: 1,
@@ -248,8 +258,8 @@ pub fn apply_deblocking_clipped(
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
         };
-        deblock_one_direction(&mut cb, cus, &grid, EdgeType::Vertical, no_filter_cols);
-        deblock_one_direction(&mut cb, cus, &grid, EdgeType::Horizontal, no_filter_rows);
+        deblock_one_direction(&mut cb, c_cus, c_grid, EdgeType::Vertical, no_filter_cols);
+        deblock_one_direction(&mut cb, c_cus, c_grid, EdgeType::Horizontal, no_filter_rows);
         let mut cr = PlaneCtx {
             plane: &mut out.cr,
             c_idx: 2,
@@ -261,8 +271,8 @@ pub fn apply_deblocking_clipped(
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
         };
-        deblock_one_direction(&mut cr, cus, &grid, EdgeType::Vertical, no_filter_cols);
-        deblock_one_direction(&mut cr, cus, &grid, EdgeType::Horizontal, no_filter_rows);
+        deblock_one_direction(&mut cr, c_cus, c_grid, EdgeType::Vertical, no_filter_cols);
+        deblock_one_direction(&mut cr, c_cus, c_grid, EdgeType::Horizontal, no_filter_rows);
     }
 }
 
@@ -340,18 +350,20 @@ fn deblock_one_direction(
         let cw = (cu.w / plane.sub_w) as i32;
         let ch = (cu.h / plane.sub_h) as i32;
 
-        // §8.8.3.2: chroma deblock is gated on 8-sample alignment of
-        // the leading edge in luma coordinates. Skip CUs that don't
-        // satisfy that constraint.
+        // §8.8.3.1 — "edges that do not correspond to 8x8 sample grid
+        // boundaries of the CHROMA component" are excluded: the gate
+        // tests the leading-edge position in chroma samples (the luma
+        // 4x4-grid rule is satisfied by construction — CB edges are
+        // 4-luma-aligned).
         if plane.c_idx != 0 {
             match edge_type {
                 EdgeType::Vertical => {
-                    if cu.x % 8 != 0 {
+                    if (cu.x / plane.sub_w) % 8 != 0 {
                         continue;
                     }
                 }
                 EdgeType::Horizontal => {
-                    if cu.y % 8 != 0 {
+                    if (cu.y / plane.sub_h) % 8 != 0 {
                         continue;
                     }
                 }
@@ -1055,7 +1067,7 @@ fn long_luma_apply(
     plt_p: bool,
     plt_q: bool,
 ) {
-    let bd = 8u32;
+    let bd = plane.bit_depth;
     let mfl_p_u = mfl_p as usize;
     let mfl_q_u = mfl_q as usize;
 
@@ -1217,7 +1229,7 @@ fn short_luma_apply(
     plt_p: bool,
     plt_q: bool,
 ) {
-    let bd = 8u32;
+    let bd = plane.bit_depth;
     let read_p = |i: i32| -> i32 {
         if is_vertical {
             read_clamped(plane, cx - i - 1, cy)
@@ -1343,7 +1355,7 @@ fn run_chroma_filter_v(
     if tc == 0 {
         return;
     }
-    let bd = 8u32;
+    let bd = plane.bit_depth;
     // §8.8.3.6.5 maxK for EDGE_VER, SubHeightC = 2 (4:2:0) → maxK = 1
     // (i.e. 2 sample rows along the edge). Our chroma path always
     // operates on 2 sample positions per segment.
@@ -1400,7 +1412,7 @@ fn run_chroma_filter_h(
     if tc == 0 {
         return;
     }
-    let bd = 8u32;
+    let bd = plane.bit_depth;
     let max_k = 1i32;
 
     // §8.8.3.6.4: with both lengths 1 and bS != 2 the edge is left

@@ -157,18 +157,20 @@ pub struct DequantParams {
     pub n_tb_w: u32,
     /// Transform block height (power of two, ≤ 64).
     pub n_tb_h: u32,
-    /// `qP` after the §8.7.3 Qp′Y / Qp′Cb / Qp′Cr selection + the
-    /// Clip3 of eq. 1141 (non-TS) or 1144 (TS). Caller is responsible
-    /// for plumbing the Qp′ path.
+    /// `qP` from the §8.7.1 / §8.7.2 Qp′Y / Qp′Cb / Qp′Cr selection —
+    /// i.e. INCLUDING the `QpBdOffset` term. The eq. 1141 (non-TS) /
+    /// eq. 1144 (TS) Clip3 is applied internally.
     pub qp: i32,
+    /// §7.4.3.4 eq. 61 `QpPrimeTsMin = 4 + 6 * sps_min_qp_prime_ts` —
+    /// the eq. 1144 transform-skip qP floor. Only consulted when
+    /// `transform_skip` is set.
+    pub qp_prime_ts_min: i32,
     /// `sh_dep_quant_used_flag` — only affects the `bdShift` +1 term
     /// and `ls[x][y]` ladder shift (eqs. 1143 / 1151 / 1152).
     pub dep_quant: bool,
     /// `transform_skip_flag[x][y][cIdx]`. When set, the spec uses the
     /// shorter `bdShift = 10`, `rectNonTsFlag = 0` ladder and the qP is
-    /// clipped to `QpPrimeTsMin` from below (eqs. 1144 – 1146). This
-    /// scaffold treats `qp` as already clipped (callers handle the
-    /// `QpPrimeTsMin` floor at parse time).
+    /// clipped to `QpPrimeTsMin` from below (eqs. 1144 – 1146).
     pub transform_skip: bool,
     /// `BdpcmFlag[x][y][cIdx]`. When set, eqs. 1153 / 1154 accumulate
     /// `dz[x][y]` along the prediction direction before scaling.
@@ -189,6 +191,7 @@ impl DequantParams {
             n_tb_w,
             n_tb_h,
             qp,
+            qp_prime_ts_min: 4,
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
@@ -211,6 +214,7 @@ impl DequantParams {
             n_tb_w,
             n_tb_h,
             qp,
+            qp_prime_ts_min: 4,
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
@@ -276,10 +280,18 @@ pub fn dequantize_tb_flat(levels: &[i32], params: &DequantParams) -> Result<Vec<
     // levelScale[rectNonTsFlag][qP%6] << (qP/6) — or the dep_quant
     // variant that uses (qP+1)%6 / (qP+1)/6 (eq. 1151). dep_quant is
     // ignored in transform-skip mode (eq. 1152).
-    let (q_mod, q_div) = if params.dep_quant && !params.transform_skip {
-        ((params.qp + 1).rem_euclid(6) as u32, (params.qp + 1) / 6)
+    // eq. 1141 (non-TS) / eq. 1144 (TS) — clip qP into
+    // [0, 63 + QpBdOffset] (TS floors at QpPrimeTsMin instead of 0).
+    let qp_max = 63 + 6 * (params.bit_depth as i32 - 8);
+    let qp = if params.transform_skip {
+        params.qp.clamp(params.qp_prime_ts_min.min(qp_max), qp_max)
     } else {
-        (params.qp.rem_euclid(6) as u32, params.qp / 6)
+        params.qp.clamp(0, qp_max)
+    };
+    let (q_mod, q_div) = if params.dep_quant && !params.transform_skip {
+        ((qp + 1).rem_euclid(6) as u32, (qp + 1) / 6)
+    } else {
+        (qp.rem_euclid(6) as u32, qp / 6)
     };
     let level_scale = LEVEL_SCALE[rect_non_ts as usize][q_mod as usize] as i64;
     // For flat scaling list, m[x][y] = 16 everywhere (spec NOTE on
@@ -374,10 +386,18 @@ pub fn dequantize_tb_with_scaling_list(
     } else {
         1i64 << (bd_shift - 1)
     };
-    let (q_mod, q_div) = if params.dep_quant && !params.transform_skip {
-        ((params.qp + 1).rem_euclid(6) as u32, (params.qp + 1) / 6)
+    // eq. 1141 (non-TS) / eq. 1144 (TS) — clip qP into
+    // [0, 63 + QpBdOffset] (TS floors at QpPrimeTsMin instead of 0).
+    let qp_max = 63 + 6 * (params.bit_depth as i32 - 8);
+    let qp = if params.transform_skip {
+        params.qp.clamp(params.qp_prime_ts_min.min(qp_max), qp_max)
     } else {
-        (params.qp.rem_euclid(6) as u32, params.qp / 6)
+        params.qp.clamp(0, qp_max)
+    };
+    let (q_mod, q_div) = if params.dep_quant && !params.transform_skip {
+        ((qp + 1).rem_euclid(6) as u32, (qp + 1) / 6)
+    } else {
+        (qp.rem_euclid(6) as u32, qp / 6)
     };
     let level_scale = LEVEL_SCALE[rect_non_ts as usize][q_mod as usize] as i64;
     let q_shift = q_div.max(0) as u32;
@@ -489,6 +509,7 @@ mod tests {
             n_tb_w: 4,
             n_tb_h: 8,
             qp: 26,
+            qp_prime_ts_min: 4,
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
@@ -597,6 +618,7 @@ mod tests {
             n_tb_w: 3,
             n_tb_h: 4,
             qp: 26,
+            qp_prime_ts_min: 4,
             dep_quant: false,
             transform_skip: false,
             bdpcm: false,
