@@ -139,6 +139,22 @@ fn lfnst_matrix(
 /// §8.7.4.2 one-dimensional LFNST process. `x` holds `nonZeroSize`
 /// scaled coefficients; the result `y` has `nTrS == n_lfnst_out_size`
 /// entries (eq. 1176): `y[i] = Clip3(min, max, (Σ M[i][j]*x[j] + 64) >> 7)`.
+///
+/// **Publication erratum in the 2026-01 (V4) edition** (the same block
+/// transposition as the §8.7.4.5 32-point DST-VII / DCT-VIII tables —
+/// see `transform::DST_VII_32_ROWS_16_31`): the §8.7.4.3
+/// `lowFreqTransMatrix` tables are printed with the *input*
+/// (coefficient) index as the printed row and the *output* index as
+/// the printed column — each printed 16×16 sub-block is the transpose
+/// of the `[m][n]` block the equations declare. Read literally, the
+/// assembled 48×16 matrices are far from orthogonal (basis-column
+/// norms 33..46076 for a 128-scaled kernel whose true columns all sit
+/// at ~16384) and do not reconstruct conformance bitstreams; with the
+/// transposed indexing every one of the sixteen matrices is orthogonal
+/// to within ~1% (the `lfnst_matrices_near_orthogonal` test pins
+/// this). The statics in `lfnst_matrices.rs` stay verbatim as printed;
+/// this multiply indexes them transposed: entry `M[i][j]` of the
+/// eq. 1176 matrix lives at `stacked[16 * (i >> 4) + j][i & 15]`.
 fn lfnst_1d(
     x: &[i32],
     n_lfnst_out_size: usize,
@@ -150,9 +166,10 @@ fn lfnst_1d(
     let mut y = vec![0i32; n_lfnst_out_size];
     for (i, yi) in y.iter_mut().enumerate() {
         let mut acc: i64 = 0;
-        let row = &matrix[i];
+        let block = 16 * (i >> 4);
+        let col = i & 15;
         for (j, &xj) in x.iter().enumerate().take(non_zero) {
-            acc += row[j] as i64 * xj as i64;
+            acc += matrix[block + j][col] as i64 * xj as i64;
         }
         let v = (acc + 64) >> 7;
         *yi = v.clamp(coeff_min as i64, coeff_max as i64) as i32;
@@ -178,6 +195,38 @@ pub fn apply_inverse_lfnst(
     d: &mut [i32],
     n_tb_w: usize,
     n_tb_h: usize,
+    pred_mode_intra: i32,
+    lfnst_idx: u8,
+    coeff_min: i32,
+    coeff_max: i32,
+) -> Result<()> {
+    apply_inverse_lfnst_remap(
+        d,
+        n_tb_w,
+        n_tb_h,
+        n_tb_w,
+        n_tb_h,
+        pred_mode_intra,
+        lfnst_idx,
+        coeff_min,
+        coeff_max,
+    )
+}
+
+/// [`apply_inverse_lfnst`] with an explicit wide-angle-remap geometry.
+///
+/// §8.4.5.2.7 derives its `nW` / `nH` from the *coding block* when
+/// `IntraSubPartitionsSplitType != ISP_NO_SPLIT` (and `cIdx == 0`), so
+/// an ISP subpartition's LFNST runs the remap on the CU dims
+/// (`remap_w` / `remap_h`) while the eqs. 1158 – 1161 size derivations
+/// keep the TB (partition) dims.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_inverse_lfnst_remap(
+    d: &mut [i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    remap_w: usize,
+    remap_h: usize,
     pred_mode_intra: i32,
     lfnst_idx: u8,
     coeff_min: i32,
@@ -213,10 +262,11 @@ pub fn apply_inverse_lfnst(
         *slot = d[(yc as usize) * n_tb_w + (xc as usize)];
     }
 
-    // §8.4.5.2.7 wide-angle remap (nW == nTbW, nH == nTbH on the
-    // single-tree non-ISP luma path). The remapped mode drives both the
-    // Table-41 set selection and the eqs. 1165/1166 transpose decision.
-    let remapped_mode = wide_angle_remap_mode(pred_mode_intra, n_tb_w, n_tb_h);
+    // §8.4.5.2.7 wide-angle remap (`nW == nTbW, nH == nTbH` on the
+    // non-ISP paths; the CU dims on the ISP luma path). The remapped
+    // mode drives both the Table-41 set selection and the
+    // eqs. 1165/1166 transpose decision.
+    let remapped_mode = wide_angle_remap_mode(pred_mode_intra, remap_w, remap_h);
 
     // §8.7.4.2 multiply.
     let set_idx = lfnst_tr_set_idx(remapped_mode);
@@ -309,6 +359,56 @@ mod tests {
     /// nonZeroSize=8 path and produces a fully-populated 4x4 corner; all
     /// 16 positions are written (DC drives every output via the matrix
     /// column 0).
+    /// Every §8.7.4.3 matrix, read with the transposed indexing
+    /// `lfnst_1d` uses (see its V4-erratum note), is a near-orthogonal
+    /// 128-scaled kernel: all 16 basis columns have norm ≈ 128² and
+    /// pairwise dot products below ~1.2% of it. The literal
+    /// `[m][n] = printed[m][n]` reading of the 48-point tables fails
+    /// this by three orders of magnitude, which pins the erratum
+    /// resolution.
+    #[test]
+    fn lfnst_matrices_near_orthogonal() {
+        let all: [(&'static [[i16; 16]], usize); 16] = [
+            (&LFNST_16_SET0_IDX1, 16),
+            (&LFNST_16_SET0_IDX2, 16),
+            (&LFNST_16_SET1_IDX1, 16),
+            (&LFNST_16_SET1_IDX2, 16),
+            (&LFNST_16_SET2_IDX1, 16),
+            (&LFNST_16_SET2_IDX2, 16),
+            (&LFNST_16_SET3_IDX1, 16),
+            (&LFNST_16_SET3_IDX2, 16),
+            (&LFNST_48_SET0_IDX1, 48),
+            (&LFNST_48_SET0_IDX2, 48),
+            (&LFNST_48_SET1_IDX1, 48),
+            (&LFNST_48_SET1_IDX2, 48),
+            (&LFNST_48_SET2_IDX1, 48),
+            (&LFNST_48_SET2_IDX2, 48),
+            (&LFNST_48_SET3_IDX1, 48),
+            (&LFNST_48_SET3_IDX2, 48),
+        ];
+        for (mi, (matrix, n_tr_s)) in all.iter().enumerate() {
+            // Column j of the eq. 1176 matrix under the transposed
+            // indexing: M[i][j] = stacked[16 * (i >> 4) + j][i & 15].
+            let col = |j: usize| -> Vec<i64> {
+                (0..*n_tr_s)
+                    .map(|i| matrix[16 * (i >> 4) + j][i & 15] as i64)
+                    .collect()
+            };
+            for a in 0..16 {
+                let ca = col(a);
+                let norm: i64 = ca.iter().map(|v| v * v).sum();
+                assert!(
+                    (norm - 16384).abs() < 250,
+                    "matrix {mi} col {a} norm {norm}"
+                );
+                for b in a + 1..16 {
+                    let dot: i64 = ca.iter().zip(col(b)).map(|(x, y)| x * y).sum();
+                    assert!(dot.abs() < 200, "matrix {mi} cols {a},{b} dot {dot}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn inverse_lfnst_4x4_dc_only_fills_corner() {
         let mut d = vec![0i32; 16];
