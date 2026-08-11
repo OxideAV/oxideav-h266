@@ -559,6 +559,26 @@ impl StreamDecoder {
                 sh_cabac_init_flag: sh0.sh_cabac_init_flag,
             });
         }
+        // Debug aid (shares the `H266_DBG_TB` gate): one line of
+        // slice-level tool state per decoded slice for corpus triage.
+        if std::env::var_os("H266_DBG_TB").is_some() {
+            eprintln!(
+                "SLICE dbg: lmcs_used={} crs={} qp_y={} dep_quant={} sdh={} explicit_sl={} alf={} alf_aps={:?} cb={} cr={} cc_cb={} cc_cr={} type={:?}",
+                sh0.sh_lmcs_used_flag,
+                ph.ph_chroma_residual_scale_flag,
+                sh0.sh_qp_delta,
+                sh0.sh_dep_quant_used_flag,
+                sh0.sh_sign_data_hiding_used_flag,
+                sh0.sh_explicit_scaling_list_used_flag,
+                sh0.sh_alf_enabled_flag,
+                sh0.sh_alf_aps_id_luma,
+                sh0.sh_alf_cb_enabled_flag,
+                sh0.sh_alf_cr_enabled_flag,
+                sh0.sh_alf_cc_cb_enabled_flag,
+                sh0.sh_alf_cc_cr_enabled_flag,
+                sh0.sh_slice_type,
+            );
+        }
         if sh0.sh_lmcs_used_flag {
             let data = self.lmcs_apss.get(&ph.ph_lmcs_aps_id).ok_or_else(|| {
                 Error::invalid(format!(
