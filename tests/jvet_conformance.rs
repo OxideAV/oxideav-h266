@@ -604,62 +604,71 @@ fn corpus_decode_triage() {
 /// fail the harness. Classes: P = pass (byte-exact vs .opl),
 /// F = fail (decodes, diverges), U = unsupported tool, E = error.
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
+    // r440 re-triage: the r437 "CTC-toolset desync family" (46 E)
+    // resolved into concrete root causes — the §8.7.4.5 32-point
+    // DST-VII / DCT-VIII and §8.7.4.3 LFNST publication errata, the
+    // missing MIP / BDPCM / ISP transform-unit reads, the single-tree
+    // cclm_mode_flag read, the §8.4.4 64-grid CqtDepth threshold at
+    // CTB 128, and the §7.3.11.2 implicit-QT cbSubdiv seed. Intra
+    // pictures now largely decode; the remaining E rows are later
+    // (mostly inter-picture) desyncs and the U rows are precise named
+    // feature gates.
     ("10b422_B_5", 'U'),          // 10-bit 4:2:2 chroma format
-    ("8b400_A_2", 'U'),           // intra multi-TB-per-CU tiling (128x128 CU) not wired
-    ("8b420_A_2", 'E'), // CTC-toolset desync family (r437: recon-level ±1 drift feeds a late parse desync)
-    ("8b420_B_2", 'E'), // CTC-toolset desync family
-    ("8b444_A_2", 'U'), // 4:4:4
-    ("AFF_A_2", 'E'),   // CTC-toolset desync family
-    ("ALF_A_3", 'E'),   // CTC-toolset desync family
-    ("ALF_B_3", 'E'),   // CTC-toolset desync family
-    ("ALF_C_3", 'E'),   // CTC-toolset desync family
-    ("AMVR_A_3", 'E'),  // CTC-toolset desync family
-    ("BDOF_A_4", 'E'),  // CTC-toolset desync family
-    ("BDPCM_A_2", 'E'), // CTC-toolset desync family
-    ("CCLM_A_2", 'E'),  // CTC-toolset desync family
-    ("CST_A_4", 'E'),   // CTC-toolset desync family
-    ("CodingToolsSets_A_2", 'F'), // r437: LUMA byte-exact both pictures; CCLM chroma prediction diverges
-    ("CodingToolsSets_B_2", 'E'), // desync in the inter pictures (inter-tool parse family; no SAO/ALF/LMCS)
-    ("CodingToolsSets_C_2", 'F'), // 10-bit twin of A_2 — same remaining divergence class
+    ("8b400_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("8b420_A_2", 'U'),           // inter residual multi-TB tiling (CB > MaxTbSizeY)
+    ("8b420_B_2", 'U'),           // inter residual multi-TB tiling (CB > MaxTbSizeY)
+    ("8b444_A_2", 'U'),           // 4:4:4
+    ("AFF_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("ALF_A_3", 'E'),             // desync beyond the first pictures (under triage)
+    ("ALF_B_3", 'E'),             // desync beyond the first pictures (under triage)
+    ("ALF_C_3", 'F'),             // decodes fully; plane divergence (under triage)
+    ("AMVR_A_3", 'E'),            // inter-picture desync (under triage)
+    ("BDOF_A_4", 'E'),            // inter-picture desync (under triage)
+    ("BDPCM_A_2", 'E'),           // desync (under triage)
+    ("CCLM_A_2", 'F'),            // decodes fully; CCLM sample-level class
+    ("CST_A_4", 'E'),             // desync (under triage)
+    ("CodingToolsSets_A_2", 'F'), // LUMA byte-exact; CCLM chroma sample-level class
+    ("CodingToolsSets_B_2", 'E'), // inter-picture desync (no SAO/ALF/LMCS)
+    ("CodingToolsSets_C_2", 'F'), // 10-bit twin of A_2 — same remaining class
     ("CodingToolsSets_D_2", 'E'), // desync surfaces as a spurious IBC BV-conformance error
     ("CodingToolsSets_E_1", 'U'), // subpictures
-    ("DEBLOCKING_A_3", 'E'),      // CTC-toolset desync family
-    ("DEBLOCKING_C_3", 'E'),      // CTC-toolset desync family
-    ("DEBLOCKING_E_3", 'U'),      // intra multi-TB-per-CU tiling (128x128 CU) not wired
+    ("DEBLOCKING_A_3", 'U'),      // affine non-merge reconstruction in the stream walker
+    ("DEBLOCKING_C_3", 'U'),      // inter residual multi-TB tiling
+    ("DEBLOCKING_E_3", 'U'),      // inter residual multi-TB tiling
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
-    ("DMVR_B_4", 'E'),            // CTC-toolset desync family
-    ("GDR_A_2", 'E'),             // CTC-toolset desync family (+ virtual boundaries later)
-    ("GPM_A_3", 'E'),             // CTC-toolset desync family
+    ("DMVR_B_4", 'E'),            // inter-picture desync (under triage)
+    ("GDR_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("GPM_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
     ("IBC_A_2", 'E'),             // desync surfaces as a spurious IBC BV-conformance error
-    ("ISP_A_3", 'E'),             // CTC-toolset desync family
-    ("JCCR_A_2", 'E'),            // CTC-toolset desync family
-    ("JCCR_C_3", 'E'),            // CTC-toolset desync family
-    ("LFNST_A_4", 'E'),           // CTC-toolset desync family
-    ("LFNST_B_4", 'E'),           // CTC-toolset desync family
-    ("LMCS_A_3", 'E'),            // CTC-toolset desync family
+    ("ISP_A_3", 'E'),             // desync (under triage)
+    ("JCCR_A_2", 'E'),            // desync (under triage)
+    ("JCCR_C_3", 'E'),            // desync (under triage)
+    ("LFNST_A_4", 'F'),           // decodes fully; plane divergence (under triage)
+    ("LFNST_B_4", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
-    ("LMCS_C_1", 'E'),            // CTC-toolset desync family
+    ("LMCS_C_1", 'U'),            // inter residual multi-TB tiling
     ("LOSSLESS_B_3", 'E'),        // desync surfaces as a spurious IBC BV-conformance error
-    ("MERGE_A_2", 'E'),           // CTC-toolset desync family
-    ("MIP_A_3", 'E'),             // CTC-toolset desync family
-    ("MIP_B_3", 'E'),             // CTC-toolset desync family
-    ("MMVD_A_3", 'E'),            // CTC-toolset desync family
-    ("MTS_A_4", 'E'),             // CTC-toolset desync family
-    ("PROF_B_3", 'E'),            // CTC-toolset desync family
-    ("QUANT_A_2", 'E'),           // CTC-toolset desync family
-    ("QUANT_B_2", 'E'),           // CTC-toolset desync family
-    ("RAP_A_1", 'E'), // CTC-toolset desync family (r437: exact until x=58 of row 0, then ±1 drift)
-    ("RAP_B_1", 'E'), // CTC-toolset desync family
-    ("SAO_A_3", 'E'), // CTC-toolset desync family
-    ("SBT_A_2", 'E'), // CTC-toolset desync family
-    ("SLICES_A_3", 'E'), // CTC-toolset desync family
-    ("SMVD_A_2", 'E'), // CTC-toolset desync family
-    ("SUBPIC_C_1", 'U'), // subpictures
-    ("SbTMVP_A_3", 'E'), // CTC-toolset desync family
-    ("TILE_A_2", 'E'), // CTC-toolset desync family
-    ("TMVP_A_3", 'E'), // CTC-toolset desync family
-    ("WPP_A_3", 'E'), // CTC-toolset desync family
-    ("WP_A_3", 'E'),  // CTC-toolset desync family
+    ("MERGE_A_2", 'E'),           // inter-picture desync (under triage)
+    ("MIP_A_3", 'F'),             // decodes fully; plane divergence (under triage)
+    ("MIP_B_3", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("MMVD_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("MTS_A_4", 'F'),             // decodes fully; plane divergence (under triage)
+    ("PROF_B_3", 'U'),            // inter residual multi-TB tiling
+    ("QUANT_A_2", 'U'),           // inter residual multi-TB tiling
+    ("QUANT_B_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("RAP_A_1", 'F'),             // decodes fully; plane divergence (under triage)
+    ("RAP_B_1", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("SAO_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("SBT_A_2", 'E'),             // inter-picture desync (under triage)
+    ("SLICES_A_3", 'E'),          // desync (under triage)
+    ("SMVD_A_2", 'E'),            // inter-picture desync (under triage)
+    ("SUBPIC_C_1", 'U'),          // subpictures
+    ("SbTMVP_A_3", 'U'),          // intra multi-TB-per-CU tiling (128x128 CU)
+    ("TILE_A_2", 'E'),            // desync (under triage)
+    ("TMVP_A_3", 'E'),            // desync (under triage)
+    ("WPP_A_3", 'E'),             // desync (under triage)
+    ("WP_A_3", 'E'),              // desync (under triage)
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this
