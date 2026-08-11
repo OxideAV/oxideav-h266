@@ -266,7 +266,15 @@ impl SplitAllows {
 impl SplitConstraints {
     /// Intra-slice luma / single-tree constraints from the SPS.
     pub fn intra_luma(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
-        let pc = &sps.partition_constraints;
+        Self::intra_luma_pc(&sps.partition_constraints, pic_w, pic_h)
+    }
+
+    /// Intra-slice luma constraints from an explicit
+    /// [`crate::sps::PartitionConstraints`] — the picture-level
+    /// effective set when the §7.3.2.8
+    /// `ph_partition_constraints_override_flag` replaced the SPS
+    /// values (§7.4.3.8).
+    pub fn intra_luma_pc(pc: &crate::sps::PartitionConstraints, pic_w: u32, pic_h: u32) -> Self {
         let min_cb_log2 = pc.log2_min_luma_coding_block_size_minus2 + 2;
         let min_qt_log2 = pc.log2_diff_min_qt_min_cb_intra_slice_luma + min_cb_log2;
         Self {
@@ -282,7 +290,12 @@ impl SplitConstraints {
 
     /// Inter-slice constraints from the SPS.
     pub fn inter(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
-        let pc = &sps.partition_constraints;
+        Self::inter_pc(&sps.partition_constraints, pic_w, pic_h)
+    }
+
+    /// Inter-slice constraints from an explicit constraint set (see
+    /// [`Self::intra_luma_pc`]).
+    pub fn inter_pc(pc: &crate::sps::PartitionConstraints, pic_w: u32, pic_h: u32) -> Self {
         let min_cb_log2 = pc.log2_min_luma_coding_block_size_minus2 + 2;
         let min_qt_log2 = pc.log2_diff_min_qt_min_cb_inter_slice + min_cb_log2;
         Self {
@@ -299,7 +312,12 @@ impl SplitConstraints {
     /// Dual-tree intra chroma constraints from the SPS (dimensions in
     /// luma samples, matching the chroma coding-tree walk).
     pub fn intra_chroma(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
-        let pc = &sps.partition_constraints;
+        Self::intra_chroma_pc(&sps.partition_constraints, pic_w, pic_h)
+    }
+
+    /// Dual-tree intra chroma constraints from an explicit constraint
+    /// set (see [`Self::intra_luma_pc`]).
+    pub fn intra_chroma_pc(pc: &crate::sps::PartitionConstraints, pic_w: u32, pic_h: u32) -> Self {
         let min_cb_log2 = pc.log2_min_luma_coding_block_size_minus2 + 2;
         let min_qt_log2 = pc.log2_diff_min_qt_min_cb_intra_slice_chroma + min_cb_log2;
         Self {

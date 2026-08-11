@@ -610,26 +610,31 @@ struct DmvrRefinedRect {
 /// origin and `yCb32` is the origin or origin + 32.
 ///
 /// The spec's `CqtDepth[chType][x][y]` counts from the CTB root and the
-/// conditions compare it against `CtbLog2SizeY − 6` — the implicit-QT
-/// depth of a 64×64 node — so in node-local terms `CqtDepth ==
-/// CtbLog2SizeY − 6` ⇔ the covering leaf's walker `cqt_depth == 0`, and
-/// `CqtDepth > CtbLog2SizeY − 6` ⇔ `cqt_depth > 0`.
+/// conditions compare it against `depth64 = CtbLog2SizeY − 6` — the
+/// implicit-QT depth of a 64×64 node. The walker records that same
+/// CTB-rooted depth on every `CtuCu` (the §7.3.11.2 implicit-QT levels
+/// seed `cqt_depth`, r434), so the comparisons run against `depth64`
+/// directly (r440 conformance fix: the pre-r434 node-local convention
+/// compared against 0, which under a 128 CTB made the `CqtDepth >
+/// CtbLog2SizeY − 6` arm true for every CB — `cclm_mode_flag` was read
+/// on CBs whose `CclmEnabled` derivation is 0).
 ///
 /// Enabled when one of the four 64-node conditions holds:
 /// 1. the chroma CB covering `(xCb64, yCb64)` is 64×64;
-/// 2. that CB has `cqt_depth == 0`, `MttSplitMode[xCb64][yCb64][0] ==
-///    SPLIT_BT_HOR`, and the chroma CB covering `(xCb64, yCb32)` is
-///    64×32;
-/// 3. that CB has `cqt_depth > 0`;
-/// 4. `cqt_depth == 0`, `MttSplitMode[xCb64][yCb64][0] == SPLIT_BT_HOR`
-///    and `MttSplitMode[xCb64][yCb32][1] == SPLIT_BT_VER`;
+/// 2. that CB has `cqt_depth == depth64`, `MttSplitMode[xCb64][yCb64]
+///    [0] == SPLIT_BT_HOR`, and the chroma CB covering `(xCb64, yCb32)`
+///    is 64×32;
+/// 3. that CB has `cqt_depth > depth64`;
+/// 4. `cqt_depth == depth64`, `MttSplitMode[xCb64][yCb64][0] ==
+///    SPLIT_BT_HOR` and `MttSplitMode[xCb64][yCb32][1] == SPLIT_BT_VER`;
 ///
 /// then suppressed (set back to FALSE) when the collocated luma 64-node
 /// is a 64×64 ISP CU, or when the luma CB covering the origin is
-/// smaller than 64 in either dimension while its `cqt_depth == 0` (luma
-/// stopped QT-splitting at 64 and went MTT).
+/// smaller than 64 in either dimension while its `cqt_depth == depth64`
+/// (luma stopped QT-splitting at 64 and went MTT).
 #[allow(clippy::too_many_arguments)]
 fn cclm_enabled_64_grid(
+    depth64: u32,
     node_x: u32,
     node_y: u32,
     chroma_cus: &[CtuCu],
@@ -663,9 +668,9 @@ fn cclm_enabled_64_grid(
         .is_some_and(|c| c.cu.w == 64 && c.cu.h == 32);
 
     let cond1 = c64.cu.w == 64 && c64.cu.h == 64;
-    let cond2 = c64.cu.cqt_depth == 0 && bt_hor_at_64 && c_y32_is_64x32;
-    let cond3 = c64.cu.cqt_depth > 0;
-    let cond4 = c64.cu.cqt_depth == 0 && bt_hor_at_64 && bt_ver_at_y32;
+    let cond2 = c64.cu.cqt_depth == depth64 && bt_hor_at_64 && c_y32_is_64x32;
+    let cond3 = c64.cu.cqt_depth > depth64;
+    let cond4 = c64.cu.cqt_depth == depth64 && bt_hor_at_64 && bt_ver_at_y32;
     let mut enabled = cond1 || cond2 || cond3 || cond4;
 
     // Luma-side suppression.
@@ -678,7 +683,7 @@ fn cclm_enabled_64_grid(
             if lcu.cu.w == 64 && lcu.cu.h == 64 && isp {
                 enabled = false;
             }
-            if (lcu.cu.w < 64 || lcu.cu.h < 64) && lcu.cu.cqt_depth == 0 {
+            if (lcu.cu.w < 64 || lcu.cu.h < 64) && lcu.cu.cqt_depth == depth64 {
                 enabled = false;
             }
         }
@@ -977,6 +982,12 @@ pub struct CtuWalker<'a, 'b> {
     /// payload is inert. [`Self::decode_picture_into`] fails fast when
     /// the slice uses explicit scaling lists but no binding exists.
     scaling_list: Option<crate::scaling_list::ScalingListData>,
+    /// §7.4.3.8 — the picture-level effective partition constraints
+    /// when the PH's `ph_partition_constraints_override_flag` replaced
+    /// the SPS set (installed via
+    /// [`Self::set_partition_constraints`]); `None` keeps the SPS
+    /// values.
+    partition_constraints_override: Option<crate::sps::PartitionConstraints>,
     /// §8.7.5.3 — per-4x4-cell top-left luma origin of the coding unit
     /// covering the cell (shares the [`Self::intra_grid`] geometry).
     /// Written by [`Self::write_intra_block`] as each leaf CU commits;
@@ -1343,6 +1354,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             affine_cpmv_field,
             lmcs: None,
             scaling_list: None,
+            partition_constraints_override: None,
             cu_qp_delta_subdiv: u32::MAX,
             qg_delta_coded: false,
             qg_delta_val: 0,
@@ -2200,6 +2212,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.cu_qp_delta_subdiv = subdiv;
     }
 
+    /// Install the picture-level effective partition constraints
+    /// (§7.4.3.8) — the SPS set with the PH
+    /// `ph_partition_constraints_override_flag` values substituted for
+    /// the sections the PH carries. Must be called before
+    /// [`Self::decode_picture_into`] whenever the picture header
+    /// overrides the constraints; every §6.4.1 – §6.4.3 allowed-split
+    /// derivation (split-bin presence AND §9.3.4.2 ctxIncs) then runs
+    /// on the effective set.
+    pub fn set_partition_constraints(&mut self, pc: crate::sps::PartitionConstraints) {
+        self.partition_constraints_override = Some(pc);
+    }
+
+    /// The active partition-constraint set: the PH-overridden copy
+    /// when one was installed, the SPS set otherwise.
+    fn active_partition_constraints(&self) -> &crate::sps::PartitionConstraints {
+        self.partition_constraints_override
+            .as_ref()
+            .unwrap_or(&self.sps.partition_constraints)
+    }
+
     /// r418 — §8.7.1 `qPY_PRED` for the quantization group whose
     /// top-left luma sample is `(x_qg, y_qg)` (absolute picture
     /// coordinates). Runs at QG declaration time, when everything the
@@ -2616,6 +2648,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mrl: tf.mrl_enabled_flag,
             isp: tf.isp_enabled_flag,
             lfnst_enabled: tf.lfnst_enabled_flag,
+            cclm_enabled: tf.cclm_enabled_flag,
             act: tf.act_enabled_flag,
             max_tb_size_y: 64,
             min_tb_size_y: 4,
@@ -2807,14 +2840,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // r412 — §6.4.1 – §6.4.3 allowed-split constraints from the
         // SPS partition constraints (intra vs inter slice set).
         let constraints = if self.sh.sh_slice_type == SliceType::I {
-            crate::coding_tree::SplitConstraints::intra_luma(
-                self.sps,
+            crate::coding_tree::SplitConstraints::intra_luma_pc(
+                self.active_partition_constraints(),
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
         } else {
-            crate::coding_tree::SplitConstraints::inter(
-                self.sps,
+            crate::coding_tree::SplitConstraints::inter_pc(
+                self.active_partition_constraints(),
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
@@ -3517,14 +3550,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // are picture-absolute via the rebase below.
         let _avail = Self::neighbour_avail(ctu);
         let constraints = if self.sh.sh_slice_type == SliceType::I {
-            crate::coding_tree::SplitConstraints::intra_luma(
-                self.sps,
+            crate::coding_tree::SplitConstraints::intra_luma_pc(
+                self.active_partition_constraints(),
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
         } else {
-            crate::coding_tree::SplitConstraints::inter(
-                self.sps,
+            crate::coding_tree::SplitConstraints::inter_pc(
+                self.active_partition_constraints(),
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
@@ -3611,6 +3644,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return Ok(());
         }
         if cb_size > 64 {
+            // §7.3.11.2 — the implicit levels carry `cbSubdiv =
+            // 2 * cqtDepth` and perform the QG declaration when
+            // `cbSubdiv <= CuQpDeltaSubdiv` (r440 conformance fix: the
+            // component walks used to re-arm a QG at every 64-node
+            // because their `cbSubdiv` restarted at 0, reading a
+            // spurious `cu_qp_delta` per node whenever the signalled
+            // subdiv keeps QGs at CTU granularity).
+            let ctb_log2 = self.layout.ctb_size_y.trailing_zeros();
+            let cqt_depth = ctb_log2.saturating_sub(cb_size.trailing_zeros());
+            let cb_subdiv = 2 * cqt_depth;
+            if self.pps.pps_cu_qp_delta_enabled_flag && cb_subdiv <= self.cu_qp_delta_subdiv {
+                self.qg_delta_coded = false;
+                self.qg_delta_val = 0;
+                self.qg_qp_y_pred = self.derive_qp_y_pred(x0, y0);
+            }
             let half = cb_size / 2;
             let x1 = x0 + half;
             let y1 = y0 + half;
@@ -3739,14 +3787,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         let is_luma = tree == TreeType::DualTreeLuma;
         let constraints = if is_luma {
-            crate::coding_tree::SplitConstraints::intra_luma(
-                self.sps,
+            crate::coding_tree::SplitConstraints::intra_luma_pc(
+                self.active_partition_constraints(),
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
         } else {
-            crate::coding_tree::SplitConstraints::intra_chroma(
-                self.sps,
+            crate::coding_tree::SplitConstraints::intra_chroma_pc(
+                self.active_partition_constraints(),
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
@@ -3766,7 +3814,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mtt_depth: 0,
             parent_tt_ver: None,
             part_idx: 0,
-            cb_subdiv: 0,
+            // §7.3.11.2 — the component tree of an implicit-QT node
+            // starts at `cbSubdiv = 2 * cqtDepth`, so the §7.3.11.4 QG
+            // declarations (`cbSubdiv <= CuQpDeltaSubdiv`) see the
+            // CTB-rooted subdivision level.
+            cb_subdiv: 2 * cqt_depth0,
             qg_on_y: true,
             depth_offset: 0,
         }];
@@ -3902,7 +3954,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         let mut with_self = cus.clone();
                         with_self.push(ccu);
                         cclm_enabled_64_grid(
-                            node_x, node_y, &with_self, &mtt_log, luma_cus, luma_infos, ccu.cu.x,
+                            self.layout.ctb_size_y.trailing_zeros().saturating_sub(6),
+                            node_x,
+                            node_y,
+                            &with_self,
+                            &mtt_log,
+                            luma_cus,
+                            luma_infos,
+                            ccu.cu.x,
                             ccu.cu.y,
                         )
                     });
@@ -14173,6 +14232,7 @@ mod tests {
         // Condition 1 — chroma 64-node unsplit → enabled.
         let chroma_unsplit = vec![mk(0, 0, 64, 64, 0)];
         assert!(cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_unsplit,
@@ -14191,6 +14251,7 @@ mod tests {
             mk(32, 32, 32, 32, 1),
         ];
         assert!(cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_qt,
@@ -14212,6 +14273,7 @@ mod tests {
             binary: true,
         }];
         assert!(!cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_btv,
@@ -14233,6 +14295,7 @@ mod tests {
             binary: true,
         }];
         assert!(cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_bth,
@@ -14267,6 +14330,7 @@ mod tests {
             },
         ];
         assert!(cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_c4,
@@ -14282,6 +14346,7 @@ mod tests {
         isp_info.isp_split = crate::leaf_cu::IspSplitType::VerSplit;
         let luma_isp_infos = vec![isp_info];
         assert!(!cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_unsplit,
@@ -14297,6 +14362,7 @@ mod tests {
         let luma_mtt = vec![mk(0, 0, 32, 64, 0), mk(32, 0, 32, 64, 0)];
         let luma_mtt_infos = vec![LeafCuInfo::default(), LeafCuInfo::default()];
         assert!(!cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_unsplit,
@@ -14316,6 +14382,7 @@ mod tests {
         ];
         let luma_qt_infos = vec![LeafCuInfo::default(); 4];
         assert!(cclm_enabled_64_grid(
+            /*depth64=*/ 0,
             0,
             0,
             &chroma_unsplit,

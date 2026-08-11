@@ -517,6 +517,59 @@ impl StreamDecoder {
         let mut walker =
             CtuWalker::begin_slice(&layout, &sps, &pps, sh0, ph.ph_qp_delta, &cabacs[0])?;
 
+        // §7.4.3.8 — apply the PH partition-constraints override: the
+        // PH values replace the SPS set for this picture, per section
+        // (intra fields only when `ph_intra_slice_allowed_flag`, inter
+        // fields only when `ph_inter_slice_allowed_flag` — the absent
+        // sections keep the SPS values).
+        if let Some(ov) = &ph.partition_override {
+            let mut pc = sps.partition_constraints.clone();
+            if ph.ph_intra_slice_allowed_flag {
+                pc.log2_diff_min_qt_min_cb_intra_slice_luma =
+                    ov.log2_diff_min_qt_min_cb_intra_slice_luma;
+                pc.max_mtt_hierarchy_depth_intra_slice_luma =
+                    ov.max_mtt_hierarchy_depth_intra_slice_luma;
+                if ov.max_mtt_hierarchy_depth_intra_slice_luma != 0 {
+                    pc.log2_diff_max_bt_min_qt_intra_slice_luma =
+                        ov.log2_diff_max_bt_min_qt_intra_slice_luma;
+                    pc.log2_diff_max_tt_min_qt_intra_slice_luma =
+                        ov.log2_diff_max_tt_min_qt_intra_slice_luma;
+                } else {
+                    // §7.4.3.8 inference: zero MTT depth pins MaxBt /
+                    // MaxTt at MinQt (the log2 diffs read as 0).
+                    pc.log2_diff_max_bt_min_qt_intra_slice_luma = 0;
+                    pc.log2_diff_max_tt_min_qt_intra_slice_luma = 0;
+                }
+                if sps.partition_constraints.qtbtt_dual_tree_intra_flag {
+                    pc.log2_diff_min_qt_min_cb_intra_slice_chroma =
+                        ov.log2_diff_min_qt_min_cb_intra_slice_chroma;
+                    pc.max_mtt_hierarchy_depth_intra_slice_chroma =
+                        ov.max_mtt_hierarchy_depth_intra_slice_chroma;
+                    if ov.max_mtt_hierarchy_depth_intra_slice_chroma != 0 {
+                        pc.log2_diff_max_bt_min_qt_intra_slice_chroma =
+                            ov.log2_diff_max_bt_min_qt_intra_slice_chroma;
+                        pc.log2_diff_max_tt_min_qt_intra_slice_chroma =
+                            ov.log2_diff_max_tt_min_qt_intra_slice_chroma;
+                    } else {
+                        pc.log2_diff_max_bt_min_qt_intra_slice_chroma = 0;
+                        pc.log2_diff_max_tt_min_qt_intra_slice_chroma = 0;
+                    }
+                }
+            }
+            if ph.ph_inter_slice_allowed_flag {
+                pc.log2_diff_min_qt_min_cb_inter_slice = ov.log2_diff_min_qt_min_cb_inter_slice;
+                pc.max_mtt_hierarchy_depth_inter_slice = ov.max_mtt_hierarchy_depth_inter_slice;
+                if ov.max_mtt_hierarchy_depth_inter_slice != 0 {
+                    pc.log2_diff_max_bt_min_qt_inter_slice = ov.log2_diff_max_bt_min_qt_inter_slice;
+                    pc.log2_diff_max_tt_min_qt_inter_slice = ov.log2_diff_max_tt_min_qt_inter_slice;
+                } else {
+                    pc.log2_diff_max_bt_min_qt_inter_slice = 0;
+                    pc.log2_diff_max_tt_min_qt_inter_slice = 0;
+                }
+            }
+            walker.set_partition_constraints(pc);
+        }
+
         // PH-level switches.
         if pps.pps_cu_qp_delta_enabled_flag {
             walker.set_cu_qp_delta_subdiv(if sh0.sh_slice_type == SliceType::I {
@@ -577,6 +630,12 @@ impl StreamDecoder {
                 sh0.sh_alf_cc_cb_enabled_flag,
                 sh0.sh_alf_cc_cr_enabled_flag,
                 sh0.sh_slice_type,
+            );
+            eprintln!(
+                "PH dbg: part_override={:?} qp_delta_subdiv_intra={} chroma_off_subdiv_intra={}",
+                ph.partition_override,
+                ph.ph_cu_qp_delta_subdiv_intra_slice,
+                ph.ph_cu_chroma_qp_offset_subdiv_intra_slice,
             );
         }
         if sh0.sh_lmcs_used_flag {
