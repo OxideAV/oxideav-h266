@@ -421,6 +421,12 @@ pub struct CuToolFlags {
     /// `lfnst_idx` parse (§7.3.11.5) and the §8.7.4.1 inverse-LFNST
     /// reconstruction.
     pub lfnst_enabled: bool,
+    /// `sps_cclm_enabled_flag`. On a SINGLE_TREE walk the §8.4.4
+    /// `CclmEnabled` derivation collapses to this flag (the complex
+    /// 64-grid arm requires `sps_qtbtt_dual_tree_intra_flag == 1` on
+    /// an I slice with `CtbLog2SizeY >= 6` — which is a dual-tree
+    /// walk), so it alone gates the single-tree `cclm_mode_flag` read.
+    pub cclm_enabled: bool,
     /// `sps_act_enabled_flag`.
     pub act: bool,
     /// `MaxTbSizeY` — max transform block size in luma samples.
@@ -1599,9 +1605,14 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 } else {
                     INTRA_ANGULAR18
                 };
+                // r440 conformance fix: fall through to the chroma
+                // derivation + `transform_unit()` reads below — a
+                // BDPCM CU still carries its full TU (the early
+                // return here skipped every CBF / residual bin).
                 if self.tree != TreeType::DualTreeLuma {
                     self.derive_chroma(info);
                 }
+                self.decode_transform_unit(info, residual)?;
                 return Ok(());
             }
         }
@@ -1632,9 +1643,14 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // MIP has its own mode namespace — we still store 0 for
             // intra_pred_mode_y so callers know to branch on the flag.
             info.intra_pred_mode_y = 0;
+            // r440 conformance fix: a MIP CU still carries its full
+            // §7.3.11.10 `transform_unit()` — the early return here
+            // skipped every CBF / residual bin, desynchronising CABAC
+            // on any MIP CU with coded residual.
             if self.tree != TreeType::DualTreeLuma {
                 self.derive_chroma(info);
             }
+            self.decode_transform_unit(info, residual)?;
             return Ok(());
         }
 
@@ -4132,7 +4148,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             let transform_skip = if ts_flag_present {
                 crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 0)?
             } else {
-                false
+                // §7.4.12.5 — when the flag is absent it is inferred 1
+                // for a BDPCM TB (BdpcmFlag == 1) and 0 otherwise.
+                info.intra_bdpcm_luma
             };
             info.transform_skip_luma = transform_skip;
 
@@ -4149,7 +4167,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     cb_h,
                     0,
                     self.tools.ts_residual_coding_rice_idx,
-                    /*bdpcm=*/ false,
+                    /*bdpcm=*/ info.intra_bdpcm_luma,
                 )?
             } else {
                 let (levels, flags) = decode_tb_coefficients_opts(
@@ -4194,7 +4212,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 let ts = if ts_present {
                     crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 1)?
                 } else {
-                    false
+                    // §7.4.12.5 inference — 1 for a BDPCM chroma TB.
+                    info.intra_bdpcm_chroma
                 };
                 info.transform_skip_cb = ts;
                 let levels = if ts && !self.tools.ts_residual_coding_disabled {
@@ -4205,7 +4224,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         ch,
                         1,
                         self.tools.ts_residual_coding_rice_idx,
-                        false,
+                        info.intra_bdpcm_chroma,
                     )?
                 } else {
                     let (levels, flags) = decode_tb_coefficients_opts(
@@ -4238,7 +4257,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 let ts = if ts_present {
                     crate::residual::read_transform_skip_flag(self.dec, &mut self.ctxs.residual, 2)?
                 } else {
-                    false
+                    // §7.4.12.5 inference — 1 for a BDPCM chroma TB.
+                    info.intra_bdpcm_chroma
                 };
                 info.transform_skip_cr = ts;
                 let levels = if ts && !self.tools.ts_residual_coding_disabled {
@@ -4249,7 +4269,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         ch,
                         2,
                         self.tools.ts_residual_coding_rice_idx,
-                        false,
+                        info.intra_bdpcm_chroma,
                     )?
                 } else {
                     let (levels, flags) = decode_tb_coefficients_opts(
@@ -4755,16 +4775,43 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 return;
             }
         }
+        // §7.3.11.5 — `cclm_mode_flag` precedes `intra_chroma_pred_mode`
+        // whenever the §8.4.4 `CclmEnabled` derivation holds. On this
+        // SINGLE_TREE path that derivation collapses to
+        // `sps_cclm_enabled_flag` (see the `CuToolFlags::cclm_enabled`
+        // note). r440 conformance fix: this read was missing entirely —
+        // every single-tree intra CU with chroma desynchronised the
+        // CABAC bin stream against wires that code CCLM.
+        let cclm_flag = if self.tools.cclm_enabled {
+            let idx = (self.ctxs.init_type as usize).min(self.ctxs.cclm_mode_flag.len() - 1);
+            self.dec
+                .decode_decision(&mut self.ctxs.cclm_mode_flag[idx])
+                .unwrap_or(0)
+                == 1
+        } else {
+            false
+        };
+        if cclm_flag {
+            // `cclm_mode_idx` — TR(cMax = 2, cRice = 0): bin 0
+            // ctx-coded, bin 1 bypass (Table 132); Table 20 maps
+            // cclm_mode_flag == 1 to modes 81 + idx.
+            let idx = (self.ctxs.init_type as usize).min(self.ctxs.cclm_mode_idx.len() - 1);
+            let bin0 = self
+                .dec
+                .decode_decision(&mut self.ctxs.cclm_mode_idx[idx])
+                .unwrap_or(0);
+            let cclm_idx = if bin0 == 0 {
+                0
+            } else if self.dec.decode_bypass().unwrap_or(0) == 0 {
+                1
+            } else {
+                2
+            };
+            info.intra_chroma_pred_mode = 4 + 1 + cclm_idx; // raw namespace marker
+            info.intra_pred_mode_c = INTRA_LT_CCLM + cclm_idx;
+            return;
+        }
         // Read intra_chroma_pred_mode — Table 130, bin 0 ctx, bins 1-2 bypass.
-        // If MIP is active the chroma derivation path inherits luma
-        // (MipChromaDirectFlag can force this), but reading the mode
-        // element is still gated on cclm_mode_flag == 0. For this round
-        // we always take the non-CCLM path (cclm tool disabled in tests).
-        // When intra_bdpcm_chroma_flag is not present or is 0 the
-        // element is read.
-        // We bail the read to a best-effort: if there is insufficient
-        // bitstream, error up the chain.
-        // Best-effort: missing bitstream tail means defaults.
         let icp = self.read_intra_chroma_pred_mode().unwrap_or_default();
         info.intra_chroma_pred_mode = icp;
         let luma = info.intra_pred_mode_y;
