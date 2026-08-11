@@ -4834,6 +4834,38 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             vec![0i32; n_tb_w * n_tb_h]
         };
 
+        // Debug aid (`H266_DBG_TB=x,y`): dump the single-TB intra
+        // luma pipeline state (parsed non-zero levels, prediction row
+        // 0, residual row/column 0) for the CU whose origin matches —
+        // companion to `H266_DBG_CU` for corpus triage.
+        if let Ok(v) = std::env::var("H266_DBG_TB") {
+            let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+            if want.len() == 2 && cu.cu.x as usize == want[0] && cu.cu.y as usize == want[1] {
+                eprintln!(
+                    "TB ({},{}) {}x{}: qp={} lvl_nz={:?}",
+                    cu.cu.x,
+                    cu.cu.y,
+                    n_tb_w,
+                    n_tb_h,
+                    self.cabac.slice_qp_y.0 + info.cu_qp_delta_val,
+                    residual
+                        .luma_levels
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &l)| l != 0)
+                        .map(|(i, &l)| (i % n_tb_w, i / n_tb_w, l))
+                        .collect::<Vec<_>>()
+                );
+                eprintln!("pred row0: {:?}", &pred[..n_tb_w.min(32)]);
+                eprintln!("res row0 : {:?}", &residual_samples[..n_tb_w.min(32)]);
+                eprintln!(
+                    "res col0 : {:?}",
+                    (0..n_tb_h.min(8))
+                        .map(|y| residual_samples[y * n_tb_w])
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
         // 5. Reconstruct (eq. 1426). The destination plane row stride
         // matches its sample width by construction (PicturePlane::filled).
         reconstruct_tb_into(
@@ -9313,7 +9345,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // n_pb_w`, this always holds.
             let _ = pb_factor;
 
-            // 3. Dequant + IDCT for the per-subpartition residual.
+            // 3. Dequant + inverse transforms for the per-subpartition
+            //    residual. §8.7.4.1: an ISP TB has
+            //    `implicitMtsEnabled == 1` whenever
+            //    `sps_mts_enabled_flag` is set, so `lfnst_idx == 0`
+            //    selects the eqs. 1167 / 1168 DST-VII kernels per
+            //    partition dimension (4..16), while `lfnst_idx != 0`
+            //    pins DCT-II on both axes and routes the dequantised
+            //    coefficients through the §8.7.4.2 inverse LFNST at
+            //    the partition dims (r440 conformance fix: this path
+            //    previously hard-coded DCT-II and never applied the
+            //    LFNST).
             let residual_samples: Vec<i32> = if sub.tu_y_coded_flag && !sub.levels.is_empty() {
                 // Qp′Y = QpY + QpBdOffset (§8.7.1).
                 let qp = self.cabac.slice_qp_y.0
@@ -9332,20 +9374,59 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     bdpcm: false,
                     bdpcm_dir: false,
                 };
-                let d = self.dequantize_tb(
-                    &sub.levels,
-                    &params,
-                    PredModeKind::Intra,
-                    0,
-                    /*apply_lfnst=*/ false,
-                )?;
+                let apply_lfnst = info.lfnst_idx > 0;
+                let mut d =
+                    self.dequantize_tb(&sub.levels, &params, PredModeKind::Intra, 0, apply_lfnst)?;
+                let (tr_h, tr_v, non_zero_w, non_zero_h) = if apply_lfnst {
+                    // §8.7.4.1 — LFNST pins the primary transform to
+                    // DCT-II (the trType derivation's first arm) and
+                    // eqs. 1169 / 1170 cap the non-zero extent. The
+                    // §8.4.5.2.7 remap inside the LFNST runs on the CU
+                    // dims for an ISP luma TB.
+                    let max_c = (1i32 << log2_tr_range) - 1;
+                    crate::lfnst::apply_inverse_lfnst_remap(
+                        &mut d,
+                        n_w,
+                        n_h,
+                        cb_w as usize,
+                        cb_h as usize,
+                        info.intra_pred_mode_y as i32,
+                        info.lfnst_idx,
+                        -(max_c + 1),
+                        max_c,
+                    )?;
+                    let nz = if n_w == 4 || n_h == 4 { 4 } else { 8 };
+                    (TrType::DctII, TrType::DctII, n_w.min(nz), n_h.min(nz))
+                } else if self.sps.tool_flags.mts_enabled_flag {
+                    // eqs. 1167 / 1168 with the partition dims; the
+                    // eqs. 1171 / 1172 non-zero extents follow the
+                    // per-axis kernel.
+                    let tr_h = if (4..=16).contains(&n_w) {
+                        TrType::DstVII
+                    } else {
+                        TrType::DctII
+                    };
+                    let tr_v = if (4..=16).contains(&n_h) {
+                        TrType::DstVII
+                    } else {
+                        TrType::DctII
+                    };
+                    (
+                        tr_h,
+                        tr_v,
+                        n_w.min(if tr_h != TrType::DctII { 16 } else { 32 }),
+                        n_h.min(if tr_v != TrType::DctII { 16 } else { 32 }),
+                    )
+                } else {
+                    (TrType::DctII, TrType::DctII, n_w.min(32), n_h.min(32))
+                };
                 inverse_transform_2d(
                     n_w,
                     n_h,
-                    n_w,
-                    n_h,
-                    TrType::DctII,
-                    TrType::DctII,
+                    non_zero_w,
+                    non_zero_h,
+                    tr_h,
+                    tr_v,
                     &d,
                     bit_depth,
                     log2_tr_range,

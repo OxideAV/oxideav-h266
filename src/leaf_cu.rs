@@ -4346,12 +4346,14 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     }
 
     /// §7.3.11.5 `lfnst_idx` read. The element is present only for an
-    /// intra (`MODE_INTRA`) single-TB CU where `sps_lfnst_enabled_flag`
-    /// is set, both TB dims are >= 4 and the CB fits in `MaxTbSizeY`,
-    /// the luma TB is not transform-skipped (`lfnstNotTsFlag`), and the
-    /// MIP exception holds (non-MIP, or `Min(w, h) >= 16`). The
-    /// `LfnstDcOnly == 0 && LfnstZeroOutSigCoeffFlag == 1` gate (no ISP
-    /// here) decides whether the bin is coded. Inferred 0 when absent.
+    /// intra (`MODE_INTRA`) CU where `sps_lfnst_enabled_flag` is set,
+    /// both lfnst dims (CB dims, ISP-scaled along the split direction)
+    /// are >= 4 and the CB fits in `MaxTbSizeY`, no coded TB of the CU
+    /// is transform-skipped (`lfnstNotTsFlag`), and the MIP exception
+    /// holds (non-MIP, or `Min(w, h) >= 16`). The inner
+    /// `(ISP != NO_SPLIT || LfnstDcOnly == 0) &&
+    /// LfnstZeroOutSigCoeffFlag == 1` gate decides whether the bin is
+    /// coded. Inferred 0 when absent.
     ///
     /// Binarisation is TR(cMax=2): two ctx-coded bins (the second only
     /// read when the first is 1), ctxInc via
@@ -4367,31 +4369,48 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         }
         let cb_w = info.cb_width;
         let cb_h = info.cb_height;
-        // lfnstWidth / lfnstHeight for SINGLE_TREE / ISP_NO_SPLIT equal
-        // the CB dims (the DUAL_TREE_CHROMA / ISP scaling does not apply
-        // on this single-tree intra-luma path).
-        let lfnst_min = cb_w.min(cb_h);
-        // lfnstNotTsFlag (§7.3.11.5): cleared when any coded TB of the CU
-        // used transform-skip. On this single-tree intra-luma path the
-        // luma transform_skip_flag is the relevant signal; a TS luma TB
-        // forbids LFNST.
-        let lfnst_not_ts = !info.transform_skip_luma;
+        // §7.3.11.5 lfnstWidth / lfnstHeight: the CB dims, scaled down
+        // by `NumIntraSubPartitions` along the ISP split direction
+        // (`cbWidth / NumIntraSubPartitions` for ISP_VER_SPLIT, the
+        // height analogously for ISP_HOR_SPLIT). The DUAL_TREE_CHROMA
+        // scaling does not apply on this intra-luma path.
+        let num_parts = crate::isp::iter_isp_partitions(info.isp_split, cb_w, cb_h).len() as u32;
+        let (lfnst_w, lfnst_h) = match info.isp_split {
+            IspSplitType::NoSplit => (cb_w, cb_h),
+            IspSplitType::VerSplit => (cb_w / num_parts.max(1), cb_h),
+            IspSplitType::HorSplit => (cb_w, cb_h / num_parts.max(1)),
+        };
+        let lfnst_min = lfnst_w.min(lfnst_h);
+        // lfnstNotTsFlag (§7.3.11.5): cleared when any coded TB of the
+        // CU used transform-skip — the luma TB term
+        // (`!tu_y_coded_flag || transform_skip_flag[..][0] == 0`) and,
+        // on trees that carry chroma, the Cb / Cr terms.
+        let lfnst_not_ts = !info.transform_skip_luma
+            && (!info.tu_cb_coded_flag || !info.transform_skip_cb)
+            && (!info.tu_cr_coded_flag || !info.transform_skip_cr);
         // MIP exception (§7.3.11.5): allowed when non-MIP or min dim >= 16.
         let mip_ok = !info.intra_mip_flag || lfnst_min >= 16;
         let size_ok = lfnst_min >= 4 && cb_w.max(cb_h) <= self.tools.max_tb_size_y;
         if !(size_ok && lfnst_not_ts && mip_ok) {
             return Ok(());
         }
-        // No ISP on this path → the inner gate is
-        // `LfnstDcOnly == 0 && LfnstZeroOutSigCoeffFlag == 1`.
-        if res_flags.lfnst_dc_only || !res_flags.lfnst_zero_out_sig_coeff_flag {
+        // Inner gate (§7.3.11.5): `(IntraSubPartitionsSplitType !=
+        // ISP_NO_SPLIT || LfnstDcOnly == 0) && LfnstZeroOutSigCoeffFlag
+        // == 1` — the DcOnly term only applies to non-ISP CUs.
+        if (info.isp_split == IspSplitType::NoSplit && res_flags.lfnst_dc_only)
+            || !res_flags.lfnst_zero_out_sig_coeff_flag
+        {
             return Ok(());
         }
-        // TR(cMax=2): bin 0, then bin 1 only if bin 0 == 1. treeType is
-        // SINGLE_TREE on this path.
+        // TR(cMax=2): bin 0, then bin 1 only if bin 0 == 1.
         let off = (self.ctxs.init_type as usize) * 3;
         let n = self.ctxs.lfnst_idx.len() - 1;
-        let inc0 = crate::ctx::ctx_inc_lfnst_idx(0, /*tree_single=*/ true) as usize;
+        // §9.3.4.2.2 Table 132 — bin 0 ctxInc is
+        // `(treeType != SINGLE_TREE) ? 1 : 0`; this reader also runs
+        // the DUAL_TREE_LUMA walk (r440 conformance fix: was hard-wired
+        // to the SINGLE_TREE arm).
+        let tree_single = self.tree == TreeType::SingleTree;
+        let inc0 = crate::ctx::ctx_inc_lfnst_idx(0, tree_single) as usize;
         let bin0 = self
             .dec
             .decode_decision(&mut self.ctxs.lfnst_idx[(off + inc0).min(n)])?;
@@ -4399,7 +4418,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.lfnst_idx = 0;
             return Ok(());
         }
-        let inc1 = crate::ctx::ctx_inc_lfnst_idx(1, true) as usize;
+        let inc1 = crate::ctx::ctx_inc_lfnst_idx(1, tree_single) as usize;
         let bin1 = self
             .dec
             .decode_decision(&mut self.ctxs.lfnst_idx[(off + inc1).min(n)])?;
@@ -4449,25 +4468,31 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         residual.luma_subparts.clear();
         residual.luma_subparts.reserve(num_parts);
 
-        // Walk subpartitions in order. We accumulate the per-part
-        // CBFs first to honour spec read ordering — chroma CBFs come
-        // *before* luma CBFs only on the last partition.
+        // Walk subpartitions in the spec's §7.3.11.9 order — each
+        // subpartition is one §7.3.11.10 `transform_unit()` invocation
+        // and every element of that TU is read inline, in syntax
+        // order. (r440 conformance fix: the previous shape deferred
+        // `cu_qp_delta` / `cu_chroma_qp_offset` /
+        // `tu_joint_cbcr_residual_flag` and the chroma residuals to a
+        // trailing pass after every partition's `residual_coding()`,
+        // which desynchronised the CABAC bin stream against foreign
+        // wires the moment any of those elements was present.)
         let mut infer_tu_cbf_luma = true;
         let mut last_tu_cbf_y = false;
-        // Per-partition luma CBFs we read along the way. Chroma CBFs
-        // are deferred until the final partition.
-        let mut part_cbfs: Vec<bool> = Vec::with_capacity(num_parts);
-        // We also collect the full per-partition records so the
-        // residual decode (which interleaves with CBF reads in spec
-        // order) can be invoked at the right moment.
+        let mut any_cbf_y = false;
+        // §7.3.11.11 LFNST / MTS gating flags accumulate across every
+        // `residual_coding()` call of the CU (luma partitions and the
+        // last-partition chroma TBs alike) and gate the CU-trailing
+        // `lfnst_idx` read below.
+        let mut res_flags = crate::residual::TbResidualFlags::default();
         let mut sub_records: Vec<LeafCuLumaSubpart> = Vec::with_capacity(num_parts);
 
         for (i, p) in parts.iter().enumerate() {
             let is_last = i == num_parts - 1;
 
-            // Spec §7.3.11.10: chroma CBFs are read only on the last
-            // subpartition (and only for SINGLE_TREE / DUAL_TREE_CHROMA
-            // with chroma format != monochrome).
+            // §7.3.11.10: chroma CBFs are read only in the last
+            // subpartition's TU (and only when the tree carries
+            // chroma).
             if is_last && chroma {
                 info.tu_cb_coded_flag = read_tu_cb_coded_flag(
                     self.dec,
@@ -4482,7 +4507,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 )?;
             }
 
-            // Spec §7.3.11.10: tu_y_coded_flag read condition for ISP
+            // §7.3.11.10: tu_y_coded_flag read condition for ISP
             // simplifies to `subTuIndex < NumIntraSubPartitions - 1
             // || !InferTuCbfLuma`. When neither is true (last
             // partition, all priors zero) the flag is inferred to 1.
@@ -4502,35 +4527,64 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // §7.3.11.10: InferTuCbfLuma stays true only while every
             // partition has reported zero.
             infer_tu_cbf_luma = infer_tu_cbf_luma && !cbf_y;
-            part_cbfs.push(cbf_y);
+            any_cbf_y |= cbf_y;
 
-            // The cu_qp_delta / cu_chroma_qp_offset reads are gated
-            // on the same conditions as the single-TB path; we read
-            // them on the first partition where the CBFs (or any of
-            // the size escapes) make them available, which for ISP
-            // means: as soon as we have a CBF == 1 in luma, or once
-            // chroma CBFs are read (last partition).
-            if i == num_parts - 1 {
-                // Defer to the trailing pass below.
+            let chroma_cbf_here =
+                is_last && chroma && (info.tu_cb_coded_flag || info.tu_cr_coded_flag);
+
+            // §7.3.11.10 — `cu_qp_delta_abs` is read inside the first
+            // TU whose CBFs open the gate (before that partition's
+            // residual_coding), not once per CU at the tail.
+            if (cbf_y || chroma_cbf_here)
+                && self.tools.cu_qp_delta_enabled
+                && !self.tools.cu_qp_delta_already_coded
+                && !info.cu_qp_delta_read
+            {
+                info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+                info.cu_qp_delta_read = true;
+            }
+            // §7.3.11.10 — `cu_chroma_qp_offset_*` +
+            // `tu_joint_cbcr_residual_flag` live in the last
+            // partition's TU, after `cu_qp_delta` and before its luma
+            // `residual_coding()`.
+            if chroma_cbf_here {
+                if self.tools.cu_chroma_qp_offset_enabled {
+                    let (flag, idx) = read_cu_chroma_qp_offset(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        self.tools.chroma_qp_offset_list_len_minus1,
+                    )?;
+                    info.cu_chroma_qp_offset_flag = flag;
+                    info.cu_chroma_qp_offset_idx = idx;
+                }
+                // ISP CUs are MODE_INTRA, so the §7.3.11.10 joint
+                // condition is just "any chroma CBF".
+                if self.tools.joint_cbcr_enabled {
+                    info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
+                        self.dec,
+                        &mut self.ctxs.residual,
+                        info.tu_cb_coded_flag,
+                        info.tu_cr_coded_flag,
+                    )?;
+                }
             }
 
-            // Decode this partition's luma residual now (spec orders
-            // residual_coding *after* the CBF reads of *this*
-            // partition's transform_unit; chroma CBFs only appear in
-            // the last partition's TU and the per-partition luma
-            // residual lives inside the same TU body).
+            // This partition's luma residual. `transform_skip_flag`
+            // is never present on an ISP TB (§7.3.11.10 gates it on
+            // ISP_NO_SPLIT).
             let n_w = p.n_w as usize;
             let n_h = p.n_h as usize;
             let levels = if cbf_y {
-                decode_tb_coefficients_opts(
+                let (levels, flags) = decode_tb_coefficients_opts(
                     self.dec,
                     &mut self.ctxs.residual,
                     n_w,
                     n_h,
                     0,
                     self.tools.rc_opts,
-                )?
-                .0
+                )?;
+                res_flags.merge(flags);
+                levels
             } else {
                 Vec::new()
             };
@@ -4542,88 +4596,118 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 tu_y_coded_flag: cbf_y,
                 levels,
             });
+
+            // Chroma TBs close the last partition's TU (spec order:
+            // after its luma residual_coding). Chroma is not split for
+            // ISP (eqs. 251 – 254) — one full-CU TB per component, each
+            // preceded by its §7.3.11.10 `transform_skip_flag` when
+            // the gate opens.
+            if is_last && chroma {
+                let cw = (cb_w / sub_w) as usize;
+                let ch = (cb_h / sub_h) as usize;
+                if cw >= 2 && ch >= 2 {
+                    let ts_gate = |tools: &CuToolFlags| {
+                        tools.transform_skip_enabled
+                            && (cw as u32) <= tools.max_ts_size
+                            && (ch as u32) <= tools.max_ts_size
+                    };
+                    if info.tu_cb_coded_flag {
+                        let ts = if ts_gate(&self.tools) {
+                            crate::residual::read_transform_skip_flag(
+                                self.dec,
+                                &mut self.ctxs.residual,
+                                1,
+                            )?
+                        } else {
+                            false
+                        };
+                        info.transform_skip_cb = ts;
+                        residual.cb_levels = if ts && !self.tools.ts_residual_coding_disabled {
+                            crate::residual::decode_ts_tb_coefficients(
+                                self.dec,
+                                &mut self.ctxs.residual,
+                                cw,
+                                ch,
+                                1,
+                                self.tools.ts_residual_coding_rice_idx,
+                                /*bdpcm=*/ false,
+                            )?
+                        } else {
+                            let (levels, flags) = decode_tb_coefficients_opts(
+                                self.dec,
+                                &mut self.ctxs.residual,
+                                cw,
+                                ch,
+                                1,
+                                self.tools.rc_opts,
+                            )?;
+                            res_flags.merge(flags);
+                            levels
+                        };
+                    }
+                    if info.tu_cr_coded_flag
+                        && !(info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag)
+                    {
+                        let ts = if ts_gate(&self.tools) {
+                            crate::residual::read_transform_skip_flag(
+                                self.dec,
+                                &mut self.ctxs.residual,
+                                2,
+                            )?
+                        } else {
+                            false
+                        };
+                        info.transform_skip_cr = ts;
+                        residual.cr_levels = if ts && !self.tools.ts_residual_coding_disabled {
+                            crate::residual::decode_ts_tb_coefficients(
+                                self.dec,
+                                &mut self.ctxs.residual,
+                                cw,
+                                ch,
+                                2,
+                                self.tools.ts_residual_coding_rice_idx,
+                                /*bdpcm=*/ false,
+                            )?
+                        } else {
+                            let (levels, flags) = decode_tb_coefficients_opts(
+                                self.dec,
+                                &mut self.ctxs.residual,
+                                cw,
+                                ch,
+                                2,
+                                self.tools.rc_opts,
+                            )?;
+                            res_flags.merge(flags);
+                            levels
+                        };
+                    }
+                }
+            }
         }
 
-        // The combined `tu_y_coded_flag` flag captured into `LeafCuInfo`
-        // is the OR across partitions: the deblocker / chroma-CBF
-        // logic only cares about "did this CU produce any luma
-        // residual".
-        info.tu_y_coded_flag = part_cbfs.iter().any(|&b| b);
-
-        // Trailing per-CU reads (cu_qp_delta_*, cu_chroma_qp_offset_*,
-        // joint_cbcr) — these are only signalled once per CU.
-        let any_cbf = info.tu_y_coded_flag || info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && any_cbf {
-            info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
-            info.cu_qp_delta_read = true;
-        }
-        let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_chroma_qp_offset_enabled && chroma && chroma_cbf {
-            let (flag, idx) = read_cu_chroma_qp_offset(
-                self.dec,
-                &mut self.ctxs.residual,
-                self.tools.chroma_qp_offset_list_len_minus1,
-            )?;
-            info.cu_chroma_qp_offset_flag = flag;
-            info.cu_chroma_qp_offset_idx = idx;
-        }
-        // §7.3.11.10 — tu_joint_cbcr_residual_flag on the ISP path
-        // (ISP CUs are MODE_INTRA); §7.4.12.11 TuCResMode derivation.
-        if self.tools.joint_cbcr_enabled
-            && chroma
-            && ((info.pred_mode == CuPredMode::Intra && chroma_cbf)
-                || (info.tu_cb_coded_flag && info.tu_cr_coded_flag))
-        {
-            info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
-                self.dec,
-                &mut self.ctxs.residual,
-                info.tu_cb_coded_flag,
-                info.tu_cr_coded_flag,
-            )?;
-        }
+        // The combined `tu_y_coded_flag` captured into `LeafCuInfo` is
+        // the OR across partitions: the deblocker / chroma-CBF logic
+        // only cares about "did this CU produce any luma residual".
+        info.tu_y_coded_flag = any_cbf_y;
         info.tu_c_res_mode = derive_tu_c_res_mode(
             info.tu_joint_cbcr_residual_flag,
             info.tu_cb_coded_flag,
             info.tu_cr_coded_flag,
         );
 
-        // Chroma residuals (single-pass at the CU level — chroma is
-        // not split for ISP per eqs. 251 – 254).
-        if info.tu_cb_coded_flag && chroma {
-            let cw = (cb_w / sub_w) as usize;
-            let ch = (cb_h / sub_h) as usize;
-            if cw >= 2 && ch >= 2 {
-                residual.cb_levels = decode_tb_coefficients_opts(
-                    self.dec,
-                    &mut self.ctxs.residual,
-                    cw,
-                    ch,
-                    1,
-                    self.tools.rc_opts,
-                )?
-                .0;
-            }
-        }
-        if info.tu_cr_coded_flag
-            && chroma
-            && !(info.tu_cb_coded_flag && info.tu_joint_cbcr_residual_flag)
-        {
-            let cw = (cb_w / sub_w) as usize;
-            let ch = (cb_h / sub_h) as usize;
-            if cw >= 2 && ch >= 2 {
-                residual.cr_levels = decode_tb_coefficients_opts(
-                    self.dec,
-                    &mut self.ctxs.residual,
-                    cw,
-                    ch,
-                    2,
-                    self.tools.rc_opts,
-                )?
-                .0;
-            }
-        }
-
         residual.luma_subparts = sub_records;
+
+        // §7.3.11.5 — `lfnst_idx` follows `transform_tree()` on ISP
+        // CUs too: the presence gate scales the CB dims by the split
+        // (`lfnstWidth = cbWidth / NumIntraSubPartitions` for
+        // ISP_VER_SPLIT, height analogously) and the `LfnstDcOnly`
+        // term is bypassed (`IntraSubPartitionsSplitType !=
+        // ISP_NO_SPLIT || LfnstDcOnly == 0`). r440 conformance fix:
+        // this read was previously missing entirely on the ISP path.
+        self.read_lfnst_idx(info, &res_flags)?;
+        // §7.3.11.5 — `mts_idx` is never present on an ISP CU (its
+        // gate requires ISP_NO_SPLIT); the call keeps the inference.
+        self.read_mts_idx(info, &res_flags)?;
         Ok(())
     }
 
