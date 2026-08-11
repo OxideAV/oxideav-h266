@@ -77,7 +77,22 @@ pub struct DeblockCu {
     /// every filtered sample on a palette-coded side: the deblocker
     /// reads across the edge but never modifies palette samples.
     pub plt: bool,
+    /// r440 — §8.8.3.6.4 per-component chroma QPs for the eq. 1343
+    /// average: `[QpCb, QpCr, QpCbCr]` of the TB, each the
+    /// ChromaQpTable-mapped `QpY` plus the PPS / SH / CU additive
+    /// offsets (i.e. `Qp′X − QpBdOffset`). The sentinel
+    /// `[i32::MIN; 3]` selects the legacy identity arm
+    /// (`QpY + plane qp_offset`) used by the encoder-side designs and
+    /// harnesses, whose SPS derives an identity chroma-QP table.
+    pub qp_c: [i32; 3],
+    /// r440 — `TuCResMode == 2` for the CU's chroma TB: §8.8.3.6.4
+    /// reads `Qp′CbCr` for both components.
+    pub joint_cbcr2: bool,
 }
+
+/// Sentinel for [`DeblockCu::qp_c`] — take the legacy
+/// `QpY + qp_offset` identity arm.
+pub const DEBLOCK_QP_C_LEGACY: [i32; 3] = [i32::MIN; 3];
 
 /// Offsets and disable flags that govern the deblock pass.
 ///
@@ -701,8 +716,22 @@ fn compute_thresholds_chroma(
     q: &DeblockCu,
     b_s: i32,
 ) -> (i32, i32, i32) {
-    let qp_p = (p.qp_y + plane.qp_offset).clamp(0, 63);
-    let qp_q = (q.qp_y + plane.qp_offset).clamp(0, 63);
+    // §8.8.3.6.4 — QpP / QpQ are the per-component chroma QPs of the
+    // TBs containing p0,0 / q0,0 (`Qp′CbCr` when the TB's
+    // `TuCResMode == 2`, else `Qp′Cb` / `Qp′Cr` by cIdx), taken in the
+    // `− QpBdOffset` domain per eq. 1343. Records carrying the legacy
+    // sentinel fall back to the identity `QpY + qp_offset` arm.
+    let pick = |c: &DeblockCu| -> i32 {
+        if c.qp_c[0] == i32::MIN {
+            (c.qp_y + plane.qp_offset).clamp(0, 63)
+        } else if c.joint_cbcr2 {
+            c.qp_c[2]
+        } else {
+            c.qp_c[(plane.c_idx as usize).saturating_sub(1).min(1)]
+        }
+    };
+    let qp_p = pick(p);
+    let qp_q = pick(q);
     let qp_c = (qp_p + qp_q + 1) >> 1;
     let q_beta = (qp_c + (plane.beta_offset_div2 << 1)).clamp(0, 63);
     let beta_p = beta_prime(q_beta);
@@ -1677,6 +1706,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
             DeblockCu {
@@ -1691,6 +1722,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
         ];
@@ -1731,6 +1764,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
             DeblockCu {
@@ -1745,6 +1780,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
         ];
@@ -1792,6 +1829,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
             DeblockCu {
@@ -1806,6 +1845,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
         ];
@@ -1837,6 +1878,8 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+            joint_cbcr2: false,
             plt: false,
         };
         let cu_medium = DeblockCu { w: 16, ..cu_small };
@@ -1869,6 +1912,8 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+            joint_cbcr2: false,
             plt: false,
         };
         let cu_16 = DeblockCu { w: 16, ..cu_8 };
@@ -1909,6 +1954,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
             DeblockCu {
@@ -1923,6 +1970,8 @@ mod tests {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             },
         ];
@@ -1959,6 +2008,8 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+            joint_cbcr2: false,
             plt: false,
         }
     }
@@ -2105,6 +2156,8 @@ mod tests {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+            joint_cbcr2: false,
             plt: false,
         }];
         let params = DeblockParams {

@@ -2292,6 +2292,49 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
     /// r418 — commit a CU's derived `QpY` into the per-4x4 map (the
     /// §8.7.1 qPY_A / qPY_B source for later QGs).
+    /// r440 — §8.8.3.6.4 per-component chroma deblock QPs for a CU's
+    /// [`DeblockCu`] record: `[QpCb, QpCr, QpCbCr]` in the eq. 1343
+    /// `Qp′X − QpBdOffset` domain — the ChromaQpTable-mapped `qp_y`
+    /// plus the §8.7.1 eqs. 1147 / 1148 PPS / SH / CU additive offsets
+    /// (per-component lists for Cb / Cr, the joint list for CbCr).
+    fn deblock_chroma_qps(&self, qp_y: i32, cu_offset_flag: bool, cu_offset_idx: u32) -> [i32; 3] {
+        let mut out = [0i32; 3];
+        for c_idx in 1u32..=2 {
+            let cu_off = cu_chroma_qp_offset(
+                c_idx,
+                cu_offset_flag,
+                cu_offset_idx,
+                &self.pps.pps_cb_qp_offset_list,
+                &self.pps.pps_cr_qp_offset_list,
+            );
+            let off = chroma_qp_offset_sum(
+                c_idx,
+                self.pps.pps_cb_qp_offset,
+                self.pps.pps_cr_qp_offset,
+                self.sh.sh_cb_qp_offset,
+                self.sh.sh_cr_qp_offset,
+                cu_off,
+            );
+            out[(c_idx - 1) as usize] = chroma_qp_mapped(self.sps, c_idx as usize - 1, qp_y, off);
+        }
+        let joint_cu = if cu_offset_flag {
+            self.pps
+                .pps_joint_cbcr_qp_offset_list
+                .get(cu_offset_idx as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        out[2] = chroma_qp_mapped(
+            self.sps,
+            2,
+            qp_y,
+            self.pps.pps_joint_cbcr_qp_offset_value + self.sh.sh_joint_cbcr_qp_offset + joint_cu,
+        );
+        out
+    }
+
     fn commit_qp_y(&mut self, x0: u32, y0: u32, w: u32, h: u32, qp_y: i32) {
         let x1 = ((x0 + w).div_ceil(4)).min(self.intra_grid_w);
         let y1 = ((y0 + h).div_ceil(4)).min(self.intra_grid_h);
@@ -3978,6 +4021,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         .with_tree_type(TreeType::DualTreeChroma)
                         .with_palette_predictor(&mut self.palette_pred);
                     reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
+                    // §8.7.1 — for a DUAL_TREE_CHROMA CU, `QpY` is the
+                    // luma quantization parameter of the luma CU
+                    // covering the CB-centre luma location
+                    // `(xCb + cbWidth / 2, yCb + cbHeight / 2)` (the
+                    // luma tree of this node committed its per-4x4
+                    // QpY map before the chroma tree walks). Encoding
+                    // it as a delta against the slice QP lets every
+                    // downstream `SliceQpY + cu_qp_delta_val` site
+                    // (chroma dequant, deblock records) read the
+                    // spec's QpY without new plumbing. r440
+                    // conformance fix: the chroma tree previously
+                    // dequantised at the plain slice QP, which
+                    // diverges whenever the collocated luma QG carried
+                    // a `cu_qp_delta`.
+                    let qp_y_center = {
+                        let cx = ((ccu.cu.x + ccu.cu.w / 2) / 4).min(self.intra_grid_w - 1);
+                        let cy = ((ccu.cu.y + ccu.cu.h / 2) / 4).min(self.intra_grid_h - 1);
+                        self.qp_y_map[(cy * self.intra_grid_w + cx) as usize]
+                    };
+                    info.cu_qp_delta_val = qp_y_center - self.cabac.slice_qp_y.0;
                     (info, residual)
                 };
                 cus.push(ccu);
@@ -4322,6 +4385,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: info.intra_bdpcm_chroma,
+            qp_c: self.deblock_chroma_qps(
+                qp_y.clamp(0, 63),
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         Ok(())
@@ -4446,6 +4515,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: self.deblock_chroma_qps(
+                    qp_y.clamp(0, 63),
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                ),
+                joint_cbcr2: info.tu_c_res_mode == 2,
                 plt: true,
             });
             return Ok(());
@@ -4467,6 +4542,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y.clamp(0, 63),
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: true,
         });
         self.write_intra_block(x0, y0, cu.cu.w, cu.cu.h, false);
@@ -4672,6 +4753,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 tu_cr_coded: info.tu_cr_coded_flag,
                 bdpcm_luma: info.intra_bdpcm_luma,
                 bdpcm_chroma: false,
+                qp_c: self.deblock_chroma_qps(
+                    qp_y.clamp(0, 63),
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                ),
+                joint_cbcr2: info.tu_c_res_mode == 2,
                 plt: false,
             });
             self.write_intra_block(
@@ -4992,6 +5079,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: info.intra_bdpcm_luma,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y.clamp(0, 63),
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         // Round-28 §8.5.6.7 — record this CU's prediction mode in the
@@ -5207,6 +5300,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y,
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         self.write_intra_block(x_cb, y_cb, cb_w, cb_h, false);
@@ -6180,6 +6279,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y,
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         // Round-28 §8.5.6.7 — inter CUs record MODE_INTER in the
@@ -7870,6 +7975,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y,
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
@@ -8209,6 +8320,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y,
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
@@ -9234,6 +9351,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y.clamp(0, 63),
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
         });
         self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);

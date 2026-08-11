@@ -17,7 +17,11 @@ fn main() {
     for nal in iter_annex_b(&bs) {
         if nal.header.nal_unit_type == NalUnitType::SpsNut {
             let sps = parse_sps(&extract_rbsp(nal.payload())).unwrap();
-            println!("{name}: {:#?}", sps.tool_flags);
+            println!(
+                "{name}: ctu_size={} {:#?}",
+                1u32 << (sps.sps_log2_ctu_size_minus5 + 5),
+                sps.tool_flags
+            );
             println!("partition: {:#?}", sps.partition_constraints);
             return;
         }

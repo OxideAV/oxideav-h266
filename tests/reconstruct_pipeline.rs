@@ -300,6 +300,8 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: oxideav_h266::deblock::DEBLOCK_QP_C_LEGACY,
+            joint_cbcr2: false,
             plt: false,
         },
         DeblockCu {
@@ -314,6 +316,8 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             tu_cr_coded: false,
             bdpcm_luma: false,
             bdpcm_chroma: false,
+            qp_c: oxideav_h266::deblock::DEBLOCK_QP_C_LEGACY,
+            joint_cbcr2: false,
             plt: false,
         },
     ];

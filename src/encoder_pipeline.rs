@@ -2321,6 +2321,8 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 tu_cr_coded: false,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: true,
             });
         }
@@ -2339,6 +2341,8 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 tu_cr_coded: cbf_cr,
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
+                qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
+                joint_cbcr2: false,
                 plt: false,
             });
         }
