@@ -580,7 +580,7 @@ at the edges, coded boundary BT, implicit-BT `depthOffset`,
 implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
 decode end-to-end.
 
-## JVET conformance triage (r434, re-triaged r437)
+## JVET conformance triage (r434, re-triaged r437 / r440)
 
 The staged JVET FDIS-r1 conformance corpus (56 official bitstreams,
 `docs/video/h266/conformance/` in the workspace) now runs through a
@@ -623,18 +623,58 @@ eq. 1141 / 1144 clips and TS floor in `DequantParams`), the
 eqs. 1135 – 1139 JCCR qP selection (joint QP only for TuCResMode 2),
 and §8.8.3 chroma deblocking (chroma-tree edge records on dual-tree
 slices per §8.8.3.2, and the §8.8.3.1 chroma 8×8-grid exclusion in
-chroma-sample units). Scorecard: `CodingToolsSets_A_2` decodes its
-full **luma plane byte-exactly** (both pictures; a CCLM chroma
-divergence remains), its 10-bit twin `CodingToolsSets_C_2` is
-bin-exact with the same remaining class, 8 streams gate on named
-tools (subpictures, 4:2:2 / 4:4:4, explicit weighted prediction,
-intra multi-TB tiling), and the remaining 46 — which now all decode
-pictures (previously hard-gated on 10-bit) — share a CTC-toolset
-desync family (first divergence is a localized ±1 reconstruction
-drift that later shifts the parse; per-stream notes in the tracked
-baseline). `examples/triage_dbg` decodes one corpus stream against
-its `.opl` sidecar with optional plane dumps for oracle diffing. The
-corpus triage remains the priority pick list.
+chroma-sample units).
+
+**r440 — the "CTC-toolset desync family" (46 streams) is dissolved
+and `CodingToolsSets_A_2` is the first fully byte-exact corpus
+stream.** The family's root causes, found clause-by-clause with
+locally-built single-tool fixture streams (a staged black-box encoder
+produces them, an independent black-box decoder is the oracle, and
+`examples/decode_dump` diffs our planes sample-level):
+
+* Two **publication errata in the 2026-01 (V4) edition**, both pinned
+  by orthogonality + derivation tests from the Recommendation's own
+  printed data: the §8.7.4.5 32-point DST-VII / DCT-VIII
+  `Col16to31` sub-tables print the *top-right kernel block* where
+  eqs. 1190 / 1197 declare output rows 16..31
+  (`DST_VII_32_ROWS_16_31` / `DCT_VIII_32_ROWS_16_31` carry the
+  derived rows), and the §8.7.4.3 LFNST matrices print each 16×16
+  sub-block transposed (the eq. 1176 multiply now indexes them
+  accordingly).
+* **ISP transform units** re-shaped to spec order (`cu_qp_delta`
+  inside the first CBF-positive partition's TU, last-partition chroma
+  reads, chroma TS flags), the previously-missing **ISP `lfnst_idx`**
+  read, per-partition **implicit-MTS / LFNST reconstruction**, and
+  the Table-132 `lfnst_idx` ctxInc tree arm.
+* **Missing single-tree `cclm_mode_flag`**, **MIP / BDPCM transform
+  units** (both arms returned before their TU reads), and the BDPCM
+  §7.4.12.5 transform-skip inference.
+* Dual-tree CTB-128: the §8.4.4 64-grid `CqtDepth` threshold
+  (`CtbLog2SizeY − 6`, not the node-local 0), the §7.3.11.2
+  implicit-QT `cbSubdiv = 2·cqtDepth` seed + CTU-level QG
+  declaration, and the previously parsed-but-dropped §7.3.2.8 PH
+  partition-constraints override.
+* §8.8.3.6.4 chroma deblock QPs (per-TB `Qp′Cb` / `Qp′Cr` /
+  `Qp′CbCr` via the ChromaQpTable, eq. 1343), the §8.7.1 dual-tree
+  chroma `QpY` (collocated-centre luma CU), and the §8.4.5.2.14 CCLM
+  neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
+  their 4-point model from oversampled positions).
+
+Scorecard (r437 → r440): 0 P / 2 F / 8 U / 46 E → **1 PASS / 7 FAIL /
+26 UNSUPPORTED / 22 ERROR**. The 7 FAIL streams decode end-to-end
+with localized plane divergences (`RAP_A_1`, `MTS_A_4`, `MIP_A_3`,
+`LFNST_A_4`, `ALF_C_3`, `CCLM_A_2`, `CodingToolsSets_C_2` — the
+10-bit twin's second picture carries a 10-bit-specific class), the 26
+UNSUPPORTED rows are precise named feature gates (affine non-merge
+reconstruction in the stream walker, inter residual multi-TB tiling,
+per-slice loop-filter divergence, subpictures, 4:2:2 / 4:4:4,
+explicit weighted prediction), and the 22 ERROR rows are later
+(mostly inter-picture) desyncs still under triage. `examples/
+triage_dbg` decodes one corpus stream against its `.opl` sidecar with
+optional plane dumps; `examples/sps_dump` prints a stream's SPS
+tool-flag set; `H266_DBG_TB` / `H266_DBG_CCLM` / `H266_DBG_CU` dump
+per-CU pipeline state. The corpus triage remains the priority pick
+list.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
