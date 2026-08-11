@@ -627,7 +627,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("BDPCM_A_2", 'E'),           // desync (under triage)
     ("CCLM_A_2", 'F'),            // decodes fully; CCLM sample-level class
     ("CST_A_4", 'E'),             // desync (under triage)
-    ("CodingToolsSets_A_2", 'F'), // LUMA byte-exact; CCLM chroma sample-level class
+    ("CodingToolsSets_A_2", 'P'), // r440 — the first fully byte-exact corpus stream
     ("CodingToolsSets_B_2", 'E'), // inter-picture desync (no SAO/ALF/LMCS)
     ("CodingToolsSets_C_2", 'F'), // 10-bit twin of A_2 — same remaining class
     ("CodingToolsSets_D_2", 'E'), // desync surfaces as a spurious IBC BV-conformance error

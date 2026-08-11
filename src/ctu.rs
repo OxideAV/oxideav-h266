@@ -181,8 +181,15 @@ fn cclm_chroma_neighbours(
     let plane_h = plane.height;
     // Top side.
     let top: Vec<i16> = if above_avail {
+        // §8.4.5.2.14 — the neighbour array only reaches
+        // `p[0..2*nTbW − 1][−1]`: the numTopRight probe runs
+        // `x = nTbW..2*nTbW − 1`, so at most nTbW extension cells
+        // exist (eq. 361's `Min(numTopRight, nTbH)` then caps the
+        // *use*, inside `predict_cclm`). r440 conformance fix: this
+        // collected up to `nTbW + nTbH` cells, over-extending the
+        // pick range on tall TBs (nTbH > nTbW).
         let want = match mode {
-            INTRA_T_CCLM => n_tb_w + n_tb_h,
+            INTRA_T_CCLM => 2 * n_tb_w,
             _ => n_tb_w,
         };
         // The §8.4.5.2.14 numTopRight loop probes §6.4.4 availability
@@ -214,8 +221,11 @@ fn cclm_chroma_neighbours(
     };
     // Left side.
     let left: Vec<i16> = if left_avail {
+        // Mirror of the top-side bound: `p[−1][−1..2*nTbH − 1]` — the
+        // numLeftBelow probe runs `y = nTbH..2*nTbH − 1` (at most nTbH
+        // extension cells; eq. 362 caps the use by nTbW).
         let want = match mode {
-            INTRA_L_CCLM => n_tb_h + n_tb_w,
+            INTRA_L_CCLM => 2 * n_tb_h,
             _ => n_tb_h,
         };
         let max_y = plane_h.saturating_sub(y0);

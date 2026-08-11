@@ -275,6 +275,20 @@ pub fn predict_cclm(inp: &CclmInputs<'_>) -> Result<Vec<i16>> {
     // Step 7 — derive (a, b, k).
     let (a, b, k) = derive_a_b_k(min_y, max_y, min_c, max_c);
 
+    // Debug aid (`H266_DBG_CCLM=x,y` in chroma sample coords): dump
+    // the model inputs + coefficients for the CB at that origin.
+    if let Ok(v) = std::env::var("H266_DBG_CCLM") {
+        let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+        if want.len() == 2 && inp.x_tb_c == want[0] && inp.y_tb_c == want[1] {
+            eprintln!(
+                "CCLM ({},{}) {}x{} mode={} ctu_boundary={} top_len={} left_len={} numSampT={num_samp_t} numSampL={num_samp_l} picksT={pick_pos_t:?} picksL={pick_pos_l:?} selDsY={p_sel_dsy:?} selC={p_sel_c:?} minY={min_y} maxY={max_y} minC={min_c} maxC={max_c} a={a} b={b} k={k}",
+                inp.x_tb_c, inp.y_tb_c, n_tb_w, n_tb_h, inp.mode, inp.b_ctu_boundary,
+                inp.neigh_top_chroma.len(), inp.neigh_left_chroma.len(),
+            );
+            eprintln!("CCLM pDsY row0: {:?}", &p_ds_y[..n_tb_w.min(16)]);
+        }
+    }
+
     // Step 8 — generate the prediction (eq. 404).
     let lo = 0i32;
     let hi = (1i32 << inp.bit_depth) - 1;
