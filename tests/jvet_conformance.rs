@@ -645,7 +645,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("DMVR_B_4", 'F'),            // 10 of 11 pictures byte-exact since r443
     ("GDR_A_2", 'E'),             // desync (under triage)
     ("GPM_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("IBC_A_2", 'E'),             // IBC BV derivation (under triage)
+    ("IBC_A_2", 'U'),             // inter residual multi-TB tiling (r443: IBC parse fixed)
     ("ISP_A_3", 'F'),             // decodes fully; plane divergence (under triage)
     ("JCCR_A_2", 'E'),            // desync (under triage)
     ("JCCR_C_3", 'U'),            // inter residual multi-TB tiling

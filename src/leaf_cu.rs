@@ -2188,15 +2188,25 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         cu_skip: bool,
     ) -> Result<()> {
         info.pred_mode = CuPredMode::Ibc;
-        let init_type_offset = (self.ctxs.init_type as usize) * 3;
+        // §8.4.3 / §8.7.4.1 eq. 1157 — a collocated MODE_IBC (or
+        // MODE_PLT) luma position substitutes INTRA_DC into the chroma
+        // DM / LFNST mode derivations; carry it on the parse-time
+        // luma-mode grid like the palette arm does (r443 fix — the
+        // grid previously read INTRA_PLANAR over IBC CUs, mis-deriving
+        // every DM chroma CU collocated with an IBC block).
+        info.intra_pred_mode_y = INTRA_DC;
         let general_merge = if cu_skip {
             true
         } else {
+            // Table 82 — ONE ctx per initType (index `initType + inc`,
+            // not the 3-per-type stride of cu_skip; r443 fix — P
+            // slices previously landed on the B column via the cap).
             let inc = ctx_inc_general_merge_flag() as usize;
             let n = self.ctxs.general_merge_flag.len() - 1;
-            self.dec.decode_decision(
-                &mut self.ctxs.general_merge_flag[(init_type_offset + inc).min(n)],
-            )? == 1
+            let slot = (self.ctxs.init_type as usize + inc).min(n);
+            self.dec
+                .decode_decision(&mut self.ctxs.general_merge_flag[slot])?
+                == 1
         };
         info.inter.general_merge_flag = general_merge;
         let max_ibc = self.tools.max_num_ibc_merge_cand;
@@ -2351,9 +2361,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // §7.3.11.5 inter else-branch: if !cu_skip_flag, read
         // general_merge_flag. Otherwise infer it to 1.
         let general_merge_flag = if !cu_skip {
+            // Table 82 — ONE ctx per initType (r443 fix, see the
+            // I-slice IBC arm above).
             let inc = ctx_inc_general_merge_flag() as usize;
             let n = self.ctxs.general_merge_flag.len() - 1;
-            let ctx_idx = (init_type_offset + inc).min(n);
+            let ctx_idx = (self.ctxs.init_type as usize + inc).min(n);
             let bit = self
                 .dec
                 .decode_decision(&mut self.ctxs.general_merge_flag[ctx_idx])?;
@@ -3791,9 +3803,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         };
 
         // §7.3.11.10 — chroma CBFs (Cb then Cr) precede the luma CBF.
-        // `chromaAvailable` is true for SINGLE_TREE + non-monochrome +
-        // ISP_NO_SPLIT.
-        let chroma_available = chroma;
+        // `chromaAvailable = treeType != DUAL_TREE_LUMA &&
+        // sps_chroma_format_idc != 0` (ISP never applies to an inter /
+        // IBC CU). r443 fix: an IBC CU on the DUAL_TREE_LUMA walk has
+        // no chroma — the reader consumed two spurious chroma-CBF bins
+        // per coded dual-luma IBC CU (and mis-gated the luma CBF),
+        // desyncing every dual-tree wire whose IBC CUs carry residuals.
+        let chroma_available = chroma && self.tree != TreeType::DualTreeLuma;
         if chroma_available {
             info.tu_cb_coded_flag = read_tu_cb_coded_flag(
                 self.dec,
@@ -7772,7 +7788,7 @@ mod tests {
         // general_merge_flag(1).
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
-        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        let gm_slot = (init_type as usize + gm_inc).min(gm_n);
         enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
             .unwrap();
 
@@ -7848,7 +7864,7 @@ mod tests {
 
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
-        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        let gm_slot = (init_type as usize + gm_inc).min(gm_n);
         enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
             .unwrap();
 
@@ -7920,7 +7936,7 @@ mod tests {
             .unwrap();
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
-        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        let gm_slot = (init_type as usize + gm_inc).min(gm_n);
         enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
             .unwrap();
         enc.encode_terminate(1).unwrap();
@@ -7976,7 +7992,7 @@ mod tests {
             .unwrap();
         let gm_inc = ctx_inc_general_merge_flag() as usize;
         let gm_n = ctxs.general_merge_flag.len() - 1;
-        let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+        let gm_slot = (init_type as usize + gm_inc).min(gm_n);
         enc.encode_decision(&mut ctxs.general_merge_flag[gm_slot], 1)
             .unwrap();
         enc.encode_terminate(1).unwrap();
@@ -9208,8 +9224,12 @@ mod tests {
             .unwrap();
         let inc = ctx_inc_general_merge_flag() as usize;
         let n = ctxs.general_merge_flag.len() - 1;
-        enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
-            .unwrap();
+        // Table 82 — ONE ctx per initType (r443).
+        enc.encode_decision(
+            &mut ctxs.general_merge_flag[(ctxs.init_type as usize + inc).min(n)],
+            0,
+        )
+        .unwrap();
         encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -4, y: 0 }).unwrap();
         encode_mvp_lx_flag(&mut enc, &mut ctxs, 1).unwrap();
         // (no amvr_precision_idx — amvr disabled in tools)
@@ -9384,8 +9404,12 @@ mod tests {
         .unwrap();
         let inc = ctx_inc_general_merge_flag() as usize;
         let n = ctxs.general_merge_flag.len() - 1;
-        enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
-            .unwrap();
+        // Table 82 — ONE ctx per initType (r443).
+        enc.encode_decision(
+            &mut ctxs.general_merge_flag[(ctxs.init_type as usize + inc).min(n)],
+            0,
+        )
+        .unwrap();
         // ---- L0 block, spec order (NumRefIdxActive[0] = 2) ----
         encode_ref_idx_lx(&mut enc, &mut ctxs, 1, 2).unwrap();
         encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: 3, y: -1 }).unwrap();
@@ -9465,8 +9489,12 @@ mod tests {
         .unwrap();
         let inc = ctx_inc_general_merge_flag() as usize;
         let n = ctxs.general_merge_flag.len() - 1;
-        enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
-            .unwrap();
+        // Table 82 — ONE ctx per initType (r443).
+        enc.encode_decision(
+            &mut ctxs.general_merge_flag[(ctxs.init_type as usize + inc).min(n)],
+            0,
+        )
+        .unwrap();
         encode_inter_pred_idc(&mut enc, &mut ctxs, InterPredDir::PredBi, 16, 16).unwrap();
         // L0 block (NumRefIdxActive[0] = 1 → no ref_idx bin).
         encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -2, y: 0 }).unwrap();

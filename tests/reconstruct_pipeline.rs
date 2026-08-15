@@ -2197,7 +2197,8 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     //    same formula so we land on the identical context.
     let gm_inc = ctx_inc_general_merge_flag() as usize;
     let gm_n = general_merge_ctxs.len() - 1;
-    let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+    // Table 82 — ONE ctx per initType (r443).
+    let gm_slot = (init_type as usize + gm_inc).min(gm_n);
     enc.encode_decision(&mut general_merge_ctxs[gm_slot], 1)
         .unwrap();
 
@@ -2571,7 +2572,8 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     // 3. general_merge_flag(1).
     let gm_inc = ctx_inc_general_merge_flag() as usize;
     let gm_n = general_merge_ctxs.len() - 1;
-    let gm_slot = ((init_type as usize) * 3 + gm_inc).min(gm_n);
+    // Table 82 — ONE ctx per initType (r443).
+    let gm_slot = (init_type as usize + gm_inc).min(gm_n);
     enc.encode_decision(&mut general_merge_ctxs[gm_slot], 1)
         .unwrap();
 
@@ -3890,8 +3892,12 @@ fn decode_p_slice_ibc_cu_copies_inter_ctu() {
     // general_merge_flag(0) → the IBC AMVP arm.
     let inc = ctx_inc_general_merge_flag() as usize;
     let n = ctxs.general_merge_flag.len() - 1;
-    enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
-        .unwrap();
+    // Table 82 — ONE ctx per initType (r443).
+    enc.encode_decision(
+        &mut ctxs.general_merge_flag[(init_type as usize + inc).min(n)],
+        0,
+    )
+    .unwrap();
     encode_mvd_coding(&mut enc, &mut ctxs, MotionVector { x: -32, y: 0 }).unwrap();
     encode_mvp_lx_flag(&mut enc, &mut ctxs, 0).unwrap();
     // (no amvr_precision_idx — sps_amvr_enabled_flag = 0)
@@ -4175,8 +4181,12 @@ fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
     .unwrap();
     let inc = ctx_inc_general_merge_flag() as usize;
     let n = ctxs.general_merge_flag.len() - 1;
-    enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
-        .unwrap();
+    // Table 82 — ONE ctx per initType (r443).
+    enc.encode_decision(
+        &mut ctxs.general_merge_flag[(init_type as usize + inc).min(n)],
+        0,
+    )
+    .unwrap();
     // L0 block: NumRefIdxActive[0] = 1 → no ref_idx bin; MvdL0 =
     // (16, 0) quarter-luma = a 4-px right... (AmvrShift 2: 16 << 2 =
     // 64 sixteenth-luma = 4 px); mvp_l0_flag(0) (zero-pad predictor).
@@ -4284,8 +4294,12 @@ fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
     .unwrap();
     let inc = ctx_inc_general_merge_flag() as usize;
     let n = ctxs.general_merge_flag.len() - 1;
-    enc.encode_decision(&mut ctxs.general_merge_flag[(init_off + inc).min(n)], 0)
-        .unwrap();
+    // Table 82 — ONE ctx per initType (r443).
+    enc.encode_decision(
+        &mut ctxs.general_merge_flag[(init_type as usize + inc).min(n)],
+        0,
+    )
+    .unwrap();
     // inter_pred_idc = PRED_BI (two-bin form at 16+16 > 12).
     encode_inter_pred_idc(&mut enc, &mut ctxs, InterPredDir::PredBi, 16, 16).unwrap();
     // L0 block: no ref_idx bin (1 active), zero MVD, mvp_l0(0).
