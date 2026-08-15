@@ -580,7 +580,7 @@ at the edges, coded boundary BT, implicit-BT `depthOffset`,
 implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
 decode end-to-end.
 
-## JVET conformance triage (r434, re-triaged r437 / r440)
+## JVET conformance triage (r434, re-triaged r437 / r440 / r443)
 
 The staged JVET FDIS-r1 conformance corpus (56 official bitstreams,
 `docs/video/h266/conformance/` in the workspace) now runs through a
@@ -632,15 +632,15 @@ locally-built single-tool fixture streams (a staged black-box encoder
 produces them, an independent black-box decoder is the oracle, and
 `examples/decode_dump` diffs our planes sample-level):
 
-* Two **publication errata in the 2026-01 (V4) edition**, both pinned
-  by orthogonality + derivation tests from the Recommendation's own
-  printed data: the §8.7.4.5 32-point DST-VII / DCT-VIII
-  `Col16to31` sub-tables print the *top-right kernel block* where
-  eqs. 1190 / 1197 declare output rows 16..31
-  (`DST_VII_32_ROWS_16_31` / `DCT_VIII_32_ROWS_16_31` carry the
-  derived rows), and the §8.7.4.3 LFNST matrices print each 16×16
-  sub-block transposed (the eq. 1176 multiply now indexes them
-  accordingly).
+* **Publication errata in the 2026-01 (V4) edition**, pinned by
+  orthogonality + derivation tests from the Recommendation's own
+  printed data: the §8.7.4.3 LFNST matrices print each 16×16
+  sub-block transposed (the eq. 1176 multiply indexes them
+  accordingly), and — as r443 established — EVERY §8.7.4.5 MTS table
+  body is printed the same way (`transMatrix[m][n]` declared with `m`
+  the transformed-sample index while the printed rows carry `n`); the
+  statics stay byte-for-byte as printed and the eq. 1177 / 1178
+  multiplies index them transposed.
 * **ISP transform units** re-shaped to spec order (`cu_qp_delta`
   inside the first CBF-positive partition's TU, last-partition chroma
   reads, chroma TS flags), the previously-missing **ISP `lfnst_idx`**
@@ -660,21 +660,51 @@ produces them, an independent black-box decoder is the oracle, and
   neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
   their 4-point model from oversampled positions).
 
-Scorecard (r437 → r440): 0 P / 2 F / 8 U / 46 E → **1 PASS / 7 FAIL /
-26 UNSUPPORTED / 22 ERROR**. The 7 FAIL streams decode end-to-end
-with localized plane divergences (`RAP_A_1`, `MTS_A_4`, `MIP_A_3`,
-`LFNST_A_4`, `ALF_C_3`, `CCLM_A_2`, `CodingToolsSets_C_2` — the
-10-bit twin's second picture carries a 10-bit-specific class), the 26
-UNSUPPORTED rows are precise named feature gates (affine non-merge
-reconstruction in the stream walker, inter residual multi-TB tiling,
-per-slice loop-filter divergence, subpictures, 4:2:2 / 4:4:4,
-explicit weighted prediction), and the 22 ERROR rows are later
-(mostly inter-picture) desyncs still under triage. `examples/
-triage_dbg` decodes one corpus stream against its `.opl` sidecar with
-optional plane dumps; `examples/sps_dump` prints a stream's SPS
-tool-flag set; `H266_DBG_TB` / `H266_DBG_CCLM` / `H266_DBG_CU` dump
-per-CU pipeline state. The corpus triage remains the priority pick
-list.
+Scorecard (r437 → r440 → r443): 0 P / 2 F / 8 U / 46 E →
+1 P / 7 F / 26 U / 22 E → **1 PASS / 14 FAIL / 33 UNSUPPORTED /
+8 ERROR**. r443 dissolved the r440 "22 inter-picture desync" family
+into root causes, each pinned with black-box fixture streams:
+
+* **A third V4 publication-erratum finding that GENERALIZES the r440
+  pair**: every §8.7.4.5 MTS table body is printed transposed
+  relative to the declared `transMatrix[m][n]` layout (the eq. 1179
+  index ranges and the eq. 1183 / 1184 reflections prove it from the
+  printed text alone). The DCT-II path already read the bodies
+  transposed; the eq. 1178 DST-VII multiply did not — every DST-VII
+  TB at every size reconstructed through the transposed kernel
+  (asymptomatic for the symmetric DCT-VIII). The r440-derived
+  32-point "rows 16..31" constants dissolved into the same reading.
+* **§9.3.2.2 initType columns** — every P/B slice previously
+  initialised the coding-tree + residual CABAC context bundles (and
+  the leaf reader's intra-family elements) from the I-slice rows,
+  desyncing on the first inter picture.
+* **§7.3.11.12 TS gtX budget** (once per coefficient, not per flag),
+  the **§7.4.12.5 BDPCM transform-skip inference on the
+  dual-tree-chroma TU path**, the **§7.3.11.10 `chromaAvailable`
+  derivation on the dual-luma IBC path** (+ §8.4.3 INTRA_DC
+  collocated substitution for MODE_IBC, Table 82 general_merge
+  ctxIdx), and the **§8.5.1 eqs. 456 / 457 DMVR sub-block dims**.
+* **§7.3.11.9 multi-TB tiling** — inter AND intra CBs above
+  `MaxTbSizeY` parse per-TU and reconstruct per tile (the §8.4.5.1
+  eq. 248 – 250 per-transform-block intra prediction).
+* **§7.3.11.4 local dual tree (SCIPU)** — `ModeTypeCondition`,
+  `non_inter_flag`, DUAL_TREE_LUMA subtrees and the single
+  DUAL_TREE_CHROMA leaf in the single-tree walker.
+
+The 14 FAIL streams decode end-to-end with localized (mostly ±small,
+10-bit) plane divergences — `DMVR_B_4` is 10 of 11 pictures
+byte-exact and `MIP_A_3` / `CCLM_A_2` are luma-byte-exact with a
+chroma-only class. The 33 UNSUPPORTED rows are named feature gates
+(affine non-merge reconstruction in the stream walker — the largest
+at 14 streams, subpictures, 4:2:2 / 4:4:4, explicit weighted
+prediction, per-slice loop-filter divergence), and the 8 ERROR rows
+are deeper desyncs plus an IBC BV-derivation class under triage.
+`examples/triage_dbg` decodes one corpus stream against its `.opl`
+sidecar with optional plane dumps; `examples/decode_dump` writes
+POC-ordered YUV for fixture diffing; `examples/sps_dump` prints a
+stream's SPS tool-flag set; `H266_DBG_TB` / `H266_DBG_CCLM` /
+`H266_DBG_CU` / `H266_DBG_IBC` dump per-CU pipeline state. The
+corpus triage remains the priority pick list.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
