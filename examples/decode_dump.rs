@@ -12,7 +12,9 @@ fn main() {
     let input = args.next().expect("input .bit path");
     let output = args.next().expect("output .yuv path");
     let bs = std::fs::read(&input).unwrap();
-    let mut raw: Vec<u8> = Vec::new();
+    // (cvs, poc, raw-planes) — sorted into output order at the end so
+    // the dump matches a display-order reference decode byte-for-byte.
+    let mut pics: Vec<(u32, i32, Vec<u8>)> = Vec::new();
     let mut n = 0usize;
     let r = StreamDecoder::new().decode_annex_b(&bs, &mut |pic| {
         if !pic.output_flag {
@@ -26,6 +28,7 @@ fn main() {
             planes.push((&pic.frame.cb, cx / 2, cy / 2, cw / 2, ch / 2));
             planes.push((&pic.frame.cr, cx / 2, cy / 2, cw / 2, ch / 2));
         }
+        let mut raw: Vec<u8> = Vec::new();
         for (p, x0, y0, w, h) in planes {
             for y in y0..y0 + h {
                 for &v in &p.samples[y * p.stride + x0..y * p.stride + x0 + w] {
@@ -37,9 +40,15 @@ fn main() {
                 }
             }
         }
+        pics.push((pic.cvs_idx, pic.poc, raw));
     });
     if let Err(e) = r {
         eprintln!("DECODE ERROR after {n} pictures: {e}");
+    }
+    pics.sort_by_key(|(cvs, poc, _)| (*cvs, *poc));
+    let mut raw: Vec<u8> = Vec::new();
+    for (_, _, p) in &pics {
+        raw.extend_from_slice(p);
     }
     std::fs::write(&output, raw).unwrap();
     eprintln!("wrote {n} pictures to {output}");

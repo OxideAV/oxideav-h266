@@ -610,6 +610,12 @@ pub struct CuToolFlags {
 /// `tu_y_coded_flag == 0` and chroma CBFs are 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeafCuInfo {
+    /// r443 — the §7.3.11.4 `treeType` this CU was parsed under.
+    /// `SingleTree` for the historical walk; `DualTreeLuma` /
+    /// `DualTreeChroma` inside a §7.3.11.4 local dual tree (SCIPU —
+    /// `modeType == MODE_TYPE_INTRA` on a non-dual-tree slice). The
+    /// reconstruct dispatch routes on it.
+    pub tree: TreeType,
     /// Top-left luma x (picture-absolute).
     pub x0: u32,
     /// Top-left luma y (picture-absolute).
@@ -732,6 +738,7 @@ pub struct LeafCuInfo {
 impl Default for LeafCuInfo {
     fn default() -> Self {
         Self {
+            tree: TreeType::SingleTree,
             x0: 0,
             y0: 0,
             cb_width: 0,
@@ -1445,6 +1452,12 @@ pub struct LeafCuReader<'a, 'b> {
     /// (no chroma syntax) and its chroma tree with `DualTreeChroma`
     /// (chroma-only syntax via [`Self::decode_dual_chroma`]).
     tree: TreeType,
+    /// r443 — §7.3.11.4 `modeType` for the CU being parsed
+    /// (0 = MODE_TYPE_ALL, 1 = MODE_TYPE_INTRA, 2 = MODE_TYPE_INTER).
+    /// Drives the §7.3.11.5 prologue presence conditions and the
+    /// §7.4.12.5 inferences inside a local dual tree / inter-only
+    /// subtree.
+    mode_type: u8,
     /// r431 — the slice's running §7.4.12.6 predictor palette. The
     /// §7.3.11.6 reuse loop reads it and the §8.4.5.3 maintenance
     /// (parse-order state — the NEXT palette CU's reuse loop needs it)
@@ -1464,6 +1477,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             ctxs,
             tools,
             tree: TreeType::SingleTree,
+            mode_type: 0,
             palette_pred: None,
         }
     }
@@ -1471,6 +1485,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     /// §7.3.11.4 — select the component tree this reader parses.
     pub fn with_tree_type(mut self, tree: TreeType) -> Self {
         self.tree = tree;
+        self
+    }
+
+    /// r443 — §7.3.11.4 `modeType` for this CU (see [`Self::tree`]'s
+    /// local-dual-tree notes). Defaults to MODE_TYPE_ALL.
+    pub fn with_mode_type(mut self, mode_type: u8) -> Self {
+        self.mode_type = mode_type;
         self
     }
 
@@ -2317,14 +2338,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         neigh: &CuNeighbourhood,
     ) -> Result<()> {
         // §7.3.11.5 cu_skip_flag gate on a P/B slice (treeType is
-        // never DUAL_TREE_CHROMA here; modeType is always
-        // MODE_TYPE_ALL — this walker never enters a local dual tree):
+        // never DUAL_TREE_CHROMA here):
         //   (!(4x4) && modeType != MODE_TYPE_INTRA) ||
         //   (sps_ibc_enabled_flag && cbW <= 64 && cbH <= 64)
         let cb_is_4x4 = info.cb_width == 4 && info.cb_height == 4;
         let ibc_size_ok = self.tools.ibc && info.cb_width <= 64 && info.cb_height <= 64;
         let init_type_offset = (self.ctxs.init_type as usize) * 3;
-        let cu_skip = if !cb_is_4x4 || ibc_size_ok {
+        let cu_skip = if (!cb_is_4x4 && self.mode_type != 1) || ibc_size_ok {
             let inc = ctx_inc_cu_skip_flag(
                 neigh.left_available,
                 neigh.above_available,
@@ -2352,8 +2372,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // below immediately overrides it to MODE_IBC). ctxInc per
         // eq. 1552 samples the parse-time `CuPredMode[0][xNb][yNb] ==
         // MODE_INTRA` committed in coding order.
-        let mode_intra = if !cu_skip && !cb_is_4x4 {
+        let mode_intra = if !cu_skip && !cb_is_4x4 && self.mode_type == 0 {
             self.read_pred_mode_flag(neigh)?
+        } else if self.mode_type != 0 {
+            // §7.4.12.5 — modeType INTRA infers 1, modeType INTER 0.
+            self.mode_type == 1
         } else {
             cb_is_4x4
         };
@@ -2367,7 +2390,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         //   && cbW <= 64 && cbH <= 64 && sps_ibc_enabled_flag
         // §7.4.12.5 inference when absent: skip && 4x4 → 1;
         // 128-wide/-tall → 0; otherwise 0 on a P/B slice.
-        let ibc_gate = ibc_size_ok && (!mode_intra || (cb_is_4x4 && !cu_skip));
+        let ibc_gate = ibc_size_ok
+            && self.mode_type != 2
+            && (!mode_intra || ((cb_is_4x4 || self.mode_type == 1) && !cu_skip));
         let mode_ibc = if ibc_gate {
             let inc = ctx_inc_pred_mode_ibc_flag(
                 neigh.left_available,
@@ -2380,7 +2405,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 &mut self.ctxs.pred_mode_ibc_flag[(init_type_offset + inc).min(n)],
             )? == 1
         } else {
-            cu_skip && cb_is_4x4
+            // §7.4.12.5 — skip && (4x4 || modeType INTRA) infers 1;
+            // modeType INTER infers 0; otherwise 0 on a P/B slice.
+            self.mode_type != 2 && cu_skip && (cb_is_4x4 || self.mode_type == 1)
         };
         if mode_ibc {
             return self.decode_ibc_tail(info, residual, cu_skip);

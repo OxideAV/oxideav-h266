@@ -2817,6 +2817,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cu: &CtuCu,
         neigh: &CuNeighbourhood,
     ) -> Result<(LeafCuInfo, LeafCuResidual)> {
+        self.decode_leaf_cu_syntax_scoped(cu, neigh, TreeType::SingleTree, 0)
+    }
+
+    /// r443 — [`Self::decode_leaf_cu_syntax`] with the §7.3.11.4
+    /// `treeType` / `modeType` the enclosing coding-tree walk resolved
+    /// (`DualTreeLuma` + `MODE_TYPE_INTRA` inside a local dual tree,
+    /// `MODE_TYPE_INTER` in a `non_inter_flag == 0` subtree).
+    pub fn decode_leaf_cu_syntax_scoped(
+        &mut self,
+        cu: &CtuCu,
+        neigh: &CuNeighbourhood,
+        tree: TreeType,
+        mode_type: u8,
+    ) -> Result<(LeafCuInfo, LeafCuResidual)> {
         let mut tools = self.cu_tool_flags();
         // r418 — §7.3.11.4 quantization-group state: a CU whose QG
         // already carried `cu_qp_delta_abs` must not read another one
@@ -2834,10 +2848,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu_qp_delta_val: self.qg_delta_val,
             ..LeafCuInfo::default()
         };
+        info.tree = tree;
         let mut residual = LeafCuResidual::default();
         let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+            .with_tree_type(tree)
+            .with_mode_type(mode_type)
             .with_palette_predictor(&mut self.palette_pred);
         reader.decode(&mut info, &mut residual, neigh)?;
+        info.tree = tree;
         Ok((info, residual))
     }
 
@@ -2869,6 +2887,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if ctu.width_luma == 0 || ctu.height_luma == 0 {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
+        #[derive(Clone)]
         struct Node {
             x: u32,
             y: u32,
@@ -2888,6 +2907,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             /// §7.4.12.4 `depthOffset` — incremented by boundary
             /// implicit BT splits; raises the effective `maxMttDepth`.
             depth_offset: u32,
+            /// r443 — §7.3.11.4 `modeType` (0 = MODE_TYPE_ALL,
+            /// 1 = MODE_TYPE_INTRA, 2 = MODE_TYPE_INTER), set by the
+            /// §7.4.12.4 `ModeTypeCondition` / `non_inter_flag` at the
+            /// enclosing split.
+            mode_type: u8,
+            /// r443 — the subtree walks as DUAL_TREE_LUMA (a local
+            /// dual tree opened by `modeType == MODE_TYPE_INTRA` on a
+            /// MODE_TYPE_ALL parent).
+            dual_luma: bool,
+            /// r443 — marker node: parse ONE DUAL_TREE_CHROMA
+            /// `coding_unit()` covering this SCIPU region (§7.3.11.4 —
+            /// the chroma re-walk allows no splits under
+            /// `modeType == MODE_TYPE_INTRA`, so it is always a single
+            /// leaf).
+            chroma_leaf: bool,
         }
         // r412 — §6.4.1 – §6.4.3 allowed-split constraints from the
         // SPS partition constraints (intra vs inter slice set).
@@ -2929,8 +2963,68 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cb_subdiv: 0,
             qg_on_y: true,
             depth_offset: 0,
+            mode_type: 0,
+            dual_luma: false,
+            chroma_leaf: false,
         }];
         while let Some(n) = stack.pop() {
+            // r443 — §7.3.11.4 local dual tree: after a
+            // `modeType == MODE_TYPE_INTRA` subtree's DUAL_TREE_LUMA
+            // CUs, the SAME region re-walks as DUAL_TREE_CHROMA. All
+            // §6.4.1 – §6.4.3 splits are disallowed there (the
+            // `treeType == DUAL_TREE_CHROMA && modeType ==
+            // MODE_TYPE_INTRA` arms), so no split bin is present and
+            // the region is exactly one chroma `coding_unit()`.
+            if n.chroma_leaf {
+                let ccu = CtuCu {
+                    ctu_addr_rs: ctu.ctu_addr_rs,
+                    cu: Cu {
+                        x: n.x + ctu.x0,
+                        y: n.y + ctu.y0,
+                        w: n.w,
+                        h: n.h,
+                        cqt_depth: n.cqt_depth,
+                        mtt_depth: n.mtt_depth,
+                    },
+                };
+                // §8.4.3 — collocated luma mode at the CB centre (the
+                // region's DUAL_TREE_LUMA CUs committed their modes /
+                // MIP / IBC / palette substitutions in parse order).
+                let dm_mode = self.luma_mode_at(ccu.cu.x + ccu.cu.w / 2, ccu.cu.y + ccu.cu.h / 2);
+                // §8.4.4 — on a slice that is not (I ∧
+                // sps_qtbtt_dual_tree_intra_flag) the CclmEnabled
+                // derivation collapses to the SPS flag.
+                let cclm_enabled = self.sps.tool_flags.cclm_enabled_flag;
+                let tools = self.cu_tool_flags();
+                let mut info = LeafCuInfo {
+                    tree: TreeType::DualTreeChroma,
+                    x0: ccu.cu.x,
+                    y0: ccu.cu.y,
+                    cb_width: ccu.cu.w,
+                    cb_height: ccu.cu.h,
+                    ..LeafCuInfo::default()
+                };
+                let mut residual = LeafCuResidual::default();
+                let mut reader = LeafCuReader::new(&mut self.arith, &mut self.leaf_ctxs, tools)
+                    .with_tree_type(TreeType::DualTreeChroma)
+                    .with_palette_predictor(&mut self.palette_pred);
+                reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
+                info.tree = TreeType::DualTreeChroma;
+                // §8.7.1 — a DUAL_TREE_CHROMA CU's `QpY` is that of
+                // the luma CU covering the CB-centre luma location
+                // (committed to the per-4x4 QpY map by the region's
+                // luma CUs).
+                let qp_y_center = {
+                    let cx = ((ccu.cu.x + ccu.cu.w / 2) / 4).min(self.intra_grid_w - 1);
+                    let cy = ((ccu.cu.y + ccu.cu.h / 2) / 4).min(self.intra_grid_h - 1);
+                    self.qp_y_map[(cy * self.intra_grid_w + cx) as usize]
+                };
+                info.cu_qp_delta_val = qp_y_center - self.cabac.slice_qp_y.0;
+                cus.push(ccu);
+                infos.push(info);
+                residuals.push(residual);
+                continue;
+            }
             // r418 — §7.3.11.4 quantization-group declaration: a node
             // with `qgOnY && cbSubdiv <= CuQpDeltaSubdiv` opens a new
             // QG — `IsCuQpDeltaCoded = 0`, `CuQpDeltaVal = 0`
@@ -2946,7 +3040,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.qg_delta_val = 0;
                 self.qg_qp_y_pred = self.derive_qp_y_pred(ctu.x0 + n.x, ctu.y0 + n.y);
             }
-            let allows = constraints.allows_off(
+            let mut allows = constraints.allows_off(
                 ctu.x0 + n.x,
                 ctu.y0 + n.y,
                 n.w,
@@ -2957,6 +3051,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 n.part_idx,
                 n.depth_offset,
             );
+            // r443 — the §6.4.2 / §6.4.3 `modeType == MODE_TYPE_INTER`
+            // arms: a 32-sample node cannot BT-split and a 64-sample
+            // node cannot TT-split (either would create <16-sample
+            // luma CBs in an inter-only region).
+            if n.mode_type == 2 {
+                if n.w * n.h == 32 {
+                    allows.bt_ver = false;
+                    allows.bt_hor = false;
+                }
+                if n.w * n.h == 64 {
+                    allows.tt_ver = false;
+                    allows.tt_hor = false;
+                }
+            }
             let (
                 left_avail,
                 above_avail,
@@ -3008,7 +3116,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     },
                 };
                 let neigh = self.compute_cu_neighbourhood(&ccu);
-                let (mut info, residual) = self.decode_leaf_cu_syntax(&ccu, &neigh)?;
+                let leaf_tree = if n.dual_luma {
+                    TreeType::DualTreeLuma
+                } else {
+                    TreeType::SingleTree
+                };
+                let (mut info, residual) =
+                    self.decode_leaf_cu_syntax_scoped(&ccu, &neigh, leaf_tree, n.mode_type)?;
                 // r418 — fold the CU's cu_qp_delta outcome back into
                 // the QG state (§7.4.11.8: a read sets
                 // IsCuQpDeltaCoded = 1 and fixes CuQpDeltaVal for the
@@ -3083,6 +3197,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
                         depth_offset: 0,
+                        ..n.clone()
                     },
                     Node {
                         x: n.x + hw,
@@ -3096,6 +3211,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
                         depth_offset: 0,
+                        ..n.clone()
                     },
                     Node {
                         x: n.x,
@@ -3109,6 +3225,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
                         depth_offset: 0,
+                        ..n.clone()
                     },
                     Node {
                         x: n.x + hw,
@@ -3122,6 +3239,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
                         depth_offset: 0,
+                        ..n.clone()
                     },
                 ];
                 all.into_iter()
@@ -3204,6 +3322,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
                                 depth_offset: bt_doff,
+                                ..n.clone()
                             },
                             Node {
                                 x: n.x + hw,
@@ -3217,6 +3336,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
                                 depth_offset: bt_doff,
+                                ..n.clone()
                             },
                         ];
                         if !x1_in {
@@ -3242,6 +3362,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
                                 depth_offset: bt_doff,
+                                ..n.clone()
                             },
                             Node {
                                 x: n.x,
@@ -3255,6 +3376,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
                                 depth_offset: bt_doff,
+                                ..n.clone()
                             },
                         ];
                         if !y1_in {
@@ -3285,6 +3407,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
                                 depth_offset: n.depth_offset,
+                                ..n.clone()
                             },
                             Node {
                                 x: n.x + q,
@@ -3298,6 +3421,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: qg_next,
                                 depth_offset: n.depth_offset,
+                                ..n.clone()
                             },
                             Node {
                                 x: n.x + q * 3,
@@ -3311,6 +3435,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
                                 depth_offset: n.depth_offset,
+                                ..n.clone()
                             },
                         ]
                     } else {
@@ -3328,6 +3453,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
                                 depth_offset: n.depth_offset,
+                                ..n.clone()
                             },
                             Node {
                                 x: n.x,
@@ -3341,6 +3467,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: qg_next,
                                 depth_offset: n.depth_offset,
+                                ..n.clone()
                             },
                             Node {
                                 x: n.x,
@@ -3354,12 +3481,106 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
                                 depth_offset: n.depth_offset,
+                                ..n.clone()
                             },
                         ]
                     }
                 }
             };
-            for child in children.into_iter().rev() {
+            // r443 — §7.4.12.4 `ModeTypeCondition` at the resolved
+            // split, and the §7.3.11.4 `non_inter_flag` /
+            // `modeType` / `treeType` derivation for the children.
+            let mut mode_type = n.mode_type;
+            if n.mode_type == 0
+                && !(self.sh.sh_slice_type == SliceType::I
+                    && self.sps.partition_constraints.qtbtt_dual_tree_intra_flag)
+                && self.sps.sps_chroma_format_idc != 0
+                && self.sps.sps_chroma_format_idc != 3
+            {
+                let area = n.w * n.h;
+                let is_qt = split_qt == 1;
+                let (is_tt, is_ver) = if is_qt {
+                    (false, false)
+                } else if let Some(c0) = children.first() {
+                    (children.len() == 3, c0.h == n.h)
+                } else {
+                    (false, false)
+                };
+                let is_bt = !is_qt && !is_tt;
+                let chroma_420 = self.sps.sps_chroma_format_idc == 1;
+                let cond =
+                    if (area == 64 && is_qt) || (area == 64 && is_tt) || (area == 32 && is_bt) {
+                        1u8
+                    } else if (area == 64 && is_bt && chroma_420)
+                        || (area == 128 && is_tt && chroma_420)
+                        || (n.w == 8 && is_bt && is_ver)
+                        || (n.w == 16 && !is_qt && is_tt && is_ver)
+                    {
+                        if self.sh.sh_slice_type == SliceType::I {
+                            1
+                        } else {
+                            2
+                        }
+                    } else {
+                        0
+                    };
+                mode_type = match cond {
+                    1 => 1,
+                    2 => {
+                        // non_inter_flag — eq. 1552 ctxInc off the
+                        // parse-time MODE_INTRA neighbour grid,
+                        // Table 63 contexts (P at 0..1, B at 2..3 —
+                        // the sliced bundle indexes plainly).
+                        let ccu = CtuCu {
+                            ctu_addr_rs: ctu.ctu_addr_rs,
+                            cu: Cu {
+                                x: n.x + ctu.x0,
+                                y: n.y + ctu.y0,
+                                w: n.w,
+                                h: n.h,
+                                cqt_depth: n.cqt_depth,
+                                mtt_depth: n.mtt_depth,
+                            },
+                        };
+                        let neigh = self.compute_cu_neighbourhood(&ccu);
+                        let inc = crate::ctx::ctx_inc_pred_mode_flag(
+                            neigh.left_available,
+                            neigh.above_available,
+                            neigh.left_intra,
+                            neigh.above_intra,
+                        ) as usize;
+                        let ctxs = &mut self.cabac.tree_ctxs.non_inter;
+                        if ctxs.is_empty() {
+                            return Err(Error::invalid(
+                                "h266 slice_data: non_inter_flag on an I slice",
+                            ));
+                        }
+                        let cap = ctxs.len() - 1;
+                        let bit = self.arith.decode_decision(&mut ctxs[inc.min(cap)])?;
+                        if bit == 1 {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => n.mode_type,
+                };
+                // §7.3.11.4 — a MODE_TYPE_ALL parent whose children
+                // resolve to MODE_TYPE_INTRA re-walks the region as
+                // DUAL_TREE_CHROMA after the (DUAL_TREE_LUMA)
+                // children: push the chroma-leaf marker FIRST so it
+                // pops after every child.
+                if mode_type == 1 {
+                    stack.push(Node {
+                        chroma_leaf: true,
+                        ..n.clone()
+                    });
+                }
+            }
+            let child_dual_luma = mode_type == 1 || n.dual_luma;
+            for mut child in children.into_iter().rev() {
+                child.mode_type = mode_type;
+                child.dual_luma = child_dual_luma;
                 stack.push(child);
             }
         }
@@ -4591,6 +4812,37 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        // r443 — §7.3.11.4 local dual tree (SCIPU): a
+        // DUAL_TREE_CHROMA leaf reconstructs chroma-only through the
+        // dual-chroma path (its region's luma was reconstructed by the
+        // preceding DUAL_TREE_LUMA CUs), and a DUAL_TREE_LUMA leaf
+        // runs the luma-only pipeline with luma-only IBC bookkeeping —
+        // mirroring the §7.3.11.2 dual-tree walk.
+        match info.tree {
+            TreeType::DualTreeChroma => {
+                self.reconstruct_leaf_cu_dual_chroma(cu, info, residual, out)?;
+                self.mark_reconstructed_chroma(cu.cu.x / 2, cu.cu.y / 2, cu.cu.w / 2, cu.cu.h / 2);
+                return Ok(());
+            }
+            TreeType::DualTreeLuma => {
+                if let Some(ibc) = self.ibc.as_mut() {
+                    let vsize = self.layout.ctb_size_y.min(64);
+                    ibc.virbuf
+                        .on_cu_start(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, vsize);
+                }
+                self.reconstruct_leaf_cu_with_tree(
+                    cu,
+                    info,
+                    residual,
+                    out,
+                    TreeType::DualTreeLuma,
+                )?;
+                self.ibc_store_cu(cu, out, false);
+                self.mark_reconstructed_luma(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h);
+                return Ok(());
+            }
+            TreeType::SingleTree => {}
+        }
         // Round-406 — §7.4.12.5 IbcVirBuf maintenance runs per
         // `coding_unit()` in decode order for EVERY prediction mode:
         // eq. 181 applies a pending `ResetIbcBuf`, eq. 182 invalidates
@@ -5709,8 +5961,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     // applies (the CU-wide MvField is the pre-DMVR
                     // candidate); the per-sub-block refined pairs are
                     // recorded for `motion_field_for_temporal`.
-                    let sb_w = 16u32;
-                    let sb_h = 16u32;
+                    // §8.5.1 eqs. 456 / 457 — sbWidth = cbWidth /
+                    // numSbX (16 only when the dimension exceeds 16;
+                    // an 8-sample dimension keeps its 8 — r443 fix:
+                    // the hard-coded 16 overran the picture at
+                    // bottom-edge 16x8 / 8x16 DMVR CUs).
+                    let sb_w = cu.cu.w / num_sb_x;
+                    let sb_h = cu.cu.h / num_sb_y;
                     let chroma = self.sps.sps_chroma_format_idc == 1;
                     let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
                     // §8.5.6.5 bdofUsedFlag — every DMVR gate bullet that

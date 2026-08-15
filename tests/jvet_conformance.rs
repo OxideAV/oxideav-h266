@@ -619,62 +619,62 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     // named feature gates (affine non-merge in the stream walker,
     // inter residual multi-TB tiling) plus subpictures / 4:2:2 /
     // 4:4:4 / explicit WP.
-    ("10b422_B_5", 'U'),          // 10-bit 4:2:2 chroma format
+    ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
     ("8b400_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("8b420_A_2", 'E'),           // desync past the r443 multi-TB tiling (under triage)
+    ("8b420_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
     ("8b420_B_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("8b444_A_2", 'U'),           // 4:4:4
+    ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
     ("AFF_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
     ("ALF_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("ALF_B_3", 'E'),             // desync past the r443 multi-TB tiling (under triage)
-    ("ALF_C_3", 'F'),             // decodes fully; plane divergence (under triage)
+    ("ALF_B_3", 'E'),             // desync (under triage)
+    ("ALF_C_3", 'F'),             // 4/4 pictures diverge (first poc 0 plane Y)
     ("AMVR_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
     ("BDOF_A_4", 'U'),            // affine non-merge reconstruction in the stream walker
-    ("BDPCM_A_2", 'F'),           // decodes fully; plane divergence (under triage)
-    ("CCLM_A_2", 'F'),            // luma byte-exact since r443; chroma class remains
-    ("CST_A_4", 'F'),             // decodes fully; plane divergence (under triage)
-    ("CodingToolsSets_A_2", 'P'), // r440 — the first fully byte-exact corpus stream
-    ("CodingToolsSets_B_2", 'E'), // desync (under triage)
-    ("CodingToolsSets_C_2", 'F'), // 10-bit twin of A_2 — same remaining class
+    ("BDPCM_A_2", 'F'),           // 3/3 pictures diverge (first poc 0 plane Y)
+    ("CCLM_A_2", 'F'),            // 7/7 pictures diverge (first poc 0 plane Cb)
+    ("CST_A_4", 'F'),             // 21/21 pictures diverge (first poc 0 plane Y)
+    ("CodingToolsSets_A_2", 'P'), // byte-exact
+    ("CodingToolsSets_B_2", 'F'), // 8/9 pictures diverge (first poc 1 plane Y)
+    ("CodingToolsSets_C_2", 'F'), // 2/2 pictures diverge (first poc 0 plane Y)
     ("CodingToolsSets_D_2", 'E'), // IBC BV derivation (under triage)
     ("CodingToolsSets_E_1", 'U'), // subpictures
     ("DEBLOCKING_A_3", 'U'),      // affine non-merge reconstruction in the stream walker
     ("DEBLOCKING_C_3", 'U'),      // affine non-merge reconstruction in the stream walker
     ("DEBLOCKING_E_3", 'E'),      // desync (under triage)
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
-    ("DMVR_B_4", 'F'),            // 10 of 11 pictures byte-exact since r443
-    ("GDR_A_2", 'E'),             // desync (under triage)
+    ("DMVR_B_4", 'F'),            // 1/11 pictures diverge (first poc 9 plane Y)
+    ("GDR_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
     ("GPM_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("IBC_A_2", 'U'),             // affine non-merge reconstruction (r443: IBC parse fixed)
-    ("ISP_A_3", 'F'),             // decodes fully; plane divergence (under triage)
+    ("IBC_A_2", 'E'),             // desync (under triage)
+    ("ISP_A_3", 'F'),             // 34/34 pictures diverge (first poc 0 plane Y)
     ("JCCR_A_2", 'E'),            // desync (under triage)
-    ("JCCR_C_3", 'E'),            // desync past the r443 multi-TB tiling (under triage)
-    ("LFNST_A_4", 'F'),           // decodes fully; plane divergence (under triage)
-    ("LFNST_B_4", 'E'),           // desync (under triage)
+    ("JCCR_C_3", 'F'),            // 63/66 pictures diverge (first poc 1 plane Y)
+    ("LFNST_A_4", 'F'),           // 53/53 pictures diverge (first poc 0 plane Y)
+    ("LFNST_B_4", 'U'),           // affine non-merge reconstruction in the stream walker
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'U'),            // affine non-merge reconstruction in the stream walker
     ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
     ("MERGE_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("MIP_A_3", 'F'),             // luma byte-exact since r443; chroma class remains
+    ("MIP_A_3", 'F'),             // 39/39 pictures diverge (first poc 0 plane Cb)
     ("MIP_B_3", 'U'),             // affine non-merge reconstruction in the stream walker
     ("MMVD_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
-    ("MTS_A_4", 'F'),             // decodes fully; plane divergence (under triage)
+    ("MTS_A_4", 'F'),             // 21/21 pictures diverge (first poc 0 plane Y)
     ("PROF_B_3", 'U'),            // affine non-merge reconstruction in the stream walker
     ("QUANT_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
     ("QUANT_B_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("RAP_A_1", 'F'),             // decodes fully; plane divergence (under triage)
+    ("RAP_A_1", 'F'),             // 1/1 pictures diverge (first poc 32 plane Y)
     ("RAP_B_1", 'U'),             // affine non-merge reconstruction in the stream walker
     ("SAO_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
     ("SBT_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
     ("SLICES_A_3", 'E'),          // desync (under triage)
-    ("SMVD_A_2", 'E'),            // desync past the r443 multi-TB tiling (under triage)
+    ("SMVD_A_2", 'F'),            // 10/10 pictures diverge (first poc 0 plane Y)
     ("SUBPIC_C_1", 'U'),          // subpictures
-    ("SbTMVP_A_3", 'E'), // desync past the r443 multi-TB tiling (single-tree SCIPU suspected)
-    ("TILE_A_2", 'U'),   // affine non-merge reconstruction in the stream walker
-    ("TMVP_A_3", 'U'),   // affine non-merge reconstruction in the stream walker
-    ("WPP_A_3", 'E'),    // desync (under triage)
-    ("WP_A_3", 'U'),     // explicit weighted prediction
+    ("SbTMVP_A_3", 'E'),          // desync (under triage)
+    ("TILE_A_2", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("TMVP_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("WPP_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("WP_A_3", 'U'),              // explicit weighted prediction
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this
