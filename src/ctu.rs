@@ -4786,18 +4786,60 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return Ok(());
         }
 
-        // Per §7.4.10.5 / §8.7.4.1 the largest single TB is `MaxTbSizeY`
-        // (≤ 64). When a leaf CU exceeds that size the spec splits it
-        // into multiple transform units (`maxTbSize`-aligned tiling);
-        // that multi-TB-per-CU walker is not yet wired, so surface a
-        // precise Unsupported instead of trying to feed a 128-tall TB
-        // into an inverse transform that doesn't exist.
+        // r443 — §8.4.5.1 / §7.3.11.9: an intra CB exceeding
+        // `MaxTbSizeY` was parsed as tiled `transform_unit()` leaves
+        // (`residual.inter_tus`); reconstruct it by recursing per tile
+        // with a synthetic ≤MaxTbSizeY CU carrying that tile's CBFs /
+        // joint-CbCr mode / levels. The §8.4.5.1 recursion predicts
+        // each transform block at ITS dims with the CU's
+        // `predModeIntra`, and the per-tile availability marking makes
+        // the later tiles' reference reads see the earlier tiles —
+        // exactly the eq. 248 – 250 vertical-first halving order the
+        // parse used. Per-tile deblock records carry the per-TB coded
+        // flags the §8.8.3.2 transform-edge derivation wants.
         if n_tb_w > 64 || n_tb_h > 64 {
-            return Err(Error::unsupported(format!(
-                "h266 reconstruct_leaf_cu: leaf CU {}x{} exceeds MaxTbSizeY=64; \
-                 multi-TB-per-CU tiling (§7.4.10.5) not yet wired",
-                n_tb_w, n_tb_h,
-            )));
+            if residual.inter_tus.is_empty() {
+                return Err(Error::unsupported(format!(
+                    "h266 reconstruct_leaf_cu: leaf CU {}x{} exceeds MaxTbSizeY=64 \
+                     without parsed §7.3.11.9 tiles",
+                    n_tb_w, n_tb_h,
+                )));
+            }
+            let tus = residual.inter_tus.clone();
+            for tu in &tus {
+                let tile_cu = CtuCu {
+                    ctu_addr_rs: cu.ctu_addr_rs,
+                    cu: Cu {
+                        x: cu.cu.x + tu.x,
+                        y: cu.cu.y + tu.y,
+                        w: tu.w,
+                        h: tu.h,
+                        cqt_depth: cu.cu.cqt_depth,
+                        mtt_depth: cu.cu.mtt_depth,
+                    },
+                };
+                let mut tile_info = *info;
+                tile_info.cb_width = tu.w;
+                tile_info.cb_height = tu.h;
+                tile_info.tu_y_coded_flag = tu.tu_y_coded;
+                tile_info.tu_cb_coded_flag = tu.tu_cb_coded;
+                tile_info.tu_cr_coded_flag = tu.tu_cr_coded;
+                tile_info.tu_joint_cbcr_residual_flag = tu.joint_cbcr;
+                tile_info.tu_c_res_mode = tu.tu_c_res_mode;
+                tile_info.transform_skip_luma = false;
+                tile_info.transform_skip_cb = tu.transform_skip_cb;
+                tile_info.transform_skip_cr = tu.transform_skip_cr;
+                tile_info.lfnst_idx = 0;
+                tile_info.mts_idx = 0;
+                let tile_res = LeafCuResidual {
+                    luma_levels: tu.luma_levels.clone(),
+                    cb_levels: tu.cb_levels.clone(),
+                    cr_levels: tu.cr_levels.clone(),
+                    ..LeafCuResidual::default()
+                };
+                self.reconstruct_leaf_cu_with_tree(&tile_cu, &tile_info, &tile_res, out, tree)?;
+            }
+            return Ok(());
         }
 
         // 1./2. §8.4.5.2 reference generation + intra prediction.
@@ -6387,6 +6429,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let cu_qp_delta = info.cu_qp_delta_val;
+        // r443 — §7.3.11.9 multi-TB tiling: per-TU residual adds (each
+        // ≤MaxTbSizeY leaf carries its own CBFs / joint-CbCr mode /
+        // chroma TBs at its own offset).
+        if !residual.inter_tus.is_empty() {
+            return self.add_inter_cu_residual_tiled(cu, info, residual, bit_depth, out);
+        }
         if info.cu_sbt_flag {
             if info.tu_y_coded_flag && !residual.luma_levels.is_empty() {
                 let geo = crate::transform::sbt_geometry(
@@ -6562,6 +6610,138 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         cu_qp_delta,
                         bit_depth,
                         info.transform_skip_cr,
+                        cu_off_cr,
+                        lmcs_cvs,
+                        out,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// r443 — per-TU residual adds for a §7.3.11.9 multi-TB inter /
+    /// IBC CU (`residual.inter_tus`). Each ≤MaxTbSizeY leaf adds its
+    /// luma residual at its CU-relative offset and reconstructs its
+    /// own chroma pair (joint-CbCr aware, per-TB transform-skip on the
+    /// ≤32 chroma TBs). The CU-level `cu_qp_delta` /
+    /// `cu_chroma_qp_offset` (§7.3.11.10 — read once at the first TU)
+    /// and the §8.7.5.3 chroma-residual-scaling `varScale` apply to
+    /// every TU.
+    fn add_inter_cu_residual_tiled(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        bit_depth: u32,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        let cu_qp_delta = info.cu_qp_delta_val;
+        let chroma = self.sps.sps_chroma_format_idc == 1;
+        let lmcs_cvs = if chroma {
+            self.lmcs_chroma_var_scale_for_cu(cu, out)
+        } else {
+            None
+        };
+        let cu_off_cb = cu_chroma_qp_offset(
+            1,
+            info.cu_chroma_qp_offset_flag,
+            info.cu_chroma_qp_offset_idx,
+            &self.pps.pps_cb_qp_offset_list,
+            &self.pps.pps_cr_qp_offset_list,
+        );
+        let cu_off_cr = cu_chroma_qp_offset(
+            2,
+            info.cu_chroma_qp_offset_flag,
+            info.cu_chroma_qp_offset_idx,
+            &self.pps.pps_cb_qp_offset_list,
+            &self.pps.pps_cr_qp_offset_list,
+        );
+        let cu_off_cbcr = if info.cu_chroma_qp_offset_flag {
+            self.pps
+                .pps_joint_cbcr_qp_offset_list
+                .get(info.cu_chroma_qp_offset_idx as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        for tu in &residual.inter_tus {
+            let x0 = (cu.cu.x + tu.x) as usize;
+            let y0 = (cu.cu.y + tu.y) as usize;
+            if tu.tu_y_coded && tu.luma_levels.len() == (tu.w * tu.h) as usize {
+                self.add_inter_residual_plane(
+                    /*c_idx=*/ 0,
+                    x0,
+                    y0,
+                    tu.w as usize,
+                    tu.h as usize,
+                    &tu.luma_levels,
+                    cu_qp_delta,
+                    bit_depth,
+                    /*transform_skip=*/ false,
+                    /*cu_chroma_qp_offset=*/ 0,
+                    /*lmcs_chroma_var_scale=*/ None,
+                    out,
+                )?;
+            }
+            if !chroma {
+                continue;
+            }
+            let (c_x, c_y, c_w, c_h) = (x0 / 2, y0 / 2, (tu.w / 2) as usize, (tu.h / 2) as usize);
+            if tu.tu_c_res_mode != 0 {
+                // §8.7.2 joint Cb-Cr — one coded TB for both chroma
+                // residuals of THIS TU.
+                let tu_res = LeafCuResidual {
+                    cb_levels: tu.cb_levels.clone(),
+                    cr_levels: tu.cr_levels.clone(),
+                    ..LeafCuResidual::default()
+                };
+                self.add_inter_joint_cbcr_residual(
+                    c_x,
+                    c_y,
+                    c_w,
+                    c_h,
+                    tu.tu_c_res_mode,
+                    &tu_res,
+                    cu_qp_delta,
+                    bit_depth,
+                    cu_off_cbcr,
+                    info.cu_chroma_qp_offset_flag,
+                    info.cu_chroma_qp_offset_idx,
+                    tu.transform_skip_cb,
+                    tu.transform_skip_cr,
+                    lmcs_cvs,
+                    out,
+                )?;
+            } else {
+                if tu.tu_cb_coded && tu.cb_levels.len() == c_w * c_h {
+                    self.add_inter_residual_plane(
+                        /*c_idx=*/ 1,
+                        c_x,
+                        c_y,
+                        c_w,
+                        c_h,
+                        &tu.cb_levels,
+                        cu_qp_delta,
+                        bit_depth,
+                        tu.transform_skip_cb,
+                        cu_off_cb,
+                        lmcs_cvs,
+                        out,
+                    )?;
+                }
+                if tu.tu_cr_coded && tu.cr_levels.len() == c_w * c_h {
+                    self.add_inter_residual_plane(
+                        /*c_idx=*/ 2,
+                        c_x,
+                        c_y,
+                        c_w,
+                        c_h,
+                        &tu.cr_levels,
+                        cu_qp_delta,
+                        bit_depth,
+                        tu.transform_skip_cr,
                         cu_off_cr,
                         lmcs_cvs,
                         out,

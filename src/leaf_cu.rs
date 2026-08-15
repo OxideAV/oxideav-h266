@@ -845,6 +845,40 @@ pub struct LeafCuResidual {
     /// r431 — the parsed §7.3.11.6 `palette_coding()` payload when
     /// `pred_mode_plt_flag == 1` (`info.pred_mode == CuPredMode::Plt`).
     pub palette: Option<crate::palette::PaletteCuInfo>,
+    /// r443 — §7.3.11.9 multi-TB tiling for an inter / IBC CB
+    /// exceeding `MaxTbSizeY`: one record per `transform_unit()` leaf
+    /// in the spec recursion order (vertical-first halving of the
+    /// longer >64 dimension). Empty for single-TU CUs.
+    pub inter_tus: Vec<InterTu>,
+}
+
+/// r443 — one §7.3.11.9 / §7.3.11.10 transform unit of a multi-TB
+/// inter CU (the `transform_tree()` MaxTbSizeY halving recursion).
+/// Offsets are CU-relative luma samples.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InterTu {
+    /// CU-relative luma offset of this TU.
+    pub x: u32,
+    pub y: u32,
+    /// TU luma dims (≤ MaxTbSizeY each).
+    pub w: u32,
+    pub h: u32,
+    pub tu_y_coded: bool,
+    pub tu_cb_coded: bool,
+    pub tu_cr_coded: bool,
+    /// §7.3.11.10 `tu_joint_cbcr_residual_flag` + the §7.4.12.11
+    /// `TuCResMode` derivation for THIS TU's chroma pair.
+    pub joint_cbcr: bool,
+    pub tu_c_res_mode: u8,
+    /// Per-TB `transform_skip_flag[..][1] / [2]` (the luma TB of a
+    /// tiled TU can never satisfy the `MaxTsSize` gate — one dim is
+    /// always the 64-sample `MaxTbSizeY` half).
+    pub transform_skip_cb: bool,
+    pub transform_skip_cr: bool,
+    /// Row-major coefficient levels (empty when the CBF is 0).
+    pub luma_levels: Vec<i32>,
+    pub cb_levels: Vec<i32>,
+    pub cr_levels: Vec<i32>,
 }
 
 /// §7.3.11.5 syntax values for the intra-mode constants (Table 19).
@@ -3772,6 +3806,184 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     /// inferred 1). The chroma CBFs, `cu_qp_delta`,
     /// `cu_chroma_qp_offset_*` and the residual coefficient walk are
     /// otherwise identical to the intra single-TB path.
+    /// r443 — §7.3.11.9 `transform_tree()` MaxTbSizeY tiling for an
+    /// inter / IBC CB whose luma dims exceed `MaxTbSizeY`: the
+    /// vertical-first halving recursion yields raster-ordered
+    /// ≤MaxTbSizeY leaves, and each leaf runs the §7.3.11.10
+    /// `transform_unit()` reads — per-TU chroma CBFs, an ALWAYS-coded
+    /// `tu_y_coded_flag` (the `CbWidth > MaxTbSizeY ||
+    /// CbHeight > MaxTbSizeY` presence arm), the once-per-CU
+    /// `cu_qp_delta` / `cu_chroma_qp_offset` (the same >64 arm opens
+    /// their gates at the first TU regardless of CBFs), the per-TU
+    /// `tu_joint_cbcr_residual_flag`, and the per-TB residual walks.
+    /// A tiled luma TB never reads `transform_skip_flag` (one dim is
+    /// the 64-sample MaxTbSizeY half > the 32-sample MaxTsSize cap);
+    /// the ≤32 chroma TBs keep their per-component TS gate.
+    fn decode_inter_transform_tree_tiled(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+        is_intra: bool,
+    ) -> Result<()> {
+        let tiles = crate::transform::transform_tree_tiles(
+            info.cb_width,
+            info.cb_height,
+            self.tools.max_tb_size_y,
+        );
+        let chroma_available =
+            self.tools.chroma_format_idc != 0 && self.tree != TreeType::DualTreeLuma;
+        if chroma_available && self.tools.chroma_format_idc != 1 {
+            return Err(Error::unsupported(
+                "h266 leaf CU inter: multi-TB tiling is walked for 4:2:0 / monochrome only",
+            ));
+        }
+        let mut qp_delta_done = self.tools.cu_qp_delta_already_coded;
+        // Chroma-offset QGs are armed per CU on this walker (matching
+        // the single-TU inter path): the first eligible TU reads the
+        // pair, later TUs of the CU inherit it.
+        let mut chroma_off_done = false;
+        for t in &tiles {
+            let mut tu = InterTu {
+                x: t.x,
+                y: t.y,
+                w: t.w,
+                h: t.h,
+                ..InterTu::default()
+            };
+            if chroma_available {
+                tu.tu_cb_coded = read_tu_cb_coded_flag(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    /*bdpcm_chroma=*/ false,
+                )?;
+                tu.tu_cr_coded = read_tu_cr_coded_flag(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    /*bdpcm_chroma=*/ false,
+                    tu.tu_cb_coded,
+                )?;
+            }
+            // §7.3.11.10 — tu_y_coded_flag is PRESENT on every tiled
+            // TU (the CbWidth/CbHeight > MaxTbSizeY presence arm).
+            tu.tu_y_coded = read_tu_y_coded_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                /*bdpcm_y=*/ false,
+                /*isp_split=*/ false,
+                /*prev_tu_cbf_y=*/ false,
+            )?;
+            // §7.3.11.10 — the same >64 arm opens the cu_qp_delta /
+            // cu_chroma_qp_offset gates unconditionally; only the
+            // first TU of the (QG-armed) CU reads them.
+            if self.tools.cu_qp_delta_enabled && !qp_delta_done {
+                info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+                info.cu_qp_delta_read = true;
+                qp_delta_done = true;
+            }
+            if self.tools.cu_chroma_qp_offset_enabled && chroma_available && !chroma_off_done {
+                let (flag, idx) = read_cu_chroma_qp_offset(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    self.tools.chroma_qp_offset_list_len_minus1,
+                )?;
+                info.cu_chroma_qp_offset_flag = flag;
+                info.cu_chroma_qp_offset_idx = idx;
+                chroma_off_done = true;
+            }
+            // §7.3.11.10 joint-CbCr gate: an intra TU reads the flag
+            // when EITHER chroma CBF is set; an inter TU only when
+            // both are.
+            let joint_gate = if is_intra {
+                tu.tu_cb_coded || tu.tu_cr_coded
+            } else {
+                tu.tu_cb_coded && tu.tu_cr_coded
+            };
+            if self.tools.joint_cbcr_enabled && chroma_available && joint_gate {
+                tu.joint_cbcr = read_tu_joint_cbcr_residual_flag(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    tu.tu_cb_coded,
+                    tu.tu_cr_coded,
+                )?;
+            }
+            tu.tu_c_res_mode = derive_tu_c_res_mode(tu.joint_cbcr, tu.tu_cb_coded, tu.tu_cr_coded);
+            if tu.tu_y_coded {
+                let (levels, _) = decode_tb_coefficients_opts(
+                    self.dec,
+                    &mut self.ctxs.residual,
+                    t.w as usize,
+                    t.h as usize,
+                    /*c_idx=*/ 0,
+                    self.tools.rc_opts,
+                )?;
+                tu.luma_levels = levels;
+            }
+            let cw = (t.w / 2) as usize;
+            let ch = (t.h / 2) as usize;
+            if chroma_available && cw >= 2 && ch >= 2 {
+                let ts_present_chroma = self.tools.transform_skip_enabled
+                    && (cw as u32) <= self.tools.max_ts_size
+                    && (ch as u32) <= self.tools.max_ts_size;
+                for c_idx in [1u32, 2u32] {
+                    let coded = if c_idx == 1 {
+                        tu.tu_cb_coded
+                    } else {
+                        // §7.3.11.10 — the Cr block is absent when the
+                        // joint flag says Cb's coded TB carries both.
+                        tu.tu_cr_coded && !(tu.tu_cb_coded && tu.joint_cbcr)
+                    };
+                    if !coded {
+                        continue;
+                    }
+                    let ts = if ts_present_chroma {
+                        crate::residual::read_transform_skip_flag(
+                            self.dec,
+                            &mut self.ctxs.residual,
+                            c_idx,
+                        )?
+                    } else {
+                        false
+                    };
+                    let levels = if ts && !self.tools.ts_residual_coding_disabled {
+                        crate::residual::decode_ts_tb_coefficients(
+                            self.dec,
+                            &mut self.ctxs.residual,
+                            cw,
+                            ch,
+                            c_idx,
+                            self.tools.ts_residual_coding_rice_idx,
+                            /*bdpcm=*/ false,
+                        )?
+                    } else {
+                        decode_tb_coefficients_opts(
+                            self.dec,
+                            &mut self.ctxs.residual,
+                            cw,
+                            ch,
+                            c_idx,
+                            self.tools.rc_opts,
+                        )?
+                        .0
+                    };
+                    if c_idx == 1 {
+                        tu.transform_skip_cb = ts;
+                        tu.cb_levels = levels;
+                    } else {
+                        tu.transform_skip_cr = ts;
+                        tu.cr_levels = levels;
+                    }
+                }
+            }
+            // Aggregate CU-level markers (deblock records + the
+            // walker's "has coded residual" consumers).
+            info.tu_y_coded_flag |= tu.tu_y_coded;
+            info.tu_cb_coded_flag |= tu.tu_cb_coded;
+            info.tu_cr_coded_flag |= tu.tu_cr_coded;
+            residual.inter_tus.push(tu);
+        }
+        Ok(())
+    }
+
     fn decode_inter_transform_unit(
         &mut self,
         info: &mut LeafCuInfo,
@@ -3779,15 +3991,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     ) -> Result<()> {
         let cb_w = info.cb_width as usize;
         let cb_h = info.cb_height as usize;
-        // Multi-TB-per-CU tiling (§7.3.11.9 recursion) is not wired for
-        // the inter residual path; surface a precise Unsupported rather
-        // than mis-parsing a CB that the spec would split into several
-        // transform units.
+        // r443 — §7.3.11.9 multi-TB tiling: a CB exceeding MaxTbSizeY
+        // splits into ≤MaxTbSizeY transform units (vertical-first
+        // halving of the longer oversized dimension), each with its
+        // own §7.3.11.10 CBF / joint-CbCr / residual reads.
         if info.cb_width > self.tools.max_tb_size_y || info.cb_height > self.tools.max_tb_size_y {
-            return Err(Error::unsupported(
-                "h266 leaf CU inter: residual transform_tree for a CB exceeding MaxTbSizeY \
-                 (multi-TB tiling, §7.3.11.9) not yet wired",
-            ));
+            return self
+                .decode_inter_transform_tree_tiled(info, residual, /*is_intra=*/ false);
         }
         let chroma = self.tools.chroma_format_idc != 0;
         let (sub_w, sub_h) = match self.tools.chroma_format_idc {
@@ -4074,6 +4284,12 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     ) -> Result<()> {
         if info.isp_split != IspSplitType::NoSplit {
             return self.decode_transform_unit_isp(info, residual);
+        }
+        // r443 — §7.3.11.9 multi-TB tiling for an intra CB exceeding
+        // MaxTbSizeY (the §7.3.11.5 lfnst/mts gates exclude such CBs,
+        // so the per-CU tail reads below never apply to them).
+        if info.cb_width > self.tools.max_tb_size_y || info.cb_height > self.tools.max_tb_size_y {
+            return self.decode_inter_transform_tree_tiled(info, residual, /*is_intra=*/ true);
         }
         // §7.3.11.5 transform_unit() init: the LFNST / MTS gating flags
         // accumulate across this CU's per-plane residual_coding() calls.
