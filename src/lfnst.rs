@@ -140,9 +140,9 @@ fn lfnst_matrix(
 /// scaled coefficients; the result `y` has `nTrS == n_lfnst_out_size`
 /// entries (eq. 1176): `y[i] = Clip3(min, max, (Σ M[i][j]*x[j] + 64) >> 7)`.
 ///
-/// **Publication erratum in the 2026-01 (V4) edition** (the same block
-/// transposition as the §8.7.4.5 32-point DST-VII / DCT-VIII tables —
-/// see `transform::DST_VII_32_ROWS_16_31`): the §8.7.4.3
+/// **Publication erratum in the 2026-01 (V4) edition** (the same body
+/// transposition as every §8.7.4.5 MTS table — see the
+/// `transform` module-level erratum note): the §8.7.4.3
 /// `lowFreqTransMatrix` tables are printed with the *input*
 /// (coefficient) index as the printed row and the *output* index as
 /// the printed column — each printed 16×16 sub-block is the transpose

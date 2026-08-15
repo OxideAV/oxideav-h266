@@ -73,24 +73,47 @@ pub struct Cu {
 pub struct TreeCtxs {
     pub split_cu: Vec<ContextModel>,
     pub split_qt: Vec<ContextModel>,
-    /// Round-55 — `mtt_split_cu_vertical_flag` per Table 61 (15 ctxIdx).
+    /// Round-55 — `mtt_split_cu_vertical_flag` per Table 61 (5 ctxIdx
+    /// for the active initType).
     pub mtt_split_vertical: Vec<ContextModel>,
-    /// Round-55 — `mtt_split_cu_binary_flag` per Table 62 (12 ctxIdx).
+    /// Round-55 — `mtt_split_cu_binary_flag` per Table 62 (4 ctxIdx
+    /// for the active initType).
     pub mtt_split_binary: Vec<ContextModel>,
     pub intra_luma_mpm: Vec<ContextModel>,
+    /// r443 — `non_inter_flag` per Table 63 (2 ctxIdx for initType
+    /// 1 / 2; the bin never occurs on I slices — §7.4.12.4
+    /// `ModeTypeCondition` is 1, not 2, there).
+    pub non_inter: Vec<ContextModel>,
 }
 
 impl TreeCtxs {
-    /// Build the context arrays from Table 59 / 60 / 61 / 62 / 75
-    /// at the supplied slice QP.
+    /// Build the I-slice (`initType = 0`) context arrays from
+    /// Table 59 / 60 / 61 / 62 / 75 at the supplied slice QP.
     pub fn init(slice_qp_y: i32) -> Self {
-        use crate::tables::{init_contexts, SyntaxCtx};
+        Self::init_with_init_type(slice_qp_y, 0)
+    }
+
+    /// §9.3.2.2 — build the context arrays for one `initType`. Each
+    /// vector holds ONLY that initType's models (the initValue
+    /// tables' 3-way column split), so the walker's plain-`ctxInc`
+    /// indices are the spec ctxIdx on every slice type (r443 fix —
+    /// P / B slices previously initialised every split bin from the
+    /// I-slice columns and desynced on the first inter picture).
+    pub fn init_with_init_type(slice_qp_y: i32, init_type: u8) -> Self {
+        use crate::tables::{init_contexts, init_contexts_for_type as ict, SyntaxCtx};
+        // Table 63 has no I column: P addresses entries 0..1, B 2..3.
+        let non_inter = match init_type {
+            1 => init_contexts(SyntaxCtx::NonInterFlag, slice_qp_y)[0..2].to_vec(),
+            2 => init_contexts(SyntaxCtx::NonInterFlag, slice_qp_y)[2..4].to_vec(),
+            _ => Vec::new(),
+        };
         Self {
-            split_cu: init_contexts(SyntaxCtx::SplitCuFlag, slice_qp_y),
-            split_qt: init_contexts(SyntaxCtx::SplitQtFlag, slice_qp_y),
-            mtt_split_vertical: init_contexts(SyntaxCtx::MttSplitCuVerticalFlag, slice_qp_y),
-            mtt_split_binary: init_contexts(SyntaxCtx::MttSplitCuBinaryFlag, slice_qp_y),
-            intra_luma_mpm: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp_y),
+            split_cu: ict(SyntaxCtx::SplitCuFlag, slice_qp_y, init_type),
+            split_qt: ict(SyntaxCtx::SplitQtFlag, slice_qp_y, init_type),
+            mtt_split_vertical: ict(SyntaxCtx::MttSplitCuVerticalFlag, slice_qp_y, init_type),
+            mtt_split_binary: ict(SyntaxCtx::MttSplitCuBinaryFlag, slice_qp_y, init_type),
+            intra_luma_mpm: ict(SyntaxCtx::IntraLumaMpmFlag, slice_qp_y, init_type),
+            non_inter,
         }
     }
 }

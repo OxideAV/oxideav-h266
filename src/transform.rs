@@ -30,6 +30,25 @@
 //! arrays in `i32` (they may carry up to 15-bit magnitudes after
 //! de-quantisation, plus room for the accumulation headroom).
 //!
+//! **Publication erratum in the 2026-01 (V4) edition — every §8.7.4.5
+//! table body is printed transposed.** The equations declare
+//! `transMatrix[ m ][ n ]` with `m` the transformed-sample (spatial)
+//! index that eq. 1177 / 1178 sum over per output `y[ i ]`, and `n`
+//! the coefficient index; the printed bodies carry `n` as the printed
+//! row and `m` as the printed column. This is visible in the
+//! Recommendation's own text: eq. 1179 declares `transMatrixCol0to15
+//! [ m ][ n ] with m = 0..15, n = 0..63`, yet the printed body is 64
+//! rows of 16 entries, and the eq. 1183 / 1184 reflections index the
+//! first axis with `47 − m` / `63 − m` (m up to 63) — only consistent
+//! with the declared `[ m ][ n ]` layout, not the printed one. It is
+//! the same print-transposition class r440 established for the
+//! §8.7.4.3 LFNST `lowFreqTransMatrix` tables. The statics below stay
+//! byte-for-byte as printed; every multiply indexes them transposed
+//! (`printed[ n ][ m ]`), which the `dst_vii_*` orientation tests pin
+//! (the first inverse-DST-VII basis is monotonically increasing —
+//! true of every printed row 0, not of column 0) and the black-box
+//! fixture matrix seals sample-exactly.
+//!
 //! Composition into the full 2D inverse transform (`clause 8.7.4.1`)
 //! — including the mid-shift of 7 and final shift to
 //! `(20 - BitDepth)` — lives alongside the CU/TU walker rather than in
@@ -133,13 +152,12 @@ pub const DST_VII_32_COL_0_15: [[i16; 16]; 16] = [
 ];
 
 /// The eq. 1191 sub-table, transcribed exactly as printed in the
-/// 2026-01 (V4) edition. As printed it holds the *top-right* block of
-/// the 32-point DST-VII kernel — output rows 0..15 at coefficient
-/// columns 16..31 — not the output rows 16..31 that eq. 1190 declares
-/// (see the erratum note on [`DST_VII_32_ROWS_16_31`], which carries
-/// the rows the transformation actually needs). Kept verbatim so the
-/// derivation test can rebuild [`DST_VII_32_ROWS_16_31`] from the
-/// Recommendation's own printed data.
+/// 2026-01 (V4) edition. Like every §8.7.4.5 body it is printed
+/// transposed (see the module-level erratum note): eq. 1190 declares
+/// it as `transMatrix[ m ][ n ]` with `m = 16..31, n = 0..15` — the
+/// transformed-sample positions 16..31 at coefficient columns 0..15 —
+/// so the printed entry `[ r ][ c ]` carries `transMatrix[ 16 + c ]
+/// [ r ]` and [`apply_dst_vii_32`] indexes it accordingly.
 #[rustfmt::skip]
 pub const DST_VII_32_COL_16_31: [[i16; 16]; 16] = [
     [  66,  68,  72,  74,  77,  78,  80,  82,  84,  85,  86,  87,  88,  89,  90,  90],
@@ -158,83 +176,6 @@ pub const DST_VII_32_COL_16_31: [[i16; 16]; 16] = [
     [ -17, -90, -30,  74,  68, -38, -88,  -9,  84,  53, -56, -82,  13,  89,  34, -72],
     [ -86,   9,  90,  21, -82, -50,  66,  72, -42, -85,  13,  90,  17, -84, -46,  68],
     [  30,  86, -17, -89,   4,  90,   9, -88, -21,  85,  34, -80, -46,  74,  56, -66],
-];
-
-/// 32-point DST-VII matrix rows (output positions) 16..31 for
-/// coefficient columns 0..15.
-///
-/// **Publication erratum in the 2026-01 (V4) edition:** eq. 1190
-/// places the eq. 1191 sub-table at `transMatrix[m][n]` with
-/// `m = 16..31, n = 0..15`, but the sub-table as printed contains the
-/// *top-right* block of the full 32×32 kernel — output rows 0..15 at
-/// coefficient columns 16..31 (each printed entry `[r][c]` continues
-/// the eq. 1189 rows: it carries the kernel value for the index
-/// product `(2r + 1)·(c + 17)`, verified entry-by-entry against the
-/// eq. 1189 block's value set). Read literally, the assembled matrix
-/// is far from orthogonal (basis cross-correlations up to ~76% of the
-/// column norm) and does not reconstruct conformance bitstreams; with
-/// the rows below it is orthogonal to within 0.3% and the JVET
-/// conformance streams that exercise 32-point MTS decode correctly.
-///
-/// The rows below are derived **from the Recommendation's own printed
-/// data**: the 512 printed entries of eqs. 1189 + 1191 are mutually
-/// consistent as a single value table indexed by the folded kernel
-/// product `(2m + 1)·(n + 1) mod 130` (sign per the half-period), and
-/// that table covers every index 0..32 — so the missing output rows
-/// 16..31 follow mechanically from the same product mapping. The
-/// `dst_vii_32_rows_16_31_derivation` test re-derives this constant
-/// from the two printed sub-tables and asserts equality.
-#[rustfmt::skip]
-pub const DST_VII_32_ROWS_16_31: [[i16; 16]; 16] = [
-    [  90,  -4, -90,   9,  89, -13, -88,  17,  87, -21, -86,  26,  85, -30, -84,  34],
-    [  89, -21, -84,  42,  74, -60, -60,  74,  42, -84, -21,  89,   0, -89,  21,  84],
-    [  87, -38, -72,  68,  42, -86,  -4,  88, -34, -74,  66,  46, -85,  -9,  89, -30],
-    [  85, -53, -53,  85,   0, -85,  53,  53, -85,   0,  85, -53, -53,  85,   0, -85],
-    [  82, -66, -30,  90, -42, -56,  86, -13, -77,  74,  17, -87,  53,  46, -89,  26],
-    [  78, -77,  -4,  80, -74,  -9,  82, -72, -13,  84, -68, -17,  85, -66, -21,  86],
-    [  74, -84,  21,  60, -89,  42,  42, -89,  60,  21, -84,  74,   0, -74,  84, -21],
-    [  68, -88,  46,  30, -84,  78, -17, -56,  90, -60, -13,  77, -85,  34,  42, -87],
-    [  63, -90,  66,  -4, -60,  90, -68,   9,  56, -89,  72, -13, -53,  88, -74,  17],
-    [  56, -87,  80, -38, -21,  72, -90,  68, -17, -42,  82, -86,  53,   4, -60,  88],
-    [  50, -82,  88, -66,  21,  30, -72,  90, -78,  42,   9, -56,  85, -86,  60, -13],
-    [  42, -74,  89, -84,  60, -21, -21,  60, -84,  89, -74,  42,   0, -42,  74, -89],
-    [  34, -63,  82, -90,  84, -66,  38,  -4, -30,  60, -80,  90, -85,  68, -42,   9],
-    [  26, -50,  68, -82,  89, -88,  80, -66,  46, -21,  -4,  30, -53,  72, -84,  90],
-    [  17, -34,  50, -63,  74, -82,  87, -90,  88, -84,  77, -66,  53, -38,  21,  -4],
-    [   9, -17,  26, -34,  42, -50,  56, -63,  68, -74,  78, -82,  85, -87,  89, -90],
-];
-
-/// 32-point DCT-VIII matrix rows (output positions) 16..31 for
-/// coefficient columns 0..15.
-///
-/// Same publication erratum as [`DST_VII_32_ROWS_16_31`]: the eq. 1198
-/// sub-table as printed is the top-right block (rows 0..15, columns
-/// 16..31) of the full kernel, not the rows 16..31 that eq. 1197
-/// declares. Because the DCT-VIII kernel is symmetric in its two
-/// indices, the needed rows are exactly the transpose of the printed
-/// block; the general folded-product derivation (`(2m + 1)·(2n + 1)
-/// mod 260` over the printed eq. 1196 + 1198 entries) produces the
-/// same values. The `dct_viii_32_rows_16_31_derivation` test
-/// re-derives this constant from the two printed sub-tables and
-/// asserts equality.
-#[rustfmt::skip]
-pub const DCT_VIII_32_ROWS_16_31: [[i16; 16]; 16] = [
-    [  63, -66, -60,  68,  56, -72, -53,  74,  50, -77, -46,  78,  42, -80, -38,  82],
-    [  60, -74, -42,  84,  21, -89,   0,  89, -21, -84,  42,  74, -60, -60,  74,  42],
-    [  56, -80, -21,  90, -17, -82,  53,  60, -78, -26,  90, -13, -84,  50,  63, -77],
-    [  53, -85,   0,  85, -53, -53,  85,   0, -85,  53,  53, -85,   0,  85, -53, -53],
-    [  50, -88,  21,  72, -78,  -9,  85, -60, -38,  90, -34, -63,  84,  -4, -80,  68],
-    [  46, -90,  42,  50, -90,  38,  53, -89,  34,  56, -88,  30,  60, -87,  26,  63],
-    [  42, -89,  60,  21, -84,  74,   0, -74,  84, -21, -60,  89, -42, -42,  89, -60],
-    [  38, -86,  74,  -9, -63,  90, -53, -21,  80, -82,  26,  50, -89,  66,   4, -72],
-    [  34, -82,  84, -38, -30,  80, -85,  42,  26, -78,  86, -46, -21,  77, -87,  50],
-    [  30, -77,  89, -63,   9,  50, -85,  84, -46, -13,  66, -90,  74, -26, -34,  78],
-    [  26, -68,  89, -80,  46,   4, -53,  84, -87,  63, -17, -34,  74, -90,  77, -38],
-    [  21, -60,  84, -89,  74, -42,   0,  42, -74,  89, -84,  60, -21, -21,  60, -84],
-    [  17, -50,  74, -87,  88, -77,  53, -21, -13,  46, -72,  86, -89,  78, -56,  26],
-    [  13, -38,  60, -77,  86, -90,  85, -74,  56, -34,   9,  17, -42,  63, -78,  87],
-    [   9, -26,  42, -56,  68, -78,  85, -89,  90, -86,  80, -72,  60, -46,  30, -13],
-    [   4, -13,  21, -30,  38, -46,  53, -60,  66, -72,  77, -80,  84, -86,  88, -90],
 ];
 
 /// 16-point DCT-VIII matrix (eq. 1194).
@@ -280,12 +221,14 @@ pub const DCT_VIII_32_COL_0_15: [[i16; 16]; 16] = [
 ];
 
 /// The eq. 1198 sub-table, transcribed exactly as printed in the
-/// 2026-01 (V4) edition. As printed it holds the *top-right* block of
-/// the 32-point DCT-VIII kernel — output rows 0..15 at coefficient
-/// columns 16..31 — not the output rows 16..31 that eq. 1197 declares
-/// (see the erratum note on [`DCT_VIII_32_ROWS_16_31`]). Kept verbatim
-/// so the derivation test can rebuild [`DCT_VIII_32_ROWS_16_31`] from
-/// the Recommendation's own printed data.
+/// 2026-01 (V4) edition. Like every §8.7.4.5 body it is printed
+/// transposed (see the module-level erratum note): eq. 1197 declares
+/// it as `transMatrix[ m ][ n ]` with `m = 16..31, n = 0..15`, so the
+/// printed entry `[ r ][ c ]` carries `transMatrix[ 16 + c ][ r ]`
+/// and [`apply_dct_viii_32`] indexes it accordingly. (Because the
+/// DCT-VIII kernel is symmetric in its two indices, this transposed
+/// read happens to equal the "high-frequency rows" reading — the
+/// DST-VII twin is where the two readings differ.)
 #[rustfmt::skip]
 pub const DCT_VIII_32_COL_16_31: [[i16; 16]; 16] = [
     [  63,  60,  56,  53,  50,  46,  42,  38,  34,  30,  26,  21,  17,  13,   9,   4],
@@ -549,14 +492,20 @@ pub fn one_d_transform(
     }
 }
 
+/// Eq. 1178 multiply over a §8.7.4.5 table kept byte-for-byte as
+/// printed. Per the print-transposition erratum (module doc) the
+/// printed entry `[ r ][ c ]` is the declared `transMatrix[ c ][ r ]`
+/// — coefficient index `r`, transformed-sample position `c` — so the
+/// output sample `y[ i ]` sums `matrix[ j ][ i ] · x[ j ]` over the
+/// coefficients `j`.
 fn apply_matrix<const N: usize>(matrix: &[[i16; N]; N], non_zero_s: usize, x: &[i32]) -> Vec<i32> {
     let mut y = vec![0i32; N];
-    for (i, row) in matrix.iter().enumerate() {
+    for (i, y_i) in y.iter_mut().enumerate() {
         let mut acc: i64 = 0;
-        for j in 0..non_zero_s {
-            acc += row[j] as i64 * x[j] as i64;
+        for (j, row) in matrix.iter().enumerate().take(non_zero_s) {
+            acc += row[i] as i64 * x[j] as i64;
         }
-        y[i] = acc as i32;
+        *y_i = acc as i32;
     }
     y
 }
@@ -1213,11 +1162,11 @@ pub fn scaling_and_transformation(
 }
 
 /// Apply the 32-point DST-VII (§8.7.4.4 eq. 1178 with the §8.7.4.5
-/// eqs. 1188 – 1191 matrix): output rows 0..15 come from the eq. 1189
-/// sub-table; rows 16..31 come from [`DST_VII_32_ROWS_16_31`] — the
-/// eq. 1191 sub-table as printed in the 2026-01 edition is the
-/// top-right block of the kernel (rows 0..15, coefficient columns
-/// 16..31), see the erratum note on [`DST_VII_32_ROWS_16_31`].
+/// eqs. 1188 – 1191 matrix). Per the print-transposition erratum (see
+/// the module doc), the eq. 1189 / eq. 1191 bodies hold the declared
+/// `transMatrix[ m ][ n ]` (m = transformed-sample position, n =
+/// coefficient) at printed position `[ n ][ m ]` / `[ n ][ m − 16 ]`,
+/// so `y[ i ] = Σ_j printed[ j ][ i or i − 16 ] · x[ j ]`.
 ///
 /// Only coefficient columns 0..15 exist on the wire: a 32-point
 /// DST-VII / DCT-VIII TB is coefficient-limited to the low 16
@@ -1225,37 +1174,33 @@ pub fn scaling_and_transformation(
 /// the §7.3.11.11 `cu_sbt_flag` zero-out arm for SBT). We enforce
 /// `nonZeroS ≤ 16` here.
 fn apply_dst_vii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
-    let non_zero_s = non_zero_s.min(16);
-    let mut y = vec![0i32; 32];
-    for (m, y_m) in y.iter_mut().enumerate() {
-        let row: &[i16; 16] = if m < 16 {
-            &DST_VII_32_COL_0_15[m]
-        } else {
-            &DST_VII_32_ROWS_16_31[m - 16]
-        };
-        let mut acc: i64 = 0;
-        for j in 0..non_zero_s {
-            acc += row[j] as i64 * x[j] as i64;
-        }
-        *y_m = acc as i32;
-    }
-    y
+    apply_split_32(&DST_VII_32_COL_0_15, &DST_VII_32_COL_16_31, non_zero_s, x)
 }
 
+/// 32-point DCT-VIII twin of [`apply_dst_vii_32`] (eqs. 1195 – 1198).
 fn apply_dct_viii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
+    apply_split_32(&DCT_VIII_32_COL_0_15, &DCT_VIII_32_COL_16_31, non_zero_s, x)
+}
+
+/// Shared 32-point matrix multiply over a printed-transposed split
+/// table pair: `lo` carries transformed-sample positions 0..15, `hi`
+/// positions 16..31, both with the coefficient index as the printed
+/// row.
+fn apply_split_32(
+    lo: &[[i16; 16]; 16],
+    hi: &[[i16; 16]; 16],
+    non_zero_s: usize,
+    x: &[i32],
+) -> Vec<i32> {
     let non_zero_s = non_zero_s.min(16);
     let mut y = vec![0i32; 32];
-    for (m, y_m) in y.iter_mut().enumerate() {
-        let row: &[i16; 16] = if m < 16 {
-            &DCT_VIII_32_COL_0_15[m]
-        } else {
-            &DCT_VIII_32_ROWS_16_31[m - 16]
-        };
+    for (i, y_i) in y.iter_mut().enumerate() {
         let mut acc: i64 = 0;
         for j in 0..non_zero_s {
-            acc += row[j] as i64 * x[j] as i64;
+            let m = if i < 16 { lo[j][i] } else { hi[j][i - 16] };
+            acc += m as i64 * x[j] as i64;
         }
-        *y_m = acc as i32;
+        *y_i = acc as i32;
     }
     y
 }
@@ -1419,10 +1364,14 @@ mod tests {
     fn dst_vii_4_dc_input_returns_first_column() {
         let x = [100, 0, 0, 0];
         let y = one_d_transform(TrType::DstVII, 4, 1, &x).unwrap();
-        assert_eq!(y, vec![29 * 100, 74 * 100, 84 * 100, 55 * 100]);
+        // Printed row 0 (= declared transMatrix[ i ][ 0 ] per the
+        // print-transposition erratum): the first inverse-DST-VII
+        // basis rises monotonically.
+        assert_eq!(y, vec![29 * 100, 55 * 100, 74 * 100, 84 * 100]);
     }
 
-    /// Same for DCT-VIII 4×4.
+    /// Same for DCT-VIII 4×4 (symmetric kernel — printed row 0 and
+    /// column 0 coincide).
     #[test]
     fn dct_viii_4_dc_input_returns_first_column() {
         let x = [50, 0, 0, 0];
@@ -1431,15 +1380,37 @@ mod tests {
     }
 
     /// Feeding an impulse in coefficient position k returns the k-th
-    /// column of the matrix. Loop over all 8 positions of DST-VII 8.
+    /// printed ROW of the matrix (the declared k-th coefficient
+    /// column, per the §8.7.4.5 print-transposition erratum). Loop
+    /// over all 8 positions of DST-VII 8.
     #[test]
     fn dst_vii_8_impulse_responses_match_columns() {
         for k in 0..8 {
             let mut x = [0i32; 8];
             x[k] = 1;
             let y = one_d_transform(TrType::DstVII, 8, 8, &x).unwrap();
-            let expected: Vec<i32> = DST_VII_8.iter().map(|row| row[k] as i32).collect();
-            assert_eq!(y, expected, "DST-VII-8 column {k} mismatch");
+            let expected: Vec<i32> = DST_VII_8[k].iter().map(|&v| v as i32).collect();
+            assert_eq!(y, expected, "DST-VII-8 printed row {k} mismatch");
+        }
+    }
+
+    /// Orientation pin for the print-transposition erratum: the first
+    /// inverse basis of every DST-VII size (the response to a lone DC
+    /// coefficient) is monotonically non-decreasing (the largest two
+    /// integer-rounded samples may tie). This is true of every printed
+    /// ROW 0 and false of every printed COLUMN 0 (which rises then
+    /// falls past the kernel's half-period), so it discriminates the
+    /// two readings from the Recommendation's own data.
+    #[test]
+    fn dst_vii_first_basis_is_monotone() {
+        for n in [4usize, 8, 16, 32] {
+            let mut x = vec![0i32; n];
+            x[0] = 1000;
+            let y = one_d_transform(TrType::DstVII, n, 1, &x).unwrap();
+            for i in 1..n {
+                assert!(y[i] >= y[i - 1], "DST-VII {n} first basis dips at {i}");
+            }
+            assert!(y[n - 1] > y[0], "DST-VII {n} first basis is flat");
         }
     }
 
@@ -1462,7 +1433,7 @@ mod tests {
         let _y_full = one_d_transform(TrType::DstVII, 4, 4, &x_full).unwrap();
         let y_trunc = one_d_transform(TrType::DstVII, 4, 2, &x_full).unwrap();
         let expected: Vec<i32> = (0..4)
-            .map(|i| (DST_VII_4[i][0] as i32 * 10) + (DST_VII_4[i][1] as i32 * 20))
+            .map(|i| (DST_VII_4[0][i] as i32 * 10) + (DST_VII_4[1][i] as i32 * 20))
             .collect();
         assert_eq!(y_trunc, expected);
     }
@@ -1627,7 +1598,7 @@ mod tests {
         let mut x = [0i32; 16];
         x[0] = 1;
         let y = one_d_transform(TrType::DstVII, 16, 1, &x).unwrap();
-        let expected: Vec<i32> = DST_VII_16.iter().map(|row| row[0] as i32).collect();
+        let expected: Vec<i32> = DST_VII_16[0].iter().map(|&v| v as i32).collect();
         assert_eq!(y, expected);
     }
 
@@ -1636,7 +1607,7 @@ mod tests {
         let mut x = [0i32; 16];
         x[0] = 1;
         let y = one_d_transform(TrType::DctVIII, 16, 1, &x).unwrap();
-        let expected: Vec<i32> = DCT_VIII_16.iter().map(|row| row[0] as i32).collect();
+        let expected: Vec<i32> = DCT_VIII_16[0].iter().map(|&v| v as i32).collect();
         assert_eq!(y, expected);
     }
 
@@ -2139,16 +2110,18 @@ mod tests {
         assert_eq!(t(4), (TrType::DctVIII, TrType::DctVIII));
     }
 
-    /// Rebuild the full 32-point DST-VII rows 16..31 from the printed
-    /// eq. 1189 + 1191 sub-tables (see the [`DST_VII_32_ROWS_16_31`]
-    /// erratum note). Every printed entry `[m][n]` (m = 0..15 output
-    /// row, n = 0..31 coefficient column) carries the kernel value for
-    /// the folded index product `(2m + 1)·(n + 1) mod 130` — the 512
-    /// printed entries agree on a single 33-entry value table covering
-    /// every index 0..32, and the rows 16..31 follow from the same
-    /// mapping.
+    /// The printed 32-point DST-VII sub-tables (eqs. 1189 + 1191) are
+    /// two blocks of ONE kernel: every printed entry `[ r ][ c ]`
+    /// carries the kernel value for the folded index product
+    /// `(2r + 1)·(c + 1) mod 130` (columns 16..31 continue at
+    /// `c + 17`), and the 512 printed entries agree on a single
+    /// 33-entry value table covering every index 0..32. This pins the
+    /// two blocks as the halves eq. 1188 / eq. 1190 declare — split
+    /// along the SECOND printed axis — so the only reading that fills
+    /// the declared `m = 0..31` range is the transposed one the
+    /// module-level erratum note describes.
     #[test]
-    fn dst_vii_32_rows_16_31_derivation() {
+    fn dst_vii_32_printed_blocks_are_one_kernel() {
         // Fold a kernel index product into (sign, canonical index).
         let fold = |p: i64| -> (i64, usize) {
             let p = p.rem_euclid(130);
@@ -2156,32 +2129,28 @@ mod tests {
             (s, p.min(65 - p) as usize)
         };
         let mut lut = [None::<i64>; 33];
-        for m in 0..16i64 {
-            for n in 0..32i64 {
-                let printed = if n < 16 {
-                    DST_VII_32_COL_0_15[m as usize][n as usize]
+        for r in 0..16i64 {
+            for c in 0..32i64 {
+                let printed = if c < 16 {
+                    DST_VII_32_COL_0_15[r as usize][c as usize]
                 } else {
-                    DST_VII_32_COL_16_31[m as usize][(n - 16) as usize]
+                    DST_VII_32_COL_16_31[r as usize][(c - 16) as usize]
                 } as i64;
-                let (s, i) = fold((2 * m + 1) * (n + 1));
+                let (s, i) = fold((2 * r + 1) * (c + 1));
                 let v = s * printed;
                 assert_eq!(*lut[i].get_or_insert(v), v, "value table at {i}");
             }
         }
-        for (m, row) in DST_VII_32_ROWS_16_31.iter().enumerate() {
-            for (n, &want) in row.iter().enumerate() {
-                let (s, i) = fold((2 * (m as i64 + 16) + 1) * (n as i64 + 1));
-                assert_eq!(s * lut[i].unwrap(), want as i64, "row {m} col {n}");
-            }
-        }
+        assert!(lut.iter().all(|v| v.is_some()), "kernel value table gap");
     }
 
-    /// Same rebuild for the 32-point DCT-VIII rows 16..31 (folded
-    /// index product `(2m + 1)·(2n + 1) mod 260`, eqs. 1196 + 1198);
-    /// the symmetric kernel also makes the needed rows the transpose
-    /// of the printed eq. 1198 block, asserted alongside.
+    /// DCT-VIII twin (folded index product `(2r + 1)·(2c + 1) mod
+    /// 260`, eqs. 1196 + 1198). The symmetric kernel additionally
+    /// makes the eq. 1198 block's transposed read equal its printed
+    /// high-frequency read — asserted so the DST-VII/DCT-VIII
+    /// asymmetry stays documented.
     #[test]
-    fn dct_viii_32_rows_16_31_derivation() {
+    fn dct_viii_32_printed_blocks_are_one_kernel() {
         let fold = |p: i64| -> (i64, usize) {
             let p = p.rem_euclid(260);
             let p = if p > 130 { 260 - p } else { p };
@@ -2192,53 +2161,59 @@ mod tests {
             }
         };
         let mut lut = [None::<i64>; 66];
-        for m in 0..16i64 {
-            for n in 0..32i64 {
-                let printed = if n < 16 {
-                    DCT_VIII_32_COL_0_15[m as usize][n as usize]
+        for r in 0..16i64 {
+            for c in 0..32i64 {
+                let printed = if c < 16 {
+                    DCT_VIII_32_COL_0_15[r as usize][c as usize]
                 } else {
-                    DCT_VIII_32_COL_16_31[m as usize][(n - 16) as usize]
+                    DCT_VIII_32_COL_16_31[r as usize][(c - 16) as usize]
                 } as i64;
-                let (s, i) = fold((2 * m + 1) * (2 * n + 1));
+                let (s, i) = fold((2 * r + 1) * (2 * c + 1));
                 let v = s * printed;
                 assert_eq!(*lut[i].get_or_insert(v), v, "value table at {i}");
             }
         }
-        for (m, row) in DCT_VIII_32_ROWS_16_31.iter().enumerate() {
-            for (n, &want) in row.iter().enumerate() {
-                let (s, i) = fold((2 * (m as i64 + 16) + 1) * (2 * n as i64 + 1));
-                assert_eq!(s * lut[i].unwrap(), want as i64, "row {m} col {n}");
-                // Symmetric kernel: rows 16..31 are the printed
-                // eq. 1198 block transposed.
-                assert_eq!(want, DCT_VIII_32_COL_16_31[n][m], "transpose {m},{n}");
+        // Symmetry: printed[r][c] of the eq. 1198 block equals the
+        // kernel at the swapped indices, i.e. the transposed read
+        // coincides with the high-frequency-rows read.
+        for r in 0..16 {
+            for c in 0..16 {
+                let (s, i) = fold((2 * (c as i64 + 16) + 1) * (2 * r as i64 + 1));
+                assert_eq!(
+                    s * lut[i].unwrap(),
+                    DCT_VIII_32_COL_16_31[r][c] as i64,
+                    "symmetry {r},{c}"
+                );
             }
         }
     }
 
-    /// The corrected full 32×16 inverse matrices are near-orthogonal
-    /// (tuned-integer kernels: basis-column norms within 1% of each
-    /// other, cross-correlations below 0.3% of the norm). The eq. 1190
-    /// / eq. 1197 sub-tables read literally fail this by two orders of
-    /// magnitude — this pins the erratum resolution.
+    /// The 16 inverse basis vectors of each 32-point MTS kernel under
+    /// the transposed (erratum-corrected) reading — basis j sampled as
+    /// `printed[ j ][ i ]` over Col0to15 ∥ Col16to31 — are
+    /// near-orthonormal (tuned-integer kernels: norms within ~1%,
+    /// cross-correlations below ~0.3% of the norm). The literal
+    /// untransposed reading assembles length-32 spatial slices of only
+    /// 16 frequencies and fails this by two orders of magnitude.
     #[test]
     fn mts_32_point_matrices_near_orthogonal() {
-        for (top, bottom) in [
-            (&DST_VII_32_COL_0_15, &DST_VII_32_ROWS_16_31),
-            (&DCT_VIII_32_COL_0_15, &DCT_VIII_32_ROWS_16_31),
+        for (lo, hi) in [
+            (&DST_VII_32_COL_0_15, &DST_VII_32_COL_16_31),
+            (&DCT_VIII_32_COL_0_15, &DCT_VIII_32_COL_16_31),
         ] {
-            let col = |n: usize| -> Vec<i64> {
+            let basis = |j: usize| -> Vec<i64> {
                 (0..32)
-                    .map(|m| (if m < 16 { top[m][n] } else { bottom[m - 16][n] }) as i64)
+                    .map(|i| (if i < 16 { lo[j][i] } else { hi[j][i - 16] }) as i64)
                     .collect()
             };
             for a in 0..16 {
-                let ca = col(a);
-                let norm: i64 = ca.iter().map(|v| v * v).sum();
-                assert!((130_000 - norm).abs() < 1_500, "col {a} norm {norm}");
+                let ba = basis(a);
+                let norm: i64 = ba.iter().map(|v| v * v).sum();
+                assert!((130_000 - norm).abs() < 1_500, "basis {a} norm {norm}");
                 for b in a + 1..16 {
-                    let cb = col(b);
-                    let dot: i64 = ca.iter().zip(&cb).map(|(x, y)| x * y).sum();
-                    assert!(dot.abs() < 400, "cols {a},{b} dot {dot}");
+                    let bb = basis(b);
+                    let dot: i64 = ba.iter().zip(&bb).map(|(x, y)| x * y).sum();
+                    assert!(dot.abs() < 400, "bases {a},{b} dot {dot}");
                 }
             }
         }

@@ -1141,7 +1141,7 @@ impl LeafCuCtxs {
             mts_idx: init_contexts(SyntaxCtx::MtsIdx, slice_qp_y),
             palette: crate::palette::PaletteCtxs::init(slice_qp_y, init_type),
             init_type,
-            residual: ResidualCtxs::init(slice_qp_y),
+            residual: ResidualCtxs::init_with_init_type(slice_qp_y, init_type),
         }
     }
 }
@@ -1582,7 +1582,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if bdpcm_gate {
             // Table 132 — ctxInc 0; Table 69 init values plumbed via
             // SyntaxCtx::IntraBdpcmLumaFlag.
-            let inc = ctx_inc_intra_bdpcm_luma_flag() as usize;
+            let inc = self.ctxs.init_type as usize + ctx_inc_intra_bdpcm_luma_flag() as usize;
             let n = self.ctxs.intra_bdpcm_luma_flag.len() - 1;
             let bit = self
                 .dec
@@ -1590,7 +1590,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.intra_bdpcm_luma = bit == 1;
             if info.intra_bdpcm_luma {
                 // intra_bdpcm_luma_dir_flag — Table 70.
-                let inc = ctx_inc_intra_bdpcm_luma_dir_flag() as usize;
+                let inc =
+                    self.ctxs.init_type as usize + ctx_inc_intra_bdpcm_luma_dir_flag() as usize;
                 let n = self.ctxs.intra_bdpcm_luma_dir_flag.len() - 1;
                 let bit = self
                     .dec
@@ -1627,6 +1628,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 neigh.left.map(|n| n.mip).unwrap_or(false),
                 neigh.above.map(|n| n.mip).unwrap_or(false),
             ) as usize;
+            let inc = self.ctxs.init_type as usize * 4 + inc;
             let n = self.ctxs.intra_mip_flag.len() - 1;
             let bit = self
                 .dec
@@ -1659,11 +1661,12 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // bins. Each bin gets its own ctxInc per
         // [`ctx_inc_intra_luma_ref_idx`].
         if self.tools.mrl && (info.y0 % self.tools.ctb_size_y) > 0 {
+            let off = self.ctxs.init_type as usize * 2;
             let ctxs = &mut self.ctxs.intra_luma_ref_idx;
             let n = ctxs.len() - 1;
             let mut val = 0u32;
             for bin_idx in 0..2u32 {
-                let inc = ctx_inc_intra_luma_ref_idx(bin_idx) as usize;
+                let inc = off + ctx_inc_intra_luma_ref_idx(bin_idx) as usize;
                 let bit = self.dec.decode_decision(&mut ctxs[inc.min(n)])?;
                 if bit == 0 {
                     break;
@@ -1684,7 +1687,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             && info.cb_width * info.cb_height > self.tools.min_tb_size_y * self.tools.min_tb_size_y;
         let mut isp_mode_flag = false;
         if isp_gate {
-            let inc = ctx_inc_intra_subpartitions_mode_flag() as usize;
+            let inc =
+                self.ctxs.init_type as usize + ctx_inc_intra_subpartitions_mode_flag() as usize;
             let n = self.ctxs.intra_subpartitions_mode_flag.len() - 1;
             let bit = self
                 .dec
@@ -1692,7 +1696,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             isp_mode_flag = bit == 1;
         }
         if isp_mode_flag {
-            let inc = ctx_inc_intra_subpartitions_split_flag() as usize;
+            let inc =
+                self.ctxs.init_type as usize + ctx_inc_intra_subpartitions_split_flag() as usize;
             let n = self.ctxs.intra_subpartitions_split_flag.len() - 1;
             let split_bit = self
                 .dec
@@ -1708,10 +1713,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
 
         // intra_luma_mpm_flag — only present when intra_luma_ref_idx == 0.
         if info.intra_luma_ref_idx == 0 {
-            let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+            let inc = self.ctxs.init_type as usize + ctx_inc_intra_luma_mpm_flag() as usize;
+            let n = self.ctxs.intra_luma_mpm_flag.len() - 1;
             let bit = self
                 .dec
-                .decode_decision(&mut self.ctxs.intra_luma_mpm_flag[inc])?;
+                .decode_decision(&mut self.ctxs.intra_luma_mpm_flag[inc.min(n)])?;
             info.intra_luma_mpm_flag = bit == 1;
         } else {
             // MRL index > 0 implies the MPM is used (not_planar and mpm_idx).
@@ -1721,7 +1727,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if info.intra_luma_mpm_flag {
             if info.intra_luma_ref_idx == 0 {
                 // intra_luma_not_planar_flag.
-                let inc = ctx_inc_intra_luma_not_planar_flag(isp_mode_flag) as usize;
+                let inc = self.ctxs.init_type as usize * 2
+                    + ctx_inc_intra_luma_not_planar_flag(isp_mode_flag) as usize;
                 let n = self.ctxs.intra_luma_not_planar_flag.len() - 1;
                 let bit = self
                     .dec
@@ -1938,14 +1945,15 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             && info.cb_width / sub_w <= self.tools.max_ts_size
             && info.cb_height / sub_h <= self.tools.max_ts_size;
         if bdpcm_chroma_gate {
-            let inc = ctx_inc_intra_bdpcm_chroma_flag() as usize;
+            let inc = self.ctxs.init_type as usize + ctx_inc_intra_bdpcm_chroma_flag() as usize;
             let n = self.ctxs.intra_bdpcm_chroma_flag.len() - 1;
             let bit = self
                 .dec
                 .decode_decision(&mut self.ctxs.intra_bdpcm_chroma_flag[inc.min(n)])?;
             info.intra_bdpcm_chroma = bit == 1;
             if info.intra_bdpcm_chroma {
-                let inc = ctx_inc_intra_bdpcm_chroma_dir_flag() as usize;
+                let inc =
+                    self.ctxs.init_type as usize + ctx_inc_intra_bdpcm_chroma_dir_flag() as usize;
                 let n = self.ctxs.intra_bdpcm_chroma_dir_flag.len() - 1;
                 let bit = self
                     .dec
@@ -2069,7 +2077,14 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         c_idx,
                     )?
                 } else {
-                    false
+                    // §7.4.12.5 — an absent transform_skip_flag on a
+                    // BDPCM TB is inferred 1 (r443 fix: the
+                    // dual-tree-chroma path previously ran a
+                    // BDPCM-chroma TB through regular
+                    // residual_coding(), desyncing at the first such
+                    // CU; the single-tree paths got this inference in
+                    // r440).
+                    info.intra_bdpcm_chroma
                 };
                 let levels = if ts && !self.tools.ts_residual_coding_disabled {
                     crate::residual::decode_ts_tb_coefficients(
@@ -4750,7 +4765,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             && info.cb_width / sub_w <= self.tools.max_ts_size
             && info.cb_height / sub_h <= self.tools.max_ts_size;
         if bdpcm_chroma_gate {
-            let inc = ctx_inc_intra_bdpcm_chroma_flag() as usize;
+            let inc = self.ctxs.init_type as usize + ctx_inc_intra_bdpcm_chroma_flag() as usize;
             let n = self.ctxs.intra_bdpcm_chroma_flag.len() - 1;
             let bit = self
                 .dec
@@ -4758,7 +4773,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 .unwrap_or(0);
             info.intra_bdpcm_chroma = bit == 1;
             if info.intra_bdpcm_chroma {
-                let inc = ctx_inc_intra_bdpcm_chroma_dir_flag() as usize;
+                let inc =
+                    self.ctxs.init_type as usize + ctx_inc_intra_bdpcm_chroma_dir_flag() as usize;
                 let n = self.ctxs.intra_bdpcm_chroma_dir_flag.len() - 1;
                 let bit = self
                     .dec
@@ -4821,7 +4837,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     fn read_intra_chroma_pred_mode(&mut self) -> Result<u32> {
         // Binarisation Table 130:
         //   val==4 → "0", val∈0..3 → "1" + FL(2 bits).
-        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        let inc = self.ctxs.init_type as usize + ctx_inc_intra_chroma_pred_mode() as usize;
         let n = self.ctxs.intra_chroma_pred_mode.len() - 1;
         let bin0 = self
             .dec
@@ -8969,13 +8985,13 @@ mod tests {
             enc.encode_decision(&mut ctxs.pred_mode_flag[pm_slot], 1)
                 .unwrap();
         }
-        let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+        let inc = init_type as usize + ctx_inc_intra_luma_mpm_flag() as usize;
         enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[inc], 1)
             .unwrap();
-        let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+        let inc = init_type as usize * 2 + ctx_inc_intra_luma_not_planar_flag(false) as usize;
         enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[inc], 0)
             .unwrap();
-        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        let inc = init_type as usize + ctx_inc_intra_chroma_pred_mode() as usize;
         enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
             .unwrap();
         write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();
@@ -9259,13 +9275,13 @@ mod tests {
         )
         .unwrap();
         // NO pred_mode_ibc_flag bin — straight to the intra cascade.
-        let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+        let inc = init_type as usize + ctx_inc_intra_luma_mpm_flag() as usize;
         enc.encode_decision(&mut ctxs.intra_luma_mpm_flag[inc], 1)
             .unwrap();
-        let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+        let inc = init_type as usize * 2 + ctx_inc_intra_luma_not_planar_flag(false) as usize;
         enc.encode_decision(&mut ctxs.intra_luma_not_planar_flag[inc], 0)
             .unwrap();
-        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        let inc = init_type as usize + ctx_inc_intra_chroma_pred_mode() as usize;
         enc.encode_decision(&mut ctxs.intra_chroma_pred_mode[inc], 0)
             .unwrap();
         write_tu_cb_coded_flag(&mut enc, &mut ctxs.residual, false, false).unwrap();

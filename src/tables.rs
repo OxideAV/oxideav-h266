@@ -75,6 +75,8 @@ pub enum SyntaxCtx {
     /// Round-55: per Table 132 the ctxInc =
     /// `2 * mtt_split_cu_vertical_flag + (mttDepth <= 1 ? 1 : 0)`.
     MttSplitCuBinaryFlag,
+    /// Table 63 — `non_inter_flag` (4 ctxIdx; P → 0..1, B → 2..3).
+    NonInterFlag,
     PredModeFlag,
     IntraBdpcmLumaFlag,
     IntraBdpcmLumaDirFlag,
@@ -318,6 +320,11 @@ pub const MTT_SPLIT_CU_BINARY_FLAG_SHIFT: &[u8] = &[12, 13, 12, 13, 12, 13, 12, 
 /// Table 66 — `pred_mode_flag` (4 ctxIdx).
 pub const PRED_MODE_FLAG_INIT: &[u8] = &[40, 35, 40, 35];
 pub const PRED_MODE_FLAG_SHIFT: &[u8] = &[5, 1, 5, 1];
+
+/// Table 63 — `non_inter_flag` (4 ctxIdx; P slices address 0..1, B
+/// slices 2..3, I slices never code the bin).
+pub const NON_INTER_FLAG_INIT: &[u8] = &[25, 12, 25, 20];
+pub const NON_INTER_FLAG_SHIFT: &[u8] = &[1, 0, 1, 0];
 
 /// Table 67 — `pred_mode_plt_flag` (3 ctxIdx, one per initType ∈
 /// {0, 1, 2}). From the spec table:
@@ -853,6 +860,7 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
             MTT_SPLIT_CU_BINARY_FLAG_INIT,
             MTT_SPLIT_CU_BINARY_FLAG_SHIFT,
         ),
+        SyntaxCtx::NonInterFlag => (NON_INTER_FLAG_INIT, NON_INTER_FLAG_SHIFT),
         SyntaxCtx::PredModeFlag => (PRED_MODE_FLAG_INIT, PRED_MODE_FLAG_SHIFT),
         SyntaxCtx::IntraBdpcmLumaFlag => (INTRA_BDPCM_LUMA_FLAG_INIT, INTRA_BDPCM_LUMA_FLAG_SHIFT),
         SyntaxCtx::IntraBdpcmLumaDirFlag => (
@@ -969,6 +977,25 @@ pub fn init_contexts(kind: SyntaxCtx, slice_qp_y: i32) -> Vec<ContextModel> {
         .zip(shift.iter())
         .map(|(&iv, &sh)| ContextModel::init(iv, sh, slice_qp_y))
         .collect()
+}
+
+/// §9.3.2.2 — initialise only the context variables of ONE `initType`
+/// column. Every per-element initValue table lists its three initType
+/// columns back-to-back (I at `0..per`, then the two P/B rows), so the
+/// slice `[initType * per, (initType + 1) * per)` holds exactly the
+/// models a slice of that initType addresses with a plain `ctxInc`
+/// index. Callers that keep the full table must add the
+/// `initType * per` offset themselves instead.
+pub fn init_contexts_for_type(
+    kind: SyntaxCtx,
+    slice_qp_y: i32,
+    init_type: u8,
+) -> Vec<ContextModel> {
+    let all = init_contexts(kind, slice_qp_y);
+    debug_assert_eq!(all.len() % 3, 0, "ctx table not 3-way splittable");
+    let per = all.len() / 3;
+    let start = (init_type as usize).min(2) * per;
+    all[start..start + per].to_vec()
 }
 
 #[cfg(test)]

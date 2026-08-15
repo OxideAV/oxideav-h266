@@ -869,7 +869,7 @@ fn decode_p_slice_writes_motion_field() {
 fn decode_b_slice_all_skip_bipred_matches_average() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -908,7 +908,7 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
     // init_type = 2 per Table 51.
     let slice_qp = 26;
     let init_type = 2u8;
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
 
@@ -993,7 +993,7 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
 fn decode_b_slice_writes_bipred_motion_field() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -1010,7 +1010,7 @@ fn decode_b_slice_writes_bipred_motion_field() {
 
     let slice_qp = 26;
     let init_type = 2u8;
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
@@ -1235,7 +1235,7 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
     use oxideav_h266::ctx::{
         ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     // 16x16 picture inside a single 32-CTU. The walker recurses
     // walk(0,0,16,16): split_cu_flag(1) + split_qt_flag(1) → four 8x8
@@ -1253,8 +1253,8 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
 
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
-    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
+    let mut split_qt_ctxs = init_contexts_for_type(SyntaxCtx::SplitQtFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
@@ -1442,7 +1442,7 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
     use oxideav_h266::inter::{MotionField, MotionVector, MvField};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -1492,7 +1492,7 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
     // HMVP empty at slice start).
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
@@ -1678,7 +1678,7 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
         ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
     };
     use oxideav_h266::inter::{MotionField, MotionVector, MvField};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -1731,8 +1731,8 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
     // CU0=0, CU1=1, CU2=1, CU3=4.
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
-    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
+    let mut split_qt_ctxs = init_contexts_for_type(SyntaxCtx::SplitQtFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
     let mut enc = ArithEncoder::new();
@@ -1943,7 +1943,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_split_cu_flag};
     use oxideav_h266::inter::MotionVector;
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -1966,7 +1966,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
 
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut mmvd_merge_ctxs = init_contexts(SyntaxCtx::MmvdMergeFlag, slice_qp);
     let mut mmvd_cand_ctxs = init_contexts(SyntaxCtx::MmvdCandFlag, slice_qp);
@@ -2139,7 +2139,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -2162,7 +2162,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
 
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
     let mut regular_merge_ctxs = init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp);
@@ -2227,7 +2227,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     //    parsed rather than inferred), tu_y_coded(0), then a
     //    single-DC 4×4 Cr residual TB — the asserted luma plane stays
     //    untouched by the residual.
-    let mut res_ctxs = ResidualCtxs::init(slice_qp);
+    let mut res_ctxs = ResidualCtxs::init_with_init_type(slice_qp, init_type);
     write_tu_cb_coded_flag(&mut enc, &mut res_ctxs, false, false).unwrap();
     write_tu_cr_coded_flag(&mut enc, &mut res_ctxs, true, false, false).unwrap();
     write_tu_y_coded_flag(&mut enc, &mut res_ctxs, false, false, false, false).unwrap();
@@ -2332,7 +2332,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
 fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 8u32;
@@ -2379,8 +2379,8 @@ fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     // → mergeCandList[0] = bipred zero-MV pad.
     let slice_qp = 26;
     let init_type = 2u8;
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
-    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
+    let mut split_qt_ctxs = init_contexts_for_type(SyntaxCtx::SplitQtFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut merge_idx_ctxs = init_contexts(SyntaxCtx::MergeIdx, slice_qp);
 
@@ -2517,7 +2517,7 @@ fn decode_b_slice_gpm_fires_and_decodes() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -2539,7 +2539,7 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     let slice_qp = 26;
     let init_type = 2u8; // B-slice, sh_cabac_init_flag = 0
 
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
     let mut regular_merge_ctxs = init_contexts(SyntaxCtx::RegularMergeFlag, slice_qp);
@@ -2605,7 +2605,7 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     //    parsed rather than inferred), tu_y_coded(0), then a
     //    single-DC 8×8 Cr residual TB — the asserted luma plane stays
     //    untouched by the residual.
-    let mut res_ctxs = ResidualCtxs::init(slice_qp);
+    let mut res_ctxs = ResidualCtxs::init_with_init_type(slice_qp, init_type);
     write_tu_cb_coded_flag(&mut enc, &mut res_ctxs, false, false).unwrap();
     write_tu_cr_coded_flag(&mut enc, &mut res_ctxs, true, false, false).unwrap();
     write_tu_y_coded_flag(&mut enc, &mut res_ctxs, false, false, false, false).unwrap();
@@ -3658,7 +3658,7 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
     use oxideav_h266::residual_enc::{
         write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -3671,8 +3671,8 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
 
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, sh_cabac_init_flag = 0
-    let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
-    let mut split_qt_ctxs = init_contexts(SyntaxCtx::SplitQtFlag, slice_qp);
+    let mut split_cu_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
+    let mut split_qt_ctxs = init_contexts_for_type(SyntaxCtx::SplitQtFlag, slice_qp, init_type);
     let mut leaf_ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
     let mut enc = ArithEncoder::new();
 
@@ -3736,14 +3736,15 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
     let pm_slot = ((init_type as usize - 1) * 2 + pm_inc).min(pm_n);
     enc.encode_decision(&mut leaf_ctxs.pred_mode_flag[pm_slot], 1)
         .unwrap();
-    // Intra cascade: MPM → PLANAR; DM chroma; all CBFs 0.
-    let inc = ctx_inc_intra_luma_mpm_flag() as usize;
+    // Intra cascade: MPM → PLANAR; DM chroma; all CBFs 0. The intra
+    // elements' ctxIdx carries the §9.3.2.2 initType offset (r443).
+    let inc = init_type as usize + ctx_inc_intra_luma_mpm_flag() as usize;
     enc.encode_decision(&mut leaf_ctxs.intra_luma_mpm_flag[inc], 1)
         .unwrap();
-    let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+    let inc = init_type as usize * 2 + ctx_inc_intra_luma_not_planar_flag(false) as usize;
     enc.encode_decision(&mut leaf_ctxs.intra_luma_not_planar_flag[inc], 0)
         .unwrap();
-    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    let inc = init_type as usize + ctx_inc_intra_chroma_pred_mode() as usize;
     enc.encode_decision(&mut leaf_ctxs.intra_chroma_pred_mode[inc], 0)
         .unwrap();
     write_tu_cb_coded_flag(&mut enc, &mut leaf_ctxs.residual, false, false).unwrap();
@@ -3819,7 +3820,7 @@ fn decode_p_slice_ibc_cu_copies_inter_ctu() {
     use oxideav_h266::leaf_cu::LeafCuCtxs;
     use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
     use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 64u32;
     let pic_h = 32u32;
@@ -3847,7 +3848,7 @@ fn decode_p_slice_ibc_cu_copies_inter_ctu() {
     };
 
     let mut enc = ArithEncoder::new();
-    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
     let init_off = (init_type as usize) * 3;
 
@@ -4133,7 +4134,7 @@ fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
     use oxideav_h266::leaf_cu::LeafCuCtxs;
     use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
     use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4154,7 +4155,7 @@ fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
     };
 
     let mut enc = ArithEncoder::new();
-    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
     let init_off = (init_type as usize) * 3;
 
@@ -4246,7 +4247,7 @@ fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
     use oxideav_h266::leaf_cu::{InterPredDir, LeafCuCtxs};
     use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
     use oxideav_h266::non_merge_mvp_syntax_enc::{encode_inter_pred_idc, encode_mvp_lx_flag};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4265,7 +4266,7 @@ fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
     };
 
     let mut enc = ArithEncoder::new();
-    let mut split_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
+    let mut split_ctxs = init_contexts_for_type(SyntaxCtx::SplitCuFlag, slice_qp, init_type);
     let mut ctxs = LeafCuCtxs::init_with_init_type(slice_qp, init_type);
     let init_off = (init_type as usize) * 3;
 

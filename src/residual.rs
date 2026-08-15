@@ -66,7 +66,7 @@ use crate::ctx::{
     loc_num_sig_and_sum_abs_pass1_ts, loc_sum_abs_rice, rice_param_from_loc_sum_abs,
 };
 use crate::scan::{coeff_scan_positions, sb_grid};
-use crate::tables::{init_contexts, SyntaxCtx};
+use crate::tables::SyntaxCtx;
 
 /// Context array bundle used by the residual decoder + the TU-level
 /// CBF / QP-delta reads.
@@ -95,26 +95,35 @@ pub struct ResidualCtxs {
 }
 
 impl ResidualCtxs {
+    /// I-slice (`initType = 0`) context bundle — the historical
+    /// entry point every encoder path uses.
     pub fn init(slice_qp_y: i32) -> Self {
+        Self::init_with_init_type(slice_qp_y, 0)
+    }
+
+    /// §9.3.2.2 — context bundle initialised for one `initType`. Each
+    /// vector holds ONLY that initType's models (the tables' 3-way
+    /// column split), so every read site's plain-`ctxInc` index is the
+    /// spec ctxIdx regardless of slice type.
+    pub fn init_with_init_type(slice_qp_y: i32, init_type: u8) -> Self {
+        use crate::tables::init_contexts_for_type as ict;
+        let t = init_type;
         Self {
-            sig_coeff: init_contexts(SyntaxCtx::SigCoeffFlag, slice_qp_y),
-            sb_coded: init_contexts(SyntaxCtx::SbCodedFlag, slice_qp_y),
-            abs_gtx: init_contexts(SyntaxCtx::AbsLevelGtxFlag, slice_qp_y),
-            par_level: init_contexts(SyntaxCtx::ParLevelFlag, slice_qp_y),
-            last_x: init_contexts(SyntaxCtx::LastSigCoeffXPrefix, slice_qp_y),
-            last_y: init_contexts(SyntaxCtx::LastSigCoeffYPrefix, slice_qp_y),
-            tu_y_coded: init_contexts(SyntaxCtx::TuYCodedFlag, slice_qp_y),
-            tu_cb_coded: init_contexts(SyntaxCtx::TuCbCodedFlag, slice_qp_y),
-            tu_cr_coded: init_contexts(SyntaxCtx::TuCrCodedFlag, slice_qp_y),
-            cu_qp_delta_abs: init_contexts(SyntaxCtx::CuQpDeltaAbs, slice_qp_y),
-            cu_chroma_qp_offset_flag: init_contexts(SyntaxCtx::CuChromaQpOffsetFlag, slice_qp_y),
-            cu_chroma_qp_offset_idx: init_contexts(SyntaxCtx::CuChromaQpOffsetIdx, slice_qp_y),
-            tu_joint_cbcr_residual_flag: init_contexts(
-                SyntaxCtx::TuJointCbCrResidualFlag,
-                slice_qp_y,
-            ),
-            transform_skip_flag: init_contexts(SyntaxCtx::TransformSkipFlag, slice_qp_y),
-            coeff_sign: init_contexts(SyntaxCtx::CoeffSignFlag, slice_qp_y),
+            sig_coeff: ict(SyntaxCtx::SigCoeffFlag, slice_qp_y, t),
+            sb_coded: ict(SyntaxCtx::SbCodedFlag, slice_qp_y, t),
+            abs_gtx: ict(SyntaxCtx::AbsLevelGtxFlag, slice_qp_y, t),
+            par_level: ict(SyntaxCtx::ParLevelFlag, slice_qp_y, t),
+            last_x: ict(SyntaxCtx::LastSigCoeffXPrefix, slice_qp_y, t),
+            last_y: ict(SyntaxCtx::LastSigCoeffYPrefix, slice_qp_y, t),
+            tu_y_coded: ict(SyntaxCtx::TuYCodedFlag, slice_qp_y, t),
+            tu_cb_coded: ict(SyntaxCtx::TuCbCodedFlag, slice_qp_y, t),
+            tu_cr_coded: ict(SyntaxCtx::TuCrCodedFlag, slice_qp_y, t),
+            cu_qp_delta_abs: ict(SyntaxCtx::CuQpDeltaAbs, slice_qp_y, t),
+            cu_chroma_qp_offset_flag: ict(SyntaxCtx::CuChromaQpOffsetFlag, slice_qp_y, t),
+            cu_chroma_qp_offset_idx: ict(SyntaxCtx::CuChromaQpOffsetIdx, slice_qp_y, t),
+            tu_joint_cbcr_residual_flag: ict(SyntaxCtx::TuJointCbCrResidualFlag, slice_qp_y, t),
+            transform_skip_flag: ict(SyntaxCtx::TransformSkipFlag, slice_qp_y, t),
+            coeff_sign: ict(SyntaxCtx::CoeffSignFlag, slice_qp_y, t),
         }
     }
 }
@@ -1222,12 +1231,16 @@ pub fn decode_ts_tb_coefficients(
             // The previous gtx for j == 1 is abs_level_gtx_flag[n][0],
             // which is set iff AbsLevelPass1 >= 2 (sig + gt1, par adds at
             // most 1 so a value >= 2 implies gt1 == 1).
+            // §7.3.11.12 — the whole j = 1..4 cascade of one
+            // coefficient runs once the n-loop admits it: the
+            // `RemCcbs >= 4` condition guards the LOOP (one budget
+            // check per coefficient, covering its up-to-4 flags), not
+            // the individual flags. An early per-flag budget break
+            // here desynced any sub-block whose budget ran out
+            // mid-cascade (r443 corpus fix).
             let mut prev_gtx = abs_level_pass1[at(xc, yc)] >= 2;
             for j in 1..5u32 {
                 if !prev_gtx {
-                    break;
-                }
-                if rem_ccbs < 4 {
                     break;
                 }
                 let sig_left = xc > 0 && sig_flag[at(xc - 1, yc)];
@@ -1322,15 +1335,20 @@ mod tests {
     /// we just assert a minimum-usable count.
     #[test]
     fn residual_ctxs_init_sizes() {
-        let ctxs = ResidualCtxs::init(32);
-        assert!(ctxs.sig_coeff.len() >= 64);
-        assert_eq!(ctxs.sb_coded.len(), 21);
-        assert!(ctxs.last_x.len() >= 32);
-        assert!(ctxs.last_y.len() >= 32);
-        assert_eq!(ctxs.tu_y_coded.len(), 12);
-        assert_eq!(ctxs.tu_cb_coded.len(), 6);
-        assert_eq!(ctxs.tu_cr_coded.len(), 9);
-        assert_eq!(ctxs.cu_qp_delta_abs.len(), 6);
+        // §9.3.2.2 — the bundle carries ONE initType's models: a third
+        // of each table (r443: P/B slices previously initialised from
+        // the I-slice columns).
+        for t in 0..3u8 {
+            let ctxs = ResidualCtxs::init_with_init_type(32, t);
+            assert_eq!(ctxs.sig_coeff.len(), 63);
+            assert_eq!(ctxs.sb_coded.len(), 7);
+            assert_eq!(ctxs.last_x.len(), 23);
+            assert_eq!(ctxs.last_y.len(), 23);
+            assert_eq!(ctxs.tu_y_coded.len(), 4);
+            assert_eq!(ctxs.tu_cb_coded.len(), 2);
+            assert_eq!(ctxs.tu_cr_coded.len(), 3);
+            assert_eq!(ctxs.cu_qp_delta_abs.len(), 2);
+        }
     }
 
     /// 4x4 TB with a zero-stream: the whole TB is all zero. Since a

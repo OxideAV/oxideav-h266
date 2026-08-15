@@ -575,17 +575,14 @@ pub struct SliceCabacState {
 
 impl SliceCabacState {
     /// Initialise the CABAC context bundle for the first CTU of a
-    /// slice using §9.3.2.2 entry arithmetic via [`TreeCtxs::init`].
-    ///
-    /// This is the "simplest pipeline" path: it picks the I-slice
-    /// initValue/shift rows unconditionally. When the I-slice walker
-    /// is extended to P/B, the `sh_cabac_init_flag` bit will swap in
-    /// the alternative row per spec Table 52.
-    pub fn init_for_slice(slice_qp_y: SliceQpY, sh_cabac_init_flag: bool) -> Self {
+    /// slice using §9.3.2.2 entry arithmetic via
+    /// [`TreeCtxs::init_with_init_type`] — `init_type` is the
+    /// slice-type + `sh_cabac_init_flag` derived value (0 / 1 / 2).
+    pub fn init_for_slice(slice_qp_y: SliceQpY, sh_cabac_init_flag: bool, init_type: u8) -> Self {
         Self {
             slice_qp_y,
             sh_cabac_init_flag,
-            tree_ctxs: TreeCtxs::init(slice_qp_y.as_init_qp()),
+            tree_ctxs: TreeCtxs::init_with_init_type(slice_qp_y.as_init_qp(), init_type),
         }
     }
 }
@@ -1250,8 +1247,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // arms from the slice flag.
 
         let slice_qp = SliceQpY::derive(sps, pps, sh, ph_qp_delta);
-        let cabac_state = SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag);
-        let arith = ArithDecoder::new(cabac_payload)?;
         // §9.3.2.2 / Table 51 — initType = 0 for I, otherwise picks
         // 1 / 2 from `sh_cabac_init_flag` per the slice type. The same
         // value drives the [`sao_syntax::SaoSyntaxConfig::init_type`]
@@ -1273,6 +1268,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 }
             }
         };
+        let cabac_state =
+            SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag, init_type);
+        let arith = ArithDecoder::new(cabac_payload)?;
         let leaf_ctxs = LeafCuCtxs::init_with_init_type(slice_qp.as_init_qp(), init_type);
 
         let sao_picture =
@@ -1461,8 +1459,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.sh = sh;
         self.cur_slice_id += 1;
         let slice_qp = SliceQpY::derive(self.sps, self.pps, sh, ph_qp_delta);
-        self.cabac = SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag);
-        self.arith = ArithDecoder::new(cabac_payload)?;
         self.init_type = match sh.sh_slice_type {
             SliceType::I => 0,
             SliceType::P => {
@@ -1480,6 +1476,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 }
             }
         };
+        self.cabac =
+            SliceCabacState::init_for_slice(slice_qp, sh.sh_cabac_init_flag, self.init_type);
+        self.arith = ArithDecoder::new(cabac_payload)?;
         self.leaf_ctxs = LeafCuCtxs::init_with_init_type(slice_qp.as_init_qp(), self.init_type);
         self.sao_ctxs = SaoCtxs::init(slice_qp.as_init_qp());
         if self.alf_ctxs.is_some() {
@@ -4279,7 +4278,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ) -> Result<()> {
         if dbg_cu_enabled() {
             eprintln!(
-                "CU DualTreeChroma ({},{}) {}x{} modeCraw={} modeC={} cbf_cb={} cbf_cr={} jcbcr={}",
+                "CU DualTreeChroma ({},{}) {}x{} modeCraw={} modeC={} cbf_cb={} cbf_cr={} jcbcr={} bdpcmC={} tsCb={} tsCr={}",
                 cu.cu.x,
                 cu.cu.y,
                 cu.cu.w,
@@ -4289,6 +4288,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.tu_cb_coded_flag,
                 info.tu_cr_coded_flag,
                 info.tu_joint_cbcr_residual_flag,
+                info.intra_bdpcm_chroma,
+                info.transform_skip_cb,
+                info.transform_skip_cr,
             );
         }
         if self.sps.sps_chroma_format_idc != 1 {
@@ -4658,7 +4660,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ) -> Result<()> {
         if dbg_cu_enabled() {
             eprintln!(
-                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} qpd={}",
+                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} qpd={} bdpcm={} ts={}",
                 tree,
                 cu.cu.x,
                 cu.cu.y,
@@ -4672,6 +4674,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.mts_idx,
                 info.tu_y_coded_flag,
                 info.cu_qp_delta_val,
+                info.intra_bdpcm_luma,
+                info.transform_skip_luma,
             );
         }
         // Round-21 inter dispatch — runs the §8.5.2 spatial-merge
@@ -5235,9 +5239,29 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let bvd = crate::amvr::apply_amvr_shift(info.inter.non_merge.mvd_l0, shift);
             bv = crate::ibc::fold_bv_with_bvd(bv, bvd);
         }
+        if dbg_cu_enabled() {
+            eprintln!(
+                "IBC ({x_cb},{y_cb}) {cb_w}x{cb_h} merge={} idx={bv_idx} bv=({},{}) \
+                 mvd=({},{}) amvr={:?} skip={}",
+                info.inter.general_merge_flag,
+                bv.x,
+                bv.y,
+                info.inter.non_merge.mvd_l0.x,
+                info.inter.non_merge.mvd_l0.y,
+                info.inter.non_merge.amvr_shift,
+                info.inter.cu_skip_flag,
+            );
+        }
         {
             let ibc = self.ibc.as_mut().expect("checked is_some above");
             if !ibc.virbuf.bv_conformance_ok(x_cb, y_cb, cb_w, cb_h, bv) {
+                if std::env::var_os("H266_DBG_IBC").is_some() {
+                    eprintln!(
+                        "IBC DBG: cu ({x_cb},{y_cb}) {cb_w}x{cb_h} merge={} idx={bv_idx} \
+                         a1={a1:?} b1={b1:?} cands={cand_list:?}",
+                        info.inter.general_merge_flag
+                    );
+                }
                 return Err(Error::invalid(format!(
                     "h266 IBC: block vector ({}, {}) at CU ({x_cb}, {y_cb}) {cb_w}x{cb_h} \
                      violates the §8.6.2.1 reference-region constraints",
@@ -10471,7 +10495,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// the `begin_slice` bundle initialization exactly.
     fn reinit_ctxs_for_region_start(&mut self) {
         let qp = self.cabac.slice_qp_y.as_init_qp();
-        self.cabac.tree_ctxs = TreeCtxs::init(qp);
+        self.cabac.tree_ctxs = TreeCtxs::init_with_init_type(qp, self.init_type);
         self.leaf_ctxs = LeafCuCtxs::init_with_init_type(qp, self.init_type);
         self.sao_ctxs = SaoCtxs::init(qp);
         if self.alf_ctxs.is_some() {
@@ -11084,7 +11108,7 @@ mod tests {
 
     #[test]
     fn slice_cabac_state_builds_nonempty_tables() {
-        let state = SliceCabacState::init_for_slice(SliceQpY(26), false);
+        let state = SliceCabacState::init_for_slice(SliceQpY(26), false, 0);
         // All four table groups must be populated.
         assert!(!state.tree_ctxs.split_cu.is_empty());
         assert!(!state.tree_ctxs.split_qt.is_empty());

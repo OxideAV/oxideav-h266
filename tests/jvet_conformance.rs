@@ -604,71 +604,77 @@ fn corpus_decode_triage() {
 /// fail the harness. Classes: P = pass (byte-exact vs .opl),
 /// F = fail (decodes, diverges), U = unsupported tool, E = error.
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
-    // r440 re-triage: the r437 "CTC-toolset desync family" (46 E)
-    // resolved into concrete root causes — the §8.7.4.5 32-point
-    // DST-VII / DCT-VIII and §8.7.4.3 LFNST publication errata, the
-    // missing MIP / BDPCM / ISP transform-unit reads, the single-tree
-    // cclm_mode_flag read, the §8.4.4 64-grid CqtDepth threshold at
-    // CTB 128, and the §7.3.11.2 implicit-QT cbSubdiv seed. Intra
-    // pictures now largely decode; the remaining E rows are later
-    // (mostly inter-picture) desyncs and the U rows are precise named
-    // feature gates.
+    // r443 re-triage: the r440 "22 inter-picture desync" family
+    // resolved into four root causes — the §8.7.4.5 print-transposed
+    // DST-VII kernels (all sizes; the same V4 body-transposition
+    // erratum class as the r440 LFNST finding), the missing §9.3.2.2
+    // initType column selection on the coding-tree + residual context
+    // bundles (every P/B slice initialised its CABAC contexts from
+    // the I-slice rows), a mid-cascade RemCcbs budget break inside
+    // the §7.3.11.12 gtX pass (the spec checks the budget once per
+    // coefficient, not per flag), and the missing §7.4.12.5 BDPCM
+    // transform-skip inference on the dual-tree-chroma TU path. The
+    // remaining E rows cluster on IBC BV derivation (under triage)
+    // plus a handful of deeper desyncs; the U rows are the two big
+    // named feature gates (affine non-merge in the stream walker,
+    // inter residual multi-TB tiling) plus subpictures / 4:2:2 /
+    // 4:4:4 / explicit WP.
     ("10b422_B_5", 'U'),          // 10-bit 4:2:2 chroma format
-    ("8b400_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("8b400_A_2", 'U'),           // inter residual multi-TB tiling (CB > MaxTbSizeY)
     ("8b420_A_2", 'U'),           // inter residual multi-TB tiling (CB > MaxTbSizeY)
-    ("8b420_B_2", 'U'),           // inter residual multi-TB tiling (CB > MaxTbSizeY)
+    ("8b420_B_2", 'U'),           // intra multi-TB-per-CU tiling (128x128 CU)
     ("8b444_A_2", 'U'),           // 4:4:4
     ("AFF_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("ALF_A_3", 'E'),             // desync beyond the first pictures (under triage)
-    ("ALF_B_3", 'E'),             // desync beyond the first pictures (under triage)
+    ("ALF_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("ALF_B_3", 'U'),             // inter residual multi-TB tiling
     ("ALF_C_3", 'F'),             // decodes fully; plane divergence (under triage)
-    ("AMVR_A_3", 'E'),            // inter-picture desync (under triage)
-    ("BDOF_A_4", 'E'),            // inter-picture desync (under triage)
-    ("BDPCM_A_2", 'E'),           // desync (under triage)
-    ("CCLM_A_2", 'F'),            // decodes fully; CCLM sample-level class
-    ("CST_A_4", 'E'),             // desync (under triage)
+    ("AMVR_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("BDOF_A_4", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("BDPCM_A_2", 'F'),           // decodes fully; plane divergence (under triage)
+    ("CCLM_A_2", 'F'),            // luma byte-exact since r443; chroma class remains
+    ("CST_A_4", 'F'),             // decodes fully; plane divergence (under triage)
     ("CodingToolsSets_A_2", 'P'), // r440 — the first fully byte-exact corpus stream
-    ("CodingToolsSets_B_2", 'E'), // inter-picture desync (no SAO/ALF/LMCS)
+    ("CodingToolsSets_B_2", 'E'), // desync (under triage)
     ("CodingToolsSets_C_2", 'F'), // 10-bit twin of A_2 — same remaining class
-    ("CodingToolsSets_D_2", 'E'), // desync surfaces as a spurious IBC BV-conformance error
+    ("CodingToolsSets_D_2", 'E'), // IBC BV derivation (under triage)
     ("CodingToolsSets_E_1", 'U'), // subpictures
     ("DEBLOCKING_A_3", 'U'),      // affine non-merge reconstruction in the stream walker
     ("DEBLOCKING_C_3", 'U'),      // inter residual multi-TB tiling
-    ("DEBLOCKING_E_3", 'U'),      // inter residual multi-TB tiling
+    ("DEBLOCKING_E_3", 'E'),      // desync (under triage)
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
-    ("DMVR_B_4", 'E'),            // inter-picture desync (under triage)
-    ("GDR_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("DMVR_B_4", 'F'),            // 10 of 11 pictures byte-exact since r443
+    ("GDR_A_2", 'E'),             // desync (under triage)
     ("GPM_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("IBC_A_2", 'E'),             // desync surfaces as a spurious IBC BV-conformance error
-    ("ISP_A_3", 'E'),             // desync (under triage)
+    ("IBC_A_2", 'E'),             // IBC BV derivation (under triage)
+    ("ISP_A_3", 'F'),             // decodes fully; plane divergence (under triage)
     ("JCCR_A_2", 'E'),            // desync (under triage)
-    ("JCCR_C_3", 'E'),            // desync (under triage)
+    ("JCCR_C_3", 'U'),            // inter residual multi-TB tiling
     ("LFNST_A_4", 'F'),           // decodes fully; plane divergence (under triage)
-    ("LFNST_B_4", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("LFNST_B_4", 'E'),           // desync (under triage)
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'U'),            // inter residual multi-TB tiling
-    ("LOSSLESS_B_3", 'E'),        // desync surfaces as a spurious IBC BV-conformance error
-    ("MERGE_A_2", 'E'),           // inter-picture desync (under triage)
-    ("MIP_A_3", 'F'),             // decodes fully; plane divergence (under triage)
+    ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
+    ("MERGE_A_2", 'U'),           // inter residual multi-TB tiling
+    ("MIP_A_3", 'F'),             // luma byte-exact since r443; chroma class remains
     ("MIP_B_3", 'U'),             // affine non-merge reconstruction in the stream walker
     ("MMVD_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
     ("MTS_A_4", 'F'),             // decodes fully; plane divergence (under triage)
     ("PROF_B_3", 'U'),            // inter residual multi-TB tiling
     ("QUANT_A_2", 'U'),           // inter residual multi-TB tiling
-    ("QUANT_B_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("QUANT_B_2", 'U'),           // inter residual multi-TB tiling
     ("RAP_A_1", 'F'),             // decodes fully; plane divergence (under triage)
     ("RAP_B_1", 'U'),             // affine non-merge reconstruction in the stream walker
     ("SAO_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("SBT_A_2", 'E'),             // inter-picture desync (under triage)
+    ("SBT_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
     ("SLICES_A_3", 'E'),          // desync (under triage)
-    ("SMVD_A_2", 'E'),            // inter-picture desync (under triage)
+    ("SMVD_A_2", 'U'),            // inter residual multi-TB tiling
     ("SUBPIC_C_1", 'U'),          // subpictures
-    ("SbTMVP_A_3", 'U'),          // intra multi-TB-per-CU tiling (128x128 CU)
-    ("TILE_A_2", 'E'),            // desync (under triage)
-    ("TMVP_A_3", 'E'),            // desync (under triage)
+    ("SbTMVP_A_3", 'U'),          // inter residual multi-TB tiling
+    ("TILE_A_2", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("TMVP_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
     ("WPP_A_3", 'E'),             // desync (under triage)
-    ("WP_A_3", 'E'),              // desync (under triage)
+    ("WP_A_3", 'U'),              // explicit weighted prediction
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this
