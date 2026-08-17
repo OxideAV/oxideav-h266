@@ -214,6 +214,45 @@ pub fn build_extended_pred_8bit(pred: &PicturePlane, n_cb_w: u32, n_cb_h: u32) -
 /// matches the spec's `hx = Clip3(1, nCbW, x)` / `vy = Clip3(1, nCbH,
 /// y)` clip applied to the extended array indexed `0..=nCbW+1` /
 /// `0..=nCbH+1`.
+/// r447 — §8.5.6.3.2 BDOF border derivation: the `(nCbW + 2) ×
+/// (nCbH + 2)` array's border samples come from the §8.5.6.3.3 luma
+/// INTEGER sample fetch at the fraction-rounded position
+/// `(xInt + (xFrac >> 3) − 1, yInt + (yFrac >> 3) − 1)`, lifted
+/// `<< (14 − BitDepth)` — not from edge replication of the
+/// interpolated interior. `(dst_x, dst_y)` is the block's
+/// picture-absolute origin; `mv` the (unrefined-for-this-list,
+/// possibly DMVR-refined) MV in 1/16-luma units.
+#[allow(clippy::too_many_arguments)]
+pub fn build_extended_pred_bdof(
+    pred: &[i32],
+    n_cb_w: u32,
+    n_cb_h: u32,
+    src: &crate::reconstruct::PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    mv: crate::inter::MotionVector,
+) -> Result<Vec<i32>> {
+    let mut out = build_extended_pred_high_precision(pred, n_cb_w, n_cb_h)?;
+    let ext_w = n_cb_w as usize + 2;
+    let ext_h = n_cb_h as usize + 2;
+    let pic_w = src.width as i32;
+    let pic_h = src.height as i32;
+    let lift = 14 - src.bit_depth as i32;
+    let x_int_base = dst_x as i32 + (mv.x >> 4) + ((mv.x & 15) >> 3);
+    let y_int_base = dst_y as i32 + (mv.y >> 4) + ((mv.y & 15) >> 3);
+    for y in 0..ext_h {
+        for x in 0..ext_w {
+            if x != 0 && y != 0 && x != ext_w - 1 && y != ext_h - 1 {
+                continue;
+            }
+            let xi = (x_int_base + x as i32 - 1).clamp(0, pic_w - 1) as usize;
+            let yi = (y_int_base + y as i32 - 1).clamp(0, pic_h - 1) as usize;
+            out[y * ext_w + x] = (src.samples[yi * src.stride + xi] as i32) << lift;
+        }
+    }
+    Ok(out)
+}
+
 pub fn build_extended_pred_high_precision(
     pred: &[i32],
     n_cb_w: u32,

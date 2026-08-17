@@ -181,6 +181,15 @@ pub struct MotionField {
     pub blocks_h: u32,
     /// Row-major storage; `field[y * blocks_w + x]`.
     pub field: Vec<MvField>,
+    /// r447 — per-cell RESOLVED reference POCs `(poc_l0, poc_l1)`,
+    /// parallel to `field`. Filled only on the temporal export
+    /// ([`crate::ctu::CtuWalker::motion_field_for_temporal`]) so a
+    /// later picture's §8.5.2.12 `colPocDiff` (eq. 598) reads the
+    /// collocated block's OWN reference distance instead of an
+    /// equal-distance approximation. Empty (`ref_pocs.is_empty()`)
+    /// means unresolved — consumers fall back to their legacy
+    /// equal-distance behaviour (encoder-side scaffolds).
+    pub ref_pocs: Vec<(i32, i32)>,
     /// r429 — §6.4.4 availability region: `(x0, y0, x1, y1, col_cap)`
     /// in luma samples (`x0..x1` / `y0..y1` half-open, plus an
     /// exclusive column cap for the WPP `xNbCtb >= xCurrCtb + 1` arm).
@@ -201,8 +210,26 @@ impl MotionField {
             blocks_w: bw,
             blocks_h: bh,
             field: vec![MvField::UNAVAILABLE; (bw * bh) as usize],
+            ref_pocs: Vec::new(),
             region: None,
         }
+    }
+
+    /// r447 — resolved `(poc_l0, poc_l1)` of the cell containing luma
+    /// sample `(x, y)`, or `None` when the field carries no resolved
+    /// POCs (see [`Self::ref_pocs`]) or the position is out of bounds.
+    pub fn ref_pocs_at_luma(&self, x: i32, y: i32) -> Option<(i32, i32)> {
+        if self.ref_pocs.is_empty() || x < 0 || y < 0 {
+            return None;
+        }
+        let bx = (x as u32) / 4;
+        let by = (y as u32) / 4;
+        if bx >= self.blocks_w || by >= self.blocks_h {
+            return None;
+        }
+        self.ref_pocs
+            .get((by * self.blocks_w + bx) as usize)
+            .copied()
     }
 
     /// r429 — install the §6.4.4 availability region (see the field
@@ -1644,7 +1671,38 @@ pub struct TemporalMergeInputs<'a> {
     pub current_poc: i32,
     pub current_ref_poc: i32,
     pub col_pic: &'a ReferencePicture,
+    /// r447 — fallback `colPocDiff` reference POC used ONLY when the
+    /// collocated [`MotionField`] carries no resolved per-cell POCs
+    /// (see [`MotionField::ref_pocs`]); resolvable fields read the
+    /// collocated block's own reference POC per eq. 598.
     pub col_ref_poc: i32,
+    /// r447 — the list `X` this half is derived for (§8.5.2.12
+    /// sbFlag = 0 both-lists arm under `NoBackwardPredFlag == 1`).
+    pub x: u32,
+    /// §8.5.2.1 `NoBackwardPredFlag`.
+    pub no_backward_pred: bool,
+    /// `sh_collocated_from_l0_flag` — the `N` of the §8.5.2.12
+    /// both-lists arm when `NoBackwardPredFlag == 0`.
+    pub collocated_from_l0: bool,
+}
+
+/// r447 — §8.5.2.15 temporal motion buffer compression (eqs.
+/// 611 – 615): each component is rounded to the 6-bit-mantissa /
+/// 4-bit-exponent representation the collocated buffer stores.
+pub fn compress_temporal_mv(mv: MotionVector) -> MotionVector {
+    fn comp(v: i32) -> i32 {
+        let s = v >> 17;
+        // Floor(Log2((v ^ s) | 31)) — the OR makes the operand ≥ 31 > 0.
+        let x = (v ^ s) | 31;
+        let f = (31 - x.leading_zeros() as i32) - 4;
+        let mask = (-1i32 << f) >> 1;
+        let round = (1i32 << f) >> 2;
+        (v + round) & mask
+    }
+    MotionVector {
+        x: comp(mv.x),
+        y: comp(mv.y),
+    }
 }
 
 /// §8.5.2.11 — derive one half (L0 or L1) of the temporal merge
@@ -1692,6 +1750,20 @@ pub fn derive_temporal_merge_candidate(inputs: &TemporalMergeInputs<'_>) -> Opti
     fetch_collocated_mv(mf, x_col_cb, y_col_cb, inputs)
 }
 
+/// r447 — public positional wrapper over the §8.5.2.12 collocated
+/// fetch: derive `mvLXCol` at an ALREADY-derived 8×8-snapped
+/// `(x_col_cb, y_col_cb)` collocated position (no bottom-right /
+/// centre walk). The §8.5.5.6 fourth-corner derivation uses exactly
+/// this: bottom-right position only, no fallback, no AMVR rounding.
+pub fn derive_temporal_collocated_at(
+    inputs: &TemporalMergeInputs<'_>,
+    x_col_cb: i32,
+    y_col_cb: i32,
+) -> Option<MvField> {
+    let mf = inputs.col_pic.motion_field.as_ref()?;
+    fetch_collocated_mv(mf, x_col_cb, y_col_cb, inputs)
+}
+
 /// Fetch + scale the collocated MV at the spec-derived 8x8-aligned
 /// `(x_col_cb, y_col_cb)` luma position. Returns `None` when the
 /// fetched block is intra-coded, has no active prediction list, or the
@@ -1711,34 +1783,50 @@ fn fetch_collocated_mv(
         // §8.5.2.12: intra / IBC / palette colCb → not available.
         return None;
     }
-    // §8.5.2.12: pick the collocated motion vector. Spec rules:
-    //   * If predFlagColL0 == 0 → use L1.
-    //   * Else if predFlagColL1 == 0 → use L0.
-    //   * Else (both lists active in collocated): pick per
-    //     NoBackwardPredFlag / sh_collocated_from_l0_flag. For the
-    //     round-25 fixture (uni-pred-L0 reference) we pick L0.
-    let (mv_col, _ref_idx_col) = if !raw.pred_flag_l0 && raw.pred_flag_l1 {
-        (raw.mv_l1, raw.ref_idx_l1)
-    } else if raw.pred_flag_l0 {
-        (raw.mv_l0, raw.ref_idx_l0)
+    // §8.5.2.12 (sbFlag = 0) — pick (mvCol, listCol):
+    //   * predFlagColL0 == 0 → L1;
+    //   * predFlagColL0 == 1 && predFlagColL1 == 0 → L0;
+    //   * both → LX when NoBackwardPredFlag == 1, else LN with
+    //     N = sh_collocated_from_l0_flag (r447 — previously always L0).
+    let use_l1 = if !raw.pred_flag_l0 && raw.pred_flag_l1 {
+        true
+    } else if raw.pred_flag_l0 && !raw.pred_flag_l1 {
+        false
+    } else if raw.pred_flag_l0 && raw.pred_flag_l1 {
+        if inputs.no_backward_pred {
+            inputs.x == 1
+        } else {
+            // §8.5.2.12 — listCol = LN with N = the VALUE of
+            // sh_collocated_from_l0_flag (flag 1 ⇒ L1, flag 0 ⇒ L0).
+            inputs.collocated_from_l0
+        }
     } else {
         return None;
     };
+    let mv_col = if use_l1 { raw.mv_l1 } else { raw.mv_l0 };
 
-    // §8.5.2.15 temporal MV buffer compression — round to integer-pel
-    // (effectively `mv >> 4 << 4` on each component when the buffer
-    // stores at 1-sample granularity). The full spec does
-    // `(mv + ((1 << 4) - 1)) >> 4 << 4` with sign-aware rounding;
-    // using straight integer-pel rounding via `mv >> 4 << 4` is the
-    // sample-accurate variant the fixture exercises and matches
-    // analytical equality for the integer-pel test vectors.
-    let mv_col = MotionVector {
-        x: (mv_col.x >> 4) << 4,
-        y: (mv_col.y >> 4) << 4,
+    // r447 — §8.5.2.15 temporal motion buffer compression
+    // (mantissa/exponent rounding per eqs. 611 – 615; small MVs pass
+    // through unchanged — the pre-r447 integer-pel truncation wrecked
+    // every fractional collocated MV).
+    let mv_col = compress_temporal_mv(mv_col);
+
+    // §8.5.2.12 eqs. 598/599 — POC distance computation. The
+    // collocated block's own reference POC comes from the exported
+    // per-cell resolution when present (eq. 598); the caller-supplied
+    // fallback keeps the legacy equal-distance behaviour for
+    // unresolved fields.
+    let col_ref_poc = match mf.ref_pocs_at_luma(x_col_cb, y_col_cb) {
+        Some((p0, p1)) => {
+            let p = if use_l1 { p1 } else { p0 };
+            if p == i32::MIN {
+                return None;
+            }
+            p
+        }
+        None => inputs.col_ref_poc,
     };
-
-    // §8.5.2.12 eqs. 598/599 — POC distance computation.
-    let col_poc_diff = inputs.col_pic.poc.wrapping_sub(inputs.col_ref_poc);
+    let col_poc_diff = inputs.col_pic.poc.wrapping_sub(col_ref_poc);
     let curr_poc_diff = inputs.current_poc.wrapping_sub(inputs.current_ref_poc);
     if col_poc_diff == 0 {
         // Degenerate scaling — spec does not generate a valid Col here.
@@ -2739,6 +2827,81 @@ pub fn predict_chroma_block_high_precision(
         }
     }
     Ok(out)
+}
+
+/// r447 — §8.5.6.3.2 eqs. 926 / 927 DMVR-bounded luma MC at high
+/// precision: every 8-tap read is clamped to the
+/// `[xSbIntL − 3, xSbIntL + sbWidth + 3]` × `[ySbIntL − 3,
+/// ySbIntL + sbHeight + 3]` window anchored at the UNREFINED MV's
+/// integer position, then picture-clamped. Realised by materializing
+/// the (pic-clamped) bounded window as a local patch and running the
+/// ordinary HP predictor against it — coordinate clamping at the patch
+/// edges reproduces the eq. 926 / 927 clip exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block_high_precision_dmvr(
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane,
+    mv_orig: MotionVector,
+    mv_refined: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    let x_sb_int = dst_x as i32 + (mv_orig.x >> 4);
+    let y_sb_int = dst_y as i32 + (mv_orig.y >> 4);
+    let left = x_sb_int - 3;
+    let top = y_sb_int - 3;
+    let pw = w as usize + 7;
+    let ph = h as usize + 7;
+    let mut patch = PicturePlane::filled_bd(pw, ph, 0, src.bit_depth);
+    for r in 0..ph {
+        let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;
+        for c in 0..pw {
+            let sx = (left + c as i32).clamp(0, src.width as i32 - 1) as usize;
+            patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
+        }
+    }
+    let mv_adj = MotionVector {
+        x: mv_refined.x + ((dst_x as i32 - left) << 4),
+        y: mv_refined.y + ((dst_y as i32 - top) << 4),
+    };
+    predict_luma_block_high_precision(0, 0, w, h, &patch, mv_adj, bit_depth)
+}
+
+/// r447 — chroma twin of [`predict_luma_block_high_precision_dmvr`]:
+/// §8.5.6.3.4 clamps chroma reads to `[xSbIntC − 1,
+/// xSbIntC + sbWidth + 2]` (chroma units, 4-tap halo).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_chroma_block_high_precision_dmvr(
+    dst_x_c: u32,
+    dst_y_c: u32,
+    w_c: u32,
+    h_c: u32,
+    src: &PicturePlane,
+    mv_orig: MotionVector,
+    mv_refined: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    let x_sb_int = dst_x_c as i32 + (mv_orig.x >> 5);
+    let y_sb_int = dst_y_c as i32 + (mv_orig.y >> 5);
+    let left = x_sb_int - 1;
+    let top = y_sb_int - 1;
+    let pw = w_c as usize + 4;
+    let ph = h_c as usize + 4;
+    let mut patch = PicturePlane::filled_bd(pw, ph, 0, src.bit_depth);
+    for r in 0..ph {
+        let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;
+        for c in 0..pw {
+            let sx = (left + c as i32).clamp(0, src.width as i32 - 1) as usize;
+            patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
+        }
+    }
+    let mv_adj = MotionVector {
+        x: mv_refined.x + ((dst_x_c as i32 - left) << 5),
+        y: mv_refined.y + ((dst_y_c as i32 - top) << 5),
+    };
+    predict_chroma_block_high_precision(0, 0, w_c, h_c, &patch, mv_adj, bit_depth)
 }
 
 /// r447 — §8.5.6.6.2 eqs. 980 / 981 bi-pred composition from two
@@ -4206,6 +4369,9 @@ mod tests {
             current_ref_poc: 0,
             col_pic: &col_pic,
             col_ref_poc: 0,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true,
         };
         assert!(derive_temporal_merge_candidate(&inputs).is_none());
     }
@@ -4229,7 +4395,10 @@ mod tests {
             current_poc: 2,
             current_ref_poc: 0, // currPocDiff = 2
             col_pic: &col_pic,
-            col_ref_poc: -1, // colPocDiff = 1 - (-1) = 2 (equal)
+            col_ref_poc: -1,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true, // colPocDiff = 1 - (-1) = 2 (equal)
         };
         let cand = derive_temporal_merge_candidate(&inputs).unwrap();
         assert_eq!(cand.mv_l0, MotionVector::from_int_pel(2, -1));
@@ -4261,7 +4430,10 @@ mod tests {
             current_poc: 2,
             current_ref_poc: 0,
             col_pic: &col_pic,
-            col_ref_poc: -1, // equal-distance (col 1-(-1)=2 = curr)
+            col_ref_poc: -1,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true, // equal-distance (col 1-(-1)=2 = curr)
         };
         let cand = derive_temporal_merge_candidate(&inputs).unwrap();
         assert_eq!(cand.mv_l0, MotionVector::from_int_pel(1, 1));
@@ -4291,6 +4463,9 @@ mod tests {
             current_ref_poc: 0,
             col_pic: &col_pic,
             col_ref_poc: -1,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true,
         };
         let cand = derive_temporal_merge_candidate(&inputs).unwrap();
         assert_eq!(cand.mv_l0, MotionVector::from_int_pel(3, 0));
@@ -4317,6 +4492,9 @@ mod tests {
             current_ref_poc: 0,
             col_pic: &col_pic,
             col_ref_poc: -3,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true,
         };
         let cand = derive_temporal_merge_candidate(&inputs).unwrap();
         // Spec eqs:
@@ -4351,6 +4529,9 @@ mod tests {
             current_ref_poc: 9,
             col_pic: &col_pic,
             col_ref_poc: 9,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true,
         };
         let cand = derive_temporal_merge_candidate(&inputs).unwrap();
         // Equal distance → mv passes through (rounded to integer-pel by
@@ -4387,6 +4568,9 @@ mod tests {
             current_ref_poc: 0,
             col_pic: &col_pic,
             col_ref_poc: -1,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true,
         };
         assert!(derive_temporal_merge_candidate(&inputs).is_none());
     }

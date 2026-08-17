@@ -378,6 +378,86 @@ pub fn derive_gpm_partition_motion(
 /// entry is already clipped to `[0, 255]` and the §8.5.7.2 blend
 /// re-applies the eq. 1016 division). For higher bit-depths callers
 /// should run [`blend_gpm_into_plane_u16`] (a future round).
+/// r447 — §8.5.7.2 eq. 1016 blend over the REAL §8.5.6.3
+/// high-precision per-partition arrays (`BitDepth + 6` domain,
+/// CU-anchored, length `cb_w * cb_h`) — no re-lift of clipped samples.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_gpm_into_plane_hp(
+    dst: &mut PicturePlane,
+    x0: u32,
+    y0: u32,
+    cb_w: u32,
+    cb_h: u32,
+    pred_a: &[i32],
+    pred_b: &[i32],
+    ctx: &GpmContext,
+    c_idx: u32,
+    bit_depth: u32,
+) {
+    let stride = cb_w as usize;
+    let dst_stride = dst.stride;
+    for y in 0..cb_h {
+        for x in 0..cb_w {
+            let a_pre = pred_a[y as usize * stride + x as usize];
+            let b_pre = pred_b[y as usize * stride + x as usize];
+            let pix = ctx.blend_at(x, y, c_idx, a_pre, b_pre, bit_depth);
+            let yi = (y0 as usize) + y as usize;
+            let xi = (x0 as usize) + x as usize;
+            if yi < dst.height && xi < dst.width {
+                dst.samples[yi * dst_stride + xi] = pix as u16;
+            }
+        }
+    }
+}
+
+/// r447 — §8.5.7.3 eqs. 1017 – 1026: the per-4×4-sub-block storage
+/// type of a GPM CU. `0` stores partition A's motion, `1` partition
+/// B's, `2` the blended-region rule (bi-combination when the two
+/// partitions use different lists, else partition B).
+pub fn gpm_storage_s_type(
+    cb_width: u32,
+    cb_height: u32,
+    angle_idx: u32,
+    distance_idx: u32,
+    x_sb_idx: u32,
+    y_sb_idx: u32,
+) -> u8 {
+    let displacement_x = angle_idx as usize;
+    let displacement_y = ((angle_idx + 8) % 32) as usize;
+    let is_flip = (13..=27).contains(&angle_idx);
+    let shift_hor = !(angle_idx % 16 == 8 || (angle_idx % 16 != 0 && cb_height >= cb_width));
+    let (offset_x, offset_y) = if !shift_hor {
+        (
+            -(cb_width as i32) >> 1,
+            (-(cb_height as i32) >> 1)
+                + if angle_idx < 16 {
+                    ((distance_idx * cb_height) >> 3) as i32
+                } else {
+                    -(((distance_idx * cb_height) >> 3) as i32)
+                },
+        )
+    } else {
+        (
+            (-(cb_width as i32) >> 1)
+                + if angle_idx < 16 {
+                    ((distance_idx * cb_width) >> 3) as i32
+                } else {
+                    -(((distance_idx * cb_width) >> 3) as i32)
+                },
+            -(cb_height as i32) >> 1,
+        )
+    };
+    let motion_idx = (((4 * x_sb_idx as i32 + offset_x) << 1) + 5) * DIS_LUT[displacement_x]
+        + (((4 * y_sb_idx as i32 + offset_y) << 1) + 5) * DIS_LUT[displacement_y];
+    if motion_idx.abs() < 32 {
+        2
+    } else if motion_idx <= 0 {
+        u8::from(!is_flip)
+    } else {
+        u8::from(is_flip)
+    }
+}
+
 pub fn blend_gpm_into_plane(
     dst: &mut PicturePlane,
     x0: u32,

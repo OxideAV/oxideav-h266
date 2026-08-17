@@ -2671,21 +2671,24 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         let cb_h = info.cb_height;
         let cb_under_128 = cb_w < 128 && cb_h < 128;
         let ciip_size_ok = (cb_w as u64 * cb_h as u64) >= 64;
-        // Pure-CIIP regular_merge_flag gate (P-slice or non-GPM B-slice).
-        let ciip_branch_open = self.tools.ciip_enabled && !cu_skip && ciip_size_ok && cb_under_128;
-        // §7.3.11.7 GPM gate (round-40): B-slice only, square-ish CU
-        // (8 ≤ side < 8 × other_side), under 128, !cu_skip, GPM enabled in
-        // SPS with at least 2 GPM merge candidates.
+        // §7.3.11.7 (V4) regular_merge_flag presence — CIIP arm:
+        // `sps_ciip_enabled_flag && cu_skip_flag == 0 &&
+        // (cbWidth * cbHeight) >= 64` (the ≥ 64 term sits INSIDE this
+        // arm; the < 128 bound is the shared outer condition).
+        let ciip_branch_open = self.tools.ciip_enabled && !cu_skip && ciip_size_ok;
+        // GPM arm: `sps_gpm_enabled_flag && sh_slice_type == B &&
+        // cbWidth >= 8 && cbHeight >= 8 && cbWidth < 8 * cbHeight &&
+        // cbHeight < 8 * cbWidth`. r447 conformance fix: the pre-r447
+        // gate additionally required `cu_skip_flag == 0` and
+        // `MaxNumGpmMergeCand >= 2` — neither appears in the V4
+        // listing, so a GPM-eligible SKIP CU inferred
+        // `regular_merge_flag = 1` instead of reading the bin,
+        // desyncing every GPM-enabled wire at its first GPM skip CU.
         let gpm_size_ok = cb_w >= 8
             && cb_h >= 8
             && (cb_w as u64) < 8u64 * cb_h as u64
             && (cb_h as u64) < 8u64 * cb_w as u64;
-        let gpm_branch_open = self.tools.gpm_enabled
-            && self.tools.slice_is_b
-            && self.tools.max_num_gpm_merge_cand >= 2
-            && !cu_skip
-            && cb_under_128
-            && gpm_size_ok;
+        let gpm_branch_open = self.tools.gpm_enabled && self.tools.slice_is_b && gpm_size_ok;
 
         let regular_merge_flag = if cb_under_128 && (ciip_branch_open || gpm_branch_open) {
             let inc = ctx_inc_regular_merge_flag(cu_skip) as usize;
@@ -2751,18 +2754,24 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // simultaneously (forcing the decoder to disambiguate); when
             // only one of the two is open, §7.4.12.7 infers ciip_flag
             // (= 1 for CIIP-only, = 0 for GPM-only).
-            let ciip_parse_gate = ciip_branch_open && gpm_branch_open;
+            // §7.3.11.7 (V4) ciip_flag presence: both tools enabled, B
+            // slice, cu_skip == 0, GPM geometry, under 128 (no ≥ 64
+            // term — the ≥ 8 sides imply it).
+            let ciip_parse_gate = self.tools.ciip_enabled
+                && self.tools.gpm_enabled
+                && self.tools.slice_is_b
+                && !cu_skip
+                && gpm_size_ok
+                && cb_under_128;
             let ciip_flag = if ciip_parse_gate {
                 let n = self.ctxs.ciip_flag.len();
                 let slot = (self.ctxs.init_type as usize).saturating_sub(1).min(n - 1);
                 self.dec.decode_decision(&mut self.ctxs.ciip_flag[slot])? == 1
             } else {
-                // §7.4.12.7 inference: when only the CIIP gate is open
-                // → ciip_flag = 1; when only the GPM gate is open
-                // → ciip_flag = 0; if neither is open, the
-                // regular_merge_flag inference (above) already selected
-                // regular_merge = 1 so this branch is unreachable.
-                ciip_branch_open && !gpm_branch_open
+                // §7.4.12.7 inference: 1 iff sps_ciip && merge &&
+                // !subblock && !regular && !skip && both dims < 128 &&
+                // cbW*cbH >= 64; else 0.
+                self.tools.ciip_enabled && !cu_skip && cb_under_128 && ciip_size_ok
             };
             info.inter.merge_data.ciip_flag = ciip_flag;
 

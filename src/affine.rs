@@ -1059,6 +1059,17 @@ pub fn predict_luma_subblock_affine_high_precision(
         // r = 0 / r = sb_h + 1 are halo rows.
         let local_x = c - 1;
         let local_y = r - 1;
+        // r447 — §8.5.6.3.2: the PROF / BDOF border samples
+        // (`xL ∈ {0, sbWidth + 1}` or `yL ∈ {0, sbHeight + 1}`) come
+        // from the §8.5.6.3.3 luma INTEGER sample fetch at the
+        // fraction-rounded position `(xInt + (xFrac >> 3) − 1,
+        // yInt + (yFrac >> 3) − 1)`, lifted `<< (14 − BitDepth)` —
+        // not from the interpolation filter.
+        if c == 0 || r == 0 || c == out_w as i32 - 1 || r == out_h as i32 - 1 {
+            let xi = (x_int_base + local_x + ((x_frac as i32) >> 3)).clamp(0, pic_w - 1) as usize;
+            let yi = (y_int_base + local_y + ((y_frac as i32) >> 3)).clamp(0, pic_h - 1) as usize;
+            return (src.samples[yi * src.stride + xi] as i32) << lift;
+        }
         if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
             // Integer-pel fast path: lift to BitDepth + 6 precision
             // (eq. 932: `<< (14 - BitDepth)`).

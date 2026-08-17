@@ -68,7 +68,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::alf::{AlfApsBinding, AlfConfig, AlfPicture};
-use crate::bdof::{bdof_refine_into, bdof_used_flag, build_extended_pred_high_precision};
+use crate::bdof::{bdof_refine_into, bdof_used_flag};
 use crate::cabac::ArithDecoder;
 use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
 use crate::coding_tree::{Cu, CuNeighbourMap, MttSplitRec, TreeCtxs, TreeType, TreeWalker};
@@ -77,10 +77,7 @@ use crate::dequant::{
     dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, log2_matrix_size,
     scaling_matrix_id, DequantParams, PredModeKind,
 };
-use crate::gpm::{
-    blend_gpm_into_plane, derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motion,
-    GpmContext,
-};
+use crate::gpm::{derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motion, GpmContext};
 use crate::inter::{
     apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
@@ -1857,6 +1854,28 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // spatially constrain to this picture's tile layout: drop any
         // live per-CTU availability region from the clone.
         mf.clear_region();
+        // r447 — resolve every cell's per-list reference POCs so the
+        // consumer's §8.5.2.12 eq. 598 `colPocDiff` reads the
+        // collocated block's OWN reference distance. Resolution uses
+        // the active slice's lists (the corpus' multi-slice wires
+        // share one RPL per picture).
+        let poc_of = |pred: bool, list: &[ReferencePicture], idx: i32| -> i32 {
+            if !pred || idx < 0 {
+                return i32::MIN;
+            }
+            list.get(idx as usize).map(|r| r.poc).unwrap_or(i32::MIN)
+        };
+        mf.ref_pocs = self
+            .motion_field
+            .field
+            .iter()
+            .map(|f| {
+                (
+                    poc_of(f.pred_flag_l0, &self.ref_pic_list_l0, f.ref_idx_l0),
+                    poc_of(f.pred_flag_l1, &self.ref_pic_list_l1, f.ref_idx_l1),
+                )
+            })
+            .collect();
         for r in &self.dmvr_refined {
             let base = mf.get_at_luma(r.x as i32, r.y as i32);
             if !base.available {
@@ -2517,6 +2536,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             current_ref_poc: curr_ref_poc_l0,
             col_pic,
             col_ref_poc,
+            x: 0,
+            no_backward_pred: self.no_backward_pred_flag(),
+            collocated_from_l0: self.collocated_from_l0,
         };
         let l0_mv = derive_temporal_merge_candidate(&l0_inputs);
         if !is_b {
@@ -2530,6 +2552,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             .unwrap_or(self.current_poc);
         let l1_inputs = TemporalMergeInputs {
             current_ref_poc: curr_ref_poc_l1,
+            x: 1,
             ..l0_inputs.clone()
         };
         let l1_mv = derive_temporal_merge_candidate(&l1_inputs);
@@ -5803,7 +5826,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // (Tables 36 / 37) with `cIdx ∈ {1, 2}`; eqs. 999/1000 scale to
         // the chroma sub-sample grid.
         if info.inter.merge_data.gpm_flag {
-            return self.reconstruct_leaf_cu_gpm(cu, info, &mlist, out);
+            return self.reconstruct_leaf_cu_gpm(cu, info, residual, &mlist, out);
         }
 
         // §8.5.5.2 — sub-block (affine / SbTMVP) merge. When
@@ -5957,7 +5980,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `motion_field_for_temporal` folds them over a clone of the
         // unrefined store so the collocated (temporal) export a later
         // picture reads sees the refined MVs, per the NOTE's split.
-        let mut chosen = chosen;
         let unrefined_mv_l0 = chosen.mv_l0;
         let unrefined_mv_l1 = chosen.mv_l1;
         // Set when the §8.5.1 multi-16×16-sub-block DMVR path has already
@@ -5999,33 +6021,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // exceeds 16.
                 let num_sb_x = if cu.cu.w > 16 { cu.cu.w >> 4 } else { 1 };
                 let num_sb_y = if cu.cu.h > 16 { cu.cu.h >> 4 } else { 1 };
-                if num_sb_x == 1 && num_sb_y == 1 {
-                    // Single sub-block: refine `chosen` in place and let
-                    // the shared CU-wide MC + BDOF tail consume it.
-                    let refined = crate::dmvr::apply_dmvr(
-                        cu.cu.x,
-                        cu.cu.y,
-                        cu.cu.w,
-                        cu.cu.h,
-                        chosen.mv_l0,
-                        chosen.mv_l1,
-                        &rp0.frame.luma,
-                        &rp1.frame.luma,
-                    )?;
-                    chosen.mv_l0 = refined.mv_l0_refined;
-                    chosen.mv_l1 = refined.mv_l1_refined;
-                    // §8.5.1 NOTE — record `MvDmvrLX` for the temporal
-                    // (collocated) motion store this picture exports via
-                    // `motion_field_for_temporal`.
-                    self.dmvr_refined.push(DmvrRefinedRect {
-                        x: cu.cu.x,
-                        y: cu.cu.y,
-                        w: cu.cu.w,
-                        h: cu.cu.h,
-                        mv_l0: refined.mv_l0_refined,
-                        mv_l1: refined.mv_l1_refined,
-                    });
-                } else {
+                // r447 — the 1×1 case runs through the same
+                // per-sub-block walk (one iteration): every DMVR MC
+                // read must honour the §8.5.6.3.2 eqs. 926 / 927
+                // bounded reference window around the UNREFINED MV,
+                // which the shared CU-wide MC below does not model.
+                {
                     // Multi-sub-block split (§8.5.1 eqs. 456 – 459): each
                     // 16×16 sub-block is refined independently and runs
                     // its own §8.5.6 bi-pred MC (luma + 4:2:0 chroma) at
@@ -6100,34 +6101,50 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mv_l0: refined.mv_l0_refined,
                                 mv_l1: refined.mv_l1_refined,
                             });
+                            // r447 — every DMVR MC read is bounded by
+                            // the §8.5.6.3.2 eqs. 926 / 927 window
+                            // anchored at the UNREFINED MV.
+                            let pred_l0 = crate::inter::predict_luma_block_high_precision_dmvr(
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                &rp0.frame.luma,
+                                chosen.mv_l0,
+                                refined.mv_l0_refined,
+                                bit_depth,
+                            )?;
+                            let pred_l1 = crate::inter::predict_luma_block_high_precision_dmvr(
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                &rp1.frame.luma,
+                                chosen.mv_l1,
+                                refined.mv_l1_refined,
+                                bit_depth,
+                            )?;
                             if bdof_runs {
-                                // §8.5.6.5 — spec-precision per-list MC
-                                // intermediates lifted into the
-                                // `(sbW + 2) × (sbH + 2)` extended layout,
-                                // then the BDOF gradient refinement writes
-                                // the sub-block's luma directly.
-                                let pred_l0 = predict_luma_block_high_precision(
-                                    x,
-                                    y,
+                                // r447 — §8.5.6.3.2 integer-fetch
+                                // borders (not edge replication).
+                                let ext_l0 = crate::bdof::build_extended_pred_bdof(
+                                    &pred_l0,
                                     sb_w,
                                     sb_h,
                                     &rp0.frame.luma,
-                                    refined.mv_l0_refined,
-                                    bit_depth,
-                                )?;
-                                let pred_l1 = predict_luma_block_high_precision(
                                     x,
                                     y,
+                                    refined.mv_l0_refined,
+                                )?;
+                                let ext_l1 = crate::bdof::build_extended_pred_bdof(
+                                    &pred_l1,
                                     sb_w,
                                     sb_h,
                                     &rp1.frame.luma,
+                                    x,
+                                    y,
                                     refined.mv_l1_refined,
-                                    bit_depth,
                                 )?;
-                                let ext_l0 =
-                                    build_extended_pred_high_precision(&pred_l0, sb_w, sb_h)?;
-                                let ext_l1 =
-                                    build_extended_pred_high_precision(&pred_l1, sb_w, sb_h)?;
                                 bdof_refine_into(
                                     &mut out.luma,
                                     x,
@@ -6139,44 +6156,85 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                     bit_depth,
                                 )?;
                             } else {
-                                predict_luma_block_bipred_bcw(
+                                crate::inter::blend_bi_hp_into(
                                     &mut out.luma,
                                     x,
                                     y,
                                     sb_w,
                                     sb_h,
-                                    &rp0.frame.luma,
-                                    refined.mv_l0_refined,
-                                    &rp1.frame.luma,
-                                    refined.mv_l1_refined,
+                                    &pred_l0,
+                                    &pred_l1,
                                     /*bcw_idx*/ 0,
-                                )?;
+                                    bit_depth,
+                                );
                             }
                             if chroma {
-                                predict_chroma_block_bipred_bcw(
+                                let cb_hp_l0 =
+                                    crate::inter::predict_chroma_block_high_precision_dmvr(
+                                        x / 2,
+                                        y / 2,
+                                        sb_w / 2,
+                                        sb_h / 2,
+                                        &rp0.frame.cb,
+                                        chosen.mv_l0,
+                                        refined.mv_l0_refined,
+                                        bit_depth,
+                                    )?;
+                                let cb_hp_l1 =
+                                    crate::inter::predict_chroma_block_high_precision_dmvr(
+                                        x / 2,
+                                        y / 2,
+                                        sb_w / 2,
+                                        sb_h / 2,
+                                        &rp1.frame.cb,
+                                        chosen.mv_l1,
+                                        refined.mv_l1_refined,
+                                        bit_depth,
+                                    )?;
+                                let cr_hp_l0 =
+                                    crate::inter::predict_chroma_block_high_precision_dmvr(
+                                        x / 2,
+                                        y / 2,
+                                        sb_w / 2,
+                                        sb_h / 2,
+                                        &rp0.frame.cr,
+                                        chosen.mv_l0,
+                                        refined.mv_l0_refined,
+                                        bit_depth,
+                                    )?;
+                                let cr_hp_l1 =
+                                    crate::inter::predict_chroma_block_high_precision_dmvr(
+                                        x / 2,
+                                        y / 2,
+                                        sb_w / 2,
+                                        sb_h / 2,
+                                        &rp1.frame.cr,
+                                        chosen.mv_l1,
+                                        refined.mv_l1_refined,
+                                        bit_depth,
+                                    )?;
+                                crate::inter::blend_bi_hp_into(
                                     &mut out.cb,
                                     x / 2,
                                     y / 2,
                                     sb_w / 2,
                                     sb_h / 2,
-                                    &rp0.frame.cb,
-                                    refined.mv_l0_refined,
-                                    &rp1.frame.cb,
-                                    refined.mv_l1_refined,
+                                    &cb_hp_l0,
+                                    &cb_hp_l1,
                                     0,
-                                )?;
-                                predict_chroma_block_bipred_bcw(
+                                    bit_depth,
+                                );
+                                crate::inter::blend_bi_hp_into(
                                     &mut out.cr,
                                     x / 2,
                                     y / 2,
                                     sb_w / 2,
                                     sb_h / 2,
-                                    &rp0.frame.cr,
-                                    refined.mv_l0_refined,
-                                    &rp1.frame.cr,
-                                    refined.mv_l1_refined,
+                                    &cr_hp_l0,
+                                    &cr_hp_l1,
                                     0,
-                                )?;
+                                    bit_depth,
+                                );
                             }
                         }
                     }
@@ -6353,36 +6411,65 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     let n_cb_w = cu.cu.w;
                     let n_cb_h = cu.cu.h;
                     let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
-                    let pred_l0 = predict_luma_block_high_precision(
-                        cu.cu.x,
-                        cu.cu.y,
-                        n_cb_w,
-                        n_cb_h,
-                        &rp0.frame.luma,
-                        chosen.mv_l0,
-                        bit_depth,
-                    )?;
-                    let pred_l1 = predict_luma_block_high_precision(
-                        cu.cu.x,
-                        cu.cu.y,
-                        n_cb_w,
-                        n_cb_h,
-                        &rp1.frame.luma,
-                        chosen.mv_l1,
-                        bit_depth,
-                    )?;
-                    let ext_l0 = build_extended_pred_high_precision(&pred_l0, n_cb_w, n_cb_h)?;
-                    let ext_l1 = build_extended_pred_high_precision(&pred_l1, n_cb_w, n_cb_h)?;
-                    bdof_refine_into(
-                        &mut out.luma,
-                        cu.cu.x,
-                        cu.cu.y,
-                        n_cb_w,
-                        n_cb_h,
-                        &ext_l0,
-                        &ext_l1,
-                        bit_depth,
-                    )?;
+                    // r447 — §8.5.6.1 eqs. 888 – 892: with bdofFlag
+                    // TRUE the CU splits into ≤16×16 sub-blocks, and
+                    // §8.5.6.5 runs PER SUB-BLOCK — each with its own
+                    // §8.5.6.3.2 integer-fetched (sbW + 2)×(sbH + 2)
+                    // borders and its own gradient windows.
+                    let sb_w = n_cb_w.min(16);
+                    let sb_h = n_cb_h.min(16);
+                    for sby in 0..(n_cb_h / sb_h) {
+                        for sbx in 0..(n_cb_w / sb_w) {
+                            let x = cu.cu.x + sbx * sb_w;
+                            let y = cu.cu.y + sby * sb_h;
+                            let pred_l0 = predict_luma_block_high_precision(
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                &rp0.frame.luma,
+                                chosen.mv_l0,
+                                bit_depth,
+                            )?;
+                            let pred_l1 = predict_luma_block_high_precision(
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                &rp1.frame.luma,
+                                chosen.mv_l1,
+                                bit_depth,
+                            )?;
+                            let ext_l0 = crate::bdof::build_extended_pred_bdof(
+                                &pred_l0,
+                                sb_w,
+                                sb_h,
+                                &rp0.frame.luma,
+                                x,
+                                y,
+                                chosen.mv_l0,
+                            )?;
+                            let ext_l1 = crate::bdof::build_extended_pred_bdof(
+                                &pred_l1,
+                                sb_w,
+                                sb_h,
+                                &rp1.frame.luma,
+                                x,
+                                y,
+                                chosen.mv_l1,
+                            )?;
+                            bdof_refine_into(
+                                &mut out.luma,
+                                x,
+                                y,
+                                sb_w,
+                                sb_h,
+                                &ext_l0,
+                                &ext_l1,
+                                bit_depth,
+                            )?;
+                        }
+                    }
                 } else {
                     predict_luma_block_bipred_bcw(
                         &mut out.luma,
@@ -7203,7 +7290,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // §8.5.2.11 temporal Col candidate (AMVR-rounded inside
             // the helper). Resolved from the configured ColPic when
             // `ph_temporal_mvp_enabled`.
-            let col = slf.derive_amvp_col_candidate(xcb, ycb, cb_w, cb_h, current_ref_poc, amvr);
+            let col = slf.derive_amvp_col_candidate(
+                xcb,
+                ycb,
+                cb_w,
+                cb_h,
+                if matches!(list, RefList::L1) { 1 } else { 0 },
+                current_ref_poc,
+                amvr,
+            );
             // §8.5.2.9 step-5 HMVP fill — only consulted when the
             // list still has room after spatial + Col.
             let n_after_spatial =
@@ -7948,8 +8043,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // §8.5.5.7 step-8 temporal MV (replicated across CPs inside
             // `build_affine_mvp_cand_list`). Reuses the regular-AMVP
             // collocated walk.
-            let temporal_col =
-                slf.derive_amvp_col_candidate(xcb, ycb, cbw, cbh, current_ref_poc, amvr);
+            let temporal_col = slf.derive_amvp_col_candidate(
+                xcb,
+                ycb,
+                cbw,
+                cbh,
+                if matches!(list, RefList::L1) { 1 } else { 0 },
+                current_ref_poc,
+                amvr,
+            );
 
             // §8.5.5.7 steps 4 / 5 — inherited affine CPMVP candidates,
             // recovered from the per-CB affine CPMV store. The store
@@ -8356,16 +8458,65 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         is_b: bool,
     ) -> crate::affine_merge::AffineCpRecord {
         use crate::affine_merge::AffineCpRecord;
-        let amvr = crate::amvr::AmvrShift(2);
-        let poc_l0 = self.ref_pic_list_l0.first().map(|r| r.poc);
-        let poc_l1 = self.ref_pic_list_l1.first().map(|r| r.poc);
-        let mv_l0 =
-            poc_l0.and_then(|p| self.derive_amvp_col_candidate(xcb, ycb, cb_w, cb_h, p, amvr));
-        let mv_l1 = if is_b {
-            poc_l1.and_then(|p| self.derive_amvp_col_candidate(xcb, ycb, cb_w, cb_h, p, amvr))
+        // §8.5.5.6 eqs. 770 – 773 — the fourth corner reads ONLY the
+        // bottom-right collocated position (no centre fallback, no
+        // AMVR rounding, no ≤ 32-sample gate — r447 conformance fix:
+        // the pre-r447 helper reused the AMVP walk, which has all
+        // three).
+        if !self.ph_temporal_mvp_enabled {
+            return AffineCpRecord::UNAVAILABLE;
+        }
+        let col_list = if self.collocated_from_l0 {
+            &self.ref_pic_list_l0
         } else {
-            None
+            &self.ref_pic_list_l1
         };
+        let Some(col_pic) = col_list.get(self.col_ref_idx as usize) else {
+            return AffineCpRecord::UNAVAILABLE;
+        };
+        if col_pic.motion_field.is_none() {
+            return AffineCpRecord::UNAVAILABLE;
+        }
+        let x_col_br = xcb + cb_w;
+        let y_col_br = ycb + cb_h;
+        let same_ctb_row =
+            (ycb >> self.layout.ctb_log2_size_y) == (y_col_br >> self.layout.ctb_log2_size_y);
+        if !same_ctb_row
+            || y_col_br > self.layout.pic_height_luma as i32 - 1
+            || x_col_br > self.layout.pic_width_luma as i32 - 1
+        {
+            return AffineCpRecord::UNAVAILABLE;
+        }
+        let x_col_cb = (x_col_br >> 3) << 3;
+        let y_col_cb = (y_col_br >> 3) << 3;
+        let derive_one = |x: u32| -> Option<MotionVector> {
+            let list = if x == 0 {
+                &self.ref_pic_list_l0
+            } else {
+                &self.ref_pic_list_l1
+            };
+            let current_ref_poc = list.first().map(|r| r.poc)?;
+            let inputs = TemporalMergeInputs {
+                xcb,
+                ycb,
+                cb_w,
+                cb_h,
+                pic_w: self.layout.pic_width_luma as i32,
+                pic_h: self.layout.pic_height_luma as i32,
+                ctb_log2_size_y: self.layout.ctb_log2_size_y,
+                current_poc: self.current_poc,
+                current_ref_poc,
+                col_pic,
+                col_ref_poc: self.current_poc,
+                x,
+                no_backward_pred: self.no_backward_pred_flag(),
+                collocated_from_l0: self.collocated_from_l0,
+            };
+            crate::inter::derive_temporal_collocated_at(&inputs, x_col_cb, y_col_cb)
+                .map(|f| f.mv_l0)
+        };
+        let mv_l0 = derive_one(0);
+        let mv_l1 = if is_b { derive_one(1) } else { None };
         if mv_l0.is_none() && mv_l1.is_none() {
             return AffineCpRecord::UNAVAILABLE;
         }
@@ -8485,6 +8636,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let mf = col_pic.motion_field.as_ref().unwrap();
         let col_sampler = |x: i32, y: i32| -> ColBlockMotion {
             let m = mf.get_at_luma(x, y);
+            // r447 — per-cell resolved reference POCs (eq. 598).
+            let (poc_l0, poc_l1) = mf.ref_pocs_at_luma(x, y).unwrap_or((i32::MIN, i32::MIN));
             ColBlockMotion {
                 mode_inter: m.available && m.mode_inter,
                 pred_flag_l0: m.pred_flag_l0,
@@ -8493,6 +8646,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 mv_l1: m.mv_l1,
                 ref_idx_l0: m.ref_idx_l0,
                 ref_idx_l1: m.ref_idx_l1,
+                poc_l0,
+                poc_l1,
             }
         };
 
@@ -8603,6 +8758,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         })?;
         let col_sampler = |x: i32, y: i32| -> ColBlockMotion {
             let m = mf.get_at_luma(x, y);
+            // r447 — per-cell resolved reference POCs (eq. 598).
+            let (poc_l0, poc_l1) = mf.ref_pocs_at_luma(x, y).unwrap_or((i32::MIN, i32::MIN));
             ColBlockMotion {
                 mode_inter: m.available && m.mode_inter,
                 pred_flag_l0: m.pred_flag_l0,
@@ -8611,6 +8768,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 mv_l1: m.mv_l1,
                 ref_idx_l0: m.ref_idx_l0,
                 ref_idx_l1: m.ref_idx_l1,
+                poc_l0,
+                poc_l1,
             }
         };
         let fuse_inputs = SbTmvpFuseInputs {
@@ -9272,12 +9431,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// [`crate::amvp::derive_temporal_amvp_candidate`]. Returns `None`
     /// when TMVP is disabled, the CU is ≤ 32 samples, or the ColPic
     /// carries no motion field.
+    #[allow(clippy::too_many_arguments)]
     fn derive_amvp_col_candidate(
         &self,
         xcb: i32,
         ycb: i32,
         cb_w: i32,
         cb_h: i32,
+        x: u32,
         current_ref_poc: i32,
         amvr: crate::amvr::AmvrShift,
     ) -> Option<MotionVector> {
@@ -9298,13 +9459,37 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             current_poc: self.current_poc,
             current_ref_poc,
-            // §8.5.2.12 colPocDiff — without modelling the ColPic's own
-            // RPL we use the equal-distance fast path (eq. 600), exact
-            // for the fixtures this lands against.
+            // r447 — eq. 598 colPocDiff reads the collocated cell's
+            // own resolved reference POC (the export fills it);
+            // this fallback only feeds fields without resolved POCs.
             col_ref_poc: self.current_poc,
             ph_temporal_mvp_enabled: self.ph_temporal_mvp_enabled,
+            x,
+            no_backward_pred: self.no_backward_pred_flag(),
+            collocated_from_l0: self.collocated_from_l0,
         };
-        crate::amvp::derive_temporal_amvp_candidate(&inputs, col_pic, amvr)
+        let r = crate::amvp::derive_temporal_amvp_candidate(&inputs, col_pic, amvr);
+        if dbg_cu_enabled() {
+            let br = self
+                .motion_field // placeholder to keep borrowck simple; col cell dumped below
+                .blocks_w;
+            let _ = br;
+            let cx = ((xcb + cb_w) >> 3) << 3;
+            let cy = ((ycb + cb_h) >> 3) << 3;
+            let cell = col_pic.motion_field.as_ref().map(|m| m.get_at_luma(cx, cy));
+            let pocs = col_pic
+                .motion_field
+                .as_ref()
+                .and_then(|m| m.ref_pocs_at_luma(cx, cy));
+            eprintln!(
+                "TMVP-AMVP ({xcb},{ycb}) {cb_w}x{cb_h} X={x} colPoc={} curRefPoc={current_ref_poc} \
+                 nbp={} colL0={} br=({cx},{cy}) cell={cell:?} pocs={pocs:?} -> {r:?}",
+                col_pic.poc,
+                self.no_backward_pred_flag(),
+                self.collocated_from_l0,
+            );
+        }
+        r
     }
 
     /// §8.5.8 + §8.7.5.1 — add the inverse-transformed inter residual
@@ -9857,6 +10042,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         &mut self,
         cu: &CtuCu,
         info: &LeafCuInfo,
+        residual: &LeafCuResidual,
         mlist: &[MvField],
         out: &mut PictureBuffer,
     ) -> Result<()> {
@@ -9905,30 +10091,29 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         })?;
 
         // §8.5.7.1 step 1 — predict each partition over the full CU
-        // rectangle using §8.5.6.3 (the round-22 8-tap luma + 4-tap
-        // chroma path). The two predictions are captured in scratch
-        // planes (8-bit samples) so the §8.5.7.2 blend has the full
-        // `cbWidth × cbHeight` arrays available.
-        use crate::reconstruct::PicturePlane;
-        let mut scratch_a_luma = PicturePlane::filled(cb_w as usize, cb_h as usize, 0);
-        let mut scratch_b_luma = PicturePlane::filled(cb_w as usize, cb_h as usize, 0);
-        predict_luma_block(
-            &mut scratch_a_luma,
-            0,
-            0,
+        // rectangle using the §8.5.6.3 HIGH-PRECISION path (r447: the
+        // eq. 1016 blend consumes the BitDepth + 6 intermediates, and
+        // the MC reference origin is the CU's PICTURE-ABSOLUTE
+        // position — the pre-r447 scaffold anchored the reads at
+        // (0, 0), fetching each partition's prediction from the
+        // picture's top-left corner).
+        let hp_a_luma = crate::inter::predict_luma_block_high_precision(
+            cb_x,
+            cb_y,
             cb_w,
             cb_h,
             &ref_a.frame.luma,
             mv_a,
+            bit_depth,
         )?;
-        predict_luma_block(
-            &mut scratch_b_luma,
-            0,
-            0,
+        let hp_b_luma = crate::inter::predict_luma_block_high_precision(
+            cb_x,
+            cb_y,
             cb_w,
             cb_h,
             &ref_b.frame.luma,
             mv_b,
+            bit_depth,
         )?;
 
         // §8.5.7.1 step 2 + §8.5.7.2 — set up the partition geometry.
@@ -9937,14 +10122,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let ctx_luma = GpmContext::new(cb_w, cb_h, angle_idx, distance_idx, 0, bit_depth, 1, 1);
 
         // §8.5.7.1 step 3 — eq. 1016 blend on luma.
-        blend_gpm_into_plane(
+        crate::gpm::blend_gpm_into_plane_hp(
             &mut out.luma,
             cb_x,
             cb_y,
             cb_w,
             cb_h,
-            &scratch_a_luma.samples,
-            &scratch_b_luma.samples,
+            &hp_a_luma,
+            &hp_b_luma,
             &ctx_luma,
             0,
             bit_depth,
@@ -9959,68 +10144,64 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let cb_h_c = cb_h / 2;
             let cb_x_c = cb_x / 2;
             let cb_y_c = cb_y / 2;
-            let mut scratch_a_cb = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
-            let mut scratch_b_cb = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
-            let mut scratch_a_cr = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
-            let mut scratch_b_cr = PicturePlane::filled(cb_w_c as usize, cb_h_c as usize, 0);
-            predict_chroma_block(
-                &mut scratch_a_cb,
-                0,
-                0,
+            let hp_a_cb = crate::inter::predict_chroma_block_high_precision(
+                cb_x_c,
+                cb_y_c,
                 cb_w_c,
                 cb_h_c,
                 &ref_a.frame.cb,
                 mv_a,
+                bit_depth,
             )?;
-            predict_chroma_block(
-                &mut scratch_b_cb,
-                0,
-                0,
+            let hp_b_cb = crate::inter::predict_chroma_block_high_precision(
+                cb_x_c,
+                cb_y_c,
                 cb_w_c,
                 cb_h_c,
                 &ref_b.frame.cb,
                 mv_b,
+                bit_depth,
             )?;
-            predict_chroma_block(
-                &mut scratch_a_cr,
-                0,
-                0,
+            let hp_a_cr = crate::inter::predict_chroma_block_high_precision(
+                cb_x_c,
+                cb_y_c,
                 cb_w_c,
                 cb_h_c,
                 &ref_a.frame.cr,
                 mv_a,
+                bit_depth,
             )?;
-            predict_chroma_block(
-                &mut scratch_b_cr,
-                0,
-                0,
+            let hp_b_cr = crate::inter::predict_chroma_block_high_precision(
+                cb_x_c,
+                cb_y_c,
                 cb_w_c,
                 cb_h_c,
                 &ref_b.frame.cr,
                 mv_b,
+                bit_depth,
             )?;
             let ctx_chroma =
                 GpmContext::new(cb_w_c, cb_h_c, angle_idx, distance_idx, 1, bit_depth, 2, 2);
-            blend_gpm_into_plane(
+            crate::gpm::blend_gpm_into_plane_hp(
                 &mut out.cb,
                 cb_x_c,
                 cb_y_c,
                 cb_w_c,
                 cb_h_c,
-                &scratch_a_cb.samples,
-                &scratch_b_cb.samples,
+                &hp_a_cb,
+                &hp_b_cb,
                 &ctx_chroma,
                 1,
                 bit_depth,
             );
-            blend_gpm_into_plane(
+            crate::gpm::blend_gpm_into_plane_hp(
                 &mut out.cr,
                 cb_x_c,
                 cb_y_c,
                 cb_w_c,
                 cb_h_c,
-                &scratch_a_cr.samples,
-                &scratch_b_cr.samples,
+                &hp_a_cr,
+                &hp_b_cr,
                 &ctx_chroma,
                 2,
                 bit_depth,
@@ -10029,9 +10210,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
         // §8.7.5.2 — a GPM CU is MODE_INTER with `ciip_flag == 0`, so
         // its blended luma prediction forward-maps into the LMCS
-        // codeword domain (the GPM path carries no coded residual
-        // today, so the mapped prediction IS the mapped-domain
-        // reconstruction the §8.8.2 in-loop inverse pass expects).
+        // codeword domain BEFORE the eq. 1214 residual add.
         self.lmcs_forward_map_luma_rect(
             out,
             cb_x as usize,
@@ -10040,14 +10219,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cb_h as usize,
         );
 
-        // §8.5.7.3 — Motion vector storing process. Round-40 broadcasts
-        // partition A's MV uniformly across the CU's 4×4 motion-field
-        // grid; the per-4×4 partition-aware storage (storing partition
-        // B's MV on cells whose centre falls on the partition-B side
-        // of the line) lands when a downstream merge derivation
-        // actually consumes a partition-aware neighbour. None of the
-        // existing fixtures or downstream CUs do.
-        let mvf = MvField {
+        // §8.5.8 + §8.7.5.1 residual add (r447 — a non-skip GPM merge
+        // CU decodes its §7.3.11.10 transform unit like every other
+        // merge CU; the LMCS map already ran above).
+        self.add_inter_cu_residual_opts(cu, info, residual, out, false)?;
+
+        // §8.5.7.3 — Motion vector storing process (r447: the full
+        // per-4×4 eqs. 1017 – 1050 partition-aware storage; the
+        // pre-r447 scaffold broadcast partition A uniformly). Per
+        // §8.5.2.1's invocation condition the HMVP table is NOT
+        // updated by a GPM CU.
+        let store_a = MvField {
             mv_l0: if x_a == 0 { mv_a } else { MotionVector::ZERO },
             ref_idx_l0: if x_a == 0 { ref_idx_a } else { -1 },
             pred_flag_l0: x_a == 0,
@@ -10059,22 +10241,71 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             available: true,
             bcw_idx: 0,
         };
-        self.motion_field.write_block(cb_x, cb_y, cb_w, cb_h, mvf);
-        self.hmvp.update_with(mvf);
+        let store_b = MvField {
+            mv_l0: if x_b == 0 { mv_b } else { MotionVector::ZERO },
+            ref_idx_l0: if x_b == 0 { ref_idx_b } else { -1 },
+            pred_flag_l0: x_b == 0,
+            mv_l1: if x_b == 1 { mv_b } else { MotionVector::ZERO },
+            ref_idx_l1: if x_b == 1 { ref_idx_b } else { -1 },
+            pred_flag_l1: x_b == 1,
+            cu_skip_flag: info.inter.cu_skip_flag,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+        };
+        // sType 2 with the two partitions on DIFFERENT lists → the
+        // eqs. 1043 – 1050 bi-combination; same list → partition B
+        // (eqs. 1035 – 1042).
+        let store_bi = if x_a + x_b == 1 {
+            MvField {
+                mv_l0: if x_a == 0 { mv_a } else { mv_b },
+                ref_idx_l0: if x_a == 0 { ref_idx_a } else { ref_idx_b },
+                pred_flag_l0: true,
+                mv_l1: if x_a == 0 { mv_b } else { mv_a },
+                ref_idx_l1: if x_a == 0 { ref_idx_b } else { ref_idx_a },
+                pred_flag_l1: true,
+                cu_skip_flag: info.inter.cu_skip_flag,
+                mode_inter: true,
+                available: true,
+                bcw_idx: 0,
+            }
+        } else {
+            store_b
+        };
+        for y_sb in 0..(cb_h >> 2) {
+            for x_sb in 0..(cb_w >> 2) {
+                let s_type = crate::gpm::gpm_storage_s_type(
+                    cb_w,
+                    cb_h,
+                    angle_idx as u32,
+                    distance_idx as u32,
+                    x_sb,
+                    y_sb,
+                );
+                let mvf = match s_type {
+                    0 => store_a,
+                    1 => store_b,
+                    _ => store_bi,
+                };
+                self.motion_field
+                    .write_block(cb_x + (x_sb << 2), cb_y + (y_sb << 2), 4, 4, mvf);
+            }
+        }
 
         // Deblock + intra-grid bookkeeping (matches the round-21 inter
-        // path).
-        let qp_y = self.cabac.slice_qp_y.0;
+        // path). r447 — the GPM CU now decodes its residual, so the
+        // deblock record carries the real CBFs + the QG-inherited QP.
+        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
         self.deblock_cus.push(DeblockCu {
             x: cb_x,
             y: cb_y,
             w: cb_w,
             h: cb_h,
-            qp_y: qp_y.clamp(0, 63),
+            qp_y,
             intra: false,
-            tu_y_coded: false,
-            tu_cb_coded: false,
-            tu_cr_coded: false,
+            tu_y_coded: info.tu_y_coded_flag,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
             bdpcm_luma: false,
             bdpcm_chroma: false,
             qp_c: self.deblock_chroma_qps(

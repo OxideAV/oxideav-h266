@@ -623,10 +623,10 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("8b420_B_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
     ("AFF_A_2", 'F'),             // 10/10 pictures diverge (first poc 0 plane Y)
-    ("ALF_A_3", 'E'),             // post-affine-gate parse desync (under triage)
+    ("ALF_A_3", 'F'),             // 3/3 pictures diverge (first poc 0 plane Y)
     ("ALF_B_3", 'F'),             // 3/3 pictures diverge (first poc 0 plane Y)
     ("ALF_C_3", 'F'),             // 4/4 pictures diverge (first poc 0 plane Y)
-    ("AMVR_A_3", 'E'),            // post-affine-gate parse desync (under triage)
+    ("AMVR_A_3", 'F'),            // 85/85 pictures diverge (first poc 0 plane Cb)
     ("BDOF_A_4", 'E'),            // post-affine-gate parse desync (under triage)
     ("BDPCM_A_2", 'F'),           // 3/3 pictures diverge (first poc 0 plane Y)
     ("CCLM_A_2", 'F'),            // 7/7 pictures diverge (first poc 0 plane Cb)

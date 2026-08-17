@@ -572,6 +572,12 @@ pub struct ColBlockMotion {
     /// `refIdxL1Col[xColCb][yColCb]` — index into the collocated
     /// slice's RPL[1]. `-1` ⇒ no L1 reference.
     pub ref_idx_l1: i32,
+    /// r447 — resolved reference POC of the collocated cell's L0
+    /// reference (`i32::MIN` = unresolved → fall back to the
+    /// `poc_of_col_ref` closure).
+    pub poc_l0: i32,
+    /// r447 — L1 twin of [`Self::poc_l0`].
+    pub poc_l1: i32,
 }
 
 /// A read-back of the collocated picture's per-4×4 motion field at an
@@ -724,20 +730,26 @@ fn derive_collocated_mv_subblock(
         return (MotionVector::ZERO, false);
     };
 
-    // §8.5.2.15 buffer compression — integer-pel rounding (matches the
-    // §8.5.2.11 round-25 temporal-merge convention; sample-exact for the
-    // integer-pel vectors the fuse tests exercise).
-    let mv_col = MotionVector {
-        x: (mv_col.x >> 4) << 4,
-        y: (mv_col.y >> 4) << 4,
-    };
+    // r447 — §8.5.2.15 buffer compression (eqs. 611 – 615 mantissa /
+    // exponent rounding; previously integer-pel truncation).
+    let mv_col = crate::inter::compress_temporal_mv(mv_col);
 
-    // §8.5.2.12 eqs. 598 / 599 — POC distances.
-    let col_ref_poc = match (inputs.poc_of_col_ref)(list_col, ref_idx_col) {
-        Some(p) => p,
-        // Cannot resolve the collocated reference's POC → treat as
-        // availableFlagLXCol = 0.
-        None => return (MotionVector::ZERO, false),
+    // §8.5.2.12 eqs. 598 / 599 — POC distances. Prefer the per-cell
+    // resolved POC (r447 export); fall back to the closure.
+    let cell_poc = if list_col == 1 {
+        col.poc_l1
+    } else {
+        col.poc_l0
+    };
+    let col_ref_poc = if cell_poc != i32::MIN {
+        cell_poc
+    } else {
+        match (inputs.poc_of_col_ref)(list_col, ref_idx_col) {
+            Some(p) => p,
+            // Cannot resolve the collocated reference's POC → treat as
+            // availableFlagLXCol = 0.
+            None => return (MotionVector::ZERO, false),
+        }
     };
     let col_poc_diff = inputs.col_pic_poc.wrapping_sub(col_ref_poc);
     let curr_poc_diff = inputs.curr_pic_poc.wrapping_sub(curr_ref_poc);
@@ -1380,6 +1392,8 @@ mod tests {
             mv_l1: MotionVector::ZERO,
             ref_idx_l0: 0,
             ref_idx_l1: -1,
+            poc_l0: i32::MIN,
+            poc_l1: i32::MIN,
         }
     }
 
@@ -1509,6 +1523,8 @@ mod tests {
             mv_l1: mv1,
             ref_idx_l0: 0,
             ref_idx_l1: 0,
+            poc_l0: i32::MIN,
+            poc_l1: i32::MIN,
         };
 
         let g = fill_subblock_motion(&rec, &inputs, &sampler);
@@ -1540,6 +1556,8 @@ mod tests {
             mv_l1: mv1,
             ref_idx_l0: -1,
             ref_idx_l1: 0,
+            poc_l0: i32::MIN,
+            poc_l1: i32::MIN,
         };
 
         let g = fill_subblock_motion(&rec, &inputs, &sampler);

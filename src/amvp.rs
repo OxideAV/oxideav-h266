@@ -344,12 +344,20 @@ pub struct AmvpTemporalInputs {
     /// POC of `RefPicList[X][refIdxLX]` for the current CU — the
     /// `currPocDiff` operand (eq. 599) for the §8.5.2.12 scaling.
     pub current_ref_poc: i32,
-    /// POC of the collocated block's reference picture — the
-    /// `colPocDiff` operand (eq. 598).
+    /// Fallback POC of the collocated block's reference picture — the
+    /// `colPocDiff` operand (eq. 598) when the collocated field
+    /// carries no resolved per-cell POCs.
     pub col_ref_poc: i32,
     /// `ph_temporal_mvp_enabled_flag`. When `false` the §8.5.2.11
     /// first bullet sets `availableFlagLXCol = 0`.
     pub ph_temporal_mvp_enabled: bool,
+    /// r447 — the list `X` the candidate is derived for (§8.5.2.12
+    /// both-lists arm under `NoBackwardPredFlag == 1`).
+    pub x: u32,
+    /// §8.5.2.1 `NoBackwardPredFlag`.
+    pub no_backward_pred: bool,
+    /// `sh_collocated_from_l0_flag`.
+    pub collocated_from_l0: bool,
 }
 
 /// §8.5.2.11 (AMVP path) — derive the temporal collocated AMVP candidate
@@ -409,6 +417,9 @@ pub fn derive_temporal_amvp_candidate(
         current_ref_poc: inputs.current_ref_poc,
         col_pic,
         col_ref_poc: inputs.col_ref_poc,
+        x: inputs.x,
+        no_backward_pred: inputs.no_backward_pred,
+        collocated_from_l0: inputs.collocated_from_l0,
     };
     let col = derive_temporal_merge_candidate(&merge_inputs)?;
 
@@ -841,6 +852,9 @@ mod tests {
             current_ref_poc,
             col_ref_poc,
             ph_temporal_mvp_enabled: true,
+            x: 0,
+            no_backward_pred: false,
+            collocated_from_l0: true,
         }
     }
 
@@ -913,23 +927,16 @@ mod tests {
     fn temporal_amvp_applies_amvr_rounding() {
         // §8.5.2.9 step-3 last bullet AMVR-rounds the produced mvLXCol.
         // The §8.5.2.15 buffer compression inside the shared collocated
-        // walk first folds the raw Col MV (37, -19) to integer-pel
-        // (32, -32) (`mv >> 4 << 4`); the §8.5.2.14 AMVR rounding then
-        // runs over that value. The result equals applying
-        // `round_mv_amvr` to the buffer-compressed MV — pinning that the
-        // step is wired, not skipped. (Because buffer compression has
-        // already quantised to integer-pel, every AMVR shift <= 4 leaves
-        // the value unchanged; the wiring still matters because the spec
-        // mandates the step and future buffer-compression refinements
-        // could expose sub-integer-pel Col MVs.)
+        // walk runs first (r447 — the eqs. 611 – 615 mantissa/exponent
+        // rounding, which leaves small MVs like (37, -19) UNCHANGED);
+        // the §8.5.2.14 AMVR rounding then runs over that value. The
+        // result equals applying `round_mv_amvr` to the
+        // buffer-compressed MV — pinning that both steps are wired.
         let raw = MotionVector { x: 37, y: -19 };
         let col_pic = col_pic_uniform(32, 32, 1, raw);
         let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);
-        // The shared walk's §8.5.2.15 compression: (37, -19) → (32, -32).
-        let compressed = MotionVector {
-            x: (raw.x >> 4) << 4,
-            y: (raw.y >> 4) << 4,
-        };
+        let compressed = crate::inter::compress_temporal_mv(raw);
+        assert_eq!(compressed, raw, "eqs. 611 – 615 leave small MVs intact");
         for shift in [0u32, 1, 2, 3, 4] {
             let mv = derive_temporal_amvp_candidate(&inputs, &col_pic, AmvrShift(shift)).unwrap();
             assert_eq!(
