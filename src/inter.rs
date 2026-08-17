@@ -2567,27 +2567,11 @@ pub fn predict_luma_block_bipred(
     src_l1: &PicturePlane,
     mv_l1: MotionVector,
 ) -> Result<()> {
-    // Scratch planes are sized so the per-list call writes into
-    // (dst_x, dst_y)..(dst_x + w, dst_y + h) — matches the spec's
-    // `(xCb + mvLX[0]>>4, yCb + mvLX[1]>>4)` source-origin formula.
-    let scratch_w = (dst_x + w) as usize;
-    let scratch_h = (dst_y + h) as usize;
-    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    predict_luma_block(&mut tmp_l0, dst_x, dst_y, w, h, src_l0, mv_l0)?;
-    predict_luma_block(&mut tmp_l1, dst_x, dst_y, w, h, src_l1, mv_l1)?;
-    // Bi-pred composition: read from (dst_x, dst_y) of each scratch,
-    // write into (dst_x, dst_y) of the real destination.
-    for r in 0..h as usize {
-        for c in 0..w as usize {
-            let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
-            let v0 = tmp_l0.samples[off_src] as u32;
-            let v1 = tmp_l1.samples[off_src] as u32;
-            let avg = ((v0 + v1 + 1) >> 1) as u16;
-            dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
-        }
-    }
-    Ok(())
+    // r447 — delegate to the §8.5.6.6.2 high-precision composition
+    // (eq. 980 on the BitDepth + 6 per-list arrays); the historic
+    // final-domain `(a + b + 1) >> 1` average double-rounded every
+    // fractional-MV bi-pred block.
+    predict_luma_block_bipred_bcw(dst, dst_x, dst_y, w, h, src_l0, mv_l0, src_l1, mv_l1, 0)
 }
 
 /// Round-23 bi-pred §8.5.6.3.4 chroma motion-compensated prediction
@@ -2604,22 +2588,10 @@ pub fn predict_chroma_block_bipred(
     src_l1: &PicturePlane,
     mv_l1: MotionVector,
 ) -> Result<()> {
-    let scratch_w = (dst_x_c + w_c) as usize;
-    let scratch_h = (dst_y_c + h_c) as usize;
-    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    predict_chroma_block(&mut tmp_l0, dst_x_c, dst_y_c, w_c, h_c, src_l0, mv_l0)?;
-    predict_chroma_block(&mut tmp_l1, dst_x_c, dst_y_c, w_c, h_c, src_l1, mv_l1)?;
-    for r in 0..h_c as usize {
-        for c in 0..w_c as usize {
-            let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
-            let v0 = tmp_l0.samples[off_src] as u32;
-            let v1 = tmp_l1.samples[off_src] as u32;
-            let avg = ((v0 + v1 + 1) >> 1) as u16;
-            dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
-        }
-    }
-    Ok(())
+    // r447 — high-precision eq. 980 composition (see the luma twin).
+    predict_chroma_block_bipred_bcw(
+        dst, dst_x_c, dst_y_c, w_c, h_c, src_l0, mv_l0, src_l1, mv_l1, 0,
+    )
 }
 
 // =====================================================================
@@ -3842,10 +3814,14 @@ mod tests {
         // so the per-list outputs differ at most positions.
         let mut src_l0 = PicturePlane::filled(32, 32, 0);
         let mut src_l1 = PicturePlane::filled(32, 32, 0);
+        // r447 — keep the sources INSIDE the 8-bit range: the
+        // eq. 980 high-precision composition clips only at the end,
+        // while the per-list reference path clips each list first, so
+        // out-of-range synthetic samples would (correctly) diverge.
         for y in 0..32 {
             for x in 0..32 {
-                src_l0.samples[y * 32 + x] = ((x * 9) ^ (y * 5)) as u16;
-                src_l1.samples[y * 32 + x] = ((x * 3) ^ (y * 11)) as u16;
+                src_l0.samples[y * 32 + x] = (((x * 9) ^ (y * 5)) & 0xFF) as u16;
+                src_l1.samples[y * 32 + x] = (((x * 3) ^ (y * 11)) & 0xFF) as u16;
             }
         }
         let mv_l0 = MotionVector { x: 16, y: 0 }; // integer-pel +1
