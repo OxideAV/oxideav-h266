@@ -637,6 +637,16 @@ impl StreamDecoder {
                 ph.ph_cu_qp_delta_subdiv_intra_slice,
                 ph.ph_cu_chroma_qp_offset_subdiv_intra_slice,
             );
+            eprintln!(
+                "DBLK dbg: disabled={} beta={} tc={} cb=({},{}) cr=({},{})",
+                sh0.sh_deblocking_filter_disabled_flag,
+                sh0.sh_luma_beta_offset_div2,
+                sh0.sh_luma_tc_offset_div2,
+                sh0.sh_cb_beta_offset_div2,
+                sh0.sh_cb_tc_offset_div2,
+                sh0.sh_cr_beta_offset_div2,
+                sh0.sh_cr_tc_offset_div2,
+            );
         }
         if sh0.sh_lmcs_used_flag {
             let data = self.lmcs_apss.get(&ph.ph_lmcs_aps_id).ok_or_else(|| {

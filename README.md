@@ -8,10 +8,11 @@ oxideav. Zero C dependencies, no FFI, no `*-sys` crates.
 VVC is a very large specification (500+ pages); this crate is an
 in-progress, spec-driven implementation. It provides a complete NAL
 framing + parameter-set parsing layer, a reconstruction pipeline that
-covers a growing subset of the intra and inter coding tools, and an
-IDR-frame encoder pipeline. Affine non-merge reconstruction inside the
-picture loop and a complete encoder are still being built up
-incrementally.
+covers the intra tools and — as of r447 — the full inter tool chain
+(affine merge + non-merge, SbTMVP, GPM, MMVD, CIIP, SMVD, AMVR incl.
+the affine arm, BCW, BDOF, PROF, DMVR) validated tool-by-tool against
+black-box fixture streams, and an IDR-frame encoder pipeline. A
+complete encoder is still being built up incrementally.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -660,10 +661,50 @@ produces them, an independent black-box decoder is the oracle, and
   neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
   their 4-point model from oversampled positions).
 
-Scorecard (r437 → r440 → r443): 0 P / 2 F / 8 U / 46 E →
-1 P / 7 F / 26 U / 22 E → **1 PASS / 14 FAIL / 33 UNSUPPORTED /
-8 ERROR**. r443 dissolved the r440 "22 inter-picture desync" family
-into root causes, each pinned with black-box fixture streams:
+Scorecard (r437 → r440 → r443 → r447): 0 P / 2 F / 8 U / 46 E →
+1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
+**2 PASS / 17 FAIL / 8 UNSUPPORTED / 29 ERROR** — `DMVR_B_4` joins
+`CodingToolsSets_A_2` as byte-exact, and the r443 "affine non-merge"
+gate (the largest U family) is DISSOLVED. r447's root causes, each
+pinned with black-box single-tool fixture matrices that now decode
+**byte-exactly end-to-end** (affine, affine-AMVR, SMVD, MMVD, CIIP,
+BDOF, PROF, SbTMVP):
+
+* **§7.3.11.5 cascade order** — `inter_pred_idc` precedes the affine
+  pair, and `sym_mvd_flag` presence carries `!inter_affine_flag`;
+  both dispatcher sides mirrored the same divergence, so round-trips
+  passed while every conforming affine-enabled B-slice wire desynced
+  (the reason the affine rows sat at UNSUPPORTED: the old
+  reconstruction refusal fired before the desync could).
+* **§7.4.3.7 PH inferences** — absent `ph_bdof/dmvr/prof_disabled`
+  infer `1 − sps_*_enabled`; absent `ph_mvd_l1_zero_flag` infers 1.
+* **§8.5.2.12 / §8.5.2.15 temporal motion** — the export resolves
+  per-4×4-cell reference POCs so eq. 598 `colPocDiff` is the
+  collocated block's own distance (scaling was disabled by an
+  equal-distance shortcut); the both-lists arm picks `listCol` per
+  `NoBackwardPredFlag` / `sh_collocated_from_l0_flag`; buffer
+  compression is the real eqs. 611 – 615 mantissa/exponent rounding.
+* **§7.3.11.7 (V4) GPM presence** — the `regular_merge_flag` GPM arm
+  has no `cu_skip` / `MaxNumGpmMergeCand` terms (a GPM-eligible SKIP
+  CU desynced every GPM wire); GPM reconstruction predicts at the
+  CU's picture-absolute origin, blends eq. 1016 on real §8.5.6.3
+  intermediates, stores §8.5.7.3 per-4×4 sType motion, and decodes
+  its residual.
+* **§8.5.6.6.2 high-precision bi-pred** — eqs. 978 – 981 compose the
+  BitDepth + 6 per-list arrays on the translational, affine, SbTMVP
+  and GPM paths (the legacy final-domain `(a + b + 1) >> 1` average
+  double-rounded every fractional bi-pred block).
+* **§8.5.6.3.2 / §8.5.6.1** — PROF and BDOF border samples are
+  §8.5.6.3.3 integer fetches at the fraction-rounded position; BDOF
+  runs per ≤16×16 sub-block (eqs. 888/889); DMVR MC reads are bounded
+  by eqs. 926/927 around the unrefined MV.
+* **§8.8.3.4 / §8.8.3.5 deblocking** — full boundary-strength cascade
+  (motion-difference / CIIP / IBC arms off a per-4×4 grid with
+  resolved reference POCs), sub-block interior edges for affine /
+  sub-block-merge CUs, per-64-tile CBF maps + interior TB-edge
+  filtering for multi-TB CUs.
+
+The r443 rollup below documents the earlier family:
 
 * **A third V4 publication-erratum finding that GENERALIZES the r440
   pair**: every §8.7.4.5 MTS table body is printed transposed
@@ -691,14 +732,18 @@ into root causes, each pinned with black-box fixture streams:
   `non_inter_flag`, DUAL_TREE_LUMA subtrees and the single
   DUAL_TREE_CHROMA leaf in the single-tree walker.
 
-The 14 FAIL streams decode end-to-end with localized (mostly ±small,
-10-bit) plane divergences — `DMVR_B_4` is 10 of 11 pictures
-byte-exact and `MIP_A_3` / `CCLM_A_2` are luma-byte-exact with a
-chroma-only class. The 33 UNSUPPORTED rows are named feature gates
-(affine non-merge reconstruction in the stream walker — the largest
-at 14 streams, subpictures, 4:2:2 / 4:4:4, explicit weighted
-prediction, per-slice loop-filter divergence), and the 8 ERROR rows
-are deeper desyncs plus an IBC BV-derivation class under triage.
+After r447 the 17 FAIL streams decode end-to-end with plane
+divergences dominated by ONE precisely-repro'd class: a
+data-dependent intra deblocking tail (a 3-frame all-intra black-box
+fixture reproduces it at ~1k samples on its third picture —
+4-aligned luma edges filtered differently; pre-r447 the same fixture
+also diverged on its second picture, which r447's interior-TB-edge
+work fixed). The 8 UNSUPPORTED rows are subpictures, 4:2:2 / 4:4:4,
+explicit weighted prediction and per-slice loop-filter divergence;
+the 29 ERROR rows are the former affine-U family, which now parses
+PAST its first affine CU and hits a later desync shared with the
+intra-FAIL class (under triage — `MERGE_A_2` diverges on its intra
+picture 0 first, then desyncs on picture 2).
 `examples/triage_dbg` decodes one corpus stream against its `.opl`
 sidecar with optional plane dumps; `examples/decode_dump` writes
 POC-ordered YUV for fixture diffing; `examples/sps_dump` prints a
