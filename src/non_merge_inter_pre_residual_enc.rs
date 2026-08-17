@@ -758,12 +758,11 @@ pub fn encode_non_merge_inter_pre_residual_affine(
     let num_cp = decision.num_cp_mv();
 
     // ------------------------------------------------------------------
-    // Step 1 — affine syntax (round-177 dispatcher).
-    // ------------------------------------------------------------------
-    encode_non_merge_inter_affine(enc, ctxs, affine_gate, &decision.affine)?;
-
-    // ------------------------------------------------------------------
-    // Step 2 — inter_pred_idc (§7.3.11.7 B-slice only).
+    // Step 1 — inter_pred_idc (§7.3.11.5 B-slice only). r447 conformance
+    // fix: §7.3.11.5 puts `inter_pred_idc` BEFORE the affine pair (the
+    // pre-r447 dispatcher emitted the affine pair first; the reader
+    // mirrored it, so round-trips passed while every conforming
+    // affine-enabled B-slice wire desynced).
     // ------------------------------------------------------------------
     let outer = mvp_gate.inter_pred_idc_gate_open();
     if outer {
@@ -788,13 +787,19 @@ pub fn encode_non_merge_inter_pre_residual_affine(
     };
 
     // ------------------------------------------------------------------
-    // Step 3 — sym_mvd_flag (§7.3.11.7 SMVD gate).
-    //
-    // The affine debug-assert above already rules out SMVD on the
-    // affine path; this branch covers the translational path where
-    // the SMVD gate may open.
+    // Step 2 — affine syntax (round-177 dispatcher).
     // ------------------------------------------------------------------
-    if mvp_gate.sym_mvd_signalled(effective_inter_pred_idc) {
+    encode_non_merge_inter_affine(enc, ctxs, affine_gate, &decision.affine)?;
+
+    // ------------------------------------------------------------------
+    // Step 3 — sym_mvd_flag (§7.3.11.5 SMVD gate). The listing's
+    // presence condition carries an explicit `!inter_affine_flag` term
+    // (r447 — mirrored on the read side), so an affine CU emits no bin
+    // regardless of the slice-level SMVD gates.
+    // ------------------------------------------------------------------
+    let sym_mvd_gate =
+        !decision.affine.inter_affine_flag && mvp_gate.sym_mvd_signalled(effective_inter_pred_idc);
+    if sym_mvd_gate {
         encode_sym_mvd_flag(enc, ctxs, decision.mvp.sym_mvd_flag)?;
     } else {
         debug_assert!(
@@ -802,7 +807,7 @@ pub fn encode_non_merge_inter_pre_residual_affine(
             "sym_mvd_flag gate closed → §7.4.12.7 requires sym_mvd_flag = 0"
         );
     }
-    let effective_sym_mvd_flag = if mvp_gate.sym_mvd_signalled(effective_inter_pred_idc) {
+    let effective_sym_mvd_flag = if sym_mvd_gate {
         decision.mvp.sym_mvd_flag
     } else {
         false
@@ -2411,13 +2416,8 @@ mod tests {
         let tools = CuToolFlags::default();
         let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
 
-        // Step 1 — affine syntax.
-        let affine = reader
-            .read_non_merge_inter_affine(affine_gate)
-            .expect("reader reads affine syntax");
-        let num_cp = affine.motion_model.num_cp_mv();
-
-        // Step 2 — inter_pred_idc.
+        // Step 1 — inter_pred_idc (§7.3.11.5 order: before the affine
+        // pair — r447).
         let inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
             reader
                 .read_inter_pred_idc(mvp_gate.cb_width, mvp_gate.cb_height)
@@ -2426,14 +2426,22 @@ mod tests {
             InterPredDir::PredL0
         };
 
-        // Step 3 — sym_mvd_flag.
-        let sym_mvd_flag = if mvp_gate.sym_mvd_signalled(inter_pred_idc) {
-            reader
-                .read_sym_mvd_flag()
-                .expect("reader reads sym_mvd_flag")
-        } else {
-            false
-        };
+        // Step 2 — affine syntax.
+        let affine = reader
+            .read_non_merge_inter_affine(affine_gate)
+            .expect("reader reads affine syntax");
+        let num_cp = affine.motion_model.num_cp_mv();
+
+        // Step 3 — sym_mvd_flag (§7.3.11.5 gate carries
+        // `!inter_affine_flag` — r447).
+        let sym_mvd_flag =
+            if !affine.inter_affine_flag && mvp_gate.sym_mvd_signalled(inter_pred_idc) {
+                reader
+                    .read_sym_mvd_flag()
+                    .expect("reader reads sym_mvd_flag")
+            } else {
+                false
+            };
 
         let l0_active = matches!(inter_pred_idc, InterPredDir::PredL0 | InterPredDir::PredBi);
         let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);
@@ -2814,13 +2822,8 @@ mod tests {
         let tools = CuToolFlags::default();
         let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
 
-        // Step 1 — affine syntax.
-        let affine = reader
-            .read_non_merge_inter_affine(affine_gate)
-            .expect("reader reads affine syntax");
-        let num_cp = affine.motion_model.num_cp_mv();
-
-        // Step 2 — inter_pred_idc.
+        // Step 1 — inter_pred_idc (§7.3.11.5 order: before the affine
+        // pair — r447).
         let inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
             reader
                 .read_inter_pred_idc(mvp_gate.cb_width, mvp_gate.cb_height)
@@ -2829,14 +2832,22 @@ mod tests {
             InterPredDir::PredL0
         };
 
-        // Step 3 — sym_mvd_flag.
-        let sym_mvd_flag = if mvp_gate.sym_mvd_signalled(inter_pred_idc) {
-            reader
-                .read_sym_mvd_flag()
-                .expect("reader reads sym_mvd_flag")
-        } else {
-            false
-        };
+        // Step 2 — affine syntax.
+        let affine = reader
+            .read_non_merge_inter_affine(affine_gate)
+            .expect("reader reads affine syntax");
+        let num_cp = affine.motion_model.num_cp_mv();
+
+        // Step 3 — sym_mvd_flag (§7.3.11.5 gate carries
+        // `!inter_affine_flag` — r447).
+        let sym_mvd_flag =
+            if !affine.inter_affine_flag && mvp_gate.sym_mvd_signalled(inter_pred_idc) {
+                reader
+                    .read_sym_mvd_flag()
+                    .expect("reader reads sym_mvd_flag")
+            } else {
+                false
+            };
 
         let l0_active = matches!(inter_pred_idc, InterPredDir::PredL0 | InterPredDir::PredBi);
         let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);
@@ -2960,13 +2971,8 @@ mod tests {
         let tools = CuToolFlags::default();
         let mut reader = LeafCuReader::new(&mut dec, &mut dec_ctxs, tools);
 
-        // Step 1 — affine syntax.
-        let affine = reader
-            .read_non_merge_inter_affine(affine_gate)
-            .expect("reader reads affine syntax");
-        let num_cp = affine.motion_model.num_cp_mv();
-
-        // Step 2 — inter_pred_idc.
+        // Step 1 — inter_pred_idc (§7.3.11.5 order: before the affine
+        // pair — r447).
         let inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
             reader
                 .read_inter_pred_idc(mvp_gate.cb_width, mvp_gate.cb_height)
@@ -2975,14 +2981,22 @@ mod tests {
             InterPredDir::PredL0
         };
 
-        // Step 3 — sym_mvd_flag.
-        let sym_mvd_flag = if mvp_gate.sym_mvd_signalled(inter_pred_idc) {
-            reader
-                .read_sym_mvd_flag()
-                .expect("reader reads sym_mvd_flag")
-        } else {
-            false
-        };
+        // Step 2 — affine syntax.
+        let affine = reader
+            .read_non_merge_inter_affine(affine_gate)
+            .expect("reader reads affine syntax");
+        let num_cp = affine.motion_model.num_cp_mv();
+
+        // Step 3 — sym_mvd_flag (§7.3.11.5 gate carries
+        // `!inter_affine_flag` — r447).
+        let sym_mvd_flag =
+            if !affine.inter_affine_flag && mvp_gate.sym_mvd_signalled(inter_pred_idc) {
+                reader
+                    .read_sym_mvd_flag()
+                    .expect("reader reads sym_mvd_flag")
+            } else {
+                false
+            };
 
         let l0_active = matches!(inter_pred_idc, InterPredDir::PredL0 | InterPredDir::PredBi);
         let l1_active = matches!(inter_pred_idc, InterPredDir::PredL1 | InterPredDir::PredBi);

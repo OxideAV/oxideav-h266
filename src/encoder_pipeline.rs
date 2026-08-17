@@ -2324,6 +2324,10 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: true,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             });
         }
         PreparedCu::Leaf(tb) => {
@@ -2344,6 +2348,10 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             });
         }
         PreparedCu::BtSplit {
@@ -2815,6 +2823,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     crate::deblock::apply_deblocking_clipped(
         &mut rec,
         &all_deblock_cus,
+        None,
         None,
         &dbp,
         1,

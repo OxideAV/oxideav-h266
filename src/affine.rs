@@ -1290,6 +1290,82 @@ pub fn predict_luma_block_affine_prof(
     Ok(())
 }
 
+/// r447 — [`predict_luma_block_affine_prof`] surfacing the
+/// high-precision predSamplesLX array (no final `offset1 >> shift1`
+/// clip): the CU-anchored `Vec<i32>` of length `cb_width * cb_height`
+/// the §8.5.6.6.2 bi-pred composition consumes. Bit-identical to
+/// running the plane variant and inverting the eq. 978 rounding is not
+/// possible, hence the dedicated driver.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block_affine_prof_hp(
+    cb_x: u32,
+    cb_y: u32,
+    cb_width: u32,
+    cb_height: u32,
+    src: &PicturePlane,
+    cpmvs: &AffineCpmvs,
+    filter_set: AffineLumaFilterSet,
+    bipred: bool,
+    ph_prof_disabled_flag: bool,
+    rpr_constraints_active: bool,
+) -> Result<Vec<i32>> {
+    let grid = derive_subblock_mvs(cb_width, cb_height, cpmvs, bipred)?;
+    let sb_w = cb_width / grid.num_sb_x;
+    let sb_h = cb_height / grid.num_sb_y;
+    let prof_on = cb_prof_flag_lx(
+        cb_width,
+        cb_height,
+        cpmvs,
+        bipred,
+        ph_prof_disabled_flag,
+        rpr_constraints_active,
+    );
+    let diff_mv = if prof_on {
+        Some(derive_prof_diff_mv_array(cb_width, cb_height, cpmvs)?)
+    } else {
+        None
+    };
+    let w_us = cb_width as usize;
+    let mut out = vec![0i32; w_us * cb_height as usize];
+    for sb_iy in 0..grid.num_sb_y {
+        for sb_ix in 0..grid.num_sb_x {
+            let mv = grid.mv_at(sb_ix, sb_iy);
+            let sb_x = (sb_ix * sb_w) as usize;
+            let sb_y = (sb_iy * sb_h) as usize;
+            // The §8.5.6.3 MC couples the destination position with the
+            // reference-sample read position, so the sub-block predicts
+            // at its PICTURE-absolute origin; the output lands at the
+            // CU-anchored offset.
+            let block = predict_luma_subblock_affine_high_precision(
+                cb_x + sb_x as u32,
+                cb_y + sb_y as u32,
+                sb_w,
+                sb_h,
+                src,
+                mv,
+                filter_set,
+            )?;
+            if let Some(diff_mv) = &diff_mv {
+                let refined = apply_prof_to_subblock(&block, diff_mv, src.bit_depth)?;
+                for r in 0..sb_h as usize {
+                    for c in 0..sb_w as usize {
+                        out[(sb_y + r) * w_us + sb_x + c] = refined[r * sb_w as usize + c];
+                    }
+                }
+            } else {
+                let stride = (sb_w + 2) as usize;
+                for r in 0..sb_h as usize {
+                    for c in 0..sb_w as usize {
+                        out[(sb_y + r) * w_us + sb_x + c] =
+                            block.samples[(r + 1) * stride + (c + 1)];
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------

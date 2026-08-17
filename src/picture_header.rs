@@ -592,14 +592,42 @@ pub fn parse_picture_header_stateful(
             ph.ph_mvd_l1_zero_flag = br.u1()? == 1;
             if sps.tool_flags.bdof_control_present_in_ph_flag {
                 ph.ph_bdof_disabled_flag = br.u1()? == 1;
+            } else {
+                // §7.4.3.7 — not present with control-present 0:
+                // inferred 1 − sps_bdof_enabled_flag.
+                ph.ph_bdof_disabled_flag = !sps.tool_flags.bdof_enabled_flag;
             }
             if sps.tool_flags.dmvr_control_present_in_ph_flag {
                 ph.ph_dmvr_disabled_flag = br.u1()? == 1;
+            } else {
+                ph.ph_dmvr_disabled_flag = !sps.tool_flags.dmvr_enabled_flag;
             }
+        } else {
+            // §7.4.3.7 inferences when the whole block is absent:
+            // ph_mvd_l1_zero_flag → 1; ph_bdof_disabled_flag /
+            // ph_dmvr_disabled_flag → 1 when the per-picture control
+            // is present in PH syntax (control-present 1), else
+            // 1 − sps_*_enabled_flag.
+            ph.ph_mvd_l1_zero_flag = true;
+            ph.ph_bdof_disabled_flag = if sps.tool_flags.bdof_control_present_in_ph_flag {
+                true
+            } else {
+                !sps.tool_flags.bdof_enabled_flag
+            };
+            ph.ph_dmvr_disabled_flag = if sps.tool_flags.dmvr_control_present_in_ph_flag {
+                true
+            } else {
+                !sps.tool_flags.dmvr_enabled_flag
+            };
         }
 
         if sps.tool_flags.prof_control_present_in_ph_flag {
             ph.ph_prof_disabled_flag = br.u1()? == 1;
+        } else {
+            // §7.4.3.7 — inferred 0 when sps_affine_prof_enabled_flag
+            // is 1, else 1 (PROF off for the picture when the SPS
+            // never enabled it).
+            ph.ph_prof_disabled_flag = !sps.tool_flags.affine_prof_enabled_flag;
         }
 
         if (pps.pps_weighted_pred_flag || pps.pps_weighted_bipred_flag)

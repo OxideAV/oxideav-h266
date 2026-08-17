@@ -604,32 +604,30 @@ fn corpus_decode_triage() {
 /// fail the harness. Classes: P = pass (byte-exact vs .opl),
 /// F = fail (decodes, diverges), U = unsupported tool, E = error.
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
-    // r443 re-triage: the r440 "22 inter-picture desync" family
-    // resolved into four root causes — the §8.7.4.5 print-transposed
-    // DST-VII kernels (all sizes; the same V4 body-transposition
-    // erratum class as the r440 LFNST finding), the missing §9.3.2.2
-    // initType column selection on the coding-tree + residual context
-    // bundles (every P/B slice initialised its CABAC contexts from
-    // the I-slice rows), a mid-cascade RemCcbs budget break inside
-    // the §7.3.11.12 gtX pass (the spec checks the budget once per
-    // coefficient, not per flag), and the missing §7.4.12.5 BDPCM
-    // transform-skip inference on the dual-tree-chroma TU path. The
-    // remaining E rows cluster on IBC BV derivation (under triage)
-    // plus a handful of deeper desyncs; the U rows are the two big
-    // named feature gates (affine non-merge in the stream walker,
-    // inter residual multi-TB tiling) plus subpictures / 4:2:2 /
-    // 4:4:4 / explicit WP.
+    // r447: the "affine non-merge in the stream walker" gate is
+    // DISSOLVED — the §7.3.11.5 cascade order fix (inter_pred_idc
+    // BEFORE the affine pair; SMVD gated on !inter_affine_flag), the
+    // §7.4.3.7 BDOF / DMVR / PROF / mvd_l1_zero PH inferences, the
+    // decode_picture_into affine-AMVP hookup, the §8.8.3.4 sub-block
+    // + §8.8.3.5 motion-difference deblocking, the §8.5.6.6.2
+    // high-precision bi-pred composition (eqs. 978 – 981) and the
+    // interior 64-tile TB deblock edges all landed. DMVR_B_4 is now
+    // byte-exact and AFF_A_2 decodes end-to-end. The former affine-U
+    // rows now parse PAST the first affine CU and hit a later CABAC
+    // desync ("post-affine-gate parse desync" — under triage); the
+    // remaining U rows are subpictures / 4:2:2 / 4:4:4 / explicit WP
+    // / per-slice loop-filter divergence.
     ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
-    ("8b400_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("8b420_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("8b420_B_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("8b400_A_2", 'E'),           // post-affine-gate parse desync (under triage)
+    ("8b420_A_2", 'E'),           // post-affine-gate parse desync (under triage)
+    ("8b420_B_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
-    ("AFF_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("ALF_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("ALF_B_3", 'E'),             // desync (under triage)
+    ("AFF_A_2", 'F'),             // 10/10 pictures diverge (first poc 0 plane Y)
+    ("ALF_A_3", 'E'),             // post-affine-gate parse desync (under triage)
+    ("ALF_B_3", 'F'),             // 3/3 pictures diverge (first poc 0 plane Y)
     ("ALF_C_3", 'F'),             // 4/4 pictures diverge (first poc 0 plane Y)
-    ("AMVR_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
-    ("BDOF_A_4", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("AMVR_A_3", 'E'),            // post-affine-gate parse desync (under triage)
+    ("BDOF_A_4", 'E'),            // post-affine-gate parse desync (under triage)
     ("BDPCM_A_2", 'F'),           // 3/3 pictures diverge (first poc 0 plane Y)
     ("CCLM_A_2", 'F'),            // 7/7 pictures diverge (first poc 0 plane Cb)
     ("CST_A_4", 'F'),             // 21/21 pictures diverge (first poc 0 plane Y)
@@ -638,42 +636,42 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("CodingToolsSets_C_2", 'F'), // 2/2 pictures diverge (first poc 0 plane Y)
     ("CodingToolsSets_D_2", 'E'), // IBC BV derivation (under triage)
     ("CodingToolsSets_E_1", 'U'), // subpictures
-    ("DEBLOCKING_A_3", 'U'),      // affine non-merge reconstruction in the stream walker
-    ("DEBLOCKING_C_3", 'U'),      // affine non-merge reconstruction in the stream walker
+    ("DEBLOCKING_A_3", 'E'),      // post-affine-gate parse desync (under triage)
+    ("DEBLOCKING_C_3", 'E'),      // post-affine-gate parse desync (under triage)
     ("DEBLOCKING_E_3", 'E'),      // desync (under triage)
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
-    ("DMVR_B_4", 'F'),            // 1/11 pictures diverge (first poc 9 plane Y)
-    ("GDR_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("GPM_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
+    ("GDR_A_2", 'E'),             // post-affine-gate parse desync (under triage)
+    ("GPM_A_3", 'E'),             // post-affine-gate parse desync (under triage)
     ("IBC_A_2", 'E'),             // desync (under triage)
     ("ISP_A_3", 'F'),             // 34/34 pictures diverge (first poc 0 plane Y)
     ("JCCR_A_2", 'E'),            // desync (under triage)
     ("JCCR_C_3", 'F'),            // 63/66 pictures diverge (first poc 1 plane Y)
     ("LFNST_A_4", 'F'),           // 53/53 pictures diverge (first poc 0 plane Y)
-    ("LFNST_B_4", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("LFNST_B_4", 'E'),           // post-affine-gate parse desync (under triage)
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
-    ("LMCS_C_1", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("LMCS_C_1", 'E'),            // post-affine-gate parse desync (under triage)
     ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
-    ("MERGE_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("MERGE_A_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("MIP_A_3", 'F'),             // 39/39 pictures diverge (first poc 0 plane Cb)
-    ("MIP_B_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("MMVD_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
+    ("MIP_B_3", 'E'),             // post-affine-gate parse desync (under triage)
+    ("MMVD_A_3", 'E'),            // post-affine-gate parse desync (under triage)
     ("MTS_A_4", 'F'),             // 21/21 pictures diverge (first poc 0 plane Y)
-    ("PROF_B_3", 'U'),            // affine non-merge reconstruction in the stream walker
-    ("QUANT_A_2", 'U'),           // affine non-merge reconstruction in the stream walker
-    ("QUANT_B_2", 'U'),           // affine non-merge reconstruction in the stream walker
+    ("PROF_B_3", 'E'),            // post-affine-gate parse desync (under triage)
+    ("QUANT_A_2", 'E'),           // post-affine-gate parse desync (under triage)
+    ("QUANT_B_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("RAP_A_1", 'F'),             // 1/1 pictures diverge (first poc 32 plane Y)
-    ("RAP_B_1", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("SAO_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
-    ("SBT_A_2", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("RAP_B_1", 'E'),             // post-affine-gate parse desync (under triage)
+    ("SAO_A_3", 'E'),             // post-affine-gate parse desync (under triage)
+    ("SBT_A_2", 'E'),             // post-affine-gate parse desync (under triage)
     ("SLICES_A_3", 'E'),          // desync (under triage)
     ("SMVD_A_2", 'F'),            // 10/10 pictures diverge (first poc 0 plane Y)
     ("SUBPIC_C_1", 'U'),          // subpictures
     ("SbTMVP_A_3", 'E'),          // desync (under triage)
-    ("TILE_A_2", 'U'),            // affine non-merge reconstruction in the stream walker
-    ("TMVP_A_3", 'U'),            // affine non-merge reconstruction in the stream walker
-    ("WPP_A_3", 'U'),             // affine non-merge reconstruction in the stream walker
+    ("TILE_A_2", 'E'),            // post-affine-gate parse desync (under triage)
+    ("TMVP_A_3", 'E'),            // post-affine-gate parse desync (under triage)
+    ("WPP_A_3", 'E'),             // post-affine-gate parse desync (under triage)
     ("WP_A_3", 'U'),              // explicit weighted prediction
 ];
 

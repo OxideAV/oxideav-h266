@@ -88,6 +88,108 @@ pub struct DeblockCu {
     /// r440 — `TuCResMode == 2` for the CU's chroma TB: §8.8.3.6.4
     /// reads `Qp′CbCr` for both components.
     pub joint_cbcr2: bool,
+    /// r447 — `ciip_flag` of the CU: §8.8.3.5 forces `bS = 2` when
+    /// either side of the edge is a CIIP-coded block.
+    pub ciip: bool,
+    /// r447 — the CU is MODE_IBC: drives the §8.8.3.5
+    /// prediction-mode-difference and block-vector-difference `bS = 1`
+    /// arms (the BV lives in the motion grid's L0 slot per the
+    /// eqs. 1111 – 1118 bookkeeping).
+    pub ibc: bool,
+    /// r447 — `Some((NumSbX, NumSbY))` for an affine
+    /// (`inter_affine_flag == 1`) or sub-block-merge
+    /// (`merge_subblock_flag == 1`) CU (§8.5.5.9 grid dims). Drives the
+    /// §8.8.3.4 sub-block boundary derivation: internal edges every
+    /// `Max(8, nCb/numSb)` samples plus the eqs. 1229 / 1230 /
+    /// 1240 / 1241 maxFilterLength caps at the CU edge. `None` for
+    /// every other CU kind.
+    pub num_sb: Option<(u32, u32)>,
+    /// r447 — §7.3.11.9 multi-TB tiling map for a CU above
+    /// `MaxTbSizeY = 64`: per-64-luma-tile coded flags, so the
+    /// §8.8.3.5 tu-coded arm and the §8.8.3.2 interior
+    /// transform-block edges see the PER-TB flags instead of a
+    /// CU-wide OR. `None` for single-TB CUs (the plain `tu_*_coded`
+    /// fields apply).
+    pub tu64: Option<Tu64CbfMap>,
+}
+
+/// r447 — per-64-luma-tile CBF flags of a §7.3.11.9 multi-TB CU
+/// (at most 2×2 tiles at the 128-sample CTU ceiling). Indexed
+/// `[tile_y][tile_x]` with `tile = offset / 64` in CU-relative luma
+/// samples. `y` is `tu_y_coded_flag`; `cb` / `cr` fold the per-TU
+/// chroma CBFs (`tu_cb_coded` / `tu_cr_coded`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tu64CbfMap {
+    pub y: [[bool; 2]; 2],
+    pub cb: [[bool; 2]; 2],
+    pub cr: [[bool; 2]; 2],
+}
+
+impl DeblockCu {
+    /// Per-component coded flag of the transform block containing the
+    /// luma-coordinate sample — the per-64-tile flag for a multi-TB
+    /// CU, the CU-level flag otherwise.
+    fn tu_coded_at(&self, c_idx: u32, luma_x: i32, luma_y: i32) -> bool {
+        if let Some(map) = &self.tu64 {
+            let lx = (luma_x - self.x as i32).clamp(0, self.w as i32 - 1) as u32;
+            let ly = (luma_y - self.y as i32).clamp(0, self.h as i32 - 1) as u32;
+            let tx = ((lx / 64) as usize).min(1);
+            let ty = ((ly / 64) as usize).min(1);
+            return match c_idx {
+                0 => map.y[ty][tx],
+                1 => map.cb[ty][tx],
+                _ => map.cr[ty][tx],
+            };
+        }
+        match c_idx {
+            0 => self.tu_y_coded,
+            1 => self.tu_cb_coded,
+            _ => self.tu_cr_coded,
+        }
+    }
+}
+
+/// r447 — per-4×4-luma-cell motion snapshot the §8.8.3.5 boundary
+/// strength derivation reads: prediction flags, the *resolved reference
+/// POCs* (NOTE 1 — reference identity, not list/index position), and
+/// the (unrefined, per the §8.5.1 NOTE) motion vectors in 1/16-luma
+/// units. For a MODE_IBC cell the block vector sits in `mv_l0` with
+/// both pred flags 0 (eqs. 1111 – 1118).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeblockMvCell {
+    pub pred_l0: bool,
+    pub pred_l1: bool,
+    pub poc_l0: i32,
+    pub poc_l1: i32,
+    pub mv_l0: (i32, i32),
+    pub mv_l1: (i32, i32),
+}
+
+/// r447 — picture-wide grid of [`DeblockMvCell`]s at 4×4 luma
+/// granularity. Built by the CTU walker from its per-picture motion
+/// field after the last CTU reconstructs; `None` cells (outside any
+/// inter CU) read as the all-zero default, which the §8.8.3.5 arms
+/// never consult because the intra / mode rules fire first.
+pub struct DeblockMvGrid {
+    pub cells: Vec<DeblockMvCell>,
+    pub cells_w: usize,
+    pub cells_h: usize,
+}
+
+impl DeblockMvGrid {
+    /// Cell covering the luma sample `(x, y)`; default cell when out
+    /// of bounds.
+    pub fn at_luma(&self, x: i32, y: i32) -> DeblockMvCell {
+        if x < 0 || y < 0 {
+            return DeblockMvCell::default();
+        }
+        let cx = (x as usize) / 4;
+        let cy = (y as usize) / 4;
+        if cx >= self.cells_w || cy >= self.cells_h {
+            return DeblockMvCell::default();
+        }
+        self.cells[cy * self.cells_w + cx]
+    }
 }
 
 /// Sentinel for [`DeblockCu::qp_c`] — take the legacy
@@ -210,7 +312,7 @@ pub fn apply_deblocking(
     params: &DeblockParams,
     chroma_format_idc: u32,
 ) {
-    apply_deblocking_clipped(out, cus, None, params, chroma_format_idc, &[], &[])
+    apply_deblocking_clipped(out, cus, None, None, params, chroma_format_idc, &[], &[])
 }
 
 /// r429 — [`apply_deblocking`] with the §8.8.3.1 tile-boundary edge
@@ -220,10 +322,12 @@ pub fn apply_deblocking(
 /// `pps_loop_filter_across_tiles_enabled_flag == 0` /
 /// `pps_loop_filter_across_slices_enabled_flag == 0` arms; callers
 /// pass the interior tile boundary positions).
+#[allow(clippy::too_many_arguments)]
 pub fn apply_deblocking_clipped(
     out: &mut PictureBuffer,
     cus: &[DeblockCu],
     chroma_cus: Option<&[DeblockCu]>,
+    mv_grid: Option<&DeblockMvGrid>,
     params: &DeblockParams,
     chroma_format_idc: u32,
     no_filter_cols: &[u32],
@@ -254,8 +358,22 @@ pub fn apply_deblocking_clipped(
         bit_depth: params.bit_depth,
         ctb_size_y: 1 << params.ctb_log2_size_y,
     };
-    deblock_one_direction(&mut luma, cus, &grid, EdgeType::Vertical, no_filter_cols);
-    deblock_one_direction(&mut luma, cus, &grid, EdgeType::Horizontal, no_filter_rows);
+    deblock_one_direction(
+        &mut luma,
+        cus,
+        &grid,
+        mv_grid,
+        EdgeType::Vertical,
+        no_filter_cols,
+    );
+    deblock_one_direction(
+        &mut luma,
+        cus,
+        &grid,
+        mv_grid,
+        EdgeType::Horizontal,
+        no_filter_rows,
+    );
 
     if chroma_format_idc != 0 {
         let (c_cus, c_grid) = match (chroma_cus, chroma_grid.as_ref()) {
@@ -273,8 +391,22 @@ pub fn apply_deblocking_clipped(
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
         };
-        deblock_one_direction(&mut cb, c_cus, c_grid, EdgeType::Vertical, no_filter_cols);
-        deblock_one_direction(&mut cb, c_cus, c_grid, EdgeType::Horizontal, no_filter_rows);
+        deblock_one_direction(
+            &mut cb,
+            c_cus,
+            c_grid,
+            None,
+            EdgeType::Vertical,
+            no_filter_cols,
+        );
+        deblock_one_direction(
+            &mut cb,
+            c_cus,
+            c_grid,
+            None,
+            EdgeType::Horizontal,
+            no_filter_rows,
+        );
         let mut cr = PlaneCtx {
             plane: &mut out.cr,
             c_idx: 2,
@@ -286,8 +418,22 @@ pub fn apply_deblocking_clipped(
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
         };
-        deblock_one_direction(&mut cr, c_cus, c_grid, EdgeType::Vertical, no_filter_cols);
-        deblock_one_direction(&mut cr, c_cus, c_grid, EdgeType::Horizontal, no_filter_rows);
+        deblock_one_direction(
+            &mut cr,
+            c_cus,
+            c_grid,
+            None,
+            EdgeType::Vertical,
+            no_filter_cols,
+        );
+        deblock_one_direction(
+            &mut cr,
+            c_cus,
+            c_grid,
+            None,
+            EdgeType::Horizontal,
+            no_filter_rows,
+        );
     }
 }
 
@@ -355,6 +501,7 @@ fn deblock_one_direction(
     plane: &mut PlaneCtx,
     cus: &[DeblockCu],
     grid: &CuGrid,
+    mv_grid: Option<&DeblockMvGrid>,
     edge_type: EdgeType,
     no_filter: &[u32],
 ) {
@@ -387,6 +534,20 @@ fn deblock_one_direction(
 
         match edge_type {
             EdgeType::Vertical => {
+                // r447 — §8.8.3.4 internal sub-block edges (luma only;
+                // the §8.8.3.2 step-4 invocation is gated on cIdx == 0)
+                // run regardless of whether the CU's left edge is a
+                // picture / tile boundary.
+                if plane.c_idx == 0 && cu.num_sb.is_some() {
+                    deblock_cu_subblock_edges(plane, cu, mv_grid, EdgeType::Vertical);
+                }
+                // r447 — §8.8.3.2/§8.8.3.3 interior transform-block
+                // edges of a §7.3.11.9 multi-TB CU (the luma edges of
+                // sub-block CUs are already covered by the pass above;
+                // chroma interior edges apply to every multi-TB CU).
+                if cu.tu64.is_some() && (plane.c_idx != 0 || cu.num_sb.is_none()) {
+                    deblock_cu_interior_tu64_edges(plane, cu, mv_grid, EdgeType::Vertical);
+                }
                 // Skip the left edge if it sits on the picture edge.
                 if cx == 0 {
                     continue;
@@ -397,9 +558,15 @@ fn deblock_one_direction(
                 if no_filter.contains(&cu.x) {
                     continue;
                 }
-                deblock_cu_left_edge(plane, cus, grid, idx as u32, cu, cx, cy, cw, ch);
+                deblock_cu_left_edge(plane, cus, grid, mv_grid, idx as u32, cu, cx, cy, cw, ch);
             }
             EdgeType::Horizontal => {
+                if plane.c_idx == 0 && cu.num_sb.is_some() {
+                    deblock_cu_subblock_edges(plane, cu, mv_grid, EdgeType::Horizontal);
+                }
+                if cu.tu64.is_some() && (plane.c_idx != 0 || cu.num_sb.is_none()) {
+                    deblock_cu_interior_tu64_edges(plane, cu, mv_grid, EdgeType::Horizontal);
+                }
                 if cy == 0 {
                     continue;
                 }
@@ -408,9 +575,336 @@ fn deblock_one_direction(
                 if no_filter.contains(&cu.y) {
                     continue;
                 }
-                deblock_cu_top_edge(plane, cus, grid, idx as u32, cu, cx, cy, cw, ch);
+                deblock_cu_top_edge(plane, cus, grid, mv_grid, idx as u32, cu, cx, cy, cw, ch);
             }
         }
+    }
+}
+
+/// r447 — §8.8.3.4 internal sub-block boundary filtering for an affine
+/// / sub-block-merge CU (luma only). Internal vertical edges sit at
+/// `x = xEdge * sbW` with `sbW = Max(8, nCbW / numSbX)` for
+/// `xEdge = 1..Min(Max(1, nCbW / 8) − 1, numSbX − 1)` (the `xEdge = 0`
+/// arm is the CU's own left edge, handled by the CU-edge pass with the
+/// eqs. 1229 / 1230 caps); mirrored for horizontal edges.
+///
+/// `maxFilterLength{P,Q}` per the §8.8.3.4 cascade under this walker's
+/// one-TB-per-CU transform model (a CU above `MaxTbSizeY = 64` tiles
+/// into 64-aligned TBs, so interior transform-block edges sit at
+/// 64-sample offsets):
+///
+/// * on a TB edge (eqs. 1231 / 1232) — `Min(5, 7) = 5` both sides
+///   (each side of a 64-aligned interior line is ≥ 32 wide);
+/// * 4 samples from a TB edge (eqs. 1233 / 1234) — 1;
+/// * first / last 8-grid edge or `sbW` from a TB edge (eqs.
+///   1235 / 1236) — 2;
+/// * otherwise (eqs. 1237 / 1238) — 3.
+///
+/// The §8.8.3.5 bS for an interior edge: the tu-coded arm only on a TB
+/// edge (the CU-level CBF stands in for the per-TB flags of the
+/// §7.3.11.9 tiling — a documented approximation), then the
+/// motion-difference rules against the per-4×4 motion grid.
+fn deblock_cu_subblock_edges(
+    plane: &mut PlaneCtx,
+    cu: &DeblockCu,
+    mv_grid: Option<&DeblockMvGrid>,
+    edge_type: EdgeType,
+) {
+    let Some((num_sb_x, num_sb_y)) = cu.num_sb else {
+        return;
+    };
+    let vertical = edge_type == EdgeType::Vertical;
+    let (n_cb, n_other, num_sb) = if vertical {
+        (cu.w, cu.h, num_sb_x)
+    } else {
+        (cu.h, cu.w, num_sb_y)
+    };
+    if num_sb <= 1 || n_cb < 16 {
+        return;
+    }
+    let sb = 8u32.max(n_cb / num_sb);
+    let n8 = n_cb / 8;
+    let last_edge = n8.saturating_sub(1).max(1);
+    let n_edges = last_edge.min(num_sb - 1);
+    // Interior 64-aligned TB lines exist only when the CU exceeds
+    // MaxTbSizeY (§7.3.11.9 tiling).
+    let has_tb_lines = n_cb > 64;
+    let is_tb_line = |off: u32| has_tb_lines && off % 64 == 0;
+    for edge in 1..=n_edges {
+        let off = edge * sb;
+        if off >= n_cb {
+            break;
+        }
+        let tb_edge = is_tb_line(off);
+        let (mfl_p, mfl_q) = if tb_edge {
+            (5u32, 5u32)
+        } else if (off >= 4 && is_tb_line(off - 4)) || is_tb_line(off + 4) {
+            (1, 1)
+        } else if edge == 1
+            || edge == last_edge
+            || (off >= sb && is_tb_line(off - sb))
+            || is_tb_line(off + sb)
+        {
+            (2, 2)
+        } else {
+            (3, 3)
+        };
+        // Same CU on both sides → same QpY / palette flags.
+        let mut k = 0u32;
+        while k < n_other {
+            let (px, py, qx, qy) = if vertical {
+                (
+                    (cu.x + off) as i32 - 1,
+                    (cu.y + k) as i32,
+                    (cu.x + off) as i32,
+                    (cu.y + k) as i32,
+                )
+            } else {
+                (
+                    (cu.x + k) as i32,
+                    (cu.y + off) as i32 - 1,
+                    (cu.x + k) as i32,
+                    (cu.y + off) as i32,
+                )
+            };
+            let mut b_s = 0i32;
+            if tb_edge && (cu.tu_coded_at(0, px, py) || cu.tu_coded_at(0, qx, qy)) {
+                b_s = 1;
+            } else if let Some(g) = mv_grid {
+                if bs_motion_rule(g.at_luma(px, py), g.at_luma(qx, qy)) {
+                    b_s = 1;
+                }
+            }
+            if b_s > 0 {
+                let (_qp, beta, tc) = compute_thresholds_luma(plane, cu, cu, b_s);
+                if vertical {
+                    run_luma_filter(
+                        plane.plane,
+                        (cu.x + off) as i32,
+                        (cu.y + k) as i32,
+                        beta,
+                        tc,
+                        mfl_p,
+                        mfl_q,
+                        true,
+                        false,
+                        cu.plt,
+                        cu.plt,
+                    );
+                } else {
+                    run_luma_filter(
+                        plane.plane,
+                        (cu.x + k) as i32,
+                        (cu.y + off) as i32,
+                        beta,
+                        tc,
+                        mfl_p,
+                        mfl_q,
+                        false,
+                        false,
+                        cu.plt,
+                        cu.plt,
+                    );
+                }
+            }
+            k += 4;
+        }
+    }
+}
+
+/// r447 — §8.8.3.2 / §8.8.3.3 interior transform-block edges of a
+/// §7.3.11.9 multi-TB CU (a CB above `MaxTbSizeY = 64` tiles into
+/// 64-aligned TBs, so its interior TB edges sit at 64-luma-sample
+/// offsets — 32 chroma samples in 4:2:0).
+///
+/// * Luma: `maxFilterLength{P,Q}` per §8.8.3.3 — each side of a
+///   64-line is a ≥ 32-wide/tall TB → 7 (non-sub-block CUs only; the
+///   sub-block pass owns those CUs' luma interiors with the §8.8.3.4
+///   `Min(5, …)` cap).
+/// * Chroma: both sides ≥ 8 chroma samples → 3 / 3 (the interior of a
+///   CU never coincides with a chroma CTB row).
+/// * bS per §8.8.3.5: intra → 2, CIIP → 2, per-tile coded flags → 1,
+///   then the luma motion rules (same CU ⇒ same translational motion
+///   ⇒ 0 for non-sub-block inter CUs, but IBC / GPM per-cell motion
+///   still consults the grid).
+fn deblock_cu_interior_tu64_edges(
+    plane: &mut PlaneCtx,
+    cu: &DeblockCu,
+    mv_grid: Option<&DeblockMvGrid>,
+    edge_type: EdgeType,
+) {
+    let vertical = edge_type == EdgeType::Vertical;
+    let (n_cb, n_other) = if vertical { (cu.w, cu.h) } else { (cu.h, cu.w) };
+    if n_cb <= 64 {
+        return;
+    }
+    let c_idx = plane.c_idx;
+    let sub = if vertical { plane.sub_w } else { plane.sub_h };
+    let sub_other = if vertical { plane.sub_h } else { plane.sub_w };
+    let step = if c_idx == 0 { 4u32 } else { 2u32 * sub_other };
+    let mut off = 64u32;
+    while off < n_cb {
+        let mut k = 0u32;
+        while k < n_other {
+            let (px, py, qx, qy) = if vertical {
+                (
+                    (cu.x + off) as i32 - 1,
+                    (cu.y + k) as i32,
+                    (cu.x + off) as i32,
+                    (cu.y + k) as i32,
+                )
+            } else {
+                (
+                    (cu.x + k) as i32,
+                    (cu.y + off) as i32 - 1,
+                    (cu.x + k) as i32,
+                    (cu.y + off) as i32,
+                )
+            };
+            let mut b_s = if cu.intra || cu.ciip {
+                2
+            } else if cu.tu_coded_at(c_idx, px, py) || cu.tu_coded_at(c_idx, qx, qy) {
+                1
+            } else {
+                0
+            };
+            if b_s == 0 && c_idx == 0 && !cu.ibc {
+                if let Some(g) = mv_grid {
+                    if bs_motion_rule(g.at_luma(px, py), g.at_luma(qx, qy)) {
+                        b_s = 1;
+                    }
+                }
+            }
+            if b_s > 0 {
+                if c_idx == 0 {
+                    let (_qp, beta, tc) = compute_thresholds_luma(plane, cu, cu, b_s);
+                    run_luma_filter(
+                        plane.plane,
+                        if vertical {
+                            (cu.x + off) as i32
+                        } else {
+                            (cu.x + k) as i32
+                        },
+                        if vertical {
+                            (cu.y + k) as i32
+                        } else {
+                            (cu.y + off) as i32
+                        },
+                        beta,
+                        tc,
+                        7,
+                        7,
+                        vertical,
+                        false,
+                        cu.plt,
+                        cu.plt,
+                    );
+                } else {
+                    let (_qp, beta, tc) = compute_thresholds_chroma(plane, cu, cu, b_s);
+                    let ex = if vertical {
+                        ((cu.x + off) / sub) as i32
+                    } else {
+                        ((cu.x + k) / plane.sub_w) as i32
+                    };
+                    let ey = if vertical {
+                        ((cu.y + k) / plane.sub_h) as i32
+                    } else {
+                        ((cu.y + off) / sub) as i32
+                    };
+                    if vertical {
+                        run_chroma_filter_v(
+                            plane.plane,
+                            ex,
+                            ey,
+                            beta,
+                            tc,
+                            b_s,
+                            3,
+                            3,
+                            cu.plt,
+                            cu.plt,
+                        );
+                    } else {
+                        run_chroma_filter_h(
+                            plane.plane,
+                            ex,
+                            ey,
+                            beta,
+                            tc,
+                            b_s,
+                            3,
+                            3,
+                            cu.plt,
+                            cu.plt,
+                        );
+                    }
+                }
+            }
+            k += step;
+        }
+        off += 64;
+    }
+}
+
+/// r447 — the §8.8.3.5 motion-difference `bS = 1` cascade for a luma
+/// edge between two inter sub-blocks (both sides MODE_INTER; the
+/// intra / CIIP / IBC / mode-difference arms are the caller's).
+///
+/// Reference identity is by resolved POC (NOTE 1); "number of motion
+/// vectors" is `PredFlagL0 + PredFlagL1` (NOTE 2); the threshold is 8
+/// in 1/16-luma units (half a luma sample) on either component.
+fn bs_motion_rule(p: DeblockMvCell, q: DeblockMvCell) -> bool {
+    let np = u32::from(p.pred_l0) + u32::from(p.pred_l1);
+    let nq = u32::from(q.pred_l0) + u32::from(q.pred_l1);
+    // Different number of motion vectors.
+    if np != nq {
+        return true;
+    }
+    if np == 0 {
+        return false;
+    }
+    let diff_ge8 =
+        |a: (i32, i32), b: (i32, i32)| -> bool { (a.0 - b.0).abs() >= 8 || (a.1 - b.1).abs() >= 8 };
+    if np == 1 {
+        let (p_poc, p_mv) = if p.pred_l0 {
+            (p.poc_l0, p.mv_l0)
+        } else {
+            (p.poc_l1, p.mv_l1)
+        };
+        let (q_poc, q_mv) = if q.pred_l0 {
+            (q.poc_l0, q.mv_l0)
+        } else {
+            (q.poc_l1, q.mv_l1)
+        };
+        // Different reference pictures (by identity, list-agnostic).
+        if p_poc != q_poc {
+            return true;
+        }
+        return diff_ge8(p_mv, q_mv);
+    }
+    // np == nq == 2. Reference multiset comparison first.
+    let same_ordered = p.poc_l0 == q.poc_l0 && p.poc_l1 == q.poc_l1;
+    let same_swapped = p.poc_l0 == q.poc_l1 && p.poc_l1 == q.poc_l0;
+    if !(same_ordered || same_swapped) {
+        return true;
+    }
+    if p.poc_l0 != p.poc_l1 {
+        // Two different reference pictures on each side — compare the
+        // MVs per reference picture.
+        if same_ordered && (diff_ge8(p.mv_l0, q.mv_l0) || diff_ge8(p.mv_l1, q.mv_l1)) {
+            return true;
+        }
+        if !same_ordered && (diff_ge8(p.mv_l0, q.mv_l1) || diff_ge8(p.mv_l1, q.mv_l0)) {
+            return true;
+        }
+        false
+    } else {
+        // Both MVs of each side point at the SAME reference picture:
+        // bS = 1 only when BOTH the list-aligned and the cross-list
+        // comparisons see a ≥ half-luma difference.
+        let straight = diff_ge8(p.mv_l0, q.mv_l0) || diff_ge8(p.mv_l1, q.mv_l1);
+        let crossed = diff_ge8(p.mv_l0, q.mv_l1) || diff_ge8(p.mv_l1, q.mv_l0);
+        straight && crossed
     }
 }
 
@@ -423,6 +917,7 @@ fn deblock_cu_left_edge(
     plane: &mut PlaneCtx,
     cus: &[DeblockCu],
     grid: &CuGrid,
+    mv_grid: Option<&DeblockMvGrid>,
     idx: u32,
     cu: &DeblockCu,
     cx: i32,
@@ -451,7 +946,14 @@ fn deblock_cu_left_edge(
         let p_cu = &cus[p_idx.unwrap() as usize];
         let q_cu = cu;
 
-        let (b_s, _is_tb_edge) = derive_bs(plane.c_idx, p_cu, q_cu);
+        let b_s = derive_bs(
+            plane.c_idx,
+            p_cu,
+            q_cu,
+            mv_grid,
+            (luma_x - 1, luma_y),
+            (luma_x, luma_y),
+        );
         if b_s == 0 {
             k += step;
             continue;
@@ -464,7 +966,17 @@ fn deblock_cu_left_edge(
             // §8.8.3.6.6 + §8.8.3.6.8 (long). EDGE_VER never triggers
             // the §8.8.3.6.2 step-6 CTB-row rule.
             let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s);
-            let (mfl_p, mfl_q) = luma_max_filter_length_v(p_cu, q_cu);
+            let (mut mfl_p, mut mfl_q) = luma_max_filter_length_v(p_cu, q_cu);
+            // §8.8.3.4 eqs. 1229 / 1230 — sub-block caps at the CU
+            // edge: Q capped at 5 when the current CU is a sub-block
+            // CU with NumSbX > 1; P capped at 5 when the left
+            // neighbour is affine / sub-block-merge coded.
+            if q_cu.num_sb.is_some_and(|(nx, _)| nx > 1) {
+                mfl_q = mfl_q.min(5);
+            }
+            if p_cu.num_sb.is_some() {
+                mfl_p = mfl_p.min(5);
+            }
             run_luma_filter(
                 plane.plane,
                 cx,
@@ -507,6 +1019,7 @@ fn deblock_cu_top_edge(
     plane: &mut PlaneCtx,
     cus: &[DeblockCu],
     grid: &CuGrid,
+    mv_grid: Option<&DeblockMvGrid>,
     idx: u32,
     cu: &DeblockCu,
     cx: i32,
@@ -530,7 +1043,14 @@ fn deblock_cu_top_edge(
         let p_cu = &cus[p_idx.unwrap() as usize];
         let q_cu = cu;
 
-        let (b_s, _is_tb_edge) = derive_bs(plane.c_idx, p_cu, q_cu);
+        let b_s = derive_bs(
+            plane.c_idx,
+            p_cu,
+            q_cu,
+            mv_grid,
+            (luma_x, luma_y - 1),
+            (luma_x, luma_y),
+        );
         if b_s == 0 {
             k += step;
             continue;
@@ -538,7 +1058,15 @@ fn deblock_cu_top_edge(
 
         if plane.c_idx == 0 {
             let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s);
-            let (mfl_p, mfl_q) = luma_max_filter_length_h(p_cu, q_cu);
+            let (mut mfl_p, mut mfl_q) = luma_max_filter_length_h(p_cu, q_cu);
+            // §8.8.3.4 eqs. 1240 / 1241 — sub-block caps at the CU top
+            // edge (mirror of the vertical eqs. 1229 / 1230).
+            if q_cu.num_sb.is_some_and(|(_, ny)| ny > 1) {
+                mfl_q = mfl_q.min(5);
+            }
+            if p_cu.num_sb.is_some() {
+                mfl_p = mfl_p.min(5);
+            }
             // §8.8.3.6.2 step 6 — an EDGE_HOR edge on a luma CTB row
             // boundary suppresses sidePisLargeBlk (the P side would
             // reach into the CTB line buffer above).
@@ -668,23 +1196,67 @@ fn luma_max_filter_length_h(p_cu: &DeblockCu, q_cu: &DeblockCu) -> (u32, u32) {
 /// the round-12 walker emits one TB per CU so every CU outer edge is a
 /// TB edge by construction.
 #[inline]
-fn derive_bs(c_idx: u32, p: &DeblockCu, q: &DeblockCu) -> (i32, bool) {
+fn derive_bs(
+    c_idx: u32,
+    p: &DeblockCu,
+    q: &DeblockCu,
+    mv_grid: Option<&DeblockMvGrid>,
+    p_luma: (i32, i32),
+    q_luma: (i32, i32),
+) -> i32 {
     // BDPCM both-sides → bS = 0 (§8.8.3.5).
     if c_idx == 0 && p.bdpcm_luma && q.bdpcm_luma {
-        return (0, true);
+        return 0;
     }
     if c_idx != 0 && p.bdpcm_chroma && q.bdpcm_chroma {
-        return (0, true);
+        return 0;
     }
     if p.intra || q.intra {
-        return (2, true);
+        return 2;
     }
-    let coded_either = match c_idx {
-        0 => p.tu_y_coded || q.tu_y_coded,
-        1 => p.tu_cb_coded || q.tu_cb_coded,
-        _ => p.tu_cr_coded || q.tu_cr_coded,
-    };
-    (if coded_either { 1 } else { 0 }, true)
+    // r447 — §8.8.3.5: a CIIP-coded block on either side → bS = 2.
+    if p.ciip || q.ciip {
+        return 2;
+    }
+    // A CU-boundary edge is also a transform-block edge under this
+    // walker's TB model — the tu-coded arm applies. r447: for a
+    // §7.3.11.9 multi-TB CU the flag is the PER-TB one adjacent to the
+    // edge, not a CU-wide OR.
+    let coded_either =
+        p.tu_coded_at(c_idx, p_luma.0, p_luma.1) || q.tu_coded_at(c_idx, q_luma.0, q_luma.1);
+    if coded_either {
+        return 1;
+    }
+    // r447 — the remaining §8.8.3.5 arms are luma-only (the clause
+    // gates them on `cIdx == 0 && edgeIdc == 2`; a CU-boundary edge
+    // has edgeIdc 2).
+    if c_idx != 0 {
+        return 0;
+    }
+    // Prediction-mode difference (MODE_IBC vs MODE_INTER; intra was
+    // handled above).
+    if p.ibc != q.ibc {
+        return 1;
+    }
+    if p.ibc && q.ibc {
+        // Both IBC: block-vector difference ≥ 8 in 1/16-luma units.
+        // The BV lives in the motion grid's L0 slot (eq. 1111).
+        if let Some(g) = mv_grid {
+            let pb = g.at_luma(p_luma.0, p_luma.1).mv_l0;
+            let qb = g.at_luma(q_luma.0, q_luma.1).mv_l0;
+            if (pb.0 - qb.0).abs() >= 8 || (pb.1 - qb.1).abs() >= 8 {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    // Both MODE_INTER: reference / motion-vector difference rules.
+    if let Some(g) = mv_grid {
+        if bs_motion_rule(g.at_luma(p_luma.0, p_luma.1), g.at_luma(q_luma.0, q_luma.1)) {
+            return 1;
+        }
+    }
+    0
 }
 
 /// Eq. 1274–1279: derive `qP`, `β`, `tC` for a luma edge.
@@ -1709,6 +2281,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
             DeblockCu {
                 x: 8,
@@ -1725,6 +2301,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
         ];
         let params = DeblockParams {
@@ -1767,6 +2347,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
             DeblockCu {
                 x: 8,
@@ -1783,6 +2367,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
         ];
         let params = DeblockParams {
@@ -1832,6 +2420,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
             DeblockCu {
                 x: 0,
@@ -1848,6 +2440,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
         ];
         let params = DeblockParams {
@@ -1881,6 +2477,10 @@ mod tests {
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
             joint_cbcr2: false,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         };
         let cu_medium = DeblockCu { w: 16, ..cu_small };
         let cu_large = DeblockCu { w: 32, ..cu_small };
@@ -1915,6 +2515,10 @@ mod tests {
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
             joint_cbcr2: false,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         };
         let cu_16 = DeblockCu { w: 16, ..cu_8 };
         // 4:2:0: SubWidthC = 2 → chroma w = luma_w / 2.
@@ -1957,6 +2561,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
             DeblockCu {
                 x: 32,
@@ -1973,6 +2581,10 @@ mod tests {
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 joint_cbcr2: false,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             },
         ];
         let params = DeblockParams {
@@ -2011,6 +2623,10 @@ mod tests {
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
             joint_cbcr2: false,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         }
     }
 
@@ -2159,6 +2775,10 @@ mod tests {
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
             joint_cbcr2: false,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         }];
         let params = DeblockParams {
             disabled: false,

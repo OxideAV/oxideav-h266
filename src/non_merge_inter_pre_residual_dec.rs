@@ -510,13 +510,10 @@ pub fn read_non_merge_inter_pre_residual_affine(
     mvp_gate: &NonMergeMvpSyntaxGate,
 ) -> Result<NonMergeInterPreResidualAffineDecision> {
     // ------------------------------------------------------------------
-    // Step 1 — affine syntax (round-164 dispatcher) drives numCpMv.
-    // ------------------------------------------------------------------
-    let affine = reader.read_non_merge_inter_affine(affine_gate)?;
-    let num_cp = affine.motion_model.num_cp_mv();
-
-    // ------------------------------------------------------------------
-    // Step 2 — inter_pred_idc (§7.3.11.7 B-slice only).
+    // Step 1 — inter_pred_idc (§7.3.11.5 B-slice only). r447 conformance
+    // fix: §7.3.11.5 reads `inter_pred_idc` BEFORE the affine pair (the
+    // pre-r447 dispatcher read the affine pair first, desyncing every
+    // affine-enabled ≥16×16 non-merge CU on a B slice).
     // ------------------------------------------------------------------
     let inter_pred_idc = if mvp_gate.inter_pred_idc_gate_open() {
         reader.read_inter_pred_idc(mvp_gate.cb_width, mvp_gate.cb_height)?
@@ -525,11 +522,19 @@ pub fn read_non_merge_inter_pre_residual_affine(
     };
 
     // ------------------------------------------------------------------
-    // Step 3 — sym_mvd_flag (§7.3.11.7 SMVD gate). §7.3.11.7 gates SMVD
-    // on `inter_affine_flag == 0`; on the affine path the gate is
-    // closed by construction and the encoder emits no bin.
+    // Step 2 — affine syntax (round-164 dispatcher) drives numCpMv.
     // ------------------------------------------------------------------
-    let sym_mvd_flag = if mvp_gate.sym_mvd_signalled(inter_pred_idc) {
+    let affine = reader.read_non_merge_inter_affine(affine_gate)?;
+    let num_cp = affine.motion_model.num_cp_mv();
+
+    // ------------------------------------------------------------------
+    // Step 3 — sym_mvd_flag (§7.3.11.5 SMVD gate). The listing's
+    // presence condition carries an explicit `!inter_affine_flag` term
+    // (r447 conformance fix — the gate was previously evaluated without
+    // it, reading a spurious bin on an affine bi-pred CU whenever the
+    // slice-level SMVD gates were open).
+    // ------------------------------------------------------------------
+    let sym_mvd_flag = if !affine.inter_affine_flag && mvp_gate.sym_mvd_signalled(inter_pred_idc) {
         reader.read_sym_mvd_flag()?
     } else {
         false

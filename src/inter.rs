@@ -2639,45 +2639,155 @@ pub fn predict_luma_block_bipred_bcw(
     mv_l1: MotionVector,
     bcw_idx: u8,
 ) -> Result<()> {
-    let scratch_w = (dst_x + w) as usize;
-    let scratch_h = (dst_y + h) as usize;
-    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    predict_luma_block(&mut tmp_l0, dst_x, dst_y, w, h, src_l0, mv_l0)?;
-    predict_luma_block(&mut tmp_l1, dst_x, dst_y, w, h, src_l1, mv_l1)?;
-    if bcw_idx == 0 {
-        // Fast eq. 980 path matches predict_luma_block_bipred byte-for-
-        // byte; preserved separately to avoid the extra inner clamp.
-        for r in 0..h as usize {
-            for c in 0..w as usize {
-                let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
-                let v0 = tmp_l0.samples[off_src] as u32;
-                let v1 = tmp_l1.samples[off_src] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u16;
-                dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = avg;
-            }
-        }
-        return Ok(());
-    }
-    let idx = bcw_idx as usize;
-    if idx >= BCW_W_LUT.len() {
+    if bcw_idx as usize >= BCW_W_LUT.len() {
         return Err(Error::invalid(format!(
-            "h266 luma bipred BCW: bcw_idx {idx} out of range (0..=4)"
+            "h266 luma bipred BCW: bcw_idx {bcw_idx} out of range (0..=4)"
         )));
     }
-    let w1 = BCW_W_LUT[idx];
+    // r447 — §8.5.6.6.2 requires the composition to run on the
+    // HIGH-PRECISION per-list arrays (eqs. 980 / 981 at shift2 /
+    // shift1 + 3), not on per-list already-rounded samples: the
+    // pre-r447 final-domain `(a + b + 1) >> 1` average double-rounded
+    // every fractional-MV bi-pred block.
+    let bd = src_l0.bit_depth;
+    let hp_l0 = predict_luma_block_high_precision(dst_x, dst_y, w, h, src_l0, mv_l0, bd)?;
+    let hp_l1 = predict_luma_block_high_precision(dst_x, dst_y, w, h, src_l1, mv_l1, bd)?;
+    blend_bi_hp_into(dst, dst_x, dst_y, w, h, &hp_l0, &hp_l1, bcw_idx, bd);
+    Ok(())
+}
+
+/// r447 — §8.5.6.3.4 chroma motion-compensated prediction surfacing
+/// the `BitDepth + 6` precision intermediate (the chroma twin of
+/// [`predict_luma_block_high_precision`]). No final per-list
+/// `offset1 >> shift1` clip is applied; the returned `Vec<i32>` of
+/// length `w_c * h_c` (row-major, CU-anchored) carries the
+/// predSamplesLX values the §8.5.6.6.2 bi-pred composition consumes.
+pub fn predict_chroma_block_high_precision(
+    dst_x_c: u32,
+    dst_y_c: u32,
+    w_c: u32,
+    h_c: u32,
+    src: &PicturePlane,
+    mv: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    if !(8..=16).contains(&bit_depth) {
+        return Err(Error::invalid(format!(
+            "h266 chroma MC HP: bit_depth {bit_depth} out of supported range 8..=16",
+        )));
+    }
+    let x_int_base = dst_x_c as i32 + (mv.x >> 5);
+    let y_int_base = dst_y_c as i32 + (mv.y >> 5);
+    let x_frac = (mv.x & 31) as usize;
+    let y_frac = (mv.y & 31) as usize;
+
+    let pic_w = src.width as i32;
+    let pic_h = src.height as i32;
+    let w_us = w_c as usize;
+    let h_us = h_c as usize;
+    let mut out = vec![0i32; w_us * h_us];
+    let shift1 = shift1_for_bd(bit_depth);
+    let lift = 14 - bit_depth as i32; // integer-pel lift — eq. 948
+
+    if x_frac == 0 && y_frac == 0 {
+        for r in 0..h_c as i32 {
+            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            for c in 0..w_c as i32 {
+                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+                out[r as usize * w_us + c as usize] =
+                    (src.samples[yi * src.stride + xi] as i32) << lift;
+            }
+        }
+        return Ok(out);
+    }
+    if y_frac == 0 {
+        for r in 0..h_c as i32 {
+            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            for c in 0..w_c as i32 {
+                out[r as usize * w_us + c as usize] =
+                    chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
+            }
+        }
+        return Ok(out);
+    }
+    if x_frac == 0 {
+        for c in 0..w_c as i32 {
+            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            for r in 0..h_c as i32 {
+                out[r as usize * w_us + c as usize] =
+                    chroma_v_only_4tap(src, xi, y_int_base + r, y_frac) >> shift1;
+            }
+        }
+        return Ok(out);
+    }
+    let inter_h = h_us + 3;
+    let mut intermediate = vec![0i32; inter_h * w_us];
+    for r in 0..inter_h as i32 {
+        let yi = (y_int_base - 1 + r).clamp(0, pic_h - 1) as usize;
+        for c in 0..w_c as i32 {
+            intermediate[r as usize * w_us + c as usize] =
+                chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
+        }
+    }
+    let mut col = [0i32; 4];
+    for r in 0..h_c as i32 {
+        for c in 0..w_c as i32 {
+            for i in 0..4 {
+                col[i] = intermediate[(r as usize + i) * w_us + c as usize];
+            }
+            out[r as usize * w_us + c as usize] = chroma_v_4tap(&col, y_frac);
+        }
+    }
+    Ok(out)
+}
+
+/// r447 — §8.5.6.6.2 eqs. 980 / 981 bi-pred composition from two
+/// CU-anchored high-precision prediction arrays into the destination
+/// plane rectangle.
+///
+/// `shift1 = Max(2, 14 − bd)`, `shift2 = Max(3, 15 − bd)`,
+/// `offset2 = 1 << (shift2 − 1)`, `offset3 = 1 << (shift1 + 2)`.
+/// `bcw_idx == 0` takes the eq. 980 default-weighted average;
+/// `1..=4` the eq. 981 `bcwWLut` blend at `>> (shift1 + 3)`.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_bi_hp_into(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    bcw_idx: u8,
+    bit_depth: u32,
+) {
+    debug_assert_eq!(pred_l0.len(), (w * h) as usize);
+    debug_assert_eq!(pred_l1.len(), (w * h) as usize);
+    let shift1 = (14 - bit_depth as i32).max(2);
+    let shift2 = (15 - bit_depth as i32).max(3);
+    let offset2 = 1i32 << (shift2 - 1);
+    let offset3 = 1i32 << (shift1 + 2);
+    let max = (1i32 << bit_depth) - 1;
+    let idx = bcw_idx as usize;
+    let w1 = if idx == 0 || idx >= BCW_W_LUT.len() {
+        0
+    } else {
+        BCW_W_LUT[idx]
+    };
     let w0 = 8 - w1;
     for r in 0..h as usize {
         for c in 0..w as usize {
-            let off_src = (dst_y as usize + r) * scratch_w + (dst_x as usize + c);
-            let v0 = tmp_l0.samples[off_src] as i32;
-            let v1 = tmp_l1.samples[off_src] as i32;
-            let blended =
-                ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, (1i32 << dst.bit_depth) - 1) as u16;
-            dst.samples[(dst_y as usize + r) * dst.stride + (dst_x as usize + c)] = blended;
+            let a = pred_l0[r * w as usize + c];
+            let b = pred_l1[r * w as usize + c];
+            let v = if w1 == 0 {
+                (a + b + offset2) >> shift2
+            } else {
+                (w0 * a + w1 * b + offset3) >> (shift1 + 3)
+            };
+            dst.samples[(dst_y as usize + r) * dst.stride + dst_x as usize + c] =
+                v.clamp(0, max) as u16;
         }
     }
-    Ok(())
 }
 
 /// BCW-aware chroma bi-pred MC. Mirrors
@@ -2694,42 +2804,17 @@ pub fn predict_chroma_block_bipred_bcw(
     mv_l1: MotionVector,
     bcw_idx: u8,
 ) -> Result<()> {
-    let scratch_w = (dst_x_c + w_c) as usize;
-    let scratch_h = (dst_y_c + h_c) as usize;
-    let mut tmp_l0 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    let mut tmp_l1 = PicturePlane::filled(scratch_w, scratch_h, 0);
-    predict_chroma_block(&mut tmp_l0, dst_x_c, dst_y_c, w_c, h_c, src_l0, mv_l0)?;
-    predict_chroma_block(&mut tmp_l1, dst_x_c, dst_y_c, w_c, h_c, src_l1, mv_l1)?;
-    if bcw_idx == 0 {
-        for r in 0..h_c as usize {
-            for c in 0..w_c as usize {
-                let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
-                let v0 = tmp_l0.samples[off_src] as u32;
-                let v1 = tmp_l1.samples[off_src] as u32;
-                let avg = ((v0 + v1 + 1) >> 1) as u16;
-                dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = avg;
-            }
-        }
-        return Ok(());
-    }
-    let idx = bcw_idx as usize;
-    if idx >= BCW_W_LUT.len() {
+    if bcw_idx as usize >= BCW_W_LUT.len() {
         return Err(Error::invalid(format!(
-            "h266 chroma bipred BCW: bcw_idx {idx} out of range (0..=4)"
+            "h266 chroma bipred BCW: bcw_idx {bcw_idx} out of range (0..=4)"
         )));
     }
-    let w1 = BCW_W_LUT[idx];
-    let w0 = 8 - w1;
-    for r in 0..h_c as usize {
-        for c in 0..w_c as usize {
-            let off_src = (dst_y_c as usize + r) * scratch_w + (dst_x_c as usize + c);
-            let v0 = tmp_l0.samples[off_src] as i32;
-            let v1 = tmp_l1.samples[off_src] as i32;
-            let blended =
-                ((w0 * v0 + w1 * v1 + 4) >> 3).clamp(0, (1i32 << dst.bit_depth) - 1) as u16;
-            dst.samples[(dst_y_c as usize + r) * dst.stride + (dst_x_c as usize + c)] = blended;
-        }
-    }
+    // r447 — eqs. 980 / 981 on the high-precision per-list arrays
+    // (see the luma twin for the rationale).
+    let bd = src_l0.bit_depth;
+    let hp_l0 = predict_chroma_block_high_precision(dst_x_c, dst_y_c, w_c, h_c, src_l0, mv_l0, bd)?;
+    let hp_l1 = predict_chroma_block_high_precision(dst_x_c, dst_y_c, w_c, h_c, src_l1, mv_l1, bd)?;
+    blend_bi_hp_into(dst, dst_x_c, dst_y_c, w_c, h_c, &hp_l0, &hp_l1, bcw_idx, bd);
     Ok(())
 }
 

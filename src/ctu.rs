@@ -3595,6 +3595,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// ([`Self::decode_ctu_full`]) and the reconstruction path
     /// ([`Self::reconstruct_leaf_cu`]); the per-cell write is the
     /// same boolean either way.
+    /// r447 — fold a §7.3.11.9 multi-TB CU's per-TU coded flags into
+    /// the per-64-tile [`crate::deblock::Tu64CbfMap`] the deblocker's
+    /// §8.8.3.5 tu-coded arm and interior TB-edge pass consume.
+    /// `None` for single-TB CUs.
+    fn tu64_map(residual: &LeafCuResidual) -> Option<crate::deblock::Tu64CbfMap> {
+        if residual.inter_tus.is_empty() {
+            return None;
+        }
+        let mut m = crate::deblock::Tu64CbfMap::default();
+        for tu in &residual.inter_tus {
+            let tx = ((tu.x / 64) as usize).min(1);
+            let ty = ((tu.y / 64) as usize).min(1);
+            m.y[ty][tx] |= tu.tu_y_coded;
+            m.cb[ty][tx] |= tu.tu_cb_coded;
+            m.cr[ty][tx] |= tu.tu_cr_coded;
+        }
+        Some(m)
+    }
+
     fn commit_subblock_neighbour_state(&mut self, cu: &CtuCu, info: &LeafCuInfo) {
         let merge_sb = info.inter.merge_data.merge_subblock_flag;
         self.write_subblock_merge_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, merge_sb);
@@ -4625,6 +4644,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         });
         Ok(())
     }
@@ -4755,6 +4778,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ),
                 joint_cbcr2: info.tu_c_res_mode == 2,
                 plt: true,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: None,
             });
             return Ok(());
         }
@@ -4782,6 +4809,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: true,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         });
         self.write_intra_block(x0, y0, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -5026,6 +5057,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ),
                 joint_cbcr2: info.tu_c_res_mode == 2,
                 plt: false,
+                ciip: false,
+                ibc: false,
+                num_sb: None,
+                tu64: Self::tu64_map(residual),
             });
             self.write_intra_block(
                 cu.cu.x,
@@ -5394,6 +5429,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: Self::tu64_map(residual),
         });
         // Round-28 §8.5.6.7 — record this CU's prediction mode in the
         // 4x4 intra-coded grid so subsequent CIIP CUs see the correct
@@ -5635,6 +5674,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: false,
+            ibc: true,
+            num_sb: None,
+            tu64: None,
         });
         self.write_intra_block(x_cb, y_cb, cb_w, cb_h, false);
         self.write_parse_mode_block(
@@ -5656,6 +5699,49 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        if dbg_cu_enabled() {
+            let nm = &info.inter.non_merge;
+            let md = &info.inter.merge_data;
+            eprintln!(
+                "INTER ({},{}) {}x{} merge={} skip={} sb={} sbIdx={} gpm={} ciip={} mmvd={} \
+                 idx={} affine={} type6={} dir={:?} ref=({},{}) mvpF=({},{}) \
+                 mvd0=({},{}) cp1=({},{}) cp2=({},{}) mvd1=({},{}) cp1'=({},{}) cp2'=({},{}) \
+                 amvr={:?} bcw={}",
+                cu.cu.x,
+                cu.cu.y,
+                cu.cu.w,
+                cu.cu.h,
+                info.inter.general_merge_flag,
+                info.inter.cu_skip_flag,
+                md.merge_subblock_flag,
+                md.merge_subblock_idx,
+                md.gpm_flag,
+                md.ciip_flag,
+                md.mmvd_merge_flag,
+                md.merge_idx,
+                nm.inter_affine_flag,
+                nm.cu_affine_type_flag,
+                nm.pred_dir,
+                nm.ref_idx_l0,
+                nm.ref_idx_l1,
+                nm.mvp_l0_flag,
+                nm.mvp_l1_flag,
+                nm.mvd_l0.x,
+                nm.mvd_l0.y,
+                nm.mvd_cp1_l0.x,
+                nm.mvd_cp1_l0.y,
+                nm.mvd_cp2_l0.x,
+                nm.mvd_cp2_l0.y,
+                nm.mvd_l1.x,
+                nm.mvd_l1.y,
+                nm.mvd_cp1_l1.x,
+                nm.mvd_cp1_l1.y,
+                nm.mvd_cp2_l1.x,
+                nm.mvd_cp2_l1.y,
+                nm.amvr_shift,
+                nm.bcw_idx,
+            );
+        }
         // §8.5.2.1 — when `general_merge_flag == 0` the CU's motion is
         // signalled explicitly through the AMVP path (mvp_lX_flag +
         // ref_idx_lX + mvd_lX). The §8.5.2.8-10 candidate derivation,
@@ -5665,18 +5751,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // build below.
         if !info.inter.general_merge_flag {
             if info.inter.non_merge.inter_affine_flag {
-                // r409 — the walker parses the affine non-merge
-                // cascade (per-CP MVDs live in info.inter.non_merge)
-                // but the decode_picture_into reconstruction hookup
-                // (per-sub-block motion-field write + residual tail
-                // around reconstruct_leaf_cu_inter_affine_amvp) is a
-                // follow-up; refuse precisely rather than reconstruct
-                // a translational approximation.
-                return Err(Error::unsupported(
-                    "h266 CTU walker: affine non-merge (AMVP) reconstruction inside \
-                     decode_picture_into is not wired yet (the affine cascade parses; \
-                     reconstruct_leaf_cu_inter_affine_amvp covers the standalone path)",
-                ));
+                // r447 — the walker-parsed affine non-merge cascade
+                // (per-CP MVDs in info.inter.non_merge) drives the
+                // §8.5.5.5 / §8.5.5.7 CPMV derivation + §8.5.5.9
+                // sub-block MC through the dedicated hookup below.
+                return self.reconstruct_leaf_cu_inter_affine_amvp_walker(cu, info, residual, out);
             }
             return self.reconstruct_leaf_cu_inter_amvp(cu, info, residual, out);
         }
@@ -6619,6 +6698,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: info.inter.merge_data.ciip_flag,
+            ibc: false,
+            num_sb: None,
+            tu64: Self::tu64_map(residual),
         });
         // Round-28 §8.5.6.7 — inter CUs record MODE_INTER in the
         // intra-coded grid.
@@ -7267,93 +7350,160 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         bcw_idx: u8,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        use crate::reconstruct::PicturePlane;
+        use crate::affine::{predict_luma_block_affine_prof_hp, AffineLumaFilterSet};
+        use crate::inter::blend_bi_hp_into;
         let chroma = self.sps.sps_chroma_format_idc == 1;
-        let cw = (cb_w / 2) as usize;
-        let ch = (cb_h / 2) as usize;
-        // The §8.5.6.3 affine MC couples the destination position with
-        // the reference-sample read position (`sb_x = dst_x + ...`), so
-        // each list is predicted into a full-picture-sized scratch
-        // plane at the CU's picture-absolute offset, then the CU
-        // rectangle is averaged out of it.
-        let pw = out.luma.width;
-        let ph = out.luma.height;
-        let cpw = out.cb.width;
-        let cph = out.cb.height;
-        let mut l0_luma = PicturePlane::filled(pw, ph, 0);
-        let mut l1_luma = PicturePlane::filled(pw, ph, 0);
-        let mut l0_cb = PicturePlane::filled(cpw, cph, 0);
-        let mut l0_cr = PicturePlane::filled(cpw, cph, 0);
-        let mut l1_cb = PicturePlane::filled(cpw, cph, 0);
-        let mut l1_cr = PicturePlane::filled(cpw, cph, 0);
+        let bd = out.luma.bit_depth;
 
-        self.predict_affine_one_list(
+        // r447 — §8.5.6.6.2 composes the HIGH-PRECISION per-list
+        // arrays (eqs. 980 / 981 at shift2 / shift1 + 3). Each list's
+        // affine luma MC (incl. §8.5.5.8 PROF) surfaces its CU-anchored
+        // predSamplesLX; the chroma sub-blocks do the same through the
+        // §8.5.6.3.4 HP path.
+        let hp_l0 = predict_luma_block_affine_prof_hp(
+            cb_x,
+            cb_y,
             cb_w,
             cb_h,
+            &ref_pic_l0.frame.luma,
             cpmvs_l0,
-            ref_pic_l0,
+            AffineLumaFilterSet::Set0,
             /*bipred=*/ true,
-            &mut l0_luma,
+            self.ph_prof_disabled,
+            /*rpr_constraints_active=*/ false,
+        )?;
+        let hp_l1 = predict_luma_block_affine_prof_hp(
             cb_x,
             cb_y,
-            &mut l0_cb,
-            &mut l0_cr,
-            cb_x / 2,
-            cb_y / 2,
-        )?;
-        self.predict_affine_one_list(
             cb_w,
             cb_h,
+            &ref_pic_l1.frame.luma,
             cpmvs_l1,
-            ref_pic_l1,
+            AffineLumaFilterSet::Set0,
             /*bipred=*/ true,
-            &mut l1_luma,
-            cb_x,
-            cb_y,
-            &mut l1_cb,
-            &mut l1_cr,
-            cb_x / 2,
-            cb_y / 2,
+            self.ph_prof_disabled,
+            /*rpr_constraints_active=*/ false,
         )?;
-
-        // §8.5.6.6.2 composite into the picture. The scratch planes
-        // carry the prediction at the CU's picture-absolute offset, so
-        // the blend reads them at that same offset. eq. 980 average for
-        // `bcw_idx == 0`, eq. 981 BCW weighting otherwise. The chroma
-        // planes take the SAME `bcw_idx` (eq. 981 applies per-component).
-        self.bi_blend_plane_region_bcw(
+        blend_bi_hp_into(
             &mut out.luma,
             cb_x,
             cb_y,
             cb_w,
             cb_h,
-            &l0_luma,
-            &l1_luma,
+            &hp_l0,
+            &hp_l1,
             bcw_idx,
+            bd,
         );
+
         if chroma {
-            self.bi_blend_plane_region_bcw(
+            let (cb_hp_l0, cr_hp_l0) =
+                self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l0, ref_pic_l0)?;
+            let (cb_hp_l1, cr_hp_l1) =
+                self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l1, ref_pic_l1)?;
+            let cw = cb_w / 2;
+            let ch = cb_h / 2;
+            blend_bi_hp_into(
                 &mut out.cb,
                 cb_x / 2,
                 cb_y / 2,
-                cw as u32,
-                ch as u32,
-                &l0_cb,
-                &l1_cb,
+                cw,
+                ch,
+                &cb_hp_l0,
+                &cb_hp_l1,
                 bcw_idx,
+                bd,
             );
-            self.bi_blend_plane_region_bcw(
+            blend_bi_hp_into(
                 &mut out.cr,
                 cb_x / 2,
                 cb_y / 2,
-                cw as u32,
-                ch as u32,
-                &l0_cr,
-                &l1_cr,
+                cw,
+                ch,
+                &cr_hp_l0,
+                &cr_hp_l1,
                 bcw_idx,
+                bd,
             );
         }
         Ok(())
+    }
+
+    /// r447 — one list's affine chroma MC (§8.5.5.3 eqs. 876 – 879
+    /// sub-block MV averaging + §8.5.6.3.4 4-tap interpolation) at
+    /// HIGH precision, returned as CU-anchored `(Cb, Cr)` arrays of
+    /// length `(cb_w / 2) * (cb_h / 2)` for the §8.5.6.6.2 bi-pred
+    /// composition. Bi-pred grids only (`bipred = true`).
+    fn predict_affine_chroma_hp(
+        &self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        cpmvs: &crate::affine::AffineCpmvs,
+        ref_pic: &ReferencePicture,
+    ) -> Result<(Vec<i32>, Vec<i32>)> {
+        use crate::affine::derive_subblock_mvs;
+        use crate::inter::predict_chroma_block_high_precision;
+        let bd = ref_pic.frame.luma.bit_depth;
+        let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, /*bipred=*/ true)?;
+        let sb_w = cb_w / grid.num_sb_x;
+        let sb_h = cb_h / grid.num_sb_y;
+        let cw = (cb_w / 2) as usize;
+        let chh = (cb_h / 2) as usize;
+        let mut out_cb = vec![0i32; cw * chh];
+        let mut out_cr = vec![0i32; cw * chh];
+        let mut gy = 0u32;
+        while gy < grid.num_sb_y {
+            let mut gx = 0u32;
+            while gx < grid.num_sb_x {
+                let tl = grid.mv_at(gx, gy);
+                let br_x = (gx + 1).min(grid.num_sb_x - 1);
+                let br_y = (gy + 1).min(grid.num_sb_y - 1);
+                let br = grid.mv_at(br_x, br_y);
+                let avg = MotionVector {
+                    x: round_half_toward_zero_div2(tl.x + br.x),
+                    y: round_half_toward_zero_div2(tl.y + br.y),
+                };
+                // Each 2×2 group of luma sub-blocks covers an
+                // (sb_w × sb_h)-CHROMA-sample block (8×8 luma → 4×4
+                // chroma at the typical sb = 4), mirroring the plane
+                // variant in `predict_affine_one_list`.
+                let c_w = sb_w;
+                let c_h = sb_h;
+                let c_sb_x = cb_x / 2 + (gx * sb_w) / 2;
+                let c_sb_y = cb_y / 2 + (gy * sb_h) / 2;
+                let hp_cb = predict_chroma_block_high_precision(
+                    c_sb_x,
+                    c_sb_y,
+                    c_w,
+                    c_h,
+                    &ref_pic.frame.cb,
+                    avg,
+                    bd,
+                )?;
+                let hp_cr = predict_chroma_block_high_precision(
+                    c_sb_x,
+                    c_sb_y,
+                    c_w,
+                    c_h,
+                    &ref_pic.frame.cr,
+                    avg,
+                    bd,
+                )?;
+                let loc_x = ((gx * sb_w) / 2) as usize;
+                let loc_y = ((gy * sb_h) / 2) as usize;
+                for r in 0..c_h as usize {
+                    for c in 0..c_w as usize {
+                        out_cb[(loc_y + r) * cw + loc_x + c] = hp_cb[r * c_w as usize + c];
+                        out_cr[(loc_y + r) * cw + loc_x + c] = hp_cr[r * c_w as usize + c];
+                    }
+                }
+                gx += 2;
+            }
+            gy += 2;
+        }
+        Ok((out_cb, out_cr))
     }
 
     /// §8.5.5.5 affine non-merge (AMVP) reconstruction — the
@@ -7749,7 +7899,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         amvr: crate::amvr::AmvrShift,
         bcw_idx: u8,
         out: &mut PictureBuffer,
-    ) -> Result<()> {
+    ) -> Result<crate::inter::AffineCbRecord> {
         use crate::affine_amvp::{
             build_affine_mvp_cand_list, cumulate_affine_mvd_cp, derive_final_affine_cpmvs,
             select_affine_mvp, AffineMvpListInputs, AffineMvpRefContext, RefList,
@@ -8003,6 +8153,152 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bcw_idx: if use_l0 && use_l1 { bcw_idx } else { 0 },
         };
         self.store_affine_cb(cb_x, cb_y, cb_w, cb_h, rec);
+        // Hand the record back so the decode_picture_into hookup can
+        // broadcast the §8.5.5.9 per-sub-block MV grid into the motion
+        // field (the standalone callers ignore it).
+        Ok(rec)
+    }
+
+    /// r447 — affine non-merge (AMVP) reconstruction inside
+    /// `decode_picture_into` (§7.3.11.5 / §8.5.5).
+    ///
+    /// The walker's leaf reader has already parsed the full affine
+    /// cascade (`inter_affine_flag`, `cu_affine_type_flag`, the
+    /// per-control-point `mvd_coding` per active list, `mvp_lX_flag`,
+    /// the affine-AMVR arm, `bcw_idx`) into `info.inter.non_merge`.
+    /// This hookup:
+    ///
+    /// 1. Re-shapes the parsed fields into a
+    ///    [`crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision`],
+    ///    applying the §7.4.11.6 eqs. 173 – 176 AMVR left-shift
+    ///    (`MvdCpLX[cpIdx] = lMvdCpLX[cpIdx] << AmvrShift` — the leaf
+    ///    reader stores the raw pre-shift magnitudes).
+    /// 2. Drives [`Self::reconstruct_leaf_cu_inter_affine_amvp`]
+    ///    (§8.5.5.7 CPMVP list build, §8.5.5.5 eqs. 660 – 667 fold,
+    ///    §8.5.5.9 sub-block MC with §8.5.5.8 PROF, §8.7.5.2 LMCS
+    ///    forward mapping, affine CPMV-store broadcast).
+    /// 3. Adds the §8.5.8 / §8.7.5.1 residual (the LMCS mapping already
+    ///    ran in step 2, so the residual tail must not re-map).
+    /// 4. Broadcasts the §8.5.5.9 per-4×4 sub-block MV grid into the
+    ///    motion field, and performs the deblock / parse-grid
+    ///    bookkeeping shared with the sub-block-merge path. Per
+    ///    §8.5.2.16 the HMVP table is NOT updated by an affine CU.
+    fn reconstruct_leaf_cu_inter_affine_amvp_walker(
+        &mut self,
+        cu: &CtuCu,
+        info: &LeafCuInfo,
+        residual: &LeafCuResidual,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::leaf_cu::NonMergeInterAffineDecision;
+        use crate::non_merge_inter_pre_residual_enc::NonMergeInterPreResidualAffineDecision;
+        use crate::non_merge_mvp_syntax_enc::NonMergeMvpSyntaxDecision;
+
+        let nm = &info.inter.non_merge;
+        let motion_model = if nm.cu_affine_type_flag {
+            crate::affine::MotionModel::Affine6Param
+        } else {
+            crate::affine::MotionModel::Affine4Param
+        };
+        // §7.4.11.6 eqs. 173 – 176 — the parsed per-CP lMvdCpLX
+        // re-quantise into the canonical 1/16-luma space.
+        let s = nm.amvr_shift.value();
+        let shl = |mv: MotionVector| MotionVector {
+            x: mv.x << s,
+            y: mv.y << s,
+        };
+        let decision = NonMergeInterPreResidualAffineDecision::new(
+            NonMergeInterAffineDecision {
+                inter_affine_flag: true,
+                cu_affine_type_flag: nm.cu_affine_type_flag,
+                motion_model,
+            },
+            NonMergeMvpSyntaxDecision {
+                inter_pred_idc: nm.pred_dir,
+                // §7.3.11.7 — SMVD requires `inter_affine_flag == 0`;
+                // the leaf reader enforces the gate, so an affine CU
+                // always carries explicit per-list reference indices.
+                sym_mvd_flag: false,
+                ref_idx_l0: nm.ref_idx_l0.max(0) as u32,
+                ref_idx_l1: nm.ref_idx_l1.max(0) as u32,
+                mvp_l0_flag: nm.mvp_l0_flag,
+                mvp_l1_flag: nm.mvp_l1_flag,
+            },
+            [shl(nm.mvd_l0), shl(nm.mvd_cp1_l0), shl(nm.mvd_cp2_l0)],
+            [shl(nm.mvd_l1), shl(nm.mvd_cp1_l1), shl(nm.mvd_cp2_l1)],
+        );
+        let rec = self.reconstruct_leaf_cu_inter_affine_amvp(
+            cu.cu.x,
+            cu.cu.y,
+            cu.cu.w,
+            cu.cu.h,
+            &decision,
+            nm.amvr_shift,
+            nm.bcw_idx,
+            out,
+        )?;
+
+        if dbg_cu_enabled() {
+            eprintln!(
+                "AFFAMVP ({},{}) {}x{} model={:?} pred=({},{}) ref=({},{}) cp_l0={:?} cp_l1={:?} \
+                 bcw={}",
+                cu.cu.x,
+                cu.cu.y,
+                cu.cu.w,
+                cu.cu.h,
+                rec.model,
+                rec.pred_flag_l0,
+                rec.pred_flag_l1,
+                rec.ref_idx_l0,
+                rec.ref_idx_l1,
+                &rec.cpmvs_l0.cpmvs[..],
+                &rec.cpmvs_l1.cpmvs[..],
+                nm.bcw_idx,
+            );
+        }
+
+        // §8.5.8 + §8.7.5.1 residual add. The §8.7.5.2 LMCS forward
+        // mapping already ran inside the affine reconstruction (MC →
+        // map → residual, the spec order), so the shared tail must not
+        // map a second time.
+        self.add_inter_cu_residual_opts(cu, info, residual, out, false)?;
+
+        // Broadcast the §8.5.5.9 per-sub-block MV grid so later spatial
+        // scans (regular merge / AMVP / HMVP seed / constructed affine
+        // corners) read the per-sub-block representative MVs. The
+        // CU-corner CPMVs live in the affine CPMV store (broadcast by
+        // the reconstruction above) for the §8.5.5.7 inherited scan.
+        self.write_affine_subblock_motion_field(cu, &rec);
+
+        // Deblock + parse-grid bookkeeping (mirrors the sub-block-merge
+        // tail). §8.5.2.16 — no HMVP update for an affine CU.
+        let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
+        self.deblock_cus.push(DeblockCu {
+            x: cu.cu.x,
+            y: cu.cu.y,
+            w: cu.cu.w,
+            h: cu.cu.h,
+            qp_y,
+            intra: false,
+            tu_y_coded: info.tu_y_coded_flag,
+            tu_cb_coded: info.tu_cb_coded_flag,
+            tu_cr_coded: info.tu_cr_coded_flag,
+            bdpcm_luma: false,
+            bdpcm_chroma: false,
+            qp_c: self.deblock_chroma_qps(
+                qp_y,
+                info.cu_chroma_qp_offset_flag,
+                info.cu_chroma_qp_offset_idx,
+            ),
+            joint_cbcr2: info.tu_c_res_mode == 2,
+            plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
+            tu64: Self::tu64_map(residual),
+        });
+        self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
+        self.commit_subblock_neighbour_state(cu, info);
         Ok(())
     }
 
@@ -8453,6 +8749,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: Some((cu.cu.w / 8, cu.cu.h / 8)),
+            tu64: Self::tu64_map(residual),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -8656,6 +8956,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 list.len()
             )));
         };
+        if dbg_cu_enabled() {
+            eprintln!(
+                "SBMERGE ({xcb},{ycb}) {cb_w}x{cb_h} idx={idx} kind={kind:?} model={:?} \
+                 pred=({},{}) ref=({},{}) cp_l0={:?} cp_l1={:?} bcw={}",
+                cand.motion_model,
+                cand.pred_flag_l0,
+                cand.pred_flag_l1,
+                cand.ref_idx_l0,
+                cand.ref_idx_l1,
+                &cand.cpmvs_l0.cpmvs[..],
+                &cand.cpmvs_l1.cpmvs[..],
+                cand.bcw_idx,
+            );
+        }
 
         // §8.5.5.3 SbCol — reconstruct the SbTMVP sub-block grid to
         // pixels through the dedicated walker.
@@ -8744,15 +9058,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.5.8 residual add (shared tail).
         self.add_inter_cu_residual(cu, info, residual, out)?;
 
-        // Broadcast the §8.5.5.9 per-sub-block MV grid into the motion
-        // field. Each 4×4 cell takes its covering affine sub-block's MV
-        // so later spatial scans (regular merge / AMVP / HMVP seed) read
-        // a representative MV. The CU-corner CPMVs are kept in the affine
-        // CB store separately for the §8.5.5.7 inherited scan.
-        self.write_affine_subblock_motion_field(cu, &cand, use_l0, use_l1);
-
-        // Store the affine CB record so the next CU's §8.5.5.5 /
-        // §8.5.5.7 inherited scan can recover this block's CPMVs.
+        // Build the affine CB record (also broadcast into the CPMV
+        // store below so the next CU's §8.5.5.5 / §8.5.5.7 inherited
+        // scan can recover this block's CPMVs).
         let zero_cpmvs = crate::affine::AffineCpmvs {
             model: cand.motion_model,
             cpmvs: [MotionVector::ZERO; 3],
@@ -8773,6 +9081,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // later CU's §8.5.5.2 inherited candidate recovers it.
             bcw_idx: cand.bcw_idx,
         };
+
+        // Broadcast the §8.5.5.9 per-sub-block MV grid into the motion
+        // field. Each 4×4 cell takes its covering affine sub-block's MV
+        // so later spatial scans (regular merge / AMVP / HMVP seed) read
+        // a representative MV. The CU-corner CPMVs are kept in the affine
+        // CB store separately for the §8.5.5.7 inherited scan.
+        self.write_affine_subblock_motion_field(cu, &rec);
         self.store_affine_cb(cu.cu.x, cu.cu.y, cb_w, cb_h, rec);
 
         // Deblock + intra-grid + subblock-neighbour bookkeeping (mirrors
@@ -8798,35 +9113,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
+            tu64: Self::tu64_map(residual),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
         Ok(())
     }
 
-    /// §8.5.5.9 — broadcast a sub-block affine candidate's per-4×4 MV
-    /// grid into the motion field. The grid is derived once per active
-    /// list from the candidate CPMVs and written cell-by-cell; the
-    /// per-cell record carries the candidate's pred flags / ref indices /
-    /// bcwIdx so later neighbour reads are well-formed.
+    /// §8.5.5.9 — broadcast a decided affine CB's per-4×4 MV grid into
+    /// the motion field. The grid is derived once per active list from
+    /// the record's CPMVs and written cell-by-cell; the per-cell record
+    /// carries the CB's pred flags / ref indices / bcwIdx so later
+    /// neighbour reads are well-formed. Shared by the §8.5.5.2
+    /// sub-block-merge path and the r447 affine non-merge (AMVP) hookup.
     fn write_affine_subblock_motion_field(
         &mut self,
         cu: &CtuCu,
-        cand: &crate::affine_merge::AffineMergeCandidate,
-        use_l0: bool,
-        use_l1: bool,
+        rec: &crate::inter::AffineCbRecord,
     ) {
         use crate::affine::derive_subblock_mvs;
         let cb_w = cu.cu.w;
         let cb_h = cu.cu.h;
+        let use_l0 = rec.pred_flag_l0;
+        let use_l1 = rec.pred_flag_l1;
         let bipred = use_l0 && use_l1;
         let grid_l0 = if use_l0 {
-            derive_subblock_mvs(cb_w, cb_h, &cand.cpmvs_l0, bipred).ok()
+            derive_subblock_mvs(cb_w, cb_h, &rec.cpmvs_l0, bipred).ok()
         } else {
             None
         };
         let grid_l1 = if use_l1 {
-            derive_subblock_mvs(cb_w, cb_h, &cand.cpmvs_l1, bipred).ok()
+            derive_subblock_mvs(cb_w, cb_h, &rec.cpmvs_l1, bipred).ok()
         } else {
             None
         };
@@ -8850,84 +9170,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     .unwrap_or(MotionVector::ZERO);
                 let mvf = MvField {
                     mv_l0,
-                    ref_idx_l0: if use_l0 { cand.ref_idx_l0 } else { -1 },
+                    ref_idx_l0: if use_l0 { rec.ref_idx_l0 } else { -1 },
                     pred_flag_l0: use_l0,
                     mv_l1,
-                    ref_idx_l1: if use_l1 { cand.ref_idx_l1 } else { -1 },
+                    ref_idx_l1: if use_l1 { rec.ref_idx_l1 } else { -1 },
                     pred_flag_l1: use_l1,
                     cu_skip_flag: false,
                     mode_inter: true,
                     available: true,
-                    bcw_idx: cand.bcw_idx,
+                    bcw_idx: rec.bcw_idx,
                 };
                 let bx = cu.cu.x + gx * sb_w;
                 let by = cu.cu.y + gy * sb_h;
                 self.motion_field.write_block(bx, by, sb_w, sb_h, mvf);
-            }
-        }
-    }
-
-    /// §8.5.6.6.2 eq. 980 default-weighted average of two co-located
-    /// plane regions: `out[x][y] = (a[x][y] + b[x][y] + 1) >> 1` over
-    /// the `(w × h)` rectangle at `(dx, dy)`, where `a` / `b` are read
-    /// at the **same** offset (not anchored at (0,0) like
-    /// [`crate::inter::bi_pred_avg_8bit`]).
-    #[allow(clippy::too_many_arguments)]
-    fn bi_avg_plane_region(
-        &self,
-        out: &mut crate::reconstruct::PicturePlane,
-        dx: u32,
-        dy: u32,
-        w: u32,
-        h: u32,
-        a: &crate::reconstruct::PicturePlane,
-        b: &crate::reconstruct::PicturePlane,
-    ) {
-        for r in 0..h as usize {
-            for c in 0..w as usize {
-                let idx = (dy as usize + r) * out.stride + (dx as usize + c);
-                let ai = (dy as usize + r) * a.stride + (dx as usize + c);
-                let bi = (dy as usize + r) * b.stride + (dx as usize + c);
-                let v = (a.samples[ai] as u32 + b.samples[bi] as u32 + 1) >> 1;
-                out.samples[idx] = v as u16;
-            }
-        }
-    }
-
-    /// §8.5.6.6.2 eq. 981 BCW-weighted blend of two co-located plane
-    /// regions: `out[x][y] = Clip1((w0·a + w1·b + 4) >> 3)` over the
-    /// `(w × h)` rectangle at `(dx, dy)`, with `w1 = BCW_W_LUT[bcw_idx]`
-    /// and `w0 = 8 − w1`. `a` / `b` are read at the **same** offset as
-    /// the destination (the affine scratch-plane convention). When
-    /// `bcw_idx == 0` this is identical to [`Self::bi_avg_plane_region`]
-    /// (the eq. 980 default-weighted average), so the caller routes
-    /// through here only when `bcw_idx ∈ 1..=4`.
-    #[allow(clippy::too_many_arguments)]
-    fn bi_blend_plane_region_bcw(
-        &self,
-        out: &mut crate::reconstruct::PicturePlane,
-        dx: u32,
-        dy: u32,
-        w: u32,
-        h: u32,
-        a: &crate::reconstruct::PicturePlane,
-        b: &crate::reconstruct::PicturePlane,
-        bcw_idx: u8,
-    ) {
-        let idx_w = bcw_idx as usize;
-        if idx_w == 0 || idx_w >= crate::inter::BCW_W_LUT.len() {
-            self.bi_avg_plane_region(out, dx, dy, w, h, a, b);
-            return;
-        }
-        let w1 = crate::inter::BCW_W_LUT[idx_w];
-        let w0 = 8 - w1;
-        for r in 0..h as usize {
-            for c in 0..w as usize {
-                let idx = (dy as usize + r) * out.stride + (dx as usize + c);
-                let ai = (dy as usize + r) * a.stride + (dx as usize + c);
-                let bi = (dy as usize + r) * b.stride + (dx as usize + c);
-                let blended = (w0 * a.samples[ai] as i32 + w1 * b.samples[bi] as i32 + 4) >> 3;
-                out.samples[idx] = blended.clamp(0, (1i32 << out.bit_depth) - 1) as u16;
             }
         }
     }
@@ -9829,6 +10084,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ),
             joint_cbcr2: info.tu_c_res_mode == 2,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         });
         self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);
         // Round-149 — GPM CUs always carry `merge_subblock_flag = 0`
@@ -11165,6 +11424,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bit_depth,
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
         };
+        // r447 — §8.8.3.5 per-4×4 motion snapshot for the boundary
+        // strength derivation. Raw field reads (the picture is fully
+        // decoded; the §6.4.4 availability region no longer applies),
+        // with the per-list reference POCs resolved through the active
+        // reference lists per NOTE 1 (identity, not index). The
+        // unrefined MVs are what the field stores (§8.5.1 NOTE). On a
+        // multi-slice picture the lists are the last slice's — the
+        // corpus' multi-slice wires share one RPL per picture.
+        let mv_grid = {
+            let poc_of = |pred: bool, list: &[ReferencePicture], idx: i32| -> i32 {
+                if !pred || idx < 0 {
+                    return i32::MIN;
+                }
+                list.get(idx as usize).map(|r| r.poc).unwrap_or(i32::MIN)
+            };
+            let cells: Vec<crate::deblock::DeblockMvCell> = self
+                .motion_field
+                .field
+                .iter()
+                .map(|f| crate::deblock::DeblockMvCell {
+                    pred_l0: f.pred_flag_l0,
+                    pred_l1: f.pred_flag_l1,
+                    poc_l0: poc_of(f.pred_flag_l0, &self.ref_pic_list_l0, f.ref_idx_l0),
+                    poc_l1: poc_of(f.pred_flag_l1, &self.ref_pic_list_l1, f.ref_idx_l1),
+                    mv_l0: (f.mv_l0.x, f.mv_l0.y),
+                    mv_l1: (f.mv_l1.x, f.mv_l1.y),
+                })
+                .collect();
+            crate::deblock::DeblockMvGrid {
+                cells,
+                cells_w: self.motion_field.blocks_w as usize,
+                cells_h: self.motion_field.blocks_h as usize,
+            }
+        };
         crate::deblock::apply_deblocking_clipped(
             out,
             &self.deblock_cus,
@@ -11173,6 +11466,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             } else {
                 Some(&self.deblock_cus_chroma)
             },
+            Some(&mv_grid),
             &params,
             self.sps.sps_chroma_format_idc as u32,
             &no_filter_cols,

@@ -40,6 +40,15 @@ fn main() {
                 }
             }
         }
+        // Cheap per-picture fingerprint (FNV-1a over the raw planes)
+        // so a display-order mismatch against a reference decode can
+        // be localized without external tooling.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &raw {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        eprintln!("pic cvs={} poc={} fnv={h:016x}", pic.cvs_idx, pic.poc);
         pics.push((pic.cvs_idx, pic.poc, raw));
     });
     if let Err(e) = r {

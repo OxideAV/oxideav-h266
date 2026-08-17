@@ -303,6 +303,10 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             qp_c: oxideav_h266::deblock::DEBLOCK_QP_C_LEGACY,
             joint_cbcr2: false,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         },
         DeblockCu {
             x: 16,
@@ -319,6 +323,10 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             qp_c: oxideav_h266::deblock::DEBLOCK_QP_C_LEGACY,
             joint_cbcr2: false,
             plt: false,
+            ciip: false,
+            ibc: false,
+            num_sb: None,
+            tu64: None,
         },
     ];
     let params = DeblockParams {
