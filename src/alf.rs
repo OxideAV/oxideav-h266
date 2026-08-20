@@ -141,6 +141,13 @@ pub struct AlfConfig {
     pub cb_enabled: bool,
     /// `sh_alf_cr_enabled_flag`.
     pub cr_enabled: bool,
+    /// r449 — `sh_alf_cc_cb_enabled_flag`. CC-ALF is gated on its OWN
+    /// slice flags (§7.3.7), independent of the chroma-ALF
+    /// `sh_alf_cb_enabled_flag` (a slice can run CC-ALF on a component
+    /// whose chroma ALF is off).
+    pub cc_cb_enabled: bool,
+    /// r449 — `sh_alf_cc_cr_enabled_flag`.
+    pub cc_cr_enabled: bool,
     /// `BitDepth` (= sps_bitdepth_minus8 + 8).
     pub bit_depth: u32,
     /// `CtbLog2SizeY`.
@@ -266,6 +273,12 @@ pub fn apply_alf_clipped(
     for ry in 0..alf_pic.pic_height_in_ctbs_y {
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
             let p = alf_pic.get(rx, ry);
+            if std::env::var_os("H266_DBG_ALF_CTB").is_some() {
+                eprintln!(
+                    "ALF ctb ({rx},{ry}): luma_on={} set={} cb_on={} cb_alt={} cr_on={} cr_alt={} cc_cb={} cc_cr={}",
+                    p.luma_on, p.luma_filt_set_idx, p.cb_on, p.cb_alt_idx, p.cr_on, p.cr_alt_idx, p.cc_cb_idc, p.cc_cr_idc
+                );
+            }
             let fetch_clip_y = luma_rect(rx, ry);
             let fetch_clip_c = (
                 fetch_clip_y.0 / sub_w as i32,
@@ -303,7 +316,8 @@ pub fn apply_alf_clipped(
                 }
             }
             if cfg.chroma_format_idc != 0 {
-                if cfg.cb_enabled && p.cb_on {
+                let dbg_no_calf = std::env::var_os("H266_DBG_NO_CHROMA_ALF").is_some();
+                if cfg.cb_enabled && p.cb_on && !dbg_no_calf {
                     if let Some(aps) = binding.chroma_aps {
                         if let Some((coeff, clip_idx)) =
                             resolve_chroma_filter(aps, p.cb_alt_idx as usize)
@@ -324,7 +338,7 @@ pub fn apply_alf_clipped(
                         }
                     }
                 }
-                if cfg.cr_enabled && p.cr_on {
+                if cfg.cr_enabled && p.cr_on && !dbg_no_calf {
                     if let Some(aps) = binding.chroma_aps {
                         if let Some((coeff, clip_idx)) =
                             resolve_chroma_filter(aps, p.cr_alt_idx as usize)
@@ -352,12 +366,12 @@ pub fn apply_alf_clipped(
     // §8.8.5.1 second pass — CC-ALF runs after primary chroma ALF and
     // reads from the *pre-luma-ALF* `recPictureL`. The accumulated
     // delta is added to the post-chroma-ALF chroma plane.
-    if cfg.chroma_format_idc != 0 {
+    if cfg.chroma_format_idc != 0 && std::env::var_os("H266_DBG_NO_CCALF").is_none() {
         for ry in 0..alf_pic.pic_height_in_ctbs_y {
             for rx in 0..alf_pic.pic_width_in_ctbs_y {
                 let p = alf_pic.get(rx, ry);
                 let fetch_clip_y = luma_rect(rx, ry);
-                if cfg.cb_enabled && p.cc_cb_idc != 0 {
+                if cfg.cc_cb_enabled && p.cc_cb_idc != 0 {
                     if let Some(aps) = binding.cc_cb_aps {
                         let filt_idx = (p.cc_cb_idc - 1) as usize;
                         if filt_idx < aps.cc_cb_coeff.len() {
@@ -380,7 +394,7 @@ pub fn apply_alf_clipped(
                         }
                     }
                 }
-                if cfg.cr_enabled && p.cc_cr_idc != 0 {
+                if cfg.cc_cr_enabled && p.cc_cr_idc != 0 {
                     if let Some(aps) = binding.cc_cr_aps {
                         let filt_idx = (p.cc_cr_idc - 1) as usize;
                         if filt_idx < aps.cc_cr_coeff.len() {
@@ -1146,6 +1160,8 @@ mod tests {
             alf_enabled: true,
             cb_enabled: false,
             cr_enabled: false,
+            cc_cb_enabled: false,
+            cc_cr_enabled: false,
             bit_depth: 8,
             ctb_log2_size_y: 5,
             chroma_format_idc: 1,
@@ -1788,7 +1804,7 @@ mod tests {
             },
         );
         let mut cfg = cfg_8bit();
-        cfg.cb_enabled = true;
+        cfg.cc_cb_enabled = true;
         apply_alf(&mut buf, &pic, &cfg, &binding);
         assert!(
             buf.cb

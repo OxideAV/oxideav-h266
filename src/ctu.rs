@@ -1760,7 +1760,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             return None;
         }
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
-        let up = bit_depth.saturating_sub(8);
         let size_y = (1usize << self.layout.ctb_log2_size_y).min(64);
         // Aligned corner of the sizeY region containing the CU's luma
         // origin (the chroma TB sits at the CU corner, so eq. 1215
@@ -1789,14 +1788,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if avail_l {
             for i in 0..size_y {
                 let yy = (y_cu_cb + i).min(luma.height - 1);
-                sum += u64::from(luma.samples[yy * luma.stride + (x_cu_cb - 1)]) << up;
+                // r449 — the planes store native-BitDepth samples
+                // (r437), so eq. 1216 sums them as-is; the former
+                // `<< (BitDepth − 8)` lift double-scaled every >8-bit
+                // stream's invAvgLuma.
+                sum += u64::from(luma.samples[yy * luma.stride + (x_cu_cb - 1)]);
             }
             cnt += size_y;
         }
         if avail_t {
             for i in 0..size_y {
                 let xx = (x_cu_cb + i).min(luma.width - 1);
-                sum += u64::from(luma.samples[(y_cu_cb - 1) * luma.stride + xx]) << up;
+                sum += u64::from(luma.samples[(y_cu_cb - 1) * luma.stride + xx]);
             }
             cnt += size_y;
         }
@@ -3637,6 +3640,95 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         Some(m)
     }
 
+    /// r449 — §8.8.3.3 [`crate::deblock::TbSplit`] record for an
+    /// ISP-split intra CU (§8.4.5.1): the luma transform tree is 1-D
+    /// partitioned into 2 or 4 sub-TBs, so the deblocker filters the
+    /// interior 4-grid TB edges and takes every `maxFilterLength`
+    /// from the SUB-TB dims. The chroma TB spans the whole CU
+    /// (`luma_only`). Both sides of every interior ISP edge are
+    /// MODE_INTRA, so the §8.8.3.5 `bS = 2` arm precedes the
+    /// tu-coded arm — the CU-level luma CBF stands in for the
+    /// per-partition flags.
+    fn isp_tb_split(
+        split: crate::leaf_cu::IspSplitType,
+        w: u32,
+        h: u32,
+        y_coded: bool,
+    ) -> Option<crate::deblock::TbSplit> {
+        let parts = crate::isp::iter_isp_partitions(split, w, h);
+        if parts.len() < 2 {
+            return None;
+        }
+        let vertical = matches!(split, crate::leaf_cu::IspSplitType::VerSplit);
+        let mut bounds = [0u32; 3];
+        for (i, p) in parts.iter().skip(1).enumerate() {
+            bounds[i] = if vertical { p.x_offset } else { p.y_offset };
+        }
+        Some(crate::deblock::TbSplit {
+            vertical,
+            n_bounds: (parts.len() - 1) as u8,
+            bounds,
+            y_coded: [y_coded; 4],
+            cb_coded: [false; 4],
+            cr_coded: [false; 4],
+            luma_only: true,
+        })
+    }
+
+    /// r449 — §8.8.3.3 [`crate::deblock::TbSplit`] record for an SBT
+    /// inter CU (§7.4.12.5): two sub-TUs split at the
+    /// [`crate::transform::sbt_geometry`] boundary, the `pos_flag`-
+    /// selected one carrying the CU's whole residual (luma AND
+    /// chroma), the other coded-flag-free.
+    fn sbt_tb_split(info: &LeafCuInfo, w: u32, h: u32) -> Option<crate::deblock::TbSplit> {
+        if !info.cu_sbt_flag {
+            return None;
+        }
+        let geo = crate::transform::sbt_geometry(
+            w,
+            h,
+            info.cu_sbt_quad_flag,
+            info.cu_sbt_horizontal_flag,
+            info.cu_sbt_pos_flag,
+        );
+        let vertical = !info.cu_sbt_horizontal_flag;
+        // The single interior boundary: the residual TU's leading edge
+        // when it sits at the far side (`pos_flag == 1`), else its
+        // trailing edge.
+        let bound = if vertical {
+            if geo.res_x > 0 {
+                geo.res_x
+            } else {
+                geo.res_w
+            }
+        } else if geo.res_y > 0 {
+            geo.res_y
+        } else {
+            geo.res_h
+        };
+        if bound == 0 || bound >= (if vertical { w } else { h }) {
+            return None;
+        }
+        let res_idx = usize::from(info.cu_sbt_pos_flag);
+        let mut y_coded = [false; 4];
+        let mut cb_coded = [false; 4];
+        let mut cr_coded = [false; 4];
+        y_coded[res_idx] = info.tu_y_coded_flag;
+        // §8.8.3.5 chroma tu-coded arm folds
+        // `tu_joint_cbcr_residual_flag` into both components.
+        cb_coded[res_idx] = info.tu_cb_coded_flag || info.tu_c_res_mode != 0;
+        cr_coded[res_idx] = info.tu_cr_coded_flag || info.tu_c_res_mode != 0;
+        Some(crate::deblock::TbSplit {
+            vertical,
+            n_bounds: 1,
+            bounds: [bound, 0, 0],
+            y_coded,
+            cb_coded,
+            cr_coded,
+            luma_only: false,
+        })
+    }
+
     fn commit_subblock_neighbour_state(&mut self, cu: &CtuCu, info: &LeafCuInfo) {
         let merge_sb = info.inter.merge_data.merge_subblock_flag;
         self.write_subblock_merge_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, merge_sb);
@@ -4671,6 +4763,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: None,
             tu64: None,
+            tb_split: None,
         });
         Ok(())
     }
@@ -4805,6 +4898,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ibc: false,
                 num_sb: None,
                 tu64: None,
+                tb_split: None,
             });
             return Ok(());
         }
@@ -4836,6 +4930,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: None,
             tu64: None,
+            tb_split: None,
         });
         self.write_intra_block(x0, y0, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -5084,6 +5179,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ibc: false,
                 num_sb: None,
                 tu64: Self::tu64_map(residual),
+                tb_split: Self::isp_tb_split(
+                    info.isp_split,
+                    cu.cu.w,
+                    cu.cu.h,
+                    info.tu_y_coded_flag,
+                ),
             });
             self.write_intra_block(
                 cu.cu.x,
@@ -5456,6 +5557,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: None,
             tu64: Self::tu64_map(residual),
+            tb_split: None,
         });
         // Round-28 §8.5.6.7 — record this CU's prediction mode in the
         // 4x4 intra-coded grid so subsequent CIIP CUs see the correct
@@ -5701,6 +5803,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: true,
             num_sb: None,
             tu64: None,
+            tb_split: None,
         });
         self.write_intra_block(x_cb, y_cb, cb_w, cb_h, false);
         self.write_parse_mode_block(
@@ -6789,6 +6892,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: None,
             tu64: Self::tu64_map(residual),
+            tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         // Round-28 §8.5.6.7 — inter CUs record MODE_INTER in the
         // intra-coded grid.
@@ -8398,6 +8502,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
             tu64: Self::tu64_map(residual),
+            tb_split: None,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -8912,6 +9017,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: Some((cu.cu.w / 8, cu.cu.h / 8)),
             tu64: Self::tu64_map(residual),
+            tb_split: None,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -9276,6 +9382,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
             tu64: Self::tu64_map(residual),
+            tb_split: None,
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -10319,6 +10426,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: None,
             tu64: None,
+            tb_split: None,
         });
         self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);
         // Round-149 — GPM CUs always carry `merge_subblock_flag = 0`
@@ -11731,6 +11839,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             alf_enabled: self.sh.sh_alf_enabled_flag,
             cb_enabled: self.sh.sh_alf_cb_enabled_flag,
             cr_enabled: self.sh.sh_alf_cr_enabled_flag,
+            cc_cb_enabled: self.sh.sh_alf_cc_cb_enabled_flag,
+            cc_cr_enabled: self.sh.sh_alf_cc_cr_enabled_flag,
             bit_depth,
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,

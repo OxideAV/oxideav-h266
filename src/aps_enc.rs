@@ -311,15 +311,20 @@ fn write_alf_data(
         bw.write_ue((n - 1) as u32);
         for k in 0..n {
             for j in 0..ALF_CC_NUM_COEFF {
+                // §7.4.3.18 — the wire carries the MAPPED magnitude:
+                // coefficient 0 → 0, ±2^(m − 1) → m. Only zero and
+                // signed powers of two up to 64 are representable.
                 let v = alf.cc_cb_coeff[k][j];
                 let abs = v.unsigned_abs();
-                if abs > 7 {
+                if abs != 0 && (!abs.is_power_of_two() || abs > 64) {
                     return Err(Error::invalid(format!(
-                        "h266 ALF APS: alf_cc_cb_coeff[{k}][{j}] = {v} (|v| > 7)"
+                        "h266 ALF APS: alf_cc_cb_coeff[{k}][{j}] = {v} is not 0 or \
+                         a signed power of two <= 64 (§7.4.3.18 mapped coefficient)"
                     )));
                 }
-                bw.write_bits(abs, 3);
-                if abs > 0 {
+                let mapped_abs = if abs == 0 { 0 } else { abs.ilog2() + 1 };
+                bw.write_bits(mapped_abs, 3);
+                if mapped_abs > 0 {
                     bw.write_bit(if v < 0 { 1 } else { 0 });
                 }
             }
@@ -337,15 +342,20 @@ fn write_alf_data(
         bw.write_ue((n - 1) as u32);
         for k in 0..n {
             for j in 0..ALF_CC_NUM_COEFF {
+                // §7.4.3.18 — the wire carries the MAPPED magnitude:
+                // coefficient 0 → 0, ±2^(m − 1) → m. Only zero and
+                // signed powers of two up to 64 are representable.
                 let v = alf.cc_cr_coeff[k][j];
                 let abs = v.unsigned_abs();
-                if abs > 7 {
+                if abs != 0 && (!abs.is_power_of_two() || abs > 64) {
                     return Err(Error::invalid(format!(
-                        "h266 ALF APS: alf_cc_cr_coeff[{k}][{j}] = {v} (|v| > 7)"
+                        "h266 ALF APS: alf_cc_cr_coeff[{k}][{j}] = {v} is not 0 or \
+                         a signed power of two <= 64 (§7.4.3.18 mapped coefficient)"
                     )));
                 }
-                bw.write_bits(abs, 3);
-                if abs > 0 {
+                let mapped_abs = if abs == 0 { 0 } else { abs.ilog2() + 1 };
+                bw.write_bits(mapped_abs, 3);
+                if mapped_abs > 0 {
                     bw.write_bit(if v < 0 { 1 } else { 0 });
                 }
             }

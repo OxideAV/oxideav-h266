@@ -239,9 +239,11 @@ fn alf_aps_nal_round_trip() {
     let mut row_cc_cb = [0i32; ALF_CC_NUM_COEFF];
     row_cc_cb[1] = 2;
     row_cc_cb[2] = -2;
+    // §7.4.3.18 — CC-ALF coefficients are mapped (0 or ±2^(m − 1)),
+    // so only signed powers of two are representable on the wire.
     let mut row_cc_cr = [0i32; ALF_CC_NUM_COEFF];
-    row_cc_cr[3] = 5;
-    row_cc_cr[6] = -6;
+    row_cc_cr[3] = 4;
+    row_cc_cr[6] = -8;
 
     let alf = AlfApsData {
         alf_chroma_filter_signal_flag: true,

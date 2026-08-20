@@ -311,8 +311,14 @@ fn parse_alf_data(br: &mut BitReader<'_>, aps_chroma_present_flag: bool) -> Resu
         out.cc_cb_coeff = vec![[0i32; ALF_CC_NUM_COEFF]; n];
         for k in 0..n {
             for j in 0..ALF_CC_NUM_COEFF {
+                // §7.4.3.18 — the coefficient is MAPPED:
+                // 0 → 0, else (1 − 2·sign)·2^(mapped_abs − 1).
                 let mapped_abs = br.u(3)?;
-                let mut v = mapped_abs as i32;
+                let mut v = if mapped_abs == 0 {
+                    0
+                } else {
+                    1i32 << (mapped_abs - 1)
+                };
                 if mapped_abs > 0 && br.u1()? == 1 {
                     v = -v;
                 }
@@ -331,8 +337,13 @@ fn parse_alf_data(br: &mut BitReader<'_>, aps_chroma_present_flag: bool) -> Resu
         out.cc_cr_coeff = vec![[0i32; ALF_CC_NUM_COEFF]; n];
         for k in 0..n {
             for j in 0..ALF_CC_NUM_COEFF {
+                // §7.4.3.18 — same power-of-two mapping as Cb.
                 let mapped_abs = br.u(3)?;
-                let mut v = mapped_abs as i32;
+                let mut v = if mapped_abs == 0 {
+                    0
+                } else {
+                    1i32 << (mapped_abs - 1)
+                };
                 if mapped_abs > 0 && br.u1()? == 1 {
                     v = -v;
                 }

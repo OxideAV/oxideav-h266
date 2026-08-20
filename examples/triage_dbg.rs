@@ -9,7 +9,7 @@
 //!   workspace docs staging path).
 //! * `H266_DUMP_DIR` — when set, dump each output picture's cropped
 //!   planes (8-bit: 1 byte/sample; >8-bit: 2-byte LE) as
-//!   `ours_poc<N>.yuv` for sample-level diffing against a black-box
+//!   `ours_cvs<K>_poc<N>.yuv` for sample-level diffing against a
 //!   reference decode.
 //! * Combine with `H266_DBG_IGNORE_EOS` / `H266_DBG_CU` (see
 //!   `stream.rs` / `ctu.rs`) to inspect desynced pictures.
@@ -84,7 +84,11 @@ fn main() {
                         }
                     }
                 }
-                std::fs::write(format!("{dir}/ours_poc{}.yuv", pic.poc), raw).unwrap();
+                std::fs::write(
+                    format!("{dir}/ours_cvs{}_poc{}.yuv", pic.cvs_idx, pic.poc),
+                    raw,
+                )
+                .unwrap();
             }
         }
         eprintln!("decoded poc {} (output {})", pic.poc, pic.output_flag);

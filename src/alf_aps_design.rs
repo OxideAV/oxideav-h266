@@ -628,6 +628,8 @@ fn replay_aps_full_picture_sse(
         alf_enabled: true,
         cb_enabled: false,
         cr_enabled: false,
+        cc_cb_enabled: false,
+        cc_cr_enabled: false,
         bit_depth,
         ctb_log2_size_y,
         chroma_format_idc,

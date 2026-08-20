@@ -604,36 +604,40 @@ fn corpus_decode_triage() {
 /// fail the harness. Classes: P = pass (byte-exact vs .opl),
 /// F = fail (decodes, diverges), U = unsupported tool, E = error.
 const EXPECTED_VERDICTS: &[(&str, char)] = &[
-    // r447: the "affine non-merge in the stream walker" gate is
-    // DISSOLVED — the §7.3.11.5 cascade order fix (inter_pred_idc
-    // BEFORE the affine pair; SMVD gated on !inter_affine_flag), the
-    // §7.4.3.7 BDOF / DMVR / PROF / mvd_l1_zero PH inferences, the
-    // decode_picture_into affine-AMVP hookup, the §8.8.3.4 sub-block
-    // + §8.8.3.5 motion-difference deblocking, the §8.5.6.6.2
-    // high-precision bi-pred composition (eqs. 978 – 981) and the
-    // interior 64-tile TB deblock edges all landed. DMVR_B_4 is now
-    // byte-exact and AFF_A_2 decodes end-to-end. The former affine-U
-    // rows now parse PAST the first affine CU and hit a later CABAC
-    // desync ("post-affine-gate parse desync" — under triage); the
-    // remaining U rows are subpictures / 4:2:2 / 4:4:4 / explicit WP
-    // / per-slice loop-filter divergence.
+    // r449: EVERY intra picture in the corpus is byte-exact. Three
+    // root causes closed the former "data-dependent intra deblock
+    // tail" + the poc-0 chroma family: (1) the §8.8.3.2 – §8.8.3.5
+    // deblock driver was rebuilt as the spec's per-CU edge walk —
+    // interior ISP / SBT transform-block edges now filter, every
+    // maxFilterLength derives from TRANSFORM-BLOCK dims, and edges
+    // process in geometric order (the §8.8.3.1 same-direction data
+    // dependency); (2) the §8.7.5.3 eq. 1216 invAvgLuma summed
+    // native-BitDepth samples through a stale `<< (BitDepth − 8)`
+    // lift, wrecking LMCS chroma residual scaling on every >8-bit
+    // wire; (3) §7.4.3.18 CC-ALF coefficients are MAPPED
+    // (±2^(abs − 1)) — the parse used the raw magnitude. The
+    // remaining F rows all first diverge on their first INTER
+    // picture (poc 1 plane Y — under triage); the E rows are the
+    // post-affine-gate parse desync family; the U rows are
+    // subpictures / 4:2:2 / 4:4:4 / explicit WP / per-slice
+    // loop-filter divergence.
     ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
     ("8b400_A_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("8b420_A_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("8b420_B_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
-    ("AFF_A_2", 'F'),             // 10/10 pictures diverge (first poc 0 plane Y)
-    ("ALF_A_3", 'F'),             // 3/3 pictures diverge (first poc 0 plane Y)
-    ("ALF_B_3", 'F'),             // 3/3 pictures diverge (first poc 0 plane Y)
-    ("ALF_C_3", 'F'),             // 4/4 pictures diverge (first poc 0 plane Y)
-    ("AMVR_A_3", 'F'),            // 85/85 pictures diverge (first poc 0 plane Cb)
+    ("AFF_A_2", 'F'),             // 9/10 pictures diverge (first poc 1 plane Y)
+    ("ALF_A_3", 'F'),             // 2/3 pictures diverge (first poc 1 plane Y)
+    ("ALF_B_3", 'F'),             // 1/3 pictures diverge (first poc 1 plane Y)
+    ("ALF_C_3", 'P'),             // byte-exact (r449)
+    ("AMVR_A_3", 'F'),            // 80/85 pictures diverge (first poc 1 plane Y)
     ("BDOF_A_4", 'E'),            // post-affine-gate parse desync (under triage)
-    ("BDPCM_A_2", 'F'),           // 3/3 pictures diverge (first poc 0 plane Y)
-    ("CCLM_A_2", 'F'),            // 7/7 pictures diverge (first poc 0 plane Cb)
-    ("CST_A_4", 'F'),             // 21/21 pictures diverge (first poc 0 plane Y)
+    ("BDPCM_A_2", 'P'),           // byte-exact (r449)
+    ("CCLM_A_2", 'P'),            // byte-exact (r449)
+    ("CST_A_4", 'P'),             // byte-exact (r449)
     ("CodingToolsSets_A_2", 'P'), // byte-exact
     ("CodingToolsSets_B_2", 'F'), // 8/9 pictures diverge (first poc 1 plane Y)
-    ("CodingToolsSets_C_2", 'F'), // 2/2 pictures diverge (first poc 0 plane Y)
+    ("CodingToolsSets_C_2", 'P'), // byte-exact (r449)
     ("CodingToolsSets_D_2", 'E'), // IBC BV derivation (under triage)
     ("CodingToolsSets_E_1", 'U'), // subpictures
     ("DEBLOCKING_A_3", 'E'),      // post-affine-gate parse desync (under triage)
@@ -644,29 +648,29 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("GDR_A_2", 'E'),             // post-affine-gate parse desync (under triage)
     ("GPM_A_3", 'E'),             // post-affine-gate parse desync (under triage)
     ("IBC_A_2", 'E'),             // desync (under triage)
-    ("ISP_A_3", 'F'),             // 34/34 pictures diverge (first poc 0 plane Y)
+    ("ISP_A_3", 'P'),             // byte-exact (r449)
     ("JCCR_A_2", 'E'),            // desync (under triage)
-    ("JCCR_C_3", 'F'),            // 63/66 pictures diverge (first poc 1 plane Y)
-    ("LFNST_A_4", 'F'),           // 53/53 pictures diverge (first poc 0 plane Y)
+    ("JCCR_C_3", 'F'),            // 62/66 pictures diverge (first poc 1 plane Y)
+    ("LFNST_A_4", 'P'),           // byte-exact (r449)
     ("LFNST_B_4", 'E'),           // post-affine-gate parse desync (under triage)
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'E'),            // post-affine-gate parse desync (under triage)
     ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
     ("MERGE_A_2", 'E'),           // post-affine-gate parse desync (under triage)
-    ("MIP_A_3", 'F'),             // 39/39 pictures diverge (first poc 0 plane Cb)
+    ("MIP_A_3", 'P'),             // byte-exact (r449)
     ("MIP_B_3", 'E'),             // post-affine-gate parse desync (under triage)
     ("MMVD_A_3", 'E'),            // post-affine-gate parse desync (under triage)
-    ("MTS_A_4", 'F'),             // 21/21 pictures diverge (first poc 0 plane Y)
+    ("MTS_A_4", 'P'),             // byte-exact (r449)
     ("PROF_B_3", 'E'),            // post-affine-gate parse desync (under triage)
     ("QUANT_A_2", 'E'),           // post-affine-gate parse desync (under triage)
     ("QUANT_B_2", 'E'),           // post-affine-gate parse desync (under triage)
-    ("RAP_A_1", 'F'),             // 1/1 pictures diverge (first poc 32 plane Y)
+    ("RAP_A_1", 'P'),             // byte-exact (r449)
     ("RAP_B_1", 'E'),             // post-affine-gate parse desync (under triage)
     ("SAO_A_3", 'E'),             // post-affine-gate parse desync (under triage)
     ("SBT_A_2", 'E'),             // post-affine-gate parse desync (under triage)
     ("SLICES_A_3", 'E'),          // desync (under triage)
-    ("SMVD_A_2", 'F'),            // 10/10 pictures diverge (first poc 0 plane Y)
+    ("SMVD_A_2", 'F'),            // 9/10 pictures diverge (first poc 1 plane Y)
     ("SUBPIC_C_1", 'U'),          // subpictures
     ("SbTMVP_A_3", 'E'),          // desync (under triage)
     ("TILE_A_2", 'E'),            // post-affine-gate parse desync (under triage)

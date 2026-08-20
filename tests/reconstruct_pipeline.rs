@@ -307,6 +307,7 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             ibc: false,
             num_sb: None,
             tu64: None,
+            tb_split: None,
         },
         DeblockCu {
             x: 16,
@@ -327,6 +328,7 @@ fn deblock_smooths_synthetic_block_edge_fixture() {
             ibc: false,
             num_sb: None,
             tu64: None,
+            tb_split: None,
         },
     ];
     let params = DeblockParams {

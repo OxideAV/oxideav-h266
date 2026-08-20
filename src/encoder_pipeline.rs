@@ -2328,6 +2328,7 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 ibc: false,
                 num_sb: None,
                 tu64: None,
+                tb_split: None,
             });
         }
         PreparedCu::Leaf(tb) => {
@@ -2352,6 +2353,7 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 ibc: false,
                 num_sb: None,
                 tu64: None,
+                tb_split: None,
             });
         }
         PreparedCu::BtSplit {
