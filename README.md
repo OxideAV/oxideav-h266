@@ -661,9 +661,10 @@ produces them, an independent black-box decoder is the oracle, and
   neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
   their 4-point model from oversampled positions).
 
-Scorecard (r437 → r440 → r443 → r447): 0 P / 2 F / 8 U / 46 E →
+Scorecard (r437 → r440 → r443 → r447 → r449): 0 P / 2 F / 8 U / 46 E →
 1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
-**2 PASS / 17 FAIL / 8 UNSUPPORTED / 29 ERROR** — `DMVR_B_4` joins
+2 P / 17 F / 8 U / 29 E →
+**14 PASS / 31 FAIL / 9 UNSUPPORTED / 2 ERROR** — `DMVR_B_4` joins
 `CodingToolsSets_A_2` as byte-exact, and the r443 "affine non-merge"
 gate (the largest U family) is DISSOLVED. r447's root causes, each
 pinned with black-box single-tool fixture matrices that now decode
@@ -732,18 +733,56 @@ The r443 rollup below documents the earlier family:
   `non_inter_flag`, DUAL_TREE_LUMA subtrees and the single
   DUAL_TREE_CHROMA leaf in the single-tree walker.
 
-After r447 the 17 FAIL streams decode end-to-end with plane
-divergences dominated by ONE precisely-repro'd class: a
-data-dependent intra deblocking tail (a 3-frame all-intra black-box
-fixture reproduces it at ~1k samples on its third picture —
-4-aligned luma edges filtered differently; pre-r447 the same fixture
-also diverged on its second picture, which r447's interior-TB-edge
-work fixed). The 8 UNSUPPORTED rows are subpictures, 4:2:2 / 4:4:4,
-explicit weighted prediction and per-slice loop-filter divergence;
-the 29 ERROR rows are the former affine-U family, which now parses
-PAST its first affine CU and hits a later desync shared with the
-intra-FAIL class (under triage — `MERGE_A_2` diverges on its intra
-picture 0 first, then desyncs on picture 2).
+**r449 — every intra picture in the corpus is byte-exact, and the
+parse-desync ERROR family is DISSOLVED.** The round's root causes,
+each pinned with black-box fixture matrices (10-bit RA wires over
+static / noise / moving / screen content) that decode byte-exactly
+end-to-end:
+
+* **§8.8.3.2 – §8.8.3.5 deblocking rebuilt as the spec's per-CU edge
+  walk** — interior ISP / SBT transform-block edges filter (new
+  `DeblockCu::tb_split`), every `maxFilterLength` derives from the
+  TRANSFORM-BLOCK dims, edges process in geometric order (the
+  §8.8.3.1 same-direction data dependency — the r447 "intra deblock
+  tail" root cause), the §8.8.3.4 `edgeTbFlags` overlay and exact
+  §8.8.3.5 arm gating (tu-coded arm on TB edges only, motion arms at
+  `edgeIdc == 2` only), and the §8.8.3.6.4 chroma `(1, 1)`-length
+  edges filter only at `bS == 2`.
+* **§8.7.5.3 eq. 1216** — `invAvgLuma` summed native-BitDepth samples
+  through a stale `<< (BitDepth − 8)` lift, wrecking LMCS chroma
+  residual scaling on every >8-bit wire; **§7.4.3.18** — CC-ALF
+  coefficients are MAPPED (`±2^(abs − 1)`), the parse used the raw
+  magnitude (and the emit now writes the mapped one, with CC-ALF
+  gated on its own §7.3.7 slice flags).
+* **§7.3.11.5 / §7.3.11.9 SBT parse** (`cu_sbt_*` with Tables
+  93 – 96, the zero-TU inference walk, the §7.3.11.11 SBT 32 → 16
+  zero-out, Table-40 kernels under `implicitMtsEnabled`, sub-TU-rect
+  chroma reconstruction) — the whole "post-affine-gate parse desync"
+  E family (29 rows) was SBT-enabled wires desyncing at their first
+  coded eligible inter CU.
+* **§8.5.2.1 – §8.5.2.9 merge / AMVP details** — the
+  `(cbWidth + cbHeight) == 12` bi→uni collapse, the
+  Log2ParMrgLevel-gated HMVP update (level now from the SPS), the
+  AMVP HMVP fill counted after the A == B dedup, the eqs. 471 – 474
+  18-bit wrap, and the §8.5.2.5 zero-pad `zeroIdx` refIdx counter.
+* **§8.5.7.2 eq. 1014** — the GPM blend's `partFlip` arms were
+  inverted, mirroring partition A and B across the split line (masked
+  whenever both partitions predict near-identical content; exposed at
+  picture-edge GPM CUs).
+* **§8.5.6.1** — `sbBdofFlag`: BDOF skips per DMVR sub-block when the
+  refinement SAD is under `2·sbW·sbH`; and `sym_mvd_flag == 0` is a
+  `bdofFlag` bullet (SMVD CUs never run BDOF). **§8.5.6.3.2
+  `hpelIfIdx`** — the Table 27 alternative 6-tap half-sample filter
+  is live end-to-end (eq. 475 + merge/HMVP/pairwise inheritance).
+
+The 31 FAIL rows now all first diverge on an INTER picture (the
+poc-1-luma class, under triage — the r449-built affine-AMVR /
+CIIP-narrow-chroma leads are recorded in the round notes); the 9
+UNSUPPORTED rows are subpictures, 4:2:2 / 4:4:4, explicit weighted
+prediction, per-slice loop-filter divergence and explicit §8.8.1
+virtual boundaries (`GDR_A_2`'s real gate, surfaced once its parse
+desync dissolved); the 2 ERROR rows are IBC reference-region /
+candidate desyncs (under triage).
 `examples/triage_dbg` decodes one corpus stream against its `.opl`
 sidecar with optional plane dumps; `examples/decode_dump` writes
 POC-ordered YUV for fixture diffing; `examples/sps_dump` prints a
