@@ -2543,6 +2543,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 mvd_l1: d.mvd_cp_l1[0],
                 amvr_shift,
                 bcw_idx: bcw_idx as u8,
+                sym_mvd_flag: d.mvp.sym_mvd_flag,
                 inter_affine_flag: is_affine,
                 cu_affine_type_flag: d.affine.cu_affine_type_flag,
                 mvd_cp1_l0: d.mvd_cp_l0[1],

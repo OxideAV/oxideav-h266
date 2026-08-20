@@ -630,7 +630,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_C_3", 'P'),             // byte-exact (r449)
-    ("AMVR_A_3", 'F'),            // 72/85 pictures diverge (first poc 1 plane Y)
+    ("AMVR_A_3", 'F'),            // 68/85 pictures diverge (first poc 1 plane Y)
     ("BDOF_A_4", 'F'),            // 41/44 pictures diverge (first poc 3 plane Y)
     ("BDPCM_A_2", 'P'),           // byte-exact (r449)
     ("CCLM_A_2", 'P'),            // byte-exact (r449)

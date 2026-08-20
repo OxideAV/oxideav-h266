@@ -6172,7 +6172,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     /*is_strp_l1*/ true,
                     /*motion_model_idc*/ 0,
                     /*merge_subblock_flag*/ false,
-                    /*sym_mvd_flag*/ false,
+                    // r449 — §8.5.6.1: an SMVD CU never runs BDOF.
+                    !info.inter.general_merge_flag && info.inter.non_merge.sym_mvd_flag,
                     info.inter.merge_data.ciip_flag,
                     chosen.bcw_idx,
                     /*luma_weight_l0_flag*/ false,
@@ -6235,7 +6236,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             /*is_strp_l1*/ true,
                             /*motion_model_idc*/ 0,
                             /*merge_subblock_flag*/ false,
-                            /*sym_mvd_flag*/ false,
+                            // r449 — §8.5.6.1: `sym_mvd_flag == 0` is a
+                            // bdofFlag bullet; an SMVD CU never runs BDOF.
+                            !info.inter.general_merge_flag && info.inter.non_merge.sym_mvd_flag,
                             info.inter.merge_data.ciip_flag,
                             chosen.bcw_idx,
                             /*luma_weight_l0_flag*/ false,
@@ -6554,6 +6557,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let same_diff_poc =
                     curr_poc.wrapping_sub(rp0.poc) == rp1.poc.wrapping_sub(curr_poc);
                 let bdof_runs = self.sps.tool_flags.bdof_enabled_flag
+                    && std::env::var_os("H266_DBG_NO_BDOF").is_none()
                     && bdof_used_flag(
                         self.ph_bdof_disabled,
                         chosen.pred_flag_l0,
@@ -6563,7 +6567,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         /*is_strp_l1*/ true,
                         /*motion_model_idc*/ 0,
                         /*merge_subblock_flag*/ false,
-                        /*sym_mvd_flag*/ false,
+                        // r449 — §8.5.6.1: `sym_mvd_flag == 0` is a
+                        // bdofFlag bullet; an SMVD CU never runs BDOF.
+                        !info.inter.general_merge_flag && info.inter.non_merge.sym_mvd_flag,
                         ciip_active,
                         chosen.bcw_idx,
                         /*luma_weight_l0_flag*/ false,
@@ -8375,6 +8381,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 temporal_col,
                 _phantom: core::marker::PhantomData,
             });
+            if std::env::var_os("H266_DBG_AFFAMVP").is_some() {
+                eprintln!(
+                    "AFFLIST ({xcb},{ycb}) ncp={num_cp_mv} inhA={inherited_a:?} inhB={inherited_b:?} consFull={constructed_full:?} corners={constructed_corners:?} tcol={temporal_col:?} flag={mvp_flag}",
+                );
+            }
             let mvp = select_affine_mvp(&list_lx, mvp_flag);
 
             // §8.5.5.5 eqs. 660 – 663 cumulative MVD, then eqs. 664 –

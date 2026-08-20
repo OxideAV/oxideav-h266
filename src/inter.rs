@@ -1590,6 +1590,9 @@ pub struct NonMergeInterData {
     /// points. The full-CABAC walker currently reconstructs the
     /// translational path only; an affine non-merge CU surfaces a
     /// precise `Error::Unsupported` at reconstruction.
+    /// r449 — `sym_mvd_flag[x0][y0]` (§7.4.12.7): §8.5.6.1 bars BDOF
+    /// on an SMVD CU.
+    pub sym_mvd_flag: bool,
     pub inter_affine_flag: bool,
     /// r409 — `cu_affine_type_flag[x0][y0]` (6-param when set).
     pub cu_affine_type_flag: bool,
@@ -1616,6 +1619,7 @@ impl Default for NonMergeInterData {
             // §7.4.11.6 Table 16 default — 1/4-luma resolution.
             amvr_shift: crate::amvr::AmvrShift(2),
             bcw_idx: 0,
+            sym_mvd_flag: false,
             inter_affine_flag: false,
             cu_affine_type_flag: false,
             mvd_cp1_l0: MotionVector::ZERO,
