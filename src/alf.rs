@@ -239,6 +239,17 @@ pub fn apply_alf_clipped(
     binding: &AlfApsBinding<'_>,
     tile_bounds: Option<(&[u32], &[u32])>,
 ) {
+    if std::env::var_os("H266_DBG_ALF_CTB").is_some() {
+        eprintln!(
+            "ALF apply: enabled={} all_off={} cb={} cr={} cc_cb={} cc_cr={}",
+            cfg.alf_enabled,
+            alf_pic.is_all_off(),
+            cfg.cb_enabled,
+            cfg.cr_enabled,
+            cfg.cc_cb_enabled,
+            cfg.cc_cr_enabled
+        );
+    }
     if !cfg.alf_enabled {
         return;
     }

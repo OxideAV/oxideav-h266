@@ -535,9 +535,20 @@ pub fn derive_final_mv(mvp: MotionVector, raw_mvd: MotionVector, amvr: AmvrShift
         x: raw_mvd.x << s,
         y: raw_mvd.y << s,
     };
+    // §8.5.2.1 eqs. 471 – 474 — the sum WRAPS into the signed 18-bit
+    // range (`u = (mvp + mvd) & (2^18 − 1); mv = u >= 2^17 ? u − 2^18
+    // : u`), it does not clamp.
+    let wrap18 = |v: i32| -> i32 {
+        let u = v & 0x3_FFFF;
+        if u >= 0x2_0000 {
+            u - 0x4_0000
+        } else {
+            u
+        }
+    };
     MotionVector {
-        x: (mvp.x + shifted.x).clamp(-131072, 131071),
-        y: (mvp.y + shifted.y).clamp(-131072, 131071),
+        x: wrap18(mvp.x + shifted.x),
+        y: wrap18(mvp.y + shifted.y),
     }
 }
 
@@ -1144,15 +1155,18 @@ mod tests {
     }
 
     #[test]
-    fn derive_final_mv_clips_to_18bit_range() {
+    fn derive_final_mv_wraps_to_18bit_range() {
+        // §8.5.2.1 eqs. 471 – 474 — the fold WRAPS modulo 2^18 (it
+        // does not clamp): 131000 + 16000 = 147000 → 147000 − 262144
+        // = −115144, and the negative mirror wraps back positive.
         let mvp = MotionVector {
             x: 131000,
             y: -131000,
         };
         let raw = MotionVector { x: 1000, y: -1000 };
         let out = derive_final_mv(mvp, raw, AmvrShift(4)); // shift 4 → *16
-        assert_eq!(out.x, 131071);
-        assert_eq!(out.y, -131072);
+        assert_eq!(out.x, 147000 - 262144); // −115144
+        assert_eq!(out.y, 262144 - 147000); // +115144
     }
 
     // ---- end-to-end §8.5.2.8 ---------------------------------------

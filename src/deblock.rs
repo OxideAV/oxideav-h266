@@ -504,6 +504,14 @@ pub fn apply_deblocking_clipped(
     no_filter_cols: &[u32],
     no_filter_rows: &[u32],
 ) {
+    if std::env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
+        eprintln!(
+            "DBLK apply: cus={} chroma_cus={:?} cfi={chroma_format_idc} disabled={}",
+            cus.len(),
+            chroma_cus.map(|c| c.len()),
+            params.disabled
+        );
+    }
     if params.disabled {
         return;
     }
@@ -815,6 +823,16 @@ fn deblock_cu_dir(
                 is_tb,
                 is_sb_edge,
             );
+            if c_idx != 0 && std::env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
+                eprintln!(
+                    "DBLKC2 c={c_idx} {} q=({qx},{qy}) off={off} is_tb={is_tb} bS={b_s} p_intra={} q_intra={} p_cu=({},{})",
+                    if vertical { "V" } else { "H" },
+                    p_cu.intra,
+                    q_cu.intra,
+                    p_cu.x,
+                    p_cu.y,
+                );
+            }
             if b_s == 0 {
                 k += seg_step;
                 continue;
@@ -921,6 +939,15 @@ fn deblock_cu_dir(
                 let (_qp, beta, tc) = compute_thresholds_chroma(plane, p_cu, q_cu, b_s);
                 let ex = qx / plane.sub_w as i32;
                 let ey = qy / plane.sub_h as i32;
+                if std::env::var_os("H266_DBG_DBLK_CHROMA").is_some() {
+                    eprintln!(
+                        "DBLKC c={} {} edge ({ex},{ey}) bS={b_s} mfl=({mfl_p},{mfl_q}) beta={beta} tc={tc} cu=({},{}) off={off}",
+                        c_idx,
+                        if vertical { "V" } else { "H" },
+                        cu.x,
+                        cu.y,
+                    );
+                }
                 if vertical {
                     run_chroma_filter_v(
                         plane.plane,
@@ -1779,13 +1806,21 @@ fn run_chroma_filter_v(
     cy: i32,
     beta: i32,
     tc: i32,
-    _b_s: i32,
+    b_s: i32,
     max_filter_length_p: u32,
     max_filter_length_q: u32,
     plt_p: bool,
     plt_q: bool,
 ) {
     if tc == 0 {
+        return;
+    }
+    // §8.8.3.6.4 — "When both maxFilterLengthP and maxFilterLengthQ
+    // are equal to 1 and bS is not equal to 2, maxFilterLengthP and
+    // maxFilterLengthQ are both set equal to 0" — and §8.8.3.6.1
+    // step 2 only invokes the filter when maxFilterLengthQ > 0, so a
+    // (1, 1) edge filters ONLY at bS = 2.
+    if max_filter_length_p == 1 && max_filter_length_q == 1 && b_s != 2 {
         return;
     }
     let bd = plane.bit_depth;
@@ -1836,7 +1871,7 @@ fn run_chroma_filter_h(
     cy: i32,
     beta: i32,
     tc: i32,
-    _b_s: i32,
+    b_s: i32,
     max_filter_length_p: u32,
     max_filter_length_q: u32,
     plt_p: bool,
@@ -1845,14 +1880,17 @@ fn run_chroma_filter_h(
     if tc == 0 {
         return;
     }
+    // §8.8.3.6.4 — "When both maxFilterLengthP and maxFilterLengthQ
+    // are equal to 1 and bS is not equal to 2, maxFilterLengthP and
+    // maxFilterLengthQ are both set equal to 0" — and §8.8.3.6.1
+    // step 2 only invokes the filter when maxFilterLengthQ > 0, so a
+    // (1, 1) edge filters ONLY at bS = 2.
+    if max_filter_length_p == 1 && max_filter_length_q == 1 && b_s != 2 {
+        return;
+    }
     let bd = plane.bit_depth;
     let max_k = 1i32;
 
-    // §8.8.3.6.4: with both lengths 1 and bS != 2 the edge is left
-    // untouched entirely.
-    if max_filter_length_p == 1 && max_filter_length_q == 1 && _b_s != 2 {
-        return;
-    }
     // §8.8.3.6.4 / §8.8.3.6.10 — the strong path runs when
     // maxFilterLengthQ == 3; the P side is either 3 (symmetric
     // eqs. 1411-1416) or 1 (the r415 chroma-CTB-row asymmetric

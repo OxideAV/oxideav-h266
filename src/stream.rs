@@ -697,6 +697,18 @@ impl StreamDecoder {
                     self.resolve_list(&built[0], sh.num_ref_idx_active[0] as usize, max_poc_lsb)?;
                 let l1 =
                     self.resolve_list(&built[1], sh.num_ref_idx_active[1] as usize, max_poc_lsb)?;
+                if std::env::var_os("H266_DBG_RPL").is_some() {
+                    eprintln!(
+                        "RPL poc={poc} slice={i} type={:?} nact=[{},{}] L0={:?} L1={:?} col_l0={} col_idx={}",
+                        sh.sh_slice_type,
+                        sh.num_ref_idx_active[0],
+                        sh.num_ref_idx_active[1],
+                        l0.iter().map(|r| r.poc).collect::<Vec<_>>(),
+                        l1.iter().map(|r| r.poc).collect::<Vec<_>>(),
+                        sh.sh_collocated_from_l0_flag,
+                        sh.sh_collocated_ref_idx,
+                    );
+                }
                 walker.set_ref_pic_list_l0(l0);
                 walker.set_ref_pic_list_l1(l1);
                 walker.set_temporal_mvp(

@@ -1312,11 +1312,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `None` (covering CB not affine).
         let affine_cpmv_field =
             crate::inter::AffineCpmvField::new(layout.pic_width_luma, layout.pic_height_luma);
-        // §7.4.3.5 — Log2ParMrgLevel = pps_log2_parallel_merge_level_minus2
-        // + 2. Our PPS parser does not yet surface that field, so we
-        // default to the spec minimum (2 → ParMrgLevel = 4) which is
-        // also the value our test fixture emits.
-        let log2_par_mrg_level: u32 = 2;
+        // r449 — eq. 85: Log2ParMrgLevel =
+        // sps_log2_parallel_merge_level_minus2 + 2 (§7.4.3.4).
+        let log2_par_mrg_level: u32 = sps.tool_flags.log2_parallel_merge_level_minus2 + 2;
         Ok(Self {
             layout,
             sps,
@@ -5061,7 +5059,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ) -> Result<()> {
         if dbg_cu_enabled() {
             eprintln!(
-                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} qpd={} bdpcm={} ts={}",
+                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} cbf_cb={} cbf_cr={} jc={} qpd={} bdpcm={} ts={}",
                 tree,
                 cu.cu.x,
                 cu.cu.y,
@@ -5074,6 +5072,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.lfnst_idx,
                 info.mts_idx,
                 info.tu_y_coded_flag,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+                info.tu_c_res_mode,
                 info.cu_qp_delta_val,
                 info.intra_bdpcm_luma,
                 info.transform_skip_luma,
@@ -5918,6 +5919,40 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         } else {
             build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp))
         };
+        if std::env::var_os("H266_DBG_MERGE").is_some() {
+            eprintln!(
+                "MERGE ({xcb},{ycb}) {cb_w}x{cb_h} idx={} spatial={:?} col={:?} list={:?}",
+                info.inter.merge_data.merge_idx,
+                spatial
+                    .iter()
+                    .map(|c| {
+                        let f = &c.field;
+                        (
+                            c.available,
+                            f.mv_l0,
+                            f.ref_idx_l0,
+                            f.pred_flag_l0,
+                            f.mv_l1,
+                            f.ref_idx_l1,
+                            f.pred_flag_l1,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                col.as_ref()
+                    .map(|f| (f.mv_l0, f.ref_idx_l0, f.mv_l1, f.ref_idx_l1)),
+                mlist
+                    .iter()
+                    .map(|f| (
+                        f.mv_l0,
+                        f.ref_idx_l0,
+                        f.pred_flag_l0,
+                        f.mv_l1,
+                        f.ref_idx_l1,
+                        f.pred_flag_l1
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+        }
         // Round-40 §8.5.4 + §8.5.7 — Geometric Partitioning Mode (GPM).
         // When `gpm_flag == 1`, the CU is split along an oblique line
         // into two regions, each predicted from a separate merge
@@ -6025,6 +6060,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 "h266 inter: chosen merge candidate has both predFlags == 0; \
                  spec requires at least one active prediction list",
             ));
+        }
+        // r449 — §8.5.2.1 (after both the merge and AMVP branches):
+        // a bi-pred result on a (cbWidth + cbHeight) == 12 CU
+        // collapses to uni-pred L0 — refIdxL1 = −1, predFlagL1 = 0,
+        // bcwIdx = 0 (mvL1 is left as derived; the flags gate every
+        // consumer). Applies after merge selection / MMVD / AMVP
+        // alike.
+        let mut chosen = chosen;
+        if chosen.pred_flag_l0 && chosen.pred_flag_l1 && cu.cu.w + cu.cu.h == 12 {
+            chosen.pred_flag_l1 = false;
+            chosen.ref_idx_l1 = -1;
+            chosen.bcw_idx = 0;
         }
         // L0 reference picture lookup (when pred_flag_l0 is set).
         let ref_pic_l0 = if chosen.pred_flag_l0 {
@@ -6864,8 +6911,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, None);
 
         // Round-24 §8.5.2.16 — push the just-decoded inter CU's
-        // motion field into the per-slice HMVP table.
-        self.hmvp.update_with(mvf);
+        // motion field into the per-slice HMVP table. r449 — §8.5.2.1:
+        // the update runs only when the CU completes a parallel-merge
+        // region in BOTH dimensions
+        // (`(xCb + cbWidth) >> Log2ParMrgLevel > xCb >> Log2ParMrgLevel`
+        // and the y mirror) — CUs interior to a ParMrgLevel region
+        // leave the history untouched.
+        let par = self.log2_par_mrg_level;
+        if (cu.cu.x + cu.cu.w) >> par > cu.cu.x >> par
+            && (cu.cu.y + cu.cu.h) >> par > cu.cu.y >> par
+        {
+            self.hmvp.update_with(mvf);
+        }
 
         // Record this CU for the deblocker.
         let qp_y = (self.cabac.slice_qp_y.0 + info.cu_qp_delta_val).clamp(0, 63);
@@ -7404,9 +7461,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 amvr,
             );
             // §8.5.2.9 step-5 HMVP fill — only consulted when the
-            // list still has room after spatial + Col.
-            let n_after_spatial =
-                usize::from(spatial[0].available) + usize::from(spatial[1].available);
+            // list still has room after spatial + Col. r449: the count
+            // is AFTER the step-4 A == B dedup (an equal-MV B is
+            // dropped, so HMVP fills the freed slot — previously the
+            // pre-dedup count starved the HMVP fill into a zero pad).
+            let n_after_spatial = if spatial[0].available {
+                1 + usize::from(spatial[1].available && spatial[0].mv != spatial[1].mv)
+            } else {
+                usize::from(spatial[1].available)
+            };
             let col_suppressed =
                 spatial[0].available && spatial[1].available && spatial[0].mv != spatial[1].mv;
             let n_pre_hmvp =
@@ -7415,7 +7478,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let hmvp = derive_hmvp_mvp_candidates(&slf.hmvp, &ctx, amvr, slots_remaining);
             let list_lx = build_mvp_cand_list(spatial, col, &hmvp);
             let mvp = select_mvp(&list_lx, mvp_flag);
-            Ok(derive_final_mv(mvp, raw_mvd, amvr))
+            let fin = derive_final_mv(mvp, raw_mvd, amvr);
+            if std::env::var_os("H266_DBG_AMVP").is_some() {
+                eprintln!(
+                    "AMVP ({xcb},{ycb}) {cb_w}x{cb_h} {list:?} refIdx={ref_idx} flag={mvp_flag} spatial={:?} col={col:?} hmvp={hmvp:?} list={list_lx:?} mvp={mvp:?} mvd={raw_mvd:?} amvr={amvr:?} -> {fin:?}",
+                    raw_spatial
+                        .iter()
+                        .map(|c| (c.available, c.mv))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Ok(fin)
         };
 
         let (mv_l0, ref_idx_l0_out) = if use_l0 {
@@ -11797,11 +11870,49 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 cells_h: self.motion_field.blocks_h as usize,
             }
         };
+        // r449 — the chroma coding-block record set for §8.8.3.2:
+        //
+        // * A full dual-tree I-slice (`sps_qtbtt_dual_tree_intra_flag`)
+        //   pushes EVERY chroma CB into `deblock_cus_chroma` — pass it
+        //   through.
+        // * A single-tree slice with §7.3.11.4 local dual trees
+        //   (SCIPU) pushes ONLY the SCIPU chroma leaves there; the
+        //   rest of the picture's chroma CBs are the luma-tree CUs.
+        //   The merged set is the luma records outside every SCIPU
+        //   chroma rect plus the chroma records (chroma deblocking has
+        //   no same-direction sample dependency — 8-grid edges with
+        //   ≤ 3-sample filters — so the record order across the two
+        //   groups is immaterial). Previously the lone SCIPU record
+        //   REPLACED the whole chroma CB set, silencing chroma
+        //   deblocking on the rest of the picture.
+        let full_dual_tree = self.sps.partition_constraints.qtbtt_dual_tree_intra_flag
+            && self.sh.sh_slice_type == SliceType::I;
+        let merged_chroma: Option<Vec<DeblockCu>> = if self.deblock_cus_chroma.is_empty() {
+            None
+        } else if full_dual_tree {
+            None // pass `deblock_cus_chroma` directly below.
+        } else {
+            let inside = |cu: &DeblockCu| -> bool {
+                self.deblock_cus_chroma
+                    .iter()
+                    .any(|c| cu.x >= c.x && cu.x < c.x + c.w && cu.y >= c.y && cu.y < c.y + c.h)
+            };
+            let mut v: Vec<DeblockCu> = self
+                .deblock_cus
+                .iter()
+                .filter(|cu| !inside(cu))
+                .copied()
+                .collect();
+            v.extend(self.deblock_cus_chroma.iter().copied());
+            Some(v)
+        };
         crate::deblock::apply_deblocking_clipped(
             out,
             &self.deblock_cus,
             if self.deblock_cus_chroma.is_empty() {
                 None
+            } else if let Some(m) = merged_chroma.as_ref() {
+                Some(m.as_slice())
             } else {
                 Some(&self.deblock_cus_chroma)
             },
