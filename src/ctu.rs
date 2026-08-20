@@ -81,8 +81,8 @@ use crate::gpm::{derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motio
 use crate::inter::{
     apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
-    predict_chroma_block, predict_chroma_block_bipred_bcw, predict_luma_block,
-    predict_luma_block_bipred_bcw, predict_luma_block_high_precision, HmvpTable, MotionField,
+    predict_chroma_block, predict_chroma_block_bipred_bcw, predict_luma_block_bipred_bcw_hpel,
+    predict_luma_block_high_precision_hpel, predict_luma_block_hpel, HmvpTable, MotionField,
     MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
 };
 use crate::intra::{predict_intra, IntraPredParams, RefSamples};
@@ -2571,6 +2571,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // §8.5.2.2 step 2 — bcwIdxCol = 0 for the merge-mode
                 // temporal candidate, regardless of the L0 / L1 fuse.
                 bcw_idx: 0,
+                hpel_if_idx: 0,
             }),
             (Some(l0), None) => Some(l0),
             (None, Some(l1)) => Some(MvField {
@@ -2584,6 +2585,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 mode_inter: true,
                 available: true,
                 bcw_idx: 0,
+                hpel_if_idx: 0,
             }),
             (None, None) => None,
         }
@@ -5781,6 +5783,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mode_inter: false,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         self.motion_field.write_block(x_cb, y_cb, cb_w, cb_h, mvf);
         self.affine_cpmv_field
@@ -6085,6 +6088,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             chosen.ref_idx_l1 = -1;
             chosen.bcw_idx = 0;
         }
+        // r449 — §8.5.6.3.2: the Table 27 alternative half-sample
+        // luma filter applies when the CU's HpelIfIdx is 1 (eq. 475 /
+        // inherited by the merge candidate).
+        let hpel = chosen.hpel_if_idx == 1;
         // L0 reference picture lookup (when pred_flag_l0 is set).
         let ref_pic_l0 = if chosen.pred_flag_l0 {
             if chosen.ref_idx_l0 < 0 || (chosen.ref_idx_l0 as usize) >= self.ref_pic_list_l0.len() {
@@ -6266,27 +6273,38 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             // r447 — every DMVR MC read is bounded by
                             // the §8.5.6.3.2 eqs. 926 / 927 window
                             // anchored at the UNREFINED MV.
-                            let pred_l0 = crate::inter::predict_luma_block_high_precision_dmvr(
-                                x,
-                                y,
-                                sb_w,
-                                sb_h,
-                                &rp0.frame.luma,
-                                chosen.mv_l0,
-                                refined.mv_l0_refined,
-                                bit_depth,
-                            )?;
-                            let pred_l1 = crate::inter::predict_luma_block_high_precision_dmvr(
-                                x,
-                                y,
-                                sb_w,
-                                sb_h,
-                                &rp1.frame.luma,
-                                chosen.mv_l1,
-                                refined.mv_l1_refined,
-                                bit_depth,
-                            )?;
-                            if bdof_runs {
+                            let pred_l0 =
+                                crate::inter::predict_luma_block_high_precision_dmvr_hpel(
+                                    x,
+                                    y,
+                                    sb_w,
+                                    sb_h,
+                                    &rp0.frame.luma,
+                                    chosen.mv_l0,
+                                    refined.mv_l0_refined,
+                                    bit_depth,
+                                    hpel,
+                                )?;
+                            let pred_l1 =
+                                crate::inter::predict_luma_block_high_precision_dmvr_hpel(
+                                    x,
+                                    y,
+                                    sb_w,
+                                    sb_h,
+                                    &rp1.frame.luma,
+                                    chosen.mv_l1,
+                                    refined.mv_l1_refined,
+                                    bit_depth,
+                                    hpel,
+                                )?;
+                            // r449 — §8.5.6.1: `sbBdofFlag` is FALSE
+                            // for a DMVR sub-block whose refinement
+                            // SAD came in under `2 * sbWidth *
+                            // sbHeight` (the bilateral match is already
+                            // tight; BDOF is skipped per sub-block).
+                            let sb_bdof = bdof_runs
+                                && refined.final_int_sad >= 2 * u64::from(sb_w) * u64::from(sb_h);
+                            if sb_bdof {
                                 // r447 — §8.5.6.3.2 integer-fetch
                                 // borders (not edge replication).
                                 let ext_l0 = crate::bdof::build_extended_pred_bdof(
@@ -6492,7 +6510,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             (Some(rp0), None) => {
                 // Uni-pred L0 (P-slice path, or B-slice candidate with
                 // predFlagL1 == 0).
-                predict_luma_block(
+                predict_luma_block_hpel(
                     &mut out.luma,
                     cu.cu.x,
                     cu.cu.y,
@@ -6500,11 +6518,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu.cu.h,
                     &rp0.frame.luma,
                     chosen.mv_l0,
+                    hpel,
                 )?;
             }
             (None, Some(rp1)) => {
                 // Uni-pred L1 — re-uses the same per-list helper.
-                predict_luma_block(
+                predict_luma_block_hpel(
                     &mut out.luma,
                     cu.cu.x,
                     cu.cu.y,
@@ -6512,6 +6531,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     cu.cu.h,
                     &rp1.frame.luma,
                     chosen.mv_l1,
+                    hpel,
                 )?;
             }
             (Some(rp0), Some(rp1)) => {
@@ -6584,7 +6604,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         for sbx in 0..(n_cb_w / sb_w) {
                             let x = cu.cu.x + sbx * sb_w;
                             let y = cu.cu.y + sby * sb_h;
-                            let pred_l0 = predict_luma_block_high_precision(
+                            let pred_l0 = predict_luma_block_high_precision_hpel(
                                 x,
                                 y,
                                 sb_w,
@@ -6592,8 +6612,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 &rp0.frame.luma,
                                 chosen.mv_l0,
                                 bit_depth,
+                                hpel,
                             )?;
-                            let pred_l1 = predict_luma_block_high_precision(
+                            let pred_l1 = predict_luma_block_high_precision_hpel(
                                 x,
                                 y,
                                 sb_w,
@@ -6601,6 +6622,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 &rp1.frame.luma,
                                 chosen.mv_l1,
                                 bit_depth,
+                                hpel,
                             )?;
                             let ext_l0 = crate::bdof::build_extended_pred_bdof(
                                 &pred_l0,
@@ -6633,7 +6655,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         }
                     }
                 } else {
-                    predict_luma_block_bipred_bcw(
+                    predict_luma_block_bipred_bcw_hpel(
                         &mut out.luma,
                         cu.cu.x,
                         cu.cu.y,
@@ -6644,6 +6666,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         &rp1.frame.luma,
                         chosen.mv_l1,
                         bcw_for_blend,
+                        hpel,
                     )?;
                 }
             }
@@ -6911,6 +6934,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // onto every covered 4x4 block so subsequent spatial
             // neighbours inherit it per eqs. 496 / 501 / 506 / etc.
             bcw_idx: chosen.bcw_idx,
+            hpel_if_idx: chosen.hpel_if_idx,
         };
         self.motion_field
             .write_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, mvf);
@@ -7564,6 +7588,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             available: true,
             // §8.5.6.6.2 — BCW for the non-merge path is the parsed
             // `bcw_idx[x0][y0]`. `0` ⇒ eq. 980 default-weighted average;
+            hpel_if_idx: if nm.amvr_shift.value() == 3 { 1 } else { 0 },
             // `1..=4` ⇒ eq. 981 `BCW_W_LUT` weighted blend in the bi-pred
             // tail. Inferred 0 for uni-pred CUs (the gate never signals it).
             bcw_idx: nm.bcw_idx,
@@ -9098,6 +9123,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     mode_inter: true,
                     available: true,
                     bcw_idx: 0,
+                    hpel_if_idx: 0,
                 };
                 let bx = cu.cu.x + xs as u32 * sb_w;
                 let by = cu.cu.y + ys as u32 * sb_h;
@@ -9562,6 +9588,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     mode_inter: true,
                     available: true,
                     bcw_idx: rec.bcw_idx,
+                    hpel_if_idx: 0,
                 };
                 let bx = cu.cu.x + gx * sb_w;
                 let by = cu.cu.y + gy * sb_h;
@@ -10476,6 +10503,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let store_b = MvField {
             mv_l0: if x_b == 0 { mv_b } else { MotionVector::ZERO },
@@ -10488,6 +10516,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         // sType 2 with the two partitions on DIFFERENT lists → the
         // eqs. 1043 – 1050 bi-combination; same list → partition B
@@ -10504,6 +10533,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 mode_inter: true,
                 available: true,
                 bcw_idx: 0,
+                hpel_if_idx: 0,
             }
         } else {
             store_b
@@ -12588,6 +12618,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         // The A-side scan reads (xCb - 1, yCb + cbH) then A1 =
         // (xCb - 1, yCb + cbH - 1); broadcast the MV across the whole
@@ -13973,7 +14004,7 @@ mod tests {
 
         // Compare to a plain translational predict_luma_block.
         let mut expect = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
-        predict_luma_block(&mut expect.luma, 16, 16, 16, 16, &ref_frame.luma, mv)
+        crate::inter::predict_luma_block(&mut expect.luma, 16, 16, 16, 16, &ref_frame.luma, mv)
             .expect("translational reference MC");
         for y in 16..32usize {
             for x in 16..32usize {
@@ -14952,6 +14983,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         mf.write_block(0, 0, pic_w, pic_h, cell);
         let ref_pic = ReferencePicture {
@@ -15064,6 +15096,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         // CU at (16,16,16,16). Its TL cascade reads (15,15)/(16,15)/(15,16),
         // TR reads (31,15)/(32,15), BL reads (15,31)/(15,32). Fill the top
@@ -18328,6 +18361,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         });
         walker
             .ibc
@@ -18410,6 +18444,7 @@ mod tests {
                 mode_inter: true,
                 available: true,
                 bcw_idx: 0,
+                hpel_if_idx: 0,
             },
         );
         let neigh2 = walker2.compute_cu_neighbourhood(&ccu);

@@ -627,10 +627,10 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("8b420_B_2", 'F'),           // 47/49 pictures diverge (first poc 1 plane Y)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
     ("AFF_A_2", 'F'),             // 9/10 pictures diverge (first poc 1 plane Y)
-    ("ALF_A_3", 'F'),             // 1/3 pictures diverge (first poc 1 plane Y)
-    ("ALF_B_3", 'F'),             // 1/3 pictures diverge (first poc 1 plane Y)
+    ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
+    ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_C_3", 'P'),             // byte-exact (r449)
-    ("AMVR_A_3", 'F'),            // 77/85 pictures diverge (first poc 1 plane Y)
+    ("AMVR_A_3", 'F'),            // 72/85 pictures diverge (first poc 1 plane Y)
     ("BDOF_A_4", 'F'),            // 41/44 pictures diverge (first poc 3 plane Y)
     ("BDPCM_A_2", 'P'),           // byte-exact (r449)
     ("CCLM_A_2", 'P'),            // byte-exact (r449)
@@ -640,9 +640,9 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("CodingToolsSets_C_2", 'P'), // byte-exact (r449)
     ("CodingToolsSets_D_2", 'F'), // 8/9 pictures diverge (first poc 1 plane Y)
     ("CodingToolsSets_E_1", 'U'), // subpictures
-    ("DEBLOCKING_A_3", 'F'),      // 16/17 pictures diverge (first poc 1 plane Y)
+    ("DEBLOCKING_A_3", 'F'),      // 10/17 pictures diverge (first poc 7 plane Y)
     ("DEBLOCKING_C_3", 'F'),      // 31/33 pictures diverge (first poc 1 plane Y)
-    ("DEBLOCKING_E_3", 'F'),      // 7/8 pictures diverge (first poc 1 plane Y)
+    ("DEBLOCKING_E_3", 'F'),      // 6/8 pictures diverge (first poc 2 plane Y)
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
@@ -663,7 +663,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("MMVD_A_3", 'F'),            // 295/300 pictures diverge (first poc 1 plane Y)
     ("MTS_A_4", 'P'),             // byte-exact (r449)
     ("PROF_B_3", 'F'),            // 15/16 pictures diverge (first poc 1 plane Y)
-    ("QUANT_A_2", 'F'),           // 4/5 pictures diverge (first poc 1 plane Y)
+    ("QUANT_A_2", 'F'),           // 3/5 pictures diverge (first poc 2 plane Y)
     ("QUANT_B_2", 'F'),           // 16/17 pictures diverge (first poc 1 plane Y)
     ("RAP_A_1", 'P'),             // byte-exact (r449)
     ("RAP_B_1", 'F'),             // 31/33 pictures diverge (first poc 33 plane Y)

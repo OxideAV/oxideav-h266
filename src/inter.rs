@@ -148,6 +148,13 @@ pub struct MvField {
     /// carries the index. CTU-level apply selects between eq. 980 and
     /// eq. 981 based on this slot.
     pub bcw_idx: u8,
+    /// r449 — `HpelIfIdx[x][y]` (§8.5.2.1 eq. 475): 1 selects the
+    /// Table 27 alternative 6-tap half-sample luma interpolation
+    /// filter at the `p == 8` positions. Set to 1 by a half-pel-AMVR
+    /// non-merge CU (`AmvrShift == 3`), inherited by spatial-merge /
+    /// HMVP / MMVD candidates; 0 for temporal, pairwise-with-
+    /// differing-inputs, zero-pad, affine, GPM and IBC records.
+    pub hpel_if_idx: u8,
 }
 
 impl MvField {
@@ -165,6 +172,7 @@ impl MvField {
         mode_inter: false,
         available: false,
         bcw_idx: 0,
+        hpel_if_idx: 0,
     };
 }
 
@@ -768,6 +776,7 @@ pub fn build_merge_cand_list_b(
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         });
         zero_idx += 1;
     }
@@ -1031,6 +1040,14 @@ fn derive_pairwise_average_candidate(
         mode_inter: true,
         available: true,
         bcw_idx: 0,
+        hpel_if_idx: 0,
+    };
+    // §8.5.2.4 last bullet — hpelIfIdxavgCand: p0's when the two
+    // inputs agree, else 0.
+    avg.hpel_if_idx = if p0.hpel_if_idx == p1.hpel_if_idx {
+        p0.hpel_if_idx
+    } else {
+        0
     };
     // L0 half — always derived (numRefLists >= 1).
     derive_pairwise_per_list(
@@ -1900,6 +1917,7 @@ fn fetch_collocated_mv(
         mode_inter: true,
         available: true,
         bcw_idx: 0,
+        hpel_if_idx: 0,
     })
 }
 
@@ -2047,8 +2065,30 @@ const CHROMA_FILTER: [[i32; 4]; 32] = [
 /// `clamp(0, picW - 1)`), multiply by `LUMA_FILTER_HPEL0[xFrac]`, sum,
 /// then `>> shift1`. For BitDepth == 8 the spec sets `shift1 = 0`, so
 /// the shift is a no-op.
-fn luma_h_8tap(plane: &PicturePlane, x_int: i32, y_clamped: usize, x_frac: usize) -> i32 {
-    let coeffs = &LUMA_FILTER_HPEL0[x_frac];
+/// Table 27 — the `p == 8 (hpelIfIdx == 1)` alternative 6-tap
+/// half-sample luma filter row (r449).
+const LUMA_FILTER_HPEL1_ROW8: [i32; 8] = [0, 3, 9, 20, 20, 9, 3, 0];
+
+/// Select the Table 27 row: the alternative half-sample row when
+/// `hpelIfIdx == 1` and the fraction is the half position, the
+/// regular family otherwise.
+#[inline]
+fn luma_filter_row(frac: usize, hpel: bool) -> &'static [i32; 8] {
+    if hpel && frac == 8 {
+        &LUMA_FILTER_HPEL1_ROW8
+    } else {
+        &LUMA_FILTER_HPEL0[frac]
+    }
+}
+
+fn luma_h_8tap(
+    plane: &PicturePlane,
+    x_int: i32,
+    y_clamped: usize,
+    x_frac: usize,
+    hpel: bool,
+) -> i32 {
+    let coeffs = luma_filter_row(x_frac, hpel);
     let pic_w = plane.width as i32;
     let mut acc = 0i32;
     let row_base = y_clamped * plane.stride;
@@ -2064,8 +2104,8 @@ fn luma_h_8tap(plane: &PicturePlane, x_int: i32, y_clamped: usize, x_frac: usize
 /// already-horizontally-filtered intermediate column. `temp` is the
 /// 8-entry vertical column produced by [`luma_h_8tap`] for the rows
 /// `yInt + i - 3` with `i = 0..7`. shift2 = 6 always.
-fn luma_v_8tap(temp: &[i32; 8], y_frac: usize) -> i32 {
-    let coeffs = &LUMA_FILTER_HPEL0[y_frac];
+fn luma_v_8tap(temp: &[i32; 8], y_frac: usize, hpel: bool) -> i32 {
+    let coeffs = luma_filter_row(y_frac, hpel);
     let mut acc = 0i32;
     for i in 0..8 {
         acc += coeffs[i] * temp[i];
@@ -2077,8 +2117,14 @@ fn luma_v_8tap(temp: &[i32; 8], y_frac: usize) -> i32 {
 /// `xFracL == 0`. Reads 8 vertically-adjacent samples from the
 /// reference plane (with picture-edge clamp on `y`) and shifts by
 /// `shift1` (= 0 at BitDepth 8).
-fn luma_v_only_8tap(plane: &PicturePlane, x_clamped: usize, y_int: i32, y_frac: usize) -> i32 {
-    let coeffs = &LUMA_FILTER_HPEL0[y_frac];
+fn luma_v_only_8tap(
+    plane: &PicturePlane,
+    x_clamped: usize,
+    y_int: i32,
+    y_frac: usize,
+    hpel: bool,
+) -> i32 {
+    let coeffs = luma_filter_row(y_frac, hpel);
     let pic_h = plane.height as i32;
     let mut acc = 0i32;
     for i in 0..8 {
@@ -2127,7 +2173,7 @@ fn shift1_for_bd(bit_depth: u32) -> i32 {
 /// this collapses to [`mc_copy_block_int`]; otherwise the 8-tap
 /// separable filter is applied per eqs. 932 – 936 followed by the
 /// §8.5.6.6.2 uni-pred clamp.
-pub fn predict_luma_block(
+pub fn predict_luma_block_hpel(
     dst: &mut PicturePlane,
     dst_x: u32,
     dst_y: u32,
@@ -2135,6 +2181,7 @@ pub fn predict_luma_block(
     h: u32,
     src: &PicturePlane,
     mv: MotionVector,
+    hpel: bool,
 ) -> Result<()> {
     if dst_x as usize + w as usize > dst.width || dst_y as usize + h as usize > dst.height {
         return Err(Error::invalid(format!(
@@ -2166,7 +2213,7 @@ pub fn predict_luma_block(
         for r in 0..h as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..w as i32 {
-                let intermediate = luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
+                let intermediate = luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel) >> shift1;
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
                     pb_clip(intermediate, bd);
@@ -2180,7 +2227,8 @@ pub fn predict_luma_block(
         for c in 0..w as i32 {
             let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
             for r in 0..h as i32 {
-                let intermediate = luma_v_only_8tap(src, xi, y_int_base + r, y_frac) >> shift1;
+                let intermediate =
+                    luma_v_only_8tap(src, xi, y_int_base + r, y_frac, hpel) >> shift1;
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
                     pb_clip(intermediate, bd);
@@ -2200,7 +2248,7 @@ pub fn predict_luma_block(
         let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
         for c in 0..w as i32 {
             intermediate[r as usize * w as usize + c as usize] =
-                luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
+                luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel) >> shift1;
         }
     }
     // Vertical pass — pull 8 rows out of the intermediate column.
@@ -2210,7 +2258,7 @@ pub fn predict_luma_block(
             for i in 0..8 {
                 col[i] = intermediate[(r as usize + i) * w as usize + c as usize];
             }
-            let v = luma_v_8tap(&col, y_frac);
+            let v = luma_v_8tap(&col, y_frac, hpel);
             dst.samples[(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
                 pb_clip(v, bd);
         }
@@ -2242,7 +2290,21 @@ pub fn predict_luma_block(
 /// origin in the *current* picture (used purely for the integer
 /// reference origin); the returned buffer is CU-origin-aligned with
 /// no padding.
-pub fn predict_luma_block_high_precision(
+/// `hpelIfIdx == 0` wrapper over the r449 `_hpel` variant.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane,
+    mv: MotionVector,
+) -> Result<()> {
+    predict_luma_block_hpel(dst, dst_x, dst_y, w, h, src, mv, false)
+}
+
+pub fn predict_luma_block_high_precision_hpel(
     dst_x: u32,
     dst_y: u32,
     w: u32,
@@ -2250,6 +2312,7 @@ pub fn predict_luma_block_high_precision(
     src: &PicturePlane,
     mv: MotionVector,
     bit_depth: u32,
+    hpel: bool,
 ) -> Result<Vec<i32>> {
     if !(8..=16).contains(&bit_depth) {
         return Err(Error::invalid(format!(
@@ -2289,7 +2352,7 @@ pub fn predict_luma_block_high_precision(
         for r in 0..h as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..w as i32 {
-                let acc = luma_h_8tap(src, x_int_base + c, yi, x_frac);
+                let acc = luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel);
                 out[r as usize * w_us + c as usize] = acc >> shift1;
             }
         }
@@ -2301,7 +2364,7 @@ pub fn predict_luma_block_high_precision(
         for c in 0..w as i32 {
             let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
             for r in 0..h as i32 {
-                let acc = luma_v_only_8tap(src, xi, y_int_base + r, y_frac);
+                let acc = luma_v_only_8tap(src, xi, y_int_base + r, y_frac, hpel);
                 out[r as usize * w_us + c as usize] = acc >> shift1;
             }
         }
@@ -2317,7 +2380,7 @@ pub fn predict_luma_block_high_precision(
         let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
         for c in 0..w as i32 {
             intermediate[r as usize * w_us + c as usize] =
-                luma_h_8tap(src, x_int_base + c, yi, x_frac) >> shift1;
+                luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel) >> shift1;
         }
     }
     let mut col = [0i32; 8];
@@ -2326,7 +2389,7 @@ pub fn predict_luma_block_high_precision(
             for i in 0..8 {
                 col[i] = intermediate[(r as usize + i) * w_us + c as usize];
             }
-            out[r as usize * w_us + c as usize] = luma_v_8tap(&col, y_frac);
+            out[r as usize * w_us + c as usize] = luma_v_8tap(&col, y_frac, hpel);
         }
     }
     Ok(out)
@@ -2336,6 +2399,20 @@ pub fn predict_luma_block_high_precision(
 /// — the plane type is now `u16`-storage at every bit depth, so the
 /// twin is a delegating alias that additionally validates the
 /// reference plane's own declared bit depth.
+/// `hpelIfIdx == 0` wrapper over the r449 `_hpel` variant.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block_high_precision(
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane,
+    mv: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    predict_luma_block_high_precision_hpel(dst_x, dst_y, w, h, src, mv, bit_depth, false)
+}
+
 pub fn predict_luma_block_high_precision_u16(
     dst_x: u32,
     dst_y: u32,
@@ -2708,7 +2785,7 @@ pub fn bi_pred_avg_8bit_bcw(
 /// BCW-aware luma bi-pred MC. Drop-in replacement for
 /// [`predict_luma_block_bipred`] that selects between eq. 980 (when
 /// `bcw_idx == 0`) and eq. 981 weighted blending (when `bcw_idx > 0`).
-pub fn predict_luma_block_bipred_bcw(
+pub fn predict_luma_block_bipred_bcw_hpel(
     dst: &mut PicturePlane,
     dst_x: u32,
     dst_y: u32,
@@ -2719,6 +2796,7 @@ pub fn predict_luma_block_bipred_bcw(
     src_l1: &PicturePlane,
     mv_l1: MotionVector,
     bcw_idx: u8,
+    hpel: bool,
 ) -> Result<()> {
     if bcw_idx as usize >= BCW_W_LUT.len() {
         return Err(Error::invalid(format!(
@@ -2731,8 +2809,10 @@ pub fn predict_luma_block_bipred_bcw(
     // pre-r447 final-domain `(a + b + 1) >> 1` average double-rounded
     // every fractional-MV bi-pred block.
     let bd = src_l0.bit_depth;
-    let hp_l0 = predict_luma_block_high_precision(dst_x, dst_y, w, h, src_l0, mv_l0, bd)?;
-    let hp_l1 = predict_luma_block_high_precision(dst_x, dst_y, w, h, src_l1, mv_l1, bd)?;
+    let hp_l0 =
+        predict_luma_block_high_precision_hpel(dst_x, dst_y, w, h, src_l0, mv_l0, bd, hpel)?;
+    let hp_l1 =
+        predict_luma_block_high_precision_hpel(dst_x, dst_y, w, h, src_l1, mv_l1, bd, hpel)?;
     blend_bi_hp_into(dst, dst_x, dst_y, w, h, &hp_l0, &hp_l1, bcw_idx, bd);
     Ok(())
 }
@@ -2743,6 +2823,25 @@ pub fn predict_luma_block_bipred_bcw(
 /// `offset1 >> shift1` clip is applied; the returned `Vec<i32>` of
 /// length `w_c * h_c` (row-major, CU-anchored) carries the
 /// predSamplesLX values the §8.5.6.6.2 bi-pred composition consumes.
+/// `hpelIfIdx == 0` wrapper over the r449 `_hpel` variant.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block_bipred_bcw(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src_l0: &PicturePlane,
+    mv_l0: MotionVector,
+    src_l1: &PicturePlane,
+    mv_l1: MotionVector,
+    bcw_idx: u8,
+) -> Result<()> {
+    predict_luma_block_bipred_bcw_hpel(
+        dst, dst_x, dst_y, w, h, src_l0, mv_l0, src_l1, mv_l1, bcw_idx, false,
+    )
+}
+
 pub fn predict_chroma_block_high_precision(
     dst_x_c: u32,
     dst_y_c: u32,
@@ -2831,7 +2930,7 @@ pub fn predict_chroma_block_high_precision(
 /// ordinary HP predictor against it — coordinate clamping at the patch
 /// edges reproduces the eq. 926 / 927 clip exactly.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_luma_block_high_precision_dmvr(
+pub fn predict_luma_block_high_precision_dmvr_hpel(
     dst_x: u32,
     dst_y: u32,
     w: u32,
@@ -2840,6 +2939,7 @@ pub fn predict_luma_block_high_precision_dmvr(
     mv_orig: MotionVector,
     mv_refined: MotionVector,
     bit_depth: u32,
+    hpel: bool,
 ) -> Result<Vec<i32>> {
     let x_sb_int = dst_x as i32 + (mv_orig.x >> 4);
     let y_sb_int = dst_y as i32 + (mv_orig.y >> 4);
@@ -2859,13 +2959,30 @@ pub fn predict_luma_block_high_precision_dmvr(
         x: mv_refined.x + ((dst_x as i32 - left) << 4),
         y: mv_refined.y + ((dst_y as i32 - top) << 4),
     };
-    predict_luma_block_high_precision(0, 0, w, h, &patch, mv_adj, bit_depth)
+    predict_luma_block_high_precision_hpel(0, 0, w, h, &patch, mv_adj, bit_depth, hpel)
 }
 
 /// r447 — chroma twin of [`predict_luma_block_high_precision_dmvr`]:
 /// §8.5.6.3.4 clamps chroma reads to `[xSbIntC − 1,
 /// xSbIntC + sbWidth + 2]` (chroma units, 4-tap halo).
+///
+/// `hpelIfIdx == 0` wrapper over the r449 `_hpel` variant.
 #[allow(clippy::too_many_arguments)]
+pub fn predict_luma_block_high_precision_dmvr(
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane,
+    mv_orig: MotionVector,
+    mv_refined: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
+    predict_luma_block_high_precision_dmvr_hpel(
+        dst_x, dst_y, w, h, src, mv_orig, mv_refined, bit_depth, false,
+    )
+}
+
 pub fn predict_chroma_block_high_precision_dmvr(
     dst_x_c: u32,
     dst_y_c: u32,
@@ -3982,6 +4099,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         }
     }
 
@@ -4256,6 +4374,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         hmvp.update_with(bi_entry);
         let list = build_merge_cand_list_b(&empty_spatials, 4, None, Some(&hmvp), 1);
@@ -4335,6 +4454,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         mf.write_block(0, 0, pic_w, pic_h, cell);
         ReferencePicture {
@@ -4589,6 +4709,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let list = build_merge_cand_list(&empty, 4, Some(col), None, 1);
         assert_eq!(list.len(), 4);
@@ -4622,6 +4743,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(3, 0, 0));
@@ -4703,6 +4825,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let mut list = vec![p0, p1];
         let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ false).unwrap();
@@ -4727,6 +4850,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let p1 = dummy_mvf(-5, 6, 2);
         let mut list = vec![p0, p1];
@@ -4752,6 +4876,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let mut list = vec![inactive, inactive];
         // is_b=true so the L1 walk also runs (and mirrors the L0 result).
@@ -4780,6 +4905,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let p1 = MvField {
             mv_l0: MotionVector::from_int_pel(4, 0),
@@ -4793,6 +4919,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let mut list = vec![p0, p1];
         let avg = derive_pairwise_average_candidate(&mut list, 6, /*is_b*/ true).unwrap();
@@ -4873,6 +5000,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let mut spatials = [SpatialMergeCandidate::default(); 5];
         spatials[0] = SpatialMergeCandidate {
@@ -5007,6 +5135,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (+16, 0) 1/16
         let out = apply_mmvd_to_base(&base, off, false);
@@ -5033,6 +5162,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(0, 0, false); // (+1/4, 0)
         let out = apply_mmvd_to_base(&base, off, true);
@@ -5070,6 +5200,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
                                                    // currPocDiffL0 = +1, currPocDiffL1 = +1 — equal distance
@@ -5095,6 +5226,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
                                                    // currPocDiffL0 = +1 (L0 ref earlier), currPocDiffL1 = -1 (L1
@@ -5127,6 +5259,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (16, 0)
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, false, false);
@@ -5150,6 +5283,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
                                                    // Distances that would normally scale (1 vs 2), but `lt_l0 =
@@ -5174,6 +5308,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false);
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 0, false, false);
@@ -5197,6 +5332,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0)
         let out = apply_mmvd_to_base_with_poc(&base, off, 0, 1, false, false);
@@ -5223,6 +5359,7 @@ mod tests {
             mode_inter: true,
             available: true,
             bcw_idx: 0,
+            hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false);
         // currPocDiffL0 = 0, currPocDiffL1 = 1 — hits equal-POC short
