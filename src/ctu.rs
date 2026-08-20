@@ -8644,7 +8644,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
             tu64: Self::tu64_map(residual),
-            tb_split: None,
+            tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -9160,7 +9160,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: Some((cu.cu.w / 8, cu.cu.h / 8)),
             tu64: Self::tu64_map(residual),
-            tb_split: None,
+            tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -9525,7 +9525,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
             tu64: Self::tu64_map(residual),
-            tb_split: None,
+            tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
         self.commit_subblock_neighbour_state(cu, info);
@@ -10585,7 +10585,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ibc: false,
             num_sb: None,
             tu64: None,
-            tb_split: None,
+            tb_split: Self::sbt_tb_split(info, cb_w, cb_h),
         });
         self.write_intra_block(cb_x, cb_y, cb_w, cb_h, false);
         // Round-149 — GPM CUs always carry `merge_subblock_flag = 0`
