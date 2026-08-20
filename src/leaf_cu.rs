@@ -476,6 +476,9 @@ pub struct CuToolFlags {
     /// `sps_joint_cbcr_enabled_flag` — if true, `tu_joint_cbcr_residual_flag`
     /// may appear (currently surfaced as Unsupported when it would be read).
     pub joint_cbcr_enabled: bool,
+    /// r449 — `sps_sbt_enabled_flag` — gates the §7.3.11.5 `cu_sbt_*`
+    /// parse on coded MODE_INTER CUs.
+    pub sbt_enabled: bool,
     /// `sh_ts_residual_coding_disabled_flag`. When set the
     /// `transform_skip_flag` path is elided in the residual walker.
     pub ts_residual_coding_disabled: bool,
@@ -960,6 +963,20 @@ pub struct LeafCuCtxs {
     /// `mmvd_cand_flag` (Table 104) — 2-entry, one per non-I initType.
     /// Indexed as `(init_type - 1)`.
     pub mmvd_cand_flag: Vec<ContextModel>,
+    /// r449 — `cu_sbt_flag` (Table 93) — 4-entry, 2 per non-I
+    /// initType. Indexed as `(init_type - 1) * 2 + ctxInc` with the
+    /// Table 132 ctxInc `(cbWidth * cbHeight <= 256) ? 1 : 0`.
+    pub cu_sbt_flag: Vec<ContextModel>,
+    /// r449 — `cu_sbt_quad_flag` (Table 94) — 2-entry, one per non-I
+    /// initType. Indexed as `(init_type - 1)`.
+    pub cu_sbt_quad_flag: Vec<ContextModel>,
+    /// r449 — `cu_sbt_horizontal_flag` (Table 95) — 6-entry, 3 per
+    /// non-I initType. Indexed as `(init_type - 1) * 3 + ctxInc` with
+    /// the Table 132 ctxInc `(cbW == cbH) ? 0 : (cbW < cbH) ? 1 : 2`.
+    pub cu_sbt_horizontal_flag: Vec<ContextModel>,
+    /// r449 — `cu_sbt_pos_flag` (Table 96) — 2-entry, one per non-I
+    /// initType. Indexed as `(init_type - 1)`.
+    pub cu_sbt_pos_flag: Vec<ContextModel>,
     /// `mmvd_distance_idx` (Table 105) — 2-entry, one per non-I
     /// initType. Indexed as `(init_type - 1)`. Only the first bin is
     /// ctx-coded; remaining TR bins (cMax = 7) are bypass.
@@ -1164,6 +1181,10 @@ impl LeafCuCtxs {
             abs_mvd_greater1_flag: init_contexts(SyntaxCtx::AbsMvdGreater1Flag, slice_qp_y),
             mmvd_merge_flag: init_contexts(SyntaxCtx::MmvdMergeFlag, slice_qp_y),
             mmvd_cand_flag: init_contexts(SyntaxCtx::MmvdCandFlag, slice_qp_y),
+            cu_sbt_flag: init_contexts(SyntaxCtx::CuSbtFlag, slice_qp_y),
+            cu_sbt_quad_flag: init_contexts(SyntaxCtx::CuSbtQuadFlag, slice_qp_y),
+            cu_sbt_horizontal_flag: init_contexts(SyntaxCtx::CuSbtHorizontalFlag, slice_qp_y),
+            cu_sbt_pos_flag: init_contexts(SyntaxCtx::CuSbtPosFlag, slice_qp_y),
             mmvd_distance_idx: init_contexts(SyntaxCtx::MmvdDistanceIdx, slice_qp_y),
             ciip_flag: init_contexts(SyntaxCtx::CiipFlag, slice_qp_y),
             cu_coded_flag: init_contexts(SyntaxCtx::CuCodedFlag, slice_qp_y),
@@ -4020,6 +4041,128 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         Ok(())
     }
 
+    /// r449 — §7.3.11.9 SBT arm of `transform_tree()`: the CU splits
+    /// into two sub-TUs at the [`crate::transform::sbt_geometry`]
+    /// boundary. The `pos_flag`-selected zero TU consumes NO syntax
+    /// (every CBF inferred 0 per §7.4.12.5 / §7.4.12.10); the residual
+    /// TU reads its chroma CBFs, the §7.4.12.10-conditioned luma CBF
+    /// (present only when a chroma CBF is set, else inferred 1), the
+    /// QG `cu_qp_delta` / chroma-offset elements, the joint-CbCr flag,
+    /// and the coefficient blocks at the SUB-TU dims — luma through
+    /// the §7.3.11.11 SBT 32 → 16 zero-out arms, transform-skip never
+    /// present (`!cu_sbt_flag` in every TS gate).
+    fn decode_inter_transform_unit_sbt(
+        &mut self,
+        info: &mut LeafCuInfo,
+        residual: &mut LeafCuResidual,
+    ) -> Result<()> {
+        let geo = crate::transform::sbt_geometry(
+            info.cb_width,
+            info.cb_height,
+            info.cu_sbt_quad_flag,
+            info.cu_sbt_horizontal_flag,
+            info.cu_sbt_pos_flag,
+        );
+        let res_w = geo.res_w as usize;
+        let res_h = geo.res_h as usize;
+        let chroma = self.tools.chroma_format_idc != 0;
+        let (sub_w, sub_h) = match self.tools.chroma_format_idc {
+            0 => (1usize, 1usize),
+            1 => (2, 2),
+            2 => (2, 1),
+            3 => (1, 1),
+            _ => {
+                return Err(Error::invalid(
+                    "h266 leaf CU: unknown sps_chroma_format_idc value",
+                ));
+            }
+        };
+        // An inter CU never walks DUAL_TREE_LUMA.
+        let chroma_available = chroma && self.tree != TreeType::DualTreeLuma;
+        if chroma_available {
+            info.tu_cb_coded_flag = read_tu_cb_coded_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                /*bdpcm_chroma=*/ false,
+            )?;
+            info.tu_cr_coded_flag = read_tu_cr_coded_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                /*bdpcm_chroma=*/ false,
+                info.tu_cb_coded_flag,
+            )?;
+        }
+        let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
+        info.tu_y_coded_flag = if chroma_available && chroma_cbf {
+            read_tu_y_coded_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                /*bdpcm_y=*/ false,
+                /*isp_split=*/ false,
+                /*prev_tu_cbf_y=*/ false,
+            )?
+        } else {
+            // §7.4.12.10 — cu_coded_flag == 1 and this is the SBT
+            // residual TU.
+            true
+        };
+        let any_cbf = info.tu_y_coded_flag || chroma_cbf;
+        if self.tools.cu_qp_delta_enabled && !self.tools.cu_qp_delta_already_coded && any_cbf {
+            info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
+            info.cu_qp_delta_read = true;
+        }
+        if self.tools.cu_chroma_qp_offset_enabled && chroma_available && chroma_cbf {
+            let (flag, idx) = read_cu_chroma_qp_offset(
+                self.dec,
+                &mut self.ctxs.residual,
+                self.tools.chroma_qp_offset_list_len_minus1,
+            )?;
+            info.cu_chroma_qp_offset_flag = flag;
+            info.cu_chroma_qp_offset_idx = idx;
+        }
+        if self.tools.joint_cbcr_enabled
+            && chroma_available
+            && info.tu_cb_coded_flag
+            && info.tu_cr_coded_flag
+        {
+            info.tu_joint_cbcr_residual_flag = read_tu_joint_cbcr_residual_flag(
+                self.dec,
+                &mut self.ctxs.residual,
+                info.tu_cb_coded_flag,
+                info.tu_cr_coded_flag,
+            )?;
+        }
+        info.tu_c_res_mode = derive_tu_c_res_mode(
+            info.tu_joint_cbcr_residual_flag,
+            info.tu_cb_coded_flag,
+            info.tu_cr_coded_flag,
+        );
+        if info.tu_y_coded_flag {
+            let levels = crate::residual::decode_tb_coefficients_opts_sbt(
+                self.dec,
+                &mut self.ctxs.residual,
+                res_w,
+                res_h,
+                0,
+                self.tools.rc_opts,
+                /*sbt_luma=*/ true,
+                /*mts_enabled=*/ self.tools.mts_enabled,
+            )?
+            .0;
+            residual.luma_levels = levels;
+        }
+        self.read_inter_chroma_residual(
+            info,
+            residual,
+            res_w,
+            res_h,
+            sub_w,
+            sub_h,
+            chroma_available,
+        )?;
+        Ok(())
+    }
+
     fn decode_inter_transform_unit(
         &mut self,
         info: &mut LeafCuInfo,
@@ -4034,6 +4177,70 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if info.cb_width > self.tools.max_tb_size_y || info.cb_height > self.tools.max_tb_size_y {
             return self
                 .decode_inter_transform_tree_tiled(info, residual, /*is_intra=*/ false);
+        }
+        // r449 — §7.3.11.5 SBT flags: read for a coded MODE_INTER CU
+        // when `sps_sbt_enabled_flag && !ciip_flag` and both dims are
+        // within MaxTbSizeY (guaranteed above). MODE_IBC CUs share
+        // this residual reader but never carry SBT.
+        if self.tools.sbt_enabled
+            && matches!(info.pred_mode, CuPredMode::Inter)
+            && !info.inter.merge_data.ciip_flag
+        {
+            let allow_ver_h = info.cb_width >= 8;
+            let allow_ver_q = info.cb_width >= 16;
+            let allow_hor_h = info.cb_height >= 8;
+            let allow_hor_q = info.cb_height >= 16;
+            if allow_ver_h || allow_hor_h {
+                // Table 132 — ctxInc = (cbWidth * cbHeight <= 256) ? 1 : 0,
+                // slot-offset by (initType − 1) per the Table 93 columns.
+                let it = (self.ctxs.init_type as usize).saturating_sub(1).min(1);
+                let inc = usize::from(info.cb_width * info.cb_height <= 256);
+                let sbt_flag = self
+                    .dec
+                    .decode_decision(&mut self.ctxs.cu_sbt_flag[it * 2 + inc])?
+                    == 1;
+                info.cu_sbt_flag = sbt_flag;
+                if sbt_flag {
+                    let quad = if (allow_ver_h || allow_hor_h) && (allow_ver_q || allow_hor_q) {
+                        self.dec
+                            .decode_decision(&mut self.ctxs.cu_sbt_quad_flag[it])?
+                            == 1
+                    } else {
+                        false
+                    };
+                    info.cu_sbt_quad_flag = quad;
+                    let hor_present = (quad && allow_ver_q && allow_hor_q)
+                        || (!quad && allow_ver_h && allow_hor_h);
+                    info.cu_sbt_horizontal_flag = if hor_present {
+                        // Table 132 — ctxInc = (cbW == cbH) ? 0
+                        //   : (cbW < cbH) ? 1 : 2.
+                        let hinc = if info.cb_width == info.cb_height {
+                            0
+                        } else if info.cb_width < info.cb_height {
+                            1
+                        } else {
+                            2
+                        };
+                        self.dec
+                            .decode_decision(&mut self.ctxs.cu_sbt_horizontal_flag[it * 3 + hinc])?
+                            == 1
+                    } else {
+                        // §7.4.12.5 inference.
+                        if quad {
+                            allow_hor_q
+                        } else {
+                            allow_hor_h
+                        }
+                    };
+                    info.cu_sbt_pos_flag = self
+                        .dec
+                        .decode_decision(&mut self.ctxs.cu_sbt_pos_flag[it])?
+                        == 1;
+                }
+            }
+        }
+        if info.cu_sbt_flag {
+            return self.decode_inter_transform_unit_sbt(info, residual);
         }
         let chroma = self.tools.chroma_format_idc != 0;
         let (sub_w, sub_h) = match self.tools.chroma_format_idc {
@@ -5467,6 +5674,7 @@ mod tests {
             cu_chroma_qp_offset_enabled: false,
             chroma_qp_offset_list_len_minus1: 0,
             joint_cbcr_enabled: false,
+            sbt_enabled: false,
             ts_residual_coding_disabled: false,
             slice_is_inter: false,
             max_num_merge_cand: 6,

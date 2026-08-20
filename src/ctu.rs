@@ -2742,6 +2742,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cu_chroma_qp_offset_enabled: self.sh.sh_cu_chroma_qp_offset_enabled_flag,
             chroma_qp_offset_list_len_minus1: 0,
             joint_cbcr_enabled: tf.joint_cbcr_enabled_flag,
+            sbt_enabled: tf.sbt_enabled_flag,
             ts_residual_coding_disabled: self.sh.sh_ts_residual_coding_disabled_flag,
             slice_is_inter: self.sh.sh_slice_type != SliceType::I,
             max_num_merge_cand: max_num_merge,
@@ -5059,7 +5060,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ) -> Result<()> {
         if dbg_cu_enabled() {
             eprintln!(
-                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} cbf_cb={} cbf_cr={} jc={} qpd={} bdpcm={} ts={}",
+                "CU {:?} ({},{}) {}x{} pred={:?} modeY={} mip={} isp={:?} lfnst={} mts={} cbf_y={} cbf_cb={} cbf_cr={} jc={} qpd={} bdpcm={} ts={} sbt={}/{}/{}/{}",
                 tree,
                 cu.cu.x,
                 cu.cu.y,
@@ -5078,6 +5079,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_qp_delta_val,
                 info.intra_bdpcm_luma,
                 info.transform_skip_luma,
+                u8::from(info.cu_sbt_flag),
+                u8::from(info.cu_sbt_quad_flag),
+                u8::from(info.cu_sbt_horizontal_flag),
+                u8::from(info.cu_sbt_pos_flag),
             );
         }
         // Round-21 inter dispatch — runs the §8.5.2 spatial-merge
@@ -5914,10 +5919,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // is then inserted at step 5 last bullet of §8.5.2.2 (after
         // spatials, before HMVP).
         let col = self.derive_col_candidate(xcb, ycb, cb_w, cb_h, is_b);
-        let mlist = if is_b {
-            build_merge_cand_list_b(&spatial, max_merge, col, Some(&self.hmvp))
+        // §8.5.2.5 — numRefIdx: NumRefIdxActive[0] for P slices,
+        // Min(NumRefIdxActive[0], NumRefIdxActive[1]) for B slices.
+        let num_ref_idx = if is_b {
+            (self.ref_pic_list_l0.len().min(self.ref_pic_list_l1.len())) as u32
         } else {
-            build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp))
+            self.ref_pic_list_l0.len() as u32
+        };
+        let mlist = if is_b {
+            build_merge_cand_list_b(&spatial, max_merge, col, Some(&self.hmvp), num_ref_idx)
+        } else {
+            build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp), num_ref_idx)
         };
         if std::env::var_os("H266_DBG_MERGE").is_some() {
             eprintln!(
@@ -7032,10 +7044,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     info.cu_sbt_horizontal_flag,
                     info.cu_sbt_pos_flag,
                 );
-                let (tr_h, tr_v) = crate::transform::sbt_tr_types(
-                    info.cu_sbt_horizontal_flag,
-                    info.cu_sbt_pos_flag,
-                );
+                // §8.7.4.1 — the Table 40 DST-VII / DCT-VIII pair
+                // applies only under `implicitMtsEnabled == 1`:
+                // `sps_mts_enabled_flag == 1 && Max(nTbW, nTbH) <= 32`
+                // (DCT-II otherwise).
+                let (tr_h, tr_v) =
+                    if self.sps.tool_flags.mts_enabled_flag && geo.res_w.max(geo.res_h) <= 32 {
+                        crate::transform::sbt_tr_types(
+                            info.cu_sbt_horizontal_flag,
+                            info.cu_sbt_pos_flag,
+                        )
+                    } else {
+                        (
+                            crate::transform::TrType::DctII,
+                            crate::transform::TrType::DctII,
+                        )
+                    };
                 self.add_inter_residual_plane_tr(
                     /*c_idx=*/ 0,
                     (cu.cu.x + geo.res_x) as usize,
@@ -7106,10 +7130,30 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
         }
         if self.sps.sps_chroma_format_idc == 1 {
-            let c_w = (cu.cu.w as usize) / 2;
-            let c_h = (cu.cu.h as usize) / 2;
-            let c_x = (cu.cu.x as usize) / 2;
-            let c_y = (cu.cu.y as usize) / 2;
+            // r449 — an SBT CU's chroma residual lives in the residual
+            // sub-TU's chroma rect (§7.3.11.9), not the CU rect.
+            let (c_x, c_y, c_w, c_h) = if info.cu_sbt_flag {
+                let geo = crate::transform::sbt_geometry(
+                    cu.cu.w,
+                    cu.cu.h,
+                    info.cu_sbt_quad_flag,
+                    info.cu_sbt_horizontal_flag,
+                    info.cu_sbt_pos_flag,
+                );
+                (
+                    ((cu.cu.x + geo.res_x) as usize) / 2,
+                    ((cu.cu.y + geo.res_y) as usize) / 2,
+                    (geo.res_w as usize) / 2,
+                    (geo.res_h as usize) / 2,
+                )
+            } else {
+                (
+                    (cu.cu.x as usize) / 2,
+                    (cu.cu.y as usize) / 2,
+                    (cu.cu.w as usize) / 2,
+                    (cu.cu.h as usize) / 2,
+                )
+            };
             // §8.7.5.3 — chroma residual scaling `varScale` for this
             // CU's chroma TBs. The `nCurrSw * nCurrSh <= 4` bullet of
             // the pass-through list gates it here; the remaining
@@ -10296,6 +10340,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bit_depth,
         )?;
 
+        if std::env::var_os("H266_DBG_GPM").is_some() {
+            eprintln!(
+                "GPM ({cb_x},{cb_y}) {cb_w}x{cb_h} part={} idx0={} idx1={} m={m} n={n} A: X={x_a} mv={mv_a:?} ref={ref_idx_a} B: X={x_b} mv={mv_b:?} ref={ref_idx_b} list={:?}",
+                info.inter.merge_data.gpm_partition_idx,
+                info.inter.merge_data.gpm_idx0,
+                info.inter.merge_data.gpm_idx1,
+                mlist
+                    .iter()
+                    .map(|f| (f.mv_l0, f.ref_idx_l0, f.pred_flag_l0, f.mv_l1, f.ref_idx_l1, f.pred_flag_l1))
+                    .collect::<Vec<_>>(),
+            );
+        }
         // §8.5.7.1 step 2 + §8.5.7.2 — set up the partition geometry.
         let (angle_idx, distance_idx) =
             derive_gpm_partition(info.inter.merge_data.gpm_partition_idx);

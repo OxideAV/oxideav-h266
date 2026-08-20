@@ -641,6 +641,7 @@ pub fn build_merge_cand_list(
     max_num_merge_cand: u32,
     col: Option<MvField>,
     hmvp: Option<&HmvpTable>,
+    num_ref_idx: u32,
 ) -> Vec<MvField> {
     let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
     for cand in spatial {
@@ -676,16 +677,25 @@ pub fn build_merge_cand_list(
     // the L1 half (the spec's `numRefLists == 1` clause forces
     // refIdxL1avg = -1 / predFlagL1avg = 0).
     derive_pairwise_average_candidate(&mut out, max_num_merge_cand, /*is_b_slice*/ false);
+    // §8.5.2.5 — zero-MV pad (P-slice arm, eqs. 536 – 544): the
+    // refIdx follows the zeroIdx counter, not a constant 0.
+    let mut zero_idx = 0i32;
     while (out.len() as u32) < max_num_merge_cand {
+        let r = if zero_idx < num_ref_idx as i32 {
+            zero_idx
+        } else {
+            0
+        };
         out.push(MvField {
             mv_l0: MotionVector::ZERO,
-            ref_idx_l0: 0,
+            ref_idx_l0: r,
             pred_flag_l0: true,
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
             ..Default::default()
         });
+        zero_idx += 1;
     }
     out
 }
@@ -707,6 +717,7 @@ pub fn build_merge_cand_list_b(
     max_num_merge_cand: u32,
     col: Option<MvField>,
     hmvp: Option<&HmvpTable>,
+    num_ref_idx: u32,
 ) -> Vec<MvField> {
     let mut out: Vec<MvField> = Vec::with_capacity(max_num_merge_cand as usize);
     for cand in spatial {
@@ -736,19 +747,29 @@ pub fn build_merge_cand_list_b(
     // variant → is_b_slice = true so both L0 and L1 halves of avgCand
     // are derived (numRefLists == 2 in the spec walk).
     derive_pairwise_average_candidate(&mut out, max_num_merge_cand, /*is_b_slice*/ true);
+    // §8.5.2.5 — zero-MV pad: refIdx follows the zeroIdx counter
+    // (`(zeroIdx < numRefIdx) ? zeroIdx : 0`, eqs. 545 / 546), it is
+    // not a constant 0.
+    let mut zero_idx = 0i32;
     while (out.len() as u32) < max_num_merge_cand {
+        let r = if zero_idx < num_ref_idx as i32 {
+            zero_idx
+        } else {
+            0
+        };
         out.push(MvField {
             mv_l0: MotionVector::ZERO,
-            ref_idx_l0: 0,
+            ref_idx_l0: r,
             pred_flag_l0: true,
             mv_l1: MotionVector::ZERO,
-            ref_idx_l1: 0,
+            ref_idx_l1: r,
             pred_flag_l1: true,
             cu_skip_flag: false,
             mode_inter: true,
             available: true,
             bcw_idx: 0,
         });
+        zero_idx += 1;
     }
     out
 }
@@ -3269,7 +3290,7 @@ mod tests {
     fn build_merge_list_pads_with_zero_mvs() {
         // No spatial candidates: list collapses to all zero-MV entries.
         let empty = [SpatialMergeCandidate::default(); 5];
-        let list = build_merge_cand_list(&empty, 6, None, None);
+        let list = build_merge_cand_list(&empty, 6, None, None, 1);
         assert_eq!(list.len(), 6);
         for cand in &list {
             assert!(cand.pred_flag_l0);
@@ -3294,7 +3315,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let list = build_merge_cand_list(&spatials, 4, None, None);
+        let list = build_merge_cand_list(&spatials, 4, None, None, 1);
         assert_eq!(list.len(), 4);
         // First entry is A1 (the only available spatial).
         assert_eq!(list[0].mv_l0.int_x(), 1);
@@ -3727,7 +3748,7 @@ mod tests {
     #[test]
     fn build_merge_cand_list_b_pads_with_bipred_zero_mvs() {
         let empty = [SpatialMergeCandidate::default(); 5];
-        let list = build_merge_cand_list_b(&empty, 6, None, None);
+        let list = build_merge_cand_list_b(&empty, 6, None, None, 1);
         assert_eq!(list.len(), 6);
         for cand in &list {
             assert!(cand.pred_flag_l0);
@@ -4076,7 +4097,7 @@ mod tests {
         hmvp.update_with(dummy_mvf(1, 0, 0));
         hmvp.update_with(dummy_mvf(2, 0, 0));
         hmvp.update_with(dummy_mvf(3, 0, 0));
-        let list = build_merge_cand_list(&empty_spatials, 6, None, Some(&hmvp));
+        let list = build_merge_cand_list(&empty_spatials, 6, None, Some(&hmvp), 1);
         assert_eq!(list.len(), 6);
         // First three entries are HMVP — newest first.
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(3, 0));
@@ -4108,7 +4129,7 @@ mod tests {
         for i in 0..5 {
             hmvp.update_with(dummy_mvf(i + 1, 0, 0));
         }
-        let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&hmvp));
+        let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&hmvp), 1);
         assert_eq!(list.len(), 4);
         // 3 HMVP slots filled (newest first).
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(5, 0));
@@ -4136,7 +4157,7 @@ mod tests {
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(7, 0, 0)); // older
         hmvp.update_with(dummy_mvf(5, 0, 0)); // newest — duplicates B1
-        let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp), 1);
         // Slot 0 = B1 = (5,0). Slot 1 = older HMVP (7,0) — newest (5,0)
         // was pruned. Slot 2 = §8.5.2.4 pairwise-average of (5,0)+(7,0)
         // = (192, 0) >> 1 = (96, 0) in 1/16-pel units. Slots 3..5 are
@@ -4171,7 +4192,7 @@ mod tests {
         hmvp.update_with(dummy_mvf(5, 0, 0));
         hmvp.update_with(dummy_mvf(8, 0, 0));
         hmvp.update_with(dummy_mvf(9, 0, 0));
-        let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 6, None, Some(&hmvp), 1);
         // slot 0 = B1 (5,0); slot 1..3 = HMVP newest-first
         // (9,0), (8,0), (5,0) — the (5,0) entry survives because it
         // sits at hMvpIdx = 3 (third newest).
@@ -4205,7 +4226,7 @@ mod tests {
         }
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(99, 0, 0));
-        let list = build_merge_cand_list(&spatials, 5, None, Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 5, None, Some(&hmvp), 1);
         // 5 slots; all 5 are spatial. HMVP entry (99, 0) must NOT
         // appear — `5 < 4` is false.
         assert_eq!(list.len(), 5);
@@ -4237,7 +4258,7 @@ mod tests {
             bcw_idx: 0,
         };
         hmvp.update_with(bi_entry);
-        let list = build_merge_cand_list_b(&empty_spatials, 4, None, Some(&hmvp));
+        let list = build_merge_cand_list_b(&empty_spatials, 4, None, Some(&hmvp), 1);
         assert_eq!(list.len(), 4);
         // Slot 0 = HMVP entry (carries both lists).
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(2, 1));
@@ -4259,8 +4280,8 @@ mod tests {
     #[test]
     fn merge_list_with_none_hmvp_is_spatial_only_pad_only() {
         let empty_spatials = [SpatialMergeCandidate::default(); 5];
-        let p_list = build_merge_cand_list(&empty_spatials, 5, None, None);
-        let b_list = build_merge_cand_list_b(&empty_spatials, 5, None, None);
+        let p_list = build_merge_cand_list(&empty_spatials, 5, None, None, 1);
+        let b_list = build_merge_cand_list_b(&empty_spatials, 5, None, None, 1);
         assert_eq!(p_list.len(), 5);
         assert_eq!(b_list.len(), 5);
         // Every entry is a zero-MV pad.
@@ -4281,7 +4302,7 @@ mod tests {
     fn merge_list_empty_hmvp_skipped() {
         let empty_spatials = [SpatialMergeCandidate::default(); 5];
         let empty_hmvp = HmvpTable::new();
-        let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&empty_hmvp));
+        let list = build_merge_cand_list(&empty_spatials, 4, None, Some(&empty_hmvp), 1);
         // Empty HMVP → list is fully zero-MV padded.
         assert_eq!(list.len(), 4);
         for entry in &list {
@@ -4569,7 +4590,7 @@ mod tests {
             available: true,
             bcw_idx: 0,
         };
-        let list = build_merge_cand_list(&empty, 4, Some(col), None);
+        let list = build_merge_cand_list(&empty, 4, Some(col), None, 1);
         assert_eq!(list.len(), 4);
         // Slot 0 = Col candidate.
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(7, -3));
@@ -4604,7 +4625,7 @@ mod tests {
         };
         let mut hmvp = HmvpTable::new();
         hmvp.update_with(dummy_mvf(3, 0, 0));
-        let list = build_merge_cand_list(&spatials, 6, Some(col), Some(&hmvp));
+        let list = build_merge_cand_list(&spatials, 6, Some(col), Some(&hmvp), 1);
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(1, 0)); // B1
         assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(2, 0)); // Col
         assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(3, 0)); // HMVP
@@ -4821,7 +4842,7 @@ mod tests {
             available: true,
             field: dummy_mvf(6, 0, 0), // A1 = (96, 0)
         };
-        let list = build_merge_cand_list(&spatials, 6, None, None);
+        let list = build_merge_cand_list(&spatials, 6, None, None, 1);
         assert_eq!(list.len(), 6);
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(2, 0));
         assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(6, 0));
@@ -4862,7 +4883,7 @@ mod tests {
             available: true,
             field: bipred(4, 0, -4, 0),
         };
-        let list = build_merge_cand_list_b(&spatials, 6, None, None);
+        let list = build_merge_cand_list_b(&spatials, 6, None, None, 1);
         assert_eq!(list.len(), 6);
         // Slot 2 = pairwise: L0 = ((32+64)>>1, 0) = (48, 0);
         //                    L1 = ((-32 + -64) >> 1, 0) = (-48, 0).
@@ -4882,7 +4903,7 @@ mod tests {
             available: true,
             field: dummy_mvf(3, 0, 0),
         };
-        let list = build_merge_cand_list(&spatials, 6, None, None);
+        let list = build_merge_cand_list(&spatials, 6, None, None, 1);
         // Slot 0 = B1, slots 1..5 = zero-MV pads (no pairwise — only
         // one source candidate available).
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(3, 0));

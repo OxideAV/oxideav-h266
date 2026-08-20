@@ -769,6 +769,17 @@ impl StreamDecoder {
         }
 
         let motion = walker.motion_field_for_temporal();
+        if let Ok(spec) = std::env::var("H266_DBG_MFCELL") {
+            if let Some((xs, ys)) = spec.split_once(',') {
+                if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {
+                    eprintln!(
+                        "MFCELL poc={poc} ({x},{y}) {:?} ref_pocs={:?}",
+                        motion.get_at_luma(x, y),
+                        motion.ref_pocs_at_luma(x, y)
+                    );
+                }
+            }
+        }
         drop(walker);
 
         // §8.3.3-style retention: keep only pictures the just-decoded

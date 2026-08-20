@@ -157,6 +157,10 @@ pub enum SyntaxCtx {
     MmvdMergeFlag,
     /// Table 104 — `mmvd_cand_flag` (2 ctxIdx, one per non-I initType).
     MmvdCandFlag,
+    CuSbtFlag,
+    CuSbtQuadFlag,
+    CuSbtHorizontalFlag,
+    CuSbtPosFlag,
     /// Table 105 — `mmvd_distance_idx` (2 ctxIdx, one per non-I initType).
     /// Bin 0 ctx-coded; bins 1..6 (TR, cMax = 7) bypass-coded.
     MmvdDistanceIdx,
@@ -637,6 +641,32 @@ pub const MMVD_MERGE_FLAG_SHIFT: &[u8] = &[4, 4];
 pub const MMVD_CAND_FLAG_INIT: &[u8] = &[43, 43];
 pub const MMVD_CAND_FLAG_SHIFT: &[u8] = &[10, 10];
 
+/// Table 93 — `cu_sbt_flag` (4 ctxIdx: 2 per non-I initType; the
+/// §9.3.4.2.2 Table 132 ctxInc is `(cbWidth * cbHeight <= 256) ? 1 : 0`).
+/// Spec values:
+///   initType  |  1      |  2      |
+///   ctxInc    | 0 | 1   | 0 | 1   |
+///   initValue | 56 | 57 | 41 | 57 |
+///   shiftIdx  |  1 |  5 |  1 |  5 |
+pub const CU_SBT_FLAG_INIT: &[u8] = &[56, 57, 41, 57];
+pub const CU_SBT_FLAG_SHIFT: &[u8] = &[1, 5, 1, 5];
+
+/// Table 94 — `cu_sbt_quad_flag` (2 ctxIdx, one per non-I initType;
+/// ctxInc = 0).
+pub const CU_SBT_QUAD_FLAG_INIT: &[u8] = &[42, 42];
+pub const CU_SBT_QUAD_FLAG_SHIFT: &[u8] = &[10, 10];
+
+/// Table 95 — `cu_sbt_horizontal_flag` (6 ctxIdx: 3 per non-I
+/// initType; Table 132 ctxInc = `(cbWidth == cbHeight) ? 0 :
+/// (cbWidth < cbHeight) ? 1 : 2`).
+pub const CU_SBT_HORIZONTAL_FLAG_INIT: &[u8] = &[20, 43, 12, 35, 51, 27];
+pub const CU_SBT_HORIZONTAL_FLAG_SHIFT: &[u8] = &[8, 4, 1, 8, 4, 1];
+
+/// Table 96 — `cu_sbt_pos_flag` (2 ctxIdx, one per non-I initType;
+/// ctxInc = 0).
+pub const CU_SBT_POS_FLAG_INIT: &[u8] = &[28, 28];
+pub const CU_SBT_POS_FLAG_SHIFT: &[u8] = &[13, 13];
+
 /// Table 105 — `mmvd_distance_idx` (2 ctxIdx, one per non-I initType).
 /// TR binarisation with cMax = 7, cRiceParam = 0; bin 0 ctx-coded with
 /// ctxInc = 0, bins 1..6 bypass-coded per Table 132.
@@ -934,6 +964,12 @@ fn table_for(kind: SyntaxCtx) -> (&'static [u8], &'static [u8]) {
         SyntaxCtx::RegularMergeFlag => (REGULAR_MERGE_FLAG_INIT, REGULAR_MERGE_FLAG_SHIFT),
         SyntaxCtx::MmvdMergeFlag => (MMVD_MERGE_FLAG_INIT, MMVD_MERGE_FLAG_SHIFT),
         SyntaxCtx::MmvdCandFlag => (MMVD_CAND_FLAG_INIT, MMVD_CAND_FLAG_SHIFT),
+        SyntaxCtx::CuSbtFlag => (CU_SBT_FLAG_INIT, CU_SBT_FLAG_SHIFT),
+        SyntaxCtx::CuSbtQuadFlag => (CU_SBT_QUAD_FLAG_INIT, CU_SBT_QUAD_FLAG_SHIFT),
+        SyntaxCtx::CuSbtHorizontalFlag => {
+            (CU_SBT_HORIZONTAL_FLAG_INIT, CU_SBT_HORIZONTAL_FLAG_SHIFT)
+        }
+        SyntaxCtx::CuSbtPosFlag => (CU_SBT_POS_FLAG_INIT, CU_SBT_POS_FLAG_SHIFT),
         SyntaxCtx::MmvdDistanceIdx => (MMVD_DISTANCE_IDX_INIT, MMVD_DISTANCE_IDX_SHIFT),
         SyntaxCtx::CiipFlag => (CIIP_FLAG_INIT, CIIP_FLAG_SHIFT),
         SyntaxCtx::MergeIdx => (MERGE_IDX_INIT, MERGE_IDX_SHIFT),

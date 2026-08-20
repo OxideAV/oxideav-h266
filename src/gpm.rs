@@ -286,11 +286,14 @@ impl GpmContext {
         // Eq. 1013.
         let weight_idx =
             (((xl + self.offset_x) << 1) + 1) * dx + (((yl + self.offset_y) << 1) + 1) * dy;
-        // Eq. 1014.
+        // Eq. 1014 — `weightIdxL = partFlip ? 32 + weightIdx
+        // : 32 − weightIdx` (r449: the arms were inverted, mirroring
+        // partition A and B across the split line; masked on content
+        // where both partitions predict near-identical samples).
         let weight_idx_l = if self.part_flip == 1 {
-            32 - weight_idx
-        } else {
             32 + weight_idx
+        } else {
+            32 - weight_idx
         };
         // Eq. 1015.
         ((weight_idx_l + 4) >> 3).clamp(0, 8)
@@ -644,5 +647,18 @@ mod tests {
         // Most pixels (excluding the blend transition band) should pick
         // one side or the other.
         assert!(hits_left + hits_right >= 32, "expected bimodal split");
+    }
+}
+
+#[cfg(test)]
+mod r449_stype_probe {
+    #[test]
+    fn stype_32x64_angle12_dist2_grid() {
+        // Spec-python cross-check (r449): sub-block (4, 8) of a
+        // 32x64 GPM CU with angleIdx 12 / distanceIdx 2 stores
+        // partition B (sType = 1).
+        assert_eq!(super::gpm_storage_s_type(32, 64, 12, 2, 4, 8), 1);
+        assert_eq!(super::gpm_storage_s_type(32, 64, 12, 2, 0, 0), 0);
+        assert_eq!(super::gpm_storage_s_type(32, 64, 12, 2, 7, 0), 2);
     }
 }

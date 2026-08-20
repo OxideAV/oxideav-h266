@@ -570,6 +570,27 @@ pub fn decode_tb_coefficients_opts(
     c_idx: u32,
     opts: RcOpts,
 ) -> Result<(Vec<i32>, TbResidualFlags)> {
+    decode_tb_coefficients_opts_sbt(dec, ctxs, n_tb_w, n_tb_h, c_idx, opts, false, false)
+}
+
+/// r449 — [`decode_tb_coefficients_opts`] with the §7.3.11.11 SBT
+/// zero-out arms live: when `sbt_luma` holds (an SBT CU's luma TB with
+/// `sps_mts_enabled_flag == 1`), a 32-point dimension paired with a
+/// < 64-point sibling zeroes out to 16 (`log2ZoTbWidth = 4` when
+/// `log2TbWidth == 5 && log2TbHeight < 6`, and the height mirror) —
+/// the DST-VII / DCT-VIII kernels only carry 16 low-frequency basis
+/// vectors at length 32.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_tb_coefficients_opts_sbt(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut ResidualCtxs,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    c_idx: u32,
+    opts: RcOpts,
+    sbt_luma: bool,
+    mts_enabled: bool,
+) -> Result<(Vec<i32>, TbResidualFlags)> {
     if opts.dep_quant && opts.sign_data_hiding {
         return Err(Error::invalid(
             "h266 residual: dep_quant and sign_data_hiding are mutually exclusive (§7.3.7)",
@@ -583,14 +604,23 @@ pub fn decode_tb_coefficients_opts(
     let log2_w = n_tb_w.trailing_zeros();
     let log2_h = n_tb_h.trailing_zeros();
     // §7.3.11.11 zero-out (r412) — a 64-point DCT-II only codes the
-    // low-frequency 32-corner: `Log2ZoTbWidth = Min(log2TbWidth, 5)`
-    // (the SBT 32→16 arm never fires on this path — `cu_sbt_flag` TBs
-    // route through the SBT-specific reconstruction). Every coded
-    // geometry input below (last-sig binarisation, sub-block grid,
-    // scan, pass-1 bin budget) runs on the Zo dims; the output array
-    // keeps the full TB stride with the zeroed-out region at 0.
-    let log2_zo_w = log2_w.min(5);
-    let log2_zo_h = log2_h.min(5);
+    // low-frequency 32-corner: `Log2ZoTbWidth = Min(log2TbWidth, 5)`.
+    // Every coded geometry input below (last-sig binarisation,
+    // sub-block grid, scan, pass-1 bin budget) runs on the Zo dims;
+    // the output array keeps the full TB stride with the zeroed-out
+    // region at 0. The SBT 32 → 16 arms apply on the SBT luma path
+    // when MTS is enabled in the SPS (§7.3.11.11 first two arms).
+    let sbt_zo = sbt_luma && mts_enabled && c_idx == 0;
+    let log2_zo_w = if sbt_zo && log2_w == 5 && log2_h < 6 {
+        4
+    } else {
+        log2_w.min(5)
+    };
+    let log2_zo_h = if sbt_zo && log2_h == 5 && log2_w < 6 {
+        4
+    } else {
+        log2_h.min(5)
+    };
     let zo_w = 1usize << log2_zo_w;
     let zo_h = 1usize << log2_zo_h;
     let last = read_last_sig_coeff_pos(dec, ctxs, log2_zo_w, log2_zo_h, log2_w, log2_h, c_idx)?;
