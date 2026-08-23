@@ -1393,36 +1393,57 @@ pub fn apply_mmvd_to_base_with_poc(
     lt_l1: bool,
 ) -> MvField {
     let mut out = *base;
-    if base.pred_flag_l0 {
-        out.mv_l0 = MotionVector {
-            x: base.mv_l0.x.saturating_add(offset.x),
-            y: base.mv_l0.y.saturating_add(offset.y),
-        };
+    let add = |mv: MotionVector, off: MotionVector| MotionVector {
+        x: mv.x.saturating_add(off.x),
+        y: mv.y.saturating_add(off.y),
+    };
+    if !(base.pred_flag_l0 && base.pred_flag_l1) {
+        // Uni-pred base — eqs. 581 – 584: the raw offset lands on the
+        // one active list; the inactive list's mMvd is 0 (its stored
+        // MV carries through untouched).
+        if base.pred_flag_l0 {
+            out.mv_l0 = add(base.mv_l0, offset);
+        }
+        if base.pred_flag_l1 {
+            out.mv_l1 = add(base.mv_l1, offset);
+        }
+        return out;
     }
-    if base.pred_flag_l1 {
-        let l1_offset = if !base.pred_flag_l0 {
-            // Uni-pred-L1 base — eq. 582: just apply the offset.
+    // Bi-pred base — §8.5.2.7 eqs. 555 – 580: the RAW offset lands on
+    // the list whose reference is FARTHER (|currPocDiff| larger; ties
+    // to L0), and the other list takes the eqs. 563 – 568 / 573 – 578
+    // distScaleFactor chain when both refs are short-term, else the
+    // eqs. 569 / 570 / 579 / 580 same-sign/flip rule.
+    let (l0_offset, l1_offset) = if curr_poc_diff_l0 == curr_poc_diff_l1 {
+        // eqs. 557 – 560 — identical SIGNED distances: raw on both.
+        (offset, offset)
+    } else {
+        let sign_rule = if (curr_poc_diff_l0 >= 0) == (curr_poc_diff_l1 >= 0) {
             offset
-        } else if lt_l0 || lt_l1 || curr_poc_diff_l0 == curr_poc_diff_l1 {
-            // Equal POC distance or LT shortcut (eqs. 557 – 560).
-            offset
-        } else if (curr_poc_diff_l0 ^ curr_poc_diff_l1) < 0 {
-            // Opposite-sign POC distances — eq. 564 / 565: flip sign on
-            // both axes.
+        } else {
             MotionVector {
                 x: -offset.x,
                 y: -offset.y,
             }
+        };
+        if curr_poc_diff_l0.abs() >= curr_poc_diff_l1.abs() {
+            let l1 = if !lt_l0 && !lt_l1 {
+                mmvd_scale_offset(offset, curr_poc_diff_l0, curr_poc_diff_l1)
+            } else {
+                sign_rule
+            };
+            (offset, l1)
         } else {
-            // General asymmetric same-sign short-term refs — apply the
-            // §8.5.2.12 distScaleFactor scaling chain (eqs. 601 – 605).
-            mmvd_scale_offset(offset, curr_poc_diff_l0, curr_poc_diff_l1)
-        };
-        out.mv_l1 = MotionVector {
-            x: base.mv_l1.x.saturating_add(l1_offset.x),
-            y: base.mv_l1.y.saturating_add(l1_offset.y),
-        };
-    }
+            let l0 = if !lt_l0 && !lt_l1 {
+                mmvd_scale_offset(offset, curr_poc_diff_l1, curr_poc_diff_l0)
+            } else {
+                sign_rule
+            };
+            (l0, offset)
+        }
+    };
+    out.mv_l0 = add(base.mv_l0, l0_offset);
+    out.mv_l1 = add(base.mv_l1, l1_offset);
     out
 }
 
@@ -1442,11 +1463,11 @@ pub fn apply_mmvd_to_base_with_poc(
 /// invoking this helper, but the guard keeps the function total).
 fn mmvd_scale_offset(
     offset: MotionVector,
-    curr_poc_diff_l0: i32,
-    curr_poc_diff_l1: i32,
+    curr_poc_diff_src: i32,
+    curr_poc_diff_dst: i32,
 ) -> MotionVector {
-    let td = curr_poc_diff_l0.clamp(-128, 127);
-    let tb = curr_poc_diff_l1.clamp(-128, 127);
+    let td = curr_poc_diff_src.clamp(-128, 127);
+    let tb = curr_poc_diff_dst.clamp(-128, 127);
     if td == 0 {
         return MotionVector::ZERO;
     }
@@ -5281,9 +5302,12 @@ mod tests {
             hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (16, 0)
+                                                   // §8.5.2.7 eqs. 571 – 578: |currPocDiffL0| = 1 < |currPocDiffL1|
+                                                   // = 2, so the RAW offset lands on L1 and L0 takes the
+                                                   // distScaleFactor chain (td = 2, tb = 1 → factor 1/2 → 8).
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, false, false);
-        assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
-        assert_eq!(out.mv_l1, MotionVector::from_int_pel(2, 0));
+        assert_eq!(out.mv_l0, MotionVector { x: 8, y: 0 });
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(1, 0));
     }
 
     /// Long-term reference on either side — bypasses the asymmetric
@@ -5366,7 +5390,7 @@ mod tests {
     /// fires first when L0 distance is 0 and L1 is also 0), but the
     /// guard keeps the helper total.
     #[test]
-    fn mmvd_with_poc_zero_l0_distance_in_asymm_path_zeros_l1() {
+    fn mmvd_with_poc_zero_l0_distance_scales_l0_to_zero() {
         let base = MvField {
             mv_l0: MotionVector::ZERO,
             ref_idx_l0: 0,
@@ -5381,14 +5405,13 @@ mod tests {
             hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false);
-        // currPocDiffL0 = 0, currPocDiffL1 = 1 — hits equal-POC short
-        // (since 0 != 1 fails) but neither opposite-sign nor asymm
-        // works without a non-zero td. The path lands in the asymm
-        // branch (both same sign? 0 ^ 1 == 1 > 0, so no
-        // opposite-sign), then `mmvd_scale_offset` returns ZERO.
+        // §8.5.2.7: |currPocDiffL0| = 0 < |currPocDiffL1| = 1 → the RAW
+        // offset lands on L1 (eq. 571) and L0 takes the eqs. 573 – 578
+        // chain with td = currPocDiffL1 = 1, tb = currPocDiffL0 = 0 —
+        // a zero scale factor, so mMvdL0 collapses to ZERO.
         let out = apply_mmvd_to_base_with_poc(&base, off, 0, 1, false, false);
-        assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
-        assert_eq!(out.mv_l1, MotionVector::ZERO);
+        assert_eq!(out.mv_l0, MotionVector::ZERO);
+        assert_eq!(out.mv_l1, MotionVector::from_int_pel(1, 0));
     }
 
     /// MergeData default also keeps CIIP off so existing non-CIIP

@@ -622,15 +622,15 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     // subpictures / 4:2:2 / 4:4:4 / explicit WP / per-slice
     // loop-filter divergence.
     ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
-    ("8b400_A_2", 'F'),           // 39/49 pictures diverge (first poc 2 plane Y)
-    ("8b420_A_2", 'F'),           // 36/49 pictures diverge (first poc 3 plane Y)
+    ("8b400_A_2", 'F'),           // 19/49 pictures diverge (first poc 5 plane Y)
+    ("8b420_A_2", 'F'),           // 29/49 pictures diverge (first poc 7 plane Y)
     ("8b420_B_2", 'F'),           // 47/49 pictures diverge (first poc 1 plane Y)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
     ("AFF_A_2", 'F'),             // 7/10 pictures diverge (first poc 1 plane Y)
     ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_C_3", 'P'),             // byte-exact (r449)
-    ("AMVR_A_3", 'F'),            // 29/85 pictures diverge (first poc 1 plane Y)
+    ("AMVR_A_3", 'F'),            // 6/85 pictures diverge (first poc 11 plane Y)
     ("BDOF_A_4", 'F'),            // 41/44 pictures diverge (first poc 3 plane Y)
     ("BDPCM_A_2", 'P'),           // byte-exact (r449)
     ("CCLM_A_2", 'P'),            // byte-exact (r449)
@@ -646,18 +646,18 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
-    ("GPM_A_3", 'F'),             // 11/17 pictures diverge (first poc 3 plane Y)
+    ("GPM_A_3", 'P'),             // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
     ("IBC_A_2", 'E'),             // merge candidate with no active list (under triage)
     ("ISP_A_3", 'P'),             // byte-exact (r449)
     ("JCCR_A_2", 'P'),            // byte-exact (r450 CIIP chroma gate + per-TB joint deblock QP)
     ("JCCR_C_3", 'P'),            // byte-exact (r450 §8.5.2.3 raw-availability pruning)
     ("LFNST_A_4", 'P'),           // byte-exact (r449)
-    ("LFNST_B_4", 'F'),           // 8/46 pictures diverge (first poc 9 plane Y)
+    ("LFNST_B_4", 'P'),           // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'F'),            // 31/32 pictures diverge (first poc 1 plane Y)
     ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
-    ("MERGE_A_2", 'F'),           // 6/10 pictures diverge (first poc 3 plane Y)
+    ("MERGE_A_2", 'F'),           // 5/10 pictures diverge (first poc 3 plane Y)
     ("MIP_A_3", 'P'),             // byte-exact (r449)
     ("MIP_B_3", 'F'),             // 16/17 pictures diverge (first poc 1 plane Y)
     ("MMVD_A_3", 'F'),            // 295/300 pictures diverge (first poc 1 plane Y)
@@ -668,14 +668,14 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("RAP_A_1", 'P'),             // byte-exact (r449)
     ("RAP_B_1", 'F'),             // 1/33 pictures diverge (first poc 39 plane Y)
     ("SAO_A_3", 'F'),             // 59/60 pictures diverge (first poc 1 plane Y)
-    ("SBT_A_2", 'F'),             // 50/57 pictures diverge (first poc 2 plane Y)
+    ("SBT_A_2", 'F'),             // 44/57 pictures diverge (first poc 8 plane Y)
     ("SLICES_A_3", 'F'),          // 24/25 pictures diverge (first poc 0 plane Cb)
     ("SMVD_A_2", 'F'),            // 7/10 pictures diverge (first poc 1 plane Y)
     ("SUBPIC_C_1", 'U'),          // subpictures
-    ("SbTMVP_A_3", 'F'),          // 37/49 pictures diverge (first poc 2 plane Y)
+    ("SbTMVP_A_3", 'F'),          // 26/49 pictures diverge (first poc 5 plane Y)
     ("TILE_A_2", 'F'),            // 8/9 pictures diverge (first poc 1 plane Y)
     ("TMVP_A_3", 'F'),            // 61/64 pictures diverge (first poc 1 plane Y)
-    ("WPP_A_3", 'F'),             // 43/49 pictures diverge (first poc 3 plane Y)
+    ("WPP_A_3", 'F'),             // 42/49 pictures diverge (first poc 3 plane Y)
     ("WP_A_3", 'U'),              // explicit weighted prediction
 ];
 

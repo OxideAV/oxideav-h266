@@ -1577,6 +1577,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     pub fn set_lmcs(&mut self, data: &LmcsData, ph_chroma_residual_scale_flag: bool) -> Result<()> {
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let derived = data.derive(bit_depth)?;
+        if std::env::var_os("H266_DBG_LMCS").is_some() {
+            eprintln!(
+                "LMCS min={} max={} inputPivot={:?} lmcsPivot={:?} scale={:?} invScale={:?}",
+                data.lmcs_min_bin_idx,
+                data.lmcs_max_bin_idx(),
+                derived.input_pivot,
+                derived.lmcs_pivot,
+                derived.scale_coeff,
+                derived.inv_scale_coeff,
+            );
+        }
         self.lmcs = Some(LmcsBinding {
             derived,
             min_bin_idx: data.lmcs_min_bin_idx,
@@ -8431,6 +8442,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     &decision.mvd_cp_l0,
                 )?;
                 store_cpmvs_l0 = Some(cpmvs);
+                if std::env::var_os("H266_DBG_AFFCU").is_some() {
+                    let g = crate::affine::derive_subblock_mvs(cb_w, cb_h, &cpmvs, false);
+                    eprintln!(
+                        "AFFCU ({cb_x},{cb_y}) {cb_w}x{cb_h} uniL0 refpoc={} cpmvs={:?} sb00={:?} sb10={:?} sb01={:?} fb={:?}",
+                        ref_pic.poc,
+                        &cpmvs.cpmvs[..],
+                        g.as_ref().map(|g| g.mv_at(0, 0)),
+                        g.as_ref().map(|g| g.mv_at(1, 0)),
+                        g.as_ref().map(|g| g.mv_at(0, 1)),
+                        g.as_ref().map(|g| g.fallback),
+                    );
+                }
                 self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
             }
             (false, true) => {
