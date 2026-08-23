@@ -528,12 +528,21 @@ pub fn derive_spatial_merge_candidates(
     };
 
     // ---- A1: (xCb - 1, yCb + cbHeight - 1) --------------------------
+    //
+    // §8.5.2.3 — the pairwise redundancy gates key on the RAW §6.4.4
+    // block availability (`availableX`, kept in `avail_*_raw` below)
+    // and the neighbour's stored motion, NOT on the post-prune
+    // candidate flags (`availableFlagX`): a candidate pruned from the
+    // list still prunes later positions against its motion (e.g. A0
+    // still compares against A1 after A1 was dropped as == B1).
+    let avail_b1_raw = available_b1;
     let xa1 = xcb - 1;
     let ya1 = ycb + cb_h - 1;
     let raw_a1 = mvf.get_at_luma(xa1, ya1);
-    let mut available_a1 = raw_a1.available && !same_par(xcb, ycb, xa1, ya1);
+    let avail_a1_raw = raw_a1.available && !same_par(xcb, ycb, xa1, ya1);
+    let mut available_a1 = avail_a1_raw;
     // Redundancy: drop A1 if it has same MV/refIdx as B1.
-    if available_a1 && available_b1 && mvf_matches(&raw_a1, &out[0].field) {
+    if available_a1 && avail_b1_raw && mvf_matches(&raw_a1, &raw_b1) {
         available_a1 = false;
     }
     out[1] = SpatialMergeCandidate {
@@ -550,7 +559,7 @@ pub fn derive_spatial_merge_candidates(
     let yb0 = ycb - 1;
     let raw_b0 = mvf.get_at_luma(xb0, yb0);
     let mut available_b0 = raw_b0.available && !same_par(xcb, ycb, xb0, yb0);
-    if available_b0 && available_b1 && mvf_matches(&raw_b0, &out[0].field) {
+    if available_b0 && avail_b1_raw && mvf_matches(&raw_b0, &raw_b1) {
         available_b0 = false;
     }
     out[2] = SpatialMergeCandidate {
@@ -567,7 +576,8 @@ pub fn derive_spatial_merge_candidates(
     let ya0 = ycb + cb_h;
     let raw_a0 = mvf.get_at_luma(xa0, ya0);
     let mut available_a0 = raw_a0.available && !same_par(xcb, ycb, xa0, ya0);
-    if available_a0 && available_a1 && mvf_matches(&raw_a0, &out[1].field) {
+    // §8.5.2.3 — against RAW A1 availability + motion (see above).
+    if available_a0 && avail_a1_raw && mvf_matches(&raw_a0, &raw_a1) {
         available_a0 = false;
     }
     out[3] = SpatialMergeCandidate {
@@ -586,10 +596,10 @@ pub fn derive_spatial_merge_candidates(
     let mut available_b2 = raw_b2.available && !same_par(xcb, ycb, xb2, yb2);
     // §8.5.2.3 last bullet: B2 dropped also when A0+A1+B0+B1 == 4
     // (i.e. all four prior candidates available).
-    if available_b2 && available_a1 && mvf_matches(&raw_b2, &out[1].field) {
+    if available_b2 && avail_a1_raw && mvf_matches(&raw_b2, &raw_a1) {
         available_b2 = false;
     }
-    if available_b2 && available_b1 && mvf_matches(&raw_b2, &out[0].field) {
+    if available_b2 && avail_b1_raw && mvf_matches(&raw_b2, &raw_b1) {
         available_b2 = false;
     }
     if available_b2 && available_a0 && available_a1 && available_b0 && available_b1 {
