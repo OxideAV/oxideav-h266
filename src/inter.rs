@@ -3409,6 +3409,9 @@ mod tests {
             ref_idx_l0: 0,
             pred_flag_l0: true,
             available: true,
+            // r450 — §6.4.4 checkPredModeY: the neighbour must be
+            // MODE_INTER to be a spatial merge candidate.
+            mode_inter: true,
             ..Default::default()
         };
         mf.write_block(0, 0, 16, 16, mvf);
@@ -3433,6 +3436,8 @@ mod tests {
             ref_idx_l0: 0,
             pred_flag_l0: true,
             available: true,
+            // r450 — §6.4.4 checkPredModeY (see above).
+            mode_inter: true,
             ..Default::default()
         };
         // Write the SAME MV into both the above row (covers B1) and the
