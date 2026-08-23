@@ -1281,6 +1281,33 @@ pub fn predict_luma_block_affine_prof(
             let block = predict_luma_subblock_affine_high_precision(
                 sb_x, sb_y, sb_w, sb_h, src, mv, filter_set,
             )?;
+            if let Ok(spec) = std::env::var("H266_DBG_AFFUNI") {
+                if let Some((xs, ys)) = spec.split_once(',') {
+                    if let (Ok(px), Ok(py)) = (xs.parse::<u32>(), ys.parse::<u32>()) {
+                        if px >= sb_x && px < sb_x + sb_w && py >= sb_y && py < sb_y + sb_h {
+                            let lx = px - sb_x;
+                            let ly = py - sb_y;
+                            let stride = (sb_w + 2) as usize;
+                            let refined_dbg = diff_mv
+                                .as_ref()
+                                .and_then(|dm| {
+                                    apply_prof_to_subblock(&block, dm, src.bit_depth).ok()
+                                })
+                                .map(|r| r[(ly * sb_w + lx) as usize]);
+                            eprintln!(
+                                "AFFUNI sb=({sb_x},{sb_y}) mv=({},{}) prof={} hpcentre={} refined={:?} dmv={:?} halo_row0={:?}",
+                                mv.x,
+                                mv.y,
+                                diff_mv.is_some(),
+                                block.samples[(ly as usize + 1) * stride + lx as usize + 1],
+                                refined_dbg,
+                                diff_mv.as_ref().map(|dm| dm.entries[(ly * sb_w + lx) as usize]),
+                                &block.samples[..stride.min(6)],
+                            );
+                        }
+                    }
+                }
+            }
             if let Some(diff_mv) = &diff_mv {
                 let refined = apply_prof_to_subblock(&block, diff_mv, src.bit_depth)?;
                 for r in 0..sb_h as usize {

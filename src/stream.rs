@@ -775,6 +775,21 @@ impl StreamDecoder {
         // `H266_DBG_NO_LF` (debug aid): skip the §8.8 in-loop filter
         // stack so the raw reconstruction can be diffed sample-level
         // against an oracle away from filtered edges.
+        // Debug aid: dump the pre-filter (mapped-domain) reconstruction
+        // for sample-level triage against a spec-model — the in-loop
+        // filters still run afterwards, so reference pictures stay
+        // byte-exact (unlike `H266_DBG_NO_LF`).
+        if let Ok(dir) = std::env::var("H266_DUMP_PREFILTER") {
+            let mut raw: Vec<u8> = Vec::new();
+            for p in [&out.luma, &out.cb, &out.cr] {
+                for y in 0..p.height {
+                    for &v in &p.samples[y * p.stride..y * p.stride + p.width] {
+                        raw.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            let _ = std::fs::write(format!("{dir}/prefilter_poc{poc}.yuv"), raw);
+        }
         if std::env::var_os("H266_DBG_NO_LF").is_none() {
             walker.apply_in_loop_filters_with_alf(&mut out, &binding)?;
         }

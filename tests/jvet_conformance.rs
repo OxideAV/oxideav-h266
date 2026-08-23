@@ -622,11 +622,11 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     // subpictures / 4:2:2 / 4:4:4 / explicit WP / per-slice
     // loop-filter divergence.
     ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
-    ("8b400_A_2", 'F'),           // 19/49 pictures diverge (first poc 5 plane Y)
-    ("8b420_A_2", 'F'),           // 29/49 pictures diverge (first poc 7 plane Y)
-    ("8b420_B_2", 'F'),           // 47/49 pictures diverge (first poc 1 plane Y)
+    ("8b400_A_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("8b420_A_2", 'F'),           // 15/49 pictures diverge (first poc 33 plane Cb)
+    ("8b420_B_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
-    ("AFF_A_2", 'F'),             // 7/10 pictures diverge (first poc 1 plane Y)
+    ("AFF_A_2", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_C_3", 'P'),             // byte-exact (r449)
@@ -640,9 +640,9 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("CodingToolsSets_C_2", 'P'), // byte-exact (r449)
     ("CodingToolsSets_D_2", 'P'), // byte-exact (r450 §8.5.5.2 affine gate + §8.5.2.3 pruning)
     ("CodingToolsSets_E_1", 'U'), // subpictures
-    ("DEBLOCKING_A_3", 'F'),      // 10/17 pictures diverge (first poc 7 plane Y)
-    ("DEBLOCKING_C_3", 'F'),      // 29/33 pictures diverge (first poc 1 plane Y)
-    ("DEBLOCKING_E_3", 'F'),      // 6/8 pictures diverge (first poc 2 plane Y)
+    ("DEBLOCKING_A_3", 'F'),      // 9/17 pictures diverge (first poc 8 plane Cb)
+    ("DEBLOCKING_C_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("DEBLOCKING_E_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
@@ -655,24 +655,24 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("LFNST_B_4", 'P'),           // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
-    ("LMCS_C_1", 'F'),            // 31/32 pictures diverge (first poc 1 plane Y)
+    ("LMCS_C_1", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
     ("MERGE_A_2", 'F'),           // 5/10 pictures diverge (first poc 3 plane Y)
     ("MIP_A_3", 'P'),             // byte-exact (r449)
-    ("MIP_B_3", 'F'),             // 16/17 pictures diverge (first poc 1 plane Y)
-    ("MMVD_A_3", 'F'),            // 295/300 pictures diverge (first poc 1 plane Y)
+    ("MIP_B_3", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("MMVD_A_3", 'F'),            // 21/300 pictures diverge (first poc 33 plane Cb)
     ("MTS_A_4", 'P'),             // byte-exact (r449)
-    ("PROF_B_3", 'F'),            // 5/16 pictures diverge (first poc 11 plane Y)
+    ("PROF_B_3", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("QUANT_A_2", 'P'),           // byte-exact (r450 chroma DMVR bounding window)
-    ("QUANT_B_2", 'F'),           // 13/17 pictures diverge (first poc 1 plane Y)
+    ("QUANT_B_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("RAP_A_1", 'P'),             // byte-exact (r449)
-    ("RAP_B_1", 'F'),             // 1/33 pictures diverge (first poc 39 plane Y)
-    ("SAO_A_3", 'F'),             // 59/60 pictures diverge (first poc 1 plane Y)
+    ("RAP_B_1", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("SAO_A_3", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("SBT_A_2", 'F'),             // 44/57 pictures diverge (first poc 8 plane Y)
     ("SLICES_A_3", 'F'),          // 24/25 pictures diverge (first poc 0 plane Cb)
-    ("SMVD_A_2", 'F'),            // 7/10 pictures diverge (first poc 1 plane Y)
+    ("SMVD_A_2", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("SUBPIC_C_1", 'U'),          // subpictures
-    ("SbTMVP_A_3", 'F'),          // 26/49 pictures diverge (first poc 5 plane Y)
+    ("SbTMVP_A_3", 'P'),          // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("TILE_A_2", 'F'),            // 8/9 pictures diverge (first poc 1 plane Y)
     ("TMVP_A_3", 'F'),            // 61/64 pictures diverge (first poc 1 plane Y)
     ("WPP_A_3", 'F'),             // 42/49 pictures diverge (first poc 3 plane Y)

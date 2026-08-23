@@ -153,11 +153,39 @@ pub struct TbSplit {
 /// `[tile_y][tile_x]` with `tile = offset / 64` in CU-relative luma
 /// samples. `y` is `tu_y_coded_flag`; `cb` / `cr` fold the per-TU
 /// chroma CBFs (`tu_cb_coded` / `tu_cr_coded`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tu64CbfMap {
-    pub y: [[bool; 2]; 2],
-    pub cb: [[bool; 2]; 2],
-    pub cr: [[bool; 2]; 2],
+    /// `Log2( MaxTbSizeY )` — the implicit tiling granularity (6 for
+    /// the 64-sample default, 5 when
+    /// `sps_max_luma_transform_size_64_flag == 0`). A CU above
+    /// `MaxTbSizeY` tiles into implicit transform blocks even when it
+    /// carries NO residual (`cu_coded_flag == 0`): §8.8.3.3 reads the
+    /// TB geometry regardless, so a 128-wide skip CU still has a TB
+    /// boundary at offset 64 (r450 — the §8.8.3.4 eq. 1231/1232
+    /// `Min(5, ·)` arm depends on it).
+    pub tile_log2: u32,
+    pub y: [[bool; 4]; 4],
+    pub cb: [[bool; 4]; 4],
+    pub cr: [[bool; 4]; 4],
+}
+
+impl Default for Tu64CbfMap {
+    fn default() -> Self {
+        Self {
+            tile_log2: 6,
+            y: [[false; 4]; 4],
+            cb: [[false; 4]; 4],
+            cr: [[false; 4]; 4],
+        }
+    }
+}
+
+impl Tu64CbfMap {
+    /// Tiling granularity in luma samples.
+    #[inline]
+    pub fn tile(&self) -> u32 {
+        1 << self.tile_log2
+    }
 }
 
 impl DeblockCu {
@@ -169,8 +197,8 @@ impl DeblockCu {
         if let Some(map) = &self.tu64 {
             let lx = (luma_x - self.x as i32).clamp(0, self.w as i32 - 1) as u32;
             let ly = (luma_y - self.y as i32).clamp(0, self.h as i32 - 1) as u32;
-            let tx = ((lx / 64) as usize).min(1);
-            let ty = ((ly / 64) as usize).min(1);
+            let tx = ((lx >> map.tile_log2) as usize).min(3);
+            let ty = ((ly >> map.tile_log2) as usize).min(3);
             return match c_idx {
                 0 => map.y[ty][tx],
                 1 => map.cb[ty][tx],
@@ -221,8 +249,11 @@ impl DeblockCu {
         } else {
             (luma_y - self.y as i32).clamp(0, self.h as i32 - 1) as u32
         };
-        if self.tu64.is_some() && dim > 64 {
-            return (dim - (rel / 64) * 64).min(64);
+        if let Some(map) = &self.tu64 {
+            let tile = map.tile();
+            if dim > tile {
+                return (dim - (rel / tile) * tile).min(tile);
+            }
         }
         if let Some(ts) = &self.tb_split {
             if ts.vertical == vertical {
@@ -244,8 +275,9 @@ impl DeblockCu {
         } else {
             (luma_y - self.y as i32).clamp(0, self.h as i32 - 1) as u32
         };
-        let luma_len = if self.tu64.is_some() && dim > 64 {
-            (dim - (rel / 64) * 64).min(64)
+        let tile64 = self.tu64.as_ref().map(|m| m.tile()).filter(|&t| dim > t);
+        let luma_len = if let Some(tile) = tile64 {
+            (dim - (rel / tile) * tile).min(tile)
         } else if let Some(ts) = &self.tb_split {
             if ts.vertical == vertical && !ts.luma_only {
                 let (start, end) = ts.tb_extent(rel, dim);
@@ -269,8 +301,11 @@ impl DeblockCu {
         if off >= dim {
             return false;
         }
-        if self.tu64.is_some() && dim > 64 {
-            return off % 64 == 0;
+        if let Some(map) = &self.tu64 {
+            let tile = map.tile();
+            if dim > tile {
+                return off % tile == 0;
+            }
         }
         if let Some(ts) = &self.tb_split {
             if ts.vertical == vertical {
@@ -290,8 +325,11 @@ impl DeblockCu {
         if off >= dim {
             return false;
         }
-        if self.tu64.is_some() && dim > 64 {
-            return off % 64 == 0;
+        if let Some(map) = &self.tu64 {
+            let tile = map.tile();
+            if dim > tile {
+                return off % tile == 0;
+            }
         }
         if let Some(ts) = &self.tb_split {
             if ts.vertical == vertical && !ts.luma_only {

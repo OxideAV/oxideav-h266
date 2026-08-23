@@ -1734,6 +1734,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 plane.samples[idx] = m as u16;
             }
         }
+        if let Ok(spec) = std::env::var("H266_DBG_PIX") {
+            if let Some((xs, ys)) = spec.split_once(',') {
+                if let (Ok(px), Ok(py)) = (xs.parse::<usize>(), ys.parse::<usize>()) {
+                    if px >= x0 && px < x1 && py >= y0 && py < y1 {
+                        eprintln!(
+                            "PIXMAP rect=({x0},{y0}) {w}x{h} at({px},{py}) mapped={}",
+                            plane.samples[py * plane.stride + px]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// §8.7.5.3 ordered steps 1 – 3 — derive `varScale` for the current
@@ -3637,14 +3649,36 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// the per-64-tile [`crate::deblock::Tu64CbfMap`] the deblocker's
     /// §8.8.3.5 tu-coded arm and interior TB-edge pass consume.
     /// `None` for single-TB CUs.
-    fn tu64_map(residual: &LeafCuResidual) -> Option<crate::deblock::Tu64CbfMap> {
-        if residual.inter_tus.is_empty() {
+    fn tu64_map(
+        &self,
+        residual: &LeafCuResidual,
+        w: u32,
+        h: u32,
+    ) -> Option<crate::deblock::Tu64CbfMap> {
+        // §8.8.3.3 reads the implicit >MaxTbSizeY transform-block
+        // tiling REGARDLESS of whether the CU carries residual: a
+        // 128-wide skip CU still has TB boundaries at the MaxTbSizeY
+        // grid (r450 — the §8.8.3.4 eq. 1231/1232 arm fires on them).
+        let max_tb_log2: u32 = if self
+            .sps
+            .partition_constraints
+            .max_luma_transform_size_64_flag
+        {
+            6
+        } else {
+            5
+        };
+        let max_tb = 1u32 << max_tb_log2;
+        if residual.inter_tus.is_empty() && w <= max_tb && h <= max_tb {
             return None;
         }
-        let mut m = crate::deblock::Tu64CbfMap::default();
+        let mut m = crate::deblock::Tu64CbfMap {
+            tile_log2: max_tb_log2,
+            ..Default::default()
+        };
         for tu in &residual.inter_tus {
-            let tx = ((tu.x / 64) as usize).min(1);
-            let ty = ((tu.y / 64) as usize).min(1);
+            let tx = ((tu.x >> max_tb_log2) as usize).min(3);
+            let ty = ((tu.y >> max_tb_log2) as usize).min(3);
             m.y[ty][tx] |= tu.tu_y_coded;
             m.cb[ty][tx] |= tu.tu_cb_coded;
             m.cr[ty][tx] |= tu.tu_cr_coded;
@@ -4973,6 +5007,23 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        if let Ok(spec) = std::env::var("H266_DBG_PIX") {
+            if let Some((xs, ys)) = spec.split_once(',') {
+                if let (Ok(px), Ok(py)) = (xs.parse::<usize>(), ys.parse::<usize>()) {
+                    if px < out.luma.width && py < out.luma.height {
+                        eprintln!(
+                            "PIXCU pre-CU ({},{}) {}x{} tree={:?} val={}",
+                            cu.cu.x,
+                            cu.cu.y,
+                            cu.cu.w,
+                            cu.cu.h,
+                            info.tree,
+                            out.luma.samples[py * out.luma.stride + px]
+                        );
+                    }
+                }
+            }
+        }
         // r443 — §7.3.11.4 local dual tree (SCIPU): a
         // DUAL_TREE_CHROMA leaf reconstructs chroma-only through the
         // dual-chroma path (its region's luma was reconstructed by the
@@ -5197,7 +5248,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 ciip: false,
                 ibc: false,
                 num_sb: None,
-                tu64: Self::tu64_map(residual),
+                tu64: self.tu64_map(residual, cu.cu.w, cu.cu.h),
                 tb_split: Self::isp_tb_split(
                     info.isp_split,
                     cu.cu.w,
@@ -5575,7 +5626,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ciip: false,
             ibc: false,
             num_sb: None,
-            tu64: Self::tu64_map(residual),
+            tu64: self.tu64_map(residual, cu.cu.w, cu.cu.h),
             tb_split: None,
         });
         // Round-28 §8.5.6.7 — record this CU's prediction mode in the
@@ -7021,7 +7072,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ciip: info.inter.merge_data.ciip_flag,
             ibc: false,
             num_sb: None,
-            tu64: Self::tu64_map(residual),
+            tu64: self.tu64_map(residual, cu.cu.w, cu.cu.h),
             tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         // Round-28 §8.5.6.7 — inter CUs record MODE_INTER in the
@@ -7762,6 +7813,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             self.ph_prof_disabled,
             /*rpr_constraints_active=*/ false,
         )?;
+        if let Ok(spec) = std::env::var("H266_DBG_AFFBI") {
+            if let Some((xs, ys)) = spec.split_once(',') {
+                if let (Ok(px), Ok(py)) = (xs.parse::<u32>(), ys.parse::<u32>()) {
+                    if px >= cb_x && px < cb_x + cb_w && py >= cb_y && py < cb_y + cb_h {
+                        let lx = (px - cb_x) as usize;
+                        let ly = (py - cb_y) as usize;
+                        let g0 = crate::affine::derive_subblock_mvs(cb_w, cb_h, cpmvs_l0, true);
+                        let g1 = crate::affine::derive_subblock_mvs(cb_w, cb_h, cpmvs_l1, true);
+                        eprintln!(
+                            "AFFBI ({cb_x},{cb_y}) {cb_w}x{cb_h} bcw={bcw_idx} at({px},{py}) hp0={} hp1={} cp0={:?} cp1={:?} sbmv0={:?} sbmv1={:?}",
+                            hp_l0[ly * cb_w as usize + lx],
+                            hp_l1[ly * cb_w as usize + lx],
+                            &cpmvs_l0.cpmvs[..],
+                            &cpmvs_l1.cpmvs[..],
+                            g0.map(|g| g.mv_at((lx as u32) / 4, (ly as u32) / 4)),
+                            g1.map(|g| g.mv_at((lx as u32) / 4, (ly as u32) / 4)),
+                        );
+                    }
+                }
+            }
+        }
         blend_bi_hp_into(
             &mut out.luma,
             cb_x,
@@ -8697,7 +8769,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ciip: false,
             ibc: false,
             num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
-            tu64: Self::tu64_map(residual),
+            tu64: self.tu64_map(residual, cu.cu.w, cu.cu.h),
             tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
@@ -9260,7 +9332,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ciip: false,
             ibc: false,
             num_sb: Some((cu.cu.w / 8, cu.cu.h / 8)),
-            tu64: Self::tu64_map(residual),
+            tu64: self.tu64_map(residual, cu.cu.w, cu.cu.h),
             tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
@@ -9644,7 +9716,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ciip: false,
             ibc: false,
             num_sb: Some((cu.cu.w / 4, cu.cu.h / 4)),
-            tu64: Self::tu64_map(residual),
+            tu64: self.tu64_map(residual, cu.cu.w, cu.cu.h),
             tb_split: Self::sbt_tb_split(info, cu.cu.w, cu.cu.h),
         });
         self.write_intra_block(cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, false);
