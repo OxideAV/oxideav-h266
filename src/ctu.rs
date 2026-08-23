@@ -6103,6 +6103,30 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 /*lt_l0*/ false,
                 /*lt_l1*/ false,
             );
+            if std::env::var_os("H266_DBG_MMVD").is_some() {
+                eprintln!(
+                    "MMVD ({},{}) {}x{} cand={} dist={} dir={} off=({},{}) pocd=({},{}) -> l0=({},{})r{}f{} l1=({},{})r{}f{}",
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    info.inter.merge_data.merge_idx,
+                    info.inter.merge_data.mmvd_distance_idx,
+                    info.inter.merge_data.mmvd_direction_idx,
+                    off.x,
+                    off.y,
+                    curr_poc_diff_l0,
+                    curr_poc_diff_l1,
+                    chosen.mv_l0.x,
+                    chosen.mv_l0.y,
+                    chosen.ref_idx_l0,
+                    chosen.pred_flag_l0,
+                    chosen.mv_l1.x,
+                    chosen.mv_l1.y,
+                    chosen.ref_idx_l1,
+                    chosen.pred_flag_l1,
+                );
+            }
         }
 
         self.reconstruct_inter_with_chosen(cu, info, residual, chosen, out)

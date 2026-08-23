@@ -647,7 +647,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
     ("GPM_A_3", 'P'),             // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
-    ("IBC_A_2", 'E'),             // merge candidate with no active list (under triage)
+    ("IBC_A_2", 'F'),             // 12/17 pictures diverge (first poc 5 plane Cb)
     ("ISP_A_3", 'P'),             // byte-exact (r449)
     ("JCCR_A_2", 'P'),            // byte-exact (r450 CIIP chroma gate + per-TB joint deblock QP)
     ("JCCR_C_3", 'P'),            // byte-exact (r450 §8.5.2.3 raw-availability pruning)

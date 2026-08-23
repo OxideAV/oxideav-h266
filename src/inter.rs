@@ -499,6 +499,10 @@ pub struct SpatialMergeCandidate {
 /// Returns availability + MvField for each of the five positions in
 /// the order they are evaluated by §8.5.2.3 (B1 first, then A1, B0,
 /// A0, B2).
+// r450 — §6.4.4 `checkPredModeY == TRUE`: a regular-merge neighbour
+// must itself be MODE_INTER; a MODE_IBC record (available, block
+// vector in the L0 slot, `mode_inter == false`) is NOT a spatial
+// merge candidate.
 pub fn derive_spatial_merge_candidates(
     xcb: i32,
     ycb: i32,
@@ -517,7 +521,7 @@ pub fn derive_spatial_merge_candidates(
     let xb1 = xcb + cb_w - 1;
     let yb1 = ycb - 1;
     let raw_b1 = mvf.get_at_luma(xb1, yb1);
-    let available_b1 = raw_b1.available && !same_par(xcb, ycb, xb1, yb1);
+    let available_b1 = raw_b1.available && raw_b1.mode_inter && !same_par(xcb, ycb, xb1, yb1);
     out[0] = SpatialMergeCandidate {
         available: available_b1,
         field: if available_b1 {
@@ -539,7 +543,7 @@ pub fn derive_spatial_merge_candidates(
     let xa1 = xcb - 1;
     let ya1 = ycb + cb_h - 1;
     let raw_a1 = mvf.get_at_luma(xa1, ya1);
-    let avail_a1_raw = raw_a1.available && !same_par(xcb, ycb, xa1, ya1);
+    let avail_a1_raw = raw_a1.available && raw_a1.mode_inter && !same_par(xcb, ycb, xa1, ya1);
     let mut available_a1 = avail_a1_raw;
     // Redundancy: drop A1 if it has same MV/refIdx as B1.
     if available_a1 && avail_b1_raw && mvf_matches(&raw_a1, &raw_b1) {
@@ -558,7 +562,7 @@ pub fn derive_spatial_merge_candidates(
     let xb0 = xcb + cb_w;
     let yb0 = ycb - 1;
     let raw_b0 = mvf.get_at_luma(xb0, yb0);
-    let mut available_b0 = raw_b0.available && !same_par(xcb, ycb, xb0, yb0);
+    let mut available_b0 = raw_b0.available && raw_b0.mode_inter && !same_par(xcb, ycb, xb0, yb0);
     if available_b0 && avail_b1_raw && mvf_matches(&raw_b0, &raw_b1) {
         available_b0 = false;
     }
@@ -575,7 +579,7 @@ pub fn derive_spatial_merge_candidates(
     let xa0 = xcb - 1;
     let ya0 = ycb + cb_h;
     let raw_a0 = mvf.get_at_luma(xa0, ya0);
-    let mut available_a0 = raw_a0.available && !same_par(xcb, ycb, xa0, ya0);
+    let mut available_a0 = raw_a0.available && raw_a0.mode_inter && !same_par(xcb, ycb, xa0, ya0);
     // §8.5.2.3 — against RAW A1 availability + motion (see above).
     if available_a0 && avail_a1_raw && mvf_matches(&raw_a0, &raw_a1) {
         available_a0 = false;
@@ -593,7 +597,7 @@ pub fn derive_spatial_merge_candidates(
     let xb2 = xcb - 1;
     let yb2 = ycb - 1;
     let raw_b2 = mvf.get_at_luma(xb2, yb2);
-    let mut available_b2 = raw_b2.available && !same_par(xcb, ycb, xb2, yb2);
+    let mut available_b2 = raw_b2.available && raw_b2.mode_inter && !same_par(xcb, ycb, xb2, yb2);
     // §8.5.2.3 last bullet: B2 dropped also when A0+A1+B0+B1 == 4
     // (i.e. all four prior candidates available).
     if available_b2 && avail_a1_raw && mvf_matches(&raw_b2, &raw_a1) {
