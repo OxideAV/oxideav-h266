@@ -8974,6 +8974,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctr_mv_l0,
             ctr_mv_l1,
         };
+        if std::env::var_os("H266_DBG_SBTMVP").is_some() {
+            eprintln!(
+                "SBTMVP-REC ({xcb},{ycb}) {cb_w}x{cb_h} a1av={} tempMv=({},{}) ctrCell=({},{}) ctrInter={} ctrRaw=({},{})r{} ctrL0={ctr_pred_l0} ctrL1={ctr_pred_l1}",
+                a1.available,
+                temp_mv.x,
+                temp_mv.y,
+                (xc >> 3) << 3,
+                (yc >> 3) << 3,
+                ctr_col.mode_inter,
+                ctr_col.mv_l0.x,
+                ctr_col.mv_l0.y,
+                ctr_col.ref_idx_l0,
+            );
+        }
         Some((record, col_pic.clone()))
     }
 
@@ -9052,6 +9066,39 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let sb_grid = fill_subblock_motion(record, &fuse_inputs, &col_sampler);
         let sb_w = record.grid.sb_width as u32;
         let sb_h = record.grid.sb_height as u32;
+        if std::env::var_os("H266_DBG_SBTMVP").is_some() {
+            eprintln!(
+                "SBTMVP ({},{}) {}x{} tempMv=({},{}) ctrL0={} ctrL1={} ctrMv0=({},{}) grid={}x{}",
+                cu.cu.x,
+                cu.cu.y,
+                cu.cu.w,
+                cu.cu.h,
+                record.temp_mv.x,
+                record.temp_mv.y,
+                record.ctr_pred_flag_l0,
+                record.ctr_pred_flag_l1,
+                record.ctr_mv_l0.x,
+                record.ctr_mv_l0.y,
+                sb_grid.num_sb_x,
+                sb_grid.num_sb_y,
+            );
+            for ys in 0..sb_grid.num_sb_y {
+                for xs in 0..sb_grid.num_sb_x {
+                    let sb = sb_grid.at(xs, ys);
+                    eprintln!(
+                        "  sb({xs},{ys}) l0={}({},{})r{} l1={}({},{})r{}",
+                        sb.pred_flag_l0,
+                        sb.mv_l0.x,
+                        sb.mv_l0.y,
+                        sb.ref_idx_l0,
+                        sb.pred_flag_l1,
+                        sb.mv_l1.x,
+                        sb.mv_l1.y,
+                        sb.ref_idx_l1,
+                    );
+                }
+            }
+        }
 
         // Per-sub-block translational MC. refIdxLXSbCol == 0, so the
         // reference picture is RefPicList[X][0].
@@ -9308,10 +9355,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             (xcb + cb_w as i32 - 1, ycb - 1), // B1 (eq. 678)
             (xcb - 1, ycb - 1),               // B2 (eq. 679)
         ];
-        let inherited_a =
-            self.derive_inherited_affine_merge_side(&a_positions, xcb, ycb, cb_w, cb_h);
-        let inherited_b =
-            self.derive_inherited_affine_merge_side(&b_positions, xcb, ycb, cb_w, cb_h);
+        // §8.5.5.2 steps 3 – 6 run ONLY when sps_affine_enabled_flag
+        // == 1: with affine off (SbTMVP-only wires) the list holds the
+        // SbCol candidate plus eqs. 686 – 696 zero-MV pads — no
+        // inherited / constructed candidates exist.
+        let affine_on = self.sps.tool_flags.affine_enabled_flag;
+        let inherited_a = if affine_on {
+            self.derive_inherited_affine_merge_side(&a_positions, xcb, ycb, cb_w, cb_h)
+        } else {
+            crate::affine_merge::InheritedAffineCandidate::default()
+        };
+        let inherited_b = if affine_on {
+            self.derive_inherited_affine_merge_side(&b_positions, xcb, ycb, cb_w, cb_h)
+        } else {
+            crate::affine_merge::InheritedAffineCandidate::default()
+        };
 
         // §8.5.5.2 step 6 + §8.5.5.6 — constructed Const1..6. Corners
         // 0 / 1 / 2 read the regular per-list motion field at the cascade
@@ -9343,15 +9401,22 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let corner3 = self.read_temporal_corner3(xcb, ycb, cb_w as i32, cb_h as i32, is_b);
         let corners = [corner0, corner1, corner2, corner3];
 
-        let constructed = derive_constructed_affine_merge_candidates(
-            cb_w,
-            cb_h,
-            &corners,
-            ConstructedAffineFlags {
-                sps_6param_affine_enabled_flag: self.sps.tool_flags.six_param_affine_enabled_flag,
-                slice_type_b: is_b,
-            },
-        );
+        let constructed = if affine_on {
+            derive_constructed_affine_merge_candidates(
+                cb_w,
+                cb_h,
+                &corners,
+                ConstructedAffineFlags {
+                    sps_6param_affine_enabled_flag: self
+                        .sps
+                        .tool_flags
+                        .six_param_affine_enabled_flag,
+                    slice_type_b: is_b,
+                },
+            )
+        } else {
+            crate::affine_merge::ConstructedAffineCandidates::default()
+        };
 
         // §8.5.5.3 — build the SbTMVP (`SbCol`) record. When the
         // §8.5.5.3 step-3 `availableFlagSbCol` is true it occupies slot 0

@@ -638,7 +638,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("CodingToolsSets_A_2", 'P'), // byte-exact
     ("CodingToolsSets_B_2", 'F'), // 7/9 pictures diverge (first poc 2 plane Y)
     ("CodingToolsSets_C_2", 'P'), // byte-exact (r449)
-    ("CodingToolsSets_D_2", 'F'), // 8/9 pictures diverge (first poc 1 plane Y)
+    ("CodingToolsSets_D_2", 'F'), // 6/9 pictures diverge (first poc 3 plane Y)
     ("CodingToolsSets_E_1", 'U'), // subpictures
     ("DEBLOCKING_A_3", 'F'),      // 10/17 pictures diverge (first poc 7 plane Y)
     ("DEBLOCKING_C_3", 'F'),      // 31/33 pictures diverge (first poc 1 plane Y)
