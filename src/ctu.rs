@@ -6721,7 +6721,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // IntraPredModeC to PLANAR (luma is also forced to PLANAR
             // by §7.4.5.2 and the §8.4.3 chroma derivation table maps
             // PLANAR luma → PLANAR chroma).
-            let (ciip_pred_intra_cb, ciip_pred_intra_cr) = if ciip_active {
+            // §8.5.6.7 invocation gate (§8.5.6.1): the chroma arms
+            // run only when cbWidth / SubWidthC >= 4 — a 4-wide luma
+            // CU (2-wide chroma TB) keeps its PURE INTER chroma
+            // prediction; only luma is blended.
+            let ciip_chroma = ciip_active && cb_w_c >= 4;
+            let (ciip_pred_intra_cb, ciip_pred_intra_cr) = if ciip_chroma {
                 let n_w_c = cb_w_c as usize;
                 let n_h_c = cb_h_c as usize;
                 // §8.5.6.7 chroma intra parts run the same §8.4.5.2.6
@@ -6867,7 +6872,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // chroma neighbours sit at *the same* luma-grid 4x4 cells
             // as the luma neighbours; the intra-grid sample picked
             // earlier therefore applies here too).
-            if ciip_active {
+            if ciip_chroma {
                 apply_ciip_combine_to_plane(
                     &mut out.cb,
                     cb_x_c as usize,

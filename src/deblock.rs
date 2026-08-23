@@ -199,6 +199,17 @@ impl DeblockCu {
         }
     }
 
+    /// §8.8.3.6.4 — is the chroma TB containing the luma-coordinate
+    /// sample coded with `TuCResMode == 2`? The mode is a per-TB
+    /// property: an SBT CU's non-residual sub-TU and a >MaxTbSizeY
+    /// tile without coded chroma have `TuCResMode == 0` even when the
+    /// CU's residual-bearing TU used the joint mode, so the record's
+    /// CU-level flag is gated on the per-TB chroma coded flag.
+    fn joint2_at(&self, luma_x: i32, luma_y: i32) -> bool {
+        self.joint_cbcr2
+            && (self.tu_coded_at(1, luma_x, luma_y) || self.tu_coded_at(2, luma_x, luma_y))
+    }
+
     /// §8.8.3.3 — length (along the given axis) of the LUMA transform
     /// block containing the luma sample `(luma_x, luma_y)`. One TB per
     /// CU unless the CU tiles above `MaxTbSizeY` (`tu64`) or carries a
@@ -936,7 +947,8 @@ fn deblock_cu_dir(
                 } else {
                     (1, 1)
                 };
-                let (_qp, beta, tc) = compute_thresholds_chroma(plane, p_cu, q_cu, b_s);
+                let (_qp, beta, tc) =
+                    compute_thresholds_chroma(plane, p_cu, q_cu, (px, py), (qx, qy), b_s);
                 let ex = qx / plane.sub_w as i32;
                 let ey = qy / plane.sub_h as i32;
                 if std::env::var_os("H266_DBG_DBLK_CHROMA").is_some() {
@@ -1145,24 +1157,29 @@ fn compute_thresholds_chroma(
     plane: &PlaneCtx,
     p: &DeblockCu,
     q: &DeblockCu,
+    p_pos: (i32, i32),
+    q_pos: (i32, i32),
     b_s: i32,
 ) -> (i32, i32, i32) {
     // §8.8.3.6.4 — QpP / QpQ are the per-component chroma QPs of the
-    // TBs containing p0,0 / q0,0 (`Qp′CbCr` when the TB's
+    // TBs containing p0,0 / q0,0 (`Qp′CbCr` when THAT TB's
     // `TuCResMode == 2`, else `Qp′Cb` / `Qp′Cr` by cIdx), taken in the
-    // `− QpBdOffset` domain per eq. 1343. Records carrying the legacy
-    // sentinel fall back to the identity `QpY + qp_offset` arm.
-    let pick = |c: &DeblockCu| -> i32 {
+    // `− QpBdOffset` domain per eq. 1343. The joint-mode test is per
+    // transform block ([`DeblockCu::joint2_at`]): an SBT CU's
+    // residual-free sub-TU keeps its per-component QPs. Records
+    // carrying the legacy sentinel fall back to the identity
+    // `QpY + qp_offset` arm.
+    let pick = |c: &DeblockCu, pos: (i32, i32)| -> i32 {
         if c.qp_c[0] == i32::MIN {
             (c.qp_y + plane.qp_offset).clamp(0, 63)
-        } else if c.joint_cbcr2 {
+        } else if c.joint2_at(pos.0, pos.1) {
             c.qp_c[2]
         } else {
             c.qp_c[(plane.c_idx as usize).saturating_sub(1).min(1)]
         }
     };
-    let qp_p = pick(p);
-    let qp_q = pick(q);
+    let qp_p = pick(p, p_pos);
+    let qp_q = pick(q, q_pos);
     let qp_c = (qp_p + qp_q + 1) >> 1;
     let q_beta = (qp_c + (plane.beta_offset_div2 << 1)).clamp(0, 63);
     let beta_p = beta_prime(q_beta);

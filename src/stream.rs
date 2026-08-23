@@ -692,6 +692,17 @@ impl StreamDecoder {
                     }
                 }
             }
+            if std::env::var_os("H266_DBG_SHQP").is_some() {
+                eprintln!(
+                    "SHQP poc={poc} slice={i} type={:?} shqpd={} cb={} cr={} joint={} jsign={}",
+                    sh.sh_slice_type,
+                    sh.sh_qp_delta,
+                    sh.sh_cb_qp_offset,
+                    sh.sh_cr_qp_offset,
+                    sh.sh_joint_cbcr_qp_offset,
+                    ph.ph_joint_cbcr_sign_flag,
+                );
+            }
             if sh.sh_slice_type != SliceType::I {
                 let l0 =
                     self.resolve_list(&built[0], sh.num_ref_idx_active[0] as usize, max_poc_lsb)?;
