@@ -3009,10 +3009,15 @@ pub fn predict_chroma_block_high_precision_dmvr(
 ) -> Result<Vec<i32>> {
     let x_sb_int = dst_x_c as i32 + (mv_orig.x >> 5);
     let y_sb_int = dst_y_c as i32 + (mv_orig.y >> 5);
+    // §8.5.6.3.4 eqs. 944 / 945 — the bounding block is
+    // [xSbIntC − 1, xSbIntC + sbWidth − 1 + 2]: a (w + 3)-sample
+    // window, NOT the 4-tap halo (w + 4). A refined MV whose integer
+    // part moved +1 must re-read the window's last sample, not one
+    // past it.
     let left = x_sb_int - 1;
     let top = y_sb_int - 1;
-    let pw = w_c as usize + 4;
-    let ph = h_c as usize + 4;
+    let pw = w_c as usize + 3;
+    let ph = h_c as usize + 3;
     let mut patch = PicturePlane::filled_bd(pw, ph, 0, src.bit_depth);
     for r in 0..ph {
         let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;

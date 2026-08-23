@@ -623,14 +623,14 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     // loop-filter divergence.
     ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
     ("8b400_A_2", 'F'),           // 39/49 pictures diverge (first poc 2 plane Y)
-    ("8b420_A_2", 'F'),           // 46/49 pictures diverge (first poc 2 plane Cb)
+    ("8b420_A_2", 'F'),           // 36/49 pictures diverge (first poc 3 plane Y)
     ("8b420_B_2", 'F'),           // 47/49 pictures diverge (first poc 1 plane Y)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
-    ("AFF_A_2", 'F'),             // 8/10 pictures diverge (first poc 1 plane Y)
+    ("AFF_A_2", 'F'),             // 7/10 pictures diverge (first poc 1 plane Y)
     ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_C_3", 'P'),             // byte-exact (r449)
-    ("AMVR_A_3", 'F'),            // 50/85 pictures diverge (first poc 1 plane Y)
+    ("AMVR_A_3", 'F'),            // 29/85 pictures diverge (first poc 1 plane Y)
     ("BDOF_A_4", 'F'),            // 41/44 pictures diverge (first poc 3 plane Y)
     ("BDPCM_A_2", 'P'),           // byte-exact (r449)
     ("CCLM_A_2", 'P'),            // byte-exact (r449)
@@ -641,18 +641,18 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("CodingToolsSets_D_2", 'P'), // byte-exact (r450 §8.5.5.2 affine gate + §8.5.2.3 pruning)
     ("CodingToolsSets_E_1", 'U'), // subpictures
     ("DEBLOCKING_A_3", 'F'),      // 10/17 pictures diverge (first poc 7 plane Y)
-    ("DEBLOCKING_C_3", 'F'),      // 30/33 pictures diverge (first poc 1 plane Y)
+    ("DEBLOCKING_C_3", 'F'),      // 29/33 pictures diverge (first poc 1 plane Y)
     ("DEBLOCKING_E_3", 'F'),      // 6/8 pictures diverge (first poc 2 plane Y)
     ("DMVR_A_3", 'U'),            // explicit weighted prediction
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
-    ("GPM_A_3", 'F'),             // 13/17 pictures diverge (first poc 1 plane Y)
+    ("GPM_A_3", 'F'),             // 11/17 pictures diverge (first poc 3 plane Y)
     ("IBC_A_2", 'E'),             // merge candidate with no active list (under triage)
     ("ISP_A_3", 'P'),             // byte-exact (r449)
     ("JCCR_A_2", 'P'),            // byte-exact (r450 CIIP chroma gate + per-TB joint deblock QP)
     ("JCCR_C_3", 'P'),            // byte-exact (r450 §8.5.2.3 raw-availability pruning)
     ("LFNST_A_4", 'P'),           // byte-exact (r449)
-    ("LFNST_B_4", 'F'),           // 38/46 pictures diverge (first poc 1 plane Y)
+    ("LFNST_B_4", 'F'),           // 8/46 pictures diverge (first poc 9 plane Y)
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'F'),            // 31/32 pictures diverge (first poc 1 plane Y)
@@ -663,19 +663,19 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("MMVD_A_3", 'F'),            // 295/300 pictures diverge (first poc 1 plane Y)
     ("MTS_A_4", 'P'),             // byte-exact (r449)
     ("PROF_B_3", 'F'),            // 5/16 pictures diverge (first poc 11 plane Y)
-    ("QUANT_A_2", 'F'),           // 2/5 pictures diverge (first poc 2 plane Cb)
-    ("QUANT_B_2", 'F'),           // 15/17 pictures diverge (first poc 1 plane Y)
+    ("QUANT_A_2", 'P'),           // byte-exact (r450 chroma DMVR bounding window)
+    ("QUANT_B_2", 'F'),           // 13/17 pictures diverge (first poc 1 plane Y)
     ("RAP_A_1", 'P'),             // byte-exact (r449)
-    ("RAP_B_1", 'F'),             // 28/33 pictures diverge (first poc 33 plane Cb)
+    ("RAP_B_1", 'F'),             // 1/33 pictures diverge (first poc 39 plane Y)
     ("SAO_A_3", 'F'),             // 59/60 pictures diverge (first poc 1 plane Y)
     ("SBT_A_2", 'F'),             // 50/57 pictures diverge (first poc 2 plane Y)
     ("SLICES_A_3", 'F'),          // 24/25 pictures diverge (first poc 0 plane Cb)
-    ("SMVD_A_2", 'F'),            // 8/10 pictures diverge (first poc 1 plane Y)
+    ("SMVD_A_2", 'F'),            // 7/10 pictures diverge (first poc 1 plane Y)
     ("SUBPIC_C_1", 'U'),          // subpictures
-    ("SbTMVP_A_3", 'F'),          // 44/49 pictures diverge (first poc 2 plane Y)
+    ("SbTMVP_A_3", 'F'),          // 37/49 pictures diverge (first poc 2 plane Y)
     ("TILE_A_2", 'F'),            // 8/9 pictures diverge (first poc 1 plane Y)
     ("TMVP_A_3", 'F'),            // 61/64 pictures diverge (first poc 1 plane Y)
-    ("WPP_A_3", 'F'),             // 44/49 pictures diverge (first poc 3 plane Y)
+    ("WPP_A_3", 'F'),             // 43/49 pictures diverge (first poc 3 plane Y)
     ("WP_A_3", 'U'),              // explicit weighted prediction
 ];
 

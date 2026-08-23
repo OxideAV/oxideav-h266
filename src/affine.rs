@@ -269,23 +269,28 @@ pub fn fallback_mode_triggered(
 ) -> bool {
     let (d_hor_x, d_ver_x, d_hor_y, d_ver_y) = compute_affine_partials(cb_width, cb_height, cpmvs);
 
-    // eqs. 858 – 861
+    // eqs. 858 – 861 — the 4×4-footprint bounding box spans the X
+    // partials along the width axis (`2048 + dHorX` / `dVerX`) and the
+    // Y partials along the height axis (`dHorY` / `2048 + dVerY`).
+    // (r450: the width terms read `dHorY` and the height terms `dVerY`
+    // for both partials, so the bi-pred fallback never tripped on
+    // the wild constructed candidates the corpus carries.)
     let max_w4: i64 = (0i64)
-        .max(4 * (2048 + d_hor_y as i64))
+        .max(4 * (2048 + d_hor_x as i64))
         .max(4 * d_hor_y as i64)
-        .max(4 * (2048 + d_hor_y as i64) + 4 * d_hor_y as i64);
+        .max(4 * (2048 + d_hor_x as i64) + 4 * d_hor_y as i64);
     let min_w4: i64 = (0i64)
-        .min(4 * (2048 + d_hor_y as i64))
+        .min(4 * (2048 + d_hor_x as i64))
         .min(4 * d_hor_y as i64)
-        .min(4 * (2048 + d_hor_y as i64) + 4 * d_hor_y as i64);
+        .min(4 * (2048 + d_hor_x as i64) + 4 * d_hor_y as i64);
     let max_h4: i64 = (0i64)
-        .max(4 * d_ver_y as i64)
+        .max(4 * d_ver_x as i64)
         .max(4 * (2048 + d_ver_y as i64))
-        .max(4 * d_ver_y as i64 + 4 * (2048 + d_ver_y as i64));
+        .max(4 * d_ver_x as i64 + 4 * (2048 + d_ver_y as i64));
     let min_h4: i64 = (0i64)
-        .min(4 * d_ver_y as i64)
+        .min(4 * d_ver_x as i64)
         .min(4 * (2048 + d_ver_y as i64))
-        .min(4 * d_ver_y as i64 + 4 * (2048 + d_ver_y as i64));
+        .min(4 * d_ver_x as i64 + 4 * (2048 + d_ver_y as i64));
 
     // eqs. 862 / 863
     let bx_w_x4: i64 = ((max_w4 - min_w4) >> 11) + 9;

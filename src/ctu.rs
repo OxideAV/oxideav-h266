@@ -6273,6 +6273,21 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mv_l0: refined.mv_l0_refined,
                                 mv_l1: refined.mv_l1_refined,
                             });
+                            if std::env::var_os("H266_DBG_DMVR").is_some() {
+                                eprintln!(
+                                    "DMVR ({x},{y}) {sb_w}x{sb_h} mv0=({},{})->({},{}) mv1=({},{})->({},{}) sad={} sbBdof={}",
+                                    chosen.mv_l0.x,
+                                    chosen.mv_l0.y,
+                                    refined.mv_l0_refined.x,
+                                    refined.mv_l0_refined.y,
+                                    chosen.mv_l1.x,
+                                    chosen.mv_l1.y,
+                                    refined.mv_l1_refined.x,
+                                    refined.mv_l1_refined.y,
+                                    refined.final_int_sad,
+                                    refined.baseline_sad,
+                                );
+                            }
                             // r447 — every DMVR MC read is bounded by
                             // the §8.5.6.3.2 eqs. 926 / 927 window
                             // anchored at the UNREFINED MV.
@@ -9447,8 +9462,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
         if dbg_cu_enabled() {
             eprintln!(
-                "SBMERGE ({xcb},{ycb}) {cb_w}x{cb_h} idx={idx} kind={kind:?} model={:?} \
+                "SBMERGE ({xcb},{ycb}) {cb_w}x{cb_h} idx={idx} kind={kind:?} list={:?} model={:?} \
                  pred=({},{}) ref=({},{}) cp_l0={:?} cp_l1={:?} bcw={}",
+                &list.kinds[..list.count],
                 cand.motion_model,
                 cand.pred_flag_l0,
                 cand.pred_flag_l1,
