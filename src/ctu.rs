@@ -121,6 +121,20 @@ fn dbg_cu_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("H266_DBG_CU").is_some())
 }
 
+/// Debug aid: `H266_DBG_PIX=x,y` traces one luma sample through the
+/// per-CU reconstruction walk (`PIXCU` pre-CU snapshots + `PIXMAP`
+/// after the §8.7.5.2 forward mapping). Cached so the hot path pays
+/// one atomic load per CU when the variable is unset.
+fn dbg_pix_target() -> Option<(usize, usize)> {
+    use std::sync::OnceLock;
+    static TARGET: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let spec = std::env::var("H266_DBG_PIX").ok()?;
+        let (xs, ys) = spec.split_once(',')?;
+        Some((xs.parse().ok()?, ys.parse().ok()?))
+    })
+}
+
 fn apply_ciip_combine_to_plane(
     plane: &mut crate::reconstruct::PicturePlane,
     x0: usize,
@@ -1734,16 +1748,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 plane.samples[idx] = m as u16;
             }
         }
-        if let Ok(spec) = std::env::var("H266_DBG_PIX") {
-            if let Some((xs, ys)) = spec.split_once(',') {
-                if let (Ok(px), Ok(py)) = (xs.parse::<usize>(), ys.parse::<usize>()) {
-                    if px >= x0 && px < x1 && py >= y0 && py < y1 {
-                        eprintln!(
-                            "PIXMAP rect=({x0},{y0}) {w}x{h} at({px},{py}) mapped={}",
-                            plane.samples[py * plane.stride + px]
-                        );
-                    }
-                }
+        if let Some((px, py)) = dbg_pix_target() {
+            if px >= x0 && px < x1 && py >= y0 && py < y1 {
+                eprintln!(
+                    "PIXMAP rect=({x0},{y0}) {w}x{h} at({px},{py}) mapped={}",
+                    plane.samples[py * plane.stride + px]
+                );
             }
         }
     }
@@ -5007,21 +5017,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         residual: &LeafCuResidual,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        if let Ok(spec) = std::env::var("H266_DBG_PIX") {
-            if let Some((xs, ys)) = spec.split_once(',') {
-                if let (Ok(px), Ok(py)) = (xs.parse::<usize>(), ys.parse::<usize>()) {
-                    if px < out.luma.width && py < out.luma.height {
-                        eprintln!(
-                            "PIXCU pre-CU ({},{}) {}x{} tree={:?} val={}",
-                            cu.cu.x,
-                            cu.cu.y,
-                            cu.cu.w,
-                            cu.cu.h,
-                            info.tree,
-                            out.luma.samples[py * out.luma.stride + px]
-                        );
-                    }
-                }
+        if let Some((px, py)) = dbg_pix_target() {
+            if px < out.luma.width && py < out.luma.height {
+                eprintln!(
+                    "PIXCU pre-CU ({},{}) {}x{} tree={:?} val={}",
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    info.tree,
+                    out.luma.samples[py * out.luma.stride + px]
+                );
             }
         }
         // r443 — §7.3.11.4 local dual tree (SCIPU): a

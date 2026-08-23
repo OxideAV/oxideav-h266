@@ -581,7 +581,7 @@ at the edges, coded boundary BT, implicit-BT `depthOffset`,
 implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
 decode end-to-end.
 
-## JVET conformance triage (r434, re-triaged r437 / r440 / r443)
+## JVET conformance triage (r434, re-triaged every round since)
 
 The staged JVET FDIS-r1 conformance corpus (56 official bitstreams,
 `docs/video/h266/conformance/` in the workspace) now runs through a
@@ -661,10 +661,12 @@ produces them, an independent black-box decoder is the oracle, and
   neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
   their 4-point model from oversampled positions).
 
-Scorecard (r437 → r440 → r443 → r447 → r449): 0 P / 2 F / 8 U / 46 E →
+Scorecard (r437 → r440 → r443 → r447 → r449 → r450): 0 P / 2 F / 8 U / 46 E →
 1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
-2 P / 17 F / 8 U / 29 E →
-**14 PASS / 31 FAIL / 9 UNSUPPORTED / 2 ERROR** — `DMVR_B_4` joins
+2 P / 17 F / 8 U / 29 E → 14 P / 31 F / 9 U / 2 E →
+**34 PASS / 12 FAIL / 9 UNSUPPORTED / 1 ERROR** — twenty streams went
+byte-exact in r450 alone (see the r450 block below). In r449
+`DMVR_B_4` joined
 `CodingToolsSets_A_2` as byte-exact, and the r443 "affine non-merge"
 gate (the largest U family) is DISSOLVED. r447's root causes, each
 pinned with black-box single-tool fixture matrices that now decode
@@ -775,20 +777,66 @@ end-to-end:
   `hpelIfIdx`** — the Table 27 alternative 6-tap half-sample filter
   is live end-to-end (eq. 475 + merge/HMVP/pairwise inheritance).
 
-The 31 FAIL rows now all first diverge on an INTER picture (the
-poc-1-luma class, under triage — the r449-built affine-AMVR /
-CIIP-narrow-chroma leads are recorded in the round notes); the 9
-UNSUPPORTED rows are subpictures, 4:2:2 / 4:4:4, explicit weighted
-prediction, per-slice loop-filter divergence and explicit §8.8.1
-virtual boundaries (`GDR_A_2`'s real gate, surfaced once its parse
-desync dissolved); the 2 ERROR rows are IBC reference-region /
-candidate desyncs (under triage).
-`examples/triage_dbg` decodes one corpus stream against its `.opl`
-sidecar with optional plane dumps; `examples/decode_dump` writes
-POC-ordered YUV for fixture diffing; `examples/sps_dump` prints a
-stream's SPS tool-flag set; `H266_DBG_TB` / `H266_DBG_CCLM` /
-`H266_DBG_CU` / `H266_DBG_IBC` dump per-CU pipeline state. The
-corpus triage remains the priority pick list.
+**r450 — the poc-1-luma inter family COLLAPSES: 14 P → 34 P.** Six
+spec fixes, each root-caused from the first diverging pixel against
+the corpus (a black-box reference decode supplies per-sample diffs):
+
+* **§8.8.3.3 implicit >MaxTbSizeY transform-block tiling reaches the
+  deblocker** — a 128-wide SKIP CU still has TB boundaries at the
+  MaxTbSizeY grid (residual or not), so its interior sub-block edge
+  is a TB edge taking `maxFilterLength` from the 64-sample TB dims
+  (`Min(5, ·)` via §8.8.3.4 eqs. 1231/1232) instead of the length-3
+  arm. THIRTEEN streams flipped on this one line of geometry (the
+  corpus-wide "±1‥6 long-filter halo" on every large skip / affine /
+  SbTMVP CU); the `Tu64CbfMap` now carries `tile_log2` for the
+  32-sample tiling when `sps_max_luma_transform_size_64_flag == 0`.
+* **§8.5.2.7 MMVD offsets** — the raw `MmvdOffset` lands on the list
+  whose reference is FARTHER (ties to L0), and short-term references
+  ALWAYS take the eqs. 563 – 578 distScaleFactor chain (opposite-sign
+  distances were short-circuited to plain negation — the
+  long-term-only arm). `GPM_A_3` + `LFNST_B_4` flipped.
+* **§8.5.2.3 raw-availability pruning** — the A0-vs-A1 / B2-vs-A1 /
+  B2-vs-B1 redundancy gates key on `availableX` (the §6.4.4 block
+  availability) and the neighbour's stored motion, NOT the post-prune
+  `availableFlagX`: when A1 was pruned (== B1) a duplicate A0 == B1
+  entered every list and Col / HMVP / pairwise shifted one slot.
+  `CodingToolsSets_B_2` / `CodingToolsSets_D_2` / `JCCR_C_3` flipped.
+* **§8.5.6.1 CIIP chroma gate + §8.8.3.6.4 per-TB joint mode** — the
+  CIIP chroma intra blend runs only when `cbWidth / SubWidthC >= 4`
+  (2-wide chroma TBs keep the pure inter prediction), and the chroma
+  deblock QP picks `Qp′CbCr` per TRANSFORM BLOCK (an SBT CU's
+  residual-free sub-TU keeps per-component QPs). `JCCR_A_2` flipped.
+* **§8.5.6.3.4 eqs. 944/945 + §8.5.5.9 eqs. 858 – 861** — the DMVR
+  chroma bounding block is (w + 3) samples (the patch read one true
+  sample past it), and the affine fallback bounding box takes the X
+  partials on the width axis / Y partials on the height axis (both
+  axes read the Y partials, so wild constructed candidates never
+  tripped `fallbackModeTriggered`). `QUANT_A_2` flipped; `RAP_B_1`
+  went 28 → 1 divergent and flipped after the tiling fix.
+* **§8.5.5.2 steps 3 – 6 gate on `sps_affine_enabled_flag`** (an
+  affine-off SbTMVP wire pads with zero-MV candidates — phantom
+  constructed candidates ran garbage affine MC), and **§6.4.4
+  `checkPredModeY`** in the spatial-merge scan (a MODE_IBC
+  neighbour's block-vector record is not an inter merge candidate —
+  `IBC_A_2` stops ERRORING and decodes end-to-end).
+
+The 12 remaining FAIL rows diverge late and small (typically one
+sub-CU cluster per picture, chroma-first on several — e.g.
+`MMVD_A_3` is 21/300 pictures over a single ±1 chroma sample chain);
+the 9 UNSUPPORTED rows are subpictures, 4:2:2 / 4:4:4, explicit
+weighted prediction, per-slice loop-filter divergence and explicit
+§8.8.1 virtual boundaries (`GDR_A_2`'s real gate); the 1 ERROR row
+(`LOSSLESS_B_3`) trips an IBC reference-region guard on picture 0
+(under triage). `examples/triage_dbg` decodes one corpus stream
+against its `.opl` sidecar with optional plane dumps;
+`examples/decode_dump` writes POC-ordered YUV for fixture diffing;
+`examples/sps_dump` prints a stream's SPS tool-flag set; the
+`H266_DBG_*` env family (`_TB`, `_CCLM`, `_CU`, `_IBC`, `_MERGE`,
+`_MMVD`, `_DMVR`, `_SBTMVP`, `_AFFAMVP`, `_AFFCU`, `_AFFBI`,
+`_AFFUNI`, `_LMCS`, `_SHQP`, `_PIX`, `_RPL`) dumps per-CU pipeline
+state, and `H266_DUMP_PREFILTER` writes the pre-filter mapped-domain
+reconstruction per picture. The corpus triage remains the priority
+pick list.
 
 An inter-frame P-slice and B-slice encoder + decoder scaffold
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
