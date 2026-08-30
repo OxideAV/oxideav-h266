@@ -421,14 +421,26 @@ impl StreamDecoder {
                 sps.sps_chroma_format_idc
             )));
         }
-        if sps.tool_flags.virtual_boundaries_enabled_flag
-            && (sps.tool_flags.virtual_boundaries.is_some()
-                || ph.ph_virtual_boundaries_present_flag)
-        {
-            return Err(Error::unsupported(
-                "h266 stream: explicit §8.8.1 virtual boundaries not supported",
-            ));
-        }
+        // §7.4.3.4 / §7.4.3.7 eq. 77 — VirtualBoundariesPresentFlag and
+        // the VirtualBoundaryPosX / Y arrays (units of 8 luma samples).
+        let (vb_cols, vb_rows): (Vec<u32>, Vec<u32>) =
+            if sps.tool_flags.virtual_boundaries_enabled_flag {
+                if let Some(v) = sps.tool_flags.virtual_boundaries.as_ref() {
+                    (
+                        v.pos_x_minus1.iter().map(|p| (p + 1) * 8).collect(),
+                        v.pos_y_minus1.iter().map(|p| (p + 1) * 8).collect(),
+                    )
+                } else if let Some(v) = ph.ph_virtual_boundaries.as_ref() {
+                    (
+                        v.pos_x_minus1.iter().map(|p| (p + 1) * 8).collect(),
+                        v.pos_y_minus1.iter().map(|p| (p + 1) * 8).collect(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
         let is_irap = matches!(
             pic.nal_type,
@@ -626,6 +638,11 @@ impl StreamDecoder {
         walker.set_ph_mvd_l1_zero(ph.ph_mvd_l1_zero_flag);
         walker.set_ph_bdof_disabled(ph.ph_bdof_disabled_flag);
         walker.set_ph_dmvr_disabled(ph.ph_dmvr_disabled_flag);
+        if std::env::var_os("H266_DBG_TB").is_some() && !(vb_cols.is_empty() && vb_rows.is_empty())
+        {
+            eprintln!("VB dbg: cols={vb_cols:?} rows={vb_rows:?}");
+        }
+        walker.set_virtual_boundaries(vb_cols, vb_rows);
         walker.set_ph_prof_disabled(ph.ph_prof_disabled_flag);
         walker.set_ph_mmvd_fullpel_only(ph.ph_mmvd_fullpel_only_flag);
         walker.set_ph_joint_cbcr_sign(ph.ph_joint_cbcr_sign_flag);
@@ -700,7 +717,10 @@ impl StreamDecoder {
                 sh0.sh_cr_tc_offset_div2,
             );
         }
-        if sh0.sh_lmcs_used_flag {
+        // §7.4.8 — sh_lmcs_used_flag is per slice (LMCS_A_3 mixes on /
+        // off slices in one picture): bind the PH-referenced payload
+        // whenever ANY slice of the picture uses it.
+        if pic.slices.iter().any(|sh| sh.sh_lmcs_used_flag) {
             let data = self.lmcs_apss.get(&ph.ph_lmcs_aps_id).ok_or_else(|| {
                 Error::invalid(format!(
                     "h266 stream: LMCS APS id {} not seen",

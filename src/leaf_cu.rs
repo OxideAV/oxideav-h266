@@ -3895,8 +3895,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
     /// `transform_unit()` reads — per-TU chroma CBFs, an ALWAYS-coded
     /// `tu_y_coded_flag` (the `CbWidth > MaxTbSizeY ||
     /// CbHeight > MaxTbSizeY` presence arm), the once-per-CU
-    /// `cu_qp_delta` / `cu_chroma_qp_offset` (the same >64 arm opens
-    /// their gates at the first TU regardless of CBFs), the per-TU
+    /// `cu_qp_delta` / `cu_chroma_qp_offset` (their gates open on the
+    /// literal `CbWidth > 64 || CbHeight > 64` arm or on a coded flag of
+    /// the TU at hand), the per-TU
     /// `tu_joint_cbcr_residual_flag`, and the per-TB residual walks.
     /// A tiled luma TB never reads `transform_skip_flag` (one dim is
     /// the 64-sample MaxTbSizeY half > the 32-sample MaxTsSize cap);
@@ -3954,10 +3955,18 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 /*isp_split=*/ false,
                 /*prev_tu_cbf_y=*/ false,
             )?;
-            // §7.3.11.10 — the same >64 arm opens the cu_qp_delta /
-            // cu_chroma_qp_offset gates unconditionally; only the
-            // first TU of the (QG-armed) CU reads them.
-            if self.tools.cu_qp_delta_enabled && !qp_delta_done {
+            // §7.3.11.10 — the cu_qp_delta / cu_chroma_qp_offset gates
+            // open on `CbWidth > 64 || CbHeight > 64` (a literal 64, NOT
+            // MaxTbSizeY) or on a coded flag of THIS TU: a 64-wide CU
+            // tiled at MaxTbSizeY = 32 waits for its first TU with a
+            // CBF (r453 — the old unconditional first-TU read desynced
+            // every sps_max_luma_transform_size_64_flag = 0 wire).
+            let big_cu = info.cb_width > 64 || info.cb_height > 64;
+            let tu_chroma_cbf = chroma_available && (tu.tu_cb_coded || tu.tu_cr_coded);
+            if self.tools.cu_qp_delta_enabled
+                && !qp_delta_done
+                && (big_cu || tu.tu_y_coded || tu_chroma_cbf)
+            {
                 info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
                 info.cu_qp_delta_read = true;
                 qp_delta_done = true;
@@ -3966,6 +3975,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 && !self.tools.cu_chroma_qp_offset_already_coded
                 && chroma_available
                 && !chroma_off_done
+                && (big_cu || tu_chroma_cbf)
             {
                 let (flag, idx) = read_cu_chroma_qp_offset(
                     self.dec,

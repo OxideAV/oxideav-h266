@@ -277,9 +277,8 @@ pub fn apply_alf_clipped(
     // r429 — per-CTB luma / chroma fetch-clip rectangles: the picture
     // by default, the containing tile when tile_bounds is installed.
     let (luma_w_i, luma_h_i) = (out.luma.width as i32, out.luma.height as i32);
-    let luma_rect = move |rx: u32, ry: u32| -> (i32, i32, i32, i32) {
-        clip_rect_for_ctb(rx, ry, ctb_size_y, luma_w_i, luma_h_i, tile_bounds)
-    };
+    let regions_y = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, 1, 1);
+    let regions_c = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, sub_w, sub_h);
 
     for ry in 0..alf_pic.pic_height_in_ctbs_y {
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
@@ -290,13 +289,6 @@ pub fn apply_alf_clipped(
                     p.luma_on, p.luma_filt_set_idx, p.cb_on, p.cb_alt_idx, p.cr_on, p.cr_alt_idx, p.cc_cb_idc, p.cc_cr_idc
                 );
             }
-            let fetch_clip_y = luma_rect(rx, ry);
-            let fetch_clip_c = (
-                fetch_clip_y.0 / sub_w as i32,
-                fetch_clip_y.1 / sub_h as i32,
-                (fetch_clip_y.2 + sub_w as i32 - 1) / sub_w as i32,
-                (fetch_clip_y.3 + sub_h as i32 - 1) / sub_h as i32,
-            );
             if p.luma_on {
                 if let Some(filters) = resolve_luma_filter_set(p.luma_filt_set_idx, binding) {
                     // §8.8.5.3 — derive the per-4×4-sub-block (filtIdx,
@@ -307,7 +299,7 @@ pub fn apply_alf_clipped(
                         out.luma.stride,
                         out.luma.width as i32,
                         out.luma.height as i32,
-                        fetch_clip_y,
+                        regions_y.clone(),
                         rx,
                         ry,
                         ctb_size_y,
@@ -316,7 +308,7 @@ pub fn apply_alf_clipped(
                     apply_alf_luma_ctb(
                         &mut out.luma,
                         &luma_pre,
-                        fetch_clip_y,
+                        regions_y.clone(),
                         rx,
                         ry,
                         ctb_size_y,
@@ -336,7 +328,7 @@ pub fn apply_alf_clipped(
                             apply_alf_chroma_ctb(
                                 &mut out.cb,
                                 &cb_pre,
-                                fetch_clip_c,
+                                regions_c.clone(),
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -357,7 +349,7 @@ pub fn apply_alf_clipped(
                             apply_alf_chroma_ctb(
                                 &mut out.cr,
                                 &cr_pre,
-                                fetch_clip_c,
+                                regions_c.clone(),
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -381,7 +373,6 @@ pub fn apply_alf_clipped(
         for ry in 0..alf_pic.pic_height_in_ctbs_y {
             for rx in 0..alf_pic.pic_width_in_ctbs_y {
                 let p = alf_pic.get(rx, ry);
-                let fetch_clip_y = luma_rect(rx, ry);
                 if cfg.cc_cb_enabled && p.cc_cb_idc != 0 {
                     if let Some(aps) = binding.cc_cb_aps {
                         let filt_idx = (p.cc_cb_idc - 1) as usize;
@@ -393,7 +384,7 @@ pub fn apply_alf_clipped(
                                 out.luma.stride,
                                 out.luma.width as u32,
                                 out.luma.height as u32,
-                                fetch_clip_y,
+                                regions_y.clone(),
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -416,7 +407,7 @@ pub fn apply_alf_clipped(
                                 out.luma.stride,
                                 out.luma.width as u32,
                                 out.luma.height as u32,
-                                fetch_clip_y,
+                                regions_y.clone(),
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -450,7 +441,7 @@ fn apply_cc_alf_ctb(
     luma_stride: usize,
     luma_w: u32,
     luma_h: u32,
-    fetch_clip: (i32, i32, i32, i32),
+    fetch_clip: impl Into<ClipRegions>,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -469,12 +460,14 @@ fn apply_cc_alf_ctb(
     let half = 1i32 << (bit_depth - 1);
     let _ = luma_w;
     let ph = luma_h as i32;
+    let regions: ClipRegions = fetch_clip.into();
 
     for y in 0..j_max {
         for x in 0..i_max {
             // Map chroma → luma per eq. 1510.
             let xl = ((x_ctb_c + x) as i32) * (sub_w as i32);
             let yl = ((y_ctb_c + y) as i32) * (sub_h as i32);
+            let fetch_clip = regions.rect_at(xl, yl);
 
             // Table 47 yP1 / yP2: in the single-slice / no-virtual-
             // boundary scaffold `applyAlfLineBufBoundary` is treated as
@@ -652,7 +645,7 @@ pub fn resolve_clip_value(bit_depth: u32, clip_idx: u8) -> i32 {
 fn apply_alf_luma_ctb(
     plane: &mut PicturePlane,
     pre: &[u16],
-    fetch_clip: (i32, i32, i32, i32),
+    fetch_clip: impl Into<ClipRegions>,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -666,11 +659,13 @@ fn apply_alf_luma_ctb(
     let i_max = (ctb_size_y as usize).min(plane.width.saturating_sub(x_ctb));
     let j_max = (ctb_size_y as usize).min(plane.height.saturating_sub(y_ctb));
     let max_val = (1i32 << bit_depth) - 1;
+    let regions: ClipRegions = fetch_clip.into();
 
     for j in 0..j_max {
         for i in 0..i_max {
             let xs = (x_ctb + i) as i32;
             let ys = (y_ctb + j) as i32;
+            let fetch_clip = regions.rect_at(xs, ys);
             // §8.8.5.3 — every 4×4 sub-block shares one (filtIdx,
             // transposeIdx). Look up the entry for this pixel.
             let sx = i >> 2;
@@ -824,7 +819,7 @@ pub(crate) fn derive_luma_classification(
     stride: usize,
     _pw: i32,
     ph: i32,
-    fetch_clip: (i32, i32, i32, i32),
+    fetch_clip: impl Into<ClipRegions>,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -835,6 +830,7 @@ pub(crate) fn derive_luma_classification(
     let ctb = ctb_size_y as i32;
     let sub_size = (ctb_size_y as usize) >> 2;
     let mut out = LumaClassification::new(ctb_size_y);
+    let regions: ClipRegions = fetch_clip.into();
 
     // The line-buffer carve-outs activate when the spec's "boundary
     // condition" is met. For our single-slice / picture-only scaffold:
@@ -860,6 +856,9 @@ pub(crate) fn derive_luma_classification(
         for sx in 0..sub_size {
             let x4 = (sx as i32) << 2;
             let y4 = (sy as i32) << 2;
+            // §8.8.5.3 — the clip positions of the sub-block's own
+            // origin bound the whole 8x8 gradient window.
+            let fetch_clip = regions.rect_at(x_ctb + x4, y_ctb + y4);
 
             // §8.8.5.3 — derive (minY, maxY, ac) from y4.
             let (min_y, max_y, ac) = if y4 == ctb - 8 && carve_out_active {
@@ -1014,7 +1013,7 @@ pub(crate) fn derive_luma_classification(
 fn apply_alf_chroma_ctb(
     plane: &mut PicturePlane,
     pre: &[u16],
-    fetch_clip: (i32, i32, i32, i32),
+    fetch_clip: impl Into<ClipRegions>,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -1036,10 +1035,12 @@ fn apply_alf_chroma_ctb(
     for k in 0..ALF_CHROMA_NUM_COEFF {
         c[k] = resolve_clip_value(bit_depth, clip_idx[k]);
     }
+    let regions: ClipRegions = fetch_clip.into();
     for j in 0..j_max {
         for i in 0..i_max {
             let xs = (x_ctb_c + i) as i32;
             let ys = (y_ctb_c + j) as i32;
+            let fetch_clip = regions.rect_at(xs, ys);
             let (alf_shift_c, y1, y2) = table_46(j as i32, ctb_h_c as i32, true);
             let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
             let clip = |k: usize, dx: i32, dy: i32| -> i32 {
@@ -1068,38 +1069,89 @@ fn apply_alf_chroma_ctb(
 /// `(rx, ry)`: the containing tile's rectangle (from the §6.5.1
 /// boundary prefix lists) intersected with the picture, or the whole
 /// picture when no tile bounds are installed.
-fn clip_rect_for_ctb(
-    rx: u32,
-    ry: u32,
-    ctb_size_y: u32,
-    pw: i32,
-    ph: i32,
-    tile_bounds: Option<(&[u32], &[u32])>,
-) -> (i32, i32, i32, i32) {
-    let Some((col_bd, row_bd)) = tile_bounds else {
-        return (0, 0, pw, ph);
-    };
-    let x = rx * ctb_size_y;
-    let y = ry * ctb_size_y;
-    let span = |bds: &[u32], v: u32, max: i32| -> (i32, i32) {
-        for w in bds.windows(2) {
-            if v >= w[0] && v < w[1] {
-                return (w[0] as i32, (w[1] as i32).min(max));
-            }
-        }
-        (0, max)
-    };
-    let (x0, x1) = span(col_bd, x, pw);
-    let (y0, y1) = span(row_bd, y, ph);
-    (x0, y0, x1, y1)
+/// §8.8.5.5 / §8.8.4.2 boundary regions for the loop-filter fetches.
+///
+/// With `bounds == None` every fetch clips to the fixed `rect`
+/// (component units — the whole plane, or a test rectangle). With the
+/// luma-unit boundary prefix lists set, the clip rectangle is the
+/// region containing the SAMPLE being filtered: for CTB-aligned tile /
+/// slice boundaries that is the tile / slice rectangle, and for the
+/// §8.8.1 explicit virtual boundaries (multiples of 8, mid-CTB) it is
+/// the strip between the neighbouring boundaries — equivalent to the
+/// §8.8.5.5 `clipTopPos / clipBottomPos / clipLeftPos / clipRightPos`
+/// distance rules for every filter support this crate applies (7x7
+/// luma, 5x5 chroma, the CC-ALF cross, the SAO neighbour pair).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClipRegions {
+    rect: (i32, i32, i32, i32),
+    bounds: Option<(Vec<u32>, Vec<u32>)>,
+    luma_w: i32,
+    luma_h: i32,
+    sub_w: i32,
+    sub_h: i32,
 }
 
-/// Sample read with boundary clipping (§8.8.5.2 / §8.8.5.4 eqs.
-/// 1446 / 1447 / 1485 / 1486 picture clamp, generalised in r429 to a
-/// half-open rectangle so the §8.8.5.5 tile-boundary positions —
-/// `pps_loop_filter_across_tiles_enabled_flag == 0` — apply the
-/// §8.8.5.6 padding: coordinates clamp at the current tile's edges
-/// exactly like at picture edges).
+impl From<(i32, i32, i32, i32)> for ClipRegions {
+    fn from(rect: (i32, i32, i32, i32)) -> Self {
+        Self {
+            rect,
+            bounds: None,
+            luma_w: rect.2,
+            luma_h: rect.3,
+            sub_w: 1,
+            sub_h: 1,
+        }
+    }
+}
+
+impl ClipRegions {
+    /// Regions for a component plane of a `luma_w` x `luma_h` picture
+    /// subsampled by (`sub_w`, `sub_h`); `bounds` are the luma-unit
+    /// boundary prefix lists (`0`, interior boundaries, picture extent).
+    pub(crate) fn new(
+        bounds: Option<(&[u32], &[u32])>,
+        luma_w: i32,
+        luma_h: i32,
+        sub_w: u32,
+        sub_h: u32,
+    ) -> Self {
+        let (sw, sh) = (sub_w as i32, sub_h as i32);
+        Self {
+            rect: (0, 0, (luma_w + sw - 1) / sw, (luma_h + sh - 1) / sh),
+            bounds: bounds.map(|(c, r)| (c.to_vec(), r.to_vec())),
+            luma_w,
+            luma_h,
+            sub_w: sw,
+            sub_h: sh,
+        }
+    }
+
+    /// Clip rectangle (component units, half-open) for the region
+    /// containing component sample `(x, y)`.
+    #[inline]
+    pub(crate) fn rect_at(&self, x: i32, y: i32) -> (i32, i32, i32, i32) {
+        let Some((col_bd, row_bd)) = &self.bounds else {
+            return self.rect;
+        };
+        let span = |bds: &[u32], v: i32, max: i32| -> (i32, i32) {
+            for w in bds.windows(2) {
+                if v >= w[0] as i32 && v < w[1] as i32 {
+                    return (w[0] as i32, (w[1] as i32).min(max));
+                }
+            }
+            (0, max)
+        };
+        let (x0, x1) = span(col_bd, x * self.sub_w, self.luma_w);
+        let (y0, y1) = span(row_bd, y * self.sub_h, self.luma_h);
+        (
+            x0 / self.sub_w,
+            y0 / self.sub_h,
+            (x1 + self.sub_w - 1) / self.sub_w,
+            (y1 + self.sub_h - 1) / self.sub_h,
+        )
+    }
+}
+
 #[inline]
 fn sample(buf: &[u16], stride: usize, fetch_clip: (i32, i32, i32, i32), x: i32, y: i32) -> u16 {
     let (x0, y0, x1, y1) = fetch_clip;

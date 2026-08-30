@@ -425,25 +425,25 @@ pub fn apply_sao_clipped(
             let p = sao_pic.get(rx, ry);
             // r429 — the containing tile's rectangle (luma samples),
             // when the across-tiles gate is active.
-            let clip_y: Option<(i32, i32, i32, i32)> = tile_bounds.map(|(col_bd, row_bd)| {
-                let span = |bds: &[u32], v: u32, max: i32| -> (i32, i32) {
-                    for wnd in bds.windows(2) {
-                        if v >= wnd[0] && v < wnd[1] {
-                            return (wnd[0] as i32, (wnd[1] as i32).min(max));
-                        }
-                    }
-                    (0, max)
-                };
-                let (x0, x1) = span(col_bd, rx * ctb_size_y, out.luma.width as i32);
-                let (y0, y1) = span(row_bd, ry * ctb_size_y, out.luma.height as i32);
-                (x0, y0, x1, y1)
+            // r429 / r453 — the region containing each SAMPLE (tile /
+            // slice rectangles, or the strips between §8.8.1 virtual
+            // boundaries) gates the §8.8.4.2 neighbour reads.
+            let clip_y = tile_bounds.map(|b| {
+                crate::alf::ClipRegions::new(
+                    Some(b),
+                    out.luma.width as i32,
+                    out.luma.height as i32,
+                    1,
+                    1,
+                )
             });
-            let clip_c = clip_y.map(|(x0, y0, x1, y1)| {
-                (
-                    x0 / sub_w as i32,
-                    y0 / sub_h as i32,
-                    (x1 + sub_w as i32 - 1) / sub_w as i32,
-                    (y1 + sub_h as i32 - 1) / sub_h as i32,
+            let clip_c = tile_bounds.map(|b| {
+                crate::alf::ClipRegions::new(
+                    Some(b),
+                    out.luma.width as i32,
+                    out.luma.height as i32,
+                    sub_w,
+                    sub_h,
                 )
             });
             if cfg.luma_used && p.luma.sao_type_idx != SaoTypeIdx::NotApplied {
@@ -451,7 +451,7 @@ pub fn apply_sao_clipped(
                 apply_sao_ctb(
                     &mut out.luma,
                     pre,
-                    clip_y,
+                    clip_y.clone(),
                     rx,
                     ry,
                     ctb_size_y,
@@ -468,7 +468,7 @@ pub fn apply_sao_clipped(
                     apply_sao_ctb(
                         &mut out.cb,
                         pre,
-                        clip_c,
+                        clip_c.clone(),
                         rx,
                         ry,
                         n_ctb_sw,
@@ -482,7 +482,7 @@ pub fn apply_sao_clipped(
                     apply_sao_ctb(
                         &mut out.cr,
                         pre,
-                        clip_c,
+                        clip_c.clone(),
                         rx,
                         ry,
                         n_ctb_sw,
@@ -504,7 +504,7 @@ pub fn apply_sao_clipped(
 fn apply_sao_ctb(
     plane: &mut PicturePlane,
     pre: &[u16],
-    eo_clip: Option<(i32, i32, i32, i32)>,
+    eo_clip: Option<crate::alf::ClipRegions>,
     rx: u32,
     ry: u32,
     n_ctb_sw: u32,
@@ -552,7 +552,8 @@ fn apply_sao_ctb(
                     // pps_loop_filter_across_tiles_enabled_flag == 0 a
                     // neighbour sample in a different tile also forces
                     // edgeIdx = 0.
-                    if let Some((cx0, cy0, cx1, cy1)) = eo_clip {
+                    if let Some(regions) = &eo_clip {
+                        let (cx0, cy0, cx1, cy1) = regions.rect_at(xs, ys);
                         outside = outside
                             || nx0 < cx0
                             || ny0 < cy0

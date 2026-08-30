@@ -1138,6 +1138,16 @@ pub struct CtuWalker<'a, 'b> {
     /// `pps_loop_filter_across_slices_enabled_flag == 0` boundary
     /// derivation.
     slice_ctb_id: Vec<u16>,
+    /// `sh_lmcs_used_flag` per slice id (index = the id written into
+    /// `slice_ctb_id`) — the §8.8.2.2 "slice that contains the luma
+    /// sample" gate of the picture inverse mapping.
+    slice_lmcs_used: Vec<bool>,
+    /// §7.4.3.4 / §7.4.3.7 `VirtualBoundaryPosX[ ]` / `VirtualBoundaryPosY[ ]`
+    /// (luma samples) when `VirtualBoundariesPresentFlag == 1`: the
+    /// §8.8.3.5 bS = 0 edges, the §8.8.4.2 edgeIdx = 0 neighbours and
+    /// the §8.8.5.5 ALF clip positions — all served by the same
+    /// boundary lists the tile / slice gating uses.
+    virtual_boundaries: (Vec<u32>, Vec<u32>),
     /// r431 — index of the slice currently being decoded.
     cur_slice_id: u16,
     /// r429 — Table 51 `initType` (0 = I, 1/2 from the slice type +
@@ -1405,6 +1415,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             first_ctb_row_in_slice: true,
             wpp_ctx_store: None,
             palette_pred: crate::palette::PalettePredictor::new(),
+            // §8.8.2.2 — slice id 0 (this constructor's slice).
+            slice_lmcs_used: vec![sh.sh_lmcs_used_flag],
+            virtual_boundaries: (Vec::new(), Vec::new()),
             slice_ctb_id: vec![
                 u16::MAX;
                 (layout.pic_width_in_ctbs_y * layout.pic_height_in_ctbs_y) as usize
@@ -1464,7 +1477,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             && old.sh_alf_cc_cb_aps_id == sh.sh_alf_cc_cb_aps_id
             && old.sh_alf_cc_cr_enabled_flag == sh.sh_alf_cc_cr_enabled_flag
             && old.sh_alf_cc_cr_aps_id == sh.sh_alf_cc_cr_aps_id
-            && old.sh_lmcs_used_flag == sh.sh_lmcs_used_flag
             && old.sh_explicit_scaling_list_used_flag == sh.sh_explicit_scaling_list_used_flag
             && old.sh_cb_qp_offset == sh.sh_cb_qp_offset
             && old.sh_cr_qp_offset == sh.sh_cr_qp_offset
@@ -1485,6 +1497,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         self.sh = sh;
         self.cur_slice_id += 1;
+        // §8.8.2.2 — remember this slice's sh_lmcs_used_flag for the
+        // per-sample inverse-mapping gate of the §8.8.1 step-1 pass.
+        let sid = self.cur_slice_id as usize;
+        if self.slice_lmcs_used.len() <= sid {
+            self.slice_lmcs_used.resize(sid + 1, false);
+        }
+        self.slice_lmcs_used[sid] = sh.sh_lmcs_used_flag;
         let slice_qp = SliceQpY::derive(self.sps, self.pps, sh, ph_qp_delta);
         self.init_type = match sh.sh_slice_type {
             SliceType::I => 0,
@@ -2538,6 +2557,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// side MV refinement per 16×16 sub-block before motion compensation.
     /// Defaults to `true` (DMVR off) so callers that have not wired the
     /// bit keep the round-31 byte-for-byte pipeline.
+    /// §7.4.3.4 / §7.4.3.7 — the picture's explicit virtual boundaries
+    /// (`VirtualBoundaryPosX[ ]`, `VirtualBoundaryPosY[ ]` in luma
+    /// samples). Empty = `VirtualBoundariesPresentFlag == 0`.
+    pub fn set_virtual_boundaries(&mut self, cols: Vec<u32>, rows: Vec<u32>) {
+        self.virtual_boundaries = (cols, rows);
+    }
+
     pub fn set_ph_dmvr_disabled(&mut self, disabled: bool) {
         self.ph_dmvr_disabled = disabled;
     }
@@ -12806,16 +12832,38 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // domain; every sample is inverse-mapped via the §8.8.2.2
         // eqs. 1222 / 1223 fold (the §8.8.2.2 `sh_lmcs_used_flag == 0`
         // arm makes the pass an identity, i.e. it is skipped).
-        if self.lmcs_active() {
-            let l = self.lmcs.as_ref().expect("lmcs_active checked is_some");
+        // §8.8.2.2 — the gate is the sh_lmcs_used_flag of the SLICE
+        // containing each sample (r453: a picture may mix LMCS-on and
+        // LMCS-off slices), so the pass walks CTB by CTB through the
+        // slice map.
+        let cur_lmcs = self.sh.sh_lmcs_used_flag;
+        if let Some(l) = self
+            .lmcs
+            .as_ref()
+            .filter(|_| cur_lmcs || self.slice_lmcs_used.iter().any(|&b| b))
+        {
             let plane = &mut out.luma;
-            for row in 0..plane.height {
-                for col in 0..plane.width {
-                    let idx = row * plane.stride + col;
-                    let s = u32::from(plane.samples[idx]);
-                    let iy = l.derived.idx_y_inv(s, l.min_bin_idx, l.max_bin_idx);
-                    let v = l.derived.inverse_map_luma_sample(s, iy);
-                    plane.samples[idx] = v as u16;
+            let ctb = self.layout.ctb_size_y as usize;
+            let w_ctbs = self.layout.pic_width_in_ctbs_y as usize;
+            for (cell, &sid) in self.slice_ctb_id.iter().enumerate() {
+                if !self
+                    .slice_lmcs_used
+                    .get(sid as usize)
+                    .copied()
+                    .unwrap_or(cur_lmcs)
+                {
+                    continue;
+                }
+                let x0 = (cell % w_ctbs) * ctb;
+                let y0 = (cell / w_ctbs) * ctb;
+                for row in y0..(y0 + ctb).min(plane.height) {
+                    for col in x0..(x0 + ctb).min(plane.width) {
+                        let idx = row * plane.stride + col;
+                        let s = u32::from(plane.samples[idx]);
+                        let iy = l.derived.idx_y_inv(s, l.min_bin_idx, l.max_bin_idx);
+                        let v = l.derived.inverse_map_luma_sample(s, iy);
+                        plane.samples[idx] = v as u16;
+                    }
                 }
             }
         }
@@ -12875,7 +12923,36 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // Combined SAO / ALF clip bounds: 0 + every gated interior
         // line + the picture extents (the r429 tile-only path passed
         // the tile prefix lists; the union keeps that shape).
+        // §8.8.1 explicit virtual boundaries — §8.8.3.5 sets bS = 0 on
+        // the coinciding edges, §8.8.4.2 forces edgeIdx = 0 across them
+        // and §8.8.5.5 / §8.8.5.6 clip the ALF / CC-ALF fetches at
+        // them: the same three treatments the tile / slice gating
+        // applies, so the positions join the same lists.
+        let (vb_cols, vb_rows) = (
+            self.virtual_boundaries.0.clone(),
+            self.virtual_boundaries.1.clone(),
+        );
+        let vb_gating = !(vb_cols.is_empty() && vb_rows.is_empty());
+        if vb_gating {
+            no_filter_cols.extend(
+                vb_cols
+                    .iter()
+                    .copied()
+                    .filter(|&x| x > 0 && x < self.layout.pic_width_luma),
+            );
+            no_filter_rows.extend(
+                vb_rows
+                    .iter()
+                    .copied()
+                    .filter(|&y| y > 0 && y < self.layout.pic_height_luma),
+            );
+            no_filter_cols.sort_unstable();
+            no_filter_cols.dedup();
+            no_filter_rows.sort_unstable();
+            no_filter_rows.dedup();
+        }
         let clip_bounds: Option<(Vec<u32>, Vec<u32>)> = if tile_lf_bounds.is_some()
+            || vb_gating
             || (slice_gating && !(no_filter_cols.is_empty() && no_filter_rows.is_empty()))
         {
             let mut c = vec![0u32];

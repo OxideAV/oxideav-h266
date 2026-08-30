@@ -645,16 +645,16 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("DEBLOCKING_E_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("DMVR_A_3", 'P'),            // byte-exact (r453 §8.5.6.3 eq. 5 ClipH reference wraparound)
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
-    ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
-    ("GPM_A_3", 'P'),             // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
-    ("IBC_A_2", 'F'),             // 12/17 pictures diverge (first poc 5 planes Cb+Cr; not the
+    ("GDR_A_2", 'P'), // byte-exact (r453 §8.8.1 explicit virtual boundaries: bS = 0 / edgeIdx = 0 / ALF clip regions)
+    ("GPM_A_3", 'P'), // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
+    ("IBC_A_2", 'F'), // 12/17 pictures diverge (first poc 5 planes Cb+Cr; not the
     // §8.8.3.6.9 margin family — poc 5 has no strong-chroma units)
     ("ISP_A_3", 'P'),      // byte-exact (r449)
     ("JCCR_A_2", 'P'),     // byte-exact (r450 CIIP chroma gate + per-TB joint deblock QP)
     ("JCCR_C_3", 'P'),     // byte-exact (r450 §8.5.2.3 raw-availability pruning)
     ("LFNST_A_4", 'P'),    // byte-exact (r449)
     ("LFNST_B_4", 'P'),    // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
-    ("LMCS_A_3", 'U'),     // per-slice loop-filter parameter divergence
+    ("LMCS_A_3", 'P'),     // byte-exact (r453 §8.8.2.2 per-slice sh_lmcs_used_flag inverse mapping)
     ("LMCS_B_2", 'U'),     // subpictures
     ("LMCS_C_1", 'P'),     // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("LOSSLESS_B_3", 'P'), // byte-exact (r452 §9.3.3.6 limited-EGk escape)
