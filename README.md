@@ -661,13 +661,21 @@ produces them, an independent black-box decoder is the oracle, and
   neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
   their 4-point model from oversampled positions).
 
-Scorecard (r437 → r440 → r443 → r447 → r449 → r450 → r452): 0 P / 2 F / 8 U / 46 E →
+Scorecard (r437 → r440 → r443 → r447 → r449 → r450 → r452 → r453):
+0 P / 2 F / 8 U / 46 E →
 1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
 2 P / 17 F / 8 U / 29 E → 14 P / 31 F / 9 U / 2 E →
-34 P / 12 F / 9 U / 1 E →
-**43 PASS / 4 FAIL / 9 UNSUPPORTED / 0 ERROR** — nine more streams
-went byte-exact in r452 and the ERROR column is empty (see the r452
-block below); twenty streams flipped in r450. In r449
+34 P / 12 F / 9 U / 1 E → 43 P / 4 F / 9 U / 0 E →
+**50 PASS / 1 FAIL / 5 UNSUPPORTED / 0 ERROR** — r453 closed the r452
+chroma-deblock margin family (§8.8.3.6.4's QpP/QpQ are per TRANSFORM
+BLOCK: a >MaxTbSizeY tile or SBT sub-TU with `TuCResMode == 2`
+deblocks with `Qp′CbCr`, one β step under `Qp′Cb` at
+`pps_joint_cbcr_qp_offset_value = -1` — exactly the strong/weak flip;
+`DEBLOCKING_A_3` / `MMVD_A_3` / `SLICES_A_3` went byte-exact) and
+landed reference wraparound (`DMVR_A_3`), explicit WP on affine /
+SbTMVP + the §7.3.11.5 `bcw_idx` weight-flag gate (`WP_A_3`),
+per-slice LMCS inverse mapping (`LMCS_A_3`) and §8.8.1 explicit
+virtual boundaries (`GDR_A_2`). In r449
 `DMVR_B_4` joined
 `CodingToolsSets_A_2` as byte-exact, and the r443 "affine non-merge"
 gate (the largest U family) is DISSOLVED. r447's root causes, each
@@ -852,28 +860,48 @@ fixture wire that now decodes byte-exactly:
   Log2TransformRange`); the unlimited reader desynced on every level
   beyond 2^14 (`LOSSLESS_B_3`'s QpY-0 64×64 DC level), which is what
   the "IBC reference-region" ERROR was. `LOSSLESS_B_3` is byte-exact.
-* **§8.5.6.6.3 explicit weighted prediction** on the translational
-  inter path (§7.4.9 tables incl. the eq. 144 chroma-offset fold, the
-  eqs. 992 – 994 composition from the high-precision arrays, the
-  §8.5.1 weight-flag gates on DMVR / BDOF). Affine / sub-block-merge /
-  GPM CUs under signalled weights and **reference picture wraparound**
-  (`pps_ref_wraparound_enabled_flag`) are explicit refusals.
+* **§8.5.6.6.3 explicit weighted prediction** — the translational
+  path (§7.4.9 tables incl. the eq. 144 chroma-offset fold, the
+  eqs. 992 – 994 composition, the §8.5.1 weight-flag gates on
+  DMVR / BDOF); r453 added the affine (AMVP + merge) and SbTMVP
+  compositions, the §7.3.11.5 `bcw_idx` presence gate on the
+  slice's weight flags (resolved through `RefIdxSymLX`), and the
+  ruling that GPM never takes §8.5.6.6 (§8.5.7.1 feeds §8.5.7.2
+  directly).
+* **§8.5.6.3 reference picture wraparound** (r453) — eq. 5
+  `ClipH( PpsRefWraparoundOffset * MinCbSizeY, picW, x )` before the
+  picture clamp on every horizontal reference fetch (luma / chroma
+  interpolation, the DMVR bilinear search and its bounded final MC —
+  fetched through `ClipH` with the wrap suspended on the local
+  patch — the BDOF border fetch, affine sub-blocks).
+* **§8.8.2.2 per-slice LMCS** (r453) — the picture inverse mapping is
+  gated by the `sh_lmcs_used_flag` of the slice containing each
+  sample (CTB-by-CTB through the slice map).
+* **§8.8.1 explicit virtual boundaries** (r453) — bS = 0 on
+  coinciding edges, SAO edgeIdx = 0 across them, ALF / CC-ALF
+  fetch clipping; the SAO / ALF clip rectangle is the region
+  containing each SAMPLE (`ClipRegions::rect_at`), which also serves
+  mid-CTB boundaries (multiples of 8).
 
-The 4 remaining FAIL rows share one signature: a two-sample chroma
-deblocking decision unit at the margin of the §8.8.3.6.9
-`Abs(p3 − p0) + Abs(q0 − q3) < (β >> 3)` term where the reference
-decode weak-filters and this decoder strong-filters
-(`DEBLOCKING_A_3` poc 8 chroma (444..445, 157..162); the same shape
-on `IBC_A_2`, `MMVD_A_3`, `SLICES_A_3`, and on a VVenC wire with all
-other loop filters off). The per-side QPs, β / tC, bS and
-`maxFilterLength` match the printed clauses and every global
-variant tried (4-sample units, shifted β / tC / QpC, unscaled-β′
-thresholds) breaks the 43 passing streams, so the divergence is
-local to those units and still open. The 9 UNSUPPORTED rows are
-subpictures (3), 4:2:2 / 4:4:4 (2), explicit WP on GPM / affine /
-sub-block CUs (`WP_A_3`), reference wraparound (`DMVR_A_3`),
-per-slice loop-filter divergence (`LMCS_A_3`) and explicit §8.8.1
-virtual boundaries (`GDR_A_2`). `examples/triage_dbg` decodes one
+The one remaining FAIL row is `IBC_A_2` (12/17 pictures diverge,
+Cb + Cr only, luma byte-exact throughout). The r452 margin signature
+is NOT the cause (its pictures carry zero §8.8.3.6.9 strong-chroma
+units, and no single-unit weak-flip or bS-off flip restores any md5 —
+906 hypothesis decodes). The divergence originates in the pictures
+that contain LOCAL DUAL TREE (SCIPU) chroma CUs over IBC luma
+(decode-order-first poc 16: 43 DualTreeLuma-IBC + 14 DualTreeChroma
+CUs; the byte-exact pocs 1 – 4 contain none) and propagates by MC.
+Full-dual-tree I pictures and VVenC wires with inter-picture SCIPU
+chroma decode byte-exactly, so the defect is specific to this VTM-10
+wire's SCIPU shapes; whole-stage skips (chroma deblock / SAO / ALF /
+CC-ALF) do not restore the md5 either, so it sits in the chroma
+reconstruction of those regions. The 5 UNSUPPORTED rows are
+subpictures (3: `SUBPIC_C_1`, `CodingToolsSets_E_1`, `LMCS_B_2` —
+need the §7.3.2.4 subpic layout walk, per-subpic slice parameters
+and the treated-as-pic boundary semantics) and 4:2:2 / 4:4:4 (2:
+`10b422_B_5`, `8b444_A_2` — the SubWidthC / SubHeightC
+generalisation across intra chroma, MC, loop filters, LMCS and
+transforms). `examples/triage_dbg` decodes one
 corpus stream against its `.opl` sidecar with optional plane dumps;
 `examples/decode_dump` writes POC-ordered YUV for fixture diffing;
 `examples/sps_dump` prints a stream's SPS tool-flag set and every
@@ -881,7 +909,15 @@ PPS's partition / loop-filter / chroma-QP controls; the
 `H266_DBG_*` env family (`_TB`, `_CCLM`, `_CU`, `_IBC`, `_MERGE`,
 `_MMVD`, `_DMVR`, `_SBTMVP`, `_AFFAMVP`, `_AFFCU`, `_AFFBI`,
 `_AFFUNI`, `_LMCS`, `_SHQP`, `_PIX`, `_RPL`, `_SAO`, `_WP`,
-`_DBLK_CHROMA`) dumps per-CU pipeline state, `H266_DUMP_PREFILTER`
+`_DBLK_CHROMA`) dumps per-CU pipeline state; the r453 triage hooks
+`H266_DBG_DBLK_CSTRONG` / `H266_DBG_DBLK_CUNIT` list the chroma
+strong decisions / filtered units, `H266_DBG_CHROMA_FLIP=<pic>,<c>,<n>`
+and `H266_DBG_CHROMA_OFF=<pic>,<c>,<n>` force the n-th unit onto the
+weak / unfiltered path (the md5 hypothesis loop that pinned the r452
+margin unit), `H266_DBG_SKIP=<pic>,<stage>` (dbc / sao_c / alf_c /
+ccalf / dmvr / bdof) drops one stage for one picture, and
+`H266_DBG_WRAP=off` decodes as if `pps_ref_wraparound_enabled_flag`
+were 0. `H266_DUMP_PREFILTER`
 writes the pre-filter mapped-domain reconstruction per CVS / poc,
 `H266_DUMP_MIDLF` writes each deblocking pass's input, and
 `H266_DUMP_PARTIAL` keeps the partially reconstructed picture of a
