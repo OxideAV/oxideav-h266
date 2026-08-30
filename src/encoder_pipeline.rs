@@ -2507,6 +2507,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     let rc_opts = crate::residual::RcOpts {
         dep_quant: config.dep_quant,
         sign_data_hiding: config.sign_data_hiding,
+        log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
     };
 
     // --- Emit header NALs (VPS + SPS + PPS + PH) ---

@@ -555,6 +555,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: true,
             sign_data_hiding: false,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         for (w, h, qp) in [(8usize, 8usize, 26i32), (16, 16, 30), (4, 8, 22)] {
             let mut coeffs = vec![0i32; w * h];

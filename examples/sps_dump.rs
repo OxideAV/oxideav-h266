@@ -66,6 +66,13 @@ fn main() {
                     pps.pps_cu_qp_delta_enabled_flag,
                     pps.pps_init_qp_minus26,
                 );
+                println!(
+                    "  joint_cbcr_qp_offset_present={} joint_cbcr_qp_offset_value={} joint_list={:?} chroma_tool_offsets_present={}",
+                    pps.pps_joint_cbcr_qp_offset_present_flag,
+                    pps.pps_joint_cbcr_qp_offset_value,
+                    pps.pps_joint_cbcr_qp_offset_list,
+                    pps.pps_chroma_tool_offsets_present_flag,
+                );
                 if let Some(part) = &pps.partition {
                     println!(
                         "  tiles {}x{} cols={:?} rows={:?} lf_across_tiles={} slices={} \

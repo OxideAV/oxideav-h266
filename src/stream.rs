@@ -733,7 +733,23 @@ impl StreamDecoder {
                 walker.set_ref_pic_list_l1(Vec::new());
                 walker.set_temporal_mvp(poc, false, true, 0);
             }
-            walker.decode_picture_into(&mut out)?;
+            if let Err(e) = walker.decode_picture_into(&mut out) {
+                // Debug aid (`H266_DUMP_PARTIAL=dir`): keep the
+                // partially reconstructed picture of a failing decode
+                // for sample-level triage against an oracle.
+                if let Ok(dir) = std::env::var("H266_DUMP_PARTIAL") {
+                    let mut raw: Vec<u8> = Vec::new();
+                    for p in [&out.luma, &out.cb, &out.cr] {
+                        for y in 0..p.height {
+                            for &v in &p.samples[y * p.stride..y * p.stride + p.width] {
+                                raw.extend_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                    let _ = std::fs::write(format!("{dir}/partial_poc{poc}.yuv"), raw);
+                }
+                return Err(e);
+            }
             // `H266_DBG_IGNORE_EOS` (debug aid): downgrade a slice-end
             // marker mismatch to a warning so the reconstructed picture
             // can still be inspected against the conformance sidecars.

@@ -2885,6 +2885,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         crate::residual::RcOpts {
             dep_quant: self.sh.sh_dep_quant_used_flag,
             sign_data_hiding: self.sh.sh_sign_data_hiding_used_flag,
+            log2_transform_range: self.log2_transform_range(),
         }
     }
 

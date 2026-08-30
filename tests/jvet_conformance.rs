@@ -656,7 +656,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("LMCS_A_3", 'U'),            // per-slice loop-filter parameter divergence
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
+    ("LOSSLESS_B_3", 'P'),        // byte-exact (r452 §9.3.3.6 limited-EGk escape)
     ("MERGE_A_2", 'P'),           // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("MIP_A_3", 'P'),             // byte-exact (r449)
     ("MIP_B_3", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)

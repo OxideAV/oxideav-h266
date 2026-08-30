@@ -741,6 +741,36 @@ fn deblock_one_direction(
     edge_type: EdgeType,
     no_filter: &[u32],
 ) {
+    // Debug aid (`H266_DUMP_MIDLF=dir`): dump this plane's samples at
+    // the START of each pass (files count up: pass order is V then H
+    // per component), so the horizontal pass's decision inputs — the
+    // vertically-filtered intermediate — can be inspected offline.
+    if let Ok(dir) = std::env::var("H266_DUMP_MIDLF") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let pl = &plane.plane;
+        let mut raw: Vec<u8> = Vec::with_capacity(pl.width * pl.height * 2);
+        for y in 0..pl.height {
+            for &v in &pl.samples[y * pl.stride..y * pl.stride + pl.width] {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let _ = std::fs::write(
+            format!(
+                "{dir}/midlf_{n:04}_c{}_{}_{}x{}.bin",
+                plane.c_idx,
+                if edge_type == EdgeType::Vertical {
+                    "V"
+                } else {
+                    "H"
+                },
+                pl.width,
+                pl.height
+            ),
+            raw,
+        );
+    }
     for (idx, cu) in cus.iter().enumerate() {
         deblock_cu_dir(
             plane, cus, grid, mv_grid, idx as u32, cu, edge_type, no_filter,
@@ -991,11 +1021,19 @@ fn deblock_cu_dir(
                 let ey = qy / plane.sub_h as i32;
                 if std::env::var_os("H266_DBG_DBLK_CHROMA").is_some() {
                     eprintln!(
-                        "DBLKC c={} {} edge ({ex},{ey}) bS={b_s} mfl=({mfl_p},{mfl_q}) beta={beta} tc={tc} cu=({},{}) off={off}",
+                        "DBLKC c={} {} edge ({ex},{ey}) bS={b_s} mfl=({mfl_p},{mfl_q}) beta={beta} tc={tc} cu=({},{}) off={off} p_cu=({},{}) qpY=({},{}) qpC=({:?},{:?}) joint2=({},{})",
                         c_idx,
                         if vertical { "V" } else { "H" },
                         cu.x,
                         cu.y,
+                        p_cu.x,
+                        p_cu.y,
+                        p_cu.qp_y,
+                        q_cu.qp_y,
+                        p_cu.qp_c,
+                        q_cu.qp_c,
+                        p_cu.joint2_at(px, py),
+                        q_cu.joint2_at(qx, qy),
                     );
                 }
                 if vertical {

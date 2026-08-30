@@ -376,6 +376,44 @@ pub fn decode_coeff_abs_level_remaining(
     }
 }
 
+/// §9.3.3.6 limited k-th order Exp-Golomb bypass decode: at most
+/// `max_pre_ext_len` unary 1-bins; when the prefix reaches that cap no
+/// terminating 0-bin is coded and the suffix is a fixed
+/// `trunc_suffix_len` bits, otherwise the suffix is `preExtLen + k`
+/// bits after the 0-bin. `symbolVal = (((1 << preExtLen) − 1) << k) +
+/// suffix` (eq. 1541 inverse). The r452 conformance fix: the
+/// `abs_remainder[]` / `dec_abs_level[]` escapes are LIMITED EGk with
+/// `maxPreExtLen = 26 − Log2TransformRange` and `truncSuffixLen =
+/// Log2TransformRange` (§9.3.3.11 / §9.3.3.12) — the unlimited
+/// decoder read the fixed suffix's leading 1-bits as more prefix on
+/// every level whose prefix hit the cap (LOSSLESS_B_3's first 64×64 TB
+/// at QpY 0 carries a DC level beyond 2^14).
+pub fn decode_limited_exp_golomb_k(
+    dec: &mut ArithDecoder<'_>,
+    k: u32,
+    max_pre_ext_len: u32,
+    trunc_suffix_len: u32,
+) -> Result<u32> {
+    let mut pre_ext_len = 0u32;
+    while pre_ext_len < max_pre_ext_len {
+        if dec.decode_bypass()? == 0 {
+            break;
+        }
+        pre_ext_len += 1;
+    }
+    let escape_length = if pre_ext_len == max_pre_ext_len {
+        trunc_suffix_len
+    } else {
+        pre_ext_len + k
+    };
+    let suffix = if escape_length > 0 {
+        dec.decode_bypass_bits(escape_length)?
+    } else {
+        0
+    };
+    Ok((((1u32 << pre_ext_len) - 1) << k) + suffix)
+}
+
 /// k-th order Exp-Golomb bypass decode (§9.3.3.5).
 pub fn decode_exp_golomb_k(dec: &mut ArithDecoder<'_>, k: u32) -> Result<u32> {
     let mut log = 0u32;
@@ -552,11 +590,30 @@ pub(crate) fn q_state_advance(q_state: i32, abs_level: u32) -> i32 {
 ///
 /// The two are mutually exclusive by syntax: §7.3.7 only transmits
 /// `sh_sign_data_hiding_used_flag` when `sh_dep_quant_used_flag == 0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RcOpts {
     pub dep_quant: bool,
     pub sign_data_hiding: bool,
+    /// r452 — §7.4.3.22 eq. 106 `Log2TransformRange` (15 unless the
+    /// SPS range extension enables extended precision). Sizes the
+    /// §9.3.3.6 limited EGk escape of `abs_remainder[]` /
+    /// `dec_abs_level[]` (`maxPreExtLen = 26 − Log2TransformRange`,
+    /// `truncSuffixLen = Log2TransformRange`).
+    pub log2_transform_range: u32,
 }
+
+impl Default for RcOpts {
+    fn default() -> Self {
+        Self {
+            dep_quant: false,
+            sign_data_hiding: false,
+            log2_transform_range: DEFAULT_LOG2_TRANSFORM_RANGE,
+        }
+    }
+}
+
+/// `Log2TransformRange` without extended precision (§7.4.3.22 eq. 106).
+pub const DEFAULT_LOG2_TRANSFORM_RANGE: u32 = 15;
 
 /// Like [`decode_tb_coefficients_with_flags`] but with the slice-level
 /// residual-coding switches ([`RcOpts`]) live: dependent quantization
@@ -882,7 +939,7 @@ pub fn decode_tb_coefficients_opts_sbt(
                     4,
                     q_state,
                 );
-                let rem = decode_abs_remainder(dec, rice)?;
+                let rem = decode_abs_remainder(dec, rice, opts.log2_transform_range)?;
                 let new_abs = a1 + 2 * rem;
                 abs_level[(yc as usize) * n_tb_w + (xc as usize)] = new_abs;
             }
@@ -902,7 +959,7 @@ pub fn decode_tb_coefficients_opts_sbt(
                 0,
                 q_state,
             );
-            let dec_abs = decode_dec_abs_level(dec, rice)?;
+            let dec_abs = decode_dec_abs_level(dec, rice, opts.log2_transform_range)?;
             // dec_abs_level[n] encodes AbsLevel[xC][yC] offset by ZeroPos
             // (§7.4.11.11): when dec_abs_level == ZeroPos[n] then
             // AbsLevel is zero; when dec_abs_level < ZeroPos then
@@ -1026,10 +1083,14 @@ fn derive_rice_param(
 /// TR prefix with `cMax = 6 << cRiceParam` + optional limited-EGk
 /// suffix (order `cRiceParam + 1`). The prefix binarisation is pure
 /// bypass, so this function does not touch CABAC contexts.
-fn decode_abs_remainder(dec: &mut ArithDecoder<'_>, rice_param: u32) -> Result<u32> {
+fn decode_abs_remainder(
+    dec: &mut ArithDecoder<'_>,
+    rice_param: u32,
+    log2_transform_range: u32,
+) -> Result<u32> {
     // TR(cMax, rice): read up to (cMax >> rice) = 6 bypass bins. The
     // prefix "runs out" when 6 ones have been seen, in which case the
-    // suffix EGk(rice+1) adds the remainder.
+    // suffix limited-EGk(rice+1) adds the remainder.
     let mut prefix = 0u32;
     for _ in 0..6 {
         let b = dec.decode_bypass()?;
@@ -1047,16 +1108,27 @@ fn decode_abs_remainder(dec: &mut ArithDecoder<'_>, rice_param: u32) -> Result<u
         };
         return Ok((prefix << rice_param) + suffix);
     }
-    // Prefix is all-ones length 6 → suffix EGk present.
-    let egk = decode_exp_golomb_k(dec, rice_param + 1)?;
+    // Prefix is all-ones length 6 → suffix limited EGk present
+    // (§9.3.3.11: maxPreExtLen = 26 − Log2TransformRange,
+    // truncSuffixLen = Log2TransformRange).
+    let egk = decode_limited_exp_golomb_k(
+        dec,
+        rice_param + 1,
+        26u32.saturating_sub(log2_transform_range),
+        log2_transform_range,
+    )?;
     Ok((6u32 << rice_param) + egk)
 }
 
 /// §9.3.3.12 `dec_abs_level[]` binarisation decode. Same shape as
 /// [`decode_abs_remainder`] modulo the Rice-parameter derivation
 /// (baseLevel = 0, handled by the caller).
-fn decode_dec_abs_level(dec: &mut ArithDecoder<'_>, rice_param: u32) -> Result<u32> {
-    decode_abs_remainder(dec, rice_param)
+fn decode_dec_abs_level(
+    dec: &mut ArithDecoder<'_>,
+    rice_param: u32,
+    log2_transform_range: u32,
+) -> Result<u32> {
+    decode_abs_remainder(dec, rice_param, log2_transform_range)
 }
 
 /// §7.3.11.12 `residual_ts_coding()` — transform-skip residual coding.
@@ -1098,6 +1170,30 @@ pub fn decode_ts_tb_coefficients(
     ctxs: &mut ResidualCtxs,
     n_tb_w: usize,
     n_tb_h: usize,
+    c_idx: u32,
+    rice_idx: u32,
+    bdpcm: bool,
+) -> Result<Vec<i32>> {
+    decode_ts_tb_coefficients_range(
+        dec,
+        ctxs,
+        n_tb_w,
+        n_tb_h,
+        c_idx,
+        rice_idx,
+        bdpcm,
+        DEFAULT_LOG2_TRANSFORM_RANGE,
+    )
+}
+
+/// [`decode_ts_tb_coefficients`] with the SPS `Log2TransformRange`
+/// live (the §9.3.3.11 limited-EGk escape of the TS `abs_remainder`).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_ts_tb_coefficients_range(
+    dec: &mut ArithDecoder<'_>,
+    ctxs: &mut ResidualCtxs,
+    n_tb_w: usize,
+    n_tb_h: usize,
     // `cIdx` is part of the §7.3.11.12 syntax-structure signature but the
     // transform-skip ctxInc derivations (§9.3.4.2.6/.8/.9/.10) use fixed
     // bases independent of the colour component, so it is unused here. It
@@ -1105,6 +1201,7 @@ pub fn decode_ts_tb_coefficients(
     _c_idx: u32,
     rice_idx: u32,
     bdpcm: bool,
+    log2_transform_range: u32,
 ) -> Result<Vec<i32>> {
     if !n_tb_w.is_power_of_two() || !n_tb_h.is_power_of_two() {
         return Err(Error::invalid(
@@ -1298,7 +1395,7 @@ pub fn decode_ts_tb_coefficients(
                 || (!in_pass2 && in_pass1 && abs_level_pass1[at(xc, yc)] >= 2)
                 || (!in_pass1 && coded);
             let rem = if read_rem {
-                decode_abs_remainder(dec, rice_idx)?
+                decode_abs_remainder(dec, rice_idx, log2_transform_range)?
             } else {
                 0
             };
@@ -1532,7 +1629,7 @@ mod tests {
     fn decode_dec_abs_level_zero_stream() {
         let data = [0u8; 16];
         let mut dec = ArithDecoder::new(&data).unwrap();
-        let v = decode_dec_abs_level(&mut dec, 2).unwrap();
+        let v = decode_dec_abs_level(&mut dec, 2, DEFAULT_LOG2_TRANSFORM_RANGE).unwrap();
         assert_eq!(v, 0);
     }
 
@@ -1548,7 +1645,7 @@ mod tests {
         let data = [0u8; 16];
         let mut dec = ArithDecoder::new(&data).unwrap();
         // Zero stream → prefix=0 → value=0.
-        let v = decode_abs_remainder(&mut dec, 2).unwrap();
+        let v = decode_abs_remainder(&mut dec, 2, DEFAULT_LOG2_TRANSFORM_RANGE).unwrap();
         assert_eq!(v, 0);
     }
 

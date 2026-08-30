@@ -2163,7 +2163,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     info.intra_bdpcm_chroma
                 };
                 let levels = if ts && !self.tools.ts_residual_coding_disabled {
-                    crate::residual::decode_ts_tb_coefficients(
+                    crate::residual::decode_ts_tb_coefficients_range(
                         self.dec,
                         &mut self.ctxs.residual,
                         cw,
@@ -2171,6 +2171,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         c_idx,
                         self.tools.ts_residual_coding_rice_idx,
                         info.intra_bdpcm_chroma,
+                        self.tools.rc_opts.log2_transform_range,
                     )?
                 } else {
                     let (levels, flags) = decode_tb_coefficients_opts(
@@ -4003,7 +4004,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         false
                     };
                     let levels = if ts && !self.tools.ts_residual_coding_disabled {
-                        crate::residual::decode_ts_tb_coefficients(
+                        crate::residual::decode_ts_tb_coefficients_range(
                             self.dec,
                             &mut self.ctxs.residual,
                             cw,
@@ -4011,6 +4012,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                             c_idx,
                             self.tools.ts_residual_coding_rice_idx,
                             /*bdpcm=*/ false,
+                            self.tools.rc_opts.log2_transform_range,
                         )?
                     } else {
                         decode_tb_coefficients_opts(
@@ -4360,7 +4362,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             };
             info.transform_skip_luma = transform_skip;
             let levels = if transform_skip && !self.tools.ts_residual_coding_disabled {
-                crate::residual::decode_ts_tb_coefficients(
+                crate::residual::decode_ts_tb_coefficients_range(
                     self.dec,
                     &mut self.ctxs.residual,
                     cb_w,
@@ -4368,6 +4370,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     0,
                     self.tools.ts_residual_coding_rice_idx,
                     /*bdpcm=*/ false,
+                    self.tools.rc_opts.log2_transform_range,
                 )?
             } else {
                 decode_tb_coefficients_opts(
@@ -4447,7 +4450,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             };
             info.transform_skip_cb = ts;
             residual.cb_levels = if ts && !self.tools.ts_residual_coding_disabled {
-                crate::residual::decode_ts_tb_coefficients(
+                crate::residual::decode_ts_tb_coefficients_range(
                     self.dec,
                     &mut self.ctxs.residual,
                     cw,
@@ -4455,6 +4458,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     1,
                     self.tools.ts_residual_coding_rice_idx,
                     /*bdpcm=*/ false,
+                    self.tools.rc_opts.log2_transform_range,
                 )?
             } else {
                 decode_tb_coefficients_opts(
@@ -4479,7 +4483,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             };
             info.transform_skip_cr = ts;
             residual.cr_levels = if ts && !self.tools.ts_residual_coding_disabled {
-                crate::residual::decode_ts_tb_coefficients(
+                crate::residual::decode_ts_tb_coefficients_range(
                     self.dec,
                     &mut self.ctxs.residual,
                     cw,
@@ -4487,6 +4491,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     2,
                     self.tools.ts_residual_coding_rice_idx,
                     /*bdpcm=*/ false,
+                    self.tools.rc_opts.log2_transform_range,
                 )?
             } else {
                 decode_tb_coefficients_opts(
@@ -4651,7 +4656,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // residual_coding() path runs (which still carries the LFNST /
             // MTS gating flags).
             let levels = if transform_skip && !self.tools.ts_residual_coding_disabled {
-                crate::residual::decode_ts_tb_coefficients(
+                crate::residual::decode_ts_tb_coefficients_range(
                     self.dec,
                     &mut self.ctxs.residual,
                     cb_w,
@@ -4659,6 +4664,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     0,
                     self.tools.ts_residual_coding_rice_idx,
                     /*bdpcm=*/ info.intra_bdpcm_luma,
+                    self.tools.rc_opts.log2_transform_range,
                 )?
             } else {
                 let (levels, flags) = decode_tb_coefficients_opts(
@@ -4708,7 +4714,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 };
                 info.transform_skip_cb = ts;
                 let levels = if ts && !self.tools.ts_residual_coding_disabled {
-                    crate::residual::decode_ts_tb_coefficients(
+                    crate::residual::decode_ts_tb_coefficients_range(
                         self.dec,
                         &mut self.ctxs.residual,
                         cw,
@@ -4716,6 +4722,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         1,
                         self.tools.ts_residual_coding_rice_idx,
                         info.intra_bdpcm_chroma,
+                        self.tools.rc_opts.log2_transform_range,
                     )?
                 } else {
                     let (levels, flags) = decode_tb_coefficients_opts(
@@ -4753,7 +4760,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 };
                 info.transform_skip_cr = ts;
                 let levels = if ts && !self.tools.ts_residual_coding_disabled {
-                    crate::residual::decode_ts_tb_coefficients(
+                    crate::residual::decode_ts_tb_coefficients_range(
                         self.dec,
                         &mut self.ctxs.residual,
                         cw,
@@ -4761,6 +4768,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         2,
                         self.tools.ts_residual_coding_rice_idx,
                         info.intra_bdpcm_chroma,
+                        self.tools.rc_opts.log2_transform_range,
                     )?
                 } else {
                     let (levels, flags) = decode_tb_coefficients_opts(
@@ -5134,7 +5142,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         };
                         info.transform_skip_cb = ts;
                         residual.cb_levels = if ts && !self.tools.ts_residual_coding_disabled {
-                            crate::residual::decode_ts_tb_coefficients(
+                            crate::residual::decode_ts_tb_coefficients_range(
                                 self.dec,
                                 &mut self.ctxs.residual,
                                 cw,
@@ -5142,6 +5150,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                                 1,
                                 self.tools.ts_residual_coding_rice_idx,
                                 /*bdpcm=*/ false,
+                                self.tools.rc_opts.log2_transform_range,
                             )?
                         } else {
                             let (levels, flags) = decode_tb_coefficients_opts(
@@ -5170,7 +5179,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                         };
                         info.transform_skip_cr = ts;
                         residual.cr_levels = if ts && !self.tools.ts_residual_coding_disabled {
-                            crate::residual::decode_ts_tb_coefficients(
+                            crate::residual::decode_ts_tb_coefficients_range(
                                 self.dec,
                                 &mut self.ctxs.residual,
                                 cw,
@@ -5178,6 +5187,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                                 2,
                                 self.tools.ts_residual_coding_rice_idx,
                                 /*bdpcm=*/ false,
+                                self.tools.rc_opts.log2_transform_range,
                             )?
                         } else {
                             let (levels, flags) = decode_tb_coefficients_opts(
@@ -9056,6 +9066,7 @@ mod tests {
             let opts = RcOpts {
                 dep_quant,
                 sign_data_hiding: false,
+                log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
             };
             let levels = if dep_quant { &dq } else { &plain };
 

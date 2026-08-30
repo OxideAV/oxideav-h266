@@ -826,7 +826,41 @@ fn encode_abs_remainder(enc: &mut ArithEncoder, rice_param: u32, value: u32) -> 
             enc.encode_bypass(1)?;
         }
         let remainder = value - threshold;
-        encode_exp_golomb_k(enc, remainder, rice_param + 1)?;
+        // §9.3.3.11 — limited EGk(rice + 1) with maxPreExtLen =
+        // 26 − Log2TransformRange and truncSuffixLen =
+        // Log2TransformRange (the encoder codes without extended
+        // precision, so Log2TransformRange = 15).
+        let range = crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE;
+        encode_limited_exp_golomb_k(enc, remainder, rice_param + 1, 26 - range, range)?;
+    }
+    Ok(())
+}
+
+/// §9.3.3.6 limited k-th order Exp-Golomb bypass encode (inverse of
+/// [`crate::residual::decode_limited_exp_golomb_k`]).
+#[doc(hidden)]
+pub fn encode_limited_exp_golomb_k(
+    enc: &mut ArithEncoder,
+    value: u32,
+    k: u32,
+    max_pre_ext_len: u32,
+    trunc_suffix_len: u32,
+) -> Result<()> {
+    let code_value = value >> k;
+    let mut pre_ext_len = 0u32;
+    while pre_ext_len < max_pre_ext_len && code_value > ((2u32 << pre_ext_len) - 2) {
+        pre_ext_len += 1;
+        enc.encode_bypass(1)?;
+    }
+    let escape_length = if pre_ext_len == max_pre_ext_len {
+        trunc_suffix_len
+    } else {
+        enc.encode_bypass(0)?;
+        pre_ext_len + k
+    };
+    let symbol = value - (((1u32 << pre_ext_len) - 1) << k);
+    for i in (0..escape_length).rev() {
+        enc.encode_bypass((symbol >> i) & 1)?;
     }
     Ok(())
 }
@@ -1128,6 +1162,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: true,
             sign_data_hiding: false,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         assert_eq!(roundtrip_opts(&levels, 4, 4, 0, opts), levels);
     }
@@ -1157,6 +1192,7 @@ mod tests {
             let opts = RcOpts {
                 dep_quant: true,
                 sign_data_hiding: false,
+                log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
             };
             assert_eq!(
                 roundtrip_opts(&levels, 16, 16, c_idx, opts),
@@ -1179,6 +1215,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: true,
             sign_data_hiding: false,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         assert!(encode_tb_coefficients_opts(&mut enc, &mut ctxs, 4, 4, 0, &levels, opts).is_err());
     }
@@ -1203,6 +1240,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: false,
             sign_data_hiding: true,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         // Scan span 0..5 (> 3). Negative hidden sign ⇒ odd abs sum.
         // Diagonal scan position 0 is (0,0); make it negative and the
@@ -1229,6 +1267,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: false,
             sign_data_hiding: true,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         // Negative first-sig with EVEN abs sum: 4 + 2 + 2 = 8 → parity
         // says positive, sign says negative → Err.
@@ -1248,6 +1287,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: false,
             sign_data_hiding: true,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         let mut levels = vec![0i32; 16];
         levels[0] = -4; // scan pos 0
@@ -1262,6 +1302,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: false,
             sign_data_hiding: true,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         let mut levels = vec![0i32; 64];
         // DC sub-block: span > 3, hidden negative sign ⇒ odd sum.
@@ -1305,6 +1346,7 @@ mod tests {
             let opts = RcOpts {
                 dep_quant: false,
                 sign_data_hiding: true,
+                log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
             };
             if levels.iter().all(|&l| l == 0) {
                 continue;
@@ -1321,6 +1363,7 @@ mod tests {
         let opts = RcOpts {
             dep_quant: true,
             sign_data_hiding: true,
+            log2_transform_range: crate::residual::DEFAULT_LOG2_TRANSFORM_RANGE,
         };
         let levels = vec![0i32; 16];
         let mut enc = ArithEncoder::new();
