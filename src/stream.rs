@@ -493,16 +493,31 @@ impl StreamDecoder {
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let sh0 = &pic.slices[0];
 
-        // r452 — §8.5.6.3.2 horizontal reference wraparound
-        // (`pps_ref_wraparound_enabled_flag`, the `ClipH` sample
-        // fetch) is not modelled by the MC fetches yet: an inter
-        // picture under it is refused rather than mis-predicted.
-        if pps.pps_ref_wraparound_enabled_flag
-            && pic.slices.iter().any(|sh| sh.sh_slice_type != SliceType::I)
+        // r453 — §8.5.6.3.2 horizontal reference wraparound:
+        // §7.4.3.5 PpsRefWraparoundOffset → the §8.5.6.3 eq. 5 ClipH
+        // offset in luma samples (0 = off); set per picture so every
+        // reference fetch on this thread wraps horizontally.
         {
-            return Err(Error::unsupported(
-                "h266 stream: reference picture wraparound (pps_ref_wraparound_enabled_flag) not supported",
-            ));
+            let min_cb = 1i32
+                << (sps
+                    .partition_constraints
+                    .log2_min_luma_coding_block_size_minus2
+                    + 2);
+            let wrap = if pps.pps_ref_wraparound_enabled_flag {
+                (pps.pps_pic_width_in_luma_samples as i32 / min_cb
+                    - pps.pps_pic_width_minus_wraparound_offset as i32)
+                    * min_cb
+            } else {
+                0
+            };
+            // `H266_DBG_WRAP=off` — triage aid: decode as if the PPS
+            // flag were 0.
+            let wrap = if std::env::var_os("H266_DBG_WRAP").is_some_and(|v| v == "off") {
+                0
+            } else {
+                wrap
+            };
+            crate::inter::set_ref_wraparound(wrap);
         }
         // r452 — §8.5.6.6.1 `weightedPredFlag` base per slice: the
         // explicit tables (PH-carried under `pps_wp_info_in_ph_flag`,
@@ -662,10 +677,17 @@ impl StreamDecoder {
                 sh0.sh_slice_type,
             );
             eprintln!(
-                "PH dbg: part_override={:?} qp_delta_subdiv_intra={} chroma_off_subdiv_intra={}",
+                "PH dbg: part_override={:?} qp_delta_subdiv_intra={} chroma_off_subdiv_intra={} dmvr_dis={} bdof_dis={} prof_dis={} mvd_l1_zero={} tmvp={} col_l0={} col_idx={}",
                 ph.partition_override,
                 ph.ph_cu_qp_delta_subdiv_intra_slice,
                 ph.ph_cu_chroma_qp_offset_subdiv_intra_slice,
+                ph.ph_dmvr_disabled_flag,
+                ph.ph_bdof_disabled_flag,
+                ph.ph_prof_disabled_flag,
+                ph.ph_mvd_l1_zero_flag,
+                ph.ph_temporal_mvp_enabled_flag,
+                ph.ph_collocated_from_l0_flag,
+                ph.ph_collocated_ref_idx,
             );
             eprintln!(
                 "DBLK dbg: disabled={} beta={} tc={} cb=({},{}) cr=({},{})",

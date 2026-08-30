@@ -632,7 +632,7 @@ pub fn predict_luma_subblock_affine(
         for r in 0..sb_h as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..sb_w as i32 {
-                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+                let xi = crate::inter::clip_ref_x(x_int_base + c, pic_w, 1);
                 dst.samples
                     [(dst_y as usize + r as usize) * d_stride + dst_x as usize + c as usize] =
                     src.samples[yi * src.stride + xi];
@@ -658,7 +658,7 @@ pub fn predict_luma_subblock_affine(
     if x_frac == 0 {
         // Vertical-only filter.
         for c in 0..sb_w as i32 {
-            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            let xi = crate::inter::clip_ref_x(x_int_base + c, pic_w, 1);
             for r in 0..sb_h as i32 {
                 let intermediate = v_only_tap(table, src, xi, y_int_base + r, y_frac) >> shift1;
                 dst.samples
@@ -707,7 +707,7 @@ fn h_tap(
     let mut acc = 0i32;
     let row_base = y_clamped * plane.stride;
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = (x_int + (i as i32) - 3).clamp(0, pic_w - 1) as usize;
+        let xi = crate::inter::clip_ref_x(x_int + (i as i32) - 3, pic_w, 1);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     acc // shift1 = 0 for BitDepth = 8
@@ -1071,7 +1071,8 @@ pub fn predict_luma_subblock_affine_high_precision(
         // yInt + (yFrac >> 3) − 1)`, lifted `<< (14 − BitDepth)` —
         // not from the interpolation filter.
         if c == 0 || r == 0 || c == out_w as i32 - 1 || r == out_h as i32 - 1 {
-            let xi = (x_int_base + local_x + ((x_frac as i32) >> 3)).clamp(0, pic_w - 1) as usize;
+            let xi =
+                crate::inter::clip_ref_x(x_int_base + local_x + ((x_frac as i32) >> 3), pic_w, 1);
             let yi = (y_int_base + local_y + ((y_frac as i32) >> 3)).clamp(0, pic_h - 1) as usize;
             return (src.samples[yi * src.stride + xi] as i32) << lift;
         }
@@ -1079,7 +1080,7 @@ pub fn predict_luma_subblock_affine_high_precision(
             // Integer-pel fast path: lift to BitDepth + 6 precision
             // (eq. 932: `<< (14 - BitDepth)`).
             let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
-            let xi = (x_int_base + local_x).clamp(0, pic_w - 1) as usize;
+            let xi = crate::inter::clip_ref_x(x_int_base + local_x, pic_w, 1);
             return (src.samples[yi * src.stride + xi] as i32) << lift;
         }
         if y_frac == 0 {
@@ -1089,7 +1090,7 @@ pub fn predict_luma_subblock_affine_high_precision(
             return h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
         }
         if x_frac == 0 {
-            let xi = (x_int_base + local_x).clamp(0, pic_w - 1) as usize;
+            let xi = crate::inter::clip_ref_x(x_int_base + local_x, pic_w, 1);
             return v_only_tap(table, src, xi, y_int_base + local_y, y_frac) >> shift1;
         }
         // 2D — H pass at column `local_x`, V pass over an 8-row column.

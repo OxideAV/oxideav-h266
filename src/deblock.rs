@@ -593,6 +593,19 @@ pub(crate) fn dbg_skip_stage(stage: &str) -> bool {
     false
 }
 
+/// Reconstruction-side twin of [`dbg_skip_stage`]: the picture being
+/// RECONSTRUCTED has not run its deblocking pass yet, so its ordinal
+/// is the raw counter (stages: `dmvr`, `bdof`).
+pub(crate) fn dbg_skip_stage_recon(stage: &str) -> bool {
+    if let Ok(v) = std::env::var("H266_DBG_SKIP") {
+        let pic = DBG_PIC.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((p, st)) = v.split_once(',') {
+            return p.trim().parse() == Ok(pic) && st.trim() == stage;
+        }
+    }
+    false
+}
+
 fn dbg_chroma_unit(c_idx: u32, vertical: bool, cx: i32, cy: i32, b_s: i32) -> bool {
     use std::sync::atomic::Ordering;
     let n = DBG_CUNIT.fetch_add(1, Ordering::Relaxed);

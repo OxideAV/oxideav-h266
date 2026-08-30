@@ -643,7 +643,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("DEBLOCKING_A_3", 'P'),      // byte-exact (r453 §8.8.3.6.4 per-TB TuCResMode deblock QP)
     ("DEBLOCKING_C_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("DEBLOCKING_E_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("DMVR_A_3", 'U'),            // reference picture wraparound (pps_ref_wraparound_enabled_flag)
+    ("DMVR_A_3", 'P'),            // byte-exact (r453 §8.5.6.3 eq. 5 ClipH reference wraparound)
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
     ("GPM_A_3", 'P'),             // byte-exact (r450 §8.5.2.7 MMVD offset scaling)

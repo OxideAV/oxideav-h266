@@ -6584,6 +6584,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let bracketed_same_diff_poc =
                 curr_poc.wrapping_sub(rp0.poc) == rp1.poc.wrapping_sub(curr_poc);
             let dmvr_runs = self.sps.tool_flags.dmvr_enabled_flag
+                && !crate::deblock::dbg_skip_stage_recon("dmvr")
                 && crate::dmvr::dmvr_used_flag(
                     self.sps.tool_flags.dmvr_enabled_flag,
                     self.ph_dmvr_disabled,
@@ -6650,6 +6651,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     // remaining inputs mirror the CU-wide derivation used
                     // on the single-sub-block path below.
                     let bdof_runs = self.sps.tool_flags.bdof_enabled_flag
+                        && !crate::deblock::dbg_skip_stage_recon("bdof")
                         && bdof_used_flag(
                             self.ph_bdof_disabled,
                             chosen.pred_flag_l0,
@@ -7041,6 +7043,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     curr_poc.wrapping_sub(rp0.poc) == rp1.poc.wrapping_sub(curr_poc);
                 let bdof_runs = self.sps.tool_flags.bdof_enabled_flag
                     && std::env::var_os("H266_DBG_NO_BDOF").is_none()
+                    && !crate::deblock::dbg_skip_stage_recon("bdof")
                     && bdof_used_flag(
                         self.ph_bdof_disabled,
                         chosen.pred_flag_l0,

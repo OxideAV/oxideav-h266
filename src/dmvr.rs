@@ -213,9 +213,10 @@ fn bilinear_sample(
 
     let pw = ref_pic.width as i32;
     let ph = ref_pic.height as i32;
-    // §8.5.3.2.2 eqs. 633 / 634 (no subpic, no wraparound): edge clamp.
+    // §8.5.3.2.2 eqs. 633 / 634 (no subpic): eq. 5 ClipH for
+    // pps_ref_wraparound_enabled_flag, then the edge clamp.
     let at = |xi: i32, yi: i32| -> i32 {
-        let xc = xi.clamp(0, pw - 1) as usize;
+        let xc = crate::inter::clip_ref_x(xi, pw, 1);
         let yc = yi.clamp(0, ph - 1) as usize;
         ref_pic.samples[yc * ref_pic.stride + xc] as i32
     };

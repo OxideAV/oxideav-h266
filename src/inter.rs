@@ -2123,6 +2123,60 @@ fn luma_filter_row(frac: usize, hpel: bool) -> &'static [i32; 8] {
     }
 }
 
+// ---------------------------------------------------------------------
+// §8.5.6.3 reference-sample horizontal clipping — eq. 5 `ClipH` for
+// `pps_ref_wraparound_enabled_flag` (eqs. 928 / 930 / 937 / 939 luma,
+// 946 / 948 chroma, 631 / 633 DMVR bilinear).
+// ---------------------------------------------------------------------
+
+thread_local! {
+    /// `PpsRefWraparoundOffset * MinCbSizeY` (luma samples) for the
+    /// picture being reconstructed on this thread; 0 = wraparound off.
+    /// The walker sets it per picture from the active PPS
+    /// (§7.4.3.5); the chroma fetchers divide by `SubWidthC`.
+    static REF_WRAPAROUND_LUMA: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the §8.5.6.3.2 horizontal wraparound offset (in luma samples;
+/// `0` disables) for every reference fetch on the calling thread.
+#[doc(hidden)]
+pub fn set_ref_wraparound(offset_luma: i32) {
+    REF_WRAPAROUND_LUMA.with(|c| c.set(offset_luma.max(0)));
+}
+
+/// Run `f` with wraparound suspended — for predictors that read from a
+/// LOCAL patch (the §8.5.6.3.2 eqs. 926 / 927 DMVR-bounded window)
+/// rather than the reference picture: the patch was already fetched
+/// through `ClipH`, and eq. 5 must not fire again on patch-local
+/// coordinates.
+pub(crate) fn without_ref_wraparound<T>(f: impl FnOnce() -> T) -> T {
+    let saved = REF_WRAPAROUND_LUMA.with(|c| c.replace(0));
+    let out = f();
+    REF_WRAPAROUND_LUMA.with(|c| c.set(saved));
+    out
+}
+
+/// Eq. 5 `ClipH( xOffset, picW, x )` followed by the
+/// `Clip3( 0, picW − 1, · )` picture clamp. `sub_w` is 1 for luma and
+/// `SubWidthC` for a chroma plane (eq. `xOffset =
+/// PpsRefWraparoundOffset * MinCbSizeY / SubWidthC`).
+#[inline]
+pub(crate) fn clip_ref_x(x: i32, pic_w: i32, sub_w: i32) -> usize {
+    let wrap = REF_WRAPAROUND_LUMA.with(|c| c.get()) / sub_w;
+    let x = if wrap > 0 {
+        if x < 0 {
+            x + wrap
+        } else if x > pic_w - 1 {
+            x - wrap
+        } else {
+            x
+        }
+    } else {
+        x
+    };
+    x.clamp(0, pic_w - 1) as usize
+}
+
 fn luma_h_8tap(
     plane: &PicturePlane,
     x_int: i32,
@@ -2135,7 +2189,7 @@ fn luma_h_8tap(
     let mut acc = 0i32;
     let row_base = y_clamped * plane.stride;
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = (x_int + (i as i32) - 3).clamp(0, pic_w - 1) as usize;
+        let xi = clip_ref_x(x_int + (i as i32) - 3, pic_w, 1);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     // shift1 = Min(4, BitDepth - 8) = 0 for BitDepth = 8.
@@ -2267,7 +2321,7 @@ pub fn predict_luma_block_hpel(
     if x_frac == 0 {
         // Vertical-only filter (eq. 934).
         for c in 0..w as i32 {
-            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            let xi = clip_ref_x(x_int_base + c, pic_w, 1);
             for r in 0..h as i32 {
                 let intermediate =
                     luma_v_only_8tap(src, xi, y_int_base + r, y_frac, hpel) >> shift1;
@@ -2380,7 +2434,7 @@ pub fn predict_luma_block_high_precision_hpel(
         for r in 0..h as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..w as i32 {
-                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+                let xi = clip_ref_x(x_int_base + c, pic_w, 1);
                 out[r as usize * w_us + c as usize] =
                     (src.samples[yi * src.stride + xi] as i32) << lift;
             }
@@ -2404,7 +2458,7 @@ pub fn predict_luma_block_high_precision_hpel(
     if x_frac == 0 {
         // Vertical-only filter (eq. 934).
         for c in 0..w as i32 {
-            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            let xi = clip_ref_x(x_int_base + c, pic_w, 1);
             for r in 0..h as i32 {
                 let acc = luma_v_only_8tap(src, xi, y_int_base + r, y_frac, hpel);
                 out[r as usize * w_us + c as usize] = acc >> shift1;
@@ -2482,7 +2536,7 @@ fn chroma_h_4tap(plane: &PicturePlane, x_int: i32, y_clamped: usize, x_frac: usi
     let row_base = y_clamped * plane.stride;
     let mut acc = 0i32;
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = (x_int + (i as i32) - 1).clamp(0, pic_w - 1) as usize;
+        let xi = clip_ref_x(x_int + (i as i32) - 1, pic_w, 2);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     acc // shift1 = 0 at BitDepth 8
@@ -2581,7 +2635,7 @@ pub fn predict_chroma_block(
     }
     if x_frac == 0 {
         for c in 0..w_c as i32 {
-            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            let xi = clip_ref_x(x_int_base + c, pic_w, 2);
             for r in 0..h_c as i32 {
                 let v = chroma_v_only_4tap(src, xi, y_int_base + r, y_frac) >> shift1;
                 dst.samples
@@ -2915,7 +2969,7 @@ pub fn predict_chroma_block_high_precision(
         for r in 0..h_c as i32 {
             let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
             for c in 0..w_c as i32 {
-                let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+                let xi = clip_ref_x(x_int_base + c, pic_w, 2);
                 out[r as usize * w_us + c as usize] =
                     (src.samples[yi * src.stride + xi] as i32) << lift;
             }
@@ -2934,7 +2988,7 @@ pub fn predict_chroma_block_high_precision(
     }
     if x_frac == 0 {
         for c in 0..w_c as i32 {
-            let xi = (x_int_base + c).clamp(0, pic_w - 1) as usize;
+            let xi = clip_ref_x(x_int_base + c, pic_w, 2);
             for r in 0..h_c as i32 {
                 out[r as usize * w_us + c as usize] =
                     chroma_v_only_4tap(src, xi, y_int_base + r, y_frac) >> shift1;
@@ -2993,7 +3047,7 @@ pub fn predict_luma_block_high_precision_dmvr_hpel(
     for r in 0..ph {
         let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;
         for c in 0..pw {
-            let sx = (left + c as i32).clamp(0, src.width as i32 - 1) as usize;
+            let sx = clip_ref_x(left + c as i32, src.width as i32, 1);
             patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
         }
     }
@@ -3001,7 +3055,9 @@ pub fn predict_luma_block_high_precision_dmvr_hpel(
         x: mv_refined.x + ((dst_x as i32 - left) << 4),
         y: mv_refined.y + ((dst_y as i32 - top) << 4),
     };
-    predict_luma_block_high_precision_hpel(0, 0, w, h, &patch, mv_adj, bit_depth, hpel)
+    without_ref_wraparound(|| {
+        predict_luma_block_high_precision_hpel(0, 0, w, h, &patch, mv_adj, bit_depth, hpel)
+    })
 }
 
 /// r447 — chroma twin of [`predict_luma_block_high_precision_dmvr`]:
@@ -3050,7 +3106,7 @@ pub fn predict_chroma_block_high_precision_dmvr(
     for r in 0..ph {
         let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;
         for c in 0..pw {
-            let sx = (left + c as i32).clamp(0, src.width as i32 - 1) as usize;
+            let sx = clip_ref_x(left + c as i32, src.width as i32, 2);
             patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
         }
     }
@@ -3058,7 +3114,9 @@ pub fn predict_chroma_block_high_precision_dmvr(
         x: mv_refined.x + ((dst_x_c as i32 - left) << 5),
         y: mv_refined.y + ((dst_y_c as i32 - top) << 5),
     };
-    predict_chroma_block_high_precision(0, 0, w_c, h_c, &patch, mv_adj, bit_depth)
+    without_ref_wraparound(|| {
+        predict_chroma_block_high_precision(0, 0, w_c, h_c, &patch, mv_adj, bit_depth)
+    })
 }
 
 /// r447 — §8.5.6.6.2 eqs. 980 / 981 bi-pred composition from two

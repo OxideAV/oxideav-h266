@@ -245,7 +245,7 @@ pub fn build_extended_pred_bdof(
             if x != 0 && y != 0 && x != ext_w - 1 && y != ext_h - 1 {
                 continue;
             }
-            let xi = (x_int_base + x as i32 - 1).clamp(0, pic_w - 1) as usize;
+            let xi = crate::inter::clip_ref_x(x_int_base + x as i32 - 1, pic_w, 1);
             let yi = (y_int_base + y as i32 - 1).clamp(0, pic_h - 1) as usize;
             out[y * ext_w + x] = (src.samples[yi * src.stride + xi] as i32) << lift;
         }
