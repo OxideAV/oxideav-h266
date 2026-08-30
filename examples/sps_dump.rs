@@ -73,6 +73,14 @@ fn main() {
                     pps.pps_joint_cbcr_qp_offset_list,
                     pps.pps_chroma_tool_offsets_present_flag,
                 );
+                println!(
+                    "  ref_wraparound={} pic_width_minus_wraparound_offset={} weighted_pred={} weighted_bipred={} wp_in_ph={}",
+                    pps.pps_ref_wraparound_enabled_flag,
+                    pps.pps_pic_width_minus_wraparound_offset,
+                    pps.pps_weighted_pred_flag,
+                    pps.pps_weighted_bipred_flag,
+                    pps.pps_wp_info_in_ph_flag,
+                );
                 if let Some(part) = &pps.partition {
                     println!(
                         "  tiles {}x{} cols={:?} rows={:?} lf_across_tiles={} slices={} \

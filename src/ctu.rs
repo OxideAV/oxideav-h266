@@ -894,6 +894,10 @@ pub struct CtuWalker<'a, 'b> {
     /// bit yet keep the round-31 plain bi-pred / BDOF path
     /// byte-for-byte. Set via [`Self::set_ph_dmvr_disabled`].
     ph_dmvr_disabled: bool,
+    /// r452 — the slice's §8.5.6.6.3 explicit weighted-prediction
+    /// tables (`Some` exactly when the §8.5.6.6.1 `weightedPredFlag`
+    /// base holds for the slice). Set via [`Self::set_explicit_wp`].
+    explicit_wp: Option<crate::inter::ExplicitWpTables>,
     /// §7.4.3.7 `ph_joint_cbcr_sign_flag` — drives the §8.7.2 joint
     /// Cb-Cr `cSign = 1 − 2 * flag` used when deriving the non-coded
     /// chroma residual from the coded one. Defaults to `false`; set via
@@ -1356,6 +1360,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ph_mmvd_fullpel_only: false,
             ph_bdof_disabled: true,
             ph_dmvr_disabled: true,
+            explicit_wp: None,
             ph_joint_cbcr_sign: false,
             ph_prof_disabled: true,
             intra_grid,
@@ -2489,6 +2494,171 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// bit keep the round-31 byte-for-byte pipeline.
     pub fn set_ph_dmvr_disabled(&mut self, disabled: bool) {
         self.ph_dmvr_disabled = disabled;
+    }
+
+    /// r452 — install (or clear) the slice's explicit weighted-
+    /// prediction tables (§7.4.9 derivation of `pred_weight_table()`).
+    /// `Some` when the §8.5.6.6.1 `weightedPredFlag` base holds for
+    /// the slice (P: `pps_weighted_pred_flag`, B:
+    /// `pps_weighted_bipred_flag`); the walker then routes every
+    /// `bcwIdx == 0`, non-DMVR translational CU whose references carry
+    /// a signalled weight through §8.5.6.6.3, and the §8.5.1 DMVR /
+    /// BDOF gates read the per-reference weight flags.
+    pub fn set_explicit_wp(&mut self, tables: Option<crate::inter::ExplicitWpTables>) {
+        self.explicit_wp = tables;
+    }
+
+    /// r452 — the explicit-WP entry for `RefPicList[list][ref_idx]`
+    /// when the slice is weighted and the index is signalled.
+    fn wp_entry(&self, list: usize, ref_idx: i32) -> Option<&crate::inter::WpRefEntry> {
+        self.explicit_wp
+            .as_ref()
+            .and_then(|t| t.entry(list, ref_idx))
+    }
+
+    /// r452 — an explicit-WP slice with at least one signalled weight
+    /// on a CU path that still composes through §8.5.6.6.2 (affine,
+    /// sub-block merge, GPM) is refused rather than mis-predicted.
+    fn refuse_explicit_wp_on(&self, path: &str) -> Result<()> {
+        if self.explicit_wp.as_ref().is_some_and(|t| t.any_explicit()) {
+            return Err(Error::unsupported(format!(
+                "h266 stream: explicit weighted prediction on {path} CUs not supported"
+            )));
+        }
+        Ok(())
+    }
+
+    /// r452 — §8.5.6.6.3 explicit weighted luma prediction of one
+    /// translational CU rectangle from the per-list §8.5.6.3
+    /// high-precision arrays. `rp_lX` carry `(reference, mv)` per
+    /// active list.
+    #[allow(clippy::too_many_arguments)]
+    fn explicit_wp_luma_into(
+        &self,
+        out: &mut PictureBuffer,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        rp_l0: Option<(&ReferencePicture, MotionVector, i32)>,
+        rp_l1: Option<(&ReferencePicture, MotionVector, i32)>,
+        hpel: bool,
+        bit_depth: u32,
+    ) -> Result<()> {
+        let tables = self
+            .explicit_wp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("h266 explicit WP: no tables bound"))?;
+        let hp = |rp: Option<(&ReferencePicture, MotionVector, i32)>| -> Result<Option<Vec<i32>>> {
+            match rp {
+                Some((r, mv, _)) => Ok(Some(predict_luma_block_high_precision_hpel(
+                    x,
+                    y,
+                    w,
+                    h,
+                    &r.frame.luma,
+                    mv,
+                    bit_depth,
+                    hpel,
+                )?)),
+                None => Ok(None),
+            }
+        };
+        let p0 = hp(rp_l0)?;
+        let p1 = hp(rp_l1)?;
+        let wp0 = tables.params(0, rp_l0.map_or(-1, |r| r.2), 0, bit_depth);
+        let wp1 = tables.params(1, rp_l1.map_or(-1, |r| r.2), 0, bit_depth);
+        let pb = crate::inter::explicit_weighted_sample_pred(
+            w as usize,
+            h as usize,
+            p0.as_deref(),
+            p1.as_deref(),
+            rp_l0.is_some(),
+            rp_l1.is_some(),
+            tables.luma_log2_denom,
+            wp0,
+            wp1,
+            bit_depth,
+        )?;
+        let plane = &mut out.luma;
+        for row in 0..h as usize {
+            let dst = (y as usize + row) * plane.stride + x as usize;
+            for col in 0..w as usize {
+                plane.samples[dst + col] = pb[row * w as usize + col] as u16;
+            }
+        }
+        Ok(())
+    }
+
+    /// r452 — §8.5.6.6.3 explicit weighted 4:2:0 chroma prediction
+    /// (both planes) of one translational CU rectangle; coordinates
+    /// and dims in chroma samples.
+    #[allow(clippy::too_many_arguments)]
+    fn explicit_wp_chroma_into(
+        &self,
+        out: &mut PictureBuffer,
+        x_c: u32,
+        y_c: u32,
+        w_c: u32,
+        h_c: u32,
+        rp_l0: Option<(&ReferencePicture, MotionVector, i32)>,
+        rp_l1: Option<(&ReferencePicture, MotionVector, i32)>,
+        bit_depth: u32,
+    ) -> Result<()> {
+        let tables = self
+            .explicit_wp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("h266 explicit WP: no tables bound"))?;
+        for c_idx in 1u32..=2 {
+            fn plane_of(r: &ReferencePicture, c_idx: u32) -> &PicturePlane {
+                if c_idx == 1 {
+                    &r.frame.cb
+                } else {
+                    &r.frame.cr
+                }
+            }
+            let hp =
+                |rp: Option<(&ReferencePicture, MotionVector, i32)>| -> Result<Option<Vec<i32>>> {
+                    match rp {
+                        Some((r, mv, _)) => {
+                            Ok(Some(crate::inter::predict_chroma_block_high_precision(
+                                x_c,
+                                y_c,
+                                w_c,
+                                h_c,
+                                plane_of(r, c_idx),
+                                mv,
+                                bit_depth,
+                            )?))
+                        }
+                        None => Ok(None),
+                    }
+                };
+            let p0 = hp(rp_l0)?;
+            let p1 = hp(rp_l1)?;
+            let wp0 = tables.params(0, rp_l0.map_or(-1, |r| r.2), c_idx, bit_depth);
+            let wp1 = tables.params(1, rp_l1.map_or(-1, |r| r.2), c_idx, bit_depth);
+            let pb = crate::inter::explicit_weighted_sample_pred(
+                w_c as usize,
+                h_c as usize,
+                p0.as_deref(),
+                p1.as_deref(),
+                rp_l0.is_some(),
+                rp_l1.is_some(),
+                tables.chroma_log2_denom,
+                wp0,
+                wp1,
+                bit_depth,
+            )?;
+            let plane = if c_idx == 1 { &mut out.cb } else { &mut out.cr };
+            for row in 0..h_c as usize {
+                let dst = (y_c as usize + row) * plane.stride + x_c as usize;
+                for col in 0..w_c as usize {
+                    plane.samples[dst + col] = pb[row * w_c as usize + col] as u16;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Set `ph_joint_cbcr_sign_flag` (§7.4.3.7). Drives the §8.7.2
@@ -5986,6 +6156,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // (per-CP MVDs in info.inter.non_merge) drives the
                 // §8.5.5.5 / §8.5.5.7 CPMV derivation + §8.5.5.9
                 // sub-block MC through the dedicated hookup below.
+                self.refuse_explicit_wp_on("affine")?;
                 return self.reconstruct_leaf_cu_inter_affine_amvp_walker(cu, info, residual, out);
             }
             return self.reconstruct_leaf_cu_inter_amvp(cu, info, residual, out);
@@ -6075,6 +6246,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // (Tables 36 / 37) with `cIdx ∈ {1, 2}`; eqs. 999/1000 scale to
         // the chroma sub-sample grid.
         if info.inter.merge_data.gpm_flag {
+            self.refuse_explicit_wp_on("GPM")?;
             return self.reconstruct_leaf_cu_gpm(cu, info, residual, &mlist, out);
         }
 
@@ -6084,6 +6256,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // candidate. The dedicated walker builds the §8.5.5.2 sub-block
         // merge list and reconstructs the affine MC to pixels.
         if info.inter.merge_data.merge_subblock_flag {
+            self.refuse_explicit_wp_on("sub-block merge")?;
             return self.reconstruct_leaf_cu_inter_subblock_merge(cu, info, residual, out);
         }
 
@@ -6277,6 +6450,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // picture reads sees the refined MVs, per the NOTE's split.
         let unrefined_mv_l0 = chosen.mv_l0;
         let unrefined_mv_l1 = chosen.mv_l1;
+        // r452 — §8.5.1 `luma_weight_lX_flag[refIdxLX]` /
+        // `chroma_weight_lX_flag[refIdxLX]` for the DMVR / BDOF gates,
+        // and the §8.5.6.6.1 explicit-WP routing decision below.
+        let wp_e0 = if chosen.pred_flag_l0 {
+            self.wp_entry(0, chosen.ref_idx_l0).copied()
+        } else {
+            None
+        };
+        let wp_e1 = if chosen.pred_flag_l1 {
+            self.wp_entry(1, chosen.ref_idx_l1).copied()
+        } else {
+            None
+        };
+        let wp_flags = (
+            wp_e0.is_some_and(|e| e.luma_flag),
+            wp_e1.is_some_and(|e| e.luma_flag),
+            wp_e0.is_some_and(|e| e.chroma_flag),
+            wp_e1.is_some_and(|e| e.chroma_flag),
+        );
         // Set when the §8.5.1 multi-16×16-sub-block DMVR path has already
         // written the per-sub-block bi-pred MC into `out`, so the shared
         // CU-wide luma + chroma MC below must be skipped.
@@ -6302,10 +6494,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     !info.inter.general_merge_flag && info.inter.non_merge.sym_mvd_flag,
                     info.inter.merge_data.ciip_flag,
                     chosen.bcw_idx,
-                    /*luma_weight_l0_flag*/ false,
-                    /*luma_weight_l1_flag*/ false,
-                    /*chroma_weight_l0_flag*/ false,
-                    /*chroma_weight_l1_flag*/ false,
+                    wp_flags.0,
+                    wp_flags.1,
+                    wp_flags.2,
+                    wp_flags.3,
                     cu.cu.w,
                     cu.cu.h,
                     /*c_idx*/ 0,
@@ -6367,10 +6559,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             !info.inter.general_merge_flag && info.inter.non_merge.sym_mvd_flag,
                             info.inter.merge_data.ciip_flag,
                             chosen.bcw_idx,
-                            /*luma_weight_l0_flag*/ false,
-                            /*luma_weight_l1_flag*/ false,
-                            /*chroma_weight_l0_flag*/ false,
-                            /*chroma_weight_l1_flag*/ false,
+                            wp_flags.0,
+                            wp_flags.1,
+                            wp_flags.2,
+                            wp_flags.3,
                             cu.cu.w,
                             cu.cu.h,
                             /*rpr_constraints_active_l0*/ false,
@@ -6649,8 +6841,53 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         //
         // Skipped when the §8.5.1 multi-sub-block DMVR path already wrote
         // the per-sub-block bi-pred MC into `out` above.
+        // r452 — §8.5.6.6.1: `weightedPredFlag && bcwIdx == 0` routes
+        // the composition to §8.5.6.6.3. The slice-level base
+        // (`pps_weighted_pred_flag` / `pps_weighted_bipred_flag`) is
+        // the presence of `explicit_wp`; `!dmvrFlag` is
+        // `!dmvr_multi_done`; a CU whose references carry no
+        // signalled weight composes identically through §8.5.6.6.2
+        // (the default weight `1 << denom` and zero offset reduce
+        // eqs. 992 – 994 to eqs. 978 / 980), so only the flagged case
+        // takes the explicit path — which keeps BDOF (gated off by a
+        // luma flag, never by a chroma-only one) on its own arm.
+        let wp_explicit = self.explicit_wp.is_some()
+            && chosen.bcw_idx == 0
+            && !dmvr_multi_done
+            && (wp_flags.0 || wp_flags.1 || wp_flags.2 || wp_flags.3);
+        let wp_rp0 = ref_pic_l0.map(|r| (r, chosen.mv_l0, chosen.ref_idx_l0));
+        let wp_rp1 = ref_pic_l1.map(|r| (r, chosen.mv_l1, chosen.ref_idx_l1));
         match (ref_pic_l0, ref_pic_l1) {
             _ if dmvr_multi_done => {}
+            _ if wp_explicit
+                && !(wp_flags.0 || wp_flags.1)
+                && ref_pic_l0.is_none() != ref_pic_l1.is_none() =>
+            {
+                // Chroma-only weights on a uni-pred CU: luma is the
+                // default process (bit-identical to explicit with the
+                // inferred weight).
+                let (rp, mv) = if let Some(rp0) = ref_pic_l0 {
+                    (rp0, chosen.mv_l0)
+                } else {
+                    (ref_pic_l1.expect("one list active"), chosen.mv_l1)
+                };
+                predict_luma_block_hpel(
+                    &mut out.luma,
+                    cu.cu.x,
+                    cu.cu.y,
+                    cu.cu.w,
+                    cu.cu.h,
+                    &rp.frame.luma,
+                    mv,
+                    hpel,
+                )?;
+            }
+            _ if wp_explicit && (wp_flags.0 || wp_flags.1) => {
+                let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+                self.explicit_wp_luma_into(
+                    out, cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h, wp_rp0, wp_rp1, hpel, bit_depth,
+                )?;
+            }
             (Some(rp0), None) => {
                 // Uni-pred L0 (P-slice path, or B-slice candidate with
                 // predFlagL1 == 0).
@@ -6713,10 +6950,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         !info.inter.general_merge_flag && info.inter.non_merge.sym_mvd_flag,
                         ciip_active,
                         chosen.bcw_idx,
-                        /*luma_weight_l0_flag*/ false,
-                        /*luma_weight_l1_flag*/ false,
-                        /*chroma_weight_l0_flag*/ false,
-                        /*chroma_weight_l1_flag*/ false,
+                        wp_flags.0,
+                        wp_flags.1,
+                        wp_flags.2,
+                        wp_flags.3,
                         cu.cu.w,
                         cu.cu.h,
                         /*rpr_constraints_active_l0*/ false,
@@ -6934,6 +7171,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             };
             match (ref_pic_l0, ref_pic_l1) {
                 _ if dmvr_multi_done => {}
+                _ if wp_explicit => {
+                    // r452 — §8.5.6.6.3 chroma (eqs. 987 – 994).
+                    let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
+                    self.explicit_wp_chroma_into(
+                        out, cb_x_c, cb_y_c, cb_w_c, cb_h_c, wp_rp0, wp_rp1, bit_depth,
+                    )?;
+                }
                 (Some(rp0), None) => {
                     predict_chroma_block(
                         &mut out.cb,

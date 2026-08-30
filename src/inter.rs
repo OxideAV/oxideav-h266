@@ -3182,6 +3182,161 @@ pub struct ExplicitWpParams {
     pub offset: i32,
 }
 
+/// r452 — one reference index's §7.4.9 explicit-WP derivation:
+/// `luma_weight_lX_flag` / `chroma_weight_lX_flag`, `LumaWeightLX`,
+/// `luma_offset_lX`, `ChromaWeightLX[·][j]`, `ChromaOffsetLX[·][j]`
+/// (eq. 144). Offsets are the UNSCALED spec values; the §8.5.6.6.3
+/// `<< (bitDepth − 8)` lift (eqs. 984 / 986 / 989 / 991) is applied
+/// when the [`ExplicitWpParams`] are formed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WpRefEntry {
+    pub luma_flag: bool,
+    pub chroma_flag: bool,
+    pub luma_weight: i32,
+    pub luma_offset: i32,
+    pub chroma_weight: [i32; 2],
+    pub chroma_offset: [i32; 2],
+}
+
+/// r452 — the per-slice explicit weighted-prediction tables derived
+/// from `pred_weight_table()` (§7.3.8 / §7.4.9), indexed by
+/// `RefPicList[X][refIdx]`. Present on a slice only when the §8.5.6.6.1
+/// `weightedPredFlag` base holds (P: `pps_weighted_pred_flag`, B:
+/// `pps_weighted_bipred_flag`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExplicitWpTables {
+    /// `luma_log2_weight_denom`.
+    pub luma_log2_denom: u32,
+    /// `ChromaLog2WeightDenom = luma_log2_weight_denom +
+    /// delta_chroma_log2_weight_denom`.
+    pub chroma_log2_denom: u32,
+    pub l0: Vec<WpRefEntry>,
+    pub l1: Vec<WpRefEntry>,
+}
+
+impl ExplicitWpTables {
+    /// §7.4.9 — derive the per-reference weights / offsets from the
+    /// parsed `pred_weight_table()`: `LumaWeightLX[i] =
+    /// (1 << luma_log2_weight_denom) + delta_luma_weight_lX[i]` (the
+    /// denominator alone when `luma_weight_lX_flag[i] == 0`),
+    /// `ChromaWeightLX[i][j] = (1 << ChromaLog2WeightDenom) +
+    /// delta_chroma_weight_lX[i][j]`, and eq. 144
+    /// `ChromaOffsetLX[i][j] = Clip3(−128, 127, 128 +
+    /// delta_chroma_offset_lX[i][j] − ((128 * ChromaWeightLX[i][j]) >>
+    /// ChromaLog2WeightDenom))`.
+    pub fn from_pred_weight_table(t: &crate::picture_header::PredWeightTable) -> Self {
+        let luma_log2_denom = t.luma_log2_weight_denom;
+        let chroma_log2_denom =
+            (luma_log2_denom as i32 + t.delta_chroma_log2_weight_denom).clamp(0, 7) as u32;
+        let build = |list: &crate::picture_header::PredWeightTableList| -> Vec<WpRefEntry> {
+            (0..list.num_weights as usize)
+                .map(|i| {
+                    let luma_flag = list.luma_weight_flag.get(i).copied().unwrap_or(false);
+                    let chroma_flag = list.chroma_weight_flag.get(i).copied().unwrap_or(false);
+                    let (luma_weight, luma_offset) =
+                        match list.luma.iter().find(|r| r.ref_idx as usize == i) {
+                            Some(r) if luma_flag => (
+                                (1i32 << luma_log2_denom) + r.delta_luma_weight,
+                                r.luma_offset,
+                            ),
+                            _ => (1i32 << luma_log2_denom, 0),
+                        };
+                    let (chroma_weight, chroma_offset) =
+                        match list.chroma.iter().find(|r| r.ref_idx as usize == i) {
+                            Some(r) if chroma_flag => {
+                                let w = [
+                                    (1i32 << chroma_log2_denom) + r.delta_chroma_weight_cb,
+                                    (1i32 << chroma_log2_denom) + r.delta_chroma_weight_cr,
+                                ];
+                                let off = |delta: i32, wj: i32| -> i32 {
+                                    (128 + delta - ((128 * wj) >> chroma_log2_denom))
+                                        .clamp(-128, 127)
+                                };
+                                (
+                                    w,
+                                    [
+                                        off(r.delta_chroma_offset_cb, w[0]),
+                                        off(r.delta_chroma_offset_cr, w[1]),
+                                    ],
+                                )
+                            }
+                            _ => ([1i32 << chroma_log2_denom; 2], [0i32; 2]),
+                        };
+                    WpRefEntry {
+                        luma_flag,
+                        chroma_flag,
+                        luma_weight,
+                        luma_offset,
+                        chroma_weight,
+                        chroma_offset,
+                    }
+                })
+                .collect()
+        };
+        Self {
+            luma_log2_denom,
+            chroma_log2_denom,
+            l0: build(&t.l0),
+            l1: build(&t.l1),
+        }
+    }
+
+    /// The entry for `RefPicList[list][ref_idx]` (`None` past the
+    /// signalled weights — the spec then infers the default
+    /// weight / zero offset, which the explicit process reproduces
+    /// bit-exactly as the §8.5.6.6.2 default).
+    pub fn entry(&self, list: usize, ref_idx: i32) -> Option<&WpRefEntry> {
+        if ref_idx < 0 {
+            return None;
+        }
+        let l = if list == 0 { &self.l0 } else { &self.l1 };
+        l.get(ref_idx as usize)
+    }
+
+    /// Whether any reference carries a signalled (non-default) weight.
+    pub fn any_explicit(&self) -> bool {
+        self.l0
+            .iter()
+            .chain(self.l1.iter())
+            .any(|e| e.luma_flag || e.chroma_flag)
+    }
+
+    /// §8.5.6.6.3 eqs. 983 – 991 — the `(wN, oN)` pair for one list /
+    /// component (`c_idx` 0 = luma, 1 = Cb, 2 = Cr), offsets lifted by
+    /// `bit_depth − 8`.
+    pub fn params(
+        &self,
+        list: usize,
+        ref_idx: i32,
+        c_idx: u32,
+        bit_depth: u32,
+    ) -> ExplicitWpParams {
+        let denom = if c_idx == 0 {
+            self.luma_log2_denom
+        } else {
+            self.chroma_log2_denom
+        };
+        match self.entry(list, ref_idx) {
+            Some(e) => {
+                let (w, o) = if c_idx == 0 {
+                    (e.luma_weight, e.luma_offset)
+                } else {
+                    let j = (c_idx - 1) as usize;
+                    (e.chroma_weight[j], e.chroma_offset[j])
+                };
+                ExplicitWpParams {
+                    weight: w,
+                    offset: o << (bit_depth - 8),
+                }
+            }
+            None => ExplicitWpParams {
+                weight: 1 << denom,
+                offset: 0,
+            },
+        }
+    }
+}
+
 /// §8.5.6.6.3 single-sample explicit weighted prediction.
 ///
 /// `log2_wd` is `log2_weight_denom + Max(2, 14 − bit_depth)`.
@@ -3299,6 +3454,68 @@ mod tests {
 
     fn empty_field(w: u32, h: u32) -> MotionField {
         MotionField::new(w, h)
+    }
+
+    /// r452 — §7.4.9 explicit-WP table derivation: `LumaWeightLX =
+    /// (1 << denom) + delta`, the inferred defaults for unflagged
+    /// entries, and the eq. 144 `ChromaOffsetLX` fold; the §8.5.6.6.3
+    /// `params` lift the offsets by `bitDepth − 8`.
+    #[test]
+    fn explicit_wp_tables_follow_7_4_9() {
+        use crate::picture_header::{
+            ChromaWeight, LumaWeight, PredWeightTable, PredWeightTableList,
+        };
+        let t = PredWeightTable {
+            luma_log2_weight_denom: 6,
+            delta_chroma_log2_weight_denom: -1,
+            l0: PredWeightTableList {
+                num_weights: 2,
+                luma_weight_flag: vec![true, false],
+                chroma_weight_flag: vec![true, false],
+                luma: vec![LumaWeight {
+                    ref_idx: 0,
+                    delta_luma_weight: -3,
+                    luma_offset: 7,
+                }],
+                chroma: vec![ChromaWeight {
+                    ref_idx: 0,
+                    delta_chroma_weight_cb: 4,
+                    delta_chroma_offset_cb: -10,
+                    delta_chroma_weight_cr: -2,
+                    delta_chroma_offset_cr: 500,
+                }],
+            },
+            l1: PredWeightTableList::default(),
+        };
+        let tables = ExplicitWpTables::from_pred_weight_table(&t);
+        assert_eq!(tables.luma_log2_denom, 6);
+        assert_eq!(tables.chroma_log2_denom, 5);
+        let e0 = tables.entry(0, 0).unwrap();
+        assert!(e0.luma_flag && e0.chroma_flag);
+        assert_eq!(e0.luma_weight, 64 - 3);
+        assert_eq!(e0.luma_offset, 7);
+        // ChromaWeight = 32 + delta; ChromaOffset = Clip3(−128, 127,
+        // 128 + delta_off − ((128 * w) >> 5)).
+        assert_eq!(e0.chroma_weight, [36, 30]);
+        assert_eq!(
+            e0.chroma_offset[0],
+            (128 - 10 - ((128 * 36) >> 5)).clamp(-128, 127)
+        );
+        assert_eq!(e0.chroma_offset[1], 127);
+        let e1 = tables.entry(0, 1).unwrap();
+        assert!(!e1.luma_flag && !e1.chroma_flag);
+        assert_eq!((e1.luma_weight, e1.luma_offset), (64, 0));
+        assert_eq!((e1.chroma_weight, e1.chroma_offset), ([32, 32], [0, 0]));
+        assert!(tables.entry(1, 0).is_none() && tables.entry(0, -1).is_none());
+        assert!(tables.any_explicit());
+        // §8.5.6.6.3 eqs. 984 / 989 — offsets lifted by bitDepth − 8.
+        let p = tables.params(0, 0, 0, 10);
+        assert_eq!((p.weight, p.offset), (61, 7 << 2));
+        let pc = tables.params(0, 0, 2, 10);
+        assert_eq!((pc.weight, pc.offset), (30, 127 << 2));
+        // Past the signalled weights: the inferred default pair.
+        let pd = tables.params(1, 3, 1, 8);
+        assert_eq!((pd.weight, pd.offset), (32, 0));
     }
 
     /// r429 — the §6.4.4 WPP column cap (`xNbCtb >= xCurrCtb + 1`

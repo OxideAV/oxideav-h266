@@ -30,7 +30,7 @@ use crate::alf::AlfApsBinding;
 use crate::alf_syntax::AlfSyntaxConfig;
 use crate::aps::{parse_aps, AlfApsData, ApsParamsType};
 use crate::ctu::{CtuLayout, CtuWalker};
-use crate::inter::{MotionField, ReferencePicture};
+use crate::inter::{ExplicitWpTables, MotionField, ReferencePicture};
 use crate::lmcs::LmcsData;
 use crate::nal::{extract_rbsp, iter_annex_b, NalUnitType};
 use crate::picture_header::{parse_picture_header, parse_picture_header_stateful, PictureHeader};
@@ -491,18 +491,38 @@ impl StreamDecoder {
         let layout = CtuLayout::from_sps_pps(&sps, &pps);
         let sh0 = &pic.slices[0];
 
-        // Explicit weighted prediction has no walker path yet.
-        for sh in &pic.slices {
-            if sh.sh_pred_weight_table.is_some()
-                || (pps.pps_wp_info_in_ph_flag
-                    && ((pps.pps_weighted_pred_flag && sh.sh_slice_type == SliceType::P)
-                        || (pps.pps_weighted_bipred_flag && sh.sh_slice_type == SliceType::B)))
-            {
-                return Err(Error::unsupported(
-                    "h266 stream: explicit weighted prediction not supported",
-                ));
-            }
+        // r452 — §8.5.6.3.2 horizontal reference wraparound
+        // (`pps_ref_wraparound_enabled_flag`, the `ClipH` sample
+        // fetch) is not modelled by the MC fetches yet: an inter
+        // picture under it is refused rather than mis-predicted.
+        if pps.pps_ref_wraparound_enabled_flag
+            && pic.slices.iter().any(|sh| sh.sh_slice_type != SliceType::I)
+        {
+            return Err(Error::unsupported(
+                "h266 stream: reference picture wraparound (pps_ref_wraparound_enabled_flag) not supported",
+            ));
         }
+        // r452 — §8.5.6.6.1 `weightedPredFlag` base per slice: the
+        // explicit tables (PH-carried under `pps_wp_info_in_ph_flag`,
+        // else the slice header's own `pred_weight_table()`) are bound
+        // per slice below.
+        let explicit_wp_for = |sh: &StatefulSliceHeader| -> Result<Option<ExplicitWpTables>> {
+            let weighted = (pps.pps_weighted_pred_flag && sh.sh_slice_type == SliceType::P)
+                || (pps.pps_weighted_bipred_flag && sh.sh_slice_type == SliceType::B);
+            if !weighted {
+                return Ok(None);
+            }
+            let table = if pps.pps_wp_info_in_ph_flag {
+                &ph.pred_weight_table
+            } else {
+                sh.sh_pred_weight_table.as_ref().ok_or_else(|| {
+                    Error::invalid(
+                        "h266 stream: weighted slice without a slice-header pred_weight_table()",
+                    )
+                })?
+            };
+            Ok(Some(ExplicitWpTables::from_pred_weight_table(table)))
+        };
 
         let cabacs: Vec<Vec<u8>> = pic
             .slices
@@ -682,6 +702,14 @@ impl StreamDecoder {
             if i > 0 {
                 walker.continue_slice(sh, ph.ph_qp_delta, &cabacs[i])?;
             }
+            let wp_tables = explicit_wp_for(sh)?;
+            if std::env::var_os("H266_DBG_WP").is_some() {
+                eprintln!(
+                    "WP poc={poc} slice={i} type={:?} tables={wp_tables:?}",
+                    sh.sh_slice_type
+                );
+            }
+            walker.set_explicit_wp(wp_tables);
             // Per-slice reference lists + collocated selection.
             let built = build_lists(sh)?;
             for l in &built {

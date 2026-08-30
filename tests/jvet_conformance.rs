@@ -643,7 +643,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("DEBLOCKING_A_3", 'F'),      // 9/17 pictures diverge (first poc 8 plane Cb)
     ("DEBLOCKING_C_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("DEBLOCKING_E_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("DMVR_A_3", 'U'),            // explicit weighted prediction
+    ("DMVR_A_3", 'U'),            // reference picture wraparound (pps_ref_wraparound_enabled_flag)
     ("DMVR_B_4", 'P'),            // byte-exact (r447 §8.5.6.6.2 HP bi-pred composition)
     ("GDR_A_2", 'U'),             // explicit §8.8.1 virtual boundaries
     ("GPM_A_3", 'P'),             // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
@@ -676,7 +676,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("TILE_A_2", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("TMVP_A_3", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("WPP_A_3", 'P'),    // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("WP_A_3", 'U'),     // explicit weighted prediction
+    ("WP_A_3", 'U'),     // explicit WP on GPM / affine / sub-block-merge CUs
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this
