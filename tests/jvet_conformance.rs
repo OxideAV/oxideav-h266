@@ -623,15 +623,15 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     // loop-filter divergence.
     ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
     ("8b400_A_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("8b420_A_2", 'F'),           // 15/49 pictures diverge (first poc 33 plane Cb)
+    ("8b420_A_2", 'P'),           // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("8b420_B_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
     ("AFF_A_2", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
     ("ALF_C_3", 'P'),             // byte-exact (r449)
-    ("AMVR_A_3", 'F'),            // 6/85 pictures diverge (first poc 11 plane Y)
-    ("BDOF_A_4", 'F'),            // 41/44 pictures diverge (first poc 3 plane Y)
+    ("AMVR_A_3", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("BDOF_A_4", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("BDPCM_A_2", 'P'),           // byte-exact (r449)
     ("CCLM_A_2", 'P'),            // byte-exact (r449)
     ("CST_A_4", 'P'),             // byte-exact (r449)
@@ -657,7 +657,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("LMCS_B_2", 'U'),            // subpictures
     ("LMCS_C_1", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("LOSSLESS_B_3", 'E'),        // IBC BV derivation (under triage)
-    ("MERGE_A_2", 'F'),           // 5/10 pictures diverge (first poc 3 plane Y)
+    ("MERGE_A_2", 'P'),           // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("MIP_A_3", 'P'),             // byte-exact (r449)
     ("MIP_B_3", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("MMVD_A_3", 'F'),            // 21/300 pictures diverge (first poc 33 plane Cb)
@@ -668,14 +668,14 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("RAP_A_1", 'P'),             // byte-exact (r449)
     ("RAP_B_1", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("SAO_A_3", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("SBT_A_2", 'F'),             // 44/57 pictures diverge (first poc 8 plane Y)
+    ("SBT_A_2", 'P'),             // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("SLICES_A_3", 'F'),          // 24/25 pictures diverge (first poc 0 plane Cb)
     ("SMVD_A_2", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("SUBPIC_C_1", 'U'),          // subpictures
     ("SbTMVP_A_3", 'P'),          // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("TILE_A_2", 'F'),            // 8/9 pictures diverge (first poc 1 plane Y)
-    ("TMVP_A_3", 'F'),            // 61/64 pictures diverge (first poc 1 plane Y)
-    ("WPP_A_3", 'F'),             // 42/49 pictures diverge (first poc 3 plane Y)
+    ("TILE_A_2", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("TMVP_A_3", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("WPP_A_3", 'P'),             // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("WP_A_3", 'U'),              // explicit weighted prediction
 ];
 

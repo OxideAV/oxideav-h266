@@ -628,13 +628,16 @@ pub fn derive_spatial_merge_candidates(
 /// half is non-trivial — the §8.5.2.3 redundancy gate per spec only
 /// suppresses a candidate when it matches the prior one across **all**
 /// active prediction lists.
+///
+/// r452 — a list with `predFlagLX == 0` carries no motion: its
+/// `mvLX` is not compared (the §8.5.2.1 `(cbWidth + cbHeight) == 12`
+/// collapse clears `predFlagL1` / `refIdxL1` without touching the
+/// derived `mvL1`).
 fn mvf_matches(a: &MvField, b: &MvField) -> bool {
     a.pred_flag_l0 == b.pred_flag_l0
-        && a.ref_idx_l0 == b.ref_idx_l0
-        && a.mv_l0 == b.mv_l0
         && a.pred_flag_l1 == b.pred_flag_l1
-        && a.ref_idx_l1 == b.ref_idx_l1
-        && a.mv_l1 == b.mv_l1
+        && (!a.pred_flag_l0 || (a.ref_idx_l0 == b.ref_idx_l0 && a.mv_l0 == b.mv_l0))
+        && (!a.pred_flag_l1 || (a.ref_idx_l1 == b.ref_idx_l1 && a.mv_l1 == b.mv_l1))
 }
 
 /// §8.5.2.2 step 5 + step 7 + step 8 + step 9 — spatial mergeCandList

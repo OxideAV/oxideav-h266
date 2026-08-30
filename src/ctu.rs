@@ -6171,13 +6171,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // r449 — §8.5.2.1 (after both the merge and AMVP branches):
         // a bi-pred result on a (cbWidth + cbHeight) == 12 CU
         // collapses to uni-pred L0 — refIdxL1 = −1, predFlagL1 = 0,
-        // bcwIdx = 0 (mvL1 is left as derived; the flags gate every
-        // consumer). Applies after merge selection / MMVD / AMVP
-        // alike.
+        // bcwIdx = 0. Applies after merge selection / MMVD / AMVP
+        // alike. r452: the collapsed list's motion vector is cleared
+        // too — the stored record must carry no motion for an unused
+        // list, or the §8.5.2.3 / §8.5.2.6 / §8.5.2.16 "same motion
+        // vectors and the same reference indices" comparisons see a
+        // collapsed 4×8 / 8×4 CU as DIFFERENT from an identical
+        // uni-L0 neighbour and B2 / HMVP duplicates enter the merge
+        // list (TILE_A_2 poc 1: a GPM CU picked the un-pruned B2).
         let mut chosen = chosen;
         if chosen.pred_flag_l0 && chosen.pred_flag_l1 && cu.cu.w + cu.cu.h == 12 {
             chosen.pred_flag_l1 = false;
             chosen.ref_idx_l1 = -1;
+            chosen.mv_l1 = MotionVector::ZERO;
             chosen.bcw_idx = 0;
         }
         // r449 — §8.5.6.3.2: the Table 27 alternative half-sample
