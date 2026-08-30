@@ -2972,7 +2972,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // overrides this from the walker's live QG state.
             cu_qp_delta_already_coded: false,
             cu_chroma_qp_offset_enabled: self.sh.sh_cu_chroma_qp_offset_enabled_flag,
-            chroma_qp_offset_list_len_minus1: 0,
+            // §7.3.11.10 / §9.3.3.2 — `cu_chroma_qp_offset_idx` is
+            // TR-binarised with cMax = pps_chroma_qp_offset_list_len_minus1
+            // (the list length the PPS actually signalled, not 0).
+            chroma_qp_offset_list_len_minus1: self.pps.pps_cb_qp_offset_list.len().saturating_sub(1)
+                as u32,
             joint_cbcr_enabled: tf.joint_cbcr_enabled_flag,
             sbt_enabled: tf.sbt_enabled_flag,
             ts_residual_coding_disabled: self.sh.sh_ts_residual_coding_disabled_flag,
@@ -3888,8 +3892,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let tx = ((tu.x >> max_tb_log2) as usize).min(3);
             let ty = ((tu.y >> max_tb_log2) as usize).min(3);
             m.y[ty][tx] |= tu.tu_y_coded;
-            m.cb[ty][tx] |= tu.tu_cb_coded;
-            m.cr[ty][tx] |= tu.tu_cr_coded;
+            // §8.8.3.5 — the chroma bS terms are the CBF +
+            // `tu_joint_cbcr_residual_flag` sum per component.
+            m.cb[ty][tx] |= tu.tu_cb_coded || tu.joint_cbcr;
+            m.cr[ty][tx] |= tu.tu_cr_coded || tu.joint_cbcr;
+            // §8.8.3.6.4 — per-TB `TuCResMode == 2` joint-QP pick.
+            m.jc2[ty][tx] |= tu.tu_c_res_mode == 2;
         }
         Some(m)
     }
@@ -3925,6 +3933,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             y_coded: [y_coded; 4],
             cb_coded: [false; 4],
             cr_coded: [false; 4],
+            jc2: [false; 4],
             luma_only: true,
         })
     }
@@ -3972,6 +3981,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `tu_joint_cbcr_residual_flag` into both components.
         cb_coded[res_idx] = info.tu_cb_coded_flag || info.tu_c_res_mode != 0;
         cr_coded[res_idx] = info.tu_cr_coded_flag || info.tu_c_res_mode != 0;
+        let mut jc2 = [false; 4];
+        jc2[res_idx] = info.tu_c_res_mode == 2;
         Some(crate::deblock::TbSplit {
             vertical,
             n_bounds: 1,
@@ -3979,6 +3990,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             y_coded,
             cb_coded,
             cr_coded,
+            jc2,
             luma_only: false,
         })
     }
@@ -5011,7 +5023,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: false,
@@ -5146,7 +5158,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     info.cu_chroma_qp_offset_flag,
                     info.cu_chroma_qp_offset_idx,
                 ),
-                joint_cbcr2: info.tu_c_res_mode == 2,
+                tu_c_res_mode: info.tu_c_res_mode,
                 plt: true,
                 ciip: false,
                 ibc: false,
@@ -5178,7 +5190,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: true,
             ciip: false,
             ibc: false,
@@ -5447,7 +5459,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     info.cu_chroma_qp_offset_flag,
                     info.cu_chroma_qp_offset_idx,
                 ),
-                joint_cbcr2: info.tu_c_res_mode == 2,
+                tu_c_res_mode: info.tu_c_res_mode,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -5825,7 +5837,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: false,
@@ -6072,7 +6084,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: true,
@@ -7375,7 +7387,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: info.inter.merge_data.ciip_flag,
             ibc: false,
@@ -9072,7 +9084,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: false,
@@ -9635,7 +9647,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: false,
@@ -10019,7 +10031,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: false,
@@ -11106,7 +11118,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.cu_chroma_qp_offset_flag,
                 info.cu_chroma_qp_offset_idx,
             ),
-            joint_cbcr2: info.tu_c_res_mode == 2,
+            tu_c_res_mode: info.tu_c_res_mode,
             plt: false,
             ciip: false,
             ibc: false,

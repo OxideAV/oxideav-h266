@@ -85,9 +85,12 @@ pub struct DeblockCu {
     /// (`QpY + plane qp_offset`) used by the encoder-side designs and
     /// harnesses, whose SPS derives an identity chroma-QP table.
     pub qp_c: [i32; 3],
-    /// r440 — `TuCResMode == 2` for the CU's chroma TB: §8.8.3.6.4
-    /// reads `Qp′CbCr` for both components.
-    pub joint_cbcr2: bool,
+    /// §7.4.12.11 `TuCResMode` of the CU's chroma TB (single-TB CUs;
+    /// a multi-TB CU carries the per-TB mode in [`Tu64CbfMap::jc2`] /
+    /// [`TbSplit::jc2`]). Mode 2 makes §8.8.3.6.4 read `Qp′CbCr` for
+    /// both components; any nonzero mode counts as "joint coded" in
+    /// the §8.8.3.5 bS sums.
+    pub tu_c_res_mode: u8,
     /// r447 — `ciip_flag` of the CU: §8.8.3.5 forces `bS = 2` when
     /// either side of the edge is a CIIP-coded block.
     pub ciip: bool,
@@ -142,6 +145,8 @@ pub struct TbSplit {
     pub cb_coded: [bool; 4],
     /// Per-TB `tu_cr_coded_flag + tu_joint_cbcr_residual_flag` fold.
     pub cr_coded: [bool; 4],
+    /// Per-TB `TuCResMode == 2` (§8.8.3.6.4 joint-QP pick).
+    pub jc2: [bool; 4],
     /// `true` for ISP: only the luma TB is split (§8.4.5.1 — the
     /// chroma TBs span the whole CU), so chroma edges / flags read the
     /// CU-level fields.
@@ -165,8 +170,14 @@ pub struct Tu64CbfMap {
     /// `Min(5, ·)` arm depends on it).
     pub tile_log2: u32,
     pub y: [[bool; 4]; 4],
+    /// Per-tile §8.8.3.5 chroma "coded" terms — the clause's
+    /// `tu_cb_coded_flag + tu_joint_cbcr_residual_flag` sum, so a
+    /// joint-coded TB (any `TuCResMode`) counts for BOTH components.
     pub cb: [[bool; 4]; 4],
     pub cr: [[bool; 4]; 4],
+    /// Per-tile `TuCResMode == 2` (§8.8.3.6.4 — that TB's deblock QP
+    /// is `Qp′CbCr`, not `Qp′Cb` / `Qp′Cr`).
+    pub jc2: [[bool; 4]; 4],
 }
 
 impl Default for Tu64CbfMap {
@@ -176,6 +187,7 @@ impl Default for Tu64CbfMap {
             y: [[false; 4]; 4],
             cb: [[false; 4]; 4],
             cr: [[false; 4]; 4],
+            jc2: [[false; 4]; 4],
         }
     }
 }
@@ -220,22 +232,41 @@ impl DeblockCu {
                 };
             }
         }
+        // §8.8.3.5 — the chroma arms sum the component CBF with
+        // `tu_joint_cbcr_residual_flag`, so a joint-coded TB counts
+        // for BOTH components regardless of its `TuCResMode`.
         match c_idx {
             0 => self.tu_y_coded,
-            1 => self.tu_cb_coded,
-            _ => self.tu_cr_coded,
+            1 => self.tu_cb_coded || self.tu_c_res_mode != 0,
+            _ => self.tu_cr_coded || self.tu_c_res_mode != 0,
         }
     }
 
     /// §8.8.3.6.4 — is the chroma TB containing the luma-coordinate
     /// sample coded with `TuCResMode == 2`? The mode is a per-TB
-    /// property: an SBT CU's non-residual sub-TU and a >MaxTbSizeY
-    /// tile without coded chroma have `TuCResMode == 0` even when the
-    /// CU's residual-bearing TU used the joint mode, so the record's
-    /// CU-level flag is gated on the per-TB chroma coded flag.
+    /// property: a >MaxTbSizeY CU's tiles and an SBT CU's sub-TUs
+    /// each carry their own `tu_joint_cbcr_residual_flag`, so the
+    /// lookup routes through the per-TB maps; only a single-TB CU
+    /// reads the CU-level mode.
     fn joint2_at(&self, luma_x: i32, luma_y: i32) -> bool {
-        self.joint_cbcr2
-            && (self.tu_coded_at(1, luma_x, luma_y) || self.tu_coded_at(2, luma_x, luma_y))
+        if let Some(map) = &self.tu64 {
+            let lx = (luma_x - self.x as i32).clamp(0, self.w as i32 - 1) as u32;
+            let ly = (luma_y - self.y as i32).clamp(0, self.h as i32 - 1) as u32;
+            let tx = ((lx >> map.tile_log2) as usize).min(3);
+            let ty = ((ly >> map.tile_log2) as usize).min(3);
+            return map.jc2[ty][tx];
+        }
+        if let Some(ts) = &self.tb_split {
+            if !ts.luma_only {
+                let rel = if ts.vertical {
+                    (luma_x - self.x as i32).clamp(0, self.w as i32 - 1) as u32
+                } else {
+                    (luma_y - self.y as i32).clamp(0, self.h as i32 - 1) as u32
+                };
+                return ts.jc2[ts.tb_index(rel)];
+            }
+        }
+        self.tu_c_res_mode == 2
     }
 
     /// §8.8.3.3 — length (along the given axis) of the LUMA transform
@@ -522,6 +553,42 @@ struct PlaneCtx<'a> {
     ctb_size_y: u32,
 }
 
+// ---------------------------------------------------------------------
+// Triage aids (env-gated; zero cost when unset).
+// ---------------------------------------------------------------------
+
+/// Picture ordinal of the running deblocking pass (counts
+/// [`apply_deblocking_clipped`] invocations) and the per-picture
+/// ordinal of the chroma strong-filter decisions taken so far — the
+/// `H266_DBG_CHROMA_FLIP=<pic>,<cIdx>,<n>` hypothesis hook forces the
+/// n-th strong chroma unit of plane cIdx in picture pic onto the
+/// §8.8.3.6.4 step 6 weak path, and `H266_DBG_DBLK_CSTRONG` lists the
+/// strong decisions with their §8.8.3.6.9 terms.
+static DBG_PIC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DBG_CSTRONG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Returns true when the just-taken strong decision must be flipped to
+/// weak by the `H266_DBG_CHROMA_FLIP` hook; also emits the
+/// `H266_DBG_DBLK_CSTRONG` listing line.
+fn dbg_chroma_strong(c_idx: u32, vertical: bool, cx: i32, cy: i32, beta: i32, tc: i32) -> bool {
+    use std::sync::atomic::Ordering;
+    let n = DBG_CSTRONG.fetch_add(1, Ordering::Relaxed);
+    let pic = DBG_PIC.load(Ordering::Relaxed).saturating_sub(1);
+    if std::env::var_os("H266_DBG_DBLK_CSTRONG").is_some() {
+        eprintln!(
+            "CSTRONG pic={pic} c={c_idx} n={n} {} ({cx},{cy}) beta={beta} tc={tc}",
+            if vertical { "V" } else { "H" }
+        );
+    }
+    if let Ok(v) = std::env::var("H266_DBG_CHROMA_FLIP") {
+        let f: Vec<u32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if f.len() == 3 && f[0] == pic && f[1] == c_idx && f[2] == n {
+            return true;
+        }
+    }
+    false
+}
+
 /// Apply §8.8.3 deblocking to all three planes of `out`. CUs in `cus`
 /// must be in decode order and must tile the picture exactly. The
 /// vertical pass runs first across all CUs, then the horizontal pass
@@ -553,6 +620,8 @@ pub fn apply_deblocking_clipped(
     no_filter_cols: &[u32],
     no_filter_rows: &[u32],
 ) {
+    DBG_PIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DBG_CSTRONG.store(0, std::sync::atomic::Ordering::Relaxed);
     if std::env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
         eprintln!(
             "DBLK apply: cus={} chroma_cus={:?} cfi={chroma_format_idc} disabled={}",
@@ -1039,6 +1108,7 @@ fn deblock_cu_dir(
                 if vertical {
                     run_chroma_filter_v(
                         plane.plane,
+                        c_idx,
                         ex,
                         ey,
                         beta,
@@ -1052,6 +1122,7 @@ fn deblock_cu_dir(
                 } else {
                     run_chroma_filter_h(
                         plane.plane,
+                        c_idx,
                         ex,
                         ey,
                         beta,
@@ -1895,6 +1966,7 @@ fn short_luma_apply(
 #[allow(clippy::too_many_arguments)]
 fn run_chroma_filter_v(
     plane: &mut PicturePlane,
+    c_idx: u32,
     cx: i32,
     cy: i32,
     beta: i32,
@@ -1929,7 +2001,7 @@ fn run_chroma_filter_v(
         // and compute dpq0, dpq1, d.
         let dec0 = chroma_strong_decision_v(plane, cx, cy, beta, tc);
         let dec1 = chroma_strong_decision_v(plane, cx, cy + max_k, beta, tc);
-        if dec0 && dec1 {
+        if dec0 && dec1 && !dbg_chroma_strong(c_idx, true, cx, cy, beta, tc) {
             // Strong filter on the full 2-row stripe.
             for k in 0..=max_k {
                 chroma_strong_apply_v(plane, cx, cy + k, tc, bd, plt_p, plt_q);
@@ -1960,6 +2032,7 @@ fn run_chroma_filter_v(
 #[allow(clippy::too_many_arguments)]
 fn run_chroma_filter_h(
     plane: &mut PicturePlane,
+    c_idx: u32,
     cx: i32,
     cy: i32,
     beta: i32,
@@ -1995,7 +2068,7 @@ fn run_chroma_filter_h(
         let short_p = max_filter_length_p == 1;
         let dec0 = chroma_strong_decision_h(plane, cx, cy, beta, tc, short_p);
         let dec1 = chroma_strong_decision_h(plane, cx + max_k, cy, beta, tc, short_p);
-        if dec0 && dec1 {
+        if dec0 && dec1 && !dbg_chroma_strong(c_idx, false, cx, cy, beta, tc) {
             for k in 0..=max_k {
                 chroma_strong_apply_h(plane, cx + k, cy, tc, bd, short_p, plt_p, plt_q);
             }
@@ -2242,7 +2315,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2263,7 +2336,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2310,7 +2383,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2331,7 +2404,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2385,7 +2458,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2406,7 +2479,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2446,7 +2519,7 @@ mod tests {
             bdpcm_luma: false,
             bdpcm_chroma: false,
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-            joint_cbcr2: false,
+            tu_c_res_mode: 0,
             plt: false,
             ciip: false,
             ibc: false,
@@ -2467,6 +2540,7 @@ mod tests {
                 y_coded: [true; 4],
                 cb_coded: [false; 4],
                 cr_coded: [false; 4],
+                jc2: [false; 4],
                 luma_only: true,
             }),
             ..base
@@ -2492,6 +2566,7 @@ mod tests {
                 y_coded: [true, false, false, false],
                 cb_coded: [true, false, false, false],
                 cr_coded: [false; 4],
+                jc2: [false; 4],
                 luma_only: false,
             }),
             ..base
@@ -2531,7 +2606,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2552,7 +2627,7 @@ mod tests {
                 bdpcm_luma: false,
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-                joint_cbcr2: false,
+                tu_c_res_mode: 0,
                 plt: false,
                 ciip: false,
                 ibc: false,
@@ -2595,7 +2670,7 @@ mod tests {
             bdpcm_luma: false,
             bdpcm_chroma: false,
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-            joint_cbcr2: false,
+            tu_c_res_mode: 0,
             plt: false,
             ciip: false,
             ibc: false,
@@ -2748,7 +2823,7 @@ mod tests {
             bdpcm_luma: false,
             bdpcm_chroma: false,
             qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
-            joint_cbcr2: false,
+            tu_c_res_mode: 0,
             plt: false,
             ciip: false,
             ibc: false,
