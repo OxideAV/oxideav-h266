@@ -600,6 +600,14 @@ impl StreamDecoder {
                 ph.ph_cu_qp_delta_subdiv_inter_slice
             });
         }
+        // §7.4.3.7 eqs. 124 / 134 — CuChromaQpOffsetSubdiv.
+        if sh0.sh_cu_chroma_qp_offset_enabled_flag {
+            walker.set_cu_chroma_qp_offset_subdiv(if sh0.sh_slice_type == SliceType::I {
+                ph.ph_cu_chroma_qp_offset_subdiv_intra_slice
+            } else {
+                ph.ph_cu_chroma_qp_offset_subdiv_inter_slice
+            });
+        }
         walker.set_ph_mvd_l1_zero(ph.ph_mvd_l1_zero_flag);
         walker.set_ph_bdof_disabled(ph.ph_bdof_disabled_flag);
         walker.set_ph_dmvr_disabled(ph.ph_dmvr_disabled_flag);

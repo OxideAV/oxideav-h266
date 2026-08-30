@@ -570,6 +570,48 @@ static DBG_CSTRONG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// Returns true when the just-taken strong decision must be flipped to
 /// weak by the `H266_DBG_CHROMA_FLIP` hook; also emits the
 /// `H266_DBG_DBLK_CSTRONG` listing line.
+/// `H266_DBG_CHROMA_OFF=<pic>,<cIdx>,<n>` — count every chroma edge
+/// unit that reaches the §8.8.3.6.5 filter (bS > 0 after the (1,1)
+/// rule) and skip the n-th entirely (as if bS were 0); with
+/// `H266_DBG_DBLK_CUNIT` list them. Same counter/reset discipline as
+/// the strong-decision hook.
+static DBG_CUNIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `H266_DBG_SKIP=<pic>,<stage>` — skip one whole loop-filter stage
+/// for one picture (stage: `dbc` = chroma deblock passes, `sao_c`,
+/// `alf_c`, `ccalf` are consumed by the ctu-level driver). Coarse
+/// localization aid for corpus triage.
+pub(crate) fn dbg_skip_stage(stage: &str) -> bool {
+    if let Ok(v) = std::env::var("H266_DBG_SKIP") {
+        let pic = DBG_PIC
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        if let Some((p, st)) = v.split_once(',') {
+            return p.trim().parse() == Ok(pic) && st.trim() == stage;
+        }
+    }
+    false
+}
+
+fn dbg_chroma_unit(c_idx: u32, vertical: bool, cx: i32, cy: i32, b_s: i32) -> bool {
+    use std::sync::atomic::Ordering;
+    let n = DBG_CUNIT.fetch_add(1, Ordering::Relaxed);
+    let pic = DBG_PIC.load(Ordering::Relaxed).saturating_sub(1);
+    if std::env::var_os("H266_DBG_DBLK_CUNIT").is_some() {
+        eprintln!(
+            "CUNIT pic={pic} c={c_idx} n={n} {} ({cx},{cy}) bS={b_s}",
+            if vertical { "V" } else { "H" }
+        );
+    }
+    if let Ok(v) = std::env::var("H266_DBG_CHROMA_OFF") {
+        let f: Vec<u32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if f.len() == 3 && f[0] == pic && f[1] == c_idx && f[2] == n {
+            return true;
+        }
+    }
+    false
+}
+
 fn dbg_chroma_strong(c_idx: u32, vertical: bool, cx: i32, cy: i32, beta: i32, tc: i32) -> bool {
     use std::sync::atomic::Ordering;
     let n = DBG_CSTRONG.fetch_add(1, Ordering::Relaxed);
@@ -622,6 +664,7 @@ pub fn apply_deblocking_clipped(
 ) {
     DBG_PIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DBG_CSTRONG.store(0, std::sync::atomic::Ordering::Relaxed);
+    DBG_CUNIT.store(0, std::sync::atomic::Ordering::Relaxed);
     if std::env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
         eprintln!(
             "DBLK apply: cus={} chroma_cus={:?} cfi={chroma_format_idc} disabled={}",
@@ -672,7 +715,7 @@ pub fn apply_deblocking_clipped(
         no_filter_rows,
     );
 
-    if chroma_format_idc != 0 {
+    if chroma_format_idc != 0 && !dbg_skip_stage("dbc") {
         let (c_cus, c_grid) = match (chroma_cus, chroma_grid.as_ref()) {
             (Some(cc), Some(cg)) => (cc, cg),
             _ => (cus, &grid),
@@ -1988,6 +2031,9 @@ fn run_chroma_filter_v(
     if max_filter_length_p == 1 && max_filter_length_q == 1 && b_s != 2 {
         return;
     }
+    if dbg_chroma_unit(c_idx, true, cx, cy, b_s) {
+        return;
+    }
     let bd = plane.bit_depth;
     // §8.8.3.6.5 maxK for EDGE_VER, SubHeightC = 2 (4:2:0) → maxK = 1
     // (i.e. 2 sample rows along the edge). Our chroma path always
@@ -2052,6 +2098,9 @@ fn run_chroma_filter_h(
     // step 2 only invokes the filter when maxFilterLengthQ > 0, so a
     // (1, 1) edge filters ONLY at bS = 2.
     if max_filter_length_p == 1 && max_filter_length_q == 1 && b_s != 2 {
+        return;
+    }
+    if dbg_chroma_unit(c_idx, false, cx, cy, b_s) {
         return;
     }
     let bd = plane.bit_depth;

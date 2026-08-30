@@ -467,6 +467,10 @@ pub struct CuToolFlags {
     /// `false` = this CU opens its QG (per-CU arming, the geometry
     /// this crate's encoder declares via the PH maximum subdiv).
     pub cu_qp_delta_already_coded: bool,
+    /// `IsCuChromaQpOffsetCoded` — when true the chroma QG already
+    /// carried `cu_chroma_qp_offset_flag` and this CU inherits
+    /// `CuQpOffset*` instead of reading (§7.3.11.10 presence term).
+    pub cu_chroma_qp_offset_already_coded: bool,
     /// `sh_cu_chroma_qp_offset_enabled_flag` — gates
     /// `cu_chroma_qp_offset_flag` reads.
     pub cu_chroma_qp_offset_enabled: bool,
@@ -685,6 +689,9 @@ pub struct LeafCuInfo {
     pub cu_chroma_qp_offset_flag: bool,
     /// `cu_chroma_qp_offset_idx` (0 when the flag is 0).
     pub cu_chroma_qp_offset_idx: u32,
+    /// This CU read `cu_chroma_qp_offset_flag` (→ the walker sets
+    /// `IsCuChromaQpOffsetCoded = 1` and fixes the QG's offsets).
+    pub cu_chroma_qp_offset_read: bool,
     /// `LastSignificantCoeffX` for the luma TB (0 when no residual).
     pub last_sig_x: u32,
     /// `LastSignificantCoeffY` for the luma TB.
@@ -770,6 +777,7 @@ impl Default for LeafCuInfo {
             cu_qp_delta_read: false,
             cu_chroma_qp_offset_flag: false,
             cu_chroma_qp_offset_idx: 0,
+            cu_chroma_qp_offset_read: false,
             last_sig_x: 0,
             last_sig_y: 0,
             inter: InterCuInfo {
@@ -1937,7 +1945,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             cu_qp_delta_enabled: self.tools.cu_qp_delta_enabled,
             cu_qp_delta_already_coded: self.tools.cu_qp_delta_already_coded,
             cu_chroma_qp_offset_enabled: self.tools.cu_chroma_qp_offset_enabled,
-            cu_chroma_qp_offset_already_coded: false,
+            cu_chroma_qp_offset_already_coded: self.tools.cu_chroma_qp_offset_already_coded,
             chroma_qp_offset_list_len_minus1: self.tools.chroma_qp_offset_list_len_minus1,
         };
         let cu = crate::palette::read_palette_coding(
@@ -1958,6 +1966,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         if cu.cu_chroma_qp_offset_read {
             info.cu_chroma_qp_offset_flag = cu.cu_chroma_qp_offset_flag;
             info.cu_chroma_qp_offset_idx = cu.cu_chroma_qp_offset_idx;
+            info.cu_chroma_qp_offset_read = true;
         }
         // §8.4.5.3 predictor maintenance (eq. 450 / 451) — the eq. 451
         // mirror is gated on the picture actually walking separate
@@ -2096,7 +2105,10 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // `treeType != DUAL_TREE_CHROMA`; the chroma tree never carries
         // the luma QP delta (the pre-r434 read here desynced every
         // dual-tree wire with `pps_cu_qp_delta_enabled_flag`).
-        if self.tools.cu_chroma_qp_offset_enabled && chroma_cbf {
+        if self.tools.cu_chroma_qp_offset_enabled
+            && !self.tools.cu_chroma_qp_offset_already_coded
+            && chroma_cbf
+        {
             let (flag, idx) = read_cu_chroma_qp_offset(
                 self.dec,
                 &mut self.ctxs.residual,
@@ -2104,6 +2116,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             )?;
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
+            info.cu_chroma_qp_offset_read = true;
         }
         // §7.3.11.10 — tu_joint_cbcr_residual_flag (dual-tree chroma
         // CUs are MODE_INTRA, so the presence condition reduces to any
@@ -3939,7 +3952,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 info.cu_qp_delta_read = true;
                 qp_delta_done = true;
             }
-            if self.tools.cu_chroma_qp_offset_enabled && chroma_available && !chroma_off_done {
+            if self.tools.cu_chroma_qp_offset_enabled
+                && !self.tools.cu_chroma_qp_offset_already_coded
+                && chroma_available
+                && !chroma_off_done
+            {
                 let (flag, idx) = read_cu_chroma_qp_offset(
                     self.dec,
                     &mut self.ctxs.residual,
@@ -3947,6 +3964,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 )?;
                 info.cu_chroma_qp_offset_flag = flag;
                 info.cu_chroma_qp_offset_idx = idx;
+                info.cu_chroma_qp_offset_read = true;
                 chroma_off_done = true;
             }
             // §7.3.11.10 joint-CbCr gate: an intra TU reads the flag
@@ -4114,7 +4132,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.cu_qp_delta_val = read_cu_qp_delta(self.dec, &mut self.ctxs.residual)?;
             info.cu_qp_delta_read = true;
         }
-        if self.tools.cu_chroma_qp_offset_enabled && chroma_available && chroma_cbf {
+        if self.tools.cu_chroma_qp_offset_enabled
+            && !self.tools.cu_chroma_qp_offset_already_coded
+            && chroma_available
+            && chroma_cbf
+        {
             let (flag, idx) = read_cu_chroma_qp_offset(
                 self.dec,
                 &mut self.ctxs.residual,
@@ -4122,6 +4144,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             )?;
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
+            info.cu_chroma_qp_offset_read = true;
         }
         if self.tools.joint_cbcr_enabled
             && chroma_available
@@ -4309,7 +4332,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             info.cu_qp_delta_read = true;
         }
         // cu_chroma_qp_offset — gated on chroma CBF + enable.
-        if self.tools.cu_chroma_qp_offset_enabled && chroma_available && chroma_cbf {
+        if self.tools.cu_chroma_qp_offset_enabled
+            && !self.tools.cu_chroma_qp_offset_already_coded
+            && chroma_available
+            && chroma_cbf
+        {
             let (flag, idx) = read_cu_chroma_qp_offset(
                 self.dec,
                 &mut self.ctxs.residual,
@@ -4317,6 +4344,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             )?;
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
+            info.cu_chroma_qp_offset_read = true;
         }
         // tu_joint_cbcr_residual_flag — for MODE_INTER it is read when
         // both chroma CBFs are set (§7.3.11.10). The §7.4.12.11
@@ -4597,7 +4625,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         }
         // cu_chroma_qp_offset_flag + idx.
         let chroma_cbf = info.tu_cb_coded_flag || info.tu_cr_coded_flag;
-        if self.tools.cu_chroma_qp_offset_enabled && chroma && chroma_cbf {
+        if self.tools.cu_chroma_qp_offset_enabled
+            && !self.tools.cu_chroma_qp_offset_already_coded
+            && chroma
+            && chroma_cbf
+        {
             let (flag, idx) = read_cu_chroma_qp_offset(
                 self.dec,
                 &mut self.ctxs.residual,
@@ -4605,6 +4637,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             )?;
             info.cu_chroma_qp_offset_flag = flag;
             info.cu_chroma_qp_offset_idx = idx;
+            info.cu_chroma_qp_offset_read = true;
         }
         // §7.3.11.10 — tu_joint_cbcr_residual_flag: read for intra CUs
         // with any chroma CBF, and for others when both CBFs are set.
@@ -5067,7 +5100,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             // partition's TU, after `cu_qp_delta` and before its luma
             // `residual_coding()`.
             if chroma_cbf_here {
-                if self.tools.cu_chroma_qp_offset_enabled {
+                if self.tools.cu_chroma_qp_offset_enabled
+                    && !self.tools.cu_chroma_qp_offset_already_coded
+                {
                     let (flag, idx) = read_cu_chroma_qp_offset(
                         self.dec,
                         &mut self.ctxs.residual,
@@ -5075,6 +5110,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     )?;
                     info.cu_chroma_qp_offset_flag = flag;
                     info.cu_chroma_qp_offset_idx = idx;
+                    info.cu_chroma_qp_offset_read = true;
                 }
                 // ISP CUs are MODE_INTRA, so the §7.3.11.10 joint
                 // condition is just "any chroma CBF".

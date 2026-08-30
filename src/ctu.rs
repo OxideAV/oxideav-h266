@@ -1080,6 +1080,16 @@ pub struct CtuWalker<'a, 'b> {
     /// delta. CUs of the QG that parse after the carrying TU inherit
     /// it; reset to 0 at every QG declaration.
     qg_delta_val: i32,
+    /// §7.4.3.7 `CuChromaQpOffsetSubdiv` (eqs. 124 / 134) — the
+    /// chroma-QG counterpart of `cu_qp_delta_subdiv`: a coding-tree
+    /// node with `qgOnC && cbSubdiv <= CuChromaQpOffsetSubdiv` resets
+    /// `IsCuChromaQpOffsetCoded` / `CuQpOffsetCb/Cr/CbCr` (§7.3.11.4).
+    cu_chroma_qp_offset_subdiv: u32,
+    /// `IsCuChromaQpOffsetCoded` for the open chroma QG.
+    qg_chroma_coded: bool,
+    /// The chroma QG's `(cu_chroma_qp_offset_flag, cu_chroma_qp_offset_idx)`
+    /// — inherited by every later CU of the QG (§7.4.12.10 / eqs. 193–195).
+    qg_chroma_off: (bool, u32),
     /// r418 — the §8.7.1 `qPY_PRED` shared by every CU of the current
     /// QG, derived at QG declaration from the per-4x4 `QpY` map
     /// (qPY_A / qPY_B neighbour average with the qPY_PREV fall-backs
@@ -1378,6 +1388,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             scaling_list: None,
             partition_constraints_override: None,
             cu_qp_delta_subdiv: u32::MAX,
+            cu_chroma_qp_offset_subdiv: u32::MAX,
+            qg_chroma_coded: false,
+            qg_chroma_off: (false, 0),
             qg_delta_coded: false,
             qg_delta_val: 0,
             qg_qp_y_pred: slice_qp.0,
@@ -1511,6 +1524,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.subset_idx = 0;
         self.qg_delta_coded = false;
         self.qg_delta_val = 0;
+        self.qg_chroma_coded = false;
+        self.qg_chroma_off = (false, 0);
         self.qg_qp_y_pred = slice_qp.0;
         self.last_cu_qp_y = None;
         Ok(())
@@ -2286,6 +2301,37 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         self.cu_qp_delta_subdiv = subdiv;
     }
 
+    /// §7.4.3.7 `CuChromaQpOffsetSubdiv` (eq. 124 for intra slices /
+    /// eq. 134 for inter slices — the PH-signalled
+    /// `ph_cu_chroma_qp_offset_subdiv_{intra,inter}_slice`). Drives the
+    /// §7.3.11.4 chroma quantization-group arming.
+    pub fn set_cu_chroma_qp_offset_subdiv(&mut self, subdiv: u32) {
+        self.cu_chroma_qp_offset_subdiv = subdiv;
+    }
+
+    /// §7.3.11.4 — open a chroma QG at a node with `qgOnC && cbSubdiv
+    /// <= CuChromaQpOffsetSubdiv`: `IsCuChromaQpOffsetCoded = 0` and
+    /// the three `CuQpOffset*` terms reset (an unread flag = 0 → 0).
+    fn arm_chroma_qg(&mut self, qg_on_c: bool, cb_subdiv: u32) {
+        if self.sh.sh_cu_chroma_qp_offset_enabled_flag
+            && qg_on_c
+            && cb_subdiv <= self.cu_chroma_qp_offset_subdiv
+        {
+            self.qg_chroma_coded = false;
+            self.qg_chroma_off = (false, 0);
+        }
+    }
+
+    /// §7.4.12.10 — a CU that read `cu_chroma_qp_offset_flag` sets
+    /// `IsCuChromaQpOffsetCoded = 1` and fixes `CuQpOffset*` for the
+    /// rest of the chroma QG.
+    fn fold_chroma_qg(&mut self, info: &LeafCuInfo) {
+        if info.cu_chroma_qp_offset_read {
+            self.qg_chroma_coded = true;
+            self.qg_chroma_off = (info.cu_chroma_qp_offset_flag, info.cu_chroma_qp_offset_idx);
+        }
+    }
+
     /// Install the picture-level effective partition constraints
     /// (§7.4.3.8) — the SPS set with the PH
     /// `ph_partition_constraints_override_flag` values substituted for
@@ -2971,6 +3017,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // r418 — per-CU QG snapshot; `decode_leaf_cu_syntax`
             // overrides this from the walker's live QG state.
             cu_qp_delta_already_coded: false,
+            cu_chroma_qp_offset_already_coded: false,
             cu_chroma_qp_offset_enabled: self.sh.sh_cu_chroma_qp_offset_enabled_flag,
             // §7.3.11.10 / §9.3.3.2 — `cu_chroma_qp_offset_idx` is
             // TR-binarised with cMax = pps_chroma_qp_offset_list_len_minus1
@@ -3102,12 +3149,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // this is the historical behaviour unless a smaller
         // `CuQpDeltaSubdiv` is set.
         tools.cu_qp_delta_already_coded = self.qg_delta_coded;
+        tools.cu_chroma_qp_offset_already_coded = self.qg_chroma_coded;
         let mut info = LeafCuInfo {
             x0: cu.cu.x,
             y0: cu.cu.y,
             cb_width: cu.cu.w,
             cb_height: cu.cu.h,
             cu_qp_delta_val: self.qg_delta_val,
+            cu_chroma_qp_offset_flag: self.qg_chroma_off.0,
+            cu_chroma_qp_offset_idx: self.qg_chroma_off.1,
             ..LeafCuInfo::default()
         };
         info.tree = tree;
@@ -3166,6 +3216,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             /// `CuQpDeltaSubdiv` (`qgNextOnY`), permanently disabling
             /// QG declarations in that subtree.
             qg_on_y: bool,
+            qg_on_c: bool,
             /// §7.4.12.4 `depthOffset` — incremented by boundary
             /// implicit BT splits; raises the effective `maxMttDepth`.
             depth_offset: u32,
@@ -3224,6 +3275,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             part_idx: 0,
             cb_subdiv: 0,
             qg_on_y: true,
+            qg_on_c: true,
             depth_offset: 0,
             mode_type: 0,
             dual_luma: false,
@@ -3257,13 +3309,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // sps_qtbtt_dual_tree_intra_flag) the CclmEnabled
                 // derivation collapses to the SPS flag.
                 let cclm_enabled = self.sps.tool_flags.cclm_enabled_flag;
-                let tools = self.cu_tool_flags();
+                let mut tools = self.cu_tool_flags();
+                tools.cu_chroma_qp_offset_already_coded = self.qg_chroma_coded;
                 let mut info = LeafCuInfo {
                     tree: TreeType::DualTreeChroma,
                     x0: ccu.cu.x,
                     y0: ccu.cu.y,
                     cb_width: ccu.cu.w,
                     cb_height: ccu.cu.h,
+                    cu_chroma_qp_offset_flag: self.qg_chroma_off.0,
+                    cu_chroma_qp_offset_idx: self.qg_chroma_off.1,
                     ..LeafCuInfo::default()
                 };
                 let mut residual = LeafCuResidual::default();
@@ -3271,6 +3326,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     .with_tree_type(TreeType::DualTreeChroma)
                     .with_palette_predictor(&mut self.palette_pred);
                 reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
+                self.fold_chroma_qg(&info);
                 info.tree = TreeType::DualTreeChroma;
                 // §8.7.1 — a DUAL_TREE_CHROMA CU's `QpY` is that of
                 // the luma CU covering the CB-centre luma location
@@ -3302,6 +3358,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.qg_delta_val = 0;
                 self.qg_qp_y_pred = self.derive_qp_y_pred(ctu.x0 + n.x, ctu.y0 + n.y);
             }
+            self.arm_chroma_qg(n.qg_on_c, n.cb_subdiv);
             let mut allows = constraints.allows_off(
                 ctu.x0 + n.x,
                 ctu.y0 + n.y,
@@ -3393,6 +3450,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     self.qg_delta_coded = true;
                     self.qg_delta_val = info.cu_qp_delta_val;
                 }
+                self.fold_chroma_qg(&info);
                 // §8.7.1 eq. 1120 — QpY from the QG's qPY_PRED + the
                 // (possibly inherited) CuQpDeltaVal, with the
                 // QpBdOffset mod-wrap. `info.cu_qp_delta_val` is then
@@ -3458,6 +3516,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 0,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        qg_on_c: n.qg_on_c,
                         depth_offset: 0,
                         ..n.clone()
                     },
@@ -3472,6 +3531,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 1,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        qg_on_c: n.qg_on_c,
                         depth_offset: 0,
                         ..n.clone()
                     },
@@ -3486,6 +3546,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 2,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        qg_on_c: n.qg_on_c,
                         depth_offset: 0,
                         ..n.clone()
                     },
@@ -3500,6 +3561,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         part_idx: 3,
                         cb_subdiv: n.cb_subdiv + 2,
                         qg_on_y: n.qg_on_y,
+                        qg_on_c: n.qg_on_c,
                         depth_offset: 0,
                         ..n.clone()
                     },
@@ -3583,6 +3645,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                qg_on_c: n.qg_on_c,
                                 depth_offset: bt_doff,
                                 ..n.clone()
                             },
@@ -3597,6 +3660,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                qg_on_c: n.qg_on_c,
                                 depth_offset: bt_doff,
                                 ..n.clone()
                             },
@@ -3623,6 +3687,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                qg_on_c: n.qg_on_c,
                                 depth_offset: bt_doff,
                                 ..n.clone()
                             },
@@ -3637,6 +3702,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: n.qg_on_y,
+                                qg_on_c: n.qg_on_c,
                                 depth_offset: bt_doff,
                                 ..n.clone()
                             },
@@ -3653,6 +3719,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     // deeper node may declare a QG (the +1-side
                     // centre child included).
                     let qg_next = n.qg_on_y && n.cb_subdiv + 2 <= self.cu_qp_delta_subdiv;
+                    let qg_next_c = n.qg_on_c && n.cb_subdiv + 2 <= self.cu_chroma_qp_offset_subdiv;
                     let tt = Some(mtt_vertical == 1);
                     if mtt_vertical == 1 {
                         let q = n.w / 4;
@@ -3668,6 +3735,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                qg_on_c: qg_next_c,
                                 depth_offset: n.depth_offset,
                                 ..n.clone()
                             },
@@ -3682,6 +3750,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: qg_next,
+                                qg_on_c: qg_next_c,
                                 depth_offset: n.depth_offset,
                                 ..n.clone()
                             },
@@ -3696,6 +3765,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 2,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                qg_on_c: qg_next_c,
                                 depth_offset: n.depth_offset,
                                 ..n.clone()
                             },
@@ -3714,6 +3784,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 0,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                qg_on_c: qg_next_c,
                                 depth_offset: n.depth_offset,
                                 ..n.clone()
                             },
@@ -3728,6 +3799,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 1,
                                 cb_subdiv: n.cb_subdiv + 1,
                                 qg_on_y: qg_next,
+                                qg_on_c: qg_next_c,
                                 depth_offset: n.depth_offset,
                                 ..n.clone()
                             },
@@ -3742,6 +3814,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 part_idx: 2,
                                 cb_subdiv: n.cb_subdiv + 2,
                                 qg_on_y: qg_next,
+                                qg_on_c: qg_next_c,
                                 depth_offset: n.depth_offset,
                                 ..n.clone()
                             },
@@ -4332,6 +4405,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.qg_delta_val = 0;
                 self.qg_qp_y_pred = self.derive_qp_y_pred(x0, y0);
             }
+            self.arm_chroma_qg(true, cb_subdiv);
             let half = cb_size / 2;
             let x1 = x0 + half;
             let y1 = y0 + half;
@@ -4456,6 +4530,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             part_idx: u32,
             cb_subdiv: u32,
             qg_on_y: bool,
+            qg_on_c: bool,
             depth_offset: u32,
         }
         let is_luma = tree == TreeType::DualTreeLuma;
@@ -4493,6 +4568,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // CTB-rooted subdivision level.
             cb_subdiv: 2 * cqt_depth0,
             qg_on_y: true,
+            qg_on_c: true,
             depth_offset: 0,
         }];
         while let Some(n) = stack.pop() {
@@ -4506,6 +4582,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.qg_delta_coded = false;
                 self.qg_delta_val = 0;
                 self.qg_qp_y_pred = self.derive_qp_y_pred(node_x + n.x, node_y + n.y);
+            }
+            if !is_luma {
+                self.arm_chroma_qg(n.qg_on_c, n.cb_subdiv);
             }
             let allows = constraints.allows_off(
                 node_x + n.x,
@@ -4576,12 +4655,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     let neigh = self.compute_cu_neighbourhood(&ccu);
                     let mut tools = self.cu_tool_flags();
                     tools.cu_qp_delta_already_coded = self.qg_delta_coded;
+                    tools.cu_chroma_qp_offset_already_coded = self.qg_chroma_coded;
                     let mut info = LeafCuInfo {
                         x0: ccu.cu.x,
                         y0: ccu.cu.y,
                         cb_width: ccu.cu.w,
                         cb_height: ccu.cu.h,
                         cu_qp_delta_val: self.qg_delta_val,
+                        cu_chroma_qp_offset_flag: self.qg_chroma_off.0,
+                        cu_chroma_qp_offset_idx: self.qg_chroma_off.1,
                         ..LeafCuInfo::default()
                     };
                     let mut residual = LeafCuResidual::default();
@@ -4595,6 +4677,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             self.qg_delta_coded = true;
                             self.qg_delta_val = info.cu_qp_delta_val;
                         }
+                        self.fold_chroma_qg(&info);
                         let qp_bd_offset = 6 * self.sps.sps_bitdepth_minus8 as i32;
                         let qp_y =
                             (self.qg_qp_y_pred + info.cu_qp_delta_val + 64 + 2 * qp_bd_offset)
@@ -4638,12 +4721,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             ccu.cu.y,
                         )
                     });
-                    let tools = self.cu_tool_flags();
+                    let mut tools = self.cu_tool_flags();
+                    tools.cu_chroma_qp_offset_already_coded = self.qg_chroma_coded;
                     let mut info = LeafCuInfo {
                         x0: ccu.cu.x,
                         y0: ccu.cu.y,
                         cb_width: ccu.cu.w,
                         cb_height: ccu.cu.h,
+                        cu_chroma_qp_offset_flag: self.qg_chroma_off.0,
+                        cu_chroma_qp_offset_idx: self.qg_chroma_off.1,
                         ..LeafCuInfo::default()
                     };
                     let mut residual = LeafCuResidual::default();
@@ -4651,6 +4737,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         .with_tree_type(TreeType::DualTreeChroma)
                         .with_palette_predictor(&mut self.palette_pred);
                     reader.decode_dual_chroma(&mut info, &mut residual, dm_mode, cclm_enabled)?;
+                    self.fold_chroma_qg(&info);
                     // §8.7.1 — for a DUAL_TREE_CHROMA CU, `QpY` is the
                     // luma quantization parameter of the luma CU
                     // covering the CB-centre luma location
@@ -4710,6 +4797,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     part_idx,
                     cb_subdiv: n.cb_subdiv + 2,
                     qg_on_y: n.qg_on_y,
+                    qg_on_c: n.qg_on_c,
                     depth_offset: 0,
                 };
                 let all = vec![
@@ -4799,6 +4887,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             part_idx,
                             cb_subdiv: n.cb_subdiv + 1,
                             qg_on_y: n.qg_on_y,
+                            qg_on_c: n.qg_on_c,
                             depth_offset: bt_doff,
                         };
                         let mut v = vec![mk(n.x, 0), mk(n.x + hw, 1)];
@@ -4821,6 +4910,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             part_idx,
                             cb_subdiv: n.cb_subdiv + 1,
                             qg_on_y: n.qg_on_y,
+                            qg_on_c: n.qg_on_c,
                             depth_offset: bt_doff,
                         };
                         let mut v = vec![mk(n.y, 0), mk(n.y + hh, 1)];
@@ -4831,6 +4921,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     }
                 } else {
                     let qg_next = n.qg_on_y && n.cb_subdiv + 2 <= self.cu_qp_delta_subdiv;
+                    let qg_next_c = n.qg_on_c && n.cb_subdiv + 2 <= self.cu_chroma_qp_offset_subdiv;
                     let tt = Some(mtt_vertical == 1);
                     if mtt_vertical == 1 {
                         let q = n.w / 4;
@@ -4845,6 +4936,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             part_idx,
                             cb_subdiv: n.cb_subdiv + sub,
                             qg_on_y: qg_next,
+                            qg_on_c: qg_next_c,
                             depth_offset: n.depth_offset,
                         };
                         vec![
@@ -4865,6 +4957,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             part_idx,
                             cb_subdiv: n.cb_subdiv + sub,
                             qg_on_y: qg_next,
+                            qg_on_c: qg_next_c,
                             depth_offset: n.depth_offset,
                         };
                         vec![
@@ -12565,7 +12658,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // default unless an integration test explicitly populates it.
         let sao_cfg = SaoConfig {
             luma_used: self.sh.sh_sao_luma_used_flag,
-            chroma_used: self.sh.sh_sao_chroma_used_flag,
+            chroma_used: self.sh.sh_sao_chroma_used_flag
+                && !crate::deblock::dbg_skip_stage("sao_c"),
             bit_depth,
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
@@ -12585,10 +12679,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // it.
         let alf_cfg = AlfConfig {
             alf_enabled: self.sh.sh_alf_enabled_flag,
-            cb_enabled: self.sh.sh_alf_cb_enabled_flag,
-            cr_enabled: self.sh.sh_alf_cr_enabled_flag,
-            cc_cb_enabled: self.sh.sh_alf_cc_cb_enabled_flag,
-            cc_cr_enabled: self.sh.sh_alf_cc_cr_enabled_flag,
+            cb_enabled: self.sh.sh_alf_cb_enabled_flag && !crate::deblock::dbg_skip_stage("alf_c"),
+            cr_enabled: self.sh.sh_alf_cr_enabled_flag && !crate::deblock::dbg_skip_stage("alf_c"),
+            cc_cb_enabled: self.sh.sh_alf_cc_cb_enabled_flag
+                && !crate::deblock::dbg_skip_stage("ccalf"),
+            cc_cr_enabled: self.sh.sh_alf_cc_cr_enabled_flag
+                && !crate::deblock::dbg_skip_stage("ccalf"),
             bit_depth,
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
