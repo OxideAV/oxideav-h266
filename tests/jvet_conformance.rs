@@ -677,7 +677,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("TILE_A_2", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("TMVP_A_3", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("WPP_A_3", 'P'),    // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("WP_A_3", 'U'),     // explicit WP on GPM / affine / sub-block-merge CUs
+    ("WP_A_3", 'P'), // byte-exact (r453 §8.5.6.6.3 explicit WP on affine / SbTMVP + §7.3.11.5 bcw_idx gate)
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this

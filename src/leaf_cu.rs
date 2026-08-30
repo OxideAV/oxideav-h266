@@ -566,6 +566,12 @@ pub struct CuToolFlags {
     pub num_ref_idx_active_l1: u32,
     /// `sps_bcw_enabled_flag` — §7.3.11.5 `bcw_idx` gate.
     pub bcw_enabled: bool,
+    /// §7.3.11.5 `bcw_idx` gate — `luma_weight_lX_flag[ i ]` of the
+    /// slice's `pred_weight_table()` as a bit mask per list (bit `i` =
+    /// reference index `i`); all-zero when no explicit tables bind.
+    pub wp_luma_flag_mask: [u16; 2],
+    /// `chroma_weight_lX_flag[ i ]` bit masks per list.
+    pub wp_chroma_flag_mask: [u16; 2],
     /// `NoBackwardPredFlag` (§8.3.6) — selects the `bcw_idx` cMax
     /// (4 when set, 2 otherwise).
     pub no_backward_pred: bool,
@@ -2524,22 +2530,6 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             };
             let (_amvr_flag, _amvr_precision_idx, amvr_shift) =
                 self.read_amvr_inter_gated(&amvr_gate)?;
-            // §7.3.11.5 bcw_idx — the walker profile carries no
-            // pred_weight_table() (explicit weighted prediction is
-            // rejected upstream), so the four per-refIdx weight flags
-            // are 0.
-            let bcw_gate = BcwIdxGate {
-                sps_bcw_enabled: self.tools.bcw_enabled,
-                inter_pred_idc: Some(d.mvp.inter_pred_idc),
-                luma_weight_l0_flag: false,
-                luma_weight_l1_flag: false,
-                chroma_weight_l0_flag: false,
-                chroma_weight_l1_flag: false,
-                cb_width: info.cb_width,
-                cb_height: info.cb_height,
-                no_backward_pred_flag: self.tools.no_backward_pred,
-            };
-            let bcw_idx = self.read_bcw_idx_gated(bcw_gate)?;
             // §7.4.12.7 — under sym_mvd_flag the per-list reference
             // indices are the §8.3.5 RefIdxSymLX.
             let (ref_idx_l0, ref_idx_l1) = if d.mvp.sym_mvd_flag {
@@ -2547,6 +2537,26 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             } else {
                 (d.mvp.ref_idx_l0 as i32, d.mvp.ref_idx_l1 as i32)
             };
+            // §7.3.11.5 bcw_idx — gated on the slice's
+            // pred_weight_table() flags for the CU's reference indices
+            // (r453: a flagged reference closes the gate; the value is
+            // then inferred 0).
+            let wflag = |mask: [u16; 2], list: usize, ri: i32| -> bool {
+                (0..16).contains(&ri) && (mask[list] >> ri) & 1 == 1
+            };
+            let bcw_gate = BcwIdxGate {
+                sps_bcw_enabled: self.tools.bcw_enabled,
+                inter_pred_idc: Some(d.mvp.inter_pred_idc),
+                luma_weight_l0_flag: wflag(self.tools.wp_luma_flag_mask, 0, ref_idx_l0),
+                luma_weight_l1_flag: wflag(self.tools.wp_luma_flag_mask, 1, ref_idx_l1),
+                chroma_weight_l0_flag: wflag(self.tools.wp_chroma_flag_mask, 0, ref_idx_l0),
+                chroma_weight_l1_flag: wflag(self.tools.wp_chroma_flag_mask, 1, ref_idx_l1),
+                cb_width: info.cb_width,
+                cb_height: info.cb_height,
+                no_backward_pred_flag: self.tools.no_backward_pred,
+            };
+            let bcw_idx = self.read_bcw_idx_gated(bcw_gate)?;
+            let (ref_idx_l0, ref_idx_l1) = { (ref_idx_l0, ref_idx_l1) };
             info.inter.non_merge = crate::inter::NonMergeInterData {
                 pred_dir: d.mvp.inter_pred_idc,
                 ref_idx_l0,

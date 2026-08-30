@@ -2556,6 +2556,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
     /// r452 — the explicit-WP entry for `RefPicList[list][ref_idx]`
     /// when the slice is weighted and the index is signalled.
+    /// §7.3.11.5 `bcw_idx` gate inputs — the bound `pred_weight_table()`
+    /// flags as per-list bit masks (`(luma, chroma)`, bit `i` =
+    /// reference index `i`).
+    fn wp_flag_masks(&self) -> ([u16; 2], [u16; 2]) {
+        let mut luma = [0u16; 2];
+        let mut chroma = [0u16; 2];
+        if let Some(t) = self.explicit_wp.as_ref() {
+            for (list, entries) in [&t.l0, &t.l1].into_iter().enumerate() {
+                for (i, e) in entries.iter().enumerate().take(16) {
+                    if e.luma_flag {
+                        luma[list] |= 1 << i;
+                    }
+                    if e.chroma_flag {
+                        chroma[list] |= 1 << i;
+                    }
+                }
+            }
+        }
+        (luma, chroma)
+    }
+
     fn wp_entry(&self, list: usize, ref_idx: i32) -> Option<&crate::inter::WpRefEntry> {
         self.explicit_wp
             .as_ref()
@@ -2565,15 +2586,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// r452 — an explicit-WP slice with at least one signalled weight
     /// on a CU path that still composes through §8.5.6.6.2 (affine,
     /// sub-block merge, GPM) is refused rather than mis-predicted.
-    fn refuse_explicit_wp_on(&self, path: &str) -> Result<()> {
-        if self.explicit_wp.as_ref().is_some_and(|t| t.any_explicit()) {
-            return Err(Error::unsupported(format!(
-                "h266 stream: explicit weighted prediction on {path} CUs not supported"
-            )));
-        }
-        Ok(())
-    }
-
     /// r452 — §8.5.6.6.3 explicit weighted luma prediction of one
     /// translational CU rectangle from the per-list §8.5.6.3
     /// high-precision arrays. `rp_lX` carry `(reference, mv)` per
@@ -2711,6 +2723,240 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// `cSign = 1 − 2 * flag` factor when reconstructing the non-coded
     /// chroma residual from the joint Cb-Cr coded block. Takes effect
     /// for subsequent leaf-CU reconstructions in the picture.
+    /// §8.5.6.6.1 — does the explicit weighted sample prediction
+    /// process (§8.5.6.6.3) apply to a CU using `ref_idx_l0` /
+    /// `ref_idx_l1` (`None` = list unused) with `bcw_idx`? It applies
+    /// when `weightedPredFlag && bcwIdx == 0`; a CU whose references
+    /// carry no signalled weight composes bit-identically through the
+    /// default process (the inferred `1 << denom` weight and zero
+    /// offset reduce eqs. 992 – 994 to eqs. 978 / 980), so only the
+    /// flagged case is routed.
+    fn wp_flagged_refs(
+        &self,
+        ref_idx_l0: Option<i32>,
+        ref_idx_l1: Option<i32>,
+        bcw_idx: u8,
+    ) -> bool {
+        if bcw_idx != 0 || self.explicit_wp.is_none() {
+            return false;
+        }
+        let flagged = |list: usize, ri: Option<i32>| {
+            ri.and_then(|r| self.wp_entry(list, r))
+                .is_some_and(|e| e.luma_flag || e.chroma_flag)
+        };
+        flagged(0, ref_idx_l0) || flagged(1, ref_idx_l1)
+    }
+
+    /// Write a composed prediction block into a plane rectangle.
+    fn write_pred_block(plane: &mut PicturePlane, x: u32, y: u32, w: u32, h: u32, pb: &[i32]) {
+        for row in 0..h as usize {
+            let dst = (y as usize + row) * plane.stride + x as usize;
+            for col in 0..w as usize {
+                plane.samples[dst + col] = pb[row * w as usize + col] as u16;
+            }
+        }
+    }
+
+    /// §8.5.6.6.3 explicit weighted sample prediction on an AFFINE CU
+    /// (AMVP or merge): the per-list §8.5.5.9 / §8.5.5.8 high-precision
+    /// luma arrays (PROF included) and the §8.5.5.3-averaged chroma
+    /// sub-block arrays are composed with the §7.4.9 weights of the
+    /// CU's reference indices (eqs. 992 – 994) instead of the default
+    /// §8.5.6.6.2 average.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_affine_inter_wp(
+        &self,
+        cb_x: u32,
+        cb_y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        l0: Option<(&crate::affine::AffineCpmvs, &ReferencePicture, i32)>,
+        l1: Option<(&crate::affine::AffineCpmvs, &ReferencePicture, i32)>,
+        out: &mut PictureBuffer,
+    ) -> Result<()> {
+        use crate::affine::{predict_luma_block_affine_prof_hp, AffineLumaFilterSet};
+        let tables = self
+            .explicit_wp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("h266 explicit WP: no tables bound"))?;
+        let bd = out.luma.bit_depth;
+        let bipred = l0.is_some() && l1.is_some();
+        let hp = |l: Option<(&crate::affine::AffineCpmvs, &ReferencePicture, i32)>| -> Result<Option<Vec<i32>>> {
+            match l {
+                Some((cp, rp, _)) => Ok(Some(predict_luma_block_affine_prof_hp(
+                    cb_x,
+                    cb_y,
+                    cb_w,
+                    cb_h,
+                    &rp.frame.luma,
+                    cp,
+                    AffineLumaFilterSet::Set0,
+                    bipred,
+                    self.ph_prof_disabled,
+                    /*rpr_constraints_active=*/ false,
+                )?)),
+                None => Ok(None),
+            }
+        };
+        let hp0 = hp(l0)?;
+        let hp1 = hp(l1)?;
+        let ri0 = l0.map_or(-1, |l| l.2);
+        let ri1 = l1.map_or(-1, |l| l.2);
+        let pb = crate::inter::explicit_weighted_sample_pred(
+            cb_w as usize,
+            cb_h as usize,
+            hp0.as_deref(),
+            hp1.as_deref(),
+            l0.is_some(),
+            l1.is_some(),
+            tables.luma_log2_denom,
+            tables.params(0, ri0, 0, bd),
+            tables.params(1, ri1, 0, bd),
+            bd,
+        )?;
+        Self::write_pred_block(&mut out.luma, cb_x, cb_y, cb_w, cb_h, &pb);
+        if self.sps.sps_chroma_format_idc != 1 {
+            return Ok(());
+        }
+        let c0 = match l0 {
+            Some((cp, rp, _)) => {
+                Some(self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cp, rp, bipred)?)
+            }
+            None => None,
+        };
+        let c1 = match l1 {
+            Some((cp, rp, _)) => {
+                Some(self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cp, rp, bipred)?)
+            }
+            None => None,
+        };
+        let cw = cb_w / 2;
+        let ch = cb_h / 2;
+        fn pick(c: &Option<(Vec<i32>, Vec<i32>)>, c_idx: u32) -> Option<&[i32]> {
+            c.as_ref().map(|(cb, cr)| {
+                if c_idx == 1 {
+                    cb.as_slice()
+                } else {
+                    cr.as_slice()
+                }
+            })
+        }
+        for c_idx in 1u32..=2 {
+            let pb = crate::inter::explicit_weighted_sample_pred(
+                cw as usize,
+                ch as usize,
+                pick(&c0, c_idx),
+                pick(&c1, c_idx),
+                l0.is_some(),
+                l1.is_some(),
+                tables.chroma_log2_denom,
+                tables.params(0, ri0, c_idx, bd),
+                tables.params(1, ri1, c_idx, bd),
+                bd,
+            )?;
+            let plane = if c_idx == 1 { &mut out.cb } else { &mut out.cr };
+            Self::write_pred_block(plane, cb_x / 2, cb_y / 2, cw, ch, &pb);
+        }
+        Ok(())
+    }
+
+    /// §8.5.6.6.3 explicit weighted sample prediction for one SbTMVP
+    /// sub-block (§8.5.5.2 — both lists reference index 0): the
+    /// translational high-precision luma / chroma fetches composed with
+    /// the §7.4.9 weights (eqs. 992 – 994).
+    #[allow(clippy::too_many_arguments)]
+    fn sbtmvp_subblock_wp(
+        &self,
+        out: &mut PictureBuffer,
+        bx: u32,
+        by: u32,
+        sb_w: u32,
+        sb_h: u32,
+        l0: Option<(&ReferencePicture, MotionVector)>,
+        l1: Option<(&ReferencePicture, MotionVector)>,
+    ) -> Result<()> {
+        let tables = self
+            .explicit_wp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("h266 explicit WP: no tables bound"))?;
+        let bd = out.luma.bit_depth;
+        let hp = |l: Option<(&ReferencePicture, MotionVector)>| -> Result<Option<Vec<i32>>> {
+            match l {
+                Some((rp, mv)) => Ok(Some(predict_luma_block_high_precision_hpel(
+                    bx,
+                    by,
+                    sb_w,
+                    sb_h,
+                    &rp.frame.luma,
+                    mv,
+                    bd,
+                    false,
+                )?)),
+                None => Ok(None),
+            }
+        };
+        let hp0 = hp(l0)?;
+        let hp1 = hp(l1)?;
+        let ri0 = if l0.is_some() { 0 } else { -1 };
+        let ri1 = if l1.is_some() { 0 } else { -1 };
+        let pb = crate::inter::explicit_weighted_sample_pred(
+            sb_w as usize,
+            sb_h as usize,
+            hp0.as_deref(),
+            hp1.as_deref(),
+            l0.is_some(),
+            l1.is_some(),
+            tables.luma_log2_denom,
+            tables.params(0, ri0, 0, bd),
+            tables.params(1, ri1, 0, bd),
+            bd,
+        )?;
+        Self::write_pred_block(&mut out.luma, bx, by, sb_w, sb_h, &pb);
+        if self.sps.sps_chroma_format_idc != 1 {
+            return Ok(());
+        }
+        fn plane_of(rp: &ReferencePicture, c_idx: u32) -> &PicturePlane {
+            if c_idx == 1 {
+                &rp.frame.cb
+            } else {
+                &rp.frame.cr
+            }
+        }
+        for c_idx in 1u32..=2 {
+            let hpc = |l: Option<(&ReferencePicture, MotionVector)>| -> Result<Option<Vec<i32>>> {
+                match l {
+                    Some((rp, mv)) => Ok(Some(crate::inter::predict_chroma_block_high_precision(
+                        bx / 2,
+                        by / 2,
+                        sb_w / 2,
+                        sb_h / 2,
+                        plane_of(rp, c_idx),
+                        mv,
+                        bd,
+                    )?)),
+                    None => Ok(None),
+                }
+            };
+            let c0 = hpc(l0)?;
+            let c1 = hpc(l1)?;
+            let pb = crate::inter::explicit_weighted_sample_pred(
+                (sb_w / 2) as usize,
+                (sb_h / 2) as usize,
+                c0.as_deref(),
+                c1.as_deref(),
+                l0.is_some(),
+                l1.is_some(),
+                tables.chroma_log2_denom,
+                tables.params(0, ri0, c_idx, bd),
+                tables.params(1, ri1, c_idx, bd),
+                bd,
+            )?;
+            let plane = if c_idx == 1 { &mut out.cb } else { &mut out.cr };
+            Self::write_pred_block(plane, bx / 2, by / 2, sb_w / 2, sb_h / 2, &pb);
+        }
+        Ok(())
+    }
+
     pub fn set_ph_joint_cbcr_sign(&mut self, sign: bool) {
         self.ph_joint_cbcr_sign = sign;
     }
@@ -3018,6 +3264,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // overrides this from the walker's live QG state.
             cu_qp_delta_already_coded: false,
             cu_chroma_qp_offset_already_coded: false,
+            wp_luma_flag_mask: self.wp_flag_masks().0,
+            wp_chroma_flag_mask: self.wp_flag_masks().1,
             cu_chroma_qp_offset_enabled: self.sh.sh_cu_chroma_qp_offset_enabled_flag,
             // §7.3.11.10 / §9.3.3.2 — `cu_chroma_qp_offset_idx` is
             // TR-binarised with cMax = pps_chroma_qp_offset_list_len_minus1
@@ -6261,7 +6509,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // (per-CP MVDs in info.inter.non_merge) drives the
                 // §8.5.5.5 / §8.5.5.7 CPMV derivation + §8.5.5.9
                 // sub-block MC through the dedicated hookup below.
-                self.refuse_explicit_wp_on("affine")?;
                 return self.reconstruct_leaf_cu_inter_affine_amvp_walker(cu, info, residual, out);
             }
             return self.reconstruct_leaf_cu_inter_amvp(cu, info, residual, out);
@@ -6350,8 +6597,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.5.7.2 eq. 1016. Chroma uses the same partition geometry
         // (Tables 36 / 37) with `cIdx ∈ {1, 2}`; eqs. 999/1000 scale to
         // the chroma sub-sample grid.
+        // §8.5.7.1 — GPM's predSamplesLA / LB come straight from the
+        // §8.5.6.3 interpolation into the §8.5.7.2 blend; the §8.5.6.6
+        // weighted sample prediction (and so explicit WP) never applies.
         if info.inter.merge_data.gpm_flag {
-            self.refuse_explicit_wp_on("GPM")?;
             return self.reconstruct_leaf_cu_gpm(cu, info, residual, &mlist, out);
         }
 
@@ -6361,7 +6610,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // candidate. The dedicated walker builds the §8.5.5.2 sub-block
         // merge list and reconstructs the affine MC to pixels.
         if info.inter.merge_data.merge_subblock_flag {
-            self.refuse_explicit_wp_on("sub-block merge")?;
             return self.reconstruct_leaf_cu_inter_subblock_merge(cu, info, residual, out);
         }
 
@@ -8264,9 +8512,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
         if chroma {
             let (cb_hp_l0, cr_hp_l0) =
-                self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l0, ref_pic_l0)?;
+                self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l0, ref_pic_l0, true)?;
             let (cb_hp_l1, cr_hp_l1) =
-                self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l1, ref_pic_l1)?;
+                self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l1, ref_pic_l1, true)?;
             let cw = cb_w / 2;
             let ch = cb_h / 2;
             blend_bi_hp_into(
@@ -8308,11 +8556,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cb_h: u32,
         cpmvs: &crate::affine::AffineCpmvs,
         ref_pic: &ReferencePicture,
+        bipred: bool,
     ) -> Result<(Vec<i32>, Vec<i32>)> {
         use crate::affine::derive_subblock_mvs;
         use crate::inter::predict_chroma_block_high_precision;
         let bd = ref_pic.frame.luma.bit_depth;
-        let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, /*bipred=*/ true)?;
+        let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, bipred)?;
         let sb_w = cb_w / grid.num_sb_x;
         let sb_h = cb_h / grid.num_sb_y;
         let cw = (cb_w / 2) as usize;
@@ -8942,7 +9191,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         g.as_ref().map(|g| g.fallback),
                     );
                 }
-                self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
+                if self.wp_flagged_refs(Some(decision.mvp.ref_idx_l0 as i32), None, 0) {
+                    self.reconstruct_affine_inter_wp(
+                        cb_x,
+                        cb_y,
+                        cb_w,
+                        cb_h,
+                        Some((&cpmvs, &ref_pic, decision.mvp.ref_idx_l0 as i32)),
+                        None,
+                        out,
+                    )
+                } else {
+                    self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
+                }
             }
             (false, true) => {
                 let (cpmvs, ref_pic) = derive_one_list(
@@ -8953,7 +9214,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     &decision.mvd_cp_l1,
                 )?;
                 store_cpmvs_l1 = Some(cpmvs);
-                self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
+                if self.wp_flagged_refs(None, Some(decision.mvp.ref_idx_l1 as i32), 0) {
+                    self.reconstruct_affine_inter_wp(
+                        cb_x,
+                        cb_y,
+                        cb_w,
+                        cb_h,
+                        None,
+                        Some((&cpmvs, &ref_pic, decision.mvp.ref_idx_l1 as i32)),
+                        out,
+                    )
+                } else {
+                    self.reconstruct_affine_inter_uni(cb_x, cb_y, cb_w, cb_h, &cpmvs, &ref_pic, out)
+                }
             }
             (true, true) => {
                 let (cpmvs_l0, ref_pic_l0) = derive_one_list(
@@ -8975,18 +9248,34 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // §8.5.6.6.2 — apply the parsed `bcw_idx` so an explicit
                 // bi-pred affine CU with `bcwIdx ∈ 1..=4` takes the
                 // eq. 981 weighted blend (eq. 980 average for 0).
-                self.reconstruct_affine_inter_bi_bcw(
-                    cb_x,
-                    cb_y,
-                    cb_w,
-                    cb_h,
-                    &cpmvs_l0,
-                    &ref_pic_l0,
-                    &cpmvs_l1,
-                    &ref_pic_l1,
+                if self.wp_flagged_refs(
+                    Some(decision.mvp.ref_idx_l0 as i32),
+                    Some(decision.mvp.ref_idx_l1 as i32),
                     bcw_idx,
-                    out,
-                )
+                ) {
+                    self.reconstruct_affine_inter_wp(
+                        cb_x,
+                        cb_y,
+                        cb_w,
+                        cb_h,
+                        Some((&cpmvs_l0, &ref_pic_l0, decision.mvp.ref_idx_l0 as i32)),
+                        Some((&cpmvs_l1, &ref_pic_l1, decision.mvp.ref_idx_l1 as i32)),
+                        out,
+                    )
+                } else {
+                    self.reconstruct_affine_inter_bi_bcw(
+                        cb_x,
+                        cb_y,
+                        cb_w,
+                        cb_h,
+                        &cpmvs_l0,
+                        &ref_pic_l0,
+                        &cpmvs_l1,
+                        &ref_pic_l1,
+                        bcw_idx,
+                        out,
+                    )
+                }
             }
             (false, false) => Err(Error::invalid(
                 "h266 affine amvp: neither list active (inter_pred_idc invalid)",
@@ -9638,6 +9927,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let by = cu.cu.y + ys as u32 * sb_h;
                 let use_l0 = sb.pred_flag_l0 && ref_l0.is_some();
                 let use_l1 = is_b && sb.pred_flag_l1 && ref_l1.is_some();
+                // §8.5.6.6.1 — explicit WP (§8.5.6.6.3) per sub-block
+                // when a used reference (index 0) carries signalled
+                // weights; SbTMVP CUs have bcwIdx == 0.
+                if (use_l0 || use_l1)
+                    && self.wp_flagged_refs(use_l0.then_some(0), use_l1.then_some(0), 0)
+                {
+                    self.sbtmvp_subblock_wp(
+                        out,
+                        bx,
+                        by,
+                        sb_w,
+                        sb_h,
+                        if use_l0 {
+                            ref_l0.as_ref().map(|rp| (rp, sb.mv_l0))
+                        } else {
+                            None
+                        },
+                        if use_l1 {
+                            ref_l1.as_ref().map(|rp| (rp, sb.mv_l1))
+                        } else {
+                            None
+                        },
+                    )?;
+                    continue;
+                }
                 match (use_l0, use_l1) {
                     (true, false) => {
                         let rp = ref_l0.as_ref().unwrap();
@@ -10028,7 +10342,29 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         };
 
         // §8.5.5.9 affine MC.
+        // §8.5.6.6.1 — explicit WP (§8.5.6.6.3) when a used reference
+        // carries signalled weights and bcwIdx == 0.
+        let wp = self.wp_flagged_refs(
+            ref_pic_l0.as_ref().map(|_| cand.ref_idx_l0),
+            ref_pic_l1.as_ref().map(|_| cand.ref_idx_l1),
+            cand.bcw_idx,
+        );
         match (&ref_pic_l0, &ref_pic_l1) {
+            _ if wp => {
+                self.reconstruct_affine_inter_wp(
+                    cu.cu.x,
+                    cu.cu.y,
+                    cb_w,
+                    cb_h,
+                    ref_pic_l0
+                        .as_ref()
+                        .map(|rp| (&cand.cpmvs_l0, rp, cand.ref_idx_l0)),
+                    ref_pic_l1
+                        .as_ref()
+                        .map(|rp| (&cand.cpmvs_l1, rp, cand.ref_idx_l1)),
+                    out,
+                )?;
+            }
             (Some(rp0), None) => {
                 self.reconstruct_affine_inter_uni(
                     cu.cu.x,
