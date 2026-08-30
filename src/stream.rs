@@ -19,7 +19,9 @@
 //! Current fail-fast gates (surfaced as `Error::Unsupported` with a
 //! precise reason, so a conformance triage can classify streams):
 //! 4:2:2 / 4:4:4 chroma formats, subpicture layouts, explicit
-//! weighted prediction, and §8.8.1 explicit virtual boundaries.
+//! reference picture wraparound, explicit weighted prediction on
+//! affine / sub-block-merge / GPM CUs, and §8.8.1 explicit virtual
+//! boundaries.
 //! Reconstruction runs on BitDepth-parametric `u16` planes (8..=16).
 
 use std::collections::HashMap;
