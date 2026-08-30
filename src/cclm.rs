@@ -113,6 +113,23 @@ impl LumaPlane<'_> {
         let yc = y.clamp(0, self.height as i32 - 1) as usize;
         self.samples[yc * self.stride + xc] as i32
     }
+
+    /// §8.4.5.2.14 step 2 — `pY[ x ][ y ]` accessor with the
+    /// unavailable-side substitutions (r452): when `availL` is FALSE
+    /// the columns left of the block substitute `pY[ 0 ][ y ]`, and
+    /// when `availT` is FALSE the rows above substitute
+    /// `pY[ x ][ 0 ]`. `(dx, dy)` are luma offsets relative to the
+    /// TB's collocated luma origin `(x_tb_y, y_tb_y)`. The pre-r452
+    /// code read the raw picture snapshot across tile / slice /
+    /// picture boundaries the §6.4.4 derivation declares unavailable
+    /// (first visible as a wrong first-column `pDsY` on every CCLM TB
+    /// whose left neighbour is in another tile).
+    #[inline]
+    fn py(&self, x_tb_y: i32, y_tb_y: i32, avail_l: bool, avail_t: bool, dx: i32, dy: i32) -> i32 {
+        let dx = if !avail_l && dx < 0 { 0 } else { dx };
+        let dy = if !avail_t && dy < 0 { 0 } else { dy };
+        self.read(x_tb_y + dx, y_tb_y + dy)
+    }
 }
 
 /// Run §8.4.5.2.14. Returns the row-major chroma prediction array of
@@ -198,7 +215,7 @@ pub fn predict_cclm(inp: &CclmInputs<'_>) -> Result<Vec<i16>> {
 
     // Step 3 — down-sampled collocated luma pDsY[x][y] for the current
     // TB. Indexed [y * n_tb_w + x].
-    let p_ds_y = down_sample_collocated_luma(inp, x_tb_y, y_tb_y);
+    let p_ds_y = down_sample_collocated_luma(inp, x_tb_y, y_tb_y, avail_l, avail_t);
 
     // Step 4 / 5 — selected neighbour samples. `pSelDsY[idx]` for
     // `idx = 0..cntT-1` cover the top-neighbour pickup, `cntT..cntT+cntL-1`
@@ -208,12 +225,12 @@ pub fn predict_cclm(inp: &CclmInputs<'_>) -> Result<Vec<i16>> {
     for &x in pick_pos_t.iter().take(cnt_t) {
         // pSelC[idx] = p[pickPosT[idx]][-1]
         p_sel_c.push(inp.neigh_top_chroma[x] as i32);
-        p_sel_dsy.push(top_neighbour_dsy(inp, x_tb_y, y_tb_y, x));
+        p_sel_dsy.push(top_neighbour_dsy(inp, x_tb_y, y_tb_y, x, avail_l));
     }
     for &y in pick_pos_l.iter().take(cnt_l) {
         // pSelC[idx] = p[-1][pickPosL[idx - cntT]]
         p_sel_c.push(inp.neigh_left_chroma[y] as i32);
-        p_sel_dsy.push(left_neighbour_dsy(inp, x_tb_y, y_tb_y, y));
+        p_sel_dsy.push(left_neighbour_dsy(inp, x_tb_y, y_tb_y, y, avail_t));
     }
 
     // Step 6 — derive (minY, maxY, minC, maxC) via the 4-point min/max
@@ -319,19 +336,26 @@ fn pick_positions(num_samp_n: usize, num_is_4n: u32) -> (usize, Vec<usize>) {
 }
 
 /// Step 3 — down-sample the collocated luma block (eqs. 366 – 369).
-fn down_sample_collocated_luma(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32) -> Vec<i32> {
+fn down_sample_collocated_luma(
+    inp: &CclmInputs<'_>,
+    x_tb_y: i32,
+    y_tb_y: i32,
+    avail_l: bool,
+    avail_t: bool,
+) -> Vec<i32> {
     let n_tb_w = inp.n_tb_w;
     let n_tb_h = inp.n_tb_h;
     let sub_w = inp.sub_width_c as i32;
     let sub_h = inp.sub_height_c as i32;
     let plane = &inp.luma_plane;
+    let rd = |dx: i32, dy: i32| plane.py(x_tb_y, y_tb_y, avail_l, avail_t, dx, dy);
     let mut out = vec![0i32; n_tb_w * n_tb_h];
 
     if sub_w == 1 && sub_h == 1 {
         // 4:4:4 — eq. 366.
         for y in 0..n_tb_h {
             for x in 0..n_tb_w {
-                out[y * n_tb_w + x] = plane.read(x_tb_y + x as i32, y_tb_y + y as i32);
+                out[y * n_tb_w + x] = rd(x as i32, y as i32);
             }
         }
         return out;
@@ -341,11 +365,8 @@ fn down_sample_collocated_luma(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32) -
         // 4:2:2 — eq. 367 (3-tap horizontal).
         for y in 0..n_tb_h {
             for x in 0..n_tb_w {
-                let xb = x_tb_y + sub_w * x as i32;
-                let v = plane.read(xb - 1, y_tb_y + y as i32)
-                    + 2 * plane.read(xb, y_tb_y + y as i32)
-                    + plane.read(xb + 1, y_tb_y + y as i32)
-                    + 2;
+                let xb = sub_w * x as i32;
+                let v = rd(xb - 1, y as i32) + 2 * rd(xb, y as i32) + rd(xb + 1, y as i32) + 2;
                 out[y * n_tb_w + x] = v >> 2;
             }
         }
@@ -356,13 +377,13 @@ fn down_sample_collocated_luma(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32) -
     if inp.chroma_vertical_collocated_flag {
         for y in 0..n_tb_h {
             for x in 0..n_tb_w {
-                let xb = x_tb_y + sub_w * x as i32;
-                let yb = y_tb_y + sub_h * y as i32;
-                let v = plane.read(xb, yb - 1)
-                    + plane.read(xb - 1, yb)
-                    + 4 * plane.read(xb, yb)
-                    + plane.read(xb + 1, yb)
-                    + plane.read(xb, yb + 1)
+                let xb = sub_w * x as i32;
+                let yb = sub_h * y as i32;
+                let v = rd(xb, yb - 1)
+                    + rd(xb - 1, yb)
+                    + 4 * rd(xb, yb)
+                    + rd(xb + 1, yb)
+                    + rd(xb, yb + 1)
                     + 4;
                 out[y * n_tb_w + x] = v >> 3;
             }
@@ -370,14 +391,14 @@ fn down_sample_collocated_luma(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32) -
     } else {
         for y in 0..n_tb_h {
             for x in 0..n_tb_w {
-                let xb = x_tb_y + sub_w * x as i32;
-                let yb = y_tb_y + sub_h * y as i32;
-                let v = plane.read(xb - 1, yb)
-                    + plane.read(xb - 1, yb + 1)
-                    + 2 * plane.read(xb, yb)
-                    + 2 * plane.read(xb, yb + 1)
-                    + plane.read(xb + 1, yb)
-                    + plane.read(xb + 1, yb + 1)
+                let xb = sub_w * x as i32;
+                let yb = sub_h * y as i32;
+                let v = rd(xb - 1, yb)
+                    + rd(xb - 1, yb + 1)
+                    + 2 * rd(xb, yb)
+                    + 2 * rd(xb, yb + 1)
+                    + rd(xb + 1, yb)
+                    + rd(xb + 1, yb + 1)
                     + 4;
                 out[y * n_tb_w + x] = v >> 3;
             }
@@ -388,15 +409,25 @@ fn down_sample_collocated_luma(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32) -
 
 /// Step 4 — pSelDsY for the top neighbour at chroma-x = `x_pick`
 /// (eqs. 370 – 373).
-fn top_neighbour_dsy(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32, x_pick: usize) -> i32 {
+fn top_neighbour_dsy(
+    inp: &CclmInputs<'_>,
+    x_tb_y: i32,
+    y_tb_y: i32,
+    x_pick: usize,
+    avail_l: bool,
+) -> i32 {
     let sub_w = inp.sub_width_c as i32;
     let sub_h = inp.sub_height_c as i32;
     let plane = &inp.luma_plane;
+    // The top row is available on this path (availT == TRUE); the
+    // availL substitution still applies to the `xb − 1` taps of the
+    // pick at x = 0 (§8.4.5.2.14 step 2: pY[ −1 ][ y ] := pY[ 0 ][ y ]).
+    let rd = |dx: i32, dy: i32| plane.py(x_tb_y, y_tb_y, avail_l, true, dx, dy);
     let x = x_pick as i32;
 
     if sub_w == 1 && sub_h == 1 {
         // 4:4:4 — eq. 370.
-        return plane.read(x_tb_y + x, y_tb_y - 1);
+        return rd(x, -1);
     }
 
     if sub_h != 1 && !inp.b_ctu_boundary {
@@ -404,23 +435,18 @@ fn top_neighbour_dsy(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32, x_pick: usi
         // collocated branch.
         if inp.chroma_vertical_collocated_flag {
             // eq. 371
-            let xb = x_tb_y + sub_w * x;
-            let v = plane.read(xb, y_tb_y - 3)
-                + plane.read(xb - 1, y_tb_y - 2)
-                + 4 * plane.read(xb, y_tb_y - 2)
-                + plane.read(xb + 1, y_tb_y - 2)
-                + plane.read(xb, y_tb_y - 1)
-                + 4;
+            let xb = sub_w * x;
+            let v = rd(xb, -3) + rd(xb - 1, -2) + 4 * rd(xb, -2) + rd(xb + 1, -2) + rd(xb, -1) + 4;
             return v >> 3;
         } else {
             // eq. 372
-            let xb = x_tb_y + sub_w * x;
-            let v = plane.read(xb - 1, y_tb_y - 1)
-                + plane.read(xb - 1, y_tb_y - 2)
-                + 2 * plane.read(xb, y_tb_y - 1)
-                + 2 * plane.read(xb, y_tb_y - 2)
-                + plane.read(xb + 1, y_tb_y - 1)
-                + plane.read(xb + 1, y_tb_y - 2)
+            let xb = sub_w * x;
+            let v = rd(xb - 1, -1)
+                + rd(xb - 1, -2)
+                + 2 * rd(xb, -1)
+                + 2 * rd(xb, -2)
+                + rd(xb + 1, -1)
+                + rd(xb + 1, -2)
                 + 4;
             return v >> 3;
         }
@@ -428,55 +454,58 @@ fn top_neighbour_dsy(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32, x_pick: usi
 
     // SubHeightC == 1 OR bCTUboundary — eq. 373 (3-tap horizontal,
     // single row above).
-    let xb = x_tb_y + sub_w * x;
-    let v = plane.read(xb - 1, y_tb_y - 1)
-        + 2 * plane.read(xb, y_tb_y - 1)
-        + plane.read(xb + 1, y_tb_y - 1)
-        + 2;
+    let xb = sub_w * x;
+    let v = rd(xb - 1, -1) + 2 * rd(xb, -1) + rd(xb + 1, -1) + 2;
     v >> 2
 }
 
 /// Step 5 — pSelDsY for the left neighbour at chroma-y = `y_pick`
 /// (eqs. 374 – 377).
-fn left_neighbour_dsy(inp: &CclmInputs<'_>, x_tb_y: i32, y_tb_y: i32, y_pick: usize) -> i32 {
+fn left_neighbour_dsy(
+    inp: &CclmInputs<'_>,
+    x_tb_y: i32,
+    y_tb_y: i32,
+    y_pick: usize,
+    avail_t: bool,
+) -> i32 {
     let sub_w = inp.sub_width_c as i32;
     let sub_h = inp.sub_height_c as i32;
     let plane = &inp.luma_plane;
+    // The left column is available on this path (availL == TRUE); the
+    // availT substitution still applies to the `yb − 1` tap of the
+    // pick at y = 0 (§8.4.5.2.14 step 2: pY[ x ][ −1 ] := pY[ x ][ 0 ]).
+    let rd = |dx: i32, dy: i32| plane.py(x_tb_y, y_tb_y, true, avail_t, dx, dy);
     let y = y_pick as i32;
 
     if sub_w == 1 && sub_h == 1 {
-        return plane.read(x_tb_y - 1, y_tb_y + y);
+        return rd(-1, y);
     }
 
     if sub_h == 1 {
         // 4:2:2 — eq. 375.
-        let yb = y_tb_y + y;
-        let v = plane.read(x_tb_y - 1 - sub_w, yb)
-            + 2 * plane.read(x_tb_y - sub_w, yb)
-            + plane.read(x_tb_y + 1 - sub_w, yb)
-            + 2;
+        let v = rd(-1 - sub_w, y) + 2 * rd(-sub_w, y) + rd(1 - sub_w, y) + 2;
         return v >> 2;
     }
 
     if inp.chroma_vertical_collocated_flag {
         // eq. 376
-        let yb = y_tb_y + sub_h * y;
-        let v = plane.read(x_tb_y - sub_w, yb - 1)
-            + plane.read(x_tb_y - 1 - sub_w, yb)
-            + 4 * plane.read(x_tb_y - sub_w, yb)
-            + plane.read(x_tb_y + 1 - sub_w, yb)
-            + plane.read(x_tb_y - sub_w, yb + 1)
+        let yb = sub_h * y;
+        let v = rd(-sub_w, yb - 1)
+            + rd(-1 - sub_w, yb)
+            + 4 * rd(-sub_w, yb)
+            + rd(1 - sub_w, yb)
+            + rd(-sub_w, yb + 1)
             + 4;
         v >> 3
     } else {
         // eq. 377
-        let yb = y_tb_y + sub_h * y;
-        let v = plane.read(x_tb_y - 1 - sub_w, yb)
-            + plane.read(x_tb_y - 1 - sub_w, yb + 1)
-            + 2 * plane.read(x_tb_y - sub_w, yb)
-            + 2 * plane.read(x_tb_y - sub_w, yb + 1)
-            + plane.read(x_tb_y + 1 - sub_w, yb)
-            + plane.read(x_tb_y + 1 - sub_w, yb + 1)
+        let yb = sub_h * y;
+        let v = rd(-1 - sub_w, yb)
+            + rd(-1 - sub_w, yb + 1)
+            + 2 * rd(-sub_w, yb)
+            + 2 * rd(-sub_w, yb + 1)
+            + rd(1 - sub_w, yb)
+            + rd(1 - sub_w, yb + 1)
             + 4;
         v >> 3
     }

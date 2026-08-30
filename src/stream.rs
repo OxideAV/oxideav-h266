@@ -788,7 +788,8 @@ impl StreamDecoder {
                     }
                 }
             }
-            let _ = std::fs::write(format!("{dir}/prefilter_poc{poc}.yuv"), raw);
+            let cvs = self.cvs_idx.saturating_sub(1);
+            let _ = std::fs::write(format!("{dir}/prefilter_cvs{cvs}_poc{poc}.yuv"), raw);
         }
         if std::env::var_os("H266_DBG_NO_LF").is_none() {
             walker.apply_in_loop_filters_with_alf(&mut out, &binding)?;

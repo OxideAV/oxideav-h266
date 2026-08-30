@@ -1844,7 +1844,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let idx_y_inv = l
             .derived
             .idx_y_inv(inv_avg_luma, l.min_bin_idx, l.max_bin_idx);
-        Some(l.derived.chroma_var_scale(idx_y_inv))
+        let var_scale = l.derived.chroma_var_scale(idx_y_inv);
+        if std::env::var_os("H266_DBG_LMCS").is_some() {
+            eprintln!(
+                "LMCS varScale cu=({},{}) {}x{} cuCb=({x_cu_cb},{y_cu_cb}) availL={avail_l} availT={avail_t} cnt={cnt} invAvgLuma={inv_avg_luma} idxYInv={idx_y_inv} varScale={var_scale}",
+                cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h
+            );
+        }
+        Some(var_scale)
     }
 
     /// Install the per-slice reference-picture list 0. P-slice callers
@@ -2730,6 +2737,26 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             left_avail,
             up_avail,
         )?;
+        if std::env::var_os("H266_DBG_SAO").is_some() {
+            eprintln!(
+                "SAO ctb ({},{}) slice={} left_avail={left_avail} up_avail={up_avail} Y={:?}/{}/{:?}/{:?} Cb={:?}/{}/{:?}/{:?} Cr={:?}/{}/{:?}/{:?}",
+                ctu.x_ctb,
+                ctu.y_ctb,
+                self.cur_slice_id,
+                params.luma.sao_type_idx,
+                params.luma.band_position,
+                params.luma.eo_class,
+                params.luma.offset_val,
+                params.cb.sao_type_idx,
+                params.cb.band_position,
+                params.cb.eo_class,
+                params.cb.offset_val,
+                params.cr.sao_type_idx,
+                params.cr.band_position,
+                params.cr.eo_class,
+                params.cr.offset_val,
+            );
+        }
         self.sao_picture.set(ctu.x_ctb, ctu.y_ctb, params);
         Ok(())
     }
@@ -10485,6 +10512,33 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     "h266 intra JCCR residual: chroma TB does not fit in destination plane",
                 ));
             }
+            // Debug aid (`H266_DBG_TB=x,y`, luma CU origin): the joint
+            // Cb-Cr residual pipeline for one CU.
+            if let Ok(v) = std::env::var("H266_DBG_TB") {
+                let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+                if want.len() == 2 && cu.cu.x as usize == want[0] && cu.cu.y as usize == want[1] {
+                    eprintln!(
+                        "JCCR TB cIdx={c_idx} ({c_x},{c_y}) {c_w}x{c_h} mode={mode:?} sign={} qp={qp} ts={transform_skip} lfnst={apply_lfnst} lmcs={lmcs_cvs:?} lvl_nz={:?}",
+                        self.ph_joint_cbcr_sign,
+                        coded_levels
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &l)| l != 0)
+                            .map(|(i, &l)| (i % c_w, i / c_w, l))
+                            .collect::<Vec<_>>()
+                    );
+                    eprintln!("  d row0 : {:?}", &d[..c_w.min(32)]);
+                    eprintln!("  res row0: {:?}", &res[..c_w.min(32)]);
+                    eprintln!(
+                        "  res col0: {:?}",
+                        (0..c_h.min(8)).map(|y| res[y * c_w]).collect::<Vec<_>>()
+                    );
+                    eprintln!(
+                        "  pred row0: {:?}",
+                        &plane.samples[c_y * stride + c_x..c_y * stride + c_x + c_w.min(32)]
+                    );
+                }
+            }
             for row in 0..c_h {
                 for col in 0..c_w {
                     let idx = (c_y + row) * stride + (c_x + col);
@@ -11235,6 +11289,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // reconstructed luma plane snapshot taken just above. The
         // remaining modes run the full §8.4.5.2.6 pipeline (2-tap
         // chroma angular interpolation, wide-angle remap, PDPC).
+        if let Ok(v) = std::env::var("H266_DBG_CCLM") {
+            let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+            if want.len() == 2 && x0 == want[0] && y0 == want[1] {
+                eprintln!(
+                    "CCLM avail cIdx={c_idx} ({x0},{y0}) above={above_avail} left={left_avail} region={:?} cap={} cellL={:?} cellT={:?}",
+                    self.region_bounds_chroma_i32(),
+                    self.region_col_cap,
+                    (x0 > 0).then(|| self.avail_chroma.get(y0 * cw as usize + x0 - 1).copied()),
+                    (y0 > 0).then(|| self.avail_chroma.get((y0 - 1) * cw as usize + x0).copied()),
+                );
+            }
+        }
         let pred = if is_cclm {
             // Build the 4:2:0 chroma neighbour rows. Both `INTRA_T_CCLM`
             // and `INTRA_L_CCLM` extend the corresponding side; the

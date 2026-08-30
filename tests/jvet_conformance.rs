@@ -669,14 +669,14 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("RAP_B_1", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("SAO_A_3", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("SBT_A_2", 'P'),             // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("SLICES_A_3", 'F'),          // 24/25 pictures diverge (first poc 0 plane Cb)
-    ("SMVD_A_2", 'P'),            // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("SUBPIC_C_1", 'U'),          // subpictures
-    ("SbTMVP_A_3", 'P'),          // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("TILE_A_2", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("TMVP_A_3", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("WPP_A_3", 'P'),             // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("WP_A_3", 'U'),              // explicit weighted prediction
+    ("SLICES_A_3", 'F'), // 4/25 pictures diverge (first poc 1 plane Cb; r452 CCLM pY substitution fixed poc 0)
+    ("SMVD_A_2", 'P'),   // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("SUBPIC_C_1", 'U'), // subpictures
+    ("SbTMVP_A_3", 'P'), // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("TILE_A_2", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("TMVP_A_3", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("WPP_A_3", 'P'),    // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("WP_A_3", 'U'),     // explicit weighted prediction
 ];
 
 /// CI-runnable (no corpus needed): the stream driver must decode this
