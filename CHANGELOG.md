@@ -4,6 +4,14 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-h266/compare/v0.0.9...v0.0.10) - 2026-09-04
+
+### Other
+
+- r456 conformance tranche 3 — 4:2:2 / 4:4:4 chroma formats: §6.2 Table 2 SubWidthC/SubHeightC replaces every 4:2:0 constant (coding tree, §8.4.3 Table 21 4:2:2 mode map, 4:4:4 MipChromaDirectFlag, CCLM, §8.5.6.3.1 chroma MVs, §8.5.5.3 eqs. 876-879 affine chroma groups, GPM eqs. 1011/1012, §8.6.2.5 bvC, §8.8.3.6.5 eq. 1335 maxK, PictureBuffer::with_chroma_format_bd); Table 131 tu_cb/tu_cr_coded_flag ctxInc under chroma BDPCM on the single-tree TU; §8.5.5.6 constructed affine-merge corners skip non-MODE_INTER neighbours (§6.4.4 checkPredModeY). 10b422_B_5 + 8b444_A_2 byte-exact — corpus saturated 54P/0F/2U -> 56P/0F/0U/0E. examples/mutate_smoke bounded mutation harness; unit tests for each new rule
+- r456 conformance tranche 2 — §8.7.5.1 eqs. 1207-1209 on the chroma tree: SCIPU (local dual tree) chroma leaves fold into IbcVirBuf[1/2], so a later single-tree IBC CU predicts chroma from reconstructed samples instead of stale entries; IBC_A_2 byte-exact (53P/1F/2U -> 54P/0F/2U, no FAIL rows)
+- r456 conformance tranche 1 — subpictures: §7.4.8 eq. 114 bounds gate every reference fetch (§8.5.6.3.2 eqs. 928/929 incl. the integer-pel copy), the temporal collocated positions (§8.5.2.11/§8.5.5.3/§8.5.5.4/§8.5.5.6) and the §8.8 across-subpicture loop-filter gates; CTB-granular slice/subpicture gates (alf::LfRegionMap / FetchClip, §8.8.5.5 corner rule); §7.4.8 sh_alf_* inferred from the PH under pps_alf_info_in_ph_flag; §8.8.3.6.2 LADF qpOffset; picture-level slice index in the slice-data walk. SUBPIC_C_1 + CodingToolsSets_E_1 + LMCS_B_2 byte-exact (50P/1F/5U -> 53P/1F/2U)
+
 ### Added
 
 - r456 — subpicture decoding: the slice header's `CurrSubpicIdx` resolves the §7.4.8 eq. 114 `Subpic*BoundaryPos` set, which clamps every reference fetch when `sps_subpic_treated_as_pic_flag` is set (§8.5.6.3.2 eqs. 928 / 929, the §8.5.6.3.4 chroma, §8.5.3.2.2 DMVR and §8.5.6.3.3 integer twins, and the integer-pel copy path), bounds the temporal collocated positions (§8.5.2.11 eqs. 594 / 595, §8.5.5.3 eq. 723, §8.5.5.4 eq. 730, §8.5.5.6 eqs. 772 / 773) and gates the §8.8 loop filters at `sps_loop_filter_across_subpic_enabled_flag = 0` boundaries. `SUBPIC_C_1`, `CodingToolsSets_E_1` and `LMCS_B_2` decode byte-exact (JVET scorecard 50P/1F/5U/0E → 53P/1F/2U/0E).
