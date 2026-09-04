@@ -16,10 +16,9 @@
 //! so output-order sequencing (ascending POC within a CVS for these
 //! single-AU-per-picture streams) is a caller-side sort.
 //!
-//! Current fail-fast gates (surfaced as `Error::Unsupported` with a
-//! precise reason, so a conformance triage can classify streams):
-//! 4:2:2 / 4:4:4 chroma formats and subpicture / slice layouts whose
-//! loop-filter-across boundaries are not full CTB-grid lines.
+//! Remaining fail-fast gates surface as `Error::Unsupported` with a
+//! precise reason (so a conformance triage can classify streams) from
+//! the tool that lacks them.
 //! Reconstruction runs on BitDepth-parametric `u16` planes (8..=16).
 
 use std::collections::HashMap;
@@ -56,7 +55,8 @@ pub struct DecodedPicture {
     /// reference only and never presented.
     pub output_flag: bool,
     /// Full (uncropped) reconstruction. Chroma planes are meaningful
-    /// only for `chroma_format_idc == 1`.
+    /// only for `chroma_format_idc != 0`, at the format's
+    /// `SubWidthC` / `SubHeightC` geometry.
     pub frame: PictureBuffer,
     /// Conformance-crop window in luma samples: `(left, top, width,
     /// height)`.
@@ -428,13 +428,6 @@ impl StreamDecoder {
         let sps = sps.clone();
         let pps = pps.clone();
 
-        // --- fail-fast tool gates -----------------------------------
-        if sps.sps_chroma_format_idc >= 2 {
-            return Err(Error::unsupported(format!(
-                "h266 stream: chroma format idc {} (4:2:2/4:4:4) not supported",
-                sps.sps_chroma_format_idc
-            )));
-        }
         // §7.4.3.4 / §7.4.3.7 eq. 77 — VirtualBoundariesPresentFlag and
         // the VirtualBoundaryPosX / Y arrays (units of 8 luma samples).
         let (vb_cols, vb_rows): (Vec<u32>, Vec<u32>) =
@@ -758,11 +751,44 @@ impl StreamDecoder {
 
         let w = pps.pps_pic_width_in_luma_samples as usize;
         let h = pps.pps_pic_height_in_luma_samples as usize;
-        let mut out = PictureBuffer::yuv420_filled_bd(w, h, 0, sps.bit_depth_y());
+        let mut out = PictureBuffer::with_chroma_format_bd(
+            w,
+            h,
+            sps.sps_chroma_format_idc as u32,
+            0,
+            sps.bit_depth_y(),
+        );
 
         // Union of all RPL entries as (poc, lsb_only) match specs —
         // the §8.3.3 retention sweep must match the same way the
         // resolver does (an LTRP named by LSB only still retains).
+        // ALF APS bindings from the last slice (continue_slice enforces
+        // cross-slice agreement); built before the slice loop so the
+        // `H266_DUMP_PARTIAL` triage dump can run the §8.8 filters too.
+        let sh_last = pic.slices.last().unwrap();
+        let luma_slots: Vec<Option<&AlfApsData>> = sh_last
+            .sh_alf_aps_id_luma
+            .iter()
+            .map(|id| self.alf_apss.get(id))
+            .collect();
+        let binding = AlfApsBinding {
+            luma_apses: &luma_slots,
+            chroma_aps: if sh_last.sh_alf_cb_enabled_flag || sh_last.sh_alf_cr_enabled_flag {
+                self.alf_apss.get(&sh_last.sh_alf_aps_id_chroma)
+            } else {
+                None
+            },
+            cc_cb_aps: if sh_last.sh_alf_cc_cb_enabled_flag {
+                self.alf_apss.get(&sh_last.sh_alf_cc_cb_aps_id)
+            } else {
+                None
+            },
+            cc_cr_aps: if sh_last.sh_alf_cc_cr_enabled_flag {
+                self.alf_apss.get(&sh_last.sh_alf_cc_cr_aps_id)
+            } else {
+                None
+            },
+        };
         let mut union_refs: Vec<(i32, bool)> = Vec::new();
         for (i, sh) in pic.slices.iter().enumerate() {
             if i > 0 {
@@ -832,6 +858,10 @@ impl StreamDecoder {
                 // partially reconstructed picture of a failing decode
                 // for sample-level triage against an oracle.
                 if let Ok(dir) = std::env::var("H266_DUMP_PARTIAL") {
+                    // Run the §8.8 filters over what was decoded so the
+                    // dump compares exactly (away from the desync) with
+                    // a post-filter oracle.
+                    let _ = walker.apply_in_loop_filters_with_alf(&mut out, &binding);
                     let mut raw: Vec<u8> = Vec::new();
                     for p in [&out.luma, &out.cb, &out.cr] {
                         for y in 0..p.height {
@@ -857,31 +887,8 @@ impl StreamDecoder {
         }
 
         // §8.8 in-loop filters (ALF APS bindings from the last slice —
-        // continue_slice enforces cross-slice agreement).
-        let sh_last = pic.slices.last().unwrap();
-        let luma_slots: Vec<Option<&AlfApsData>> = sh_last
-            .sh_alf_aps_id_luma
-            .iter()
-            .map(|id| self.alf_apss.get(id))
-            .collect();
-        let binding = AlfApsBinding {
-            luma_apses: &luma_slots,
-            chroma_aps: if sh_last.sh_alf_cb_enabled_flag || sh_last.sh_alf_cr_enabled_flag {
-                self.alf_apss.get(&sh_last.sh_alf_aps_id_chroma)
-            } else {
-                None
-            },
-            cc_cb_aps: if sh_last.sh_alf_cc_cb_enabled_flag {
-                self.alf_apss.get(&sh_last.sh_alf_cc_cb_aps_id)
-            } else {
-                None
-            },
-            cc_cr_aps: if sh_last.sh_alf_cc_cr_enabled_flag {
-                self.alf_apss.get(&sh_last.sh_alf_cc_cr_aps_id)
-            } else {
-                None
-            },
-        };
+        // continue_slice enforces cross-slice agreement); built above
+        // the slice loop so a partial-picture dump can filter too.
         // `H266_DBG_NO_LF` (debug aid): skip the §8.8 in-loop filter
         // stack so the raw reconstruction can be diffed sample-level
         // against an oracle away from filtered edges.

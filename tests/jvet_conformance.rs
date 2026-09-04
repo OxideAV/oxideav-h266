@@ -422,8 +422,10 @@ fn picture_hashes(pic: &oxideav_h266::stream::DecodedPicture) -> Vec<String> {
         };
     let mut out = vec![plane_md5(&pic.frame.luma, cx, cy, cw, ch)];
     if pic.chroma_format_idc != 0 {
-        out.push(plane_md5(&pic.frame.cb, cx / 2, cy / 2, cw / 2, ch / 2));
-        out.push(plane_md5(&pic.frame.cr, cx / 2, cy / 2, cw / 2, ch / 2));
+        let (sw, sh) =
+            oxideav_h266::reconstruct::chroma_subsampling(u32::from(pic.chroma_format_idc));
+        out.push(plane_md5(&pic.frame.cb, cx / sw, cy / sh, cw / sw, ch / sh));
+        out.push(plane_md5(&pic.frame.cr, cx / sw, cy / sh, cw / sw, ch / sh));
     }
     out
 }
@@ -622,20 +624,20 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     // post-affine-gate parse desync family; the U rows are
     // subpictures / 4:2:2 / 4:4:4 / explicit WP / per-slice
     // loop-filter divergence.
-    ("10b422_B_5", 'U'),          // 4:2:2 / 4:4:4 chroma formats
-    ("8b400_A_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("8b420_A_2", 'P'),           // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("8b420_B_2", 'P'),           // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("8b444_A_2", 'U'),           // 4:2:2 / 4:4:4 chroma formats
-    ("AFF_A_2", 'P'),             // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("ALF_A_3", 'P'),             // byte-exact (r449 sbBdofFlag)
-    ("ALF_B_3", 'P'),             // byte-exact (r449 sbBdofFlag)
-    ("ALF_C_3", 'P'),             // byte-exact (r449)
-    ("AMVR_A_3", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("BDOF_A_4", 'P'),            // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
-    ("BDPCM_A_2", 'P'),           // byte-exact (r449)
-    ("CCLM_A_2", 'P'),            // byte-exact (r449)
-    ("CST_A_4", 'P'),             // byte-exact (r449)
+    ("10b422_B_5", 'P'), // byte-exact (r456 4:2:2 SubWidthC / SubHeightC generalisation)
+    ("8b400_A_2", 'P'),  // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("8b420_A_2", 'P'),  // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("8b420_B_2", 'P'),  // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("8b444_A_2", 'P'),  // byte-exact (r456 4:4:4 + §8.5.5.6 MODE_INTER corner gate)
+    ("AFF_A_2", 'P'),    // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
+    ("ALF_A_3", 'P'),    // byte-exact (r449 sbBdofFlag)
+    ("ALF_B_3", 'P'),    // byte-exact (r449 sbBdofFlag)
+    ("ALF_C_3", 'P'),    // byte-exact (r449)
+    ("AMVR_A_3", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("BDOF_A_4", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
+    ("BDPCM_A_2", 'P'),  // byte-exact (r449)
+    ("CCLM_A_2", 'P'),   // byte-exact (r449)
+    ("CST_A_4", 'P'),    // byte-exact (r449)
     ("CodingToolsSets_A_2", 'P'), // byte-exact
     ("CodingToolsSets_B_2", 'P'), // byte-exact (r450 §8.5.2.3 raw-availability pruning)
     ("CodingToolsSets_C_2", 'P'), // byte-exact (r449)

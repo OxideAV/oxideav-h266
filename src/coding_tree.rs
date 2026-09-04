@@ -263,6 +263,10 @@ pub struct SplitConstraints {
     /// §6.4.2 / §6.4.3 boundary arms.
     pub pic_w: u32,
     pub pic_h: u32,
+    /// r456 — `SubWidthC` / `SubHeightC` for the §6.4.1 – §6.4.3
+    /// chroma-tree arms (dimensions in luma samples divided by these).
+    pub sub_w: u32,
+    pub sub_h: u32,
 }
 
 /// The five per-node §6.4.1 – §6.4.3 outcomes.
@@ -287,6 +291,15 @@ impl SplitAllows {
 }
 
 impl SplitConstraints {
+    /// r456 — install the §6.2 `SubWidthC` / `SubHeightC` of
+    /// `sps_chroma_format_idc` for the chroma-tree arms.
+    pub fn with_chroma_format(mut self, chroma_format_idc: u32) -> Self {
+        let (w, h) = crate::reconstruct::chroma_subsampling(chroma_format_idc);
+        self.sub_w = w as u32;
+        self.sub_h = h as u32;
+        self
+    }
+
     /// Intra-slice luma / single-tree constraints from the SPS.
     pub fn intra_luma(sps: &crate::sps::SeqParameterSet, pic_w: u32, pic_h: u32) -> Self {
         Self::intra_luma_pc(&sps.partition_constraints, pic_w, pic_h)
@@ -308,6 +321,8 @@ impl SplitConstraints {
             min_cb_log2,
             pic_w,
             pic_h,
+            sub_w: 2,
+            sub_h: 2,
         }
     }
 
@@ -329,6 +344,8 @@ impl SplitConstraints {
             min_cb_log2,
             pic_w,
             pic_h,
+            sub_w: 2,
+            sub_h: 2,
         }
     }
 
@@ -351,6 +368,8 @@ impl SplitConstraints {
             min_cb_log2,
             pic_w,
             pic_h,
+            sub_w: 2,
+            sub_h: 2,
         }
     }
 
@@ -367,6 +386,8 @@ impl SplitConstraints {
             min_cb_log2: 2,
             pic_w,
             pic_h,
+            sub_w: 2,
+            sub_h: 2,
         }
     }
 
@@ -379,7 +400,9 @@ impl SplitConstraints {
             TreeType::SingleTree | TreeType::DualTreeLuma => cb_size > (1 << self.min_qt_log2),
             // 4:2:0 chroma tree: MinQtSizeC gate + the (cbSize /
             // SubWidthC) <= 4 kill (dimensions in luma samples).
-            TreeType::DualTreeChroma => cb_size > (1 << self.min_qt_log2) && (cb_size / 2) > 4,
+            TreeType::DualTreeChroma => {
+                cb_size > (1 << self.min_qt_log2) && (cb_size / self.sub_w) > 4
+            }
         }
     }
 
@@ -441,10 +464,10 @@ impl SplitConstraints {
             return false;
         }
         if tree == TreeType::DualTreeChroma {
-            if (w / 2) * (h / 2) <= 16 {
+            if (w / self.sub_w) * (h / self.sub_h) <= 16 {
                 return false;
             }
-            if (w / 2) == 4 && vertical {
+            if (w / self.sub_w) == 4 && vertical {
                 return false;
             }
         }
@@ -526,10 +549,10 @@ impl SplitConstraints {
             return false;
         }
         if tree == TreeType::DualTreeChroma {
-            if (w / 2) * (h / 2) <= 32 {
+            if (w / self.sub_w) * (h / self.sub_h) <= 32 {
                 return false;
             }
-            if (w / 2) == 8 && vertical {
+            if (w / self.sub_w) == 8 && vertical {
                 return false;
             }
         }

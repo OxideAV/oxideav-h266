@@ -1815,6 +1815,14 @@ pub fn derive_temporal_merge_candidate(inputs: &TemporalMergeInputs<'_>) -> Opti
     if same_ctb_row && y_col_br <= bot_boundary && x_col_br <= right_boundary {
         let x_col_cb = (x_col_br >> 3) << 3;
         let y_col_cb = (y_col_br >> 3) << 3;
+        if std::env::var_os("H266_DBG_TMVP").is_some() {
+            let raw = mf.get_at_luma(x_col_cb, y_col_cb);
+            eprintln!(
+                "TMVP-MERGE ({},{}) {}x{} X={} BR=({x_col_cb},{y_col_cb}) cell={raw:?} pocs={:?} cur={} curRef={} colPoc={}",
+                inputs.xcb, inputs.ycb, inputs.cb_w, inputs.cb_h, inputs.x,
+                mf.ref_pocs_at_luma(x_col_cb, y_col_cb), inputs.current_poc, inputs.current_ref_poc, inputs.col_pic.poc
+            );
+        }
         if let Some(mv) = fetch_collocated_mv(mf, x_col_cb, y_col_cb, inputs) {
             return Some(mv);
         }
@@ -2173,6 +2181,37 @@ thread_local! {
     /// 632 arm); `None` = the picture-wide eqs. 633 / 634 arm.
     static REF_SUBPIC_CLIP: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
         const { std::cell::Cell::new(None) };
+    /// r456 — `(SubWidthC, SubHeightC)` of the picture being
+    /// reconstructed on this thread (§6.2 Table 2); the chroma
+    /// fetchers scale the luma MV to chroma units with it (§8.5.6.3.1
+    /// eqs. `mvCLX = mvLX * 2 / SubWidthC|SubHeightC`) and divide the
+    /// clamp bounds by it. Defaults to 4:2:0.
+    static CHROMA_SUB: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((2, 2)) };
+}
+
+/// Set the chroma subsampling of the picture being reconstructed on
+/// the calling thread (`SubWidthC`, `SubHeightC`).
+#[doc(hidden)]
+pub fn set_chroma_subsampling(sub_w: u32, sub_h: u32) {
+    CHROMA_SUB.with(|c| c.set((sub_w.max(1) as i32, sub_h.max(1) as i32)));
+}
+
+#[inline]
+fn chroma_sub() -> (i32, i32) {
+    CHROMA_SUB.with(|c| c.get())
+}
+
+/// §8.5.6.3.1 — the chroma motion vector in 1/32 chroma-sample units
+/// from the luma MV (1/16 luma units): `mvCLX[0] = mvLX[0] * 2 /
+/// SubWidthC`, `mvCLX[1] = mvLX[1] * 2 / SubHeightC` (the identity
+/// under 4:2:0, a doubling under 4:4:4 / the 4:2:2 vertical axis).
+#[inline]
+fn chroma_mv(mv: MotionVector) -> MotionVector {
+    let (sw, sh) = chroma_sub();
+    MotionVector {
+        x: mv.x * 2 / sw,
+        y: mv.y * 2 / sh,
+    }
 }
 
 /// Set (or clear) the §8.5.6.3.2 eqs. 631 / 632 subpicture reference
@@ -2606,7 +2645,7 @@ fn chroma_h_4tap(plane: &PicturePlane, x_int: i32, y_clamped: usize, x_frac: usi
     let row_base = y_clamped * plane.stride;
     let mut acc = 0i32;
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = clip_ref_x(x_int + (i as i32) - 1, pic_w, 2);
+        let xi = clip_ref_x(x_int + (i as i32) - 1, pic_w, chroma_sub().0);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     acc // shift1 = 0 at BitDepth 8
@@ -2629,7 +2668,7 @@ fn chroma_v_only_4tap(plane: &PicturePlane, x_clamped: usize, y_int: i32, y_frac
     let pic_h = plane.height as i32;
     let mut acc = 0i32;
     for i in 0..4 {
-        let yi = clip_ref_y(y_int + (i as i32) - 1, pic_h, 2);
+        let yi = clip_ref_y(y_int + (i as i32) - 1, pic_h, chroma_sub().1);
         acc += coeffs[i] * (plane.samples[yi * plane.stride + x_clamped] as i32);
     }
     acc
@@ -2666,6 +2705,8 @@ pub fn predict_chroma_block(
     src: &PicturePlane,
     mv: MotionVector,
 ) -> Result<()> {
+    // §8.5.6.3.1 — luma MV → chroma MV (1/32 chroma units).
+    let mv = chroma_mv(mv);
     if dst_x_c as usize + w_c as usize > dst.width || dst_y_c as usize + h_c as usize > dst.height {
         return Err(Error::invalid(format!(
             "h266 chroma MC: destination block ({},{}) {}x{} out of plane bounds {}x{}",
@@ -2681,8 +2722,9 @@ pub fn predict_chroma_block(
     let y_frac = (mv.y & 31) as usize;
 
     if x_frac == 0 && y_frac == 0 {
+        let (csw, csh) = chroma_sub();
         return mc_copy_block_int_sub(
-            dst, dst_x_c, dst_y_c, w_c, h_c, src, x_int_base, y_int_base, 2, 2,
+            dst, dst_x_c, dst_y_c, w_c, h_c, src, x_int_base, y_int_base, csw, csh,
         );
     }
 
@@ -2695,7 +2737,7 @@ pub fn predict_chroma_block(
     if y_frac == 0 {
         // Horizontal-only chroma filter (eq. 951).
         for r in 0..h_c as i32 {
-            let yi = clip_ref_y(y_int_base + r, pic_h, 2);
+            let yi = clip_ref_y(y_int_base + r, pic_h, chroma_sub().1);
             for c in 0..w_c as i32 {
                 let v = chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
                 dst.samples
@@ -2707,7 +2749,7 @@ pub fn predict_chroma_block(
     }
     if x_frac == 0 {
         for c in 0..w_c as i32 {
-            let xi = clip_ref_x(x_int_base + c, pic_w, 2);
+            let xi = clip_ref_x(x_int_base + c, pic_w, chroma_sub().0);
             for r in 0..h_c as i32 {
                 let v = chroma_v_only_4tap(src, xi, y_int_base + r, y_frac) >> shift1;
                 dst.samples
@@ -2721,7 +2763,7 @@ pub fn predict_chroma_block(
     let inter_h = h_c as usize + 3;
     let mut intermediate = vec![0i32; inter_h * w_c as usize];
     for r in 0..inter_h as i32 {
-        let yi = clip_ref_y(y_int_base - 1 + r, pic_h, 2);
+        let yi = clip_ref_y(y_int_base - 1 + r, pic_h, chroma_sub().1);
         for c in 0..w_c as i32 {
             intermediate[r as usize * w_c as usize + c as usize] =
                 chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
@@ -3019,6 +3061,20 @@ pub fn predict_chroma_block_high_precision(
     mv: MotionVector,
     bit_depth: u32,
 ) -> Result<Vec<i32>> {
+    predict_chroma_block_high_precision_c(dst_x_c, dst_y_c, w_c, h_c, src, chroma_mv(mv), bit_depth)
+}
+
+/// [`predict_chroma_block_high_precision`] with `mv` already in
+/// 1/32 chroma-sample units (patch-local callers).
+fn predict_chroma_block_high_precision_c(
+    dst_x_c: u32,
+    dst_y_c: u32,
+    w_c: u32,
+    h_c: u32,
+    src: &PicturePlane,
+    mv: MotionVector,
+    bit_depth: u32,
+) -> Result<Vec<i32>> {
     if !(8..=16).contains(&bit_depth) {
         return Err(Error::invalid(format!(
             "h266 chroma MC HP: bit_depth {bit_depth} out of supported range 8..=16",
@@ -3039,9 +3095,9 @@ pub fn predict_chroma_block_high_precision(
 
     if x_frac == 0 && y_frac == 0 {
         for r in 0..h_c as i32 {
-            let yi = clip_ref_y(y_int_base + r, pic_h, 2);
+            let yi = clip_ref_y(y_int_base + r, pic_h, chroma_sub().1);
             for c in 0..w_c as i32 {
-                let xi = clip_ref_x(x_int_base + c, pic_w, 2);
+                let xi = clip_ref_x(x_int_base + c, pic_w, chroma_sub().0);
                 out[r as usize * w_us + c as usize] =
                     (src.samples[yi * src.stride + xi] as i32) << lift;
             }
@@ -3050,7 +3106,7 @@ pub fn predict_chroma_block_high_precision(
     }
     if y_frac == 0 {
         for r in 0..h_c as i32 {
-            let yi = clip_ref_y(y_int_base + r, pic_h, 2);
+            let yi = clip_ref_y(y_int_base + r, pic_h, chroma_sub().1);
             for c in 0..w_c as i32 {
                 out[r as usize * w_us + c as usize] =
                     chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
@@ -3060,7 +3116,7 @@ pub fn predict_chroma_block_high_precision(
     }
     if x_frac == 0 {
         for c in 0..w_c as i32 {
-            let xi = clip_ref_x(x_int_base + c, pic_w, 2);
+            let xi = clip_ref_x(x_int_base + c, pic_w, chroma_sub().0);
             for r in 0..h_c as i32 {
                 out[r as usize * w_us + c as usize] =
                     chroma_v_only_4tap(src, xi, y_int_base + r, y_frac) >> shift1;
@@ -3071,7 +3127,7 @@ pub fn predict_chroma_block_high_precision(
     let inter_h = h_us + 3;
     let mut intermediate = vec![0i32; inter_h * w_us];
     for r in 0..inter_h as i32 {
-        let yi = clip_ref_y(y_int_base - 1 + r, pic_h, 2);
+        let yi = clip_ref_y(y_int_base - 1 + r, pic_h, chroma_sub().1);
         for c in 0..w_c as i32 {
             intermediate[r as usize * w_us + c as usize] =
                 chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
@@ -3163,6 +3219,8 @@ pub fn predict_chroma_block_high_precision_dmvr(
     mv_refined: MotionVector,
     bit_depth: u32,
 ) -> Result<Vec<i32>> {
+    let mv_orig = chroma_mv(mv_orig);
+    let mv_refined = chroma_mv(mv_refined);
     let x_sb_int = dst_x_c as i32 + (mv_orig.x >> 5);
     let y_sb_int = dst_y_c as i32 + (mv_orig.y >> 5);
     // §8.5.6.3.4 eqs. 944 / 945 — the bounding block is
@@ -3176,9 +3234,9 @@ pub fn predict_chroma_block_high_precision_dmvr(
     let ph = h_c as usize + 3;
     let mut patch = PicturePlane::filled_bd(pw, ph, 0, src.bit_depth);
     for r in 0..ph {
-        let sy = clip_ref_y(top + r as i32, src.height as i32, 2);
+        let sy = clip_ref_y(top + r as i32, src.height as i32, chroma_sub().1);
         for c in 0..pw {
-            let sx = clip_ref_x(left + c as i32, src.width as i32, 2);
+            let sx = clip_ref_x(left + c as i32, src.width as i32, chroma_sub().0);
             patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
         }
     }
@@ -3187,7 +3245,7 @@ pub fn predict_chroma_block_high_precision_dmvr(
         y: mv_refined.y + ((dst_y_c as i32 - top) << 5),
     };
     without_ref_wraparound(|| {
-        predict_chroma_block_high_precision(0, 0, w_c, h_c, &patch, mv_adj, bit_depth)
+        predict_chroma_block_high_precision_c(0, 0, w_c, h_c, &patch, mv_adj, bit_depth)
     })
 }
 

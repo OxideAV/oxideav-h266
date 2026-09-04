@@ -250,7 +250,8 @@ plus a substantial P + B-slice merge subset:
   §7.4.12.5 eqs. 181 / 182 per-CU invalidation, §8.7.5.1
   eqs. 1207 – 1209 fill after every reconstructed CU, and the
   §8.6.2.1 reference-region conformance constraints enforced) for
-  luma + 4:2:0 chroma via the §8.6.2.5 `bvC`, the shared MODE_INTER
+  luma + chroma (`bvC = bv >> 5` per §8.6.2.5, every chroma format)
+  via the shared MODE_INTER
   residual tail (without the §8.7.5.2 LMCS forward mapping — an IBC
   prediction copies already-mapped-domain samples), and the
   eqs. 1111 – 1118 bookkeeping (`MvL0 = bvL`, `PredFlagLX = 0`,
@@ -370,10 +371,10 @@ plus a substantial P + B-slice merge subset:
   `reconstruct_affine_inter_uni` takes a control-point MV set, derives
   the §8.5.5.9 per-4×4-sub-block luma MV grid (eqs. 872 – 875), runs the
   §8.5.6.3.2 affine 6-tap interpolation per sub-block with §8.5.5.8 PROF
-  (`predict_luma_block_affine_prof`), and reconstructs 4:2:0 chroma by
-  averaging the §8.5.5.3 top-left + bottom-right luma sub-block MVs
-  (eqs. 876 – 879) into each chroma 4×4 sub-block before the §8.5.6.3.4
-  4-tap chroma MC. `reconstruct_affine_inter_bi` predicts each list's
+  (`predict_luma_block_affine_prof`), and reconstructs chroma by
+  averaging the §8.5.5.3 `SubWidthC × SubHeightC` luma sub-block group's
+  first + last MVs (eqs. 876 – 879 — the sub-block's own MV for 4:4:4)
+  into each chroma sub-block before the §8.5.6.3.4 4-tap chroma MC. `reconstruct_affine_inter_bi` predicts each list's
   affine MC into a CU-sized scratch then forms the §8.5.6.6.2 eq. 980
   default-weighted average over luma + chroma. **Affine-CPMV parse-to-
   pixels** (§8.5.5.5) is **live**: `reconstruct_leaf_cu_inter_affine_amvp`
@@ -681,10 +682,12 @@ r456): 0 P / 2 F / 8 U / 46 E →
 1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
 2 P / 17 F / 8 U / 29 E → 14 P / 31 F / 9 U / 2 E →
 34 P / 12 F / 9 U / 1 E → 43 P / 4 F / 9 U / 0 E →
-50 P / 1 F / 5 U / 0 E → **54 PASS / 0 FAIL / 2 UNSUPPORTED / 0 ERROR**
+50 P / 1 F / 5 U / 0 E → **56 PASS / 0 FAIL / 0 UNSUPPORTED / 0 ERROR**
 — r456 landed subpictures (`SUBPIC_C_1`, `CodingToolsSets_E_1`,
-`LMCS_B_2` byte-exact) and closed the `IBC_A_2` SCIPU-over-IBC row
-(see the r456 rollup below). r453 closed the r452
+`LMCS_B_2` byte-exact), closed the `IBC_A_2` SCIPU-over-IBC row and
+generalised the decoder over the 4:2:2 / 4:4:4 chroma formats
+(`10b422_B_5`, `8b444_A_2` byte-exact — see the r456 rollup below).
+**The staged corpus is saturated: every row decodes byte-exact.** r453 closed the r452
 chroma-deblock margin family (§8.8.3.6.4's QpP/QpQ are per TRANSFORM
 BLOCK: a >MaxTbSizeY tile or SBT sub-TU with `TuCResMode == 2`
 deblocks with `Qp′CbCr`, one β step under `Qp′Cb` at
@@ -901,8 +904,9 @@ fixture wire that now decodes byte-exactly:
   containing each SAMPLE (`ClipRegions::rect_at`), which also serves
   mid-CTB boundaries (multiples of 8).
 
-**r456 — the subpicture family + the SCIPU-over-IBC row: 50 P → 54 P,
-F 1 → 0, U 5 → 2.** Root causes,
+**r456 — the subpicture family, the SCIPU-over-IBC row and the
+4:2:2 / 4:4:4 chroma formats: 50 P → 56 P, F 1 → 0, U 5 → 0.** Root
+causes,
 each pinned against the corpus (a black-box `ffmpeg` decode supplied
 the per-sample diffs once the streams decoded end-to-end):
 
@@ -946,11 +950,30 @@ the per-sample diffs once the streams decoded end-to-end):
   its BV pulled from a SCIPU leaf, then every DC / horizontal chroma
   CU predicted from that column). Luma was exact throughout because
   the luma tree always stored.
+* **§6.2 Table 2 `SubWidthC` / `SubHeightC` everywhere** (`10b422_B_5`,
+  `8b444_A_2`) — the 4:2:0 `/ 2` constants across the coding tree
+  (`SplitConstraints` chroma arms), intra chroma (§8.4.3 Table 21
+  4:2:2 mode map, the 4:4:4 `MipChromaDirectFlag` MIP chroma
+  prediction, CCLM neighbour sampling), MC (§8.5.6.3.1 `mvC =
+  mv · 2 / SubWidthC|SubHeightC`, the §8.5.5.3 eqs. 876 – 879 affine
+  chroma groups, GPM's eqs. 1011 / 1012 chroma weight scaling), IBC
+  (§8.6.2.5 `bvC`), the residual parse (Table 131: `tu_cb_coded_flag`
+  ctxInc = `intra_bdpcm_chroma_flag`, `tu_cr_coded_flag` = 2 under
+  chroma BDPCM — the single-tree TU read both with ctx 0 and desynced
+  the 4:4:4 stream on its first BDPCM chroma CU) and the chroma
+  deblocker (§8.8.3.6.5 eq. 1335 `maxK = 3` rows per segment when the
+  edge-parallel subsampling is 1 — the weak filter hard-coded the two
+  4:2:0 rows, the ±1 tail of `10b422_B_5`).
+* **§8.5.5.6 corner cascade under §6.4.4 `checkPredModeY`** — a
+  non-MODE_INTER neighbour (IBC / intra / palette) is *unavailable*
+  and the constructed-candidate cascade moves on (B2 → B3 → A2); the
+  reader stopped at an IBC B3 with empty prediction flags, starving
+  every constructed candidate out of the sub-block merge list
+  (`8b444_A_2` poc 50: a `merge_subblock_idx = 3` CU landed on the
+  zero candidate; the mis-prediction propagated through spatial /
+  HMVP / GPM merges across the CTB row and into pocs 49 / 51).
 
-No FAIL rows remain. The 2 UNSUPPORTED rows are
-4:2:2 / 4:4:4 (`10b422_B_5`, `8b444_A_2` — the SubWidthC / SubHeightC
-generalisation across intra chroma, MC, loop filters, LMCS and
-transforms). `examples/triage_dbg` decodes one
+Every row of the staged corpus is byte-exact. `examples/triage_dbg` decodes one
 corpus stream against its `.opl` sidecar with optional plane dumps;
 `examples/decode_dump` writes POC-ordered YUV for fixture diffing;
 `examples/sps_dump` prints a stream's SPS tool-flag set and every
@@ -972,8 +995,14 @@ the picture-wide reference / collocated arms (or deliberately
 mis-clamps 16 samples inside the subpicture, proving the clamp is
 live), `H266_DBG_LF_REGION=off` drops the CTB-granular slice /
 subpicture loop-filter gates and `H266_DBG_TILE_GATE=off` filters
-across tiles; `examples/sps_dump` prints the subpicture layout and
-the PPS info-in-PH flags. `H266_DUMP_PREFILTER`
+across tiles; `H266_DBG_BINS=<x>,<y>` traces every CABAC bin of one
+CTB, `H266_DBG_GPM_FORCE_A|B=<x>,<y>` + `H266_DBG_GPM_FORCE_PIC=<n>`
+override a GPM partition's MV for one picture, `H266_DBG_SKIP=<pic>,res`
+drops the residual, `H266_DBG_LENIENT` clamps palette-escape
+overflows instead of failing, and `H266_DUMP_PARTIAL` runs the loop
+filters on the partial picture; `examples/sps_dump` prints the
+subpicture layout, the PPS info-in-PH flags and the range extension.
+`H266_DUMP_PREFILTER`
 writes the pre-filter mapped-domain reconstruction per CVS / poc,
 `H266_DUMP_MIDLF` writes each deblocking pass's input, and
 `H266_DUMP_PARTIAL` keeps the partially reconstructed picture of a

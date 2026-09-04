@@ -109,9 +109,20 @@ impl PicturePlane {
     }
 }
 
-/// Frame-level reconstruction buffer for 4:2:0 YUV. Chroma planes live
-/// alongside luma at half the dimensions in each direction, at the
-/// same bit depth.
+/// §6.2 Table 2 — `(SubWidthC, SubHeightC)` for `sps_chroma_format_idc`
+/// (monochrome reports the 4:2:0 footprint of its placeholder planes).
+pub fn chroma_subsampling(chroma_format_idc: u32) -> (usize, usize) {
+    match chroma_format_idc {
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => (2, 2),
+    }
+}
+
+/// Frame-level reconstruction buffer for YUV. Chroma planes live
+/// alongside luma at `1 / SubWidthC × 1 / SubHeightC` of its
+/// dimensions (4:2:0 by the historical constructors), at the same bit
+/// depth.
 #[derive(Clone, Debug)]
 pub struct PictureBuffer {
     pub luma: PicturePlane,
@@ -135,6 +146,26 @@ impl PictureBuffer {
             luma: PicturePlane::filled_bd(luma_w, luma_h, seed, bit_depth),
             cb: PicturePlane::filled_bd(luma_w / 2, luma_h / 2, mid, bit_depth),
             cr: PicturePlane::filled_bd(luma_w / 2, luma_h / 2, mid, bit_depth),
+        }
+    }
+
+    /// r456 — allocate a frame for any `sps_chroma_format_idc` at the
+    /// given `bit_depth`: chroma planes are `luma / SubWidthC ×
+    /// luma / SubHeightC` (§6.2 Table 2; monochrome keeps the 4:2:0
+    /// footprint as an unused placeholder), seeded to mid-grey.
+    pub fn with_chroma_format_bd(
+        luma_w: usize,
+        luma_h: usize,
+        chroma_format_idc: u32,
+        seed: u16,
+        bit_depth: u32,
+    ) -> Self {
+        let (sub_w, sub_h) = chroma_subsampling(chroma_format_idc);
+        let mid = 1u16 << (bit_depth - 1);
+        Self {
+            luma: PicturePlane::filled_bd(luma_w, luma_h, seed, bit_depth),
+            cb: PicturePlane::filled_bd(luma_w / sub_w, luma_h / sub_h, mid, bit_depth),
+            cr: PicturePlane::filled_bd(luma_w / sub_w, luma_h / sub_h, mid, bit_depth),
         }
     }
 
@@ -602,5 +633,19 @@ mod tests {
             first > 255,
             "Main10 reconstruction must escape the 8-bit ceiling, got {first}",
         );
+    }
+
+    /// r456 — §6.2 Table 2 `(SubWidthC, SubHeightC)` per chroma format.
+    #[test]
+    fn chroma_subsampling_follows_table_2() {
+        assert_eq!(chroma_subsampling(1), (2, 2));
+        assert_eq!(chroma_subsampling(2), (2, 1));
+        assert_eq!(chroma_subsampling(3), (1, 1));
+        // Monochrome keeps the 4:2:0 placeholder footprint.
+        assert_eq!(chroma_subsampling(0), (2, 2));
+        let pb = PictureBuffer::with_chroma_format_bd(64, 32, 2, 0, 10);
+        assert_eq!((pb.cb.width, pb.cb.height), (32, 32));
+        let pb = PictureBuffer::with_chroma_format_bd(64, 32, 3, 0, 8);
+        assert_eq!((pb.cr.width, pb.cr.height), (64, 32));
     }
 }

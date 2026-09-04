@@ -646,11 +646,17 @@ pub fn read_palette_coding(
                     if cu.index_map[cur] as usize == max_palette_index {
                         let v = decode_exp_golomb_k(dec, 5)?;
                         if v >= (1u32 << p.bit_depth) {
-                            return Err(Error::invalid(
-                                "h266 palette_coding: palette_escape_val exceeds \
-                                 (1 << BitDepth) - 1",
-                            ));
+                            // `H266_DBG_LENIENT` — triage aid: clamp a
+                            // desynced escape value instead of aborting so
+                            // the picture can still be diffed.
+                            if std::env::var_os("H266_DBG_LENIENT").is_none() {
+                                return Err(Error::invalid(
+                                    "h266 palette_coding: palette_escape_val exceeds \
+                                     (1 << BitDepth) - 1",
+                                ));
+                            }
                         }
+                        let v = v.min((1u32 << p.bit_depth) - 1);
                         cu.escape_vals[c][cur] = v as u16;
                     }
                 }

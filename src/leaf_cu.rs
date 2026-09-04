@@ -656,6 +656,11 @@ pub struct LeafCuInfo {
     pub intra_mip_mode: u32,
     /// `IntraLumaRefLineIdx[x0][y0]`.
     pub intra_luma_ref_idx: u32,
+    /// r456 — §8.4.3 `MipChromaDirectFlag[x0][y0]`: a 4:4:4 single-tree
+    /// MIP CU whose `intra_chroma_pred_mode` is the direct mode (or
+    /// `cu_act_enabled_flag`) predicts its chroma with the luma MIP
+    /// matrix (§8.4.5.2.1 → §8.4.5.2.2 with `cIdx != 0`).
+    pub mip_chroma_direct: bool,
     /// Derived ISP split type.
     pub isp_split: IspSplitType,
     /// `intra_luma_mpm_flag[x0][y0]` (inferred 1 if not present).
@@ -768,6 +773,7 @@ impl Default for LeafCuInfo {
             intra_mip_transposed_flag: false,
             intra_mip_mode: 0,
             intra_luma_ref_idx: 0,
+            mip_chroma_direct: false,
             isp_split: IspSplitType::NoSplit,
             intra_luma_mpm_flag: true,
             intra_luma_not_planar_flag: true,
@@ -1412,6 +1418,23 @@ pub fn derive_intra_pred_mode_c(intra_chroma_pred_mode: u32, luma_intra_pred_mod
 /// INTRA_ANGULAR66 (top-right diagonal) — Table 20's "alt" direct mode.
 pub const INTRA_ANGULAR66: u32 = 66;
 
+/// §8.4.3 Table 21 — the 4:2:2 mapping from the Table 20 chroma intra
+/// prediction mode X to mode Y (`sps_chroma_format_idc == 2`): the
+/// angular modes are re-targeted for the horizontally-halved chroma
+/// geometry; PLANAR / DC and the CCLM modes (≥ 81) pass through.
+pub fn map_chroma_mode_422(mode_x: u32) -> u32 {
+    const TABLE_21: [u8; 67] = [
+        0, 1, 61, 62, 63, 64, 65, 66, 2, 3, 5, 6, 8, 10, 12, 13, 14, 16, // 0..=17
+        18, 20, 22, 23, 24, 26, 28, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, // 18..=35
+        41, 42, 43, 43, 44, 44, 45, 45, 46, 47, 48, 48, 49, 49, 50, 51, 51, 52, // 36..=53
+        52, 53, 54, 55, 55, 56, 56, 57, 57, 58, 59, 59, 60, // 54..=66
+    ];
+    match TABLE_21.get(mode_x as usize) {
+        Some(&y) => u32::from(y),
+        None => mode_x,
+    }
+}
+
 /// Neighbourhood snapshot passed into [`LeafCuReader`] per CU.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CuNeighbourhood {
@@ -1934,8 +1957,13 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         };
         let (bw, bh) = if self.tree == TreeType::DualTreeChroma {
             // §7.3.11.5 — palette_coding( x0, y0, cbWidth / SubWidthC,
-            // cbHeight / SubHeightC, treeType ); this walker is 4:2:0.
-            (info.cb_width / 2, info.cb_height / 2)
+            // cbHeight / SubHeightC, treeType ).
+            let (sw, sh) = match self.tools.chroma_format_idc {
+                2 => (2, 1),
+                3 => (1, 1),
+                _ => (2, 2),
+            };
+            (info.cb_width / sw, info.cb_height / sh)
         } else {
             (info.cb_width, info.cb_height)
         };
@@ -2000,12 +2028,16 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                                             // DUAL_TREE_CHROMA`, and §7.4.12.5 infers `pred_mode_ibc_flag
                                             // = 0` for a DUAL_TREE_CHROMA CU — the chroma tree is always
                                             // intra (r409; the pre-r409 reader refused the whole slice).
-        if self.tools.chroma_format_idc != 1 {
-            return Err(Error::unsupported(
-                "h266 leaf CU (dual-tree chroma): only 4:2:0 is walked",
-            ));
-        }
-        let (sub_w, sub_h) = (2u32, 2u32);
+        let (sub_w, sub_h) = match self.tools.chroma_format_idc {
+            1 => (2u32, 2u32),
+            2 => (2, 1),
+            3 => (1, 1),
+            _ => {
+                return Err(Error::invalid(
+                    "h266 leaf CU (dual-tree chroma): chroma tree on a monochrome SPS",
+                ))
+            }
+        };
 
         // r431 — §7.3.11.5 `pred_mode_plt_flag` on the chroma tree:
         // the area gate reads `cbWidth * cbHeight > 16 * SubWidthC *
@@ -2092,6 +2124,9 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 let icp = self.read_intra_chroma_pred_mode()?;
                 info.intra_chroma_pred_mode = icp;
                 info.intra_pred_mode_c = derive_intra_pred_mode_c(icp, luma_intra_pred_mode);
+                if self.tools.chroma_format_idc == 2 {
+                    info.intra_pred_mode_c = map_chroma_mode_422(info.intra_pred_mode_c);
+                }
             }
         }
 
@@ -3908,6 +3943,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         residual: &mut LeafCuResidual,
         is_intra: bool,
     ) -> Result<()> {
+        let (sub_w, sub_h) = match self.tools.chroma_format_idc {
+            2 => (2u32, 1u32),
+            3 => (1, 1),
+            _ => (2, 2),
+        };
         let tiles = crate::transform::transform_tree_tiles(
             info.cb_width,
             info.cb_height,
@@ -3915,11 +3955,6 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         );
         let chroma_available =
             self.tools.chroma_format_idc != 0 && self.tree != TreeType::DualTreeLuma;
-        if chroma_available && self.tools.chroma_format_idc != 1 {
-            return Err(Error::unsupported(
-                "h266 leaf CU inter: multi-TB tiling is walked for 4:2:0 / monochrome only",
-            ));
-        }
         let mut qp_delta_done = self.tools.cu_qp_delta_already_coded;
         // Chroma-offset QGs are armed per CU on this walker (matching
         // the single-TU inter path): the first eligible TU reads the
@@ -4015,8 +4050,8 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                 )?;
                 tu.luma_levels = levels;
             }
-            let cw = (t.w / 2) as usize;
-            let ch = (t.h / 2) as usize;
+            let cw = (t.w / sub_w) as usize;
+            let ch = (t.h / sub_h) as usize;
             if chroma_available && cw >= 2 && ch >= 2 {
                 let ts_present_chroma = self.tools.transform_skip_enabled
                     && (cw as u32) <= self.tools.max_ts_size
@@ -4612,17 +4647,21 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             }
         };
         // Read tu_cb/tu_cr_coded first (spec order — chroma CBFs come
-        // before luma within transform_unit()).
+        // before luma within transform_unit()). r456 — Table 131:
+        // `tu_cb_coded_flag` ctxInc = intra_bdpcm_chroma_flag and
+        // `tu_cr_coded_flag` ctxInc = intra_bdpcm_chroma_flag ? 2 :
+        // tu_cb_coded_flag — the single-tree intra path passed a
+        // constant 0, desyncing every single-tree chroma-BDPCM CU
+        // (8b444_A_2's screen content codes them from its first
+        // picture; the 4:2:0 corpus only carries chroma BDPCM on the
+        // dual chroma tree).
         if chroma {
-            info.tu_cb_coded_flag = read_tu_cb_coded_flag(
-                self.dec,
-                &mut self.ctxs.residual,
-                /*bdpcm_chroma=*/ false,
-            )?;
+            info.tu_cb_coded_flag =
+                read_tu_cb_coded_flag(self.dec, &mut self.ctxs.residual, info.intra_bdpcm_chroma)?;
             info.tu_cr_coded_flag = read_tu_cr_coded_flag(
                 self.dec,
                 &mut self.ctxs.residual,
-                /*bdpcm_chroma=*/ false,
+                info.intra_bdpcm_chroma,
                 info.tu_cb_coded_flag,
             )?;
         }
@@ -5372,8 +5411,24 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // Read intra_chroma_pred_mode — Table 130, bin 0 ctx, bins 1-2 bypass.
         let icp = self.read_intra_chroma_pred_mode().unwrap_or_default();
         info.intra_chroma_pred_mode = icp;
-        let luma = info.intra_pred_mode_y;
+        // §8.4.3 — a SINGLE_TREE 4:4:4 MIP CU: `lumaIntraPredMode = −1`
+        // (no Table 20 "alt" substitution fires) and the direct mode
+        // sets `MipChromaDirectFlag` (chroma predicted by the luma MIP
+        // matrix); every other MIP CU reads INTRA_PLANAR.
+        let mip_444 = self.tools.chroma_format_idc == 3 && info.intra_mip_flag;
+        let luma = if mip_444 {
+            u32::MAX
+        } else {
+            info.intra_pred_mode_y
+        };
         info.intra_pred_mode_c = derive_intra_pred_mode_c(icp, luma);
+        if mip_444 && icp == 4 {
+            info.mip_chroma_direct = true;
+            info.intra_pred_mode_c = info.intra_pred_mode_y;
+        }
+        if self.tools.chroma_format_idc == 2 {
+            info.intra_pred_mode_c = map_chroma_mode_422(info.intra_pred_mode_c);
+        }
     }
 
     fn read_intra_chroma_pred_mode(&mut self) -> Result<u32> {
@@ -10072,5 +10127,33 @@ mod tests {
         assert_eq!(nm.mvp_l0_flag, 0);
         assert_eq!(nm.mvp_l1_flag, 1);
         assert_eq!(nm.bcw_idx, 0);
+    }
+
+    /// r456 — §8.4.3 Table 21: the 4:2:2 chroma mode map re-targets
+    /// the angular modes (spot-checked against the staged table),
+    /// passes PLANAR / DC through and leaves the CCLM modes (≥ 81)
+    /// untouched.
+    #[test]
+    fn table_21_maps_422_chroma_modes() {
+        for (x, y) in [
+            (0, 0),
+            (1, 1),
+            (2, 61),
+            (7, 66),
+            (8, 2),
+            (17, 16),
+            (18, 18),
+            (19, 20),
+            (35, 41),
+            (36, 41),
+            (44, 46),
+            (53, 52),
+            (54, 52),
+            (66, 60),
+            (81, 81),
+            (83, 83),
+        ] {
+            assert_eq!(map_chroma_mode_422(x), y, "mode X = {x}");
+        }
     }
 }

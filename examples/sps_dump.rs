@@ -31,8 +31,11 @@ fn main() {
                 );
                 println!("partition: {:#?}", sps.partition_constraints);
                 println!(
-                    "chroma_format_idc={} subpic_info_present={}",
-                    sps.sps_chroma_format_idc, sps.sps_subpic_info_present_flag
+                    "chroma_format_idc={} subpic_info_present={} range_extension={} {:?}",
+                    sps.sps_chroma_format_idc,
+                    sps.sps_subpic_info_present_flag,
+                    sps.sps_range_extension_flag,
+                    sps.range_extension
                 );
                 if let Some(info) = &sps.subpic_info {
                     println!(

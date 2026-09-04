@@ -644,6 +644,11 @@ pub(crate) fn dbg_skip_stage(stage: &str) -> bool {
     false
 }
 
+/// Reconstruction-side picture ordinal (the raw `DBG_PIC` counter).
+pub(crate) fn dbg_pic_ordinal() -> u32 {
+    DBG_PIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Reconstruction-side twin of [`dbg_skip_stage`]: the picture being
 /// RECONSTRUCTED has not run its deblocking pass yet, so its ordinal
 /// is the raw counter (stages: `dmvr`, `bdof`).
@@ -816,11 +821,13 @@ pub(crate) fn apply_deblocking_regions(
             (Some(cc), Some(cg)) => (cc, cg),
             _ => (cus, &grid),
         };
+        let (csw, csh) = crate::reconstruct::chroma_subsampling(chroma_format_idc);
+        let (csw, csh) = (csw as u32, csh as u32);
         let mut cb = PlaneCtx {
             plane: &mut out.cb,
             c_idx: 1,
-            sub_w: 2,
-            sub_h: 2,
+            sub_w: csw,
+            sub_h: csh,
             beta_offset_div2: params.cb_beta_offset_div2,
             tc_offset_div2: params.cb_tc_offset_div2,
             qp_offset: params.chroma_qp_offset_cb,
@@ -849,8 +856,8 @@ pub(crate) fn apply_deblocking_regions(
         let mut cr = PlaneCtx {
             plane: &mut out.cr,
             c_idx: 2,
-            sub_w: 2,
-            sub_h: 2,
+            sub_w: csw,
+            sub_h: csh,
             beta_offset_div2: params.cr_beta_offset_div2,
             tc_offset_div2: params.cr_tc_offset_div2,
             qp_offset: params.chroma_qp_offset_cr,
@@ -1040,13 +1047,12 @@ fn deblock_cu_dir(
     } else {
         8 * if vertical { plane.sub_w } else { plane.sub_h }
     };
-    // Segment step along the edge (luma units): 4 luma rows / 2 chroma
-    // rows per §8.8.3.5 eqs. 1254 / 1258.
-    let seg_step = if c_idx == 0 {
-        4u32
-    } else {
-        2 * if vertical { plane.sub_h } else { plane.sub_w }
-    };
+    // Segment step along the edge (luma units): §8.8.3.6.1 eqs. 1266 /
+    // 1267 step the chroma edge by `1 << (2 / subH)` chroma rows (EDGE_VER)
+    // / `1 << (2 / subW)` chroma columns (EDGE_HOR) — 2 chroma samples
+    // under 4:2:0, 4 under 4:2:2 (vertical) / 4:4:4 — which is 4 luma
+    // samples in every format.
+    let seg_step = 4u32;
     // §8.8.3.4 sub-block geometry (luma only; numSb = 1 otherwise).
     let num_sb_axis = if c_idx == 0 {
         cu.num_sb
@@ -1284,6 +1290,18 @@ fn deblock_cu_dir(
                         q_cu.joint2_at(qx, qy),
                     );
                 }
+                // §8.8.3.6.5 eqs. 1335 / 1336 — segment rows / columns.
+                let max_k = if vertical {
+                    if plane.sub_h == 1 {
+                        3
+                    } else {
+                        1
+                    }
+                } else if plane.sub_w == 1 {
+                    3
+                } else {
+                    1
+                };
                 if vertical {
                     run_chroma_filter_v(
                         plane.plane,
@@ -1297,6 +1315,7 @@ fn deblock_cu_dir(
                         mfl_q,
                         p_cu.plt,
                         q_cu.plt,
+                        max_k,
                     );
                 } else {
                     run_chroma_filter_h(
@@ -1311,6 +1330,7 @@ fn deblock_cu_dir(
                         mfl_q,
                         p_cu.plt,
                         q_cu.plt,
+                        max_k,
                     );
                 }
             }
@@ -2158,6 +2178,7 @@ fn run_chroma_filter_v(
     max_filter_length_q: u32,
     plt_p: bool,
     plt_q: bool,
+    max_k: i32,
 ) {
     if tc == 0 {
         return;
@@ -2174,10 +2195,8 @@ fn run_chroma_filter_v(
         return;
     }
     let bd = plane.bit_depth;
-    // §8.8.3.6.5 maxK for EDGE_VER, SubHeightC = 2 (4:2:0) → maxK = 1
-    // (i.e. 2 sample rows along the edge). Our chroma path always
-    // operates on 2 sample positions per segment.
-    let max_k = 1i32;
+    // §8.8.3.6.5 eq. 1335 — maxK = (SubHeightC == 1) ? 3 : 1 rows along
+    // the edge per segment (the caller derives it from the plane).
 
     let strong_eligible = max_filter_length_p == 3 && max_filter_length_q == 3;
     if strong_eligible {
@@ -2197,8 +2216,9 @@ fn run_chroma_filter_v(
     }
 
     // Weak filter (eqs 1421 – 1423) — §8.8.3.6.10 palette
-    // substitution realised as per-side write skips.
-    for k in 0..2i32 {
+    // substitution realised as per-side write skips, over the
+    // segment's `k = 0..maxK` rows (eq. 1335).
+    for k in 0..=max_k {
         let p1 = read_clamped(plane, cx - 2, cy + k);
         let p0 = read_clamped(plane, cx - 1, cy + k);
         let q0 = read_clamped(plane, cx, cy + k);
@@ -2227,6 +2247,7 @@ fn run_chroma_filter_h(
     max_filter_length_q: u32,
     plt_p: bool,
     plt_q: bool,
+    max_k: i32,
 ) {
     if tc == 0 {
         return;
@@ -2243,7 +2264,7 @@ fn run_chroma_filter_h(
         return;
     }
     let bd = plane.bit_depth;
-    let max_k = 1i32;
+    // §8.8.3.6.5 eq. 1336 — maxK = (SubWidthC == 1) ? 3 : 1.
 
     // §8.8.3.6.4 / §8.8.3.6.10 — the strong path runs when
     // maxFilterLengthQ == 3; the P side is either 3 (symmetric
@@ -2264,7 +2285,7 @@ fn run_chroma_filter_h(
         }
     }
 
-    for k in 0..2i32 {
+    for k in 0..=max_k {
         let p1 = read_clamped(plane, cx + k, cy - 2);
         let p0 = read_clamped(plane, cx + k, cy - 1);
         let q0 = read_clamped(plane, cx + k, cy);
@@ -3045,5 +3066,40 @@ mod tests {
         assert_eq!(t.qp_offset(101), 1);
         assert_eq!(t.qp_offset(300), 1);
         assert_eq!(t.qp_offset(301), 3);
+    }
+
+    /// r456 — §8.8.3.6.5 eq. 1335: a chroma segment spans `maxK + 1`
+    /// rows along a vertical edge (3 + 1 when `SubHeightC == 1`, i.e.
+    /// 4:2:2 / 4:4:4; 1 + 1 for 4:2:0). The weak filter must cover
+    /// every row of the segment.
+    #[test]
+    fn chroma_weak_filter_covers_max_k_rows() {
+        fn step_plane() -> PicturePlane {
+            let mut p = PicturePlane::filled_bd(8, 8, 100, 8);
+            for y in 0..8 {
+                for x in 4..8 {
+                    p.set(x, y, 110).unwrap();
+                }
+            }
+            p
+        }
+        // bS = 2 keeps the (1, 1) edge on the weak path; tc = 5 does
+        // not clamp the eq. 1421 delta of 4.
+        let mut p = step_plane();
+        run_chroma_filter_v(&mut p, 1, 4, 0, 0, 5, 2, 1, 1, false, false, 1);
+        assert_eq!((p.get(3, 0), p.get(4, 0)), (Some(104), Some(106)));
+        assert_eq!((p.get(3, 1), p.get(4, 1)), (Some(104), Some(106)));
+        assert_eq!((p.get(3, 2), p.get(4, 2)), (Some(100), Some(110)));
+        assert_eq!((p.get(3, 3), p.get(4, 3)), (Some(100), Some(110)));
+        let mut p = step_plane();
+        run_chroma_filter_v(&mut p, 1, 4, 0, 0, 5, 2, 1, 1, false, false, 3);
+        for y in 0..4 {
+            assert_eq!(
+                (p.get(3, y), p.get(4, y)),
+                (Some(104), Some(106)),
+                "row {y}"
+            );
+        }
+        assert_eq!((p.get(3, 4), p.get(4, 4)), (Some(100), Some(110)));
     }
 }

@@ -1618,4 +1618,18 @@ mod tests {
         assert_eq!(ctx_inc_coeff_sign_flag_ts(-1, 0, false), 2);
         assert_eq!(ctx_inc_coeff_sign_flag_ts(-1, 0, true), 5);
     }
+
+    /// r456 — Table 131: `tu_cb_coded_flag` ctxInc is
+    /// `intra_bdpcm_chroma_flag`, `tu_cr_coded_flag` is 2 under
+    /// chroma BDPCM and `tu_cb_coded_flag` otherwise (the 4:4:4
+    /// single-tree parse desynced by reading both with ctx 0).
+    #[test]
+    fn tu_chroma_coded_flag_ctx_inc_follows_table_131() {
+        assert_eq!(ctx_inc_tu_cb_coded_flag(false), 0);
+        assert_eq!(ctx_inc_tu_cb_coded_flag(true), 1);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(false, false), 0);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(false, true), 1);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(true, false), 2);
+        assert_eq!(ctx_inc_tu_cr_coded_flag(true, true), 2);
+    }
 }

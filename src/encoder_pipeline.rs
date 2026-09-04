@@ -351,6 +351,8 @@ fn encoder_split_constraints(pic_w: u32, pic_h: u32, mtt_enabled: bool) -> Split
         min_cb_log2: 2,
         pic_w,
         pic_h,
+        sub_w: 2,
+        sub_h: 2,
     }
 }
 

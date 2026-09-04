@@ -109,6 +109,21 @@ impl ContextModel {
 /// §9.3.4.3). The input is the raw slice-data RBSP starting at the
 /// byte containing the first CABAC bit; callers are expected to have
 /// already advanced past the slice-header bits.
+/// r456 triage aid — bin-level CABAC trace (`H266_DBG_BINS=x,y` arms
+/// it for the CTB whose luma origin is `(x, y)`; see the walker).
+static BIN_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_bin_trace(on: bool) {
+    BIN_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+#[doc(hidden)]
+pub fn bin_trace_on() -> bool {
+    BIN_TRACE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct ArithDecoder<'a> {
     /// Source bytes (already emulation-prevention stripped).
     data: &'a [u8],
@@ -276,6 +291,16 @@ impl<'a> ArithDecoder<'a> {
     /// DecodeDecision (§9.3.4.3.2). Decodes a single contextual bin
     /// and updates the context's probability state.
     pub fn decode_decision(&mut self, ctx: &mut ContextModel) -> Result<u32> {
+        if bin_trace_on() {
+            let (p0, p1) = (ctx.p_state_idx0, ctx.p_state_idx1);
+            let v = self.decode_decision_inner(ctx)?;
+            eprintln!("BIN ctx=({p0},{p1}) -> {v}");
+            return Ok(v);
+        }
+        self.decode_decision_inner(ctx)
+    }
+
+    fn decode_decision_inner(&mut self, ctx: &mut ContextModel) -> Result<u32> {
         let q_range_idx = self.ivl_curr_range >> 5;
         let (val_mps, ivl_lps_range) = ctx.lps_range(q_range_idx);
         self.ivl_curr_range -= ivl_lps_range;
@@ -294,6 +319,14 @@ impl<'a> ArithDecoder<'a> {
 
     /// DecodeBypass (§9.3.4.3.4).
     pub fn decode_bypass(&mut self) -> Result<u32> {
+        let v = self.decode_bypass_inner()?;
+        if bin_trace_on() {
+            eprintln!("BYP -> {v}");
+        }
+        Ok(v)
+    }
+
+    fn decode_bypass_inner(&mut self) -> Result<u32> {
         let b = self.read_bit()?;
         self.ivl_offset = (self.ivl_offset << 1) | b;
         if self.ivl_offset >= self.ivl_curr_range {

@@ -42,6 +42,8 @@ fn main() {
     let mut dec = StreamDecoder::new();
     let r = dec.decode_annex_b(&bs, &mut |pic| {
         let (cx, cy, cw, ch) = pic.crop;
+        let (sw, sh) =
+            oxideav_h266::reconstruct::chroma_subsampling(u32::from(pic.chroma_format_idc));
         let wide = pic.bit_depth > 8;
         let plane_md5 = |p: &oxideav_h266::reconstruct::PicturePlane,
                          x0: usize,
@@ -62,8 +64,8 @@ fn main() {
         };
         let mut hashes = vec![plane_md5(&pic.frame.luma, cx, cy, cw, ch)];
         if pic.chroma_format_idc != 0 {
-            hashes.push(plane_md5(&pic.frame.cb, cx / 2, cy / 2, cw / 2, ch / 2));
-            hashes.push(plane_md5(&pic.frame.cr, cx / 2, cy / 2, cw / 2, ch / 2));
+            hashes.push(plane_md5(&pic.frame.cb, cx / sw, cy / sh, cw / sw, ch / sh));
+            hashes.push(plane_md5(&pic.frame.cr, cx / sw, cy / sh, cw / sw, ch / sh));
         }
         if pic.output_flag {
             outs.push((pic.cvs_idx, pic.poc, hashes));
@@ -71,8 +73,8 @@ fn main() {
                 let mut raw: Vec<u8> = Vec::new();
                 for (p, x0, y0, w, h) in [
                     (&pic.frame.luma, cx, cy, cw, ch),
-                    (&pic.frame.cb, cx / 2, cy / 2, cw / 2, ch / 2),
-                    (&pic.frame.cr, cx / 2, cy / 2, cw / 2, ch / 2),
+                    (&pic.frame.cb, cx / sw, cy / sh, cw / sw, ch / sh),
+                    (&pic.frame.cr, cx / sw, cy / sh, cw / sw, ch / sh),
                 ] {
                     for y in y0..y0 + h {
                         for &v in &p.samples[y * p.stride + x0..y * p.stride + x0 + w] {

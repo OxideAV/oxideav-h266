@@ -1223,6 +1223,34 @@ struct IbcState {
     hmvp: crate::ibc::HmvpIbcList,
 }
 
+/// r456 — §8.5.5.3 eqs. 876 – 879: the luma MV feeding the chroma
+/// motion vector of luma sub-block `(gx, gy)`: the sub-block's own MV
+/// when both `SubWidthC` and `SubHeightC` are 1, else the eq. 878 /
+/// 879 rounded average of the group's first and last sub-block
+/// (`x >> (SubWidthC − 1) << (SubWidthC − 1)` and `+ (SubWidthC − 1)`,
+/// likewise vertically).
+fn affine_chroma_group_mv(
+    grid: &crate::affine::SubblockMvGrid,
+    gx: u32,
+    gy: u32,
+    sub_w: u32,
+    sub_h: u32,
+) -> MotionVector {
+    if sub_w == 1 && sub_h == 1 {
+        return grid.mv_at(gx, gy);
+    }
+    let ax = (gx >> (sub_w - 1)) << (sub_w - 1);
+    let ay = (gy >> (sub_h - 1)) << (sub_h - 1);
+    let bx = (ax + (sub_w - 1)).min(grid.num_sb_x - 1);
+    let by = (ay + (sub_h - 1)).min(grid.num_sb_y - 1);
+    let a = grid.mv_at(ax, ay);
+    let b = grid.mv_at(bx, by);
+    MotionVector {
+        x: round_half_toward_zero_div2(a.x + b.x),
+        y: round_half_toward_zero_div2(a.y + b.y),
+    }
+}
+
 /// r456 — §7.4.8 eq. 114: the subpicture boundary positions of the
 /// slice's `CurrSubpicIdx` when `sps_subpic_treated_as_pic_flag` is
 /// set and the SPS carries more than one subpicture (the §8.5.6.3.2
@@ -1462,10 +1490,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             subset_idx: 0,
             intra_luma_mode_grid: vec![INTRA_PLANAR as u8; (intra_grid_w * intra_grid_h) as usize],
             avail_luma: vec![false; (layout.pic_width_luma * layout.pic_height_luma) as usize],
-            avail_chroma: vec![
-                false;
-                ((layout.pic_width_luma / 2) * (layout.pic_height_luma / 2)) as usize
-            ],
+            avail_chroma: {
+                let (sw, sh) =
+                    crate::reconstruct::chroma_subsampling(sps.sps_chroma_format_idc as u32);
+                vec![
+                    false;
+                    (layout.pic_width_luma as usize / sw) * (layout.pic_height_luma as usize / sh)
+                ]
+            },
             alf_syntax_cfg: None,
             alf_ctxs: None,
         })
@@ -1633,11 +1665,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
     }
 
-    /// r412 — eq. 1212 for the chroma planes (4:2:0 chroma
+    /// r412 — eq. 1212 for the chroma planes (chroma-sample
     /// coordinates; Cb and Cr are reconstructed together).
     pub fn mark_reconstructed_chroma(&mut self, cx: u32, cy: u32, cw: u32, ch: u32) {
-        let pw = (self.layout.pic_width_luma / 2) as usize;
-        let ph = (self.layout.pic_height_luma / 2) as usize;
+        let (pw, ph) = self.chroma_plane_dims();
         for yy in (cy as usize)..((cy + ch) as usize).min(ph) {
             for xx in (cx as usize)..((cx + cw) as usize).min(pw) {
                 self.avail_chroma[yy * pw + xx] = true;
@@ -1646,11 +1677,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     }
 
     /// r412 — convenience: mark a luma rectangle plus its collocated
-    /// 4:2:0 chroma rectangle reconstructed.
+    /// chroma rectangle reconstructed.
     pub fn mark_reconstructed_rect(&mut self, x: u32, y: u32, w: u32, h: u32) {
         self.mark_reconstructed_luma(x, y, w, h);
-        if self.sps.sps_chroma_format_idc == 1 {
-            self.mark_reconstructed_chroma(x / 2, y / 2, w.div_ceil(2), h.div_ceil(2));
+        if self.sps.sps_chroma_format_idc != 0 {
+            let (sw, sh) = self.sub_wh();
+            self.mark_reconstructed_chroma(x / sw, y / sh, w.div_ceil(sw), h.div_ceil(sh));
         }
     }
 
@@ -2038,13 +2070,35 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         )
     }
 
-    /// r429 — [`Self::region_bounds_i32`] at 4:2:0 chroma resolution
-    /// (tile boundaries and the WPP column cap are CTB-aligned, hence
-    /// even in luma samples, so the halving is exact).
+    /// r456 — §6.2 Table 2 `(SubWidthC, SubHeightC)` of the active
+    /// SPS (4:2:0 = (2, 2), 4:2:2 = (2, 1), 4:4:4 = (1, 1)).
+    #[inline]
+    fn sub_wh(&self) -> (u32, u32) {
+        let (w, h) = crate::reconstruct::chroma_subsampling(self.sps.sps_chroma_format_idc as u32);
+        (w as u32, h as u32)
+    }
+
+    /// r456 — the chroma plane dimensions `(pic_width_luma / SubWidthC,
+    /// pic_height_luma / SubHeightC)`.
+    #[inline]
+    fn chroma_plane_dims(&self) -> (usize, usize) {
+        let (sw, sh) = self.sub_wh();
+        (
+            (self.layout.pic_width_luma / sw) as usize,
+            (self.layout.pic_height_luma / sh) as usize,
+        )
+    }
+
+    /// r429 — [`Self::region_bounds_i32`] at chroma resolution (tile
+    /// boundaries and the WPP column cap are CTB-aligned, hence
+    /// multiples of `SubWidthC` / `SubHeightC` in luma samples, so the
+    /// division is exact).
     #[inline]
     fn region_bounds_chroma_i32(&self) -> (i32, i32, i32, i32, i32) {
         let (rx0, ry0, rx1, ry1, rcap) = self.region_bounds_i32();
-        (rx0 / 2, ry0 / 2, rx1 / 2, ry1 / 2, rcap / 2)
+        let (sw, sh) = self.sub_wh();
+        let (sw, sh) = (sw as i32, sh as i32);
+        (rx0 / sw, ry0 / sh, rx1 / sw, ry1 / sh, rcap / sw)
     }
 
     /// r429 — [`Self::nb_in_region`] for a chroma-resolution sample
@@ -2834,6 +2888,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         l1: Option<(&crate::affine::AffineCpmvs, &ReferencePicture, i32)>,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         use crate::affine::{predict_luma_block_affine_prof_hp, AffineLumaFilterSet};
         let tables = self
             .explicit_wp
@@ -2875,7 +2930,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bd,
         )?;
         Self::write_pred_block(&mut out.luma, cb_x, cb_y, cb_w, cb_h, &pb);
-        if self.sps.sps_chroma_format_idc != 1 {
+        if self.sps.sps_chroma_format_idc == 0 {
             return Ok(());
         }
         let c0 = match l0 {
@@ -2890,8 +2945,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             None => None,
         };
-        let cw = cb_w / 2;
-        let ch = cb_h / 2;
+        let cw = cb_w / sw;
+        let ch = cb_h / sh;
         fn pick(c: &Option<(Vec<i32>, Vec<i32>)>, c_idx: u32) -> Option<&[i32]> {
             c.as_ref().map(|(cb, cr)| {
                 if c_idx == 1 {
@@ -2935,6 +2990,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         l0: Option<(&ReferencePicture, MotionVector)>,
         l1: Option<(&ReferencePicture, MotionVector)>,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         let tables = self
             .explicit_wp
             .as_ref()
@@ -2972,7 +3028,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bd,
         )?;
         Self::write_pred_block(&mut out.luma, bx, by, sb_w, sb_h, &pb);
-        if self.sps.sps_chroma_format_idc != 1 {
+        if self.sps.sps_chroma_format_idc == 0 {
             return Ok(());
         }
         fn plane_of(rp: &ReferencePicture, c_idx: u32) -> &PicturePlane {
@@ -2986,10 +3042,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let hpc = |l: Option<(&ReferencePicture, MotionVector)>| -> Result<Option<Vec<i32>>> {
                 match l {
                     Some((rp, mv)) => Ok(Some(crate::inter::predict_chroma_block_high_precision(
-                        bx / 2,
-                        by / 2,
-                        sb_w / 2,
-                        sb_h / 2,
+                        bx / sw,
+                        by / sh,
+                        sb_w / sw,
+                        sb_h / sh,
                         plane_of(rp, c_idx),
                         mv,
                         bd,
@@ -3000,8 +3056,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let c0 = hpc(l0)?;
             let c1 = hpc(l1)?;
             let pb = crate::inter::explicit_weighted_sample_pred(
-                (sb_w / 2) as usize,
-                (sb_h / 2) as usize,
+                (sb_w / sw) as usize,
+                (sb_h / sh) as usize,
                 c0.as_deref(),
                 c1.as_deref(),
                 l0.is_some(),
@@ -3012,7 +3068,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 bd,
             )?;
             let plane = if c_idx == 1 { &mut out.cb } else { &mut out.cr };
-            Self::write_pred_block(plane, bx / 2, by / 2, sb_w / 2, sb_h / 2, &pb);
+            Self::write_pred_block(plane, bx / sw, by / sh, sb_w / sw, sb_h / sh, &pb);
         }
         Ok(())
     }
@@ -3448,6 +3504,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         tree: TreeType,
         mode_type: u8,
     ) -> Result<(LeafCuInfo, LeafCuResidual)> {
+        if crate::cabac::bin_trace_on() {
+            eprintln!(
+                "LEAF ({},{}) {}x{} {tree:?} modeType={mode_type}",
+                cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h
+            );
+        }
         let mut tools = self.cu_tool_flags();
         // r418 — §7.3.11.4 quantization-group state: a CU whose QG
         // already carried `cu_qp_delta_abs` must not read another one
@@ -4854,6 +4916,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.layout.pic_width_luma,
                 self.layout.pic_height_luma,
             )
+            .with_chroma_format(self.sps.sps_chroma_format_idc as u32)
         };
         let pic_w = self.layout.pic_width_luma;
         let pic_h = self.layout.pic_height_luma;
@@ -5315,11 +5378,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.transform_skip_cr,
             );
         }
-        if self.sps.sps_chroma_format_idc != 1 {
-            return Err(Error::unsupported(
-                "h266 dual-tree chroma reconstruction: only 4:2:0 is walked",
-            ));
-        }
         // r431 — a chroma-tree palette CU writes its planes directly
         // (§8.4.5.3); no intra prediction / residual path applies.
         if matches!(info.pred_mode, CuPredMode::Plt) {
@@ -5396,11 +5454,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             )?;
         }
         // §8.7.5.1 eq. 1212 — chroma-tree CUs mark the chroma planes.
+        let (sw, sh) = self.sub_wh();
         self.mark_reconstructed_chroma(
-            cu.cu.x / 2,
-            cu.cu.y / 2,
-            cu.cu.w.div_ceil(2),
-            cu.cu.h.div_ceil(2),
+            cu.cu.x / sw,
+            cu.cu.y / sh,
+            cu.cu.w.div_ceil(sw),
+            cu.cu.h.div_ceil(sh),
         );
         // §8.8.3.2 — chroma-edge record for the §8.8 deblock pass
         // (chroma-tree geometry, in luma coordinates). QpY of a
@@ -5490,7 +5549,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 },
             );
         }
-        if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
+        if self.sps.sps_chroma_format_idc != 0 && tree != TreeType::DualTreeLuma {
             for c_idx in 1..=2u32 {
                 // §7.4.10.6 eqs. 193 / 194 + §8.7.1 eqs. 1147 / 1148.
                 let cu_offset = cu_chroma_qp_offset(
@@ -5510,14 +5569,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 );
                 let qp_prime_c =
                     chroma_qp_mapped(self.sps, c_idx as usize - 1, qp_y, qp_offset) + qp_bd_offset;
-                let (cx0, cy0) = (x0 / 2, y0 / 2);
+                let (sw, sh) = self.sub_wh();
+                let (cx0, cy0) = (x0 / sw, y0 / sh);
                 let plane = if c_idx == 1 { &mut out.cb } else { &mut out.cr };
                 let (stride, pw, ph) = (plane.stride, plane.width, plane.height);
                 pcu.reconstruct_component(
                     p,
                     c_idx as usize,
-                    cu.cu.w / 2,
-                    cu.cu.h / 2,
+                    cu.cu.w / sw,
+                    cu.cu.h / sh,
                     qp_prime_c,
                     qp_prime_ts_min,
                     |x, y, s| {
@@ -5534,11 +5594,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // §8.7.5.1 eq. 1212 — chroma-tree CUs mark the chroma
             // planes (the dual-chroma caller does not run the shared
             // epilogue).
+            let (sw, sh) = self.sub_wh();
             self.mark_reconstructed_chroma(
-                x0 / 2,
-                y0 / 2,
-                cu.cu.w.div_ceil(2),
-                cu.cu.h.div_ceil(2),
+                x0 / sw,
+                y0 / sh,
+                cu.cu.w.div_ceil(sw),
+                cu.cu.h.div_ceil(sh),
             );
             // §8.8.3.2 — chroma-tree edge record (palette CU: no coded
             // TBs, writes suppressed on the palette side).
@@ -5658,7 +5719,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // never stored left the region's chroma stale
                 // (IBC_A_2's 12-picture Cb / Cr divergence).
                 self.ibc_store_cu_planes(cu, out, false, true);
-                self.mark_reconstructed_chroma(cu.cu.x / 2, cu.cu.y / 2, cu.cu.w / 2, cu.cu.h / 2);
+                let (sw, sh) = self.sub_wh();
+                self.mark_reconstructed_chroma(
+                    cu.cu.x / sw,
+                    cu.cu.y / sh,
+                    cu.cu.w / sw,
+                    cu.cu.h / sh,
+                );
                 return Ok(());
             }
             TreeType::DualTreeLuma => {
@@ -5719,7 +5786,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         include_luma: bool,
         include_chroma: bool,
     ) {
-        let chroma_420 = include_chroma && self.sps.sps_chroma_format_idc == 1;
+        let chroma_420 = include_chroma && self.sps.sps_chroma_format_idc != 0;
+        let (sw, sh) = self.sub_wh();
         let Some(ibc) = self.ibc.as_mut() else {
             return;
         };
@@ -5736,7 +5804,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             });
         }
         if chroma_420 {
-            let (cx, cy, cw, ch) = (x / 2, y / 2, w / 2, h / 2);
+            let (cx, cy, cw, ch) = (x / sw, y / sh, w / sw, h / sh);
             if cw > 0 && ch > 0 {
                 let pcb = &out.cb;
                 ibc.virbuf.store_region(1, cx, cy, cw, ch, |dx, dy| {
@@ -5837,7 +5905,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // Fall through to the chroma + bookkeeping passes below.
             // The luma plane is fully written by the ISP walker so the
             // single-TB luma block (steps 1 – 5) is skipped.
-            if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
+            if self.sps.sps_chroma_format_idc != 0 && tree != TreeType::DualTreeLuma {
                 if info.tu_c_res_mode != 0 {
                     // §8.7.2 joint Cb-Cr (intra): predictions first,
                     // then both residuals from the single coded TB.
@@ -6211,7 +6279,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // luma, just at half spatial resolution and with the §8.4.3
         // chroma intra-mode mapping already baked into
         // `info.intra_pred_mode_c`.
-        if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
+        if self.sps.sps_chroma_format_idc != 0 && tree != TreeType::DualTreeLuma {
             if info.tu_c_res_mode != 0 {
                 // §8.7.2 joint Cb-Cr (intra): predictions first, then
                 // both residuals from the single coded TB.
@@ -6430,6 +6498,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         info.inter.general_merge_flag
                     );
                 }
+                // `H266_DBG_LENIENT` — triage aid: leave the CU
+                // unpredicted and keep decoding so the rest of the
+                // picture can be diffed against an oracle.
+                if std::env::var_os("H266_DBG_LENIENT").is_some() {
+                    return Ok(());
+                }
                 return Err(Error::invalid(format!(
                     "h266 IBC: block vector ({}, {}) at CU ({x_cb}, {y_cb}) {cb_w}x{cb_h} \
                      violates the §8.6.2.1 reference-region constraints",
@@ -6451,13 +6525,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     out.luma.samples[idx] = v as u16;
                 }
             }
-            if self.sps.sps_chroma_format_idc == 1 && tree != TreeType::DualTreeLuma {
+            if self.sps.sps_chroma_format_idc != 0 && tree != TreeType::DualTreeLuma {
                 // §8.6.2.5 — chroma block vector (1/32 chroma units).
                 // On the DUAL_TREE_LUMA walk the CU has no chroma —
                 // this area's chroma CBs live in the sibling
                 // DUAL_TREE_CHROMA coding tree (§7.3.11.2, r409).
-                let bv_c = crate::ibc::derive_chroma_bv(bv, 2, 2);
-                let (cx, cy, cw, ch) = (x_cb / 2, y_cb / 2, cb_w / 2, cb_h / 2);
+                let (sw, sh) = self.sub_wh();
+                let bv_c = crate::ibc::derive_chroma_bv(bv, sw, sh);
+                let (cx, cy, cw, ch) = (x_cb / sw, y_cb / sh, cb_w / sw, cb_h / sh);
                 for dy in 0..ch {
                     for dx in 0..cw {
                         let vcb = ibc.virbuf.chroma_at(1, cx + dx, cy + dy, bv_c)?;
@@ -6543,7 +6618,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 "INTER ({},{}) {}x{} merge={} skip={} sb={} sbIdx={} gpm={} ciip={} mmvd={} \
                  idx={} affine={} type6={} dir={:?} ref=({},{}) mvpF=({},{}) \
                  mvd0=({},{}) cp1=({},{}) cp2=({},{}) mvd1=({},{}) cp1'=({},{}) cp2'=({},{}) \
-                 amvr={:?} bcw={}",
+                 amvr={:?} bcw={} gpm=({},{},{})",
                 cu.cu.x,
                 cu.cu.y,
                 cu.cu.w,
@@ -6577,6 +6652,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 nm.mvd_cp2_l1.y,
                 nm.amvr_shift,
                 nm.bcw_idx,
+                md.gpm_partition_idx,
+                md.gpm_idx0,
+                md.gpm_idx1,
             );
         }
         // §8.5.2.1 — when `general_merge_flag == 0` the CU's motion is
@@ -6637,8 +6715,31 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp), num_ref_idx)
         };
         if std::env::var_os("H266_DBG_MERGE").is_some() {
+            let raw = |x: i32, y: i32| {
+                let f = self.motion_field.get_at_luma(x, y);
+                (
+                    x,
+                    y,
+                    f.available,
+                    f.mode_inter,
+                    f.mv_l0,
+                    f.ref_idx_l0,
+                    f.pred_flag_l0,
+                    f.mv_l1,
+                    f.ref_idx_l1,
+                    f.pred_flag_l1,
+                )
+            };
             eprintln!(
-                "MERGE ({xcb},{ycb}) {cb_w}x{cb_h} idx={} spatial={:?} col={:?} list={:?}",
+                "MERGE-RAW ({xcb},{ycb}) A1={:?} B1={:?} B0={:?} A0={:?} B2={:?}",
+                raw(xcb - 1, ycb + cb_h - 1),
+                raw(xcb + cb_w - 1, ycb - 1),
+                raw(xcb + cb_w, ycb - 1),
+                raw(xcb - 1, ycb + cb_h),
+                raw(xcb - 1, ycb - 1)
+            );
+            eprintln!(
+                "MERGE ({xcb},{ycb}) {cb_w}x{cb_h} idx={} spatial={:?} col={:?} list={:?} hmvp={:?}",
                 info.inter.merge_data.merge_idx,
                 spatial
                     .iter()
@@ -6668,6 +6769,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         f.pred_flag_l1
                     ))
                     .collect::<Vec<_>>(),
+                self.hmvp.entries.iter().map(|f| (f.mv_l0, f.ref_idx_l0, f.pred_flag_l0, f.mv_l1, f.ref_idx_l1, f.pred_flag_l1)).collect::<Vec<_>>(),
             );
         }
         // Round-40 §8.5.4 + §8.5.7 — Geometric Partitioning Mode (GPM).
@@ -6799,6 +6901,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         chosen: MvField,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         if !chosen.pred_flag_l0 && !chosen.pred_flag_l1 {
             return Err(Error::invalid(
                 "h266 inter: chosen merge candidate has both predFlags == 0; \
@@ -6973,7 +7076,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     // bottom-edge 16x8 / 8x16 DMVR CUs).
                     let sb_w = cu.cu.w / num_sb_x;
                     let sb_h = cu.cu.h / num_sb_y;
-                    let chroma = self.sps.sps_chroma_format_idc == 1;
+                    let chroma = self.sps.sps_chroma_format_idc != 0;
                     let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
                     // §8.5.6.5 bdofUsedFlag — every DMVR gate bullet that
                     // overlaps (bi-pred, symmetric STRP POC bracket,
@@ -7125,10 +7228,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                             if chroma {
                                 let cb_hp_l0 =
                                     crate::inter::predict_chroma_block_high_precision_dmvr(
-                                        x / 2,
-                                        y / 2,
-                                        sb_w / 2,
-                                        sb_h / 2,
+                                        x / sw,
+                                        y / sh,
+                                        sb_w / sw,
+                                        sb_h / sh,
                                         &rp0.frame.cb,
                                         chosen.mv_l0,
                                         refined.mv_l0_refined,
@@ -7136,10 +7239,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                     )?;
                                 let cb_hp_l1 =
                                     crate::inter::predict_chroma_block_high_precision_dmvr(
-                                        x / 2,
-                                        y / 2,
-                                        sb_w / 2,
-                                        sb_h / 2,
+                                        x / sw,
+                                        y / sh,
+                                        sb_w / sw,
+                                        sb_h / sh,
                                         &rp1.frame.cb,
                                         chosen.mv_l1,
                                         refined.mv_l1_refined,
@@ -7147,10 +7250,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                     )?;
                                 let cr_hp_l0 =
                                     crate::inter::predict_chroma_block_high_precision_dmvr(
-                                        x / 2,
-                                        y / 2,
-                                        sb_w / 2,
-                                        sb_h / 2,
+                                        x / sw,
+                                        y / sh,
+                                        sb_w / sw,
+                                        sb_h / sh,
                                         &rp0.frame.cr,
                                         chosen.mv_l0,
                                         refined.mv_l0_refined,
@@ -7158,10 +7261,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                     )?;
                                 let cr_hp_l1 =
                                     crate::inter::predict_chroma_block_high_precision_dmvr(
-                                        x / 2,
-                                        y / 2,
-                                        sb_w / 2,
-                                        sb_h / 2,
+                                        x / sw,
+                                        y / sh,
+                                        sb_w / sw,
+                                        sb_h / sh,
                                         &rp1.frame.cr,
                                         chosen.mv_l1,
                                         refined.mv_l1_refined,
@@ -7169,10 +7272,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                     )?;
                                 crate::inter::blend_bi_hp_into(
                                     &mut out.cb,
-                                    x / 2,
-                                    y / 2,
-                                    sb_w / 2,
-                                    sb_h / 2,
+                                    x / sw,
+                                    y / sh,
+                                    sb_w / sw,
+                                    sb_h / sh,
                                     &cb_hp_l0,
                                     &cb_hp_l1,
                                     0,
@@ -7180,10 +7283,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 );
                                 crate::inter::blend_bi_hp_into(
                                     &mut out.cr,
-                                    x / 2,
-                                    y / 2,
-                                    sb_w / 2,
-                                    sb_h / 2,
+                                    x / sw,
+                                    y / sh,
+                                    sb_w / sw,
+                                    sb_h / sh,
                                     &cr_hp_l0,
                                     &cr_hp_l1,
                                     0,
@@ -7525,12 +7628,13 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             );
         }
 
-        // ---- Chroma MC for 4:2:0 -----------------------------------------
-        if self.sps.sps_chroma_format_idc == 1 {
-            let cb_w_c = cu.cu.w / 2;
-            let cb_h_c = cu.cu.h / 2;
-            let cb_x_c = cu.cu.x / 2;
-            let cb_y_c = cu.cu.y / 2;
+        // ---- Chroma MC ----------------------------------------------------
+        if self.sps.sps_chroma_format_idc != 0 {
+            let (sw, sh) = self.sub_wh();
+            let cb_w_c = cu.cu.w / sw;
+            let cb_h_c = cu.cu.h / sh;
+            let cb_x_c = cu.cu.x / sw;
+            let cb_y_c = cu.cu.y / sh;
             // Round-28 §8.5.6.7 — capture the planar chroma intra
             // prediction *before* the chroma MC overwrites the CU
             // rectangle. The §8.4.5.2.11 planar predictor is the same
@@ -7549,8 +7653,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // §8.5.6.7 chroma intra parts run the same §8.4.5.2.6
                 // pipeline (PLANAR + PDPC) against the chroma-plane
                 // §6.4.4 decode-order availability mask.
-                let cw = (self.layout.pic_width_luma / 2) as i32;
-                let chh = (self.layout.pic_height_luma / 2) as i32;
+                let (cw, chh) = self.chroma_plane_dims();
+                let (cw, chh) = (cw as i32, chh as i32);
                 let avail = &self.avail_chroma;
                 let (x0i, y0i) = (cb_x_c as i32, cb_y_c as i32);
                 let params_c = IntraPredParams {
@@ -7888,6 +7992,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         }
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let cu_qp_delta = info.cu_qp_delta_val;
+        // `H266_DBG_SKIP=<pic>,res` — triage aid: leave every inter CU of
+        // one picture at its prediction (no residual add).
+        if crate::deblock::dbg_skip_stage_recon("res") {
+            return Ok(());
+        }
         // r443 — §7.3.11.9 multi-TB tiling: per-TU residual adds (each
         // ≤MaxTbSizeY leaf carries its own CBFs / joint-CbCr mode /
         // chroma TBs at its own offset).
@@ -7988,7 +8097,9 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 )?;
             }
         }
-        if self.sps.sps_chroma_format_idc == 1 {
+        if self.sps.sps_chroma_format_idc != 0 {
+            let (sw, sh) = self.sub_wh();
+            let (sw, sh) = (sw as usize, sh as usize);
             // r449 — an SBT CU's chroma residual lives in the residual
             // sub-TU's chroma rect (§7.3.11.9), not the CU rect.
             let (c_x, c_y, c_w, c_h) = if info.cu_sbt_flag {
@@ -8000,17 +8111,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     info.cu_sbt_pos_flag,
                 );
                 (
-                    ((cu.cu.x + geo.res_x) as usize) / 2,
-                    ((cu.cu.y + geo.res_y) as usize) / 2,
-                    (geo.res_w as usize) / 2,
-                    (geo.res_h as usize) / 2,
+                    ((cu.cu.x + geo.res_x) as usize) / sw,
+                    ((cu.cu.y + geo.res_y) as usize) / sh,
+                    (geo.res_w as usize) / sw,
+                    (geo.res_h as usize) / sh,
                 )
             } else {
                 (
-                    (cu.cu.x as usize) / 2,
-                    (cu.cu.y as usize) / 2,
-                    (cu.cu.w as usize) / 2,
-                    (cu.cu.h as usize) / 2,
+                    (cu.cu.x as usize) / sw,
+                    (cu.cu.y as usize) / sh,
+                    (cu.cu.w as usize) / sw,
+                    (cu.cu.h as usize) / sh,
                 )
             };
             // §8.7.5.3 — chroma residual scaling `varScale` for this
@@ -8128,7 +8239,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<()> {
         let cu_qp_delta = info.cu_qp_delta_val;
-        let chroma = self.sps.sps_chroma_format_idc == 1;
+        let chroma = self.sps.sps_chroma_format_idc != 0;
         let lmcs_cvs = if chroma {
             self.lmcs_chroma_var_scale_for_cu(cu, out)
         } else {
@@ -8179,7 +8290,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             if !chroma {
                 continue;
             }
-            let (c_x, c_y, c_w, c_h) = (x0 / 2, y0 / 2, (tu.w / 2) as usize, (tu.h / 2) as usize);
+            let (sw, sh) = self.sub_wh();
+            let (sw_u, sh_u) = (sw as usize, sh as usize);
+            let (c_x, c_y, c_w, c_h) = (
+                x0 / sw_u,
+                y0 / sh_u,
+                (tu.w / sw) as usize,
+                (tu.h / sh) as usize,
+            );
             if tu.tu_c_res_mode != 0 {
                 // §8.7.2 joint Cb-Cr — one coded TB for both chroma
                 // residuals of THIS TU.
@@ -8463,6 +8581,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ref_pic: &ReferencePicture,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         // Uni-pred: affine MC for the single list writes straight into
         // the output picture at the CU's picture-absolute offset.
         self.predict_affine_one_list(
@@ -8476,8 +8595,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             cb_y,
             &mut out.cb,
             &mut out.cr,
-            cb_x / 2,
-            cb_y / 2,
+            cb_x / sw,
+            cb_y / sh,
         )
     }
 
@@ -8526,9 +8645,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         bcw_idx: u8,
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         use crate::affine::{predict_luma_block_affine_prof_hp, AffineLumaFilterSet};
         use crate::inter::blend_bi_hp_into;
-        let chroma = self.sps.sps_chroma_format_idc == 1;
+        let chroma = self.sps.sps_chroma_format_idc != 0;
         let bd = out.luma.bit_depth;
 
         // r447 — §8.5.6.6.2 composes the HIGH-PRECISION per-list
@@ -8598,12 +8718,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l0, ref_pic_l0, true)?;
             let (cb_hp_l1, cr_hp_l1) =
                 self.predict_affine_chroma_hp(cb_x, cb_y, cb_w, cb_h, cpmvs_l1, ref_pic_l1, true)?;
-            let cw = cb_w / 2;
-            let ch = cb_h / 2;
+            let cw = cb_w / sw;
+            let ch = cb_h / sh;
             blend_bi_hp_into(
                 &mut out.cb,
-                cb_x / 2,
-                cb_y / 2,
+                cb_x / sw,
+                cb_y / sh,
                 cw,
                 ch,
                 &cb_hp_l0,
@@ -8613,8 +8733,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             );
             blend_bi_hp_into(
                 &mut out.cr,
-                cb_x / 2,
-                cb_y / 2,
+                cb_x / sw,
+                cb_y / sh,
                 cw,
                 ch,
                 &cr_hp_l0,
@@ -8641,36 +8761,27 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ref_pic: &ReferencePicture,
         bipred: bool,
     ) -> Result<(Vec<i32>, Vec<i32>)> {
+        let (sw, sh) = self.sub_wh();
         use crate::affine::derive_subblock_mvs;
         use crate::inter::predict_chroma_block_high_precision;
         let bd = ref_pic.frame.luma.bit_depth;
         let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, bipred)?;
         let sb_w = cb_w / grid.num_sb_x;
         let sb_h = cb_h / grid.num_sb_y;
-        let cw = (cb_w / 2) as usize;
-        let chh = (cb_h / 2) as usize;
+        let cw = (cb_w / sw) as usize;
+        let chh = (cb_h / sh) as usize;
         let mut out_cb = vec![0i32; cw * chh];
         let mut out_cr = vec![0i32; cw * chh];
-        let mut gy = 0u32;
-        while gy < grid.num_sb_y {
-            let mut gx = 0u32;
-            while gx < grid.num_sb_x {
-                let tl = grid.mv_at(gx, gy);
-                let br_x = (gx + 1).min(grid.num_sb_x - 1);
-                let br_y = (gy + 1).min(grid.num_sb_y - 1);
-                let br = grid.mv_at(br_x, br_y);
-                let avg = MotionVector {
-                    x: round_half_toward_zero_div2(tl.x + br.x),
-                    y: round_half_toward_zero_div2(tl.y + br.y),
-                };
-                // Each 2×2 group of luma sub-blocks covers an
-                // (sb_w × sb_h)-CHROMA-sample block (8×8 luma → 4×4
-                // chroma at the typical sb = 4), mirroring the plane
-                // variant in `predict_affine_one_list`.
-                let c_w = sb_w;
-                let c_h = sb_h;
-                let c_sb_x = cb_x / 2 + (gx * sb_w) / 2;
-                let c_sb_y = cb_y / 2 + (gy * sb_h) / 2;
+        for gy in 0..grid.num_sb_y {
+            for gx in 0..grid.num_sb_x {
+                // §8.5.5.3 eqs. 876 – 879 per luma sub-block (see
+                // `affine_chroma_group_mv`); the chroma block is the
+                // sub-block's footprint at chroma resolution.
+                let avg = affine_chroma_group_mv(&grid, gx, gy, sw, sh);
+                let c_w = sb_w / sw;
+                let c_h = sb_h / sh;
+                let c_sb_x = cb_x / sw + (gx * sb_w) / sw;
+                let c_sb_y = cb_y / sh + (gy * sb_h) / sh;
                 let hp_cb = predict_chroma_block_high_precision(
                     c_sb_x,
                     c_sb_y,
@@ -8689,17 +8800,15 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     avg,
                     bd,
                 )?;
-                let loc_x = ((gx * sb_w) / 2) as usize;
-                let loc_y = ((gy * sb_h) / 2) as usize;
+                let loc_x = ((gx * sb_w) / sw) as usize;
+                let loc_y = ((gy * sb_h) / sh) as usize;
                 for r in 0..c_h as usize {
                     for c in 0..c_w as usize {
                         out_cb[(loc_y + r) * cw + loc_x + c] = hp_cb[r * c_w as usize + c];
                         out_cr[(loc_y + r) * cw + loc_x + c] = hp_cr[r * c_w as usize + c];
                     }
                 }
-                gx += 2;
             }
-            gy += 2;
         }
         Ok((out_cb, out_cr))
     }
@@ -9581,7 +9690,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let par = self.log2_par_mrg_level;
         for &(xnb, ynb) in positions {
             let nb = self.motion_field.get_at_luma(xnb, ynb);
-            if !nb.available {
+            // §8.5.5.2 invokes the §6.4.4 availability process with
+            // `checkPredModeY = TRUE`, so a neighbour that is not
+            // MODE_INTER (intra, IBC, palette) is *unavailable* and the
+            // cascade moves on to the next position — it must not
+            // claim the corner with empty prediction flags (r456
+            // 8b444_A_2: an IBC B3 masked the A2 corner and starved
+            // every constructed candidate out of the sub-block list).
+            if !nb.available || !nb.mode_inter {
                 continue;
             }
             // §8.5.5.2 parallel-merge-level suppression (eq. 60).
@@ -10201,24 +10317,25 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ref_frame: &PictureBuffer,
         mv: MotionVector,
     ) -> Result<()> {
-        if self.sps.sps_chroma_format_idc != 1 {
+        let (sw, sh) = self.sub_wh();
+        if self.sps.sps_chroma_format_idc == 0 {
             return Ok(());
         }
         crate::inter::predict_chroma_block(
             &mut out.cb,
-            bx / 2,
-            by / 2,
-            sb_w / 2,
-            sb_h / 2,
+            bx / sw,
+            by / sh,
+            sb_w / sw,
+            sb_h / sh,
             &ref_frame.cb,
             mv,
         )?;
         crate::inter::predict_chroma_block(
             &mut out.cr,
-            bx / 2,
-            by / 2,
-            sb_w / 2,
-            sb_h / 2,
+            bx / sw,
+            by / sh,
+            sb_w / sw,
+            sb_h / sh,
             &ref_frame.cr,
             mv,
         )?;
@@ -10240,15 +10357,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         ref_l1: &PictureBuffer,
         mv_l1: MotionVector,
     ) -> Result<()> {
-        if self.sps.sps_chroma_format_idc != 1 {
+        let (sw, sh) = self.sub_wh();
+        if self.sps.sps_chroma_format_idc == 0 {
             return Ok(());
         }
         crate::inter::predict_chroma_block_bipred(
             &mut out.cb,
-            bx / 2,
-            by / 2,
-            sb_w / 2,
-            sb_h / 2,
+            bx / sw,
+            by / sh,
+            sb_w / sw,
+            sb_h / sh,
             &ref_l0.cb,
             mv_l0,
             &ref_l1.cb,
@@ -10256,10 +10374,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         )?;
         crate::inter::predict_chroma_block_bipred(
             &mut out.cr,
-            bx / 2,
-            by / 2,
-            sb_w / 2,
-            sb_h / 2,
+            bx / sw,
+            by / sh,
+            sb_w / sw,
+            sb_h / sh,
             &ref_l0.cr,
             mv_l0,
             &ref_l1.cr,
@@ -10681,6 +10799,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         c_dst_x: u32,
         c_dst_y: u32,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         use crate::affine::{
             derive_subblock_mvs, predict_luma_block_affine_prof, AffineLumaFilterSet,
         };
@@ -10702,35 +10821,24 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             /*rpr_constraints_active=*/ false,
         )?;
 
-        if self.sps.sps_chroma_format_idc != 1 {
+        if self.sps.sps_chroma_format_idc == 0 {
             return Ok(());
         }
-        // §8.5.5.3 eqs. 876 – 879 — average the top-left + bottom-right
-        // luma sub-block MVs of each 2×2 group into the chroma MV.
+        // §8.5.5.3 eqs. 876 – 879 — per luma sub-block, the chroma MV is
+        // the sub-block's own MV (4:4:4) or the rounded average of the
+        // SubWidthC × SubHeightC group's first and last members.
         let grid = derive_subblock_mvs(cb_w, cb_h, cpmvs, bipred)?;
         let sb_w = cb_w / grid.num_sb_x;
         let sb_h = cb_h / grid.num_sb_y;
-        let mut gy = 0u32;
-        while gy < grid.num_sb_y {
-            let mut gx = 0u32;
-            while gx < grid.num_sb_x {
-                let tl = grid.mv_at(gx, gy);
-                let br_x = (gx + 1).min(grid.num_sb_x - 1);
-                let br_y = (gy + 1).min(grid.num_sb_y - 1);
-                let br = grid.mv_at(br_x, br_y);
-                let avg = MotionVector {
-                    x: round_half_toward_zero_div2(tl.x + br.x),
-                    y: round_half_toward_zero_div2(tl.y + br.y),
-                };
-                let c_w = sb_w; // 2 luma sub-blocks (8 luma) → 4 chroma
-                let c_h = sb_h;
-                let c_sb_x = c_dst_x + (gx * sb_w) / 2;
-                let c_sb_y = c_dst_y + (gy * sb_h) / 2;
+        for gy in 0..grid.num_sb_y {
+            for gx in 0..grid.num_sb_x {
+                let avg = affine_chroma_group_mv(&grid, gx, gy, sw, sh);
+                let (c_w, c_h) = (sb_w / sw, sb_h / sh);
+                let c_sb_x = c_dst_x + (gx * sb_w) / sw;
+                let c_sb_y = c_dst_y + (gy * sb_h) / sh;
                 predict_chroma_block(cb_dst, c_sb_x, c_sb_y, c_w, c_h, &ref_pic.frame.cb, avg)?;
                 predict_chroma_block(cr_dst, c_sb_x, c_sb_y, c_w, c_h, &ref_pic.frame.cr, avg)?;
-                gx += 2;
             }
-            gy += 2;
         }
         Ok(())
     }
@@ -11176,10 +11284,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
-        let c_w = (cu.cu.w as usize) / 2;
-        let c_h = (cu.cu.h as usize) / 2;
-        let c_x = (cu.cu.x as usize) / 2;
-        let c_y = (cu.cu.y as usize) / 2;
+        let (sw, sh) = self.sub_wh();
+        let c_w = (cu.cu.w / sw) as usize;
+        let c_h = (cu.cu.h / sh) as usize;
+        let c_x = (cu.cu.x / sw) as usize;
+        let c_y = (cu.cu.y / sh) as usize;
         if c_w == 0 || c_h == 0 {
             return Ok(());
         }
@@ -11385,6 +11494,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         mlist: &[MvField],
         out: &mut PictureBuffer,
     ) -> Result<()> {
+        let (sw, sh) = self.sub_wh();
         if mlist.is_empty() {
             return Err(Error::invalid(
                 "h266 GPM: empty merge candidate list — §8.5.4.2 step 1 violation",
@@ -11428,6 +11538,50 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         .ok_or_else(|| {
             Error::invalid("h266 GPM: partition B reference not available — §8.5.4.2 / §8.5.7.1")
         })?;
+        // `H266_DBG_GPM_FORCE_A=x,y` / `_B` — triage aids: override a
+        // partition's motion vector (luma 1/16 units, list / reference
+        // unchanged).
+        // The overrides apply only to the picture named by
+        // `H266_DBG_GPM_FORCE_PIC=<recon ordinal>` (see `dbg_skip_stage_recon`).
+        let force_pic_ok = std::env::var("H266_DBG_GPM_FORCE_PIC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .is_some_and(|p| p == crate::deblock::dbg_pic_ordinal());
+        let mv_a = match std::env::var("H266_DBG_GPM_FORCE_A")
+            .ok()
+            .filter(|_| force_pic_ok)
+        {
+            Some(v) => {
+                let p: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                if p.len() == 2 {
+                    MotionVector { x: p[0], y: p[1] }
+                } else {
+                    mv_a
+                }
+            }
+            None => mv_a,
+        };
+        let mv_b = match std::env::var("H266_DBG_GPM_FORCE_B")
+            .ok()
+            .filter(|_| force_pic_ok)
+        {
+            Some(v) => {
+                let p: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                if p.len() == 2 {
+                    MotionVector { x: p[0], y: p[1] }
+                } else {
+                    mv_b
+                }
+            }
+            None => mv_b,
+        };
+        if dbg_cu_enabled() {
+            eprintln!(
+                "GPM ({},{}) {}x{} part={} m={m} n={n} A: X={x_a} mv=({},{}) ref={ref_idx_a} poc={} B: X={x_b} mv=({},{}) ref={ref_idx_b} poc={} candA={cand_a:?} candB={cand_b:?}",
+                cu.cu.x, cu.cu.y, cb_w, cb_h, info.inter.merge_data.gpm_partition_idx,
+                mv_a.x, mv_a.y, ref_a.poc, mv_b.x, mv_b.y, ref_b.poc
+            );
+        }
 
         // §8.5.7.1 step 1 — predict each partition over the full CU
         // rectangle using the §8.5.6.3 HIGH-PRECISION path (r447: the
@@ -11490,11 +11644,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `(angleIdx, distanceIdx)` apply; eqs. 999 / 1000 expand the
         // CU back to luma units so `wValue` is consistent across the
         // partition line.
-        if self.sps.sps_chroma_format_idc == 1 {
-            let cb_w_c = cb_w / 2;
-            let cb_h_c = cb_h / 2;
-            let cb_x_c = cb_x / 2;
-            let cb_y_c = cb_y / 2;
+        if self.sps.sps_chroma_format_idc != 0 {
+            let cb_w_c = cb_w / sw;
+            let cb_h_c = cb_h / sh;
+            let cb_x_c = cb_x / sw;
+            let cb_y_c = cb_y / sh;
             let hp_a_cb = crate::inter::predict_chroma_block_high_precision(
                 cb_x_c,
                 cb_y_c,
@@ -11531,8 +11685,16 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 mv_b,
                 bit_depth,
             )?;
-            let ctx_chroma =
-                GpmContext::new(cb_w_c, cb_h_c, angle_idx, distance_idx, 1, bit_depth, 2, 2);
+            let ctx_chroma = GpmContext::new(
+                cb_w_c,
+                cb_h_c,
+                angle_idx,
+                distance_idx,
+                1,
+                bit_depth,
+                sw,
+                sh,
+            );
             crate::gpm::blend_gpm_into_plane_hp(
                 &mut out.cb,
                 cb_x_c,
@@ -12009,11 +12171,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
         lfnst_pred_mode: Option<u32>,
     ) -> Result<()> {
-        // 4:2:0 chroma sub-sampling: half in both directions.
-        let n_tb_w = (cu.cu.w as usize) / 2;
-        let n_tb_h = (cu.cu.h as usize) / 2;
-        let x0 = (cu.cu.x as usize) / 2;
-        let y0 = (cu.cu.y as usize) / 2;
+        // §6.2 chroma sub-sampling (SubWidthC / SubHeightC).
+        let (sub_w, sub_h) = self.sub_wh();
+        let n_tb_w = (cu.cu.w / sub_w) as usize;
+        let n_tb_h = (cu.cu.h / sub_h) as usize;
+        let x0 = (cu.cu.x / sub_w) as usize;
+        let y0 = (cu.cu.y / sub_h) as usize;
         if n_tb_w == 0 || n_tb_h == 0 {
             return Ok(());
         }
@@ -12053,8 +12216,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // 1. Reference availability per §6.4.4 against the chroma-plane
         // eq. 1212 mask (r412 — decode-order availability; previously a
         // picture-edge-only rule).
-        let cw = (self.layout.pic_width_luma / 2) as i32;
-        let chh = (self.layout.pic_height_luma / 2) as i32;
+        let (cw, chh) = self.chroma_plane_dims();
+        let (cw, chh) = (cw as i32, chh as i32);
         let avail = &self.avail_chroma;
         let (crx0, cry0, crx1, cry1, crcap) = self.region_bounds_chroma_i32();
         let above_avail = y0 > 0
@@ -12107,7 +12270,29 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 );
             }
         }
-        let pred = if is_cclm {
+        let pred = if info.mip_chroma_direct {
+            // r456 — §8.4.5.2.1: `MipChromaDirectFlag` (4:4:4 single
+            // tree) runs §8.4.5.2.2 on the chroma plane with the luma
+            // CU's `intra_mip_mode` / `intra_mip_transposed_flag`.
+            let refs = RefSamples::build(fetch, 0, n_tb_w + 1, n_tb_h + 1, bit_depth);
+            let mut ref_t = Vec::with_capacity(n_tb_w);
+            for x in 0..n_tb_w {
+                ref_t.push(refs.p(x as i32, -1)?);
+            }
+            let mut ref_l = Vec::with_capacity(n_tb_h);
+            for y in 0..n_tb_h {
+                ref_l.push(refs.p(-1, y as i32)?);
+            }
+            predict_mip(
+                n_tb_w,
+                n_tb_h,
+                info.intra_mip_mode,
+                info.intra_mip_transposed_flag,
+                &ref_t,
+                &ref_l,
+                bit_depth,
+            )?
+        } else if is_cclm {
             // Build the 4:2:0 chroma neighbour rows. Both `INTRA_T_CCLM`
             // and `INTRA_L_CCLM` extend the corresponding side; the
             // helper caps the lengths at the plane boundary.
@@ -12118,7 +12303,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     return false;
                 }
                 self.avail_chroma
-                    .get(y * (self.layout.pic_width_luma as usize / 2) + x)
+                    .get(y * self.chroma_plane_dims().0 + x)
                     .copied()
                     .unwrap_or(false)
             };
@@ -12140,13 +12325,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             // (after eq. 358) is `y_tb_y = y0_chroma << 1`, and the
             // boundary check uses `y_tb_y & (CtbSizeY - 1) == 0`.
             let ctb_size_y = self.layout.ctb_size_y as usize;
-            let b_ctu_boundary = ctb_size_y > 0 && (((y0 << 1) & (ctb_size_y - 1)) == 0);
+            let b_ctu_boundary =
+                ctb_size_y > 0 && (((y0 * sub_h as usize) & (ctb_size_y - 1)) == 0);
             let inputs = CclmInputs {
                 mode: mode_c,
                 n_tb_w,
                 n_tb_h,
-                sub_width_c: 2,
-                sub_height_c: 2,
+                sub_width_c: sub_w,
+                sub_height_c: sub_h,
                 chroma_vertical_collocated_flag: self
                     .sps
                     .tool_flags
@@ -12390,6 +12576,10 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             );
         }
         crate::inter::set_ref_subpic_clip(self.subpic_clip_eff());
+        {
+            let (sw, sh) = self.sub_wh();
+            crate::inter::set_chroma_subsampling(sw, sh);
+        }
         // r429 — resolve the §6.5.1 walk plan: `CtbAddrInCurrSlice[]`
         // in decoding order (tile-scan for partitioned PPSes), or the
         // historical whole-picture raster scan.
@@ -12590,6 +12780,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// `qPY_PREV` tile reset, and run the §7.3.11.1 row-start resets
     /// when `CtbAddrX == CtbToTileColBd[CtbAddrX]`.
     fn begin_ctu(&mut self, ctu: &CtuPos) {
+        // `H266_DBG_BINS=x,y` — bin-level CABAC trace for one CTB.
+        if let Ok(v) = std::env::var("H266_DBG_BINS") {
+            let want: Vec<u32> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+            crate::cabac::set_bin_trace(want.len() == 2 && want[0] == ctu.x0 && want[1] == ctu.y0);
+        }
         let ctb_log2 = self.layout.ctb_log2_size_y;
         let (rect, col_cap, tile_idx, at_row_start) = match &self.tile_walk {
             Some(tw) => {
@@ -19726,5 +19921,102 @@ mod tests {
         walker.ibc_store_cu_planes(&cu, &out, true, false);
         let virbuf = &walker.ibc.as_ref().unwrap().virbuf;
         assert_eq!(virbuf.luma_at(16, 0, zero).unwrap(), 77);
+    }
+
+    /// r456 — §8.5.5.3 eqs. 876 – 879: the chroma MV of an affine
+    /// sub-block averages the group's first / last luma sub-block MVs
+    /// (2×2 groups for 4:2:0, 2×1 for 4:2:2) and is the sub-block's own
+    /// MV for 4:4:4.
+    #[test]
+    fn affine_chroma_group_mv_follows_eqs_876_879() {
+        let grid = crate::affine::SubblockMvGrid {
+            num_sb_x: 2,
+            num_sb_y: 2,
+            fallback: false,
+            mvs: vec![
+                MotionVector { x: 0, y: 0 },
+                MotionVector { x: 4, y: 8 },
+                MotionVector { x: -6, y: 2 },
+                MotionVector { x: 10, y: -3 },
+            ],
+        };
+        // 4:2:0 — every sub-block of the 2×2 group averages (0,0) and
+        // (10,−3): eqs. 878 / 879 round the half toward zero
+        // (`(−3 + 1 − 0) >> 1 = −1`).
+        for (gx, gy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(
+                affine_chroma_group_mv(&grid, gx, gy, 2, 2),
+                MotionVector { x: 5, y: -1 },
+                "({gx},{gy})"
+            );
+        }
+        // 4:2:2 — horizontal pairs only.
+        assert_eq!(
+            affine_chroma_group_mv(&grid, 1, 0, 2, 1),
+            MotionVector { x: 2, y: 4 }
+        );
+        assert_eq!(
+            affine_chroma_group_mv(&grid, 0, 1, 2, 1),
+            MotionVector { x: 2, y: 0 }
+        );
+        // 4:4:4 — the sub-block's own MV.
+        assert_eq!(
+            affine_chroma_group_mv(&grid, 1, 1, 1, 1),
+            MotionVector { x: 10, y: -3 }
+        );
+    }
+
+    /// r456 — §8.5.5.6 corner cascade under §6.4.4 `checkPredModeY`:
+    /// a neighbour that is not MODE_INTER (IBC / intra) is unavailable
+    /// and the cascade continues to the next position instead of
+    /// claiming the corner with empty prediction flags (`8b444_A_2`:
+    /// an IBC B3 starved every constructed sub-block merge candidate).
+    #[test]
+    fn constructed_merge_corner_skips_non_inter_neighbours() {
+        let sps = dummy_sps(2, 256, 256);
+        let pps = dummy_pps(256, 256, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 8];
+        let mut w = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let (xcb, ycb) = (64, 8);
+        let ibc = MvField {
+            mv_l0: MotionVector { x: -1024, y: 0 },
+            ref_idx_l0: -1,
+            pred_flag_l0: false,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: true,
+            mode_inter: false,
+            available: true,
+            bcw_idx: 0,
+            hpel_if_idx: 0,
+        };
+        let inter = MvField {
+            mv_l0: MotionVector { x: 3, y: -25 },
+            ref_idx_l0: 1,
+            pred_flag_l0: true,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: -1,
+            pred_flag_l1: false,
+            cu_skip_flag: false,
+            mode_inter: true,
+            available: true,
+            bcw_idx: 0,
+            hpel_if_idx: 0,
+        };
+        // B3 = (xCb, yCb − 1) is an IBC block, A2 = (xCb − 1, yCb) inter.
+        w.motion_field.write_block(64, 0, 64, 8, ibc);
+        w.motion_field.write_block(0, 8, 64, 16, inter);
+        let tl = [(xcb - 1, ycb - 1), (xcb, ycb - 1), (xcb - 1, ycb)];
+        let corner = w.read_constructed_merge_corner(&tl, xcb, ycb);
+        assert!(corner.available);
+        assert!(corner.pred_flag_l0);
+        assert_eq!(corner.ref_idx_l0, 1);
+        assert_eq!(corner.mv_l0, MotionVector { x: 3, y: -25 });
+        // With only the IBC neighbour in reach the corner is unavailable.
+        let corner = w.read_constructed_merge_corner(&tl[..2], xcb, ycb);
+        assert!(!corner.available);
     }
 }

@@ -373,9 +373,8 @@ impl IbcVirtualBuffer {
 
     /// §8.6.3 eqs. 1108 – 1110 — chroma prediction read for the
     /// chroma-plane sample at `(x, y)` (chroma-sample units) with the
-    /// *luma* block vector `bv` (the spec indexes the chroma buffer
-    /// with `bv >> (3 + SubWidthC / SubHeightC)`, i.e. the integer
-    /// chroma displacement of the luma BV).
+    /// §8.6.2.5 *chroma* block vector `bv` (1/32 chroma-sample units;
+    /// r456 — the integer displacement is `bvC >> 5` in every format).
     pub fn chroma_at(&self, c_idx: u32, x: u32, y: u32, bv: MotionVector) -> Result<i32> {
         let (buf_w, buf_h) = self.plane_dims(c_idx);
         if buf_w == 0 {
@@ -383,8 +382,11 @@ impl IbcVirtualBuffer {
                 "h266 IBC: chroma read on a monochrome IbcVirBuf",
             ));
         }
-        let xv = ((x as i32 + (bv.x >> (3 + self.sub_width_c))) & (buf_w as i32 - 1)) as usize;
-        let yv = ((y as i32 + (bv.y >> (3 + self.sub_height_c))) & (buf_h as i32 - 1)) as usize;
+        // `bv` is the §8.6.2.5 chroma block vector in 1/32 chroma-sample
+        // units (eqs. 1108 / 1109: `bvC >> 5` is the integer chroma
+        // displacement in every chroma format).
+        let xv = ((x as i32 + (bv.x >> 5)) & (buf_w as i32 - 1)) as usize;
+        let yv = ((y as i32 + (bv.y >> 5)) & (buf_h as i32 - 1)) as usize;
         let plane = if c_idx == 1 { &self.cb } else { &self.cr };
         Ok(plane[yv * buf_w as usize + xv])
     }

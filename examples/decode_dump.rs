@@ -22,11 +22,13 @@ fn main() {
         }
         n += 1;
         let (cx, cy, cw, ch) = pic.crop;
+        let (sw, sh) =
+            oxideav_h266::reconstruct::chroma_subsampling(u32::from(pic.chroma_format_idc));
         let wide = pic.bit_depth > 8;
         let mut planes = vec![(&pic.frame.luma, cx, cy, cw, ch)];
         if pic.chroma_format_idc != 0 {
-            planes.push((&pic.frame.cb, cx / 2, cy / 2, cw / 2, ch / 2));
-            planes.push((&pic.frame.cr, cx / 2, cy / 2, cw / 2, ch / 2));
+            planes.push((&pic.frame.cb, cx / sw, cy / sh, cw / sw, ch / sh));
+            planes.push((&pic.frame.cr, cx / sw, cy / sh, cw / sw, ch / sh));
         }
         let mut raw: Vec<u8> = Vec::new();
         for (p, x0, y0, w, h) in planes {
