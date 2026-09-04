@@ -681,9 +681,10 @@ r456): 0 P / 2 F / 8 U / 46 E →
 1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
 2 P / 17 F / 8 U / 29 E → 14 P / 31 F / 9 U / 2 E →
 34 P / 12 F / 9 U / 1 E → 43 P / 4 F / 9 U / 0 E →
-50 P / 1 F / 5 U / 0 E → **53 PASS / 1 FAIL / 2 UNSUPPORTED / 0 ERROR**
+50 P / 1 F / 5 U / 0 E → **54 PASS / 0 FAIL / 2 UNSUPPORTED / 0 ERROR**
 — r456 landed subpictures (`SUBPIC_C_1`, `CodingToolsSets_E_1`,
-`LMCS_B_2` byte-exact, see the r456 rollup below). r453 closed the r452
+`LMCS_B_2` byte-exact) and closed the `IBC_A_2` SCIPU-over-IBC row
+(see the r456 rollup below). r453 closed the r452
 chroma-deblock margin family (§8.8.3.6.4's QpP/QpQ are per TRANSFORM
 BLOCK: a >MaxTbSizeY tile or SBT sub-TU with `TuCResMode == 2`
 deblocks with `Qp′CbCr`, one β step under `Qp′Cb` at
@@ -900,7 +901,8 @@ fixture wire that now decodes byte-exactly:
   containing each SAMPLE (`ClipRegions::rect_at`), which also serves
   mid-CTB boundaries (multiples of 8).
 
-**r456 — the subpicture family: 50 P → 53 P, U 5 → 2.** Root causes,
+**r456 — the subpicture family + the SCIPU-over-IBC row: 50 P → 54 P,
+F 1 → 0, U 5 → 2.** Root causes,
 each pinned against the corpus (a black-box `ffmpeg` decode supplied
 the per-sample diffs once the streams decoded end-to-end):
 
@@ -934,20 +936,18 @@ the per-sample diffs once the streams decoded end-to-end):
   `CtbAddrInCurrSlice[]` on the eq. 23-resolved `pic_level_slice_idx`
   (the subpicture-level `sh_slice_address` is 0 in every
   single-slice subpicture).
+* **§8.7.5.1 eqs. 1207 – 1209 on the chroma tree** (`IBC_A_2`, the
+  r453 "SCIPU over IBC" row) — every reconstructed block folds into
+  `IbcVirBuf[ cIdx ]`, DUAL_TREE_CHROMA leaves included. The SCIPU
+  chroma leaf never stored, so a later single-tree IBC CU whose block
+  vector reached a local-dual-tree region predicted its chroma from
+  the buffer's STALE entries (the oracle diff: a 32×8 IBC CU whose
+  chroma matched for 13 columns and sat 5 codes off for the 3 columns
+  its BV pulled from a SCIPU leaf, then every DC / horizontal chroma
+  CU predicted from that column). Luma was exact throughout because
+  the luma tree always stored.
 
-The one remaining FAIL row is `IBC_A_2` (12/17 pictures diverge,
-Cb + Cr only, luma byte-exact throughout). The r452 margin signature
-is NOT the cause (its pictures carry zero §8.8.3.6.9 strong-chroma
-units, and no single-unit weak-flip or bS-off flip restores any md5 —
-906 hypothesis decodes). The divergence originates in the pictures
-that contain LOCAL DUAL TREE (SCIPU) chroma CUs over IBC luma
-(decode-order-first poc 16: 43 DualTreeLuma-IBC + 14 DualTreeChroma
-CUs; the byte-exact pocs 1 – 4 contain none) and propagates by MC.
-Full-dual-tree I pictures and VVenC wires with inter-picture SCIPU
-chroma decode byte-exactly, so the defect is specific to this VTM-10
-wire's SCIPU shapes; whole-stage skips (chroma deblock / SAO / ALF /
-CC-ALF) do not restore the md5 either, so it sits in the chroma
-reconstruction of those regions. The 2 UNSUPPORTED rows are
+No FAIL rows remain. The 2 UNSUPPORTED rows are
 4:2:2 / 4:4:4 (`10b422_B_5`, `8b444_A_2` — the SubWidthC / SubHeightC
 generalisation across intra chroma, MC, loop filters, LMCS and
 transforms). `examples/triage_dbg` decodes one

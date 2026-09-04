@@ -16,6 +16,7 @@ All notable changes to this crate are recorded here.
 - r456 — §7.4.8: under `pps_alf_info_in_ph_flag = 1` every `sh_alf_*` element infers to its `ph_alf_*` value (`slice_header::PhAlfState` on `PhState`); the parser previously left such slices ALF-off and desynced on the first CTU's ALF bins.
 - r456 — the integer-pel MC copy (`inter::mc_copy_block_int`) clamps through the same reference helpers as the fractional paths (eq. 5 `ClipH` wraparound + the subpicture arm) instead of a bare picture-edge `Clip3`.
 - r456 — the slice-data walk keys `CtbAddrInCurrSlice[]` on the eq. 23-resolved picture-level slice index rather than the subpicture-level `sh_slice_address`.
+- r456 — §8.7.5.1 eqs. 1207 – 1209: DUAL_TREE_CHROMA (local dual tree / SCIPU) leaves fold their chroma into `IbcVirBuf[ 1 / 2 ]`, so a later single-tree IBC CU predicts its chroma from the reconstructed samples instead of stale buffer entries; `IBC_A_2` is byte-exact (JVET scorecard 53P/1F/2U/0E → 54P/0F/2U/0E, no FAIL rows remain).
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-h266/compare/v0.0.8...v0.0.9) - 2026-08-30
 

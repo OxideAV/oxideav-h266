@@ -5650,6 +5650,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         match info.tree {
             TreeType::DualTreeChroma => {
                 self.reconstruct_leaf_cu_dual_chroma(cu, info, residual, out)?;
+                // r456 — §8.7.5.1 eqs. 1207 – 1209 fold EVERY
+                // reconstructed block into IbcVirBuf[ cIdx ], the
+                // chroma tree's included: a later single-tree IBC CU
+                // (P / B slices with local dual trees) predicts its
+                // chroma from the buffer, and a SCIPU chroma leaf that
+                // never stored left the region's chroma stale
+                // (IBC_A_2's 12-picture Cb / Cr divergence).
+                self.ibc_store_cu_planes(cu, out, false, true);
                 self.mark_reconstructed_chroma(cu.cu.x / 2, cu.cu.y / 2, cu.cu.w / 2, cu.cu.h / 2);
                 return Ok(());
             }
@@ -5698,6 +5706,19 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// luma only (§8.6.3 with cIdx 0), and the luma-tree CU's chroma
     /// area is not reconstructed yet when the fill runs.
     fn ibc_store_cu(&mut self, cu: &CtuCu, out: &PictureBuffer, include_chroma: bool) {
+        self.ibc_store_cu_planes(cu, out, true, include_chroma);
+    }
+
+    /// Plane-selectable [`Self::ibc_store_cu`]: the DUAL_TREE_CHROMA
+    /// leaf stores chroma only (its luma went in with the luma-tree
+    /// CUs), the DUAL_TREE_LUMA leaf luma only.
+    fn ibc_store_cu_planes(
+        &mut self,
+        cu: &CtuCu,
+        out: &PictureBuffer,
+        include_luma: bool,
+        include_chroma: bool,
+    ) {
         let chroma_420 = include_chroma && self.sps.sps_chroma_format_idc == 1;
         let Some(ibc) = self.ibc.as_mut() else {
             return;
@@ -5708,10 +5729,12 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if w == 0 || h == 0 {
             return;
         }
-        let plane = &out.luma;
-        ibc.virbuf.store_region(0, x, y, w, h, |dx, dy| {
-            i32::from(plane.samples[(y + dy) as usize * plane.stride + (x + dx) as usize])
-        });
+        if include_luma {
+            let plane = &out.luma;
+            ibc.virbuf.store_region(0, x, y, w, h, |dx, dy| {
+                i32::from(plane.samples[(y + dy) as usize * plane.stride + (x + dx) as usize])
+            });
+        }
         if chroma_420 {
             let (cx, cy, cw, ch) = (x / 2, y / 2, w / 2, h / 2);
             if cw > 0 && ch > 0 {
@@ -19658,5 +19681,50 @@ mod tests {
             !neigh2.left_cu_skip,
             "the motion field must no longer drive the cu_skip_flag ctxInc"
         );
+    }
+
+    /// r456 — §8.7.5.1 eqs. 1207 – 1209: a DUAL_TREE_CHROMA leaf's
+    /// reconstruction is folded into `IbcVirBuf[ 1 / 2 ]` (chroma
+    /// only), so a later single-tree IBC CU reads the SCIPU chroma
+    /// rather than a stale entry; the luma entries stay untouched.
+    #[test]
+    fn ibc_store_cu_planes_chroma_only_fills_chroma_buffers() {
+        let sps = ibc_sps(64, 32);
+        let pps = dummy_pps(64, 32, true);
+        let sh = intra_slice_header();
+        let layout = CtuLayout::from_sps_pps(&sps, &pps);
+        let data = [0u8; 64];
+        let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
+        let mut out = PictureBuffer::yuv420_filled(64, 32, 0);
+        for y in 0..16usize {
+            for x in 0..32usize {
+                out.cb.samples[y * out.cb.stride + x] = (40 + x + y) as u16;
+                out.cr.samples[y * out.cr.stride + x] = (200 - x - y) as u16;
+            }
+        }
+        for v in out.luma.samples.iter_mut() {
+            *v = 77;
+        }
+        let cu = ibc_ccu(16, 0, 16, 16);
+        walker
+            .ibc
+            .as_mut()
+            .unwrap()
+            .virbuf
+            .on_cu_start(0, 0, 32, 32, 32);
+        walker.ibc_store_cu_planes(&cu, &out, false, true);
+        let virbuf = &walker.ibc.as_ref().unwrap().virbuf;
+        // Chroma (8..16, 0..8) is now readable through a zero BV.
+        let zero = MotionVector::ZERO;
+        assert_eq!(virbuf.chroma_at(1, 8, 0, zero).unwrap(), 40 + 8);
+        assert_eq!(virbuf.chroma_at(1, 15, 7, zero).unwrap(), 40 + 15 + 7);
+        assert_eq!(virbuf.chroma_at(2, 9, 3, zero).unwrap(), 200 - 9 - 3);
+        // The luma entries were not written (still the eq. 181 / 182
+        // invalid marker).
+        assert!(virbuf.luma_at(16, 0, zero).is_err());
+        // The luma-only store (DUAL_TREE_LUMA) fills luma alone.
+        walker.ibc_store_cu_planes(&cu, &out, true, false);
+        let virbuf = &walker.ibc.as_ref().unwrap().virbuf;
+        assert_eq!(virbuf.luma_at(16, 0, zero).unwrap(), 77);
     }
 }
