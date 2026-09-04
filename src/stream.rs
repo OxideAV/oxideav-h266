@@ -18,10 +18,8 @@
 //!
 //! Current fail-fast gates (surfaced as `Error::Unsupported` with a
 //! precise reason, so a conformance triage can classify streams):
-//! 4:2:2 / 4:4:4 chroma formats, subpicture layouts, explicit
-//! reference picture wraparound, explicit weighted prediction on
-//! affine / sub-block-merge / GPM CUs, and §8.8.1 explicit virtual
-//! boundaries.
+//! 4:2:2 / 4:4:4 chroma formats and subpicture / slice layouts whose
+//! loop-filter-across boundaries are not full CTB-grid lines.
 //! Reconstruction runs on BitDepth-parametric `u16` planes (8..=16).
 
 use std::collections::HashMap;
@@ -42,7 +40,9 @@ use crate::ref_pic_list::{
     build_ref_pic_list, BuiltRefPicEntry, HeaderRefPicList, RefPicKind, RefPicListInputs,
 };
 use crate::scaling_list::ScalingListData;
-use crate::slice_header::{parse_slice_header_stateful, PhState, SliceType, StatefulSliceHeader};
+use crate::slice_header::{
+    parse_slice_header_stateful, PhAlfState, PhState, SliceType, StatefulSliceHeader,
+};
 use crate::sps::{parse_sps, SeqParameterSet};
 
 /// One decoded picture, in decode order.
@@ -306,8 +306,15 @@ impl StreamDecoder {
             ],
             ph_collocated_from_l0_flag: ph.ph_collocated_from_l0_flag,
             ph_collocated_ref_idx: ph.ph_collocated_ref_idx,
+            ph_alf: PhAlfState::from_ph(ph),
         };
-        parse_slice_header_stateful(rbsp, sps, pps, &ph_state)
+        let sh = parse_slice_header_stateful(rbsp, sps, pps, &ph_state)?;
+        // Triage aid (`H266_DBG_SH`): one Debug dump per parsed slice
+        // header (the PH state it resolved against first).
+        if std::env::var_os("H266_DBG_SH").is_some() {
+            eprintln!("SH dbg: ph_state={ph_state:?}\nSH dbg: {sh:?}");
+        }
+        Ok(sh)
     }
 
     /// §8.3.1 — PicOrderCntVal.
@@ -410,6 +417,13 @@ impl StreamDecoder {
             }
         }
         let ph = &pic.ph;
+        // Triage aid (`H266_DBG_PH`): one Debug dump per picture header.
+        if std::env::var_os("H266_DBG_PH").is_some() {
+            eprintln!(
+                "PH full dbg: nal={:?} tid={} {ph:?}",
+                pic.nal_type, pic.temporal_id
+            );
+        }
         let (sps, pps) = self.resolve_ps(ph.ph_pic_parameter_set_id)?;
         let sps = sps.clone();
         let pps = pps.clone();
@@ -892,6 +906,18 @@ impl StreamDecoder {
         }
 
         let motion = walker.motion_field_for_temporal();
+        if std::env::var_os("H266_DBG_TB").is_some() {
+            let inter = motion
+                .field
+                .iter()
+                .filter(|f| f.available && f.mode_inter)
+                .count();
+            let avail = motion.field.iter().filter(|f| f.available).count();
+            eprintln!(
+                "MF export dbg: poc={poc} cells={} available={avail} inter={inter}",
+                motion.field.len()
+            );
+        }
         if let Ok(spec) = std::env::var("H266_DBG_MFCELL") {
             if let Some((xs, ys)) = spec.split_once(',') {
                 if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {

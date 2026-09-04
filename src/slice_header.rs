@@ -91,6 +91,48 @@ pub struct PhState {
     /// `sh_collocated_ref_idx` inference when
     /// `pps_rpl_info_in_ph_flag == 1`.
     pub ph_collocated_ref_idx: u32,
+    /// r456 — the PH-carried ALF selection (§7.3.2.8), inherited by
+    /// every slice when `pps_alf_info_in_ph_flag == 1` (§7.4.8: the
+    /// absent `sh_alf_*` elements infer to their `ph_alf_*` values).
+    pub ph_alf: PhAlfState,
+}
+
+/// r456 — `ph_alf_*` (§7.4.3.7) as the slice header inherits them
+/// under `pps_alf_info_in_ph_flag == 1`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhAlfState {
+    pub num_alf_aps_ids_luma: u8,
+    /// `ph_alf_aps_id_luma[ i ]` for `i < num_alf_aps_ids_luma`
+    /// (`u(3)` count, so at most 7).
+    pub alf_aps_id_luma: [u8; 7],
+    pub alf_cb_enabled_flag: bool,
+    pub alf_cr_enabled_flag: bool,
+    pub alf_aps_id_chroma: u8,
+    pub alf_cc_cb_enabled_flag: bool,
+    pub alf_cc_cb_aps_id: u8,
+    pub alf_cc_cr_enabled_flag: bool,
+    pub alf_cc_cr_aps_id: u8,
+}
+
+impl PhAlfState {
+    /// Project a parsed picture header's ALF fields.
+    pub fn from_ph(ph: &crate::picture_header::PictureHeader) -> Self {
+        let mut ids = [0u8; 7];
+        for (slot, &id) in ids.iter_mut().zip(&ph.ph_alf_aps_id_luma) {
+            *slot = id;
+        }
+        Self {
+            num_alf_aps_ids_luma: ph.ph_num_alf_aps_ids_luma.min(7),
+            alf_aps_id_luma: ids,
+            alf_cb_enabled_flag: ph.ph_alf_cb_enabled_flag,
+            alf_cr_enabled_flag: ph.ph_alf_cr_enabled_flag,
+            alf_aps_id_chroma: ph.ph_alf_aps_id_chroma,
+            alf_cc_cb_enabled_flag: ph.ph_alf_cc_cb_enabled_flag,
+            alf_cc_cb_aps_id: ph.ph_alf_cc_cb_aps_id,
+            alf_cc_cr_enabled_flag: ph.ph_alf_cc_cr_enabled_flag,
+            alf_cc_cr_aps_id: ph.ph_alf_cc_cr_aps_id,
+        }
+    }
 }
 
 impl Default for PhState {
@@ -109,6 +151,7 @@ impl Default for PhState {
             num_ref_entries: [0, 0],
             ph_collocated_from_l0_flag: true,
             ph_collocated_ref_idx: 0,
+            ph_alf: PhAlfState::default(),
         }
     }
 }
@@ -375,6 +418,7 @@ pub fn parse_slice_header_stateful(
             ],
             ph_collocated_from_l0_flag: ph.ph_collocated_from_l0_flag,
             ph_collocated_ref_idx: ph.ph_collocated_ref_idx,
+            ph_alf: PhAlfState::from_ph(ph),
         },
         None => *ph_state,
     };
@@ -489,9 +533,9 @@ pub fn parse_slice_header_stateful(
         NalUnitType::IdrWRadl | NalUnitType::IdrNLp | NalUnitType::CraNut | NalUnitType::GdrNut
     ) && br.u1()? == 1;
 
-    // ALF — only when `sps_alf_enabled_flag && !pps_alf_info_in_ph_flag`.
-    // Under our assumption pps_alf_info_in_ph_flag is always 1 so this
-    // whole block is skipped.
+    // ALF — transmitted only when `sps_alf_enabled_flag &&
+    // !pps_alf_info_in_ph_flag`; otherwise (r456) every `sh_alf_*`
+    // element infers to the PH's `ph_alf_*` value (§7.4.8).
     let mut out = StatefulSliceHeader::default();
     out.sh_picture_header_in_slice_header_flag = sh_picture_header_in_slice_header_flag;
     out.embedded_picture_header = embedded_picture_header;
@@ -528,6 +572,21 @@ pub fn parse_slice_header_stateful(
                     out.sh_alf_cc_cr_aps_id = br.u(3)? as u8;
                 }
             }
+        }
+    } else if sps.tool_flags.alf_enabled_flag && pps.pps_alf_info_in_ph_flag {
+        out.sh_alf_enabled_flag = ph_state.ph_alf_enabled_flag;
+        if out.sh_alf_enabled_flag {
+            let a = &ph_state.ph_alf;
+            out.sh_num_alf_aps_ids_luma = a.num_alf_aps_ids_luma;
+            out.sh_alf_aps_id_luma =
+                a.alf_aps_id_luma[..usize::from(a.num_alf_aps_ids_luma)].to_vec();
+            out.sh_alf_cb_enabled_flag = a.alf_cb_enabled_flag;
+            out.sh_alf_cr_enabled_flag = a.alf_cr_enabled_flag;
+            out.sh_alf_aps_id_chroma = a.alf_aps_id_chroma;
+            out.sh_alf_cc_cb_enabled_flag = a.alf_cc_cb_enabled_flag;
+            out.sh_alf_cc_cb_aps_id = a.alf_cc_cb_aps_id;
+            out.sh_alf_cc_cr_enabled_flag = a.alf_cc_cr_enabled_flag;
+            out.sh_alf_cc_cr_aps_id = a.alf_cc_cr_aps_id;
         }
     }
 
@@ -1625,5 +1684,63 @@ mod tests {
 
         let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
         assert_eq!(sh.sh_slice_header_extension_bytes, vec![0xFF, 0x00]);
+    }
+
+    /// r456 — §7.4.8: under `pps_alf_info_in_ph_flag == 1` the slice
+    /// header carries no ALF syntax and every `sh_alf_*` element
+    /// infers to the PH's `ph_alf_*` value (SUBPIC_C_1 signals ALF in
+    /// the PH; the pre-r456 parser left the slice ALF-off and desynced
+    /// on the first CTU's ALF bins).
+    #[test]
+    fn stateful_alf_inherits_ph_when_alf_info_in_ph() {
+        let (mut sps, pps) = synthetic_sps_pps();
+        sps.tool_flags.alf_enabled_flag = true;
+        sps.tool_flags.ccalf_enabled_flag = true;
+        assert!(pps.pps_alf_info_in_ph_flag);
+        let mut ids = [0u8; 7];
+        ids[0] = 7;
+        ids[1] = 2;
+        let ph_state = PhState {
+            ph_inter_slice_allowed_flag: false,
+            ph_intra_slice_allowed_flag: true,
+            ph_alf_enabled_flag: true,
+            num_extra_sh_bits: 0,
+            nal_unit_type: NalUnitType::IdrWRadl,
+            ph_alf: PhAlfState {
+                num_alf_aps_ids_luma: 2,
+                alf_aps_id_luma: ids,
+                alf_cb_enabled_flag: true,
+                alf_cr_enabled_flag: false,
+                alf_aps_id_chroma: 5,
+                alf_cc_cb_enabled_flag: false,
+                alf_cc_cb_aps_id: 0,
+                alf_cc_cr_enabled_flag: true,
+                alf_cc_cr_aps_id: 3,
+            },
+            ..Default::default()
+        };
+        let mut bits: Vec<u8> = Vec::new();
+        push_u(&mut bits, 0, 1); // sh_ph_in_sh_flag
+        push_u(&mut bits, 0, 1); // sh_no_output_of_prior_pics_flag
+        push_byte_align(&mut bits);
+        let bytes = pack(&bits);
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &ph_state).unwrap();
+        assert!(sh.sh_alf_enabled_flag);
+        assert_eq!(sh.sh_num_alf_aps_ids_luma, 2);
+        assert_eq!(sh.sh_alf_aps_id_luma, vec![7, 2]);
+        assert!(sh.sh_alf_cb_enabled_flag);
+        assert!(!sh.sh_alf_cr_enabled_flag);
+        assert_eq!(sh.sh_alf_aps_id_chroma, 5);
+        assert!(!sh.sh_alf_cc_cb_enabled_flag);
+        assert!(sh.sh_alf_cc_cr_enabled_flag);
+        assert_eq!(sh.sh_alf_cc_cr_aps_id, 3);
+        // PH ALF off → the slice inherits "off" (no bins consumed).
+        let off = PhState {
+            ph_alf_enabled_flag: false,
+            ..ph_state
+        };
+        let sh = parse_slice_header_stateful(&bytes, &sps, &pps, &off).unwrap();
+        assert!(!sh.sh_alf_enabled_flag);
+        assert!(sh.sh_alf_aps_id_luma.is_empty());
     }
 }

@@ -217,7 +217,7 @@ fn bilinear_sample(
     // pps_ref_wraparound_enabled_flag, then the edge clamp.
     let at = |xi: i32, yi: i32| -> i32 {
         let xc = crate::inter::clip_ref_x(xi, pw, 1);
-        let yc = yi.clamp(0, ph - 1) as usize;
+        let yc = crate::inter::clip_ref_y(yi, ph, 1);
         ref_pic.samples[yc * ref_pic.stride + xc] as i32
     };
 

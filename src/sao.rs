@@ -392,6 +392,19 @@ pub fn apply_sao_clipped(
     cfg: &SaoConfig,
     tile_bounds: Option<(&[u32], &[u32])>,
 ) {
+    apply_sao_regions(out, sao_pic, cfg, tile_bounds, None)
+}
+
+/// r456 — [`apply_sao_clipped`] with the CTB-granular slice /
+/// subpicture gate map (§8.8.4.2 `edgeIdx = 0` across a gated
+/// boundary).
+pub(crate) fn apply_sao_regions(
+    out: &mut PictureBuffer,
+    sao_pic: &SaoPicture,
+    cfg: &SaoConfig,
+    tile_bounds: Option<(&[u32], &[u32])>,
+    region: Option<&crate::alf::LfRegionMap>,
+) {
     if sao_pic.is_all_not_applied() {
         return;
     }
@@ -419,33 +432,40 @@ pub fn apply_sao_clipped(
 
     let (sub_w, sub_h) = cfg.chroma_subsampling();
     let ctb_size_y = 1u32 << cfg.ctb_log2_size_y;
-
-    for ry in 0..sao_pic.pic_height_in_ctbs_y {
-        for rx in 0..sao_pic.pic_width_in_ctbs_y {
-            let p = sao_pic.get(rx, ry);
-            // r429 — the containing tile's rectangle (luma samples),
-            // when the across-tiles gate is active.
-            // r429 / r453 — the region containing each SAMPLE (tile /
-            // slice rectangles, or the strips between §8.8.1 virtual
-            // boundaries) gates the §8.8.4.2 neighbour reads.
-            let clip_y = tile_bounds.map(|b| {
+    // r429 / r453 / r456 — the region containing each SAMPLE (tile
+    // strips, the strips between §8.8.1 virtual boundaries, and the
+    // CTB-granular slice / subpicture gate map) gates the §8.8.4.2
+    // neighbour reads.
+    let (clip_y, clip_c) = if tile_bounds.is_some() || region.is_some() {
+        (
+            Some(
                 crate::alf::ClipRegions::new(
-                    Some(b),
+                    tile_bounds,
                     out.luma.width as i32,
                     out.luma.height as i32,
                     1,
                     1,
                 )
-            });
-            let clip_c = tile_bounds.map(|b| {
+                .with_region(region),
+            ),
+            Some(
                 crate::alf::ClipRegions::new(
-                    Some(b),
+                    tile_bounds,
                     out.luma.width as i32,
                     out.luma.height as i32,
                     sub_w,
                     sub_h,
                 )
-            });
+                .with_region(region),
+            ),
+        )
+    } else {
+        (None, None)
+    };
+
+    for ry in 0..sao_pic.pic_height_in_ctbs_y {
+        for rx in 0..sao_pic.pic_width_in_ctbs_y {
+            let p = sao_pic.get(rx, ry);
             if cfg.luma_used && p.luma.sao_type_idx != SaoTypeIdx::NotApplied {
                 let pre = luma_pre.as_ref().unwrap();
                 apply_sao_ctb(
@@ -553,16 +573,9 @@ fn apply_sao_ctb(
                     // neighbour sample in a different tile also forces
                     // edgeIdx = 0.
                     if let Some(regions) = &eo_clip {
-                        let (cx0, cy0, cx1, cy1) = regions.rect_at(xs, ys);
                         outside = outside
-                            || nx0 < cx0
-                            || ny0 < cy0
-                            || nx1 < cx0
-                            || ny1 < cy0
-                            || nx0 >= cx1
-                            || ny0 >= cy1
-                            || nx1 >= cx1
-                            || ny1 >= cy1;
+                            || !regions.neighbour_in_region(xs, ys, nx0, ny0)
+                            || !regions.neighbour_in_region(xs, ys, nx1, ny1);
                     }
                     if outside {
                         // edgeIdx = 0 → offset_val[0] = 0. Copy through.

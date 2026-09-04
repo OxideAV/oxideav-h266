@@ -226,6 +226,7 @@ fn corpus_headers_parse() {
                                 ],
                                 ph_collocated_from_l0_flag: ph.ph_collocated_from_l0_flag,
                                 ph_collocated_ref_idx: ph.ph_collocated_ref_idx,
+                                ph_alf: oxideav_h266::slice_header::PhAlfState::from_ph(ph),
                             }
                         };
                         parse_slice_header_stateful(&rbsp, sps, pps, &ph_state)
@@ -639,7 +640,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("CodingToolsSets_B_2", 'P'), // byte-exact (r450 §8.5.2.3 raw-availability pruning)
     ("CodingToolsSets_C_2", 'P'), // byte-exact (r449)
     ("CodingToolsSets_D_2", 'P'), // byte-exact (r450 §8.5.5.2 affine gate + §8.5.2.3 pruning)
-    ("CodingToolsSets_E_1", 'U'), // subpictures
+    ("CodingToolsSets_E_1", 'P'), // byte-exact (r456 subpictures + §8.8.3.6.2 LADF + §7.4.8 sh_alf_* from PH)
     ("DEBLOCKING_A_3", 'P'),      // byte-exact (r453 §8.8.3.6.4 per-TB TuCResMode deblock QP)
     ("DEBLOCKING_C_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("DEBLOCKING_E_3", 'P'),      // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
@@ -655,7 +656,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("LFNST_A_4", 'P'),    // byte-exact (r449)
     ("LFNST_B_4", 'P'),    // byte-exact (r450 §8.5.2.7 MMVD offset scaling)
     ("LMCS_A_3", 'P'),     // byte-exact (r453 §8.8.2.2 per-slice sh_lmcs_used_flag inverse mapping)
-    ("LMCS_B_2", 'U'),     // subpictures
+    ("LMCS_B_2", 'P'),     // byte-exact (r456 subpictures + CTB-granular §8.8 slice gates)
     ("LMCS_C_1", 'P'),     // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("LOSSLESS_B_3", 'P'), // byte-exact (r452 §9.3.3.6 limited-EGk escape)
     ("MERGE_A_2", 'P'),    // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
@@ -672,7 +673,7 @@ const EXPECTED_VERDICTS: &[(&str, char)] = &[
     ("SBT_A_2", 'P'),      // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("SLICES_A_3", 'P'), // byte-exact (r452 CCLM pY substitution + r453 per-TB TuCResMode deblock QP)
     ("SMVD_A_2", 'P'),   // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
-    ("SUBPIC_C_1", 'U'), // subpictures
+    ("SUBPIC_C_1", 'P'), // byte-exact (r456 subpictures: eq. 114 bounds → MC / TMVP / loop-filter gates)
     ("SbTMVP_A_3", 'P'), // byte-exact (r450 implicit MaxTbSizeY deblock tiling)
     ("TILE_A_2", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)
     ("TMVP_A_3", 'P'),   // byte-exact (r452 §8.5.2.1 collapsed-list motion clear)

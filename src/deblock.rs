@@ -470,6 +470,54 @@ pub struct DeblockParams {
     /// caps the P side to 1 on horizontal edges that coincide with a
     /// chroma-CTB row boundary (r415).
     pub ctb_log2_size_y: u32,
+    /// r456 — §8.8.3.6.2 eqs. 1272 / 1273 luma-adaptive deblocking
+    /// (`sps_ladf_enabled_flag`); `None` = `qpOffset = 0`.
+    pub ladf: Option<LadfTable>,
+}
+
+/// r456 — the §7.4.3.4 LADF intervals in the shape §8.8.3.6.2 eq.
+/// 1273 walks them: `lower_bound[i + 1]` per eq. 63 and the paired
+/// `sps_ladf_qp_offset[i]`, with `sps_ladf_lowest_interval_qp_offset`
+/// as the starting value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LadfTable {
+    pub lowest_interval_qp_offset: i32,
+    /// Number of signalled intervals (`sps_num_ladf_intervals_minus2 +
+    /// 1`, at most 4).
+    pub num_intervals: u8,
+    /// `(SpsLadfIntervalLowerBound[i + 1], sps_ladf_qp_offset[i])`.
+    pub intervals: [(i32, i32); 4],
+}
+
+impl LadfTable {
+    /// Build from the parsed SPS block.
+    pub fn from_sps(p: &crate::sps::LadfParameters) -> Self {
+        let mut bound = 0i32;
+        let mut intervals = [(0i32, 0i32); 4];
+        let n = p.intervals.len().min(4);
+        for (slot, &(qp_off, delta_minus1)) in intervals.iter_mut().zip(&p.intervals) {
+            bound += delta_minus1 as i32 + 1;
+            *slot = (bound, qp_off);
+        }
+        Self {
+            lowest_interval_qp_offset: p.lowest_interval_qp_offset,
+            num_intervals: n as u8,
+            intervals,
+        }
+    }
+
+    /// Eq. 1273 — `qpOffset` for `lumaLevel`.
+    pub fn qp_offset(&self, luma_level: i32) -> i32 {
+        let mut off = self.lowest_interval_qp_offset;
+        for &(lower, qp_off) in &self.intervals[..usize::from(self.num_intervals)] {
+            if luma_level > lower {
+                off = qp_off;
+            } else {
+                break;
+            }
+        }
+        off
+    }
 }
 
 /// Spec Table 43 — β′ as a function of the QP-derived index Q ∈ [0, 63].
@@ -551,6 +599,9 @@ struct PlaneCtx<'a> {
     bit_depth: u32,
     /// `CtbSizeY` in luma samples (for the §8.8.3.3 chroma CTB-row rule).
     ctb_size_y: u32,
+    /// r456 — the LADF table for the luma plane (`None` for chroma /
+    /// LADF off).
+    ladf: Option<&'a LadfTable>,
 }
 
 // ---------------------------------------------------------------------
@@ -657,13 +708,8 @@ pub fn apply_deblocking(
     apply_deblocking_clipped(out, cus, None, None, params, chroma_format_idc, &[], &[])
 }
 
-/// r429 — [`apply_deblocking`] with the §8.8.3.1 tile-boundary edge
-/// exclusion: vertical edges whose luma x coincides with an entry of
-/// `no_filter_cols`, and horizontal edges whose luma y coincides with
-/// an entry of `no_filter_rows`, are not filtered (the
-/// `pps_loop_filter_across_tiles_enabled_flag == 0` /
-/// `pps_loop_filter_across_slices_enabled_flag == 0` arms; callers
-/// pass the interior tile boundary positions).
+/// r429 — [`apply_deblocking`] with the §8.8.3.1 tile / virtual
+/// boundary edge exclusion lists (see [`apply_deblocking_regions`]).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_deblocking_clipped(
     out: &mut PictureBuffer,
@@ -674,6 +720,40 @@ pub fn apply_deblocking_clipped(
     chroma_format_idc: u32,
     no_filter_cols: &[u32],
     no_filter_rows: &[u32],
+) {
+    apply_deblocking_regions(
+        out,
+        cus,
+        chroma_cus,
+        mv_grid,
+        params,
+        chroma_format_idc,
+        no_filter_cols,
+        no_filter_rows,
+        None,
+    )
+}
+
+/// r429 — [`apply_deblocking`] with the §8.8.3.1 tile-boundary edge
+/// exclusion: vertical edges whose luma x coincides with an entry of
+/// `no_filter_cols`, and horizontal edges whose luma y coincides with
+/// an entry of `no_filter_rows`, are not filtered (the
+/// `pps_loop_filter_across_tiles_enabled_flag == 0` /
+/// `pps_loop_filter_across_slices_enabled_flag == 0` arms; callers
+/// pass the interior tile boundary positions). r456 — `region` adds
+/// the CTB-granular slice / subpicture gates (§8.8.3.2
+/// `filterEdgeFlag` slice / subpicture arms).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_deblocking_regions(
+    out: &mut PictureBuffer,
+    cus: &[DeblockCu],
+    chroma_cus: Option<&[DeblockCu]>,
+    mv_grid: Option<&DeblockMvGrid>,
+    params: &DeblockParams,
+    chroma_format_idc: u32,
+    no_filter_cols: &[u32],
+    no_filter_rows: &[u32],
+    region: Option<&crate::alf::LfRegionMap>,
 ) {
     DBG_PIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DBG_CSTRONG.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -710,6 +790,7 @@ pub fn apply_deblocking_clipped(
         qp_offset: 0,
         bit_depth: params.bit_depth,
         ctb_size_y: 1 << params.ctb_log2_size_y,
+        ladf: params.ladf.as_ref(),
     };
     deblock_one_direction(
         &mut luma,
@@ -718,6 +799,7 @@ pub fn apply_deblocking_clipped(
         mv_grid,
         EdgeType::Vertical,
         no_filter_cols,
+        region,
     );
     deblock_one_direction(
         &mut luma,
@@ -726,6 +808,7 @@ pub fn apply_deblocking_clipped(
         mv_grid,
         EdgeType::Horizontal,
         no_filter_rows,
+        region,
     );
 
     if chroma_format_idc != 0 && !dbg_skip_stage("dbc") {
@@ -743,6 +826,7 @@ pub fn apply_deblocking_clipped(
             qp_offset: params.chroma_qp_offset_cb,
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
+            ladf: None,
         };
         deblock_one_direction(
             &mut cb,
@@ -751,6 +835,7 @@ pub fn apply_deblocking_clipped(
             None,
             EdgeType::Vertical,
             no_filter_cols,
+            region,
         );
         deblock_one_direction(
             &mut cb,
@@ -759,6 +844,7 @@ pub fn apply_deblocking_clipped(
             None,
             EdgeType::Horizontal,
             no_filter_rows,
+            region,
         );
         let mut cr = PlaneCtx {
             plane: &mut out.cr,
@@ -770,6 +856,7 @@ pub fn apply_deblocking_clipped(
             qp_offset: params.chroma_qp_offset_cr,
             bit_depth: params.bit_depth,
             ctb_size_y: 1 << params.ctb_log2_size_y,
+            ladf: None,
         };
         deblock_one_direction(
             &mut cr,
@@ -778,6 +865,7 @@ pub fn apply_deblocking_clipped(
             None,
             EdgeType::Vertical,
             no_filter_cols,
+            region,
         );
         deblock_one_direction(
             &mut cr,
@@ -786,6 +874,7 @@ pub fn apply_deblocking_clipped(
             None,
             EdgeType::Horizontal,
             no_filter_rows,
+            region,
         );
     }
 }
@@ -865,6 +954,7 @@ fn deblock_one_direction(
     mv_grid: Option<&DeblockMvGrid>,
     edge_type: EdgeType,
     no_filter: &[u32],
+    region: Option<&crate::alf::LfRegionMap>,
 ) {
     // Debug aid (`H266_DUMP_MIDLF=dir`): dump this plane's samples at
     // the START of each pass (files count up: pass order is V then H
@@ -898,7 +988,7 @@ fn deblock_one_direction(
     }
     for (idx, cu) in cus.iter().enumerate() {
         deblock_cu_dir(
-            plane, cus, grid, mv_grid, idx as u32, cu, edge_type, no_filter,
+            plane, cus, grid, mv_grid, idx as u32, cu, edge_type, no_filter, region,
         );
     }
 }
@@ -917,6 +1007,7 @@ fn deblock_cu_dir(
     cu: &DeblockCu,
     edge_type: EdgeType,
     no_filter: &[u32],
+    region: Option<&crate::alf::LfRegionMap>,
 ) {
     let vertical = edge_type == EdgeType::Vertical;
     let c_idx = plane.c_idx;
@@ -939,7 +1030,9 @@ fn deblock_cu_dir(
     // §8.8.3.2 step 1 — filterEdgeFlag: picture boundary plus the
     // r429 tile / slice boundary exclusions (`no_filter` carries the
     // excluded luma positions).
-    let filter_edge = lead_luma != 0 && !no_filter.contains(&lead_luma);
+    let filter_edge = lead_luma != 0
+        && !no_filter.contains(&lead_luma)
+        && region.map_or(true, |r| r.edge_allowed(vertical, cu.x, cu.y));
     // Edge-position step along the normal (luma units): the luma
     // 4-grid, or the chroma 8-grid scaled to luma.
     let grid_step = if c_idx == 0 {
@@ -1108,7 +1201,37 @@ fn deblock_cu_dir(
                 // CU's own top edge can sit on a CTB row).
                 let ctb_row_edge =
                     !vertical && off == 0 && plane.ctb_size_y > 0 && cu.y % plane.ctb_size_y == 0;
-                let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s);
+                // r456 — §8.8.3.6.2 eq. 1272: lumaLevel from the
+                // segment's p0,0 / p0,3 / q0,0 / q0,3 (k runs along the
+                // edge), eq. 1273 qpOffset via the SPS LADF intervals.
+                let qp_offset = match plane.ladf.as_ref() {
+                    Some(t) => {
+                        let at = |x: i32, y: i32| -> i32 {
+                            let pl = &*plane.plane;
+                            let xc = x.clamp(0, pl.width as i32 - 1) as usize;
+                            let yc = y.clamp(0, pl.height as i32 - 1) as usize;
+                            i32::from(pl.samples[yc * pl.stride + xc])
+                        };
+                        let (p00, p03, q00, q03) = if vertical {
+                            (
+                                at(qx - 1, qy),
+                                at(qx - 1, qy + 3),
+                                at(qx, qy),
+                                at(qx, qy + 3),
+                            )
+                        } else {
+                            (
+                                at(qx, qy - 1),
+                                at(qx + 3, qy - 1),
+                                at(qx, qy),
+                                at(qx + 3, qy),
+                            )
+                        };
+                        t.qp_offset((p00 + p03 + q00 + q03) >> 2)
+                    }
+                    None => 0,
+                };
+                let (_qp, beta, tc) = compute_thresholds_luma(plane, p_cu, q_cu, b_s, qp_offset);
                 run_luma_filter(
                     plane.plane,
                     qx,
@@ -1339,8 +1462,11 @@ fn compute_thresholds_luma(
     p: &DeblockCu,
     q: &DeblockCu,
     b_s: i32,
+    qp_offset: i32,
 ) -> (i32, i32, i32) {
-    let qp = ((p.qp_y + q.qp_y + 1) >> 1) + 0; // qpOffset = 0 (no LADF).
+    // Eq. 1274 — `qpOffset` is the §8.8.3.6.2 LADF term (0 without
+    // `sps_ladf_enabled_flag`).
+    let qp = ((p.qp_y + q.qp_y + 1) >> 1) + qp_offset;
     let q_beta = (qp + (plane.beta_offset_div2 << 1)).clamp(0, 63);
     let beta_p = beta_prime(q_beta);
     let beta = scale_beta_for_bit_depth(beta_p, plane.bit_depth);
@@ -2900,5 +3026,24 @@ mod tests {
         };
         apply_deblocking(&mut buf, &cus, &params, 1);
         assert_eq!(buf.luma.samples, snapshot);
+    }
+
+    /// r456 — §8.8.3.6.2 eqs. 1272 / 1273 (+ §7.4.3.4 eq. 63): the LADF
+    /// `qpOffset` walks the interval lower bounds and stops at the
+    /// first one the luma level does not exceed.
+    #[test]
+    fn ladf_qp_offset_follows_eq_1273() {
+        let t = LadfTable::from_sps(&crate::sps::LadfParameters {
+            num_intervals_minus2: 0,
+            lowest_interval_qp_offset: -2,
+            intervals: vec![(1, 99), (3, 199)],
+        });
+        assert_eq!(t.num_intervals, 2);
+        assert_eq!(&t.intervals[..2], &[(100, 1), (300, 3)]);
+        assert_eq!(t.qp_offset(50), -2);
+        assert_eq!(t.qp_offset(100), -2);
+        assert_eq!(t.qp_offset(101), 1);
+        assert_eq!(t.qp_offset(300), 1);
+        assert_eq!(t.qp_offset(301), 3);
     }
 }

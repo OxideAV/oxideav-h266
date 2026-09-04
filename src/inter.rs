@@ -1984,15 +1984,44 @@ pub fn mc_copy_block_int(
             dst_x, dst_y, w, h, dst.width, dst.height
         )));
     }
+    mc_copy_block_int_sub(dst, dst_x, dst_y, w, h, src, src_x, src_y, 1, 1)
+}
+
+/// [`mc_copy_block_int`] for a plane subsampled by `(sub_w, sub_h)`
+/// (1 / 1 for luma, `SubWidthC` / `SubHeightC` for chroma): the
+/// integer fetch positions take the same §8.5.6.3.2 / §8.5.6.3.4
+/// reference clamps as the fractional paths — eq. 5 `ClipH`
+/// wraparound and the r456 subpicture arm (eqs. 928 / 929 / 949 /
+/// 950) included, not just the picture-edge `Clip3`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mc_copy_block_int_sub(
+    dst: &mut PicturePlane,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+    src: &PicturePlane,
+    src_x: i32,
+    src_y: i32,
+    sub_w: i32,
+    sub_h: i32,
+) -> Result<()> {
+    if dst_x as usize + w as usize > dst.width || dst_y as usize + h as usize > dst.height {
+        return Err(Error::invalid(format!(
+            "h266 MC: destination block ({},{}) {}x{} out of plane bounds {}x{}",
+            dst_x, dst_y, w, h, dst.width, dst.height
+        )));
+    }
     let s_w = src.width as i32;
     let s_h = src.height as i32;
     let s_stride = src.stride;
     let d_stride = dst.stride;
     for r in 0..h as i32 {
-        let sy = (src_y + r).clamp(0, s_h - 1) as usize;
+        let sy = clip_ref_y(src_y + r, s_h, sub_h);
         let dy = dst_y as usize + r as usize;
         for c in 0..w as i32 {
-            let sx = (src_x + c).clamp(0, s_w - 1) as usize;
+            let sx = clip_ref_x(src_x + c, s_w, sub_w);
             let dx = dst_x as usize + c as usize;
             dst.samples[dy * d_stride + dx] = src.samples[sy * s_stride + sx];
         }
@@ -2135,6 +2164,37 @@ thread_local! {
     /// The walker sets it per picture from the active PPS
     /// (§7.4.3.5); the chroma fetchers divide by `SubWidthC`.
     static REF_WRAPAROUND_LUMA: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// r456 — §7.4.8 eq. 114 `(SubpicLeftBoundaryPos,
+    /// SubpicTopBoundaryPos, SubpicRightBoundaryPos,
+    /// SubpicBotBoundaryPos)` (luma samples, inclusive) for the slice
+    /// being reconstructed on this thread when
+    /// `sps_subpic_treated_as_pic_flag[ CurrSubpicIdx ] == 1` and the
+    /// SPS carries more than one subpicture (the §8.5.6.3.2 eqs. 631 /
+    /// 632 arm); `None` = the picture-wide eqs. 633 / 634 arm.
+    static REF_SUBPIC_CLIP: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the §8.5.6.3.2 eqs. 631 / 632 subpicture reference
+/// clamp for every reference fetch on the calling thread: `bounds` is
+/// the eq. 114 `(left, top, right, bottom)` in luma samples,
+/// inclusive; the chroma fetchers divide by `SubWidthC` /
+/// `SubHeightC` (§8.5.6.3.4 eqs. 949 / 950).
+#[doc(hidden)]
+pub fn set_ref_subpic_clip(bounds: Option<(i32, i32, i32, i32)>) {
+    REF_SUBPIC_CLIP.with(|c| c.set(bounds));
+}
+
+/// `Clip3( SubpicTopBoundaryPos / SubHeightC, SubpicBotBoundaryPos /
+/// SubHeightC, y )` (eq. 632 / 950) when the subpicture arm is armed,
+/// else the `Clip3( 0, picH − 1, y )` picture clamp (eq. 634 / 952).
+/// `sub_h` is 1 for luma and `SubHeightC` for a chroma plane.
+#[inline]
+pub(crate) fn clip_ref_y(y: i32, pic_h: i32, sub_h: i32) -> usize {
+    match REF_SUBPIC_CLIP.with(|c| c.get()) {
+        Some((_, top, _, bot)) => y.clamp(top / sub_h, (bot / sub_h).min(pic_h - 1)) as usize,
+        None => y.clamp(0, pic_h - 1) as usize,
+    }
 }
 
 /// Set the §8.5.6.3.2 horizontal wraparound offset (in luma samples;
@@ -2151,14 +2211,21 @@ pub fn set_ref_wraparound(offset_luma: i32) {
 /// coordinates.
 pub(crate) fn without_ref_wraparound<T>(f: impl FnOnce() -> T) -> T {
     let saved = REF_WRAPAROUND_LUMA.with(|c| c.replace(0));
+    // The subpicture clamp is a reference-picture-coordinate rule
+    // too (eqs. 631 / 632); patch-local reads suspend it alongside.
+    let saved_sub = REF_SUBPIC_CLIP.with(|c| c.replace(None));
     let out = f();
     REF_WRAPAROUND_LUMA.with(|c| c.set(saved));
+    REF_SUBPIC_CLIP.with(|c| c.set(saved_sub));
     out
 }
 
 /// Eq. 5 `ClipH( xOffset, picW, x )` followed by the
-/// `Clip3( 0, picW − 1, · )` picture clamp. `sub_w` is 1 for luma and
-/// `SubWidthC` for a chroma plane (eq. `xOffset =
+/// `Clip3( 0, picW − 1, · )` picture clamp (eq. 633 / 951) — or, with
+/// the subpicture arm armed via [`set_ref_subpic_clip`], the
+/// `Clip3( SubpicLeftBoundaryPos / SubWidthC, SubpicRightBoundaryPos
+/// / SubWidthC, ClipH( · ) )` clamp of eq. 631 / 949. `sub_w` is 1 for
+/// luma and `SubWidthC` for a chroma plane (eq. `xOffset =
 /// PpsRefWraparoundOffset * MinCbSizeY / SubWidthC`).
 #[inline]
 pub(crate) fn clip_ref_x(x: i32, pic_w: i32, sub_w: i32) -> usize {
@@ -2174,7 +2241,10 @@ pub(crate) fn clip_ref_x(x: i32, pic_w: i32, sub_w: i32) -> usize {
     } else {
         x
     };
-    x.clamp(0, pic_w - 1) as usize
+    match REF_SUBPIC_CLIP.with(|c| c.get()) {
+        Some((left, _, right, _)) => x.clamp(left / sub_w, (right / sub_w).min(pic_w - 1)) as usize,
+        None => x.clamp(0, pic_w - 1) as usize,
+    }
 }
 
 fn luma_h_8tap(
@@ -2224,7 +2294,7 @@ fn luma_v_only_8tap(
     let pic_h = plane.height as i32;
     let mut acc = 0i32;
     for i in 0..8 {
-        let yi = (y_int + (i as i32) - 3).clamp(0, pic_h - 1) as usize;
+        let yi = clip_ref_y(y_int + (i as i32) - 3, pic_h, 1);
         acc += coeffs[i] * (plane.samples[yi * plane.stride + x_clamped] as i32);
     }
     // shift1 = 0 for BitDepth = 8.
@@ -2307,7 +2377,7 @@ pub fn predict_luma_block_hpel(
     if y_frac == 0 {
         // Horizontal-only filter (eq. 933).
         for r in 0..h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = clip_ref_y(y_int_base + r, pic_h, 1);
             for c in 0..w as i32 {
                 let intermediate = luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel) >> shift1;
                 dst.samples
@@ -2341,7 +2411,7 @@ pub fn predict_luma_block_hpel(
         // Vertical row index pre-clipped per eq. 931. The H pass needs
         // y rows `yInt + i - 3` for i = 0..7 → rows `yInt - 3 + r`
         // with r covering the full intermediate height.
-        let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
+        let yi = clip_ref_y(y_int_base - 3 + r, pic_h, 1);
         for c in 0..w as i32 {
             intermediate[r as usize * w as usize + c as usize] =
                 luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel) >> shift1;
@@ -2432,7 +2502,7 @@ pub fn predict_luma_block_high_precision_hpel(
     // `<< (14 - BitDepth)` to land in BD + 6 precision.
     if x_frac == 0 && y_frac == 0 {
         for r in 0..h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = clip_ref_y(y_int_base + r, pic_h, 1);
             for c in 0..w as i32 {
                 let xi = clip_ref_x(x_int_base + c, pic_w, 1);
                 out[r as usize * w_us + c as usize] =
@@ -2446,7 +2516,7 @@ pub fn predict_luma_block_high_precision_hpel(
         // Horizontal-only filter (eq. 933). Output is in BD + 6
         // precision after `>> shift1`.
         for r in 0..h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = clip_ref_y(y_int_base + r, pic_h, 1);
             for c in 0..w as i32 {
                 let acc = luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel);
                 out[r as usize * w_us + c as usize] = acc >> shift1;
@@ -2473,7 +2543,7 @@ pub fn predict_luma_block_high_precision_hpel(
     let inter_h = h_us + 7;
     let mut intermediate = vec![0i32; inter_h * w_us];
     for r in 0..inter_h as i32 {
-        let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
+        let yi = clip_ref_y(y_int_base - 3 + r, pic_h, 1);
         for c in 0..w as i32 {
             intermediate[r as usize * w_us + c as usize] =
                 luma_h_8tap(src, x_int_base + c, yi, x_frac, hpel) >> shift1;
@@ -2559,7 +2629,7 @@ fn chroma_v_only_4tap(plane: &PicturePlane, x_clamped: usize, y_int: i32, y_frac
     let pic_h = plane.height as i32;
     let mut acc = 0i32;
     for i in 0..4 {
-        let yi = (y_int + (i as i32) - 1).clamp(0, pic_h - 1) as usize;
+        let yi = clip_ref_y(y_int + (i as i32) - 1, pic_h, 2);
         acc += coeffs[i] * (plane.samples[yi * plane.stride + x_clamped] as i32);
     }
     acc
@@ -2611,7 +2681,9 @@ pub fn predict_chroma_block(
     let y_frac = (mv.y & 31) as usize;
 
     if x_frac == 0 && y_frac == 0 {
-        return mc_copy_block_int(dst, dst_x_c, dst_y_c, w_c, h_c, src, x_int_base, y_int_base);
+        return mc_copy_block_int_sub(
+            dst, dst_x_c, dst_y_c, w_c, h_c, src, x_int_base, y_int_base, 2, 2,
+        );
     }
 
     let pic_w = src.width as i32;
@@ -2623,7 +2695,7 @@ pub fn predict_chroma_block(
     if y_frac == 0 {
         // Horizontal-only chroma filter (eq. 951).
         for r in 0..h_c as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = clip_ref_y(y_int_base + r, pic_h, 2);
             for c in 0..w_c as i32 {
                 let v = chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
                 dst.samples
@@ -2649,7 +2721,7 @@ pub fn predict_chroma_block(
     let inter_h = h_c as usize + 3;
     let mut intermediate = vec![0i32; inter_h * w_c as usize];
     for r in 0..inter_h as i32 {
-        let yi = (y_int_base - 1 + r).clamp(0, pic_h - 1) as usize;
+        let yi = clip_ref_y(y_int_base - 1 + r, pic_h, 2);
         for c in 0..w_c as i32 {
             intermediate[r as usize * w_c as usize + c as usize] =
                 chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
@@ -2967,7 +3039,7 @@ pub fn predict_chroma_block_high_precision(
 
     if x_frac == 0 && y_frac == 0 {
         for r in 0..h_c as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = clip_ref_y(y_int_base + r, pic_h, 2);
             for c in 0..w_c as i32 {
                 let xi = clip_ref_x(x_int_base + c, pic_w, 2);
                 out[r as usize * w_us + c as usize] =
@@ -2978,7 +3050,7 @@ pub fn predict_chroma_block_high_precision(
     }
     if y_frac == 0 {
         for r in 0..h_c as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = clip_ref_y(y_int_base + r, pic_h, 2);
             for c in 0..w_c as i32 {
                 out[r as usize * w_us + c as usize] =
                     chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
@@ -2999,7 +3071,7 @@ pub fn predict_chroma_block_high_precision(
     let inter_h = h_us + 3;
     let mut intermediate = vec![0i32; inter_h * w_us];
     for r in 0..inter_h as i32 {
-        let yi = (y_int_base - 1 + r).clamp(0, pic_h - 1) as usize;
+        let yi = clip_ref_y(y_int_base - 1 + r, pic_h, 2);
         for c in 0..w_c as i32 {
             intermediate[r as usize * w_us + c as usize] =
                 chroma_h_4tap(src, x_int_base + c, yi, x_frac) >> shift1;
@@ -3045,7 +3117,7 @@ pub fn predict_luma_block_high_precision_dmvr_hpel(
     let ph = h as usize + 7;
     let mut patch = PicturePlane::filled_bd(pw, ph, 0, src.bit_depth);
     for r in 0..ph {
-        let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;
+        let sy = clip_ref_y(top + r as i32, src.height as i32, 1);
         for c in 0..pw {
             let sx = clip_ref_x(left + c as i32, src.width as i32, 1);
             patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
@@ -3104,7 +3176,7 @@ pub fn predict_chroma_block_high_precision_dmvr(
     let ph = h_c as usize + 3;
     let mut patch = PicturePlane::filled_bd(pw, ph, 0, src.bit_depth);
     for r in 0..ph {
-        let sy = (top + r as i32).clamp(0, src.height as i32 - 1) as usize;
+        let sy = clip_ref_y(top + r as i32, src.height as i32, 2);
         for c in 0..pw {
             let sx = clip_ref_x(left + c as i32, src.width as i32, 2);
             patch.samples[r * patch.stride + c] = src.samples[sy * src.stride + sx];
@@ -6319,5 +6391,43 @@ mod tests {
             8
         )
         .is_err());
+    }
+
+    /// r456 — §8.5.6.3.2 eqs. 928 / 929: with the subpicture arm armed,
+    /// every reference fetch (the fractional helpers and the
+    /// integer-pel copy alike) clamps to the eq. 114 subpicture bounds
+    /// instead of the picture; chroma divides by SubWidthC /
+    /// SubHeightC.
+    #[test]
+    fn subpicture_clamp_gates_every_reference_fetch() {
+        let mut src = PicturePlane::filled(64, 64, 0);
+        for y in 0..64 {
+            for x in 0..64 {
+                src.samples[y * src.stride + x] = (y * 64 + x) as u16;
+            }
+        }
+        set_ref_subpic_clip(Some((32, 32, 63, 63)));
+        assert_eq!(clip_ref_x(10, 64, 1), 32);
+        assert_eq!(clip_ref_x(70, 64, 1), 63);
+        assert_eq!(clip_ref_y(31, 64, 1), 32);
+        assert_eq!(clip_ref_x(3, 32, 2), 16);
+        assert_eq!(clip_ref_y(40, 32, 2), 31);
+        let mut dst = PicturePlane::filled(8, 8, 0);
+        mc_copy_block_int_sub(&mut dst, 0, 0, 8, 8, &src, 28, 30, 1, 1).unwrap();
+        // Rows 0 / 1 replicate row 32, columns 0..4 replicate column 32.
+        assert_eq!(dst.samples[0], (32 * 64 + 32) as u16);
+        assert_eq!(dst.samples[1 * dst.stride + 3], (32 * 64 + 32) as u16);
+        assert_eq!(dst.samples[2 * dst.stride + 4], (32 * 64 + 32) as u16);
+        assert_eq!(dst.samples[3 * dst.stride + 5], (33 * 64 + 33) as u16);
+        // The patch-local wrapper suspends the clamp.
+        without_ref_wraparound(|| {
+            assert_eq!(clip_ref_x(10, 64, 1), 10);
+            assert_eq!(clip_ref_y(10, 64, 1), 10);
+        });
+        assert_eq!(clip_ref_x(10, 64, 1), 32);
+        set_ref_subpic_clip(None);
+        assert_eq!(clip_ref_x(10, 64, 1), 10);
+        mc_copy_block_int_sub(&mut dst, 0, 0, 8, 8, &src, 28, 30, 1, 1).unwrap();
+        assert_eq!(dst.samples[0], (30 * 64 + 28) as u16);
     }
 }

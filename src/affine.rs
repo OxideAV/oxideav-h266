@@ -630,7 +630,7 @@ pub fn predict_luma_subblock_affine(
     // Integer-pel fast path mirrors the §8.5.6.3 eq. 932 shortcut.
     if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
         for r in 0..sb_h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = crate::inter::clip_ref_y(y_int_base + r, pic_h, 1);
             for c in 0..sb_w as i32 {
                 let xi = crate::inter::clip_ref_x(x_int_base + c, pic_w, 1);
                 dst.samples
@@ -644,7 +644,7 @@ pub fn predict_luma_subblock_affine(
     if y_frac == 0 {
         // Horizontal-only filter.
         for r in 0..sb_h as i32 {
-            let yi = (y_int_base + r).clamp(0, pic_h - 1) as usize;
+            let yi = crate::inter::clip_ref_y(y_int_base + r, pic_h, 1);
             for c in 0..sb_w as i32 {
                 let intermediate = h_tap(table, src, x_int_base + c, yi, x_frac) >> shift1;
                 dst.samples
@@ -673,7 +673,7 @@ pub fn predict_luma_subblock_affine(
     let inter_h = sb_h as usize + 7;
     let mut intermediate = vec![0i32; inter_h * sb_w as usize];
     for r in 0..inter_h as i32 {
-        let yi = (y_int_base - 3 + r).clamp(0, pic_h - 1) as usize;
+        let yi = crate::inter::clip_ref_y(y_int_base - 3 + r, pic_h, 1);
         for c in 0..sb_w as i32 {
             intermediate[r as usize * sb_w as usize + c as usize] =
                 h_tap(table, src, x_int_base + c, yi, x_frac) >> shift1;
@@ -735,7 +735,7 @@ fn v_only_tap(
     let pic_h = plane.height as i32;
     let mut acc = 0i32;
     for i in 0..8 {
-        let yi = (y_int + (i as i32) - 3).clamp(0, pic_h - 1) as usize;
+        let yi = crate::inter::clip_ref_y(y_int + (i as i32) - 3, pic_h, 1);
         acc += coeffs[i] * (plane.samples[yi * plane.stride + x_clamped] as i32);
     }
     acc
@@ -1073,18 +1073,19 @@ pub fn predict_luma_subblock_affine_high_precision(
         if c == 0 || r == 0 || c == out_w as i32 - 1 || r == out_h as i32 - 1 {
             let xi =
                 crate::inter::clip_ref_x(x_int_base + local_x + ((x_frac as i32) >> 3), pic_w, 1);
-            let yi = (y_int_base + local_y + ((y_frac as i32) >> 3)).clamp(0, pic_h - 1) as usize;
+            let yi =
+                crate::inter::clip_ref_y(y_int_base + local_y + ((y_frac as i32) >> 3), pic_h, 1);
             return (src.samples[yi * src.stride + xi] as i32) << lift;
         }
         if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
             // Integer-pel fast path: lift to BitDepth + 6 precision
             // (eq. 932: `<< (14 - BitDepth)`).
-            let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
+            let yi = crate::inter::clip_ref_y(y_int_base + local_y, pic_h, 1);
             let xi = crate::inter::clip_ref_x(x_int_base + local_x, pic_w, 1);
             return (src.samples[yi * src.stride + xi] as i32) << lift;
         }
         if y_frac == 0 {
-            let yi = (y_int_base + local_y).clamp(0, pic_h - 1) as usize;
+            let yi = crate::inter::clip_ref_y(y_int_base + local_y, pic_h, 1);
             // Horizontal-only filter — the `>> shift1` H pass lands
             // at BitDepth + 6 precision.
             return h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
@@ -1096,7 +1097,7 @@ pub fn predict_luma_subblock_affine_high_precision(
         // 2D — H pass at column `local_x`, V pass over an 8-row column.
         let mut col = [0i32; 8];
         for i in 0..8 {
-            let yi = (y_int_base + local_y - 3 + i as i32).clamp(0, pic_h - 1) as usize;
+            let yi = crate::inter::clip_ref_y(y_int_base + local_y - 3 + i as i32, pic_h, 1);
             col[i] = h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
         }
         // v_tap applies `>> 6 = shift2 = 6`. After the H pass at

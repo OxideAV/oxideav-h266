@@ -4,6 +4,19 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- r456 — subpicture decoding: the slice header's `CurrSubpicIdx` resolves the §7.4.8 eq. 114 `Subpic*BoundaryPos` set, which clamps every reference fetch when `sps_subpic_treated_as_pic_flag` is set (§8.5.6.3.2 eqs. 928 / 929, the §8.5.6.3.4 chroma, §8.5.3.2.2 DMVR and §8.5.6.3.3 integer twins, and the integer-pel copy path), bounds the temporal collocated positions (§8.5.2.11 eqs. 594 / 595, §8.5.5.3 eq. 723, §8.5.5.4 eq. 730, §8.5.5.6 eqs. 772 / 773) and gates the §8.8 loop filters at `sps_loop_filter_across_subpic_enabled_flag = 0` boundaries. `SUBPIC_C_1`, `CodingToolsSets_E_1` and `LMCS_B_2` decode byte-exact (JVET scorecard 50P/1F/5U/0E → 53P/1F/2U/0E).
+- r456 — `alf::LfRegionMap` / `FetchClip`: the `pps_loop_filter_across_slices_enabled_flag = 0` and subpicture loop-filter gates are CTB-granular (§8.8.3.2 `filterEdgeFlag`, §8.8.4.2 `edgeIdx = 0`, §8.8.5.5 clip positions with the slice-only `clipTopLeftFlag` / `clipBotRightFlag` corner rule) instead of full grid lines; non-line slice layouts no longer surface `Unsupported`.
+- r456 — §8.8.3.6.2 eqs. 1272 / 1273 luma-adaptive deblocking (`sps_ladf_enabled_flag`): `deblock::LadfTable` + the per-segment `lumaLevel` `qpOffset`.
+- r456 — triage hooks `H266_DBG_SH`, `H266_DBG_PH`, `H266_DBG_SUBPIC_CLIP=off|shrink`, `H266_DBG_LF_REGION=off`, `H266_DBG_TILE_GATE=off`; `examples/sps_dump` prints the subpicture layout and the PPS info-in-PH flags.
+
+### Fixed
+
+- r456 — §7.4.8: under `pps_alf_info_in_ph_flag = 1` every `sh_alf_*` element infers to its `ph_alf_*` value (`slice_header::PhAlfState` on `PhState`); the parser previously left such slices ALF-off and desynced on the first CTU's ALF bins.
+- r456 — the integer-pel MC copy (`inter::mc_copy_block_int`) clamps through the same reference helpers as the fractional paths (eq. 5 `ClipH` wraparound + the subpicture arm) instead of a bare picture-edge `Clip3`.
+- r456 — the slice-data walk keys `CtbAddrInCurrSlice[]` on the eq. 23-resolved picture-level slice index rather than the subpicture-level `sh_slice_address`.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-h266/compare/v0.0.8...v0.0.9) - 2026-08-30
 
 ### Other

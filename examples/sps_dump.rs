@@ -30,6 +30,32 @@ fn main() {
                     sps.tool_flags
                 );
                 println!("partition: {:#?}", sps.partition_constraints);
+                println!(
+                    "chroma_format_idc={} subpic_info_present={}",
+                    sps.sps_chroma_format_idc, sps.sps_subpic_info_present_flag
+                );
+                if let Some(info) = &sps.subpic_info {
+                    println!(
+                        "subpics: n={} independent={} same_size={} id_len_minus1={} explicit_ids={} ids={:?}",
+                        info.num_subpics_minus1 + 1,
+                        info.independent_subpics_flag,
+                        info.subpic_same_size_flag,
+                        info.subpic_id_len_minus1,
+                        info.subpic_id_mapping_explicitly_signalled_flag,
+                        info.subpic_ids,
+                    );
+                    for (i, sp) in info.subpics.iter().enumerate() {
+                        println!(
+                            "  subpic {i}: ctu_xy=({},{}) w={} h={} treated_as_pic={} lf_across={}",
+                            sp.ctu_top_left_x,
+                            sp.ctu_top_left_y,
+                            sp.width_minus1 + 1,
+                            sp.height_minus1 + 1,
+                            sp.treated_as_pic_flag,
+                            sp.loop_filter_across_subpic_enabled_flag,
+                        );
+                    }
+                }
             }
             NalUnitType::PpsNut => {
                 let pps = parse_pps(&extract_rbsp(nal.payload())).unwrap();
@@ -72,6 +98,13 @@ fn main() {
                     pps.pps_joint_cbcr_qp_offset_value,
                     pps.pps_joint_cbcr_qp_offset_list,
                     pps.pps_chroma_tool_offsets_present_flag,
+                );
+                println!(
+                    "  rpl_in_ph={} single_slice_per_subpic={} mixed_nalu={} subpic_id_mapping={}",
+                    pps.pps_rpl_info_in_ph_flag,
+                    pps.pps_single_slice_per_subpic_flag,
+                    pps.pps_mixed_nalu_types_in_pic_flag,
+                    pps.pps_subpic_id_mapping_present_flag,
                 );
                 println!(
                     "  ref_wraparound={} pic_width_minus_wraparound_offset={} weighted_pred={} weighted_bipred={} wp_in_ph={}",

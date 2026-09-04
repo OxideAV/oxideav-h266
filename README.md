@@ -75,8 +75,23 @@ oxideav-h266 = "0.0"
     through the different-tile arm, a per-CTB slice map for the SAO /
     ALF prefix availability), and the
     `pps_loop_filter_across_slices_enabled_flag = 0` deblock / SAO /
-    ALF gates (composable with the across-tiles gates). Subpicture
-    layouts remain out of scope.
+    ALF gates (composable with the across-tiles gates). **r456 —
+    subpicture layouts walk**: the slice header's `CurrSubpicIdx`
+    resolves the §7.4.8 eq. 114 `Subpic*BoundaryPos` set, which
+    gates every reference fetch (§8.5.6.3.2 eqs. 928 / 929, the
+    §8.5.6.3.4 chroma / §8.5.3.2.2 DMVR / §8.5.6.3.3 integer twins —
+    integer-pel copies included), the temporal collocated bounds
+    (§8.5.2.11 eqs. 594 / 595, §8.5.5.3 eq. 723, §8.5.5.4 eq. 730,
+    §8.5.5.6 eqs. 772 / 773) and the
+    `sps_loop_filter_across_subpic_enabled_flag = 0` loop-filter
+    gates; the slice / subpicture gates travel as a CTB-granular
+    region map (`alf::LfRegionMap`), so non-grid-line slice layouts
+    (LMCS_B_2's 8 slices over 12 tiles) filter per §8.8.3.2 /
+    §8.8.4.2 / §8.8.5.5 including the slice-only `clipTopLeftFlag` /
+    `clipBotRightFlag` corner rule. `pps_alf_info_in_ph_flag = 1`
+    slices inherit every `sh_alf_*` element from the PH (§7.4.8),
+    and the luma deblocker applies the §8.8.3.6.2 eqs. 1272 / 1273
+    LADF `qpOffset`.
   * **APS** (§7.3.2.5) — ALF / LMCS / scaling-list type. The LMCS APS
     payload (§7.3.2.19) is decoded into a typed `lmcs::LmcsData`, with
     the BitDepth-dependent §7.4.3.19 derivations (`OrgCW`, `lmcsCW`,
@@ -661,12 +676,14 @@ produces them, an independent black-box decoder is the oracle, and
   neighbour-array bound (`2·nTbW` / `2·nTbH` — tall T-CCLM TBs picked
   their 4-point model from oversampled positions).
 
-Scorecard (r437 → r440 → r443 → r447 → r449 → r450 → r452 → r453):
-0 P / 2 F / 8 U / 46 E →
+Scorecard (r437 → r440 → r443 → r447 → r449 → r450 → r452 → r453 →
+r456): 0 P / 2 F / 8 U / 46 E →
 1 P / 7 F / 26 U / 22 E → 1 P / 14 F / 33 U / 8 E →
 2 P / 17 F / 8 U / 29 E → 14 P / 31 F / 9 U / 2 E →
 34 P / 12 F / 9 U / 1 E → 43 P / 4 F / 9 U / 0 E →
-**50 PASS / 1 FAIL / 5 UNSUPPORTED / 0 ERROR** — r453 closed the r452
+50 P / 1 F / 5 U / 0 E → **53 PASS / 1 FAIL / 2 UNSUPPORTED / 0 ERROR**
+— r456 landed subpictures (`SUBPIC_C_1`, `CodingToolsSets_E_1`,
+`LMCS_B_2` byte-exact, see the r456 rollup below). r453 closed the r452
 chroma-deblock margin family (§8.8.3.6.4's QpP/QpQ are per TRANSFORM
 BLOCK: a >MaxTbSizeY tile or SBT sub-TU with `TuCResMode == 2`
 deblocks with `Qp′CbCr`, one β step under `Qp′Cb` at
@@ -883,6 +900,41 @@ fixture wire that now decodes byte-exactly:
   containing each SAMPLE (`ClipRegions::rect_at`), which also serves
   mid-CTB boundaries (multiples of 8).
 
+**r456 — the subpicture family: 50 P → 53 P, U 5 → 2.** Root causes,
+each pinned against the corpus (a black-box `ffmpeg` decode supplied
+the per-sample diffs once the streams decoded end-to-end):
+
+* **§7.4.8 eq. 114 subpicture bounds** — `sps_subpic_treated_as_pic_flag`
+  clamps every reference fetch to the subpicture (§8.5.6.3.2 eqs.
+  928 / 929 and the chroma / DMVR / integer-fetch twins) and bounds the
+  temporal collocated positions (§8.5.2.11 / §8.5.5.3 / §8.5.5.4 /
+  §8.5.5.6). The **integer-pel copy path was the last fetch without
+  the clamp** — every `xFrac == yFrac == 0` block near a subpicture
+  boundary read the neighbouring subpicture (the `CodingToolsSets_E_1`
+  / `LMCS_B_2` / `SUBPIC_C_1` "every inter picture diverges" signature;
+  the same path also skipped the eq. 5 `ClipH` wraparound).
+* **§7.4.8 `sh_alf_*` inference under `pps_alf_info_in_ph_flag`** —
+  the slice header inherits the PH's whole ALF selection (enable,
+  luma APS ids, Cb / Cr, chroma APS, CC-ALF); the parser previously
+  left ALF off and desynced on the first CTU's ALF bins
+  (`SUBPIC_C_1` signals ALF / SAO / RPL / QP delta in the PH).
+* **§8.8.3.6.2 eqs. 1272 / 1273 LADF** — the luma deblocker's
+  `qpOffset` from the segment's `p0,0 / p0,3 / q0,0 / q0,3` luma level
+  and the §7.4.3.4 eq. 63 interval bounds (`CodingToolsSets_E_1` poc 0).
+* **CTB-granular §8.8 slice / subpicture gates** — the
+  `pps_loop_filter_across_slices_enabled_flag = 0` and
+  `sps_loop_filter_across_subpic_enabled_flag = 0` gates no longer
+  need full grid lines: `alf::LfRegionMap` carries per-CTB region ids
+  into the deblocker (§8.8.3.2 `filterEdgeFlag`), SAO (§8.8.4.2
+  `edgeIdx = 0`) and ALF / CC-ALF (§8.8.5.5 clip positions + the
+  slice-only `clipTopLeftFlag` / `clipBotRightFlag` corner rule via
+  `FetchClip`), which unblocked `LMCS_B_2`'s 8-slices-over-12-tiles
+  layout. Tile and §8.8.1 virtual-boundary gates keep the line lists.
+* **§7.4.8 picture-level slice index** — the slice-data walk keys
+  `CtbAddrInCurrSlice[]` on the eq. 23-resolved `pic_level_slice_idx`
+  (the subpicture-level `sh_slice_address` is 0 in every
+  single-slice subpicture).
+
 The one remaining FAIL row is `IBC_A_2` (12/17 pictures diverge,
 Cb + Cr only, luma byte-exact throughout). The r452 margin signature
 is NOT the cause (its pictures carry zero §8.8.3.6.9 strong-chroma
@@ -895,11 +947,8 @@ Full-dual-tree I pictures and VVenC wires with inter-picture SCIPU
 chroma decode byte-exactly, so the defect is specific to this VTM-10
 wire's SCIPU shapes; whole-stage skips (chroma deblock / SAO / ALF /
 CC-ALF) do not restore the md5 either, so it sits in the chroma
-reconstruction of those regions. The 5 UNSUPPORTED rows are
-subpictures (3: `SUBPIC_C_1`, `CodingToolsSets_E_1`, `LMCS_B_2` —
-need the §7.3.2.4 subpic layout walk, per-subpic slice parameters
-and the treated-as-pic boundary semantics) and 4:2:2 / 4:4:4 (2:
-`10b422_B_5`, `8b444_A_2` — the SubWidthC / SubHeightC
+reconstruction of those regions. The 2 UNSUPPORTED rows are
+4:2:2 / 4:4:4 (`10b422_B_5`, `8b444_A_2` — the SubWidthC / SubHeightC
 generalisation across intra chroma, MC, loop filters, LMCS and
 transforms). `examples/triage_dbg` decodes one
 corpus stream against its `.opl` sidecar with optional plane dumps;
@@ -917,7 +966,14 @@ weak / unfiltered path (the md5 hypothesis loop that pinned the r452
 margin unit), `H266_DBG_SKIP=<pic>,<stage>` (dbc / sao_c / alf_c /
 ccalf / dmvr / bdof) drops one stage for one picture, and
 `H266_DBG_WRAP=off` decodes as if `pps_ref_wraparound_enabled_flag`
-were 0. `H266_DUMP_PREFILTER`
+were 0. r456 hooks: `H266_DBG_SH` / `H266_DBG_PH` dump every parsed
+slice / picture header, `H266_DBG_SUBPIC_CLIP=off|shrink` decodes on
+the picture-wide reference / collocated arms (or deliberately
+mis-clamps 16 samples inside the subpicture, proving the clamp is
+live), `H266_DBG_LF_REGION=off` drops the CTB-granular slice /
+subpicture loop-filter gates and `H266_DBG_TILE_GATE=off` filters
+across tiles; `examples/sps_dump` prints the subpicture layout and
+the PPS info-in-PH flags. `H266_DUMP_PREFILTER`
 writes the pre-filter mapped-domain reconstruction per CVS / poc,
 `H266_DUMP_MIDLF` writes each deblocking pass's input, and
 `H266_DUMP_PARTIAL` keeps the partially reconstructed picture of a

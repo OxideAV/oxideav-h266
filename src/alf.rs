@@ -239,6 +239,19 @@ pub fn apply_alf_clipped(
     binding: &AlfApsBinding<'_>,
     tile_bounds: Option<(&[u32], &[u32])>,
 ) {
+    apply_alf_regions(out, alf_pic, cfg, binding, tile_bounds, None)
+}
+
+/// r456 — [`apply_alf_clipped`] with the CTB-granular slice /
+/// subpicture gate map (§8.8.5.5 `clipLeftPos` … `clipBotRightFlag`).
+pub(crate) fn apply_alf_regions(
+    out: &mut PictureBuffer,
+    alf_pic: &AlfPicture,
+    cfg: &AlfConfig,
+    binding: &AlfApsBinding<'_>,
+    tile_bounds: Option<(&[u32], &[u32])>,
+    region: Option<&LfRegionMap>,
+) {
     if std::env::var_os("H266_DBG_ALF_CTB").is_some() {
         eprintln!(
             "ALF apply: enabled={} all_off={} cb={} cr={} cc_cb={} cc_cr={}",
@@ -277,8 +290,9 @@ pub fn apply_alf_clipped(
     // r429 — per-CTB luma / chroma fetch-clip rectangles: the picture
     // by default, the containing tile when tile_bounds is installed.
     let (luma_w_i, luma_h_i) = (out.luma.width as i32, out.luma.height as i32);
-    let regions_y = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, 1, 1);
-    let regions_c = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, sub_w, sub_h);
+    let regions_y = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, 1, 1).with_region(region);
+    let regions_c =
+        ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, sub_w, sub_h).with_region(region);
 
     for ry in 0..alf_pic.pic_height_in_ctbs_y {
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
@@ -467,7 +481,7 @@ fn apply_cc_alf_ctb(
             // Map chroma → luma per eq. 1510.
             let xl = ((x_ctb_c + x) as i32) * (sub_w as i32);
             let yl = ((y_ctb_c + y) as i32) * (sub_h as i32);
-            let fetch_clip = regions.rect_at(xl, yl);
+            let fetch_clip = regions.clip_at(xl, yl);
 
             // Table 47 yP1 / yP2: in the single-slice / no-virtual-
             // boundary scaffold `applyAlfLineBufBoundary` is treated as
@@ -665,7 +679,7 @@ fn apply_alf_luma_ctb(
         for i in 0..i_max {
             let xs = (x_ctb + i) as i32;
             let ys = (y_ctb + j) as i32;
-            let fetch_clip = regions.rect_at(xs, ys);
+            let fetch_clip = regions.clip_at(xs, ys);
             // §8.8.5.3 — every 4×4 sub-block shares one (filtIdx,
             // transposeIdx). Look up the entry for this pixel.
             let sx = i >> 2;
@@ -858,7 +872,7 @@ pub(crate) fn derive_luma_classification(
             let y4 = (sy as i32) << 2;
             // §8.8.5.3 — the clip positions of the sub-block's own
             // origin bound the whole 8x8 gradient window.
-            let fetch_clip = regions.rect_at(x_ctb + x4, y_ctb + y4);
+            let fetch_clip = regions.clip_at(x_ctb + x4, y_ctb + y4);
 
             // §8.8.5.3 — derive (minY, maxY, ac) from y4.
             let (min_y, max_y, ac) = if y4 == ctb - 8 && carve_out_active {
@@ -1040,7 +1054,7 @@ fn apply_alf_chroma_ctb(
         for i in 0..i_max {
             let xs = (x_ctb_c + i) as i32;
             let ys = (y_ctb_c + j) as i32;
-            let fetch_clip = regions.rect_at(xs, ys);
+            let fetch_clip = regions.clip_at(xs, ys);
             let (alf_shift_c, y1, y2) = table_46(j as i32, ctb_h_c as i32, true);
             let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
             let clip = |k: usize, dx: i32, dy: i32| -> i32 {
@@ -1089,6 +1103,9 @@ pub(crate) struct ClipRegions {
     luma_h: i32,
     sub_w: i32,
     sub_h: i32,
+    /// r456 — per-CTB slice / subpicture gate ids (see
+    /// [`LfRegionMap`]); `None` when neither gate is active.
+    region: Option<LfRegionMap>,
 }
 
 impl From<(i32, i32, i32, i32)> for ClipRegions {
@@ -1100,7 +1117,130 @@ impl From<(i32, i32, i32, i32)> for ClipRegions {
             luma_h: rect.3,
             sub_w: 1,
             sub_h: 1,
+            region: None,
         }
+    }
+}
+
+/// r456 — the CTB-granular §8.8 loop-filter-across gates that are NOT
+/// full grid lines: rectangular / raster slices under
+/// `pps_loop_filter_across_slices_enabled_flag == 0` and subpictures
+/// under `sps_loop_filter_across_subpic_enabled_flag == 0`. Two CTBs
+/// with different `ids` sit across a gated boundary: deblocking skips
+/// the coinciding edges (§8.8.3.1 / §8.8.3.2 `filterEdgeFlag`), SAO
+/// forces `edgeIdx = 0` for a neighbour across it (§8.8.4.2), and the
+/// ALF / CC-ALF fetches clip at the CTB edge (§8.8.5.5
+/// `clipLeftPos` … `clipBottomPos`). `slice_ids` (per CTB, empty when
+/// the slice gate is off) additionally serves the §8.8.5.5
+/// `clipTopLeftFlag` / `clipBotRightFlag` diagonal rule, which the
+/// spec words for slices only (a rectangle cannot differ on the
+/// diagonal without differing on a side).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LfRegionMap {
+    ctb_log2: u32,
+    w_ctbs: usize,
+    h_ctbs: usize,
+    ids: Vec<u32>,
+    slice_ids: Vec<u32>,
+}
+
+impl LfRegionMap {
+    pub(crate) fn new(
+        ctb_log2: u32,
+        w_ctbs: usize,
+        h_ctbs: usize,
+        ids: Vec<u32>,
+        slice_ids: Vec<u32>,
+    ) -> Self {
+        debug_assert_eq!(ids.len(), w_ctbs * h_ctbs);
+        debug_assert!(slice_ids.is_empty() || slice_ids.len() == w_ctbs * h_ctbs);
+        Self {
+            ctb_log2,
+            w_ctbs,
+            h_ctbs,
+            ids,
+            slice_ids,
+        }
+    }
+
+    /// CTB coordinates of luma sample `(x, y)`; `None` outside the
+    /// picture's CTB grid.
+    #[inline]
+    fn ctb_of(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let (cx, cy) = ((x >> self.ctb_log2) as usize, (y >> self.ctb_log2) as usize);
+        (cx < self.w_ctbs && cy < self.h_ctbs).then_some((cx, cy))
+    }
+
+    #[inline]
+    fn id_at_ctb(&self, cx: usize, cy: usize) -> u32 {
+        self.ids[cy * self.w_ctbs + cx]
+    }
+
+    /// `true` when luma samples `(x, y)` and `(nx, ny)` are not
+    /// separated by a gated boundary (a neighbour outside the CTB grid
+    /// reads `false`).
+    #[inline]
+    pub(crate) fn same_region(&self, x: i32, y: i32, nx: i32, ny: i32) -> bool {
+        match (self.ctb_of(x, y), self.ctb_of(nx, ny)) {
+            (Some((ax, ay)), Some((bx, by))) => self.id_at_ctb(ax, ay) == self.id_at_ctb(bx, by),
+            _ => false,
+        }
+    }
+
+    /// §8.8.3.2 `filterEdgeFlag` arm: may the edge whose leading luma
+    /// position is `(x, y)` (`vertical` = EDGE_VER) be filtered as far
+    /// as the slice / subpicture gates are concerned?
+    #[inline]
+    pub(crate) fn edge_allowed(&self, vertical: bool, x: u32, y: u32) -> bool {
+        let (x, y) = (x as i32, y as i32);
+        if vertical {
+            self.same_region(x - 1, y, x, y)
+        } else {
+            self.same_region(x, y - 1, x, y)
+        }
+    }
+}
+
+/// r456 — the resolved §8.8.5.6 padding rule for one filtered sample:
+/// the half-open clip rectangle (component units, eqs. 1507 – 1510)
+/// plus the `clipTopLeftFlag` / `clipBotRightFlag` corner
+/// substitutions (`tl` = `(xCtbCur, yCtbCur)`, `br` = `(xCtbCur +
+/// CtbSizeHor − 1, yCtbCur + CtbSizeVer − 1)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FetchClip {
+    pub(crate) x0: i32,
+    pub(crate) y0: i32,
+    pub(crate) x1: i32,
+    pub(crate) y1: i32,
+    tl: Option<(i32, i32)>,
+    br: Option<(i32, i32)>,
+}
+
+impl FetchClip {
+    /// The padded fetch position for neighbour `(x, y)`.
+    #[inline]
+    pub(crate) fn clamp(&self, x: i32, y: i32) -> (usize, usize) {
+        let mut xc = x.clamp(self.x0, self.x1 - 1);
+        let yc = y.clamp(self.y0, self.y1 - 1);
+        if let Some((tx, ty)) = self.tl {
+            if xc < tx && yc < ty {
+                xc = tx;
+            }
+        }
+        if let Some((bx, by)) = self.br {
+            if xc > bx && yc > by {
+                xc = bx;
+            }
+        }
+        (xc as usize, yc as usize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_rect(&self) -> (i32, i32, i32, i32) {
+        (self.x0, self.y0, self.x1, self.y1)
     }
 }
 
@@ -1123,13 +1263,21 @@ impl ClipRegions {
             luma_h,
             sub_w: sw,
             sub_h: sh,
+            region: None,
         }
     }
 
-    /// Clip rectangle (component units, half-open) for the region
-    /// containing component sample `(x, y)`.
+    /// r456 — attach the CTB-granular slice / subpicture gate map.
+    pub(crate) fn with_region(mut self, region: Option<&LfRegionMap>) -> Self {
+        self.region = region.cloned();
+        self
+    }
+
+    /// Clip rectangle (component units, half-open) of the grid-line
+    /// region (tile / virtual-boundary strips) containing component
+    /// sample `(x, y)`.
     #[inline]
-    pub(crate) fn rect_at(&self, x: i32, y: i32) -> (i32, i32, i32, i32) {
+    fn strip_at(&self, x: i32, y: i32) -> (i32, i32, i32, i32) {
         let Some((col_bd, row_bd)) = &self.bounds else {
             return self.rect;
         };
@@ -1150,13 +1298,89 @@ impl ClipRegions {
             (y1 + self.sub_h - 1) / self.sub_h,
         )
     }
+
+    /// The §8.8.5.6 padding rule for the filter centred on component
+    /// sample `(x, y)`: the grid-line strip intersected with the
+    /// containing CTB's rectangle on every side whose neighbouring CTB
+    /// sits across a slice / subpicture gate (§8.8.5.5 `clipLeftPos`
+    /// … `clipBottomPos`), plus the diagonal corner flags.
+    #[inline]
+    pub(crate) fn clip_at(&self, x: i32, y: i32) -> FetchClip {
+        let (mut x0, mut y0, mut x1, mut y1) = self.strip_at(x, y);
+        let mut tl = None;
+        let mut br = None;
+        if let Some(r) = &self.region {
+            if let Some((cx, cy)) = r.ctb_of(x * self.sub_w, y * self.sub_h) {
+                let ctb_w_c = (1i32 << r.ctb_log2) / self.sub_w;
+                let ctb_h_c = (1i32 << r.ctb_log2) / self.sub_h;
+                let cur = r.id_at_ctb(cx, cy);
+                let same = |dx: i32, dy: i32| -> bool {
+                    let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                    nx >= 0
+                        && ny >= 0
+                        && (nx as usize) < r.w_ctbs
+                        && (ny as usize) < r.h_ctbs
+                        && r.id_at_ctb(nx as usize, ny as usize) == cur
+                };
+                let (cxi, cyi) = (cx as i32, cy as i32);
+                if !same(-1, 0) {
+                    x0 = x0.max(cxi * ctb_w_c);
+                }
+                if !same(1, 0) {
+                    x1 = x1.min((cxi + 1) * ctb_w_c);
+                }
+                if !same(0, -1) {
+                    y0 = y0.max(cyi * ctb_h_c);
+                }
+                if !same(0, 1) {
+                    y1 = y1.min((cyi + 1) * ctb_h_c);
+                }
+                if !r.slice_ids.is_empty() {
+                    let sid = |nx: usize, ny: usize| r.slice_ids[ny * r.w_ctbs + nx];
+                    let me = sid(cx, cy);
+                    if cx > 0 && cy > 0 && sid(cx - 1, cy - 1) != me {
+                        tl = Some((cxi * ctb_w_c, cyi * ctb_h_c));
+                    }
+                    if cx + 1 < r.w_ctbs && cy + 1 < r.h_ctbs && sid(cx + 1, cy + 1) != me {
+                        br = Some(((cxi + 1) * ctb_w_c - 1, (cyi + 1) * ctb_h_c - 1));
+                    }
+                }
+            }
+        }
+        FetchClip {
+            x0,
+            y0,
+            x1,
+            y1,
+            tl,
+            br,
+        }
+    }
+
+    /// §8.8.4.2 — is component neighbour `(nx, ny)` of sample `(x, y)`
+    /// reachable (same grid-line strip, no slice / subpicture gate
+    /// between them)? Positions outside the picture read `false`.
+    #[inline]
+    pub(crate) fn neighbour_in_region(&self, x: i32, y: i32, nx: i32, ny: i32) -> bool {
+        let (x0, y0, x1, y1) = self.strip_at(x, y);
+        if nx < x0 || ny < y0 || nx >= x1 || ny >= y1 {
+            return false;
+        }
+        match &self.region {
+            Some(r) => r.same_region(
+                x * self.sub_w,
+                y * self.sub_h,
+                nx * self.sub_w,
+                ny * self.sub_h,
+            ),
+            None => true,
+        }
+    }
 }
 
 #[inline]
-fn sample(buf: &[u16], stride: usize, fetch_clip: (i32, i32, i32, i32), x: i32, y: i32) -> u16 {
-    let (x0, y0, x1, y1) = fetch_clip;
-    let xc = x.clamp(x0, x1 - 1) as usize;
-    let yc = y.clamp(y0, y1 - 1) as usize;
+fn sample(buf: &[u16], stride: usize, fetch_clip: FetchClip, x: i32, y: i32) -> u16 {
+    let (xc, yc) = fetch_clip.clamp(x, y);
     buf[yc * stride + xc]
 }
 
@@ -1925,5 +2149,55 @@ mod tests {
         assert_eq!(cc_alf_table_47(ctb - 3, ctb, true), (1, 1));
         // Non-carve-out positions still get (1, 2).
         assert_eq!(cc_alf_table_47(0, ctb, true), (1, 2));
+    }
+
+    /// r456 — the CTB-granular slice / subpicture gate map: a 2×2 grid
+    /// of 32-sample CTBs whose columns sit in different regions clips
+    /// the ALF fetch at the column boundary only, keeps the SAO
+    /// neighbour test symmetric, and gates the deblocking edge on the
+    /// boundary; the slice-only §8.8.5.5 corner rule substitutes the
+    /// top-left diagonal fetch.
+    #[test]
+    fn lf_region_map_clips_at_gated_ctb_edges_only() {
+        // ids: column 0 → region 0, column 1 → region 1.
+        let map = LfRegionMap::new(5, 2, 2, vec![0, 1, 0, 1], Vec::new());
+        assert!(map.same_region(30, 5, 30, 40));
+        assert!(!map.same_region(30, 5, 33, 5));
+        assert!(!map.same_region(30, 5, -1, 5));
+        assert!(!map.edge_allowed(true, 32, 0));
+        assert!(map.edge_allowed(false, 0, 32));
+        assert!(map.edge_allowed(false, 40, 32));
+        let regions = ClipRegions::new(None, 64, 64, 1, 1).with_region(Some(&map));
+        // Sample (30, 5): right side clipped at x = 32, top / left /
+        // bottom at the picture.
+        let c = regions.clip_at(30, 5);
+        assert_eq!(c.as_rect(), (0, 0, 32, 64));
+        assert_eq!(c.clamp(35, 5), (31, 5));
+        assert_eq!(c.clamp(30, -3), (30, 0));
+        // Sample (40, 40) in CTB (1, 1): left side clipped at x = 32.
+        let c = regions.clip_at(40, 40);
+        assert_eq!(c.as_rect(), (32, 0, 64, 64));
+        assert_eq!(c.clamp(29, 40), (32, 40));
+        assert!(regions.neighbour_in_region(30, 5, 30, 6));
+        assert!(!regions.neighbour_in_region(30, 5, 32, 5));
+        assert!(!regions.neighbour_in_region(40, 40, 31, 39));
+        // Chroma (4:2:0) geometry halves everything.
+        let regions_c = ClipRegions::new(None, 64, 64, 2, 2).with_region(Some(&map));
+        assert_eq!(regions_c.clip_at(15, 2).as_rect(), (0, 0, 16, 32));
+        assert_eq!(regions_c.clip_at(20, 20).as_rect(), (16, 0, 32, 32));
+
+        // Slice corner rule: one region everywhere (nothing gated on
+        // the sides) but CTB (1, 1) is a different slice from CTB
+        // (0, 0) → a top-left diagonal fetch snaps to xCtbCur.
+        let map = LfRegionMap::new(5, 2, 2, vec![0, 0, 0, 0], vec![0, 0, 0, 1]);
+        let regions = ClipRegions::new(None, 64, 64, 1, 1).with_region(Some(&map));
+        let c = regions.clip_at(40, 40);
+        assert_eq!(c.as_rect(), (0, 0, 64, 64));
+        assert_eq!(c.clamp(31, 31), (32, 31));
+        assert_eq!(c.clamp(31, 40), (31, 40));
+        // Bottom-right rule from CTB (0, 0)'s point of view.
+        let c = regions.clip_at(5, 5);
+        assert_eq!(c.clamp(33, 33), (31, 33));
+        assert_eq!(c.clamp(33, 20), (33, 20));
     }
 }

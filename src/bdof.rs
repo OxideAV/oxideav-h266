@@ -246,7 +246,7 @@ pub fn build_extended_pred_bdof(
                 continue;
             }
             let xi = crate::inter::clip_ref_x(x_int_base + x as i32 - 1, pic_w, 1);
-            let yi = (y_int_base + y as i32 - 1).clamp(0, pic_h - 1) as usize;
+            let yi = crate::inter::clip_ref_y(y_int_base + y as i32 - 1, pic_h, 1);
             out[y * ext_w + x] = (src.samples[yi * src.stride + xi] as i32) << lift;
         }
     }
