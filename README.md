@@ -1024,7 +1024,7 @@ Registering the codec wires the decoder into `oxideav`'s codec
 registry:
 
 ```rust
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 let mut codecs = CodecRegistry::new();
 oxideav_h266::register_codecs(&mut codecs);
 ```
@@ -1042,7 +1042,8 @@ Parsing parameter sets directly without going through the registry:
 use oxideav_h266::nal::{iter_annex_b, extract_rbsp, NalUnitType};
 use oxideav_h266::sps::parse_sps;
 
-let bytes: &[u8] = /* Annex B stream */;
+# let stream: Vec<u8> = Vec::new();
+let bytes: &[u8] = &stream; // Annex B stream
 for nal in iter_annex_b(bytes) {
     if nal.header.nal_unit_type == NalUnitType::SpsNut {
         let rbsp = extract_rbsp(nal.payload());
