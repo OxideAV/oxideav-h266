@@ -2,7 +2,8 @@
 //! with this crate's decoder and (when a scratch dir is given and
 //! `ffmpeg` is installed) with `ffmpeg` as an opaque black-box
 //! validator, and compare both against the encoder's own
-//! reconstruction. `MTT=1` enables the MTT pickers.
+//! reconstruction. `MTT=1` enables the MTT pickers; `LOSSLESS=1` the
+//! lossless (transform-skip) mode.
 //!
 //! `cargo run --release --example encode_probe -- W H [QP] [SCRATCH_DIR]`
 use oxideav_h266::encoder::EncoderConfig;
@@ -33,6 +34,9 @@ fn main() {
     if std::env::var_os("MTT").is_some() {
         cfg.enable_mtt_bt_picker = true;
         cfg.enable_mtt_tt_picker = true;
+    }
+    if std::env::var_os("LOSSLESS").is_some() {
+        cfg.lossless = true;
     }
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, qp, cfg).unwrap();
     let psnr = oxideav_h266::encoder_pipeline::psnr_y(&src.luma, &rec.luma).unwrap();

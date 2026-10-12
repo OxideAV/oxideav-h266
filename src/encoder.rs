@@ -425,6 +425,19 @@ pub struct EncoderConfig {
     /// §8.8.4.2 edgeIdx = 0, §8.8.5.5/§8.8.5.6 fetch padding). Only
     /// meaningful with a multi-slice layout.
     pub loop_filter_across_slices: bool,
+    /// r474 — **lossless** coding: every TB is coded with
+    /// `transform_skip_flag = 1` through `residual_ts_coding()`
+    /// (§7.3.11.12) at `Qp′ = QpPrimeTsMin = 4`, where the §8.7.3
+    /// transform-skip scaling (`levelScale[ 4 ] · 16 = 2^10`,
+    /// `bdShift = 10`) is the identity, so the residual samples ARE the
+    /// coded levels; the in-loop filters are off (PPS
+    /// `pps_deblocking_filter_disabled_flag = 1`, `sh_alf_enabled_flag
+    /// = 0`, no SAO) and the SPS signals `sps_transform_skip_enabled_flag
+    /// = 1` with `MaxTsSize = 32` (leaf CUs cap at 32x32). The decoded
+    /// picture is bit-identical to the source. Mutually exclusive with
+    /// `dep_quant` / `sign_data_hiding` / `lmcs` / the MTT pickers /
+    /// `palette` / `enable_chroma_sao_merge`. Default `false`.
+    pub lossless: bool,
 }
 
 impl EncoderConfig {
@@ -451,6 +464,7 @@ impl EncoderConfig {
             slice_per_tile: false,
             raster_slice_count: 1,
             loop_filter_across_slices: true,
+            lossless: false,
         }
     }
 
@@ -591,6 +605,20 @@ impl EncoderConfig {
         if self.chroma_format_idc != 1 {
             return Err(Error::unsupported(
                 "h266 encoder: only 4:2:0 (chroma_format_idc = 1) is supported",
+            ));
+        }
+        if self.lossless
+            && (self.dep_quant
+                || self.sign_data_hiding
+                || self.lmcs.is_some()
+                || self.enable_mtt_bt_picker
+                || self.enable_mtt_tt_picker
+                || self.palette
+                || self.enable_chroma_sao_merge)
+        {
+            return Err(Error::invalid(
+                "h266 encoder: lossless excludes dep_quant / sign_data_hiding / lmcs / the MTT \
+                 pickers / palette / chroma SAO",
             ));
         }
         if self.slice_per_tile && (self.raster_slice_layout || self.raster_slice_count > 1) {
@@ -865,7 +893,13 @@ impl VvcEncoder {
         bw.write_bit(1); // max_luma_transform_size_64_flag
 
         // ---- Tool flags (§7.3.2.4 tail) ----
-        bw.write_bit(0); // transform_skip_enabled
+        // r474 — lossless codes every TB through transform skip:
+        // MaxTsSize = 32 (log2 − 2 = 3), BDPCM off.
+        bw.write_bit(self.config.lossless as u8); // sps_transform_skip_enabled_flag
+        if self.config.lossless {
+            bw.write_ue(3); // sps_log2_transform_skip_max_size_minus2 → MaxTsSize 32
+            bw.write_bit(0); // sps_bdpcm_enabled_flag
+        }
         bw.write_bit(0); // mts_enabled
         bw.write_bit(0); // lfnst_enabled
                          // chroma_format_idc != 0 → joint_cbcr + same_qp_table + QP tables.
@@ -932,7 +966,7 @@ impl VvcEncoder {
         bw.write_bit(0); // chroma_horizontal_collocated
         bw.write_bit(0); // chroma_vertical_collocated
         bw.write_bit(self.config.palette as u8); // sps_palette_enabled_flag
-        if self.config.palette {
+        if self.config.palette || self.config.lossless {
             // §7.3.2.4 — `sps_transform_skip_enabled_flag ||
             // sps_palette_enabled_flag` opens `sps_min_qp_prime_ts`;
             // 0 keeps the §7.4.3.4 eq. 61 floor at QpPrimeTsMin = 4.
@@ -1058,7 +1092,14 @@ impl VvcEncoder {
                         // §8.8.3 deblocker.
         bw.write_bit(1); // pps_cu_qp_delta_enabled_flag
         bw.write_bit(0); // pps_chroma_tool_offsets_present_flag
-        bw.write_bit(0); // pps_deblocking_filter_control_present_flag
+                         // r474 — lossless switches deblocking off picture-wide:
+                         // control present, no override, disabled (no beta / tc offsets
+                         // follow).
+        bw.write_bit(self.config.lossless as u8); // pps_deblocking_filter_control_present_flag
+        if self.config.lossless {
+            bw.write_bit(0); // pps_deblocking_filter_override_enabled_flag
+            bw.write_bit(1); // pps_deblocking_filter_disabled_flag
+        }
         if self.config.tile_grid().is_some() {
             // §7.3.2.5 — with `pps_no_pic_partition_flag = 0` the
             // `pps_*_info_in_ph_flag` gates are transmitted; all 0
@@ -1228,26 +1269,31 @@ impl VvcEncoder {
         // IDR nal_unit_type → sh_no_output_of_prior_pics_flag.
         bw.write_bit(0);
         // §7.3.7 ALF chain — sps_alf_enabled_flag && !pps_alf_info_in_ph_flag.
-        bw.write_bit(1); // sh_alf_enabled_flag = 1
-        bw.write_bits(chain.num_alf_aps_ids_luma as u32, 3);
-        for _ in 0..chain.num_alf_aps_ids_luma {
-            bw.write_bits(chain.luma_aps_id as u32, 3); // sh_alf_aps_id_luma[i]
-        }
-        if self.config.chroma_format_idc != 0 {
-            bw.write_bit(chain.ph_alf_cb_enabled_flag as u8);
-            bw.write_bit(chain.ph_alf_cr_enabled_flag as u8);
-        }
-        if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
-            bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
-        }
-        // sps_ccalf_enabled_flag = 1 in our SPS.
-        bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
-        if chain.ph_alf_cc_cb_enabled_flag {
-            bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
-        }
-        bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
-        if chain.ph_alf_cc_cr_enabled_flag {
-            bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+        // r474 — lossless slices switch ALF off (the chain is absent).
+        if self.config.lossless {
+            bw.write_bit(0); // sh_alf_enabled_flag = 0
+        } else {
+            bw.write_bit(1); // sh_alf_enabled_flag = 1
+            bw.write_bits(chain.num_alf_aps_ids_luma as u32, 3);
+            for _ in 0..chain.num_alf_aps_ids_luma {
+                bw.write_bits(chain.luma_aps_id as u32, 3); // sh_alf_aps_id_luma[i]
+            }
+            if self.config.chroma_format_idc != 0 {
+                bw.write_bit(chain.ph_alf_cb_enabled_flag as u8);
+                bw.write_bit(chain.ph_alf_cr_enabled_flag as u8);
+            }
+            if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
+                bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
+            }
+            // sps_ccalf_enabled_flag = 1 in our SPS.
+            bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
+            if chain.ph_alf_cc_cb_enabled_flag {
+                bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
+            }
+            bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
+            if chain.ph_alf_cc_cr_enabled_flag {
+                bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+            }
         }
         // sh_lmcs_used_flag — ph_lmcs_enabled_flag && separate PH.
         if self.config.lmcs.is_some() {
@@ -1279,6 +1325,13 @@ impl VvcEncoder {
             // sps_sign_data_hiding_enabled_flag == 1 and (by config
             // validation) sh_dep_quant_used_flag == 0.
             bw.write_bit(1); // sh_sign_data_hiding_used_flag = 1
+        }
+        // r474 — §7.3.7: sps_transform_skip_enabled_flag && !dep_quant
+        // && !SDH opens sh_ts_residual_coding_disabled_flag; lossless
+        // codes every TS block through residual_ts_coding() (0). The
+        // rice-idx field stays closed (no SPS range extension).
+        if self.config.lossless {
+            bw.write_bit(0); // sh_ts_residual_coding_disabled_flag = 0
         }
         // r429 — §7.4.8 entry-point offsets (NumEntryPoints > 0 is
         // derived by the receiver from the tile / WPP geometry; it

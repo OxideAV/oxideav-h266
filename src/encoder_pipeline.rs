@@ -65,7 +65,8 @@ use crate::intra::{predict_intra, IntraPredParams};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::ResidualCtxs;
 use crate::residual_enc::{
-    encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
+    encode_tb_coefficients_opts, encode_ts_tb_coefficients, write_cu_qp_delta,
+    write_transform_skip_flag, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
     write_tu_y_coded_flag,
 };
 use crate::sao::SaoConfig;
@@ -202,6 +203,10 @@ struct PreparedLumaTb {
     /// and `pps_cu_qp_delta_enabled_flag = 1`. The dequant on the
     /// decoder side will recover the same QP via §8.7.1.
     cu_qp_local: i32,
+    /// r474 — `transform_skip_flag = 1` on every component of this TB:
+    /// the levels are residual samples coded through
+    /// `residual_ts_coding()` (lossless pipeline).
+    transform_skip: bool,
 }
 
 /// r431 — one palette CU prepared by the first pass (§7.3.11.6 /
@@ -691,30 +696,67 @@ fn emit_tu_with_cbf(
 
     // Residual blocks per component — only emitted when the
     // corresponding CBF is set (§7.3.11.10's spec gate).
+    // r474 — a transform-skip TB codes `transform_skip_flag[cIdx] = 1`
+    // ahead of each coded component (the SPS enables TS with MaxTsSize
+    // = 32 ≥ every lossless TB, no BDPCM / ISP / SBT) and ships the
+    // levels through `residual_ts_coding()` (§7.3.11.12, Rice 1).
     if cbf_y {
-        encode_tb_coefficients_opts(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, &tb.levels, rc_opts)?;
+        if tb.transform_skip {
+            write_transform_skip_flag(enc, ctxs, 0, true)?;
+            encode_ts_tb_coefficients(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, 1, false, &tb.levels)?;
+        } else {
+            encode_tb_coefficients_opts(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, &tb.levels, rc_opts)?;
+        }
     }
     if cbf_cb {
-        encode_tb_coefficients_opts(
-            enc,
-            ctxs,
-            tb.n_tb_chroma_w,
-            tb.n_tb_chroma_h,
-            1,
-            &tb.cb_levels,
-            rc_opts,
-        )?;
+        if tb.transform_skip {
+            write_transform_skip_flag(enc, ctxs, 1, true)?;
+            encode_ts_tb_coefficients(
+                enc,
+                ctxs,
+                tb.n_tb_chroma_w,
+                tb.n_tb_chroma_h,
+                1,
+                1,
+                false,
+                &tb.cb_levels,
+            )?;
+        } else {
+            encode_tb_coefficients_opts(
+                enc,
+                ctxs,
+                tb.n_tb_chroma_w,
+                tb.n_tb_chroma_h,
+                1,
+                &tb.cb_levels,
+                rc_opts,
+            )?;
+        }
     }
     if cbf_cr {
-        encode_tb_coefficients_opts(
-            enc,
-            ctxs,
-            tb.n_tb_chroma_w,
-            tb.n_tb_chroma_h,
-            2,
-            &tb.cr_levels,
-            rc_opts,
-        )?;
+        if tb.transform_skip {
+            write_transform_skip_flag(enc, ctxs, 2, true)?;
+            encode_ts_tb_coefficients(
+                enc,
+                ctxs,
+                tb.n_tb_chroma_w,
+                tb.n_tb_chroma_h,
+                2,
+                1,
+                false,
+                &tb.cr_levels,
+            )?;
+        } else {
+            encode_tb_coefficients_opts(
+                enc,
+                ctxs,
+                tb.n_tb_chroma_w,
+                tb.n_tb_chroma_h,
+                2,
+                &tb.cr_levels,
+                rc_opts,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1154,7 +1196,141 @@ fn prepare_leaf_cu(
         cb_levels,
         cr_levels,
         cu_qp_local: cu_qp,
+        transform_skip: false,
     }))
+}
+
+/// r474 — lossless dual of [`prepare_leaf_cu`]: every component TB is
+/// a transform-skip block whose coded levels ARE the prediction
+/// residual (`Qp′ = QpPrimeTsMin = 4` makes the §8.7.3 scaling the
+/// identity), so the reconstruction equals the source exactly.
+fn prepare_leaf_cu_lossless(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    cu_qp: i32,
+) -> Result<PreparedCu> {
+    let levels = prepare_luma_tb_ts(&src.luma, &mut rec.luma, avail, x, y, n_tb_w, n_tb_h)?;
+    let chr_x = x / 2;
+    let chr_y = y / 2;
+    let n_tb_chroma_w = (n_tb_w / 2).max(4);
+    let n_tb_chroma_h = (n_tb_h / 2).max(4);
+    let cb_levels = prepare_chroma_tb_ts(
+        &src.cb,
+        &mut rec.cb,
+        avail,
+        1,
+        chr_x,
+        chr_y,
+        n_tb_chroma_w,
+        n_tb_chroma_h,
+    )?;
+    let cr_levels = prepare_chroma_tb_ts(
+        &src.cr,
+        &mut rec.cr,
+        avail,
+        2,
+        chr_x,
+        chr_y,
+        n_tb_chroma_w,
+        n_tb_chroma_h,
+    )?;
+    Ok(PreparedCu::Leaf(PreparedLumaTb {
+        n_tb_w,
+        n_tb_h,
+        levels,
+        n_tb_chroma_w,
+        n_tb_chroma_h,
+        cb_levels,
+        cr_levels,
+        cu_qp_local: cu_qp,
+        transform_skip: true,
+    }))
+}
+
+/// r474 — transform-skip luma TB: decoder-mirrored DC prediction, the
+/// residual IS the level array (§8.7.2 eq. 1129 `res = d`, identity
+/// scaling at `Qp′ = 4`), reconstruction = source.
+fn prepare_luma_tb_ts(
+    src: &PicturePlane,
+    rec_plane: &mut PicturePlane,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+) -> Result<Vec<i32>> {
+    let pred = predict_dc_block(
+        rec_plane,
+        &avail.luma,
+        avail.w,
+        avail.h,
+        avail.region_for(0),
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        0,
+    )?;
+    let mut levels = vec![0i32; n_tb_w * n_tb_h];
+    for ty in 0..n_tb_h {
+        for tx in 0..n_tb_w {
+            let p = pred[ty * n_tb_w + tx] as i32;
+            let s = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(p);
+            levels[ty * n_tb_w + tx] = s - p;
+            if x + tx < rec_plane.width && y + ty < rec_plane.height {
+                rec_plane.samples[(y + ty) * rec_plane.stride + x + tx] = s as u16;
+            }
+        }
+    }
+    avail.mark_luma(x, y, n_tb_w, n_tb_h);
+    Ok(levels)
+}
+
+/// r474 — transform-skip chroma TB (see [`prepare_luma_tb_ts`]).
+#[allow(clippy::too_many_arguments)]
+fn prepare_chroma_tb_ts(
+    chroma_src: &PicturePlane,
+    chroma_rec: &mut PicturePlane,
+    avail: &mut EncAvail,
+    c_idx: u32,
+    cx: usize,
+    cy: usize,
+    n_tb_c_w: usize,
+    n_tb_c_h: usize,
+) -> Result<Vec<i32>> {
+    let pred = predict_dc_block(
+        chroma_rec,
+        &avail.chroma,
+        avail.w / 2,
+        avail.h / 2,
+        avail.region_for(c_idx),
+        cx,
+        cy,
+        n_tb_c_w,
+        n_tb_c_h,
+        c_idx,
+    )?;
+    let mut levels = vec![0i32; n_tb_c_w * n_tb_c_h];
+    for ty in 0..n_tb_c_h {
+        for tx in 0..n_tb_c_w {
+            let p = pred[ty * n_tb_c_w + tx] as i32;
+            let s = chroma_src
+                .get(cx + tx, cy + ty)
+                .map(|v| v as i32)
+                .unwrap_or(p);
+            levels[ty * n_tb_c_w + tx] = s - p;
+            if cx + tx < chroma_rec.width && cy + ty < chroma_rec.height {
+                chroma_rec.samples[(cy + ty) * chroma_rec.stride + cx + tx] = s as u16;
+            }
+        }
+    }
+    avail.mark_chroma(cx, cy, n_tb_c_w, n_tb_c_h);
+    Ok(levels)
 }
 
 /// Round-56 — sum the per-leaf CABAC bin cost for one prepared CU. Used
@@ -2509,6 +2685,13 @@ pub fn encode_idr_with_qp_picker_cfg(
     };
     let lmcs_payload = config.lmcs;
     let vvc_enc = VvcEncoder::new(config)?;
+    // r474 — lossless: every TB is transform-skip coded at Qp′ =
+    // QpPrimeTsMin = 4 (8-bit: QpY = 4), leaf CUs cap at MaxTsSize =
+    // 32, and the in-loop filter chain is off (validate() excluded the
+    // tools that would fight this).
+    let lossless = config.lossless;
+    let slice_qp_y = if lossless { 4 } else { slice_qp_y };
+    let max_leaf = if lossless { 32 } else { MAX_LEAF_CU };
     let coding_src_owned: PictureBuffer;
     let coding_src: &PictureBuffer = if let Some(der) = lmcs_derived.as_ref() {
         let mut mapped = src.clone();
@@ -2698,7 +2881,7 @@ pub fn encode_idr_with_qp_picker_cfg(
             // walk. (Pre-r474 the prepare pass tiled a flat 64-grid and
             // rounded the picture remainder UP to a power of two, so any
             // non-64-multiple size coded CUs the decoder never walks.)
-            let slots = ctb_cu_slots(ctb_x, ctb_y, ctb_size, w as usize, h as usize);
+            let slots = ctb_cu_slots(ctb_x, ctb_y, ctb_size, w as usize, h as usize, max_leaf);
             for slot in slots {
                 {
                     let tb_x = slot.x;
@@ -2716,7 +2899,11 @@ pub fn encode_idr_with_qp_picker_cfg(
                     // CU. The encoder will signal `cu_qp_delta = cu_qp -
                     // prev_qp_in_qg` on the wire when CBFs are non-zero
                     // (round-52 `pps_cu_qp_delta_enabled_flag = 1`).
-                    let cu_qp = qp_picker(rx, ry, tx, ty).clamp(0, 63);
+                    let cu_qp = if lossless {
+                        slice_qp_y
+                    } else {
+                        qp_picker(rx, ry, tx, ty).clamp(0, 63)
+                    };
 
                     // Round-56 / Round-57 — when the MTT picker is enabled
                     // (BT and/or TT) and the candidate CU is a full 64×64
@@ -2765,7 +2952,11 @@ pub fn encode_idr_with_qp_picker_cfg(
                     } else {
                         None
                     };
-                    let cu = if let Some(p) = palette_cu {
+                    let cu = if lossless {
+                        prepare_leaf_cu_lossless(
+                            coding_src, &mut rec, &mut avail, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp,
+                        )?
+                    } else if let Some(p) = palette_cu {
                         PreparedCu::Palette(p)
                     } else if mtt_eligible {
                         prepare_cu_with_mtt_picker(
@@ -2815,539 +3006,589 @@ pub fn encode_idr_with_qp_picker_cfg(
         }
     }
 
-    // Apply deblocking. `bit_depth = 8` matches the round-35 8-bit
-    // pipeline scope; without this the strong-filter `scale_*_for_
-    // bit_depth` shifts overflow on any picture that triggers a
-    // strong-edge deblocking decision (eq. 1276 / 1345 do `<< (BitDepth
-    // − 8)`, and `BitDepth = 0` would shift by −8).
-    let dbp = DeblockParams {
-        disabled: false,
-        bit_depth: 8,
-        ctb_log2_size_y: 7, // encoder SPS: sps_log2_ctu_size_minus5 = 2
-        ..Default::default()
-    };
-    // Round-384 — §8.8.1 step 1: with LMCS on, the coding-loop
-    // reconstruction is in the mapped luma domain; the picture inverse
-    // mapping (§8.8.2.1 / §8.8.2.2) runs BEFORE deblocking so the
-    // deblock / SAO / ALF designs (which compare against the ORIGINAL
-    // source) operate in the original domain, mirroring the decoder's
-    // in-loop order.
-    if let (Some(der), Some(data)) = (lmcs_derived.as_ref(), lmcs_payload.as_ref()) {
-        let (min_bin, max_bin) = (data.lmcs_min_bin_idx, data.lmcs_max_bin_idx());
-        for v in rec.luma.samples.iter_mut() {
-            let s32 = u32::from(*v);
-            let iy = der.idx_y_inv(s32, min_bin, max_bin);
-            *v = der.inverse_map_luma_sample(s32, iy) as u16;
-        }
-    }
-    crate::deblock::apply_deblocking_clipped(
-        &mut rec,
-        &all_deblock_cus,
-        None,
-        None,
-        &dbp,
-        1,
-        &lf_no_filter_cols,
-        &lf_no_filter_rows,
-    );
-
-    // SAO decision + apply.
-    //
-    // Round-50 — chroma SAO RDO + apply lit up alongside luma now that
-    // round-49 emits real chroma residuals. The reconstructed Cb / Cr
-    // planes carry chroma quant / IDCT noise that the per-CTB §8.8.4.2
-    // BO + EO RDO can shave off the same way the luma path already does.
-    // [`sao_decide_picture`] already mirrors the per-CTU walk for
-    // chroma at the 4:2:0 half-resolution, and [`apply_sao`] gates the
-    // chroma branch on `cfg.chroma_used && chroma_format_idc != 0`. The
-    // SPS still carries `sao_enabled_flag = 0` (the round-50 encoder is
-    // a self-roundtrip pipeline; SAO modifies the in-loop reconstruction
-    // but is not signalled on the wire), so flipping `chroma_used` on
-    // changes only the *internal* reconstruction the PSNR test reads.
-    // r412 wire-conformance fix — SAO may only modify the coding-loop
-    // reconstruction when it is actually SIGNALLED: the pipeline emits
-    // SAO syntax exclusively under `enable_chroma_sao_merge` (chroma
-    // components only — `sps_sao_enabled_flag` mirrors the knob and the
-    // per-CTB emit runs with `luma_used = false`). The pre-r412 code
-    // designed and applied luma + chroma SAO unconditionally while
-    // signalling nothing, so no conforming decoder could reproduce the
-    // encoder reconstruction.
-    let sao_signalled_chroma = config.enable_chroma_sao_merge;
-    let sao_indep = sao_decide_picture(src, &rec, 7, 8, false, sao_signalled_chroma);
-    // Round-54 — when the encoder config opts in, run the per-CTB chroma
-    // SAO merge pass on top of the independent decisions. The returned
-    // `merged` SaoPicture rewrites the chroma slots to the chosen
-    // neighbour's params on every MergeLeft / MergeAbove CTB, and the
-    // returned `merge_map` flows into the second CABAC pass so the wire
-    // stream emits `sao_merge_*_flag = 1` for those CTBs.
-    let pic_w_in_ctbs = sao_indep.pic_width_in_ctbs_y;
-    let pic_h_in_ctbs = sao_indep.pic_height_in_ctbs_y;
-    let (sao_pic, sao_merge_map) = if config.enable_chroma_sao_merge {
-        crate::sao_enc::apply_chroma_sao_merge(src, &rec, &sao_indep, 8, 7)
-    } else {
+    // r474 — lossless skips the whole in-loop filter chain: nothing is
+    // applied to the (already exact) reconstruction, no APS ships, the
+    // per-CTB ALF / SAO syntax stays off.
+    #[allow(clippy::type_complexity)]
+    let (
+        alf_pic,
+        _ship_aps,
+        ship_chroma_aps,
+        ship_cc_cb,
+        ship_cc_cr,
+        sh_num_alf_aps_ids_luma,
+        ph_num_alf_aps_ids_luma,
+        sao_pic,
+        sao_merge_map,
+    ) = if lossless {
         (
-            sao_indep,
-            crate::sao::SaoMergeMap::empty(pic_w_in_ctbs, pic_h_in_ctbs),
+            crate::alf::AlfPicture::empty(pic_w_ctbs as u32, pic_h_ctbs as u32),
+            false,
+            false,
+            false,
+            false,
+            0u8,
+            0u8,
+            crate::sao::SaoPicture::empty(pic_w_ctbs as u32, pic_h_ctbs as u32),
+            crate::sao::SaoMergeMap::empty(pic_w_ctbs as u32, pic_h_ctbs as u32),
         )
-    };
-    let sao_cfg = SaoConfig {
-        luma_used: false,
-        chroma_used: sao_signalled_chroma,
-        bit_depth: 8,
-        ctb_log2_size_y: 7,
-        chroma_format_idc: 1,
-    };
-    crate::sao::apply_sao_clipped(&mut rec, &sao_pic, &sao_cfg, lf_bounds_ref);
+    } else {
+        // Apply deblocking. `bit_depth = 8` matches the round-35 8-bit
+        // pipeline scope; without this the strong-filter `scale_*_for_
+        // bit_depth` shifts overflow on any picture that triggers a
+        // strong-edge deblocking decision (eq. 1276 / 1345 do `<< (BitDepth
+        // − 8)`, and `BitDepth = 0` would shift by −8).
+        let dbp = DeblockParams {
+            disabled: false,
+            bit_depth: 8,
+            ctb_log2_size_y: 7, // encoder SPS: sps_log2_ctu_size_minus5 = 2
+            ..Default::default()
+        };
+        // Round-384 — §8.8.1 step 1: with LMCS on, the coding-loop
+        // reconstruction is in the mapped luma domain; the picture inverse
+        // mapping (§8.8.2.1 / §8.8.2.2) runs BEFORE deblocking so the
+        // deblock / SAO / ALF designs (which compare against the ORIGINAL
+        // source) operate in the original domain, mirroring the decoder's
+        // in-loop order.
+        if let (Some(der), Some(data)) = (lmcs_derived.as_ref(), lmcs_payload.as_ref()) {
+            let (min_bin, max_bin) = (data.lmcs_min_bin_idx, data.lmcs_max_bin_idx());
+            for v in rec.luma.samples.iter_mut() {
+                let s32 = u32::from(*v);
+                let iy = der.idx_y_inv(s32, min_bin, max_bin);
+                *v = der.inverse_map_luma_sample(s32, iy) as u16;
+            }
+        }
+        crate::deblock::apply_deblocking_clipped(
+            &mut rec,
+            &all_deblock_cus,
+            None,
+            None,
+            &dbp,
+            1,
+            &lf_no_filter_cols,
+            &lf_no_filter_rows,
+        );
 
-    // Round-41 — luma ALF filter-set RDO over all 16 fixed filter
-    // sets. The RDO chooses, per CTB, the lower-SSE_Y option among
-    // `{off, set 0, …, set 15}`.
-    //
-    // Round-43 — CC-ALF (§8.8.5.7) RDO is chained on top of the luma
-    // pass. CC-ALF reads from the *pre-luma-ALF* `recPictureL`, so we
-    // snapshot the luma plane before the luma RDO mutates it.
-    //
-    // Round-44 — primary chroma ALF (§8.8.5.4) RDO closes the on/off
-    // loop on Cb / Cr. Per §8.8.5.1 the primary chroma pass runs with
-    // luma in the same CTB walk and *before* CC-ALF (which adds onto
-    // the post-primary-chroma plane). Encoder-side we therefore order
-    // the passes:
-    //   1. snapshot pre-luma-ALF luma (CC-ALF reference);
-    //   2. luma RDO (mutates rec.luma);
-    //   3. primary chroma RDO for Cb (mutates rec.cb);
-    //   4. primary chroma RDO for Cr (mutates rec.cr);
-    //   5. CC-ALF RDO for Cb (reads pre-luma-ALF luma, mutates rec.cb);
-    //   6. CC-ALF RDO for Cr (reads pre-luma-ALF luma, mutates rec.cr).
-    // Both chroma APSes are synthesised in-memory with deliberately
-    // small magnitudes; the per-CTB SSE RDO leaves any component off
-    // whenever the trial does not lower SSE.
-    //
-    // Round-48 — design + (conditionally) emit a luma ALF APS at id 2.
-    //
-    // The round-47 single-row design is split into 25 independent
-    // §8.8.5.3 per-class Wiener fits via
-    // [`crate::alf_aps_design::design_per_class_luma_alf_filters`]. The
-    // per-class APS feeds (a) `emit_alf_aps_rbsp`, which deduplicates
-    // equal class rows so the wire format stays compact when the
-    // designer falls back to a single row, (b)
-    // `alf_decide_and_apply_with_aps`, which trial-applies the APS-
-    // signalled set alongside the 16 fixed sets and picks per CTB.
-    //
-    // Round-48 also adds a picture-level APS-vs-fixed-only competition:
-    // we run the RDO twice (once with the APS as a candidate, once
-    // without) and ship the APS NAL only when (a) at least one CTB
-    // picks the APS slot, and (b) the per-picture SSE_Y reduction
-    // exceeds the rate-distortion cost of the APS NAL. The rate-
-    // distortion cost approximates each APS byte at `lambda * 8` SSE
-    // units; `lambda` is a low-effort `2^((qp-12)/3)` curve calibrated
-    // against the round-47 baseline test pictures (QP 0 → ~0.04, QP 26
-    // → ~12.7). When the APS loses the trade-off we collapse the
-    // pipeline to round-46 fixed-only behaviour: skip the APS NAL,
-    // emit the PH with `ph_num_alf_aps_ids_luma = 0`, and configure
-    // the per-CTU walk with `sh_num_alf_aps_ids_luma = 0`.
-    //
-    // Per §7.4.2.4 the APS NAL must precede the picture header that
-    // references it; we therefore design + measure the APS *before*
-    // emitting either NAL.
-    let designed_per_class = crate::alf_aps_design::design_per_class_luma_alf_filters(src, &rec);
-    // Round-54 — when the encoder config opts in, run the per-tap luma
-    // ALF clip-index RDO on top of the per-class coefficient design.
-    // The result packs into an `AlfApsData` whose wire format carries
-    // `alf_luma_clip_flag = 1` plus the per-tap `alf_luma_clip_idx[]`
-    // block when at least one tap picked a non-zero index. When no tap
-    // wins, the packed APS stays wire-identical to the round-48 path
-    // (clip flag = 0, no per-tap block).
-    let luma_alf_aps = if config.enable_alf_clip_rdo {
-        let clip_rdo = crate::alf_aps_design::design_clip_rdo_for_luma_aps(
+        // SAO decision + apply.
+        //
+        // Round-50 — chroma SAO RDO + apply lit up alongside luma now that
+        // round-49 emits real chroma residuals. The reconstructed Cb / Cr
+        // planes carry chroma quant / IDCT noise that the per-CTB §8.8.4.2
+        // BO + EO RDO can shave off the same way the luma path already does.
+        // [`sao_decide_picture`] already mirrors the per-CTU walk for
+        // chroma at the 4:2:0 half-resolution, and [`apply_sao`] gates the
+        // chroma branch on `cfg.chroma_used && chroma_format_idc != 0`. The
+        // SPS still carries `sao_enabled_flag = 0` (the round-50 encoder is
+        // a self-roundtrip pipeline; SAO modifies the in-loop reconstruction
+        // but is not signalled on the wire), so flipping `chroma_used` on
+        // changes only the *internal* reconstruction the PSNR test reads.
+        // r412 wire-conformance fix — SAO may only modify the coding-loop
+        // reconstruction when it is actually SIGNALLED: the pipeline emits
+        // SAO syntax exclusively under `enable_chroma_sao_merge` (chroma
+        // components only — `sps_sao_enabled_flag` mirrors the knob and the
+        // per-CTB emit runs with `luma_used = false`). The pre-r412 code
+        // designed and applied luma + chroma SAO unconditionally while
+        // signalling nothing, so no conforming decoder could reproduce the
+        // encoder reconstruction.
+        let sao_signalled_chroma = config.enable_chroma_sao_merge;
+        let sao_indep = sao_decide_picture(src, &rec, 7, 8, false, sao_signalled_chroma);
+        // Round-54 — when the encoder config opts in, run the per-CTB chroma
+        // SAO merge pass on top of the independent decisions. The returned
+        // `merged` SaoPicture rewrites the chroma slots to the chosen
+        // neighbour's params on every MergeLeft / MergeAbove CTB, and the
+        // returned `merge_map` flows into the second CABAC pass so the wire
+        // stream emits `sao_merge_*_flag = 1` for those CTBs.
+        let pic_w_in_ctbs = sao_indep.pic_width_in_ctbs_y;
+        let pic_h_in_ctbs = sao_indep.pic_height_in_ctbs_y;
+        let (sao_pic, sao_merge_map) = if config.enable_chroma_sao_merge {
+            crate::sao_enc::apply_chroma_sao_merge(src, &rec, &sao_indep, 8, 7)
+        } else {
+            (
+                sao_indep,
+                crate::sao::SaoMergeMap::empty(pic_w_in_ctbs, pic_h_in_ctbs),
+            )
+        };
+        let sao_cfg = SaoConfig {
+            luma_used: false,
+            chroma_used: sao_signalled_chroma,
+            bit_depth: 8,
+            ctb_log2_size_y: 7,
+            chroma_format_idc: 1,
+        };
+        crate::sao::apply_sao_clipped(&mut rec, &sao_pic, &sao_cfg, lf_bounds_ref);
+
+        // Round-41 — luma ALF filter-set RDO over all 16 fixed filter
+        // sets. The RDO chooses, per CTB, the lower-SSE_Y option among
+        // `{off, set 0, …, set 15}`.
+        //
+        // Round-43 — CC-ALF (§8.8.5.7) RDO is chained on top of the luma
+        // pass. CC-ALF reads from the *pre-luma-ALF* `recPictureL`, so we
+        // snapshot the luma plane before the luma RDO mutates it.
+        //
+        // Round-44 — primary chroma ALF (§8.8.5.4) RDO closes the on/off
+        // loop on Cb / Cr. Per §8.8.5.1 the primary chroma pass runs with
+        // luma in the same CTB walk and *before* CC-ALF (which adds onto
+        // the post-primary-chroma plane). Encoder-side we therefore order
+        // the passes:
+        //   1. snapshot pre-luma-ALF luma (CC-ALF reference);
+        //   2. luma RDO (mutates rec.luma);
+        //   3. primary chroma RDO for Cb (mutates rec.cb);
+        //   4. primary chroma RDO for Cr (mutates rec.cr);
+        //   5. CC-ALF RDO for Cb (reads pre-luma-ALF luma, mutates rec.cb);
+        //   6. CC-ALF RDO for Cr (reads pre-luma-ALF luma, mutates rec.cr).
+        // Both chroma APSes are synthesised in-memory with deliberately
+        // small magnitudes; the per-CTB SSE RDO leaves any component off
+        // whenever the trial does not lower SSE.
+        //
+        // Round-48 — design + (conditionally) emit a luma ALF APS at id 2.
+        //
+        // The round-47 single-row design is split into 25 independent
+        // §8.8.5.3 per-class Wiener fits via
+        // [`crate::alf_aps_design::design_per_class_luma_alf_filters`]. The
+        // per-class APS feeds (a) `emit_alf_aps_rbsp`, which deduplicates
+        // equal class rows so the wire format stays compact when the
+        // designer falls back to a single row, (b)
+        // `alf_decide_and_apply_with_aps`, which trial-applies the APS-
+        // signalled set alongside the 16 fixed sets and picks per CTB.
+        //
+        // Round-48 also adds a picture-level APS-vs-fixed-only competition:
+        // we run the RDO twice (once with the APS as a candidate, once
+        // without) and ship the APS NAL only when (a) at least one CTB
+        // picks the APS slot, and (b) the per-picture SSE_Y reduction
+        // exceeds the rate-distortion cost of the APS NAL. The rate-
+        // distortion cost approximates each APS byte at `lambda * 8` SSE
+        // units; `lambda` is a low-effort `2^((qp-12)/3)` curve calibrated
+        // against the round-47 baseline test pictures (QP 0 → ~0.04, QP 26
+        // → ~12.7). When the APS loses the trade-off we collapse the
+        // pipeline to round-46 fixed-only behaviour: skip the APS NAL,
+        // emit the PH with `ph_num_alf_aps_ids_luma = 0`, and configure
+        // the per-CTU walk with `sh_num_alf_aps_ids_luma = 0`.
+        //
+        // Per §7.4.2.4 the APS NAL must precede the picture header that
+        // references it; we therefore design + measure the APS *before*
+        // emitting either NAL.
+        let designed_per_class =
+            crate::alf_aps_design::design_per_class_luma_alf_filters(src, &rec);
+        // Round-54 — when the encoder config opts in, run the per-tap luma
+        // ALF clip-index RDO on top of the per-class coefficient design.
+        // The result packs into an `AlfApsData` whose wire format carries
+        // `alf_luma_clip_flag = 1` plus the per-tap `alf_luma_clip_idx[]`
+        // block when at least one tap picked a non-zero index. When no tap
+        // wins, the packed APS stays wire-identical to the round-48 path
+        // (clip flag = 0, no per-tap block).
+        let luma_alf_aps = if config.enable_alf_clip_rdo {
+            let clip_rdo = crate::alf_aps_design::design_clip_rdo_for_luma_aps(
+                src,
+                &rec,
+                &designed_per_class.coeff,
+                7,
+                8,
+                1,
+            );
+            crate::alf_aps_design::build_per_class_luma_alf_aps_data_with_clip(&clip_rdo)
+        } else {
+            crate::alf_aps_design::build_per_class_luma_alf_aps_data(&designed_per_class)
+        };
+
+        // CC-ALF reads from the *pre-luma-ALF* `recPictureL` (eq. 1515 /
+        // §8.8.5.7). Snapshot the post-SAO luma plane *before* the
+        // luma-ALF RDO mutates `rec`, regardless of the trade-off branch.
+        let pre_luma_alf_samples = rec.luma.samples.clone();
+
+        // Trial 1 — fixed-only RDO on a clone of `rec`.
+        let mut rec_fixed_only = rec.clone();
+        let alf_pic_fixed_only = crate::alf_enc::alf_decide_and_apply_clipped(
             src,
-            &rec,
-            &designed_per_class.coeff,
+            &mut rec_fixed_only,
             7,
             8,
             1,
+            lf_bounds_ref,
         );
-        crate::alf_aps_design::build_per_class_luma_alf_aps_data_with_clip(&clip_rdo)
-    } else {
-        crate::alf_aps_design::build_per_class_luma_alf_aps_data(&designed_per_class)
-    };
+        let sse_fixed_only = total_sse_y(&src.luma, &rec_fixed_only.luma);
 
-    // CC-ALF reads from the *pre-luma-ALF* `recPictureL` (eq. 1515 /
-    // §8.8.5.7). Snapshot the post-SAO luma plane *before* the
-    // luma-ALF RDO mutates `rec`, regardless of the trade-off branch.
-    let pre_luma_alf_samples = rec.luma.samples.clone();
+        // Trial 2 — APS + fixed RDO on a clone of `rec`. Cheap because the
+        // RDO scales linearly with the number of trial sets and the test
+        // pictures are at most 128×128.
+        let mut rec_with_aps = rec.clone();
+        let alf_pic_with_aps = crate::alf_enc::alf_decide_and_apply_with_aps_clipped(
+            src,
+            &mut rec_with_aps,
+            &luma_alf_aps,
+            7,
+            8,
+            1,
+            lf_bounds_ref,
+        );
+        let sse_with_aps = total_sse_y(&src.luma, &rec_with_aps.luma);
 
-    // Trial 1 — fixed-only RDO on a clone of `rec`.
-    let mut rec_fixed_only = rec.clone();
-    let alf_pic_fixed_only = crate::alf_enc::alf_decide_and_apply_clipped(
-        src,
-        &mut rec_fixed_only,
-        7,
-        8,
-        1,
-        lf_bounds_ref,
-    );
-    let sse_fixed_only = total_sse_y(&src.luma, &rec_fixed_only.luma);
+        // Picture-bits trade-off. APS NAL byte cost includes the 2-byte NAL
+        // header plus the emulation-prevented RBSP payload.
+        let luma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(2, false, &luma_alf_aps)?;
+        let aps_byte_cost = 2 + luma_aps_rbsp.len() as u64;
+        let lambda = lambda_for_qp(slice_qp_y);
+        // §8.8.5 RDO cost = SSE + lambda * bits. APS NAL ⇒ bits = 8 * bytes.
+        let aps_rd_overhead = (lambda * (aps_byte_cost as f64) * 8.0) as u64;
+        let aps_used_anywhere = (0..alf_pic_with_aps.pic_height_in_ctbs_y).any(|ry| {
+            (0..alf_pic_with_aps.pic_width_in_ctbs_y)
+                .any(|rx| alf_pic_with_aps.get(rx, ry).luma_filt_set_idx >= 16)
+        });
 
-    // Trial 2 — APS + fixed RDO on a clone of `rec`. Cheap because the
-    // RDO scales linearly with the number of trial sets and the test
-    // pictures are at most 128×128.
-    let mut rec_with_aps = rec.clone();
-    let alf_pic_with_aps = crate::alf_enc::alf_decide_and_apply_with_aps_clipped(
-        src,
-        &mut rec_with_aps,
-        &luma_alf_aps,
-        7,
-        8,
-        1,
-        lf_bounds_ref,
-    );
-    let sse_with_aps = total_sse_y(&src.luma, &rec_with_aps.luma);
+        // Round-50 — extend the trade-off with the per-CTB CABAC bit cost of
+        // the `alf_use_aps_flag` + `alf_luma_*_filter_idx` syntax. The two
+        // candidate `AlfPicture`s differ in which luma filter index family
+        // they signal per CTB (APS vs fixed-set), and the binarisation cost
+        // is not symmetric: `alf_luma_fixed_filter_idx` is a TB-bypass with
+        // cMax = 15 (~4 bits per CTB) while `alf_luma_prev_filter_idx` with
+        // cMax = N - 1 = 0 is suppressed entirely (eq. 1437, the field is
+        // absent and prev_idx is inferred to 0). The fixed-only candidate
+        // therefore pays ~5 bits per "luma_on" CTB while the with-APS
+        // candidate pays ~1 bit. Without this term the round-48 trade-off
+        // would over-account the APS NAL byte cost in isolation; closing
+        // the gap means both branches are compared on an apples-to-apples
+        // SSE + lambda * total_bits basis.
+        //
+        // We measure each candidate against the `AlfSyntaxConfig` that
+        // matches the wire stream the second-pass CABAC walk would emit:
+        // - fixed-only: `sh_num_alf_aps_ids_luma = 0` (`alf_use_aps_flag`
+        //   suppressed downstream, but every "luma_on" CTB still pays the
+        //   fixed-filter index), with the chroma + CC-ALF parameters left
+        //   at their picture-level values so the chroma bins are folded in
+        //   identically across both branches and cancel in the difference.
+        // - with-aps: `sh_num_alf_aps_ids_luma = 1`, so each "luma_on" CTB
+        //   pays an `alf_use_aps_flag` ctx-coded bin and (when the bin is
+        //   set) the prev_idx field collapses to a no-op.
+        let cfg_fixed = crate::alf_syntax::AlfSyntaxConfig {
+            alf_enabled: true,
+            cb_enabled: true,
+            cr_enabled: true,
+            cc_cb_enabled: true,
+            cc_cr_enabled: true,
+            sh_num_alf_aps_ids_luma: 0,
+            alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1
+                as u8,
+            alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1)
+                as u8,
+            alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1)
+                as u8,
+            chroma_format_idc: 1,
+            slice_type: crate::slice_header::SliceType::I,
+            sh_cabac_init_flag: false,
+        };
+        let cfg_with_aps = crate::alf_syntax::AlfSyntaxConfig {
+            sh_num_alf_aps_ids_luma: 1,
+            ..cfg_fixed
+        };
+        let bits_fixed_only =
+            estimate_alf_picture_bin_cost(&alf_pic_fixed_only, &cfg_fixed, slice_qp_y)?;
+        let bits_with_aps =
+            estimate_alf_picture_bin_cost(&alf_pic_with_aps, &cfg_with_aps, slice_qp_y)?;
+        let rd_fixed_only = sse_fixed_only + (lambda * bits_fixed_only as f64) as u64;
+        let rd_with_aps = sse_with_aps + aps_rd_overhead + (lambda * bits_with_aps as f64) as u64;
+        let ship_aps = aps_used_anywhere && rd_with_aps < rd_fixed_only;
 
-    // Picture-bits trade-off. APS NAL byte cost includes the 2-byte NAL
-    // header plus the emulation-prevented RBSP payload.
-    let luma_aps_rbsp = crate::aps_enc::emit_alf_aps_rbsp(2, false, &luma_alf_aps)?;
-    let aps_byte_cost = 2 + luma_aps_rbsp.len() as u64;
-    let lambda = lambda_for_qp(slice_qp_y);
-    // §8.8.5 RDO cost = SSE + lambda * bits. APS NAL ⇒ bits = 8 * bytes.
-    let aps_rd_overhead = (lambda * (aps_byte_cost as f64) * 8.0) as u64;
-    let aps_used_anywhere = (0..alf_pic_with_aps.pic_height_in_ctbs_y).any(|ry| {
-        (0..alf_pic_with_aps.pic_width_in_ctbs_y)
-            .any(|rx| alf_pic_with_aps.get(rx, ry).luma_filt_set_idx >= 16)
-    });
+        // Commit the chosen luma reconstruction + AlfPicture (luma APS NAL
+        // emission deferred to round-51 unified APS-NAL pass below).
+        let (mut alf_pic, sh_num_alf_aps_ids_luma, ph_num_alf_aps_ids_luma) = if ship_aps {
+            rec.luma.samples.copy_from_slice(&rec_with_aps.luma.samples);
+            (alf_pic_with_aps, 1u8, 1u8)
+        } else {
+            rec.luma
+                .samples
+                .copy_from_slice(&rec_fixed_only.luma.samples);
+            (alf_pic_fixed_only, 0u8, 0u8)
+        };
+        drop(rec_with_aps);
+        drop(rec_fixed_only);
 
-    // Round-50 — extend the trade-off with the per-CTB CABAC bit cost of
-    // the `alf_use_aps_flag` + `alf_luma_*_filter_idx` syntax. The two
-    // candidate `AlfPicture`s differ in which luma filter index family
-    // they signal per CTB (APS vs fixed-set), and the binarisation cost
-    // is not symmetric: `alf_luma_fixed_filter_idx` is a TB-bypass with
-    // cMax = 15 (~4 bits per CTB) while `alf_luma_prev_filter_idx` with
-    // cMax = N - 1 = 0 is suppressed entirely (eq. 1437, the field is
-    // absent and prev_idx is inferred to 0). The fixed-only candidate
-    // therefore pays ~5 bits per "luma_on" CTB while the with-APS
-    // candidate pays ~1 bit. Without this term the round-48 trade-off
-    // would over-account the APS NAL byte cost in isolation; closing
-    // the gap means both branches are compared on an apples-to-apples
-    // SSE + lambda * total_bits basis.
-    //
-    // We measure each candidate against the `AlfSyntaxConfig` that
-    // matches the wire stream the second-pass CABAC walk would emit:
-    // - fixed-only: `sh_num_alf_aps_ids_luma = 0` (`alf_use_aps_flag`
-    //   suppressed downstream, but every "luma_on" CTB still pays the
-    //   fixed-filter index), with the chroma + CC-ALF parameters left
-    //   at their picture-level values so the chroma bins are folded in
-    //   identically across both branches and cancel in the difference.
-    // - with-aps: `sh_num_alf_aps_ids_luma = 1`, so each "luma_on" CTB
-    //   pays an `alf_use_aps_flag` ctx-coded bin and (when the bin is
-    //   set) the prev_idx field collapses to a no-op.
-    let cfg_fixed = crate::alf_syntax::AlfSyntaxConfig {
-        alf_enabled: true,
-        cb_enabled: true,
-        cr_enabled: true,
-        cc_cb_enabled: true,
-        cc_cr_enabled: true,
-        sh_num_alf_aps_ids_luma: 0,
-        alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
-        alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
-        alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
-        chroma_format_idc: 1,
-        slice_type: crate::slice_header::SliceType::I,
-        sh_cabac_init_flag: false,
-    };
-    let cfg_with_aps = crate::alf_syntax::AlfSyntaxConfig {
-        sh_num_alf_aps_ids_luma: 1,
-        ..cfg_fixed
-    };
-    let bits_fixed_only =
-        estimate_alf_picture_bin_cost(&alf_pic_fixed_only, &cfg_fixed, slice_qp_y)?;
-    let bits_with_aps =
-        estimate_alf_picture_bin_cost(&alf_pic_with_aps, &cfg_with_aps, slice_qp_y)?;
-    let rd_fixed_only = sse_fixed_only + (lambda * bits_fixed_only as f64) as u64;
-    let rd_with_aps = sse_with_aps + aps_rd_overhead + (lambda * bits_with_aps as f64) as u64;
-    let ship_aps = aps_used_anywhere && rd_with_aps < rd_fixed_only;
-
-    // Commit the chosen luma reconstruction + AlfPicture (luma APS NAL
-    // emission deferred to round-51 unified APS-NAL pass below).
-    let (mut alf_pic, sh_num_alf_aps_ids_luma, ph_num_alf_aps_ids_luma) = if ship_aps {
-        rec.luma.samples.copy_from_slice(&rec_with_aps.luma.samples);
-        (alf_pic_with_aps, 1u8, 1u8)
-    } else {
-        rec.luma
-            .samples
-            .copy_from_slice(&rec_fixed_only.luma.samples);
-        (alf_pic_fixed_only, 0u8, 0u8)
-    };
-    drop(rec_with_aps);
-    drop(rec_fixed_only);
-
-    // ------------------------------------------------------------------
-    // Round-51 — chroma APS RDO trade-off.
-    //
-    // The chroma APS at id 0 carries the §8.8.5.4 primary-chroma filter
-    // bank read by both `chroma_alf_decide_and_apply` invocations (Cb +
-    // Cr). When the trade-off skips it, neither chroma ALF pass can run,
-    // so PH `ph_alf_cb_enabled_flag` and `ph_alf_cr_enabled_flag` both
-    // signal 0 and the per-CTU `alf_ctb_flag[1/2]` bins are suppressed
-    // by `cb_enabled` / `cr_enabled = false` in `AlfSyntaxConfig`.
-    //
-    // RDO compare:
-    //   off:  current `rec.{cb,cr}` SSE   + lambda * bin_cost_off
-    //   on:   post-pass `rec.{cb,cr}` SSE + lambda * (8 * aps_bytes
-    //                                                + bin_cost_on)
-    //
-    // `bin_cost_off` and `bin_cost_on` differ in the per-CTB
-    // `alf_ctb_flag[1]` / `alf_ctb_flag[2]` bins (~1 bin/CTB each when
-    // chroma is enabled in the SyntaxConfig); the alt-idx fields are
-    // suppressed because the in-memory chroma APS signals only one alt
-    // (`alf_chroma_num_alt_filters_minus1 = 0`, eq. 1437 cMax = 0).
-    // ------------------------------------------------------------------
-    let chroma_aps_byte_cost = 2 + chroma_aps_rbsp.len() as u64;
-    let pre_chroma_alf_cb = rec.cb.samples.clone();
-    let pre_chroma_alf_cr = rec.cr.samples.clone();
-    let sse_chroma_off = total_sse_y(&src.cb, &rec.cb) + total_sse_y(&src.cr, &rec.cr);
-    let mut rec_with_chroma_aps = rec.clone();
-    let mut alf_pic_with_chroma_aps = alf_pic.clone();
-    crate::alf_enc::chroma_alf_decide_and_apply_clipped(
-        src,
-        &mut rec_with_chroma_aps,
-        &mut alf_pic_with_chroma_aps,
-        &chroma_alf_aps,
-        crate::alf_enc::CcAlfComponent::Cb,
-        7,
-        8,
-        1,
-        lf_bounds_ref,
-    );
-    crate::alf_enc::chroma_alf_decide_and_apply_clipped(
-        src,
-        &mut rec_with_chroma_aps,
-        &mut alf_pic_with_chroma_aps,
-        &chroma_alf_aps,
-        crate::alf_enc::CcAlfComponent::Cr,
-        7,
-        8,
-        1,
-        lf_bounds_ref,
-    );
-    let sse_chroma_on = total_sse_y(&src.cb, &rec_with_chroma_aps.cb)
-        + total_sse_y(&src.cr, &rec_with_chroma_aps.cr);
-    let chroma_picked_anywhere = (0..alf_pic_with_chroma_aps.pic_height_in_ctbs_y).any(|ry| {
-        (0..alf_pic_with_chroma_aps.pic_width_in_ctbs_y).any(|rx| {
-            let p = alf_pic_with_chroma_aps.get(rx, ry);
-            p.cb_on || p.cr_on
-        })
-    });
-    let cfg_chroma_off = crate::alf_syntax::AlfSyntaxConfig {
-        alf_enabled: true,
-        cb_enabled: false,
-        cr_enabled: false,
-        cc_cb_enabled: false,
-        cc_cr_enabled: false,
-        sh_num_alf_aps_ids_luma,
-        alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
-        alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
-        alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
-        chroma_format_idc: 1,
-        slice_type: crate::slice_header::SliceType::I,
-        sh_cabac_init_flag: false,
-    };
-    let cfg_chroma_on = crate::alf_syntax::AlfSyntaxConfig {
-        cb_enabled: true,
-        cr_enabled: true,
-        ..cfg_chroma_off
-    };
-    let bins_chroma_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_chroma_off, slice_qp_y)?;
-    let bins_chroma_on =
-        estimate_alf_picture_bin_cost(&alf_pic_with_chroma_aps, &cfg_chroma_on, slice_qp_y)?;
-    let rd_chroma_off = sse_chroma_off + (lambda * bins_chroma_off as f64) as u64;
-    let rd_chroma_on = sse_chroma_on
-        + (lambda * (chroma_aps_byte_cost as f64) * 8.0) as u64
-        + (lambda * bins_chroma_on as f64) as u64;
-    let ship_chroma_aps = chroma_picked_anywhere && rd_chroma_on < rd_chroma_off;
-    if ship_chroma_aps {
-        rec.cb
-            .samples
-            .copy_from_slice(&rec_with_chroma_aps.cb.samples);
-        rec.cr
-            .samples
-            .copy_from_slice(&rec_with_chroma_aps.cr.samples);
-        alf_pic = alf_pic_with_chroma_aps;
-    } else {
-        // Restore pre-pass chroma (defensive — should already match).
-        rec.cb.samples.copy_from_slice(&pre_chroma_alf_cb);
-        rec.cr.samples.copy_from_slice(&pre_chroma_alf_cr);
-    }
-    drop(rec_with_chroma_aps);
-
-    // ------------------------------------------------------------------
-    // Round-51 — CC-ALF APS RDO trade-off (per-component decisions, one
-    // shared APS at id 1).
-    //
-    // CC-ALF Cb and CC-ALF Cr each pick their own per-CTB `cc_*_idc`,
-    // and each can independently improve chroma SSE (or not). The APS
-    // NAL is shipped iff at least one component picks any non-zero idc;
-    // each component's PH `ph_alf_cc_*_enabled_flag` mirrors the
-    // per-component decision.
-    //
-    // We run each component's RDO on its own snapshot (pre-CC-ALF
-    // chroma) and compare against the off-baseline including:
-    //   off:  current rec.{cb,cr} SSE + lambda * bin_cost_off
-    //   on:   post-pass rec.{cb,cr} SSE + lambda * bin_cost_on
-    // The shared APS byte cost is added to whichever component's
-    // trade-off "wins first" (or split across both for symmetry).
-    // For simplicity: bind the APS byte cost to the per-component
-    // trade-off but only if the component's trade-off would otherwise
-    // win without the byte cost — i.e. each component independently
-    // decides ship/skip and the union determines whether the APS NAL
-    // ships. A component that loses on its own RDO contributes 0; a
-    // component that wins pays a fair share of the APS byte cost.
-    // ------------------------------------------------------------------
-    let cc_aps_byte_cost = 2 + cc_aps_rbsp.len() as u64;
-    let pre_cc_cb = rec.cb.samples.clone();
-    let pre_cc_cr = rec.cr.samples.clone();
-    let sse_cb_off = total_sse_y(&src.cb, &rec.cb);
-    let sse_cr_off = total_sse_y(&src.cr, &rec.cr);
-
-    // CC-ALF Cb trial.
-    let mut rec_cc_cb = rec.clone();
-    let mut alf_pic_cc_cb = alf_pic.clone();
-    crate::alf_enc::cc_alf_decide_and_apply_clipped(
-        src,
-        &mut rec_cc_cb,
-        &pre_luma_alf_samples,
-        &mut alf_pic_cc_cb,
-        &cc_alf_aps,
-        crate::alf_enc::CcAlfComponent::Cb,
-        7,
-        8,
-        1,
-        lf_bounds_ref,
-    );
-    let sse_cb_on = total_sse_y(&src.cb, &rec_cc_cb.cb);
-    let cc_cb_picked_anywhere = (0..alf_pic_cc_cb.pic_height_in_ctbs_y).any(|ry| {
-        (0..alf_pic_cc_cb.pic_width_in_ctbs_y).any(|rx| alf_pic_cc_cb.get(rx, ry).cc_cb_idc != 0)
-    });
-
-    // CC-ALF Cr trial.
-    let mut rec_cc_cr = rec.clone();
-    let mut alf_pic_cc_cr = alf_pic.clone();
-    crate::alf_enc::cc_alf_decide_and_apply_clipped(
-        src,
-        &mut rec_cc_cr,
-        &pre_luma_alf_samples,
-        &mut alf_pic_cc_cr,
-        &cc_alf_aps,
-        crate::alf_enc::CcAlfComponent::Cr,
-        7,
-        8,
-        1,
-        lf_bounds_ref,
-    );
-    let sse_cr_on = total_sse_y(&src.cr, &rec_cc_cr.cr);
-    let cc_cr_picked_anywhere = (0..alf_pic_cc_cr.pic_height_in_ctbs_y).any(|ry| {
-        (0..alf_pic_cc_cr.pic_width_in_ctbs_y).any(|rx| alf_pic_cc_cr.get(rx, ry).cc_cr_idc != 0)
-    });
-
-    // Per-component bin cost via two synthetic AlfPictures: cc_cb on,
-    // and cc_cr on. The off-baseline shares the chroma_on cfg from the
-    // round above (all chroma + cc bits live in `cfg_chroma_on`); the
-    // per-component on-bins use a cfg that gates only that component
-    // on so the bin cost reflects the single component's incremental
-    // wire cost.
-    let cfg_cc_cb_on = crate::alf_syntax::AlfSyntaxConfig {
-        cb_enabled: ship_chroma_aps,
-        cr_enabled: ship_chroma_aps,
-        cc_cb_enabled: true,
-        cc_cr_enabled: false,
-        ..cfg_chroma_off
-    };
-    let cfg_cc_cr_on = crate::alf_syntax::AlfSyntaxConfig {
-        cb_enabled: ship_chroma_aps,
-        cr_enabled: ship_chroma_aps,
-        cc_cb_enabled: false,
-        cc_cr_enabled: true,
-        ..cfg_chroma_off
-    };
-    let cfg_cc_off = crate::alf_syntax::AlfSyntaxConfig {
-        cb_enabled: ship_chroma_aps,
-        cr_enabled: ship_chroma_aps,
-        ..cfg_chroma_off
-    };
-    let bins_cc_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_cc_off, slice_qp_y)?;
-    let bins_cc_cb_on = estimate_alf_picture_bin_cost(&alf_pic_cc_cb, &cfg_cc_cb_on, slice_qp_y)?;
-    let bins_cc_cr_on = estimate_alf_picture_bin_cost(&alf_pic_cc_cr, &cfg_cc_cr_on, slice_qp_y)?;
-
-    // Per-component RDO comparison (no APS-byte share yet).
-    let rd_cb_off_no_aps = sse_cb_off + (lambda * bins_cc_off as f64) as u64;
-    let rd_cb_on_no_aps = sse_cb_on + (lambda * bins_cc_cb_on as f64) as u64;
-    let rd_cr_off_no_aps = sse_cr_off + (lambda * bins_cc_off as f64) as u64;
-    let rd_cr_on_no_aps = sse_cr_on + (lambda * bins_cc_cr_on as f64) as u64;
-    let cb_provisional_win = cc_cb_picked_anywhere && rd_cb_on_no_aps < rd_cb_off_no_aps;
-    let cr_provisional_win = cc_cr_picked_anywhere && rd_cr_on_no_aps < rd_cr_off_no_aps;
-    // APS-byte share: when both components want the APS, split 50/50;
-    // when only one component wants it, that component pays the full
-    // cost; when neither wants it, the APS NAL is dropped.
-    let (cb_aps_share, cr_aps_share) = match (cb_provisional_win, cr_provisional_win) {
-        (true, true) => (
-            cc_aps_byte_cost / 2,
-            cc_aps_byte_cost - cc_aps_byte_cost / 2,
-        ),
-        (true, false) => (cc_aps_byte_cost, 0u64),
-        (false, true) => (0u64, cc_aps_byte_cost),
-        (false, false) => (0u64, 0u64),
-    };
-    let rd_cb_on_with_share = sse_cb_on
-        + (lambda * (cb_aps_share as f64) * 8.0) as u64
-        + (lambda * bins_cc_cb_on as f64) as u64;
-    let rd_cr_on_with_share = sse_cr_on
-        + (lambda * (cr_aps_share as f64) * 8.0) as u64
-        + (lambda * bins_cc_cr_on as f64) as u64;
-    let ship_cc_cb = cc_cb_picked_anywhere && rd_cb_on_with_share < rd_cb_off_no_aps;
-    let ship_cc_cr = cc_cr_picked_anywhere && rd_cr_on_with_share < rd_cr_off_no_aps;
-
-    // Commit per-component CC-ALF picks back into rec + alf_pic.
-    if ship_cc_cb {
-        rec.cb.samples.copy_from_slice(&rec_cc_cb.cb.samples);
-        // Carry CC-Cb idc into alf_pic.
-        for ry in 0..alf_pic.pic_height_in_ctbs_y {
-            for rx in 0..alf_pic.pic_width_in_ctbs_y {
-                let mut p = alf_pic.get(rx, ry);
-                p.cc_cb_idc = alf_pic_cc_cb.get(rx, ry).cc_cb_idc;
-                alf_pic.set(rx, ry, p);
-            }
+        // ------------------------------------------------------------------
+        // Round-51 — chroma APS RDO trade-off.
+        //
+        // The chroma APS at id 0 carries the §8.8.5.4 primary-chroma filter
+        // bank read by both `chroma_alf_decide_and_apply` invocations (Cb +
+        // Cr). When the trade-off skips it, neither chroma ALF pass can run,
+        // so PH `ph_alf_cb_enabled_flag` and `ph_alf_cr_enabled_flag` both
+        // signal 0 and the per-CTU `alf_ctb_flag[1/2]` bins are suppressed
+        // by `cb_enabled` / `cr_enabled = false` in `AlfSyntaxConfig`.
+        //
+        // RDO compare:
+        //   off:  current `rec.{cb,cr}` SSE   + lambda * bin_cost_off
+        //   on:   post-pass `rec.{cb,cr}` SSE + lambda * (8 * aps_bytes
+        //                                                + bin_cost_on)
+        //
+        // `bin_cost_off` and `bin_cost_on` differ in the per-CTB
+        // `alf_ctb_flag[1]` / `alf_ctb_flag[2]` bins (~1 bin/CTB each when
+        // chroma is enabled in the SyntaxConfig); the alt-idx fields are
+        // suppressed because the in-memory chroma APS signals only one alt
+        // (`alf_chroma_num_alt_filters_minus1 = 0`, eq. 1437 cMax = 0).
+        // ------------------------------------------------------------------
+        let chroma_aps_byte_cost = 2 + chroma_aps_rbsp.len() as u64;
+        let pre_chroma_alf_cb = rec.cb.samples.clone();
+        let pre_chroma_alf_cr = rec.cr.samples.clone();
+        let sse_chroma_off = total_sse_y(&src.cb, &rec.cb) + total_sse_y(&src.cr, &rec.cr);
+        let mut rec_with_chroma_aps = rec.clone();
+        let mut alf_pic_with_chroma_aps = alf_pic.clone();
+        crate::alf_enc::chroma_alf_decide_and_apply_clipped(
+            src,
+            &mut rec_with_chroma_aps,
+            &mut alf_pic_with_chroma_aps,
+            &chroma_alf_aps,
+            crate::alf_enc::CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+            lf_bounds_ref,
+        );
+        crate::alf_enc::chroma_alf_decide_and_apply_clipped(
+            src,
+            &mut rec_with_chroma_aps,
+            &mut alf_pic_with_chroma_aps,
+            &chroma_alf_aps,
+            crate::alf_enc::CcAlfComponent::Cr,
+            7,
+            8,
+            1,
+            lf_bounds_ref,
+        );
+        let sse_chroma_on = total_sse_y(&src.cb, &rec_with_chroma_aps.cb)
+            + total_sse_y(&src.cr, &rec_with_chroma_aps.cr);
+        let chroma_picked_anywhere = (0..alf_pic_with_chroma_aps.pic_height_in_ctbs_y).any(|ry| {
+            (0..alf_pic_with_chroma_aps.pic_width_in_ctbs_y).any(|rx| {
+                let p = alf_pic_with_chroma_aps.get(rx, ry);
+                p.cb_on || p.cr_on
+            })
+        });
+        let cfg_chroma_off = crate::alf_syntax::AlfSyntaxConfig {
+            alf_enabled: true,
+            cb_enabled: false,
+            cr_enabled: false,
+            cc_cb_enabled: false,
+            cc_cr_enabled: false,
+            sh_num_alf_aps_ids_luma,
+            alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1
+                as u8,
+            alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1)
+                as u8,
+            alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1)
+                as u8,
+            chroma_format_idc: 1,
+            slice_type: crate::slice_header::SliceType::I,
+            sh_cabac_init_flag: false,
+        };
+        let cfg_chroma_on = crate::alf_syntax::AlfSyntaxConfig {
+            cb_enabled: true,
+            cr_enabled: true,
+            ..cfg_chroma_off
+        };
+        let bins_chroma_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_chroma_off, slice_qp_y)?;
+        let bins_chroma_on =
+            estimate_alf_picture_bin_cost(&alf_pic_with_chroma_aps, &cfg_chroma_on, slice_qp_y)?;
+        let rd_chroma_off = sse_chroma_off + (lambda * bins_chroma_off as f64) as u64;
+        let rd_chroma_on = sse_chroma_on
+            + (lambda * (chroma_aps_byte_cost as f64) * 8.0) as u64
+            + (lambda * bins_chroma_on as f64) as u64;
+        let ship_chroma_aps = chroma_picked_anywhere && rd_chroma_on < rd_chroma_off;
+        if ship_chroma_aps {
+            rec.cb
+                .samples
+                .copy_from_slice(&rec_with_chroma_aps.cb.samples);
+            rec.cr
+                .samples
+                .copy_from_slice(&rec_with_chroma_aps.cr.samples);
+            alf_pic = alf_pic_with_chroma_aps;
+        } else {
+            // Restore pre-pass chroma (defensive — should already match).
+            rec.cb.samples.copy_from_slice(&pre_chroma_alf_cb);
+            rec.cr.samples.copy_from_slice(&pre_chroma_alf_cr);
         }
-    } else {
-        rec.cb.samples.copy_from_slice(&pre_cc_cb);
-    }
-    if ship_cc_cr {
-        rec.cr.samples.copy_from_slice(&rec_cc_cr.cr.samples);
-        for ry in 0..alf_pic.pic_height_in_ctbs_y {
-            for rx in 0..alf_pic.pic_width_in_ctbs_y {
-                let mut p = alf_pic.get(rx, ry);
-                p.cc_cr_idc = alf_pic_cc_cr.get(rx, ry).cc_cr_idc;
-                alf_pic.set(rx, ry, p);
-            }
-        }
-    } else {
-        rec.cr.samples.copy_from_slice(&pre_cc_cr);
-    }
-    drop(rec_cc_cb);
-    drop(rec_cc_cr);
+        drop(rec_with_chroma_aps);
 
-    // Round-51 — ship the ALF APS NALs (chroma + CC + luma) per the
-    // trade-off decisions. Wire order is `chroma APS, CC APS, luma
-    // APS, PH` — the PH carries the matching `ph_alf_*_enabled_flag`s.
-    if ship_chroma_aps {
-        let chroma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &chroma_aps_rbsp);
-        annex_b(&mut bitstream, &chroma_aps_nal);
-    }
-    if ship_cc_cb || ship_cc_cr {
-        let cc_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &cc_aps_rbsp);
-        annex_b(&mut bitstream, &cc_aps_nal);
-    }
-    if ship_aps {
-        let luma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &luma_aps_rbsp);
-        annex_b(&mut bitstream, &luma_aps_nal);
-    }
+        // ------------------------------------------------------------------
+        // Round-51 — CC-ALF APS RDO trade-off (per-component decisions, one
+        // shared APS at id 1).
+        //
+        // CC-ALF Cb and CC-ALF Cr each pick their own per-CTB `cc_*_idc`,
+        // and each can independently improve chroma SSE (or not). The APS
+        // NAL is shipped iff at least one component picks any non-zero idc;
+        // each component's PH `ph_alf_cc_*_enabled_flag` mirrors the
+        // per-component decision.
+        //
+        // We run each component's RDO on its own snapshot (pre-CC-ALF
+        // chroma) and compare against the off-baseline including:
+        //   off:  current rec.{cb,cr} SSE + lambda * bin_cost_off
+        //   on:   post-pass rec.{cb,cr} SSE + lambda * bin_cost_on
+        // The shared APS byte cost is added to whichever component's
+        // trade-off "wins first" (or split across both for symmetry).
+        // For simplicity: bind the APS byte cost to the per-component
+        // trade-off but only if the component's trade-off would otherwise
+        // win without the byte cost — i.e. each component independently
+        // decides ship/skip and the union determines whether the APS NAL
+        // ships. A component that loses on its own RDO contributes 0; a
+        // component that wins pays a fair share of the APS byte cost.
+        // ------------------------------------------------------------------
+        let cc_aps_byte_cost = 2 + cc_aps_rbsp.len() as u64;
+        let pre_cc_cb = rec.cb.samples.clone();
+        let pre_cc_cr = rec.cr.samples.clone();
+        let sse_cb_off = total_sse_y(&src.cb, &rec.cb);
+        let sse_cr_off = total_sse_y(&src.cr, &rec.cr);
+
+        // CC-ALF Cb trial.
+        let mut rec_cc_cb = rec.clone();
+        let mut alf_pic_cc_cb = alf_pic.clone();
+        crate::alf_enc::cc_alf_decide_and_apply_clipped(
+            src,
+            &mut rec_cc_cb,
+            &pre_luma_alf_samples,
+            &mut alf_pic_cc_cb,
+            &cc_alf_aps,
+            crate::alf_enc::CcAlfComponent::Cb,
+            7,
+            8,
+            1,
+            lf_bounds_ref,
+        );
+        let sse_cb_on = total_sse_y(&src.cb, &rec_cc_cb.cb);
+        let cc_cb_picked_anywhere = (0..alf_pic_cc_cb.pic_height_in_ctbs_y).any(|ry| {
+            (0..alf_pic_cc_cb.pic_width_in_ctbs_y)
+                .any(|rx| alf_pic_cc_cb.get(rx, ry).cc_cb_idc != 0)
+        });
+
+        // CC-ALF Cr trial.
+        let mut rec_cc_cr = rec.clone();
+        let mut alf_pic_cc_cr = alf_pic.clone();
+        crate::alf_enc::cc_alf_decide_and_apply_clipped(
+            src,
+            &mut rec_cc_cr,
+            &pre_luma_alf_samples,
+            &mut alf_pic_cc_cr,
+            &cc_alf_aps,
+            crate::alf_enc::CcAlfComponent::Cr,
+            7,
+            8,
+            1,
+            lf_bounds_ref,
+        );
+        let sse_cr_on = total_sse_y(&src.cr, &rec_cc_cr.cr);
+        let cc_cr_picked_anywhere = (0..alf_pic_cc_cr.pic_height_in_ctbs_y).any(|ry| {
+            (0..alf_pic_cc_cr.pic_width_in_ctbs_y)
+                .any(|rx| alf_pic_cc_cr.get(rx, ry).cc_cr_idc != 0)
+        });
+
+        // Per-component bin cost via two synthetic AlfPictures: cc_cb on,
+        // and cc_cr on. The off-baseline shares the chroma_on cfg from the
+        // round above (all chroma + cc bits live in `cfg_chroma_on`); the
+        // per-component on-bins use a cfg that gates only that component
+        // on so the bin cost reflects the single component's incremental
+        // wire cost.
+        let cfg_cc_cb_on = crate::alf_syntax::AlfSyntaxConfig {
+            cb_enabled: ship_chroma_aps,
+            cr_enabled: ship_chroma_aps,
+            cc_cb_enabled: true,
+            cc_cr_enabled: false,
+            ..cfg_chroma_off
+        };
+        let cfg_cc_cr_on = crate::alf_syntax::AlfSyntaxConfig {
+            cb_enabled: ship_chroma_aps,
+            cr_enabled: ship_chroma_aps,
+            cc_cb_enabled: false,
+            cc_cr_enabled: true,
+            ..cfg_chroma_off
+        };
+        let cfg_cc_off = crate::alf_syntax::AlfSyntaxConfig {
+            cb_enabled: ship_chroma_aps,
+            cr_enabled: ship_chroma_aps,
+            ..cfg_chroma_off
+        };
+        let bins_cc_off = estimate_alf_picture_bin_cost(&alf_pic, &cfg_cc_off, slice_qp_y)?;
+        let bins_cc_cb_on =
+            estimate_alf_picture_bin_cost(&alf_pic_cc_cb, &cfg_cc_cb_on, slice_qp_y)?;
+        let bins_cc_cr_on =
+            estimate_alf_picture_bin_cost(&alf_pic_cc_cr, &cfg_cc_cr_on, slice_qp_y)?;
+
+        // Per-component RDO comparison (no APS-byte share yet).
+        let rd_cb_off_no_aps = sse_cb_off + (lambda * bins_cc_off as f64) as u64;
+        let rd_cb_on_no_aps = sse_cb_on + (lambda * bins_cc_cb_on as f64) as u64;
+        let rd_cr_off_no_aps = sse_cr_off + (lambda * bins_cc_off as f64) as u64;
+        let rd_cr_on_no_aps = sse_cr_on + (lambda * bins_cc_cr_on as f64) as u64;
+        let cb_provisional_win = cc_cb_picked_anywhere && rd_cb_on_no_aps < rd_cb_off_no_aps;
+        let cr_provisional_win = cc_cr_picked_anywhere && rd_cr_on_no_aps < rd_cr_off_no_aps;
+        // APS-byte share: when both components want the APS, split 50/50;
+        // when only one component wants it, that component pays the full
+        // cost; when neither wants it, the APS NAL is dropped.
+        let (cb_aps_share, cr_aps_share) = match (cb_provisional_win, cr_provisional_win) {
+            (true, true) => (
+                cc_aps_byte_cost / 2,
+                cc_aps_byte_cost - cc_aps_byte_cost / 2,
+            ),
+            (true, false) => (cc_aps_byte_cost, 0u64),
+            (false, true) => (0u64, cc_aps_byte_cost),
+            (false, false) => (0u64, 0u64),
+        };
+        let rd_cb_on_with_share = sse_cb_on
+            + (lambda * (cb_aps_share as f64) * 8.0) as u64
+            + (lambda * bins_cc_cb_on as f64) as u64;
+        let rd_cr_on_with_share = sse_cr_on
+            + (lambda * (cr_aps_share as f64) * 8.0) as u64
+            + (lambda * bins_cc_cr_on as f64) as u64;
+        let ship_cc_cb = cc_cb_picked_anywhere && rd_cb_on_with_share < rd_cb_off_no_aps;
+        let ship_cc_cr = cc_cr_picked_anywhere && rd_cr_on_with_share < rd_cr_off_no_aps;
+
+        // Commit per-component CC-ALF picks back into rec + alf_pic.
+        if ship_cc_cb {
+            rec.cb.samples.copy_from_slice(&rec_cc_cb.cb.samples);
+            // Carry CC-Cb idc into alf_pic.
+            for ry in 0..alf_pic.pic_height_in_ctbs_y {
+                for rx in 0..alf_pic.pic_width_in_ctbs_y {
+                    let mut p = alf_pic.get(rx, ry);
+                    p.cc_cb_idc = alf_pic_cc_cb.get(rx, ry).cc_cb_idc;
+                    alf_pic.set(rx, ry, p);
+                }
+            }
+        } else {
+            rec.cb.samples.copy_from_slice(&pre_cc_cb);
+        }
+        if ship_cc_cr {
+            rec.cr.samples.copy_from_slice(&rec_cc_cr.cr.samples);
+            for ry in 0..alf_pic.pic_height_in_ctbs_y {
+                for rx in 0..alf_pic.pic_width_in_ctbs_y {
+                    let mut p = alf_pic.get(rx, ry);
+                    p.cc_cr_idc = alf_pic_cc_cr.get(rx, ry).cc_cr_idc;
+                    alf_pic.set(rx, ry, p);
+                }
+            }
+        } else {
+            rec.cr.samples.copy_from_slice(&pre_cc_cr);
+        }
+        drop(rec_cc_cb);
+        drop(rec_cc_cr);
+
+        // Round-51 — ship the ALF APS NALs (chroma + CC + luma) per the
+        // trade-off decisions. Wire order is `chroma APS, CC APS, luma
+        // APS, PH` — the PH carries the matching `ph_alf_*_enabled_flag`s.
+        if ship_chroma_aps {
+            let chroma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &chroma_aps_rbsp);
+            annex_b(&mut bitstream, &chroma_aps_nal);
+        }
+        if ship_cc_cb || ship_cc_cr {
+            let cc_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &cc_aps_rbsp);
+            annex_b(&mut bitstream, &cc_aps_nal);
+        }
+        if ship_aps {
+            let luma_aps_nal = build_nal(NalUnitType::PrefixApsNut, 0, 1, &luma_aps_rbsp);
+            annex_b(&mut bitstream, &luma_aps_nal);
+        }
+        (
+            alf_pic,
+            ship_aps,
+            ship_chroma_aps,
+            ship_cc_cb,
+            ship_cc_cr,
+            sh_num_alf_aps_ids_luma,
+            ph_num_alf_aps_ids_luma,
+            sao_pic,
+            sao_merge_map,
+        )
+    };
 
     // Round-384 — ship the LMCS APS NAL (id 0) the PH references via
     // ph_lmcs_aps_id. Wire order per §7.4.2.4: APS before the PH.
@@ -3412,7 +3653,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     // trade-off don't emit phantom syntax bins the decoder would
     // unconditionally read.
     let alf_cfg = crate::alf_syntax::AlfSyntaxConfig {
-        alf_enabled: true,
+        alf_enabled: !lossless,
         cb_enabled: ship_chroma_aps,
         cr_enabled: ship_chroma_aps,
         cc_cb_enabled: ship_cc_cb,
@@ -3637,6 +3878,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                 0,
                 w,
                 h,
+                max_leaf as u32,
                 rc_opts,
                 &split_constraints,
             )?;
@@ -3807,7 +4049,9 @@ fn ctb_cu_slots(
     ctb_size: usize,
     pic_w: usize,
     pic_h: usize,
+    max_leaf: usize,
 ) -> Vec<CuSlot> {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         x: usize,
         y: usize,
@@ -3815,12 +4059,13 @@ fn ctb_cu_slots(
         depth: u32,
         pic_w: usize,
         pic_h: usize,
+        max_leaf: usize,
         out: &mut Vec<CuSlot>,
     ) {
         if x >= pic_w || y >= pic_h {
             return;
         }
-        if size <= MAX_LEAF_CU && x + size <= pic_w && y + size <= pic_h {
+        if size <= max_leaf && x + size <= pic_w && y + size <= pic_h {
             out.push(CuSlot {
                 x,
                 y,
@@ -3830,13 +4075,22 @@ fn ctb_cu_slots(
             return;
         }
         let half = size / 2;
-        walk(x, y, half, depth + 1, pic_w, pic_h, out);
-        walk(x + half, y, half, depth + 1, pic_w, pic_h, out);
-        walk(x, y + half, half, depth + 1, pic_w, pic_h, out);
-        walk(x + half, y + half, half, depth + 1, pic_w, pic_h, out);
+        walk(x, y, half, depth + 1, pic_w, pic_h, max_leaf, out);
+        walk(x + half, y, half, depth + 1, pic_w, pic_h, max_leaf, out);
+        walk(x, y + half, half, depth + 1, pic_w, pic_h, max_leaf, out);
+        walk(
+            x + half,
+            y + half,
+            half,
+            depth + 1,
+            pic_w,
+            pic_h,
+            max_leaf,
+            out,
+        );
     }
     let mut out = Vec::new();
-    walk(ctb_x, ctb_y, ctb_size, 0, pic_w, pic_h, &mut out);
+    walk(ctb_x, ctb_y, ctb_size, 0, pic_w, pic_h, max_leaf, &mut out);
     out
 }
 
@@ -3865,6 +4119,7 @@ fn emit_ctb_tree(
     cqt_depth: u32,
     pic_w: u32,
     pic_h: u32,
+    max_leaf: u32,
     rc_opts: crate::residual::RcOpts,
     constraints: &SplitConstraints,
 ) -> Result<()> {
@@ -3872,7 +4127,7 @@ fn emit_ctb_tree(
         return Ok(());
     }
     let in_pic = x + size <= pic_w && y + size <= pic_h;
-    if in_pic && size as usize <= MAX_LEAF_CU {
+    if in_pic && size <= max_leaf {
         let cu = cus.get(*next_slot).ok_or_else(|| {
             Error::invalid("h266 encoder: coding tree walk ran past the prepared CUs")
         })?;
@@ -3935,6 +4190,7 @@ fn emit_ctb_tree(
             cqt_depth + 1,
             pic_w,
             pic_h,
+            max_leaf,
             rc_opts,
             constraints,
         )
@@ -5068,6 +5324,7 @@ mod tests {
         // Vertical: sub-CUs are 16×64, 32×64, 16×64.
         let mk_leaf = |w: usize, h: usize| {
             PreparedCu::Leaf(PreparedLumaTb {
+                transform_skip: false,
                 n_tb_w: w,
                 n_tb_h: h,
                 levels: vec![0; w * h],

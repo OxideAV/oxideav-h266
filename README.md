@@ -513,6 +513,19 @@ chroma geometry over-ran the floor-sized planes of an odd source; SAO's
 region clip gets the same clamp). `examples/encode_probe` drives the
 encode → own decode → black-box external-decode comparison for one geometry.
 
+r474 — **lossless** (`EncoderConfig::lossless`): every TB is a
+transform-skip block coded through `residual_ts_coding()` (§7.3.11.12)
+at `Qp′ = QpPrimeTsMin = 4`, where the §8.7.3 scaling is the identity,
+so the coded levels are the prediction residual itself; leaf CUs cap at
+`MaxTsSize = 32`, deblocking is disabled in the PPS, ALF / SAO are off
+in the slice header, and the decoded picture is bit-identical to the
+source (`tests/r474_lossless.rs` — noise and smooth sources, odd sizes,
+a black-box external-decoder leg). The §7.3.11.12 encoder
+(`residual_enc::encode_ts_tb_coefficients`) is the exact dual of the
+parser: sub-block / significance inferences, the shared `RemCcbs`
+context-bin budget, the gtX cascade, the bypass remainder / sign tail
+and the inverse of the BDPCM-off level-prediction fold.
+
 Opt-in **palette coding** (`EncoderConfig::palette`, r431):
 CUs whose source block draws from ≤ 31 distinct colours palette-code
 losslessly (up to 37 with EG5 escape samples quantized at the CU QP),

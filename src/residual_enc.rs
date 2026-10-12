@@ -903,6 +903,271 @@ pub fn encode_exp_golomb_k(enc: &mut ArithEncoder, value: u32, k: u32) -> Result
 // Tests
 // ------------------------------------------------------------------
 
+// ------------------------------------------------------------------
+// r474 — transform-skip residual coding (§7.3.11.12)
+// ------------------------------------------------------------------
+
+/// r474 — write `transform_skip_flag[ x0 ][ y0 ][ cIdx ]` (§7.3.11.10;
+/// Table 132 `ctxInc = cIdx == 0 ? 0 : 1`). Dual of
+/// [`crate::residual::read_transform_skip_flag`].
+pub fn write_transform_skip_flag(
+    enc: &mut ArithEncoder,
+    ctxs: &mut ResidualCtxs,
+    c_idx: u32,
+    flag: bool,
+) -> Result<()> {
+    let inc = crate::ctx::ctx_inc_transform_skip_flag(c_idx) as usize;
+    let n = ctxs.transform_skip_flag.len() - 1;
+    enc.encode_decision(&mut ctxs.transform_skip_flag[inc.min(n)], flag as u32)
+}
+
+/// r474 — §7.3.11.12 `residual_ts_coding()` encoder, the exact dual of
+/// [`crate::residual::decode_ts_tb_coefficients_range`]: `levels` are
+/// the TARGET `TransCoeffLevel` values a decoder must reconstruct
+/// (row-major `n_tb_w * n_tb_h`); the emitter derives the coded
+/// magnitudes through the inverse of the BDPCM-off level-prediction
+/// fold, walks the sub-blocks in forward diagonal order with the
+/// `sb_coded_flag` / `sig_coeff_flag` inferences, spends the shared
+/// `RemCcbs` context-bin budget per coefficient exactly like the
+/// parser, and falls through to the bypass `abs_remainder` /
+/// `coeff_sign_flag` tail once it is exhausted. `rice_idx` is
+/// `sh_ts_residual_coding_rice_idx_minus1 + 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ts_tb_coefficients(
+    enc: &mut ArithEncoder,
+    ctxs: &mut ResidualCtxs,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    _c_idx: u32,
+    rice_idx: u32,
+    bdpcm: bool,
+    levels: &[i32],
+) -> Result<()> {
+    use crate::ctx::{
+        csbf_ctx_ts, ctx_inc_abs_level_gtx_flag_ts, ctx_inc_coeff_sign_flag_ts,
+        ctx_inc_par_level_flag_ts, ctx_inc_sb_coded_flag_ts, ctx_inc_sig_coeff_flag_ts,
+        loc_num_sig_and_sum_abs_pass1_ts,
+    };
+    if !n_tb_w.is_power_of_two() || !n_tb_h.is_power_of_two() {
+        return Err(Error::invalid(
+            "h266 residual_ts enc: nTbW / nTbH must be power of two",
+        ));
+    }
+    let total = n_tb_w * n_tb_h;
+    if levels.len() != total {
+        return Err(Error::invalid(
+            "h266 residual_ts enc: level array size does not match nTbW*nTbH",
+        ));
+    }
+    let log2_w = n_tb_w.trailing_zeros();
+    let log2_h = n_tb_h.trailing_zeros();
+    let at = |xc: u32, yc: u32| -> usize { (yc as usize) * n_tb_w + (xc as usize) };
+
+    // Target magnitudes / signs (what the decoder's AbsLevel ends at).
+    let target: Vec<u32> = levels.iter().map(|l| l.unsigned_abs()).collect();
+    let sign_of: Vec<u32> = levels.iter().map(|l| u32::from(*l < 0)).collect();
+    // Coded magnitudes (pre-fold `AbsLevel` the bins describe).
+    let mut coded = vec![0u32; total];
+    let mut sig_flag = vec![false; total];
+    let mut abs_level_pass1 = vec![0u32; total];
+    let mut abs_level_pass2 = vec![0u32; total];
+    let mut coeff_sign_level = vec![0i32; total];
+
+    let mut rem_ccbs: i32 = (((1i32) << (log2_w + log2_h)) * 7) >> 2;
+
+    let (num_sb_w, num_sb_h) = sb_grid(n_tb_w, n_tb_h);
+    let num_sb = num_sb_w * num_sb_h;
+    let last_sub_block = num_sb - 1;
+    let positions = coeff_scan_positions(n_tb_w, n_tb_h);
+    let sb_origins = sb_scan_positions(n_tb_w, n_tb_h);
+    let (sb_dim_w, sb_dim_h) = crate::scan::sb_coeff_dims(n_tb_w, n_tb_h);
+    let nsc = sb_dim_w * sb_dim_h;
+    let sb_grid_coords: Vec<(u32, u32)> = sb_origins
+        .iter()
+        .map(|&(ox, oy)| (ox / sb_dim_w as u32, oy / sb_dim_h as u32))
+        .collect();
+    let mut sb_coded = vec![false; num_sb_w * num_sb_h];
+    let sb_at = |xs: u32, ys: u32| -> usize { (ys as usize) * num_sb_w + (xs as usize) };
+
+    let mut infer_sb_cbf = true;
+    for (i, &(xs, ys)) in sb_grid_coords.iter().enumerate() {
+        let sb_start = i * nsc;
+        let sb_end = (sb_start + nsc).min(positions.len());
+        let sb_positions = &positions[sb_start..sb_end];
+        let num_sb_coeff = sb_positions.len();
+        let coded_sb = sb_positions.iter().any(|&(xc, yc)| target[at(xc, yc)] != 0);
+
+        // sb_coded_flag — coded unless this is the last sub-block and
+        // no earlier one was coded (then inferred 1).
+        if i != last_sub_block || !infer_sb_cbf {
+            let left = xs > 0 && sb_coded[sb_at(xs - 1, ys)];
+            let above = ys > 0 && sb_coded[sb_at(xs, ys - 1)];
+            let inc = ctx_inc_sb_coded_flag_ts(csbf_ctx_ts(left, above)) as usize;
+            let cap = ctxs.sb_coded.len() - 1;
+            enc.encode_decision(&mut ctxs.sb_coded[inc.min(cap)], coded_sb as u32)?;
+        } else if !coded_sb {
+            // The inferred-coded last sub-block must carry a non-zero
+            // level (its last position's sig_coeff_flag is inferred 1).
+            return Err(Error::invalid(
+                "h266 residual_ts enc: all-zero TB cannot be coded (CBF must be 0)",
+            ));
+        }
+        sb_coded[sb_at(xs, ys)] = coded_sb;
+        if coded_sb && i < last_sub_block {
+            infer_sb_cbf = false;
+        }
+
+        let mut infer_sb_sig = true;
+        let mut last_scan_pos_pass1: i32 = -1;
+
+        // First pass: sig + sign + gt1 + par.
+        for (n, &(xc, yc)) in sb_positions.iter().enumerate() {
+            if rem_ccbs < 4 {
+                break;
+            }
+            last_scan_pos_pass1 = n as i32;
+            let idx = at(xc, yc);
+            // Inverse of the §7.3.11.12 BDPCM-off level-prediction fold
+            // (decoder: 1 → pred when pred > 0; c ≤ pred → c − 1).
+            let t = target[idx];
+            let c = if bdpcm || t == 0 {
+                t
+            } else {
+                let abs_left = if xc > 0 { target[at(xc - 1, yc)] } else { 0 };
+                let abs_above = if yc > 0 { target[at(xc, yc - 1)] } else { 0 };
+                let pred = abs_left.max(abs_above);
+                if pred == 0 {
+                    t
+                } else if t == pred {
+                    1
+                } else if t < pred {
+                    t + 1
+                } else {
+                    t
+                }
+            };
+            coded[idx] = c;
+            let sig = c > 0;
+            if coded_sb && (n != num_sb_coeff - 1 || !infer_sb_sig) {
+                let (loc_num_sig, _) = loc_num_sig_and_sum_abs_pass1_ts(
+                    xc,
+                    yc,
+                    &abs_level_pass1,
+                    &sig_flag,
+                    n_tb_w as u32,
+                );
+                let inc = ctx_inc_sig_coeff_flag_ts(loc_num_sig) as usize;
+                let cap = ctxs.sig_coeff.len() - 1;
+                enc.encode_decision(&mut ctxs.sig_coeff[inc.min(cap)], sig as u32)?;
+                rem_ccbs -= 1;
+                if sig {
+                    infer_sb_sig = false;
+                }
+            } else if coded_sb && !sig {
+                return Err(Error::invalid(
+                    "h266 residual_ts enc: inferred-significant position carries a zero level",
+                ));
+            }
+            sig_flag[idx] = sig;
+            coeff_sign_level[idx] = 0;
+            let mut par = 0u32;
+            let mut gt1 = 0u32;
+            if sig {
+                let left_sign = if xc > 0 {
+                    coeff_sign_level[at(xc - 1, yc)]
+                } else {
+                    0
+                };
+                let above_sign = if yc > 0 {
+                    coeff_sign_level[at(xc, yc - 1)]
+                } else {
+                    0
+                };
+                let sinc = ctx_inc_coeff_sign_flag_ts(left_sign, above_sign, bdpcm) as usize;
+                let scap = ctxs.coeff_sign.len() - 1;
+                let s = sign_of[idx];
+                enc.encode_decision(&mut ctxs.coeff_sign[sinc.min(scap)], s)?;
+                rem_ccbs -= 1;
+                coeff_sign_level[idx] = if s > 0 { -1 } else { 1 };
+
+                let sig_left = xc > 0 && sig_flag[at(xc - 1, yc)];
+                let sig_above = yc > 0 && sig_flag[at(xc, yc - 1)];
+                let ginc =
+                    ctx_inc_abs_level_gtx_flag_ts(0, xc, yc, sig_left, sig_above, bdpcm) as usize;
+                let gcap = ctxs.abs_gtx.len() - 1;
+                gt1 = u32::from(c > 1);
+                enc.encode_decision(&mut ctxs.abs_gtx[ginc.min(gcap)], gt1)?;
+                rem_ccbs -= 1;
+                if gt1 == 1 {
+                    par = (c - 2) & 1;
+                    let pinc = ctx_inc_par_level_flag_ts() as usize;
+                    let pcap = ctxs.par_level.len() - 1;
+                    enc.encode_decision(&mut ctxs.par_level[pinc.min(pcap)], par)?;
+                    rem_ccbs -= 1;
+                }
+            }
+            abs_level_pass1[idx] = sig as u32 + par + gt1;
+        }
+
+        // Greater-than-X pass (j = 1..4), one budget check per coefficient.
+        let mut last_scan_pos_pass2: i32 = -1;
+        for (n, &(xc, yc)) in sb_positions.iter().enumerate() {
+            if rem_ccbs < 4 {
+                break;
+            }
+            let idx = at(xc, yc);
+            let a1 = abs_level_pass1[idx];
+            let mut a2 = a1;
+            let mut prev_gtx = a1 >= 2;
+            // Number of gtx flags that are 1: (c − a1) / 2 capped at 4.
+            let k = ((coded[idx].saturating_sub(a1)) / 2).min(4);
+            for j in 1..5u32 {
+                if !prev_gtx {
+                    break;
+                }
+                let sig_left = xc > 0 && sig_flag[at(xc - 1, yc)];
+                let sig_above = yc > 0 && sig_flag[at(xc, yc - 1)];
+                let ginc =
+                    ctx_inc_abs_level_gtx_flag_ts(j, xc, yc, sig_left, sig_above, bdpcm) as usize;
+                let gcap = ctxs.abs_gtx.len() - 1;
+                let g = u32::from(j <= k);
+                enc.encode_decision(&mut ctxs.abs_gtx[ginc.min(gcap)], g)?;
+                rem_ccbs -= 1;
+                a2 += 2 * g;
+                prev_gtx = g == 1;
+            }
+            abs_level_pass2[idx] = a2;
+            last_scan_pos_pass2 = n as i32;
+        }
+
+        // Remainder pass (bypass).
+        for (n, &(xc, yc)) in sb_positions.iter().enumerate() {
+            let n = n as i32;
+            let idx = at(xc, yc);
+            let in_pass2 = n <= last_scan_pos_pass2;
+            let in_pass1 = n <= last_scan_pos_pass1;
+            let c = if in_pass1 { coded[idx] } else { target[idx] };
+            let write_rem = (in_pass2 && abs_level_pass2[idx] >= 10)
+                || (!in_pass2 && in_pass1 && abs_level_pass1[idx] >= 2)
+                || (!in_pass1 && coded_sb);
+            if write_rem {
+                let rem = if in_pass2 {
+                    (c - abs_level_pass2[idx]) / 2
+                } else if in_pass1 {
+                    (c - abs_level_pass1[idx]) / 2
+                } else {
+                    c
+                };
+                encode_abs_remainder(enc, rice_idx, rem)?;
+                if !in_pass1 && c != 0 {
+                    enc.encode_bypass(sign_of[idx])?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
