@@ -513,6 +513,20 @@ chroma geometry over-ran the floor-sized planes of an odd source; SAO's
 region clip gets the same clamp). `examples/encode_probe` drives the
 encode → own decode → black-box external-decode comparison for one geometry.
 
+r474 — **chroma formats and bit depth**: 4:0:0 / 4:2:0 / 4:2:2 /
+4:4:4 (`EncoderConfig::chroma_format_idc`) at 8 – 10 bits (the depth of
+the source planes), lossy and lossless — quantisers at Qp′ = QpY +
+QpBdOffset, chroma TBs at SubWidthC / SubHeightC with the 32-corner
+zero-out on 64-point chroma TBs, monochrome CUs without chroma CBFs /
+`intra_chroma_pred_mode`, the format-gated SPS fields
+(`sps_qtbtt_dual_tree_intra_flag`, chroma QP table, CC-ALF, CCLM,
+collocated flags), Main 10 4:4:4 (profile idc 33) for 4:2:2 / 4:4:4.
+`tests/r474_formats.rs` round-trips every format at 8 and 10 bits (QP
+8 / 30 / 51, lossless, MTT pickers, odd sizes) byte-exact through this
+crate's decoder and a black-box external decoder. The forward DCT's
+final shift now follows the §8.7.4.1 `20 − BitDepth` inverse (10-bit
+lossy quality was 8 dB low before).
+
 r474 — **lossless** (`EncoderConfig::lossless`): every TB is a
 transform-skip block coded through `residual_ts_coding()` (§7.3.11.12)
 at `Qp′ = QpPrimeTsMin = 4`, where the §8.7.3 scaling is the identity,

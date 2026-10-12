@@ -90,7 +90,7 @@ pub fn forward_dct_ii_2d(
     n_tb_w: usize,
     n_tb_h: usize,
     samples: &[i32],
-    _bit_depth: u32,
+    bit_depth: u32,
 ) -> Result<Vec<i32>> {
     if samples.len() != n_tb_w * n_tb_h {
         return Err(Error::invalid(format!(
@@ -152,16 +152,24 @@ pub fn forward_dct_ii_2d(
     // For a W×H block: generalise to (log2W + log2H) − 2 using integer
     // floor (this equals 2·log2N − 2 for square blocks).
     //
+    // r474 — general bit depth: the inverse path's final shift is
+    // `20 − BitDepth` (§8.7.4.1), so `d_correct = r · 2^(15 − BitDepth)`
+    // and the ratio becomes `N² · 2^(BitDepth − 10)`:
+    //   Right-shift = (log2W + log2H) + BitDepth − 10
+    // (= the 8-bit value above; two more bits at 10-bit — without them
+    // every 10-bit coefficient was coded 4x too large and the lossy
+    // reconstruction landed 8 dB below the 8-bit result).
+    //
     // The shift is applied with round-to-nearest (add 2^(shift−1)) to
     // avoid systematic down-bias for AC coefficients.
     let log2_w = n_tb_w.trailing_zeros();
     let log2_h = n_tb_h.trailing_zeros();
     let total_log2 = log2_w + log2_h; // ≥ 4 for min 2×2
-    if total_log2 < 2 {
+    if total_log2 + bit_depth < 10 {
         // Tiny (2×1 or 1×2 — degenerate, should not occur in practice).
         return Ok(out);
     }
-    let bd_shift_final = (total_log2 - 2) as usize;
+    let bd_shift_final = (total_log2 + bit_depth - 10) as usize;
     if bd_shift_final == 0 {
         // No shift needed (2×2 block: log2W+log2H=2, shift=0).
         return Ok(out);

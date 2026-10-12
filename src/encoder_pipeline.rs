@@ -100,7 +100,8 @@ pub fn psnr_y(src: &PicturePlane, rec: &PicturePlane) -> Result<f64> {
         return Ok(f64::INFINITY);
     }
     mse /= n;
-    Ok(10.0 * (255.0 * 255.0 / mse).log10())
+    let max = f64::from((1u32 << src.bit_depth) - 1);
+    Ok(10.0 * (max * max / mse).log10())
 }
 
 /// Round-48 — total picture-wide luma SSE used by the APS-vs-fixed-only
@@ -372,6 +373,15 @@ struct EncAvail {
     chroma: Vec<bool>,
     w: usize,
     h: usize,
+    /// r474 — chroma plane geometry: `SubWidthC` / `SubHeightC` and
+    /// the chroma plane dimensions (`w / sub_w` x `h / sub_h`; the
+    /// 4:2:0 placeholder footprint for monochrome). `chroma_present`
+    /// is `sps_chroma_format_idc != 0`.
+    sub_w: usize,
+    sub_h: usize,
+    cw: usize,
+    ch: usize,
+    chroma_present: bool,
     /// r429 — §6.4.4 availability region `(x0, y0, x1, y1, col_cap)`
     /// in luma samples: the current tile's rectangle plus the WPP
     /// exclusive column cap. Reference fetches outside it read
@@ -381,12 +391,26 @@ struct EncAvail {
 }
 
 impl EncAvail {
+    /// 4:2:0 geometry (historical constructor, unit tests).
+    #[cfg(test)]
     fn new(w: usize, h: usize) -> Self {
+        Self::with_format(w, h, 1)
+    }
+
+    /// r474 — masks for `sps_chroma_format_idc` (§6.2 Table 2).
+    fn with_format(w: usize, h: usize, chroma_format_idc: u32) -> Self {
+        let (sub_w, sub_h) = crate::reconstruct::chroma_subsampling(chroma_format_idc);
+        let (cw, ch) = (w / sub_w, h / sub_h);
         Self {
             luma: vec![false; w * h],
-            chroma: vec![false; (w / 2) * (h / 2)],
+            chroma: vec![false; cw * ch],
             w,
             h,
+            sub_w,
+            sub_h,
+            cw,
+            ch,
+            chroma_present: chroma_format_idc != 0,
             region: (0, 0, w, h, usize::MAX),
         }
     }
@@ -403,13 +427,17 @@ impl EncAvail {
     fn region_for(&self, c_idx: u32) -> (i32, i32, i32, i32, i32) {
         let (x0, y0, x1, y1, cap) = self.region;
         let clip = |v: usize| -> i32 { v.min(i32::MAX as usize) as i32 };
-        let d = if c_idx == 0 { 1 } else { 2 };
+        let (dx, dy) = if c_idx == 0 {
+            (1, 1)
+        } else {
+            (self.sub_w as i32, self.sub_h as i32)
+        };
         (
-            clip(x0) / d,
-            clip(y0) / d,
-            clip(x1) / d,
-            clip(y1) / d,
-            clip(cap) / d,
+            clip(x0) / dx,
+            clip(y0) / dy,
+            clip(x1) / dx,
+            clip(y1) / dy,
+            clip(cap) / dx,
         )
     }
 
@@ -422,7 +450,7 @@ impl EncAvail {
     }
 
     fn mark_chroma(&mut self, cx: usize, cy: usize, bw: usize, bh: usize) {
-        let (cw, ch) = (self.w / 2, self.h / 2);
+        let (cw, ch) = (self.cw, self.ch);
         for yy in cy..(cy + bh).min(ch) {
             for xx in cx..(cx + bw).min(cw) {
                 self.chroma[yy * cw + xx] = true;
@@ -459,7 +487,7 @@ fn predict_dc_block(
             isp_no_split: true,
             ref_idx: 0,
             bdpcm: false,
-            bit_depth: 8,
+            bit_depth: plane.bit_depth,
         },
         |dx: i32, dy: i32| {
             let x = x0 as i32 + dx;
@@ -510,6 +538,7 @@ impl IntraModeCtxs {
 fn emit_intra_dc_mode_bins(
     enc: &mut crate::cabac_enc::ArithEncoder,
     ictx: &mut IntraModeCtxs,
+    chroma: bool,
 ) -> Result<()> {
     let inc = ctx_inc_intra_luma_mpm_flag() as usize;
     enc.encode_decision(&mut ictx.mpm_flag[inc], 1)?;
@@ -517,9 +546,13 @@ fn emit_intra_dc_mode_bins(
     let n = ictx.not_planar.len() - 1;
     enc.encode_decision(&mut ictx.not_planar[inc.min(n)], 1)?;
     enc.encode_bypass(0)?; // intra_luma_mpm_idx = 0
-    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
-    let n = ictx.chroma_mode.len() - 1;
-    enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
+                           // §7.3.11.5 — intra_chroma_pred_mode is present only with a chroma
+                           // format (`sps_chroma_format_idc != 0`; r474).
+    if chroma {
+        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+        let n = ictx.chroma_mode.len() - 1;
+        enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
+    }
     Ok(())
 }
 
@@ -570,8 +603,13 @@ fn prepare_luma_tb(
         }
     }
 
+    // r474 — bit depth from the plane; the quantiser / dequantiser take
+    // Qp′ = QpY + QpBdOffset (§8.7.1).
+    let bd = rec_plane.bit_depth;
+    let qp_prime = qp + 6 * (bd as i32 - 8);
+    let max_v = (1i32 << bd) - 1;
     // Forward DCT-II.
-    let mut coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, 8)?;
+    let mut coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, bd)?;
     // §7.3.11.11 / §8.7.4.1 zero-out (r412) — a 64-point DCT-II TB
     // codes only the low-frequency 32-corner (Log2ZoTb = Min(log2Tb,
     // 5); the decoder's eqs. 1171/1172 inverse-transform extents cap
@@ -592,9 +630,9 @@ fn prepare_luma_tb(
     // SDH arm parity-conditions each sub-block so the hidden sign is
     // recoverable (§7.3.11.11 signHiddenFlag).
     let levels = if rc.dep_quant {
-        quantize_tb_dep_quant(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?
+        quantize_tb_dep_quant(&coeffs, n_tb_w as u32, n_tb_h as u32, qp_prime, bd, 15)?
     } else {
-        let mut l = quantize_tb_flat(&coeffs, n_tb_w as u32, n_tb_h as u32, qp, 8, 15)?;
+        let mut l = quantize_tb_flat(&coeffs, n_tb_w as u32, n_tb_h as u32, qp_prime, bd, 15)?;
         if rc.sign_data_hiding {
             crate::residual_enc::condition_levels_for_sdh(&mut l, n_tb_w, n_tb_h);
         }
@@ -602,7 +640,8 @@ fn prepare_luma_tb(
     };
 
     // Dequant + IDCT to get decoded residual.
-    let mut params = DequantParams::luma_8bit(n_tb_w as u32, n_tb_h as u32, qp);
+    let mut params = DequantParams::luma_8bit(n_tb_w as u32, n_tb_h as u32, qp_prime);
+    params.bit_depth = bd;
     params.dep_quant = rc.dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
     let rec_res = inverse_transform_2d(
@@ -613,7 +652,7 @@ fn prepare_luma_tb(
         TrType::DctII,
         TrType::DctII,
         &dq,
-        8,
+        bd,
         15,
     )?;
 
@@ -624,7 +663,7 @@ fn prepare_luma_tb(
             let ry = y + ty;
             if rx < rec_plane.width && ry < rec_plane.height {
                 let s = pred[ty * n_tb_w + tx] as i32 + rec_res[ty * n_tb_w + tx];
-                rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, 255) as u16;
+                rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, max_v) as u16;
             }
         }
     }
@@ -659,7 +698,7 @@ fn emit_tu_with_cbf(
 ) -> Result<()> {
     // r412 — §7.3.11.5 orders the intra-mode cascade before
     // transform_tree(): signal INTRA_DC via the MPM path + DM chroma.
-    emit_intra_dc_mode_bins(enc, ictx)?;
+    emit_intra_dc_mode_bins(enc, ictx, tb.n_tb_chroma_w > 0)?;
 
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
@@ -667,8 +706,12 @@ fn emit_tu_with_cbf(
 
     // §7.3.10 ordering: chroma CBFs (Cb then Cr) are emitted before
     // the luma CBF. `bdpcm_chroma = false` (no BDPCM in this pipeline).
-    write_tu_cb_coded_flag(enc, ctxs, cbf_cb, false)?;
-    write_tu_cr_coded_flag(enc, ctxs, cbf_cr, false, cbf_cb)?;
+    // r474 — absent on a monochrome CU (`sps_chroma_format_idc = 0`).
+    let chroma_present = tb.n_tb_chroma_w > 0;
+    if chroma_present {
+        write_tu_cb_coded_flag(enc, ctxs, cbf_cb, false)?;
+        write_tu_cr_coded_flag(enc, ctxs, cbf_cr, false, cbf_cb)?;
+    }
     // Luma CBF — `bdpcm_y = false`, `isp_split = false`,
     // `prev_tu_cbf_y = false` (single TU, non-ISP path).
     write_tu_y_coded_flag(enc, ctxs, cbf_y, false, false, false)?;
@@ -827,8 +870,8 @@ fn prepare_chroma_tb(
     let pred = predict_dc_block(
         chroma_rec,
         &avail.chroma,
-        avail.w / 2,
-        avail.h / 2,
+        avail.cw,
+        avail.ch,
         avail.region_for(c_idx),
         cx,
         cy,
@@ -836,6 +879,9 @@ fn prepare_chroma_tb(
         n_tb_c_h,
         c_idx,
     )?;
+    let bd = chroma_rec.bit_depth;
+    let qp_prime = qp_c + 6 * (bd as i32 - 8);
+    let max_v = (1i32 << bd) - 1;
 
     // Extract source block → residual.
     let mut residual = vec![0i32; n_tb_c_w * n_tb_c_h];
@@ -860,11 +906,22 @@ fn prepare_chroma_tb(
 
     // Forward DCT-II + flat quantisation (same ladder as luma; bit_depth
     // = 8 for 4:2:0 8-bit).
-    let coeffs = forward_dct_ii_2d(n_tb_c_w, n_tb_c_h, &residual, 8)?;
+    let mut coeffs = forward_dct_ii_2d(n_tb_c_w, n_tb_c_h, &residual, bd)?;
+    // §7.3.11.11 / §8.7.4.1 zero-out — a 64-point chroma TB (4:4:4 /
+    // 4:2:2 tall) codes only the 32-corner, like luma.
+    if n_tb_c_w > 32 || n_tb_c_h > 32 {
+        for yc in 0..n_tb_c_h {
+            for xc in 0..n_tb_c_w {
+                if xc >= 32 || yc >= 32 {
+                    coeffs[yc * n_tb_c_w + xc] = 0;
+                }
+            }
+        }
+    }
     let levels = if rc.dep_quant {
-        quantize_tb_dep_quant(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?
+        quantize_tb_dep_quant(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_prime, bd, 15)?
     } else {
-        let mut l = quantize_tb_flat(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_c, 8, 15)?;
+        let mut l = quantize_tb_flat(&coeffs, n_tb_c_w as u32, n_tb_c_h as u32, qp_prime, bd, 15)?;
         if rc.sign_data_hiding {
             crate::residual_enc::condition_levels_for_sdh(&mut l, n_tb_c_w, n_tb_c_h);
         }
@@ -872,7 +929,8 @@ fn prepare_chroma_tb(
     };
 
     // Dequant → IDCT → reconstruct.
-    let mut params = DequantParams::chroma_8bit(n_tb_c_w as u32, n_tb_c_h as u32, qp_c);
+    let mut params = DequantParams::chroma_8bit(n_tb_c_w as u32, n_tb_c_h as u32, qp_prime);
+    params.bit_depth = bd;
     params.dep_quant = rc.dep_quant;
     let dq = dequantize_tb_flat(&levels, &params)?;
     let mut rec_res = inverse_transform_2d(
@@ -883,7 +941,7 @@ fn prepare_chroma_tb(
         TrType::DctII,
         TrType::DctII,
         &dq,
-        8,
+        bd,
         15,
     )?;
 
@@ -891,7 +949,7 @@ fn prepare_chroma_tb(
     // residual (the same eqs. 1219 / 1220 fold
     // `CtuWalker::reconstruct_chroma_plane` applies).
     if let Some(vs) = chroma_scale {
-        crate::ctu::lmcs_scale_chroma_residuals(&mut rec_res, vs, 8);
+        crate::ctu::lmcs_scale_chroma_residuals(&mut rec_res, vs, bd);
     }
 
     for ty in 0..n_tb_c_h {
@@ -900,7 +958,7 @@ fn prepare_chroma_tb(
             let ry = cy + ty;
             if rx < chroma_rec.width && ry < chroma_rec.height {
                 let s = pred[ty * n_tb_c_w + tx] as i32 + rec_res[ty * n_tb_c_w + tx];
-                chroma_rec.samples[ry * chroma_rec.stride + rx] = s.clamp(0, 255) as u16;
+                chroma_rec.samples[ry * chroma_rec.stride + rx] = s.clamp(0, max_v) as u16;
             }
         }
     }
@@ -909,6 +967,15 @@ fn prepare_chroma_tb(
     // own rectangle never feeds its own references).
     avail.mark_chroma(cx, cy, n_tb_c_w, n_tb_c_h);
     Ok(levels)
+}
+
+/// r474 — §8.7.1 chroma QP through the identity `ChromaQpTable` the
+/// emitted SPS derives to: `qPCb = Clip3(−QpBdOffset, 63, QpY)` (no
+/// PPS / SH / CU offsets on this encoder). The caller adds
+/// `QpBdOffset` to obtain Qp′Cb for the quantisers.
+fn chroma_qp_identity_bd(qp_y: i32, bit_depth: u32) -> i32 {
+    let qp_bd_offset = 6 * (bit_depth as i32 - 8);
+    qp_y.clamp(-qp_bd_offset, 63)
 }
 
 /// r391 — encoder inverse of the §8.7.5.3 eqs. 1219 / 1220 fold: the
@@ -942,6 +1009,7 @@ fn lmcs_chroma_var_scale_enc(
     der: &crate::lmcs::LmcsDerived,
     min_bin: u8,
     max_bin: u8,
+    bit_depth: u32,
 ) -> u32 {
     // r429 — §6.4.4 availL / availT with the tile / WPP region on top
     // of the picture-edge rule (decoder-mirrored; the left / top
@@ -967,7 +1035,7 @@ fn lmcs_chroma_var_scale_enc(
     let inv_avg_luma = if cnt > 0 {
         ((sum + (cnt as u64 >> 1)) >> cnt.trailing_zeros()) as u32
     } else {
-        128 // eq. 1217, 8-bit mid-grey
+        1u32 << (bit_depth - 1) // eq. 1217 mid-grey
     };
     let idx_y_inv = der.idx_y_inv(inv_avg_luma, min_bin, max_bin);
     der.chroma_var_scale(idx_y_inv)
@@ -1156,11 +1224,27 @@ fn prepare_leaf_cu(
         cu_qp,
         rc,
     )?;
-    let chr_x = x / 2;
-    let chr_y = y / 2;
-    let n_tb_chroma_w = (n_tb_w / 2).max(4);
-    let n_tb_chroma_h = (n_tb_h / 2).max(4);
-    let qp_c = crate::ctu::chroma_qp_identity(cu_qp, 0);
+    // r474 — monochrome CUs carry no chroma TB (the §7.3.11.10 chroma
+    // CBFs are absent); otherwise the chroma TB is the luma TB divided
+    // by SubWidthC / SubHeightC (§6.2 Table 2).
+    if !avail.chroma_present {
+        return Ok(PreparedCu::Leaf(PreparedLumaTb {
+            n_tb_w,
+            n_tb_h,
+            levels,
+            n_tb_chroma_w: 0,
+            n_tb_chroma_h: 0,
+            cb_levels: Vec::new(),
+            cr_levels: Vec::new(),
+            cu_qp_local: cu_qp,
+            transform_skip: false,
+        }));
+    }
+    let chr_x = x / avail.sub_w;
+    let chr_y = y / avail.sub_h;
+    let n_tb_chroma_w = (n_tb_w / avail.sub_w).max(4);
+    let n_tb_chroma_h = (n_tb_h / avail.sub_h).max(4);
+    let qp_c = chroma_qp_identity_bd(cu_qp, rec.bit_depth());
     let cb_levels = prepare_chroma_tb(
         &src.cb,
         &mut rec.cb,
@@ -1215,10 +1299,23 @@ fn prepare_leaf_cu_lossless(
     cu_qp: i32,
 ) -> Result<PreparedCu> {
     let levels = prepare_luma_tb_ts(&src.luma, &mut rec.luma, avail, x, y, n_tb_w, n_tb_h)?;
-    let chr_x = x / 2;
-    let chr_y = y / 2;
-    let n_tb_chroma_w = (n_tb_w / 2).max(4);
-    let n_tb_chroma_h = (n_tb_h / 2).max(4);
+    if !avail.chroma_present {
+        return Ok(PreparedCu::Leaf(PreparedLumaTb {
+            n_tb_w,
+            n_tb_h,
+            levels,
+            n_tb_chroma_w: 0,
+            n_tb_chroma_h: 0,
+            cb_levels: Vec::new(),
+            cr_levels: Vec::new(),
+            cu_qp_local: cu_qp,
+            transform_skip: true,
+        }));
+    }
+    let chr_x = x / avail.sub_w;
+    let chr_y = y / avail.sub_h;
+    let n_tb_chroma_w = (n_tb_w / avail.sub_w).max(4);
+    let n_tb_chroma_h = (n_tb_h / avail.sub_h).max(4);
     let cb_levels = prepare_chroma_tb_ts(
         &src.cb,
         &mut rec.cb,
@@ -1306,8 +1403,8 @@ fn prepare_chroma_tb_ts(
     let pred = predict_dc_block(
         chroma_rec,
         &avail.chroma,
-        avail.w / 2,
-        avail.h / 2,
+        avail.cw,
+        avail.ch,
         avail.region_for(c_idx),
         cx,
         cy,
@@ -2659,16 +2756,23 @@ pub fn encode_idr_with_qp_picker_cfg(
     // filters and every geometry derivation below run on the coded
     // size; the returned reconstruction is cropped to the source size.
     let out_dims = (src.luma.width, src.luma.height, src.cb.width, src.cb.height);
-    let (sub_w_cfg, sub_h_cfg) = config.chroma_subsampling();
+    // r474 — chroma format from the config (4:0:0 and 4:2:0 share the
+    // same plane footprint, so it cannot be inferred), bit depth from
+    // the source planes.
+    config.bit_depth = src.bit_depth() as u8;
+    let chroma_format_idc = u32::from(config.chroma_format_idc);
+    let chroma_present = chroma_format_idc != 0;
+    let bd = src.bit_depth();
+    let qp_bd_offset = 6 * (bd as i32 - 8);
+    let mid = 1u16 << (bd - 1);
+    let max_sample = (1i32 << bd) - 1;
+    // Chroma SAO is signalled only on the opt-in 4:2:0 path (validate()).
+    let sao_signalled_chroma = config.enable_chroma_sao_merge && chroma_present;
+    // Plane footprints (the 4:2:0 placeholder for monochrome).
+    let (sub_w_cfg, sub_h_cfg) = crate::reconstruct::chroma_subsampling(chroma_format_idc);
     let coded_w = config.coded_width() as usize;
     let coded_h = config.coded_height() as usize;
-    let padded_src_owned = pad_source_to_coded(
-        src,
-        coded_w,
-        coded_h,
-        sub_w_cfg as usize,
-        sub_h_cfg as usize,
-    );
+    let padded_src_owned = pad_source_to_coded(src, coded_w, coded_h, sub_w_cfg, sub_h_cfg);
     let src: &PictureBuffer = padded_src_owned.as_ref().unwrap_or(src);
     let w = coded_w as u32;
     let h = coded_h as u32;
@@ -2680,7 +2784,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     // chain below. Chroma is untouched (`ph_chroma_residual_scale_flag
     // = 0`).
     let lmcs_derived = match config.lmcs.as_ref() {
-        Some(data) => Some(data.derive(8)?),
+        Some(data) => Some(data.derive(bd)?),
         None => None,
     };
     let lmcs_payload = config.lmcs;
@@ -2690,13 +2794,19 @@ pub fn encode_idr_with_qp_picker_cfg(
     // 32, and the in-loop filter chain is off (validate() excluded the
     // tools that would fight this).
     let lossless = config.lossless;
-    let slice_qp_y = if lossless { 4 } else { slice_qp_y };
+    let slice_qp_y = if lossless {
+        4 - qp_bd_offset
+    } else {
+        slice_qp_y
+    };
     let max_leaf = if lossless { 32 } else { MAX_LEAF_CU };
     let coding_src_owned: PictureBuffer;
     let coding_src: &PictureBuffer = if let Some(der) = lmcs_derived.as_ref() {
         let mut mapped = src.clone();
         for v in mapped.luma.samples.iter_mut() {
-            *v = der.forward_map_luma_sample(u32::from(*v)).clamp(0, 255) as u16;
+            *v = der
+                .forward_map_luma_sample(u32::from(*v))
+                .clamp(0, i64::from(max_sample)) as u16;
         }
         coding_src_owned = mapped;
         &coding_src_owned
@@ -2751,17 +2861,19 @@ pub fn encode_idr_with_qp_picker_cfg(
     let pic_w_ctbs = (w as usize + ctb_size - 1) / ctb_size;
     let pic_h_ctbs = (h as usize + ctb_size - 1) / ctb_size;
 
-    let mut rec = PictureBuffer::yuv420_filled(w as usize, h as usize, 128);
+    let mut rec =
+        PictureBuffer::with_chroma_format_bd(w as usize, h as usize, chroma_format_idc, mid, bd);
     // r412 — eq. 1212 availability masks for the decoder-mirrored
     // intra prediction in the coding loop.
-    let mut avail = EncAvail::new(w as usize, h as usize);
+    let mut avail = EncAvail::with_format(w as usize, h as usize, chroma_format_idc);
     // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
     // partition fields; drive every split-bin presence + ctxInc.
     let split_constraints = encoder_split_constraints(
         w,
         h,
         config.enable_mtt_bt_picker || config.enable_mtt_tt_picker,
-    );
+    )
+    .with_chroma_format(chroma_format_idc);
     let mut all_deblock_cus: Vec<DeblockCu> = Vec::new();
 
     // TB size: use the full CTB for simplicity.  For large pictures this
@@ -2935,6 +3047,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                                     der,
                                     data.lmcs_min_bin_idx,
                                     data.lmcs_max_bin_idx(),
+                                    bd,
                                 )
                             })
                     } else {
@@ -3040,7 +3153,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         // − 8)`, and `BitDepth = 0` would shift by −8).
         let dbp = DeblockParams {
             disabled: false,
-            bit_depth: 8,
+            bit_depth: bd,
             ctb_log2_size_y: 7, // encoder SPS: sps_log2_ctu_size_minus5 = 2
             ..Default::default()
         };
@@ -3064,7 +3177,7 @@ pub fn encode_idr_with_qp_picker_cfg(
             None,
             None,
             &dbp,
-            1,
+            chroma_format_idc,
             &lf_no_filter_cols,
             &lf_no_filter_rows,
         );
@@ -3090,8 +3203,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         // designed and applied luma + chroma SAO unconditionally while
         // signalling nothing, so no conforming decoder could reproduce the
         // encoder reconstruction.
-        let sao_signalled_chroma = config.enable_chroma_sao_merge;
-        let sao_indep = sao_decide_picture(src, &rec, 7, 8, false, sao_signalled_chroma);
+        let sao_indep = sao_decide_picture(src, &rec, 7, bd, false, sao_signalled_chroma);
         // Round-54 — when the encoder config opts in, run the per-CTB chroma
         // SAO merge pass on top of the independent decisions. The returned
         // `merged` SaoPicture rewrites the chroma slots to the chosen
@@ -3101,7 +3213,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         let pic_w_in_ctbs = sao_indep.pic_width_in_ctbs_y;
         let pic_h_in_ctbs = sao_indep.pic_height_in_ctbs_y;
         let (sao_pic, sao_merge_map) = if config.enable_chroma_sao_merge {
-            crate::sao_enc::apply_chroma_sao_merge(src, &rec, &sao_indep, 8, 7)
+            crate::sao_enc::apply_chroma_sao_merge(src, &rec, &sao_indep, bd, 7)
         } else {
             (
                 sao_indep,
@@ -3111,9 +3223,9 @@ pub fn encode_idr_with_qp_picker_cfg(
         let sao_cfg = SaoConfig {
             luma_used: false,
             chroma_used: sao_signalled_chroma,
-            bit_depth: 8,
+            bit_depth: bd,
             ctb_log2_size_y: 7,
-            chroma_format_idc: 1,
+            chroma_format_idc,
         };
         crate::sao::apply_sao_clipped(&mut rec, &sao_pic, &sao_cfg, lf_bounds_ref);
 
@@ -3182,8 +3294,8 @@ pub fn encode_idr_with_qp_picker_cfg(
                 &rec,
                 &designed_per_class.coeff,
                 7,
-                8,
-                1,
+                bd,
+                chroma_format_idc,
             );
             crate::alf_aps_design::build_per_class_luma_alf_aps_data_with_clip(&clip_rdo)
         } else {
@@ -3201,8 +3313,8 @@ pub fn encode_idr_with_qp_picker_cfg(
             src,
             &mut rec_fixed_only,
             7,
-            8,
-            1,
+            bd,
+            chroma_format_idc,
             lf_bounds_ref,
         );
         let sse_fixed_only = total_sse_y(&src.luma, &rec_fixed_only.luma);
@@ -3216,8 +3328,8 @@ pub fn encode_idr_with_qp_picker_cfg(
             &mut rec_with_aps,
             &luma_alf_aps,
             7,
-            8,
-            1,
+            bd,
+            chroma_format_idc,
             lf_bounds_ref,
         );
         let sse_with_aps = total_sse_y(&src.luma, &rec_with_aps.luma);
@@ -3260,10 +3372,10 @@ pub fn encode_idr_with_qp_picker_cfg(
         //   set) the prev_idx field collapses to a no-op.
         let cfg_fixed = crate::alf_syntax::AlfSyntaxConfig {
             alf_enabled: true,
-            cb_enabled: true,
-            cr_enabled: true,
-            cc_cb_enabled: true,
-            cc_cr_enabled: true,
+            cb_enabled: chroma_present,
+            cr_enabled: chroma_present,
+            cc_cb_enabled: chroma_present,
+            cc_cr_enabled: chroma_present,
             sh_num_alf_aps_ids_luma: 0,
             alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1
                 as u8,
@@ -3271,7 +3383,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                 as u8,
             alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1)
                 as u8,
-            chroma_format_idc: 1,
+            chroma_format_idc,
             slice_type: crate::slice_header::SliceType::I,
             sh_cabac_init_flag: false,
         };
@@ -3335,8 +3447,8 @@ pub fn encode_idr_with_qp_picker_cfg(
             &chroma_alf_aps,
             crate::alf_enc::CcAlfComponent::Cb,
             7,
-            8,
-            1,
+            bd,
+            chroma_format_idc,
             lf_bounds_ref,
         );
         crate::alf_enc::chroma_alf_decide_and_apply_clipped(
@@ -3346,8 +3458,8 @@ pub fn encode_idr_with_qp_picker_cfg(
             &chroma_alf_aps,
             crate::alf_enc::CcAlfComponent::Cr,
             7,
-            8,
-            1,
+            bd,
+            chroma_format_idc,
             lf_bounds_ref,
         );
         let sse_chroma_on = total_sse_y(&src.cb, &rec_with_chroma_aps.cb)
@@ -3371,7 +3483,7 @@ pub fn encode_idr_with_qp_picker_cfg(
                 as u8,
             alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1)
                 as u8,
-            chroma_format_idc: 1,
+            chroma_format_idc,
             slice_type: crate::slice_header::SliceType::I,
             sh_cabac_init_flag: false,
         };
@@ -3387,7 +3499,8 @@ pub fn encode_idr_with_qp_picker_cfg(
         let rd_chroma_on = sse_chroma_on
             + (lambda * (chroma_aps_byte_cost as f64) * 8.0) as u64
             + (lambda * bins_chroma_on as f64) as u64;
-        let ship_chroma_aps = chroma_picked_anywhere && rd_chroma_on < rd_chroma_off;
+        let ship_chroma_aps =
+            chroma_present && chroma_picked_anywhere && rd_chroma_on < rd_chroma_off;
         if ship_chroma_aps {
             rec.cb
                 .samples
@@ -3443,8 +3556,8 @@ pub fn encode_idr_with_qp_picker_cfg(
             &cc_alf_aps,
             crate::alf_enc::CcAlfComponent::Cb,
             7,
-            8,
-            1,
+            bd,
+            chroma_format_idc,
             lf_bounds_ref,
         );
         let sse_cb_on = total_sse_y(&src.cb, &rec_cc_cb.cb);
@@ -3464,8 +3577,8 @@ pub fn encode_idr_with_qp_picker_cfg(
             &cc_alf_aps,
             crate::alf_enc::CcAlfComponent::Cr,
             7,
-            8,
-            1,
+            bd,
+            chroma_format_idc,
             lf_bounds_ref,
         );
         let sse_cr_on = total_sse_y(&src.cr, &rec_cc_cr.cr);
@@ -3530,8 +3643,10 @@ pub fn encode_idr_with_qp_picker_cfg(
         let rd_cr_on_with_share = sse_cr_on
             + (lambda * (cr_aps_share as f64) * 8.0) as u64
             + (lambda * bins_cc_cr_on as f64) as u64;
-        let ship_cc_cb = cc_cb_picked_anywhere && rd_cb_on_with_share < rd_cb_off_no_aps;
-        let ship_cc_cr = cc_cr_picked_anywhere && rd_cr_on_with_share < rd_cr_off_no_aps;
+        let ship_cc_cb =
+            chroma_present && cc_cb_picked_anywhere && rd_cb_on_with_share < rd_cb_off_no_aps;
+        let ship_cc_cr =
+            chroma_present && cc_cr_picked_anywhere && rd_cr_on_with_share < rd_cr_off_no_aps;
 
         // Commit per-component CC-ALF picks back into rec + alf_pic.
         if ship_cc_cb {
@@ -3662,7 +3777,7 @@ pub fn encode_idr_with_qp_picker_cfg(
         alf_chroma_num_alt_filters_minus1: chroma_alf_aps.alf_chroma_num_alt_filters_minus1 as u8,
         alf_cc_cb_filters_signalled_minus1: cc_alf_aps.cc_cb_coeff.len().saturating_sub(1) as u8,
         alf_cc_cr_filters_signalled_minus1: cc_alf_aps.cc_cr_coeff.len().saturating_sub(1) as u8,
-        chroma_format_idc: 1,
+        chroma_format_idc,
         slice_type: crate::slice_header::SliceType::I,
         sh_cabac_init_flag: false,
     };
@@ -3713,9 +3828,9 @@ pub fn encode_idr_with_qp_picker_cfg(
         // RDO only rewrites the chroma slots, so the per-CTB syntax
         // emit gates `luma_used` off and `chroma_used` on.
         luma_used: false,
-        chroma_used: config.enable_chroma_sao_merge,
-        chroma_format_idc: 1,
-        bit_depth: 8,
+        chroma_used: sao_signalled_chroma,
+        chroma_format_idc,
+        bit_depth: bd,
         slice_type: crate::slice_header::SliceType::I,
         sh_cabac_init_flag: false,
     };

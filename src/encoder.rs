@@ -271,11 +271,14 @@ pub struct EncoderConfig {
     pub width: u32,
     /// Picture height in luma samples; see [`Self::width`].
     pub height: u32,
-    /// Bit depth per component. Only 8-bit (luma = chroma) is emitted
-    /// by this scaffold.
+    /// Bit depth per component (luma = chroma), 8..=10 (r474). The
+    /// pipeline takes the source planes' depth and signals
+    /// `sps_bitdepth_minus8`; quantisers run at Qp′ = QpY + QpBdOffset.
     pub bit_depth: u8,
-    /// Chroma subsampling. Only 4:2:0 (`chroma_format_idc = 1`) is
-    /// supported by this scaffold.
+    /// `sps_chroma_format_idc`: 0 (4:0:0), 1 (4:2:0, default), 2
+    /// (4:2:2), 3 (4:4:4) — r474. Monochrome and 4:2:0 sources share
+    /// the same plane footprint, so the format is taken from here, not
+    /// inferred from the buffer.
     pub chroma_format_idc: u8,
     /// Round-54 — opt-in: run the per-tap luma ALF clip-index RDO after
     /// the per-class coefficient design. Default `false`.
@@ -592,9 +595,9 @@ impl EncoderConfig {
                 self.width, self.height
             )));
         }
-        if self.bit_depth != 8 {
+        if !(8..=10).contains(&self.bit_depth) {
             return Err(Error::unsupported(
-                "h266 encoder: only 8-bit is supported by the scaffold",
+                "h266 encoder: bit depth must be 8, 9 or 10 (Main 10 profiles)",
             ));
         }
         if self.dep_quant && self.sign_data_hiding {
@@ -602,9 +605,25 @@ impl EncoderConfig {
                 "h266 encoder: dep_quant and sign_data_hiding are mutually exclusive (§7.3.7)",
             ));
         }
-        if self.chroma_format_idc != 1 {
+        if self.chroma_format_idc > 3 {
+            return Err(Error::invalid(
+                "h266 encoder: chroma_format_idc must be 0 (4:0:0), 1 (4:2:0), 2 (4:2:2) or 3 \
+                 (4:4:4)",
+            ));
+        }
+        if self.palette && (self.chroma_format_idc != 1 || self.bit_depth != 8) {
             return Err(Error::unsupported(
-                "h266 encoder: only 4:2:0 (chroma_format_idc = 1) is supported",
+                "h266 encoder: palette coding is implemented for 8-bit 4:2:0 only",
+            ));
+        }
+        if self.enable_chroma_sao_merge && self.chroma_format_idc != 1 {
+            return Err(Error::unsupported(
+                "h266 encoder: chroma SAO merge is implemented for 4:2:0 only",
+            ));
+        }
+        if self.lmcs_chroma_scaling && self.chroma_format_idc == 0 {
+            return Err(Error::invalid(
+                "h266 encoder: lmcs_chroma_scaling needs a chroma format",
             ));
         }
         if self.lossless
@@ -792,7 +811,14 @@ impl VvcEncoder {
             bw.write_bit(0);
         }
         // profile_tier_level(profileTierPresentFlag = 1, MaxNumSubLayersMinus1 = 0).
-        bw.write_bits(1, 7); // general_profile_idc = 1 (Main 10)
+        // r474 — Annex A: Main 10 (idc 1) covers 4:0:0 / 4:2:0 up to
+        // 10-bit; 4:2:2 / 4:4:4 take Main 10 4:4:4 (idc 33).
+        let profile_idc = if self.config.chroma_format_idc >= 2 {
+            33
+        } else {
+            1
+        };
+        bw.write_bits(profile_idc, 7); // general_profile_idc
         bw.write_bit(0); // general_tier_flag = 0
         bw.write_bits(0x5A, 8); // general_level_idc = 0x5A
         bw.write_bit(1); // ptl_frame_only_constraint_flag = 1
@@ -883,7 +909,10 @@ impl VvcEncoder {
         } else {
             bw.write_ue(0); // max_mtt_depth_intra_luma = 0 → skip bt/tt
         }
-        bw.write_bit(0); // qtbtt_dual_tree_intra = 0 → skip chroma block
+        if self.config.chroma_format_idc != 0 {
+            // §7.3.2.4 — present only with a chroma format (r474).
+            bw.write_bit(0); // qtbtt_dual_tree_intra = 0 → skip chroma block
+        }
         bw.write_ue(0); // log2_diff_min_qt_min_cb_inter
         bw.write_ue(0); // max_mtt_depth_inter = 0 → skip bt/tt
                         // r412 wire-conformance fix — the pipeline codes 64x64 luma
@@ -902,26 +931,29 @@ impl VvcEncoder {
         }
         bw.write_bit(0); // mts_enabled
         bw.write_bit(0); // lfnst_enabled
-                         // chroma_format_idc != 0 → joint_cbcr + same_qp_table + QP tables.
-        bw.write_bit(0); // joint_cbcr_enabled
-        bw.write_bit(1); // same_qp_table_for_chroma → 1 QP table
-        bw.write_se(0); // qp_table_start_minus26
-        bw.write_ue(0); // num_points_minus1 = 0
-        bw.write_ue(0); // delta_qp_in_val_minus1[0][0]
-                        // r415 — delta_qp_diff_val = 1 makes the §7.4.3.4
-                        // derived table the IDENTITY (qpOut steps with qpIn
-                        // through the pivot, then +1 per step above it),
-                        // matching the pipeline's QpC = QpY dequant. The
-                        // pre-r415 all-zero point derived to QpC = QpY - 1
-                        // above the table start (26): every chroma recon at
-                        // QP > 27 desynced against conforming decoders.
-        bw.write_ue(1); // delta_qp_diff_val[0][0]
-                        // Round-54 — `sps_sao_enabled_flag` is gated by the encoder
-                        // config knob `enable_chroma_sao_merge`. Off → wire matches
-                        // round-53 (SAO is internal-only on the encoder reconstruction).
-                        // On → the per-CTB SAO syntax (and round-54's
-                        // `sao_merge_*_flag`) is emitted by the second-pass CABAC walk
-                        // and the PH carries `ph_sao_chroma_enabled_flag = 1`.
+        let chroma = self.config.chroma_format_idc != 0;
+        if chroma {
+            // chroma_format_idc != 0 → joint_cbcr + same_qp_table + QP tables.
+            bw.write_bit(0); // joint_cbcr_enabled
+            bw.write_bit(1); // same_qp_table_for_chroma → 1 QP table
+            bw.write_se(0); // qp_table_start_minus26
+            bw.write_ue(0); // num_points_minus1 = 0
+            bw.write_ue(0); // delta_qp_in_val_minus1[0][0]
+                            // r415 — delta_qp_diff_val = 1 makes the §7.4.3.4
+                            // derived table the IDENTITY (qpOut steps with qpIn
+                            // through the pivot, then +1 per step above it),
+                            // matching the pipeline's QpC = QpY dequant. The
+                            // pre-r415 all-zero point derived to QpC = QpY - 1
+                            // above the table start (26): every chroma recon at
+                            // QP > 27 desynced against conforming decoders.
+            bw.write_ue(1); // delta_qp_diff_val[0][0]
+        }
+        // Round-54 — `sps_sao_enabled_flag` is gated by the encoder
+        // config knob `enable_chroma_sao_merge`. Off → wire matches
+        // round-53 (SAO is internal-only on the encoder reconstruction).
+        // On → the per-CTB SAO syntax (and round-54's
+        // `sao_merge_*_flag`) is emitted by the second-pass CABAC walk
+        // and the PH carries `ph_sao_chroma_enabled_flag = 1`.
         bw.write_bit(self.config.enable_chroma_sao_merge as u8); // sao_enabled
                                                                  // Round-46 — flip `sps_alf_enabled_flag` on so the
                                                                  // PH-level ALF chain (`ph_alf_*`) becomes the
@@ -930,10 +962,12 @@ impl VvcEncoder {
                                                                  // §7.3.2.4 also emits `sps_ccalf_enabled_flag`;
                                                                  // we set both to 1.
         bw.write_bit(1); // alf_enabled
-        bw.write_bit(1); // ccalf_enabled (gated by alf_enabled && chroma_format_idc != 0)
-                         // Round-384 — sps_lmcs_enabled_flag mirrors the
-                         // EncoderConfig::lmcs knob; the PH then carries the
-                         // §7.3.2.8 LMCS chain and an LMCS APS NAL ships.
+        if chroma {
+            bw.write_bit(1); // ccalf_enabled (gated by alf_enabled && chroma_format_idc != 0)
+        }
+        // Round-384 — sps_lmcs_enabled_flag mirrors the
+        // EncoderConfig::lmcs knob; the PH then carries the
+        // §7.3.2.8 LMCS chain and an LMCS APS NAL ships.
         bw.write_bit(if self.config.lmcs.is_some() { 1 } else { 0 }); // lmcs_enabled
         bw.write_bit(0); // weighted_pred
         bw.write_bit(0); // weighted_bipred
@@ -961,10 +995,14 @@ impl VvcEncoder {
         bw.write_bit(0); // isp
         bw.write_bit(0); // mrl
         bw.write_bit(0); // mip
-        bw.write_bit(0); // cclm
-                         // chroma_format_idc == 1 → chroma-collocated flags.
-        bw.write_bit(0); // chroma_horizontal_collocated
-        bw.write_bit(0); // chroma_vertical_collocated
+        if chroma {
+            bw.write_bit(0); // cclm (chroma_format_idc != 0)
+        }
+        if self.config.chroma_format_idc == 1 {
+            // chroma_format_idc == 1 → chroma-collocated flags.
+            bw.write_bit(0); // chroma_horizontal_collocated
+            bw.write_bit(0); // chroma_vertical_collocated
+        }
         bw.write_bit(self.config.palette as u8); // sps_palette_enabled_flag
         if self.config.palette || self.config.lossless {
             // §7.3.2.4 — `sps_transform_skip_enabled_flag ||
@@ -1285,14 +1323,17 @@ impl VvcEncoder {
             if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
                 bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
             }
-            // sps_ccalf_enabled_flag = 1 in our SPS.
-            bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
-            if chain.ph_alf_cc_cb_enabled_flag {
-                bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
-            }
-            bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
-            if chain.ph_alf_cc_cr_enabled_flag {
-                bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+            // sps_ccalf_enabled_flag = 1 in our SPS whenever chroma exists
+            // (absent — and these flags with it — for 4:0:0).
+            if self.config.chroma_format_idc != 0 {
+                bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
+                if chain.ph_alf_cc_cb_enabled_flag {
+                    bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
+                }
+                bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
+                if chain.ph_alf_cc_cr_enabled_flag {
+                    bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+                }
             }
         }
         // sh_lmcs_used_flag — ph_lmcs_enabled_flag && separate PH.
@@ -1554,13 +1595,25 @@ mod tests {
     fn encoder_rejects_bad_config() {
         assert!(VvcEncoder::new(EncoderConfig::new(0, 240)).is_err());
         assert!(VvcEncoder::new(EncoderConfig::new(320, 0)).is_err());
+        // r474 — 8..=10-bit and every §6.2 chroma format are accepted;
+        // out-of-range values are not.
         assert!(VvcEncoder::new(EncoderConfig {
             bit_depth: 10,
+            ..EncoderConfig::new(320, 240)
+        })
+        .is_ok());
+        assert!(VvcEncoder::new(EncoderConfig {
+            bit_depth: 12,
             ..EncoderConfig::new(320, 240)
         })
         .is_err());
         assert!(VvcEncoder::new(EncoderConfig {
             chroma_format_idc: 3,
+            ..EncoderConfig::new(320, 240)
+        })
+        .is_ok());
+        assert!(VvcEncoder::new(EncoderConfig {
+            chroma_format_idc: 4,
             ..EncoderConfig::new(320, 240)
         })
         .is_err());
