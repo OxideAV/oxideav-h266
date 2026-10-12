@@ -4,6 +4,20 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-h266/compare/v0.0.9...v0.0.10) - 2026-10-12
+
+### Other
+
+- r474 intra decision + CU-size RDO; CABAC encoder carry overflow fixed
+- r474 chroma formats + bit depth — 4:0:0 / 4:2:2 / 4:4:4 and 10-bit encode, lossy and lossless
+- r474 lossless encoding — transform-skip residual coding at Qp' = QpPrimeTsMin
+- r474 encoder geometry — any picture size encodes to a conforming stream
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- r456 conformance tranche 3 — 4:2:2 / 4:4:4 chroma formats: §6.2 Table 2 SubWidthC/SubHeightC replaces every 4:2:0 constant (coding tree, §8.4.3 Table 21 4:2:2 mode map, 4:4:4 MipChromaDirectFlag, CCLM, §8.5.6.3.1 chroma MVs, §8.5.5.3 eqs. 876-879 affine chroma groups, GPM eqs. 1011/1012, §8.6.2.5 bvC, §8.8.3.6.5 eq. 1335 maxK, PictureBuffer::with_chroma_format_bd); Table 131 tu_cb/tu_cr_coded_flag ctxInc under chroma BDPCM on the single-tree TU; §8.5.5.6 constructed affine-merge corners skip non-MODE_INTER neighbours (§6.4.4 checkPredModeY). 10b422_B_5 + 8b444_A_2 byte-exact — corpus saturated 54P/0F/2U -> 56P/0F/0U/0E. examples/mutate_smoke bounded mutation harness; unit tests for each new rule
+- r456 conformance tranche 2 — §8.7.5.1 eqs. 1207-1209 on the chroma tree: SCIPU (local dual tree) chroma leaves fold into IbcVirBuf[1/2], so a later single-tree IBC CU predicts chroma from reconstructed samples instead of stale entries; IBC_A_2 byte-exact (53P/1F/2U -> 54P/0F/2U, no FAIL rows)
+- r456 conformance tranche 1 — subpictures: §7.4.8 eq. 114 bounds gate every reference fetch (§8.5.6.3.2 eqs. 928/929 incl. the integer-pel copy), the temporal collocated positions (§8.5.2.11/§8.5.5.3/§8.5.5.4/§8.5.5.6) and the §8.8 across-subpicture loop-filter gates; CTB-granular slice/subpicture gates (alf::LfRegionMap / FetchClip, §8.8.5.5 corner rule); §7.4.8 sh_alf_* inferred from the PH under pps_alf_info_in_ph_flag; §8.8.3.6.2 LADF qpOffset; picture-level slice index in the slice-data walk. SUBPIC_C_1 + CodingToolsSets_E_1 + LMCS_B_2 byte-exact (50P/1F/5U -> 53P/1F/2U)
+
 ### Added
 
 - r474 — **real intra decision**: every CU picks its luma mode among PLANAR / DC / the 65 angular modes (§8.4.5.2 prediction with reference filtering, wide-angle remap and PDPC — the decoder's own `intra::predict_intra`): Hadamard-SATD ranking of all 67 modes plus a mode-rate term, then full RD (`SSE + λ · bits` with a fractional CABAC bit estimate, `cabac_enc::ArithEncoder::estimated_bits`) over the best three, PLANAR and DC; the §7.3.11.5 cascade (`intra_luma_mpm_flag` / `intra_luma_not_planar_flag` / `intra_luma_mpm_idx` TR / `intra_luma_mpm_remainder` TB) is resolved against the §8.4.2 `candModeList[]` (A / B neighbours with the §6.4.4 region gates and the CTB-row rule, palette neighbours → PLANAR); chroma follows DM (Table 20, Table 21 for 4:2:2); the lossless path picks the minimum-SAD mode. Plus a **CU-size RDO** (`EncoderConfig::rdo_cu_split`, default on): every fully-inside 64x64 node is coded as one CU and as an explicit quad split down to 8x8 (`PreparedCu::QtSplit`, region-local state snapshots), keeping the lower `SSE(Y+Cb+Cr) + λ · bits`. On a 256x256 structured test picture: QP 22 25.72 dB → 41.66 dB, QP 27 25.67 → 37.56, QP 32 25.58 → 34.14, QP 37 25.42 → 31.29 (the old 64x64-DC-only layout capped quality at ~25.7 dB regardless of QP); lossless 74083 → 57736 bytes; a 128x128 noise picture 18.35 → 33.53 dB at QP 30. The MTT pickers now sit on top of the CU-size RDO. `examples/encode_probe` takes `PATTERN=smooth`.
