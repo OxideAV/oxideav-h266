@@ -70,7 +70,7 @@ use crate::residual_enc::{
 };
 use crate::sao::SaoConfig;
 use crate::sao_enc::sao_decide_picture;
-use crate::syntax_enc::{encode_coding_quadtree_split, TreeNeighbours};
+use crate::syntax_enc::TreeNeighbours;
 use crate::tables::{init_contexts, SyntaxCtx};
 use crate::transform::{inverse_transform_2d, TrType};
 use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_dep_quant, quantize_tb_flat};
@@ -2473,12 +2473,29 @@ pub fn encode_idr_with_qp_picker_cfg(
     use crate::encoder::VvcEncoder;
     use crate::nal::NalUnitType;
 
-    let w = src.luma.width as u32;
-    let h = src.luma.height as u32;
     // Force dimensions to match the source so callers can reuse a
     // default-constructed config that only sets the round-54 knobs.
-    config.width = w;
-    config.height = h;
+    config.width = src.luma.width as u32;
+    config.height = src.luma.height as u32;
+    // r474 — the CODED picture is the source padded to the §7.4.3.5
+    // Max(8, MinCbSizeY) multiple (edge replication); the SPS
+    // conformance window crops it back. The coding loop, the in-loop
+    // filters and every geometry derivation below run on the coded
+    // size; the returned reconstruction is cropped to the source size.
+    let out_dims = (src.luma.width, src.luma.height, src.cb.width, src.cb.height);
+    let (sub_w_cfg, sub_h_cfg) = config.chroma_subsampling();
+    let coded_w = config.coded_width() as usize;
+    let coded_h = config.coded_height() as usize;
+    let padded_src_owned = pad_source_to_coded(
+        src,
+        coded_w,
+        coded_h,
+        sub_w_cfg as usize,
+        sub_h_cfg as usize,
+    );
+    let src: &PictureBuffer = padded_src_owned.as_ref().unwrap_or(src);
+    let w = coded_w as u32;
+    let h = coded_h as u32;
     // Round-384 — LMCS (§8.7.5.2): with `config.lmcs` set the coding
     // loop runs in the mapped luma domain. Derive the §7.4.3.19 arrays
     // up front (validating the payload), forward-map a copy of the
@@ -2672,24 +2689,25 @@ pub fn encode_idr_with_qp_picker_cfg(
                     if wpp { (rx + 1) * ctb_size } else { usize::MAX },
                 );
             }
-            let ctb_w = ctb_size.min(w as usize - ctb_x);
-            let ctb_h = ctb_size.min(h as usize - ctb_y);
-
-            // Encode the CTU as a grid of (up to) 64×64 TBs.
-            let num_tb_x = (ctb_w + tb_size - 1) / tb_size;
-            let num_tb_y = (ctb_h + tb_size - 1) / tb_size;
-
-            for ty in 0..num_tb_y {
-                for tx in 0..num_tb_x {
-                    let tb_x = ctb_x + tx * tb_size;
-                    let tb_y = ctb_y + ty * tb_size;
-                    let this_tb_w = tb_size.min(w as usize - tb_x);
-                    let this_tb_h = tb_size.min(h as usize - tb_y);
-                    // Use the largest square TB fitting in the block.
-                    let n_tb = this_tb_w.min(this_tb_h);
-                    let n_tb_pow2 = n_tb.next_power_of_two().min(64);
-                    // Only square TBs for simplicity.
-                    let n_tb_sq = if n_tb_pow2 >= 4 { n_tb_pow2 } else { 4 };
+            // r474 — §7.4.12.4 boundary walk: the CTB root is the full
+            // 128x128 square; nodes crossing the coded picture edge take
+            // the inferred (bin-less) quad split, quadrants outside the
+            // picture are not walked, and every leaf slot is a square
+            // CU (<= 64) fully inside the coded picture, in the exact
+            // z-order the second-pass emitter and a conforming decoder
+            // walk. (Pre-r474 the prepare pass tiled a flat 64-grid and
+            // rounded the picture remainder UP to a power of two, so any
+            // non-64-multiple size coded CUs the decoder never walks.)
+            let slots = ctb_cu_slots(ctb_x, ctb_y, ctb_size, w as usize, h as usize);
+            for slot in slots {
+                {
+                    let tb_x = slot.x;
+                    let tb_y = slot.y;
+                    let n_tb_sq = slot.size;
+                    // Per-CTU 64-grid coordinates for the qp_picker
+                    // (round-52 contract: `(rx, ry, tx, ty)`).
+                    let tx = (tb_x - ctb_x) / tb_size;
+                    let ty = (tb_y - ctb_y) / tb_size;
 
                     // Round-52 — per-CU QP picked from the caller-supplied
                     // closure. The slice-level QP (`slice_qp_y`) acts as
@@ -2701,16 +2719,13 @@ pub fn encode_idr_with_qp_picker_cfg(
                     let cu_qp = qp_picker(rx, ry, tx, ty).clamp(0, 63);
 
                     // Round-56 / Round-57 — when the MTT picker is enabled
-                    // (BT and/or TT) and the candidate CU is at full 64×64
-                    // (i.e. fits in the picture without truncation),
-                    // evaluate leaf vs the chosen MTT splits on
+                    // (BT and/or TT) and the candidate CU is a full 64×64
+                    // slot, evaluate leaf vs the chosen MTT splits on
                     // `cost = SSE_Y + λ·bits` and pick the lowest-cost
                     // option. Otherwise (or when both flags are off) fall
                     // back to the round-55 leaf path.
                     let mtt_eligible = (config.enable_mtt_bt_picker || config.enable_mtt_tt_picker)
-                        && n_tb_sq == 64
-                        && tb_x + 64 <= w as usize
-                        && tb_y + 64 <= h as usize;
+                        && n_tb_sq == 64;
                     // r391 — §8.7.5.3 chroma residual scaling: derive the
                     // per-CU `varScale` from the mapped-domain
                     // reconstructed luma neighbours BEFORE this CU's
@@ -3595,123 +3610,42 @@ pub fn encode_idr_with_qp_picker_cfg(
             // first CU with any non-zero CBF emits its delta and the
             // remainder of the CTB inherits.
             let cus = &prepared_per_ctu[ry][rx];
-            // Round-55 — forced QT split fires only when the actual CTB
-            // covers a 128×128 region and produces all four 64×64 leaf
-            // CUs. Picture-edge CTBs (when the picture is narrower /
-            // shorter than 128 so only some quadrants exist) keep the
-            // round-52 single-leaf path because the spec's
-            // implicit-split path would split-then-skip the missing
-            // quadrants — we don't need to emit `split_cu_flag = 1` for
-            // a single-leaf CTB.
+            // r474 — walk the CTB's coding tree exactly like the
+            // decoder (§7.3.11.4 / §7.4.12.4): the 128x128 root, an
+            // explicit `split_cu_flag = 1` (+ `split_qt_flag` when
+            // coded) on fully-inside nodes above the 64 leaf cap, the
+            // inferred bin-less quad split on nodes crossing the coded
+            // picture edge (only `split_qt_flag` goes on the wire, and
+            // only when §6.4.1 – §6.4.3 also allow an MTT split there),
+            // and one prepared CU per fully-inside leaf slot in z-order.
             let ctb_x = rx * ctb_size;
             let ctb_y = ry * ctb_size;
-            let actual_ctb_w = ctb_size.min(w as usize - ctb_x);
-            let actual_ctb_h = ctb_size.min(h as usize - ctb_y);
-            let needs_forced_qt =
-                actual_ctb_w == ctb_size && actual_ctb_h == ctb_size && cus.len() == 4;
-            // Round-56 — neighbour map drives the CABAC ctxInc derivation.
-            // The map is populated as each CU is *emitted* so left /
-            // above neighbour lookups within the same CTB see real
-            // descriptors, not the round-55 picture-edge default.
-            let nbrs_ctb = build_tree_neighbours(&cu_map, ctb_x as u32, ctb_y as u32);
-            if needs_forced_qt {
-                // Round-55 — 128×128 CTB: forced QT split into four 64×64
-                // sub-CUs. `encode_coding_quadtree_split` emits the
-                // `split_cu_flag = 1` + `split_qt_flag = 1` pair, then
-                // calls the per-quadrant closure which hands each 64×64
-                // sub-CU to the standard leaf shell.
-                let ctu_origins = [
-                    (ctb_x, ctb_y),
-                    (ctb_x + 64, ctb_y),
-                    (ctb_x, ctb_y + 64),
-                    (ctb_x + 64, ctb_y + 64),
-                ];
-                let allows_root = split_constraints.allows(
-                    ctb_x as u32,
-                    ctb_y as u32,
-                    ctb_size as u32,
-                    ctb_size as u32,
-                    0,
-                    crate::coding_tree::TreeType::SingleTree,
-                    None,
-                    0,
-                );
-                encode_coding_quadtree_split(
-                    &mut cabac_enc,
-                    &mut tree_ctxs,
-                    ctb_size as u32,
-                    ctb_size as u32,
-                    nbrs_ctb,
-                    /*cqt_depth=*/ 0,
-                    allows_root,
-                    |enc, ctxs, q, _w, _h| {
-                        let cu = &cus[q as usize];
-                        let (qx, qy) = ctu_origins[q as usize];
-                        qp_state.begin_cu();
-                        emit_prepared_cu(
-                            enc,
-                            ctxs,
-                            &mut residual_ctxs,
-                            &mut intra_ctxs,
-                            &mut qp_state,
-                            cu,
-                            qx as u32,
-                            qy as u32,
-                            1,
-                            0,
-                            &mut cu_map,
-                            rc_opts,
-                            &split_constraints,
-                            &mut enc_palette,
-                        )?;
-                        Ok(())
-                    },
-                )?;
-            } else {
-                // Round-56 — single-leaf or split CUs at the CTB level.
-                // Each CU starts at its own (x, y) within the CTB; for
-                // round-55 we kept this as a flat list of TBs all at
-                // ctb origin, so reconstruct positions from the CU
-                // dims (round-56 BT-picker keeps cb_w == cb_h == 64
-                // when not split, otherwise sub-CU dims feed leaf_dims).
-                let mut cur_x = ctb_x;
-                let mut cur_y = ctb_y;
-                for cu in cus {
-                    qp_state.begin_cu();
-                    // r418 — a CU smaller than the CTB in the else
-                    // branch sits below implicit picture-boundary QT
-                    // levels (§7.4.12.4 inferred splits): its spec
-                    // cqtDepth is log2(CtbSizeY) − log2(cuSize), which
-                    // feeds the §9.3.4.2.2 split_qt_flag ctxInc when
-                    // the MTT picker codes a split at that node.
-                    let (cw0, _ch0) = parent_cu_dims(cu);
-                    let implicit_cqt = (ctb_size as u32)
-                        .trailing_zeros()
-                        .saturating_sub((cw0.max(4)).trailing_zeros());
-                    emit_prepared_cu(
-                        &mut cabac_enc,
-                        &mut tree_ctxs,
-                        &mut residual_ctxs,
-                        &mut intra_ctxs,
-                        &mut qp_state,
-                        cu,
-                        cur_x as u32,
-                        cur_y as u32,
-                        implicit_cqt,
-                        0,
-                        &mut cu_map,
-                        rc_opts,
-                        &split_constraints,
-                        &mut enc_palette,
-                    )?;
-                    // Advance position for the next CU in raster order.
-                    let (cw, ch) = parent_cu_dims(cu);
-                    cur_x += cw;
-                    if cur_x >= ctb_x + actual_ctb_w {
-                        cur_x = ctb_x;
-                        cur_y += ch;
-                    }
-                }
+            let mut next_slot = 0usize;
+            emit_ctb_tree(
+                &mut cabac_enc,
+                &mut tree_ctxs,
+                &mut residual_ctxs,
+                &mut intra_ctxs,
+                &mut qp_state,
+                &mut cu_map,
+                &mut enc_palette,
+                cus,
+                &mut next_slot,
+                ctb_x as u32,
+                ctb_y as u32,
+                ctb_size as u32,
+                0,
+                w,
+                h,
+                rc_opts,
+                &split_constraints,
+            )?;
+            if next_slot != cus.len() {
+                return Err(Error::invalid(format!(
+                    "h266 encoder: CTB ({rx},{ry}) prepared {} CUs but the coding tree walk \
+                     emitted {next_slot}",
+                    cus.len()
+                )));
             }
             // QG resets at the end of every CTB (§7.4.13.2 with
             // `cu_qp_delta_subdiv = 0`): the first CU of the next CTB
@@ -3838,7 +3772,263 @@ pub fn encode_idr_with_qp_picker_cfg(
         annex_b(&mut bitstream, &slice_nal);
     }
 
+    // r474 — hand back the reconstruction at the SOURCE geometry (the
+    // coded padding is cropped away, mirroring the conformance window
+    // a decoder applies).
+    let rec = crop_picture(&rec, out_dims.0, out_dims.1, out_dims.2, out_dims.3);
     Ok((bitstream, rec))
+}
+
+/// r474 — one leaf slot of a CTB's §7.4.12.4 boundary walk: a square
+/// CU of `size` luma samples at `(x, y)`, fully inside the coded
+/// picture, `cqt_depth` quad splits below the CTB root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CuSlot {
+    x: usize,
+    y: usize,
+    size: usize,
+    cqt_depth: u32,
+}
+
+/// r474 — the largest CU the pipeline codes as one leaf slot (the
+/// 64-point DCT-II cap; `MaxTbSizeY = 64` on the emitted SPS).
+const MAX_LEAF_CU: usize = 64;
+
+/// r474 — enumerate the leaf CU slots of the CTB at `(ctb_x, ctb_y)`
+/// in coding (z-) order, mirroring the decoder's §7.3.11.4 walk: the
+/// root is the full `ctb_size` square; a node above [`MAX_LEAF_CU`]
+/// or crossing the coded picture edge quad-splits (explicitly resp.
+/// by the §7.4.12.4 inference — QT is always allowed on such a node
+/// because the coded size is a multiple of 8 and `MinQtSizeY = 4`);
+/// quadrants whose origin lies outside the picture are not walked.
+fn ctb_cu_slots(
+    ctb_x: usize,
+    ctb_y: usize,
+    ctb_size: usize,
+    pic_w: usize,
+    pic_h: usize,
+) -> Vec<CuSlot> {
+    fn walk(
+        x: usize,
+        y: usize,
+        size: usize,
+        depth: u32,
+        pic_w: usize,
+        pic_h: usize,
+        out: &mut Vec<CuSlot>,
+    ) {
+        if x >= pic_w || y >= pic_h {
+            return;
+        }
+        if size <= MAX_LEAF_CU && x + size <= pic_w && y + size <= pic_h {
+            out.push(CuSlot {
+                x,
+                y,
+                size,
+                cqt_depth: depth,
+            });
+            return;
+        }
+        let half = size / 2;
+        walk(x, y, half, depth + 1, pic_w, pic_h, out);
+        walk(x + half, y, half, depth + 1, pic_w, pic_h, out);
+        walk(x, y + half, half, depth + 1, pic_w, pic_h, out);
+        walk(x + half, y + half, half, depth + 1, pic_w, pic_h, out);
+    }
+    let mut out = Vec::new();
+    walk(ctb_x, ctb_y, ctb_size, 0, pic_w, pic_h, &mut out);
+    out
+}
+
+/// r474 — second-pass emit of one CTB coding-tree node (the dual of
+/// [`ctb_cu_slots`]): a fully-inside node at or below [`MAX_LEAF_CU`]
+/// is the next prepared CU; a fully-inside node above it codes the
+/// explicit quad split (`split_cu_flag = 1`, `split_qt_flag` when
+/// present); a node crossing the coded picture edge takes the
+/// §7.4.12.4 inferred split (`split_cu_flag` absent, `split_qt_flag`
+/// coded only when §6.4.1 – §6.4.3 allow both a QT and an MTT split
+/// there) and skips the quadrants outside the picture.
+#[allow(clippy::too_many_arguments)]
+fn emit_ctb_tree(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    tree_ctxs: &mut crate::coding_tree::TreeCtxs,
+    residual_ctxs: &mut ResidualCtxs,
+    intra_ctxs: &mut IntraModeCtxs,
+    qp_state: &mut QpDeltaState,
+    cu_map: &mut CuStateMap,
+    pal: &mut Option<EncPalette>,
+    cus: &[PreparedCu],
+    next_slot: &mut usize,
+    x: u32,
+    y: u32,
+    size: u32,
+    cqt_depth: u32,
+    pic_w: u32,
+    pic_h: u32,
+    rc_opts: crate::residual::RcOpts,
+    constraints: &SplitConstraints,
+) -> Result<()> {
+    if x >= pic_w || y >= pic_h {
+        return Ok(());
+    }
+    let in_pic = x + size <= pic_w && y + size <= pic_h;
+    if in_pic && size as usize <= MAX_LEAF_CU {
+        let cu = cus.get(*next_slot).ok_or_else(|| {
+            Error::invalid("h266 encoder: coding tree walk ran past the prepared CUs")
+        })?;
+        *next_slot += 1;
+        qp_state.begin_cu();
+        return emit_prepared_cu(
+            enc,
+            tree_ctxs,
+            residual_ctxs,
+            intra_ctxs,
+            qp_state,
+            cu,
+            x,
+            y,
+            cqt_depth,
+            0,
+            cu_map,
+            rc_opts,
+            constraints,
+            pal,
+        );
+    }
+    let nbrs = build_tree_neighbours(cu_map, x, y);
+    let allows = constraints.allows(
+        x,
+        y,
+        size,
+        size,
+        0,
+        crate::coding_tree::TreeType::SingleTree,
+        None,
+        0,
+    );
+    if !allows.qt {
+        return Err(Error::invalid(format!(
+            "h266 encoder: node ({x},{y}) size {size} needs a quad split the SPS constraints \\
+             do not allow"
+        )));
+    }
+    let half = size / 2;
+    let origins = [(x, y), (x + half, y), (x, y + half), (x + half, y + half)];
+    let mut quadrant = |enc: &mut crate::cabac_enc::ArithEncoder,
+                        ctxs: &mut crate::coding_tree::TreeCtxs,
+                        q: u32|
+     -> Result<()> {
+        let (qx, qy) = origins[q as usize];
+        emit_ctb_tree(
+            enc,
+            ctxs,
+            &mut *residual_ctxs,
+            &mut *intra_ctxs,
+            &mut *qp_state,
+            &mut *cu_map,
+            &mut *pal,
+            cus,
+            &mut *next_slot,
+            qx,
+            qy,
+            half,
+            cqt_depth + 1,
+            pic_w,
+            pic_h,
+            rc_opts,
+            constraints,
+        )
+    };
+    if in_pic {
+        crate::syntax_enc::encode_coding_quadtree_split(
+            enc,
+            tree_ctxs,
+            size,
+            size,
+            nbrs,
+            cqt_depth,
+            allows,
+            |e, c, q, _w, _h| quadrant(e, c, q),
+        )
+    } else {
+        crate::syntax_enc::encode_coding_quadtree_implicit_split(
+            enc,
+            tree_ctxs,
+            nbrs,
+            cqt_depth,
+            allows,
+            |e, c, q| quadrant(e, c, q),
+        )
+    }
+}
+
+/// r474 — replicate `src` into a `coded_w x coded_h` picture (chroma
+/// at `coded / sub`) by edge extension; `None` when the source already
+/// has the coded geometry.
+fn pad_source_to_coded(
+    src: &PictureBuffer,
+    coded_w: usize,
+    coded_h: usize,
+    sub_w: usize,
+    sub_h: usize,
+) -> Option<PictureBuffer> {
+    let (cw, ch) = (coded_w / sub_w, coded_h / sub_h);
+    if src.luma.width == coded_w
+        && src.luma.height == coded_h
+        && src.cb.width == cw
+        && src.cb.height == ch
+        && src.cr.width == cw
+        && src.cr.height == ch
+    {
+        return None;
+    }
+    let pad_plane = |p: &PicturePlane, w: usize, h: usize| -> PicturePlane {
+        let mut out = PicturePlane::filled_bd(w, h, 0, p.bit_depth);
+        if p.width == 0 || p.height == 0 {
+            let mid = 1u16 << (p.bit_depth - 1);
+            out.samples.fill(mid);
+            return out;
+        }
+        for y in 0..h {
+            let sy = y.min(p.height - 1);
+            for x in 0..w {
+                let sx = x.min(p.width - 1);
+                out.samples[y * w + x] = p.samples[sy * p.stride + sx];
+            }
+        }
+        out
+    };
+    Some(PictureBuffer {
+        luma: pad_plane(&src.luma, coded_w, coded_h),
+        cb: pad_plane(&src.cb, cw, ch),
+        cr: pad_plane(&src.cr, cw, ch),
+    })
+}
+
+/// r474 — crop a reconstruction back to the source geometry.
+fn crop_picture(
+    rec: &PictureBuffer,
+    luma_w: usize,
+    luma_h: usize,
+    chroma_w: usize,
+    chroma_h: usize,
+) -> PictureBuffer {
+    let crop_plane = |p: &PicturePlane, w: usize, h: usize| -> PicturePlane {
+        if p.width == w && p.height == h {
+            return p.clone();
+        }
+        let mut out = PicturePlane::filled_bd(w, h, 0, p.bit_depth);
+        for y in 0..h.min(p.height) {
+            let row = &p.samples[y * p.stride..y * p.stride + w.min(p.width)];
+            out.samples[y * w..y * w + row.len()].copy_from_slice(row);
+        }
+        out
+    };
+    PictureBuffer {
+        luma: crop_plane(&rec.luma, luma_w, luma_h),
+        cb: crop_plane(&rec.cb, chroma_w, chroma_h),
+        cr: crop_plane(&rec.cr, chroma_w, chroma_h),
+    }
 }
 
 /// Synthesise an in-memory primary chroma ALF APS for the round-44

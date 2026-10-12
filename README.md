@@ -489,7 +489,31 @@ plus a substantial P + B-slice merge subset:
 
 An IDR-frame encoder pipeline (`encode_idr_with_residuals_cfg`) builds
 an Annex-B bitstream with real coded residuals, deblock, SAO, ALF, and
-CC-ALF. Opt-in **palette coding** (`EncoderConfig::palette`, r431):
+CC-ALF.
+
+r474 — **any picture geometry** (1x1 upwards, odd sizes included)
+encodes to a conforming stream: the coded size is the source padded to
+the §7.4.3.5 `Max(8, MinCbSizeY)` multiple (edge replication,
+`EncoderConfig::coded_width/height`), the SPS carries the §7.4.3.4
+conformance window (`EncoderConfig::conformance_window`; an odd 4:2:0
+dimension crops to the next even one, `EncoderConfig::output_size`),
+and both passes walk the §7.4.12.4 picture-boundary coding tree
+exactly like the decoder (full 128x128 CTB root, inferred bin-less quad
+splits on edge-crossing nodes with `split_qt_flag` coded only where an
+MTT split is also allowed, quadrants outside the picture skipped,
+z-order leaf CUs of 64 / 32 / 16 / 8). The returned reconstruction is
+cropped back to the source size. `tests/r474_encoder_sizes.rs` pins
+every square size 1..=70, prime / awkward rectangles, the MTT pickers
+on boundary CTBs and tiny pictures across the QP range — each decoding
+byte-exact through this crate's own receive path, and the same streams
+through a conforming third-party VVC decoder invoked black-box
+wherever it is installed. The 7x5 chroma-ALF panic is gone: `alf::ClipRegions`
+clamps the component extent to the actual plane (the ceil-derived
+chroma geometry over-ran the floor-sized planes of an odd source; SAO's
+region clip gets the same clamp). `examples/encode_probe` drives the
+encode → own decode → black-box external-decode comparison for one geometry.
+
+Opt-in **palette coding** (`EncoderConfig::palette`, r431):
 CUs whose source block draws from ≤ 31 distinct colours palette-code
 losslessly (up to 37 with EG5 escape samples quantized at the CU QP),
 with the wire-level predictor-reuse split derived from a

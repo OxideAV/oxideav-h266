@@ -291,8 +291,9 @@ pub(crate) fn apply_alf_regions(
     // by default, the containing tile when tile_bounds is installed.
     let (luma_w_i, luma_h_i) = (out.luma.width as i32, out.luma.height as i32);
     let regions_y = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, 1, 1).with_region(region);
-    let regions_c =
-        ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, sub_w, sub_h).with_region(region);
+    let regions_c = ClipRegions::new(tile_bounds, luma_w_i, luma_h_i, sub_w, sub_h)
+        .with_region(region)
+        .clamp_to_plane(out.cb.width, out.cb.height);
 
     for ry in 0..alf_pic.pic_height_in_ctbs_y {
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
@@ -1265,6 +1266,23 @@ impl ClipRegions {
             sub_h: sh,
             region: None,
         }
+    }
+
+    /// r474 — clamp the component extent to the ACTUAL plane
+    /// (`plane_w x plane_h` samples). A conforming picture is a
+    /// multiple of `Max(8, MinCbSizeY)` so `ceil(luma / sub)` and the
+    /// plane agree, but the encoder's in-loop buffers may carry an odd
+    /// source geometry whose chroma planes are `floor(luma / sub)`;
+    /// the ceil extent then addressed one row / column past the plane
+    /// (a 7x5 picture panicked in the chroma ALF).
+    pub(crate) fn clamp_to_plane(mut self, plane_w: usize, plane_h: usize) -> Self {
+        self.rect.2 = self.rect.2.min(plane_w as i32);
+        self.rect.3 = self.rect.3.min(plane_h as i32);
+        // The strip derivation re-reads the luma extent; shrink it so
+        // every `ceil(x1 / sub)` stays inside the plane too.
+        self.luma_w = self.luma_w.min(plane_w as i32 * self.sub_w);
+        self.luma_h = self.luma_h.min(plane_h as i32 * self.sub_h);
+        self
     }
 
     /// r456 — attach the CTB-granular slice / subpicture gate map.

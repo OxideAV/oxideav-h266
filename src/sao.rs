@@ -456,7 +456,8 @@ pub(crate) fn apply_sao_regions(
                     sub_w,
                     sub_h,
                 )
-                .with_region(region),
+                .with_region(region)
+                .clamp_to_plane(out.cb.width, out.cb.height),
             ),
         )
     } else {

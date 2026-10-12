@@ -208,6 +208,33 @@ where
     Ok(())
 }
 
+/// r474 — the §7.4.12.4 picture-boundary quad split of a node that
+/// crosses `pps_pic_width/height_in_luma_samples`: `split_cu_flag` is
+/// absent (inferred 1), `split_qt_flag` is coded (as 1) only when
+/// §6.4.1 – §6.4.3 allow both a QT and an MTT split at the node, and
+/// otherwise inferred 1 (`allowSplitQt` TRUE, or every allow FALSE).
+/// `body_emit_quadrant(enc, ctxs, q)` runs for the four quadrants in
+/// z-order; the caller skips the quadrants outside the picture.
+pub fn encode_coding_quadtree_implicit_split<F>(
+    enc: &mut ArithEncoder,
+    ctxs: &mut TreeCtxs,
+    nbrs: TreeNeighbours,
+    cqt_depth: u32,
+    allows: SplitAllows,
+    mut body_emit_quadrant: F,
+) -> Result<()>
+where
+    F: FnMut(&mut ArithEncoder, &mut TreeCtxs, u32) -> Result<()>,
+{
+    if allows.qt && allows.any_mtt() {
+        encode_split_qt_flag(enc, ctxs, true, nbrs, cqt_depth)?;
+    }
+    for q in 0..4u32 {
+        body_emit_quadrant(enc, ctxs, q)?;
+    }
+    Ok(())
+}
+
 /// Round-55 — direction selector for an MTT split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MttSplitDir {

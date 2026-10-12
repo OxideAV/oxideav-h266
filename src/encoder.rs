@@ -258,9 +258,18 @@ pub fn annex_b_wrap(nal_payload: &[u8], out: &mut Vec<u8>) {
 ///   Default `false`. When `true`, the encoder also flips on
 ///   `sps_sao_enabled_flag` + the matching `ph_sao_*_enabled_flag` bits
 ///   so the SAO bins land on the wire instead of being internal-only.
+/// r474 — the coded picture size is a multiple of this (§7.4.3.5:
+/// `Max(8, MinCbSizeY)` with the emitted `MinCbSizeY = 4`).
+pub const CODED_SIZE_ALIGN: u32 = 8;
+
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
+    /// Picture width in luma samples. Any value `1..=16384`; the coded
+    /// size is padded to [`CODED_SIZE_ALIGN`] and cropped back by the
+    /// conformance window ([`Self::coded_width`] /
+    /// [`Self::conformance_window`]).
     pub width: u32,
+    /// Picture height in luma samples; see [`Self::width`].
     pub height: u32,
     /// Bit depth per component. Only 8-bit (luma = chroma) is emitted
     /// by this scaffold.
@@ -445,6 +454,57 @@ impl EncoderConfig {
         }
     }
 
+    /// r474 — `(SubWidthC, SubHeightC)` of [`Self::chroma_format_idc`]
+    /// (§6.2 Table 2; monochrome is 1 / 1).
+    pub fn chroma_subsampling(&self) -> (u32, u32) {
+        match self.chroma_format_idc {
+            0 | 3 => (1, 1),
+            2 => (2, 1),
+            _ => (2, 2),
+        }
+    }
+
+    /// r474 — `pps_pic_width_in_luma_samples`: the configured width
+    /// padded up to the §7.4.3.5 `Max(8, MinCbSizeY)` multiple (8 on
+    /// the emitted SPS, `MinCbSizeY = 4`). The padding columns are
+    /// coded (edge-replicated source) and cropped away by the
+    /// §7.4.3.4 conformance window.
+    pub fn coded_width(&self) -> u32 {
+        self.width.div_ceil(CODED_SIZE_ALIGN) * CODED_SIZE_ALIGN
+    }
+
+    /// r474 — `pps_pic_height_in_luma_samples`; see
+    /// [`Self::coded_width`].
+    pub fn coded_height(&self) -> u32 {
+        self.height.div_ceil(CODED_SIZE_ALIGN) * CODED_SIZE_ALIGN
+    }
+
+    /// r474 — the §7.4.3.4 conformance window as `(left, right, top,
+    /// bottom)` offsets in chroma units (`SubWidthC` / `SubHeightC`
+    /// luma samples each). Left / top are always 0; right / bottom
+    /// crop the coded padding back to the configured size rounded UP
+    /// to the chroma subsampling (an odd 4:2:0 width cannot be
+    /// expressed exactly — the output keeps one extra column, see
+    /// [`Self::output_size`]).
+    pub fn conformance_window(&self) -> (u32, u32, u32, u32) {
+        let (sw, sh) = self.chroma_subsampling();
+        let right = (self.coded_width() - self.width) / sw;
+        let bottom = (self.coded_height() - self.height) / sh;
+        (0, right, 0, bottom)
+    }
+
+    /// r474 — the cropped output size a conforming decoder presents
+    /// (coded size minus the conformance window): the configured
+    /// size rounded up to the chroma subsampling.
+    pub fn output_size(&self) -> (u32, u32) {
+        let (sw, sh) = self.chroma_subsampling();
+        let (_, right, _, bottom) = self.conformance_window();
+        (
+            self.coded_width() - right * sw,
+            self.coded_height() - bottom * sh,
+        )
+    }
+
     /// r431 — the raster layout is active when either the r429
     /// single-slice knob or a multi-slice raster count asks for it.
     pub fn raster_layout(&self) -> bool {
@@ -492,8 +552,8 @@ impl EncoderConfig {
         if cols * rows <= 1 {
             return None;
         }
-        let pic_w_ctbs = self.width.div_ceil(128);
-        let pic_h_ctbs = self.height.div_ceil(128);
+        let pic_w_ctbs = self.coded_width().div_ceil(128);
+        let pic_h_ctbs = self.coded_height().div_ceil(128);
         let split = |total: u32, n: u32| -> Vec<u32> {
             // Near-uniform: the first (total % n) tiles get one extra
             // CTB. Every entry stays >= 1 (validate() bounds n).
@@ -580,11 +640,11 @@ impl EncoderConfig {
         // least one CTB wide / tall (CTB = 128 on the emitted SPS).
         let cols = u32::from(self.tile_columns.max(1));
         let rows = u32::from(self.tile_rows.max(1));
-        if cols > self.width.div_ceil(128) || rows > self.height.div_ceil(128) {
+        if cols > self.coded_width().div_ceil(128) || rows > self.coded_height().div_ceil(128) {
             return Err(Error::invalid(format!(
                 "h266 encoder: tile grid {cols}x{rows} exceeds the {}x{} CTB grid",
-                self.width.div_ceil(128),
-                self.height.div_ceil(128),
+                self.coded_width().div_ceil(128),
+                self.coded_height().div_ceil(128),
             )));
         }
         Ok(())
@@ -750,9 +810,20 @@ impl VvcEncoder {
         bw.write_bit(0);
         bw.write_bit(0); // sps_gdr_enabled_flag = 0
         bw.write_bit(0); // sps_ref_pic_resampling_enabled_flag = 0
-        bw.write_ue(self.config.width);
-        bw.write_ue(self.config.height);
-        bw.write_bit(0); // sps_conformance_window_flag
+                         // r474 — the coded size is the configured size padded to the
+                         // §7.4.3.5 Max(8, MinCbSizeY) multiple; the §7.4.3.4
+                         // conformance window crops the padding back out.
+        bw.write_ue(self.config.coded_width()); // sps_pic_width_max_in_luma_samples
+        bw.write_ue(self.config.coded_height()); // sps_pic_height_max_in_luma_samples
+        let (cw_l, cw_r, cw_t, cw_b) = self.config.conformance_window();
+        let conf_win = (cw_l | cw_r | cw_t | cw_b) != 0;
+        bw.write_bit(conf_win as u8); // sps_conformance_window_flag
+        if conf_win {
+            bw.write_ue(cw_l); // sps_conf_win_left_offset
+            bw.write_ue(cw_r); // sps_conf_win_right_offset
+            bw.write_ue(cw_t); // sps_conf_win_top_offset
+            bw.write_ue(cw_b); // sps_conf_win_bottom_offset
+        }
         bw.write_bit(0); // sps_subpic_info_present_flag
         bw.write_ue((self.config.bit_depth - 8) as u32); // sps_bitdepth_minus8 = 0
                                                          // r429 — WPP + entry points: entropy sync mirrors the config
@@ -893,8 +964,11 @@ impl VvcEncoder {
         bw.write_bits(0, 6); // pps_pic_parameter_set_id
         bw.write_bits(0, 4); // pps_seq_parameter_set_id
         bw.write_bit(0); // pps_mixed_nalu_types_in_pic_flag
-        bw.write_ue(self.config.width);
-        bw.write_ue(self.config.height);
+                         // r474 — the PPS size equals the SPS maximum, so §7.4.3.5
+                         // requires pps_conformance_window_flag = 0 and the window is
+                         // inferred from the SPS.
+        bw.write_ue(self.config.coded_width()); // pps_pic_width_in_luma_samples
+        bw.write_ue(self.config.coded_height()); // pps_pic_height_in_luma_samples
         bw.write_bit(0); // pps_conformance_window_flag
         bw.write_bit(0); // pps_scaling_window_explicit_signalling_flag
         bw.write_bit(0); // pps_output_flag_present_flag
