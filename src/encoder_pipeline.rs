@@ -208,6 +208,12 @@ struct PreparedLumaTb {
     /// the levels are residual samples coded through
     /// `residual_ts_coding()` (lossless pipeline).
     transform_skip: bool,
+    /// r474 — the chosen `IntraPredModeY` (0 PLANAR, 1 DC, 2..=66);
+    /// diagnostics / future chroma-mode search (the wire carries
+    /// `mode_syntax`).
+    luma_mode: u32,
+    /// r474 — its §7.3.11.5 cascade against the CU's §8.4.2 list.
+    mode_syntax: IntraModeSyntax,
 }
 
 /// r431 — one palette CU prepared by the first pass (§7.3.11.6 /
@@ -292,6 +298,16 @@ enum PreparedCu {
         /// Second child sub-CU.
         sub_b: Box<PreparedCu>,
     },
+    /// r474 — explicit quad split (`split_cu_flag = 1`, `split_qt_flag`
+    /// when coded) of a fully-inside node chosen by the CU-size RDO:
+    /// four `size / 2` children in z-order, each at `cqt_depth + 1`.
+    QtSplit {
+        /// `cqt_depth` of this node.
+        cqt_depth: u32,
+        /// Children in z-order (top-left, top-right, bottom-left,
+        /// bottom-right).
+        children: Vec<PreparedCu>,
+    },
     /// Round-57 — ternary-tree split: three sub-CUs at the 1:2:1 ratio.
     /// `Vertical` slices the CU into three columns of widths
     /// `(cb_w / 4, cb_w / 2, cb_w / 4)`; `Horizontal` slices into three
@@ -325,6 +341,11 @@ impl PreparedCu {
             PreparedCu::BtSplit { sub_a, sub_b, .. } => {
                 sub_a.for_each_leaf(f);
                 sub_b.for_each_leaf(f);
+            }
+            PreparedCu::QtSplit { children, .. } => {
+                for c in children {
+                    c.for_each_leaf(f);
+                }
             }
             PreparedCu::TtSplit {
                 sub_a,
@@ -362,6 +383,10 @@ fn encoder_split_constraints(pic_w: u32, pic_h: u32, mtt_enabled: bool) -> Split
     }
 }
 
+/// r474 — [`EncAvail::modes`] value of a palette-coded CU
+/// (`CuPredMode != MODE_INTRA` → the §8.4.2 candidate reads PLANAR).
+const NON_INTRA_MODE: u8 = 0xFF;
+
 /// r412 — encoder-side §8.7.5.1 eq. 1212 availability masks. The
 /// coding loop mirrors the decoder: a reference sample is usable for
 /// intra prediction only when its covering block has already been
@@ -382,6 +407,10 @@ struct EncAvail {
     cw: usize,
     ch: usize,
     chroma_present: bool,
+    /// r474 — `IntraPredModeY` per 4x4 luma cell (§8.4.2 MPM inputs);
+    /// [`NON_INTRA_MODE`] marks palette CUs (candidate → PLANAR).
+    modes: Vec<u8>,
+    mcb_w: usize,
     /// r429 — §6.4.4 availability region `(x0, y0, x1, y1, col_cap)`
     /// in luma samples: the current tile's rectangle plus the WPP
     /// exclusive column cap. Reference fetches outside it read
@@ -411,8 +440,58 @@ impl EncAvail {
             cw,
             ch,
             chroma_present: chroma_format_idc != 0,
+            modes: vec![crate::leaf_cu::INTRA_PLANAR as u8; w.div_ceil(4) * h.div_ceil(4)],
+            mcb_w: w.div_ceil(4),
             region: (0, 0, w, h, usize::MAX),
         }
+    }
+
+    /// r474 — record the luma intra mode of a committed CU (or
+    /// [`NON_INTRA_MODE`]) on its 4x4 cells.
+    fn mark_modes(&mut self, x: usize, y: usize, bw: usize, bh: usize, mode: u8) {
+        let mcb_h = self.h.div_ceil(4);
+        for my in (y / 4)..((y + bh).div_ceil(4)).min(mcb_h) {
+            for mx in (x / 4)..((x + bw).div_ceil(4)).min(self.mcb_w) {
+                self.modes[my * self.mcb_w + mx] = mode;
+            }
+        }
+    }
+
+    /// r474 — §8.4.2 `candIntraPredModeX` for the neighbouring luma
+    /// sample `(nx, ny)`: PLANAR when the position is outside the
+    /// picture / the §6.4.4 region, not yet reconstructed, or not an
+    /// intra CU; `side_b` applies the CTB-row rule (the above
+    /// neighbour of a CU on a CTB top row reads PLANAR).
+    fn mpm_candidate(&self, nx: i64, ny: i64, side_b: bool, cu_y: usize) -> u32 {
+        const CTB_SIZE: usize = 128;
+        if nx < 0 || ny < 0 || nx as usize >= self.w || ny as usize >= self.h {
+            return crate::leaf_cu::INTRA_PLANAR;
+        }
+        let (rx0, ry0, rx1, ry1, cap) = self.region;
+        let (ux, uy) = (nx as usize, ny as usize);
+        if ux < rx0 || uy < ry0 || ux >= rx1 || uy >= ry1 || ux >= cap {
+            return crate::leaf_cu::INTRA_PLANAR;
+        }
+        if !self.luma[uy * self.w + ux] {
+            return crate::leaf_cu::INTRA_PLANAR;
+        }
+        if side_b && cu_y % CTB_SIZE == 0 {
+            return crate::leaf_cu::INTRA_PLANAR;
+        }
+        let m = self.modes[(uy / 4) * self.mcb_w + ux / 4];
+        if m == NON_INTRA_MODE {
+            crate::leaf_cu::INTRA_PLANAR
+        } else {
+            u32::from(m)
+        }
+    }
+
+    /// r474 — the §8.4.2 `candModeList[]` of the CU at `(x, y)` of size
+    /// `w x h`: A = (x − 1, y + h − 1), B = (x + w − 1, y − 1).
+    fn mpm_cand_list(&self, x: usize, y: usize, w: usize, h: usize) -> [u32; 5] {
+        let a = self.mpm_candidate(x as i64 - 1, (y + h) as i64 - 1, false, y);
+        let b = self.mpm_candidate((x + w) as i64 - 1, y as i64 - 1, true, y);
+        crate::leaf_cu::build_mpm_cand_list(a, b)
     }
 
     /// r429 — install the §6.4.4 tile / WPP availability region for
@@ -459,11 +538,12 @@ impl EncAvail {
     }
 }
 
-/// r412 — the decoder-mirrored §8.4.5.2.6 DC prediction (with PDPC and
-/// the §8.4.5.2.9 substitution) for one encoder TB. `avail` / `aw` /
-/// `ah` describe the eq. 1212 mask of the plane being predicted.
+/// r412 / r474 — the decoder-mirrored §8.4.5.2 intra prediction
+/// (reference substitution + filtering, PLANAR / DC / angular with the
+/// wide-angle remap, PDPC) for one encoder TB in `mode`. `avail` /
+/// `aw` / `ah` describe the eq. 1212 mask of the plane being predicted.
 #[allow(clippy::too_many_arguments)]
-fn predict_dc_block(
+fn predict_block(
     plane: &PicturePlane,
     avail: &[bool],
     aw: usize,
@@ -474,11 +554,12 @@ fn predict_dc_block(
     n_w: usize,
     n_h: usize,
     c_idx: u32,
+    mode: u32,
 ) -> Result<Vec<i16>> {
     let (rx0, ry0, rx1, ry1, rcap) = region;
     predict_intra(
         &IntraPredParams {
-            mode: crate::leaf_cu::INTRA_DC,
+            mode,
             n_tb_w: n_w,
             n_tb_h: n_h,
             n_cb_w: n_w,
@@ -528,26 +609,108 @@ impl IntraModeCtxs {
     }
 }
 
-/// r412 — emit the §7.3.11.5 intra-mode cascade for one pipeline CU:
-/// `intra_luma_mpm_flag = 1`, `intra_luma_not_planar_flag = 1`,
-/// `intra_luma_mpm_idx = 0` (TR cMax = 4, one bypass 0-bin) and
-/// `intra_chroma_pred_mode` = DM (Table 130 "0" bin). Every pipeline
-/// CU codes INTRA_DC, so no neighbour is ever angular and the §8.4.2
-/// default candModeList always carries DC at index 0; DM chroma then
-/// inherits DC per Table 20.
-fn emit_intra_dc_mode_bins(
+/// r474 — the §7.3.11.5 luma intra-mode cascade of one CU, resolved
+/// against the §8.4.2 `candModeList[]` at prepare time (the second
+/// pass only writes the bins).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntraModeSyntax {
+    /// `intra_luma_mpm_flag`.
+    mpm_flag: bool,
+    /// `intra_luma_not_planar_flag` (meaningful when `mpm_flag`).
+    not_planar: bool,
+    /// `intra_luma_mpm_idx` (meaningful when `mpm_flag && not_planar`).
+    mpm_idx: u32,
+    /// `intra_luma_mpm_remainder` (meaningful when `!mpm_flag`).
+    remainder: u32,
+}
+
+impl IntraModeSyntax {
+    /// INTRA_DC against the default (both-neighbours-PLANAR) list —
+    /// the historical DC-only wire (unit tests).
+    #[cfg(test)]
+    const DC_DEFAULT: Self = Self {
+        mpm_flag: true,
+        not_planar: true,
+        mpm_idx: 0,
+        remainder: 0,
+    };
+}
+
+/// r474 — the cascade that makes §8.4.2 derive `mode` from `cand`
+/// (PLANAR via `intra_luma_not_planar_flag = 0`; a list member via
+/// its `intra_luma_mpm_idx`; anything else via the remainder, which is
+/// the mode minus one minus the number of list entries below it — the
+/// inverse of the step-4.b sorted increment walk).
+fn mode_syntax_for(mode: u32, cand: &[u32; 5]) -> IntraModeSyntax {
+    if mode == crate::leaf_cu::INTRA_PLANAR {
+        return IntraModeSyntax {
+            mpm_flag: true,
+            not_planar: false,
+            mpm_idx: 0,
+            remainder: 0,
+        };
+    }
+    if let Some(i) = cand.iter().position(|&c| c == mode) {
+        return IntraModeSyntax {
+            mpm_flag: true,
+            not_planar: true,
+            mpm_idx: i as u32,
+            remainder: 0,
+        };
+    }
+    let below = cand.iter().filter(|&&c| c < mode).count() as u32;
+    IntraModeSyntax {
+        mpm_flag: false,
+        not_planar: true,
+        mpm_idx: 0,
+        remainder: mode - 1 - below,
+    }
+}
+
+/// r474 — emit the §7.3.11.5 intra-mode cascade for one pipeline CU:
+/// `intra_luma_mpm_flag` (ctx), then either `intra_luma_not_planar_flag`
+/// (ctx) + `intra_luma_mpm_idx` (bypass TR, cMax = 4) or
+/// `intra_luma_mpm_remainder` (bypass TB, cMax = 60 — §9.3.3.4), and
+/// `intra_chroma_pred_mode` = DM (Table 130 "0" bin) when a chroma
+/// format is present.
+fn emit_intra_mode_bins(
     enc: &mut crate::cabac_enc::ArithEncoder,
     ictx: &mut IntraModeCtxs,
+    ms: &IntraModeSyntax,
     chroma: bool,
 ) -> Result<()> {
     let inc = ctx_inc_intra_luma_mpm_flag() as usize;
-    enc.encode_decision(&mut ictx.mpm_flag[inc], 1)?;
-    let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
-    let n = ictx.not_planar.len() - 1;
-    enc.encode_decision(&mut ictx.not_planar[inc.min(n)], 1)?;
-    enc.encode_bypass(0)?; // intra_luma_mpm_idx = 0
-                           // §7.3.11.5 — intra_chroma_pred_mode is present only with a chroma
-                           // format (`sps_chroma_format_idc != 0`; r474).
+    enc.encode_decision(&mut ictx.mpm_flag[inc], u32::from(ms.mpm_flag))?;
+    if ms.mpm_flag {
+        let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+        let n = ictx.not_planar.len() - 1;
+        enc.encode_decision(&mut ictx.not_planar[inc.min(n)], u32::from(ms.not_planar))?;
+        if ms.not_planar {
+            // TR(cMax = 4, cRice = 0): `mpm_idx` ones, a zero unless 4.
+            for _ in 0..ms.mpm_idx {
+                enc.encode_bypass(1)?;
+            }
+            if ms.mpm_idx < 4 {
+                enc.encode_bypass(0)?;
+            }
+        }
+    } else {
+        // TB(cMax = 60): n = 61, k = 5, u = 3 — values below u take 5
+        // bits, the rest 6 bits of (value + u).
+        let r = ms.remainder;
+        if r < 3 {
+            for i in (0..5).rev() {
+                enc.encode_bypass((r >> i) & 1)?;
+            }
+        } else {
+            let v = r + 3;
+            for i in (0..6).rev() {
+                enc.encode_bypass((v >> i) & 1)?;
+            }
+        }
+    }
+    // §7.3.11.5 — intra_chroma_pred_mode is present only with a chroma
+    // format (`sps_chroma_format_idc != 0`).
     if chroma {
         let inc = ctx_inc_intra_chroma_pred_mode() as usize;
         let n = ictx.chroma_mode.len() - 1;
@@ -556,29 +719,86 @@ fn emit_intra_dc_mode_bins(
     Ok(())
 }
 
-/// Compute residual + reconstruction for one luma TB without touching
-/// any CABAC stream. Returns the quantised levels for the later
-/// per-CTU CABAC emit pass.
-///
-/// Round-56 — accepts independent `n_tb_w` / `n_tb_h` so the BT picker
-/// can prepare non-square TBs (e.g. 32×64 after a `BT_VERT` split).
-/// Both dims must be powers of two in `[4, 64]`.
-fn prepare_luma_tb(
+/// r474 — sum of absolute Hadamard-transformed differences over 8x8
+/// blocks (4x4 for narrower dimensions): the pre-selection metric of
+/// the intra mode search.
+fn hadamard_satd(residual: &[i32], w: usize, h: usize) -> u64 {
+    fn satd_n(res: &[i32], stride: usize, x0: usize, y0: usize, n: usize) -> u64 {
+        let mut m = [0i64; 64];
+        for y in 0..n {
+            for x in 0..n {
+                m[y * n + x] = i64::from(res[(y0 + y) * stride + x0 + x]);
+            }
+        }
+        // Rows then columns, in-place butterflies (log2 n stages each).
+        let mut tmp = [0i64; 64];
+        for pass in 0..2 {
+            for line in 0..n {
+                let (base, step) = if pass == 0 { (line * n, 1) } else { (line, n) };
+                let mut len = 1;
+                while len < n {
+                    let mut i = 0;
+                    while i < n {
+                        for j in 0..len {
+                            let a = m[base + (i + j) * step];
+                            let b = m[base + (i + j + len) * step];
+                            tmp[i + j] = a + b;
+                            tmp[i + j + len] = a - b;
+                        }
+                        i += 2 * len;
+                    }
+                    for (k, v) in tmp.iter().take(n).enumerate() {
+                        m[base + k * step] = *v;
+                    }
+                    len <<= 1;
+                }
+            }
+        }
+        let sum: i64 = m[..n * n].iter().map(|v| v.abs()).sum();
+        // Normalise like the per-block SAD scale (÷ n for 8x8, ÷ 2 for 4x4).
+        (sum as u64) / if n == 8 { 8 } else { 2 }
+    }
+    let n = if w >= 8 && h >= 8 { 8 } else { 4 };
+    let mut total = 0u64;
+    for y0 in (0..h).step_by(n) {
+        for x0 in (0..w).step_by(n) {
+            if x0 + n <= w && y0 + n <= h {
+                total += satd_n(residual, w, x0, y0, n);
+            }
+        }
+    }
+    total
+}
+
+/// r474 — one fully coded luma TB candidate: levels, reconstruction
+/// and distortion, not yet committed to the plane.
+struct LumaTrial {
+    mode: u32,
+    syntax: IntraModeSyntax,
+    levels: Vec<i32>,
+    rec: Vec<u16>,
+    sse: u64,
+}
+
+/// r474 — forward-code one luma TB in intra `mode` without touching
+/// the plane: prediction (decoder-mirrored), DCT-II + 32-corner
+/// zero-out, quantisation (flat / dep-quant / SDH), dequantisation and
+/// inverse transform, reconstruction and SSE against the source.
+#[allow(clippy::too_many_arguments)]
+fn code_luma_tb_trial(
     src: &PicturePlane,
-    rec_plane: &mut PicturePlane,
-    avail: &mut EncAvail,
+    rec_plane: &PicturePlane,
+    avail: &EncAvail,
     x: usize,
     y: usize,
     n_tb_w: usize,
     n_tb_h: usize,
     qp: i32,
     rc: crate::residual::RcOpts,
-) -> Result<Vec<i32>> {
-    // r412 — real §8.4.5.2.12 DC intra prediction (+ PDPC) from the
-    // partially-reconstructed plane, decoder-mirrored: the wire
-    // signals INTRA_DC per CU, so the encoder reconstruction must use
-    // the exact prediction a conforming decoder derives.
-    let pred = predict_dc_block(
+    mode: u32,
+    syntax: IntraModeSyntax,
+) -> Result<LumaTrial> {
+    let pred = predict_block(
         rec_plane,
         &avail.luma,
         avail.w,
@@ -589,33 +809,22 @@ fn prepare_luma_tb(
         n_tb_w,
         n_tb_h,
         0,
+        mode,
     )?;
-
-    // Extract source block → residual.
-    let mut residual = vec![0i32; n_tb_w * n_tb_h];
-    for ty in 0..n_tb_h {
-        for tx in 0..n_tb_w {
-            let sx = x + tx;
-            let sy = y + ty;
-            let p = pred[ty * n_tb_w + tx] as i32;
-            let src_s = src.get(sx, sy).map(|v| v as i32).unwrap_or(p);
-            residual[ty * n_tb_w + tx] = src_s - p;
-        }
-    }
-
-    // r474 — bit depth from the plane; the quantiser / dequantiser take
-    // Qp′ = QpY + QpBdOffset (§8.7.1).
     let bd = rec_plane.bit_depth;
     let qp_prime = qp + 6 * (bd as i32 - 8);
     let max_v = (1i32 << bd) - 1;
-    // Forward DCT-II.
+    let mut residual = vec![0i32; n_tb_w * n_tb_h];
+    let mut src_blk = vec![0i32; n_tb_w * n_tb_h];
+    for ty in 0..n_tb_h {
+        for tx in 0..n_tb_w {
+            let p = pred[ty * n_tb_w + tx] as i32;
+            let s = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(p);
+            src_blk[ty * n_tb_w + tx] = s;
+            residual[ty * n_tb_w + tx] = s - p;
+        }
+    }
     let mut coeffs = forward_dct_ii_2d(n_tb_w, n_tb_h, &residual, bd)?;
-    // §7.3.11.11 / §8.7.4.1 zero-out (r412) — a 64-point DCT-II TB
-    // codes only the low-frequency 32-corner (Log2ZoTb = Min(log2Tb,
-    // 5); the decoder's eqs. 1171/1172 inverse-transform extents cap
-    // there too). Zero the out-of-corner coefficients BEFORE
-    // quantisation so the coded levels, the reconstruction, and a
-    // conforming decoder all agree.
     if n_tb_w > 32 || n_tb_h > 32 {
         for yc in 0..n_tb_h {
             for xc in 0..n_tb_w {
@@ -625,10 +834,6 @@ fn prepare_luma_tb(
             }
         }
     }
-
-    // Quantise — the dep-quant arm walks the §7.4.12.11 trellis; the
-    // SDH arm parity-conditions each sub-block so the hidden sign is
-    // recoverable (§7.3.11.11 signHiddenFlag).
     let levels = if rc.dep_quant {
         quantize_tb_dep_quant(&coeffs, n_tb_w as u32, n_tb_h as u32, qp_prime, bd, 15)?
     } else {
@@ -638,8 +843,6 @@ fn prepare_luma_tb(
         }
         l
     };
-
-    // Dequant + IDCT to get decoded residual.
     let mut params = DequantParams::luma_8bit(n_tb_w as u32, n_tb_h as u32, qp_prime);
     params.bit_depth = bd;
     params.dep_quant = rc.dep_quant;
@@ -655,21 +858,516 @@ fn prepare_luma_tb(
         bd,
         15,
     )?;
+    let mut rec = vec![0u16; n_tb_w * n_tb_h];
+    let mut sse = 0u64;
+    for i in 0..n_tb_w * n_tb_h {
+        let v = (pred[i] as i32 + rec_res[i]).clamp(0, max_v);
+        rec[i] = v as u16;
+        let d = i64::from(v - src_blk[i]);
+        sse += (d * d) as u64;
+    }
+    Ok(LumaTrial {
+        mode,
+        syntax,
+        levels,
+        rec,
+        sse,
+    })
+}
 
-    // Write reconstructed samples.
+/// r474 — estimated CABAC cost (fractional bits) of one luma TB: the
+/// §7.3.11.5 mode cascade, `tu_y_coded_flag` and the §7.3.11.11
+/// residual bins, coded into a scratch engine with fresh contexts.
+fn estimate_luma_tb_bits(
+    syntax: &IntraModeSyntax,
+    levels: &[i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    rc: crate::residual::RcOpts,
+) -> Result<f64> {
+    let mut enc = crate::cabac_enc::ArithEncoder::new();
+    let mut ictx = IntraModeCtxs::init(qp);
+    let mut rctx = ResidualCtxs::init(qp);
+    emit_intra_mode_bins(&mut enc, &mut ictx, syntax, false)?;
+    let cbf = levels.iter().any(|&l| l != 0);
+    write_tu_y_coded_flag(&mut enc, &mut rctx, cbf, false, false, false)?;
+    if cbf {
+        encode_tb_coefficients_opts(&mut enc, &mut rctx, n_tb_w, n_tb_h, 0, levels, rc)?;
+    }
+    Ok(enc.estimated_bits())
+}
+
+/// r474 — intra mode decision for one luma TB: every PLANAR / DC /
+/// angular mode (0..=66) is predicted and ranked by Hadamard SATD plus
+/// a mode-rate term; the best three, PLANAR and DC are then fully coded
+/// and the lowest `SSE + λ · bits` wins. Returns the committed-ready
+/// trial.
+#[allow(clippy::too_many_arguments)]
+fn decide_luma_mode(
+    src: &PicturePlane,
+    rec_plane: &PicturePlane,
+    avail: &EncAvail,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    rc: crate::residual::RcOpts,
+) -> Result<LumaTrial> {
+    const RD_CANDIDATES: usize = 3;
+    let cand = avail.mpm_cand_list(x, y, n_tb_w, n_tb_h);
+    let bd = rec_plane.bit_depth;
+    let lambda = lambda_for_qp(qp) * f64::from(1u32 << (2 * (bd - 8)));
+    let lambda_satd = lambda.sqrt();
+    let region = avail.region_for(0);
+    let mut src_blk = vec![0i32; n_tb_w * n_tb_h];
     for ty in 0..n_tb_h {
         for tx in 0..n_tb_w {
-            let rx = x + tx;
-            let ry = y + ty;
+            src_blk[ty * n_tb_w + tx] = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(0);
+        }
+    }
+    let mut scored: Vec<(f64, u32)> = Vec::with_capacity(67);
+    let mut residual = vec![0i32; n_tb_w * n_tb_h];
+    for mode in 0..=66u32 {
+        let pred = predict_block(
+            rec_plane,
+            &avail.luma,
+            avail.w,
+            avail.h,
+            region,
+            x,
+            y,
+            n_tb_w,
+            n_tb_h,
+            0,
+            mode,
+        )?;
+        for i in 0..n_tb_w * n_tb_h {
+            residual[i] = src_blk[i] - pred[i] as i32;
+        }
+        let satd = hadamard_satd(&residual, n_tb_w, n_tb_h) as f64;
+        // Rough mode-rate: planar 2 bins, an MPM 2 + idx + 1, else ~8.
+        let ms = mode_syntax_for(mode, &cand);
+        let mode_bits = if !ms.mpm_flag {
+            8.0
+        } else if !ms.not_planar {
+            2.0
+        } else {
+            3.0 + ms.mpm_idx.min(4) as f64
+        };
+        scored.push((satd + lambda_satd * mode_bits, mode));
+    }
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cands: Vec<u32> = scored.iter().take(RD_CANDIDATES).map(|s| s.1).collect();
+    for m in [crate::leaf_cu::INTRA_PLANAR, crate::leaf_cu::INTRA_DC] {
+        if !cands.contains(&m) {
+            cands.push(m);
+        }
+    }
+    let mut best: Option<(f64, LumaTrial)> = None;
+    for mode in cands {
+        let syntax = mode_syntax_for(mode, &cand);
+        let trial = code_luma_tb_trial(
+            src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc, mode, syntax,
+        )?;
+        let bits = estimate_luma_tb_bits(&syntax, &trial.levels, n_tb_w, n_tb_h, qp, rc)?;
+        let cost = trial.sse as f64 + lambda * bits;
+        if best.as_ref().map(|(c, _)| cost < *c).unwrap_or(true) {
+            best = Some((cost, trial));
+        }
+    }
+    Ok(best.map(|(_, t)| t).expect("at least one intra candidate"))
+}
+
+/// r474 — commit a chosen luma trial: write the reconstruction, mark
+/// the eq. 1212 availability and record the mode for later §8.4.2
+/// derivations.
+fn commit_luma_trial(
+    rec_plane: &mut PicturePlane,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    trial: &LumaTrial,
+) {
+    for ty in 0..n_tb_h {
+        for tx in 0..n_tb_w {
+            let (rx, ry) = (x + tx, y + ty);
             if rx < rec_plane.width && ry < rec_plane.height {
-                let s = pred[ty * n_tb_w + tx] as i32 + rec_res[ty * n_tb_w + tx];
-                rec_plane.samples[ry * rec_plane.stride + rx] = s.clamp(0, max_v) as u16;
+                rec_plane.samples[ry * rec_plane.stride + rx] = trial.rec[ty * n_tb_w + tx];
             }
         }
     }
-    // §8.7.5.1 eq. 1212 — this TB's samples become available.
     avail.mark_luma(x, y, n_tb_w, n_tb_h);
-    Ok(levels)
+    avail.mark_modes(x, y, n_tb_w, n_tb_h, trial.mode as u8);
+}
+
+/// r474 — snapshot of everything a CU trial may modify inside its
+/// rectangle: the three reconstruction planes, the eq. 1212 masks and
+/// the §8.4.2 mode cells. Region-local so the CU-size RDO stays linear
+/// in the picture area.
+struct RegionSnap {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    luma: Vec<u16>,
+    cb: Vec<u16>,
+    cr: Vec<u16>,
+    av_l: Vec<bool>,
+    av_c: Vec<bool>,
+    modes: Vec<u8>,
+}
+
+fn copy_rect<T: Copy>(
+    buf: &[T],
+    stride: usize,
+    pw: usize,
+    ph: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(w * h);
+    for yy in y..(y + h).min(ph) {
+        let x1 = (x + w).min(pw);
+        if x < x1 {
+            out.extend_from_slice(&buf[yy * stride + x..yy * stride + x1]);
+        }
+    }
+    out
+}
+
+fn paste_rect<T: Copy>(
+    buf: &mut [T],
+    stride: usize,
+    pw: usize,
+    ph: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    src: &[T],
+) {
+    let mut off = 0;
+    for yy in y..(y + h).min(ph) {
+        let x1 = (x + w).min(pw);
+        if x < x1 {
+            let n = x1 - x;
+            buf[yy * stride + x..yy * stride + x1].copy_from_slice(&src[off..off + n]);
+            off += n;
+        }
+    }
+}
+
+fn snapshot_region(
+    rec: &PictureBuffer,
+    avail: &EncAvail,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> RegionSnap {
+    let (cx, cy, cw, ch) = (
+        x / avail.sub_w,
+        y / avail.sub_h,
+        w / avail.sub_w,
+        h / avail.sub_h,
+    );
+    RegionSnap {
+        x,
+        y,
+        w,
+        h,
+        luma: copy_rect(
+            &rec.luma.samples,
+            rec.luma.stride,
+            rec.luma.width,
+            rec.luma.height,
+            x,
+            y,
+            w,
+            h,
+        ),
+        cb: copy_rect(
+            &rec.cb.samples,
+            rec.cb.stride,
+            rec.cb.width,
+            rec.cb.height,
+            cx,
+            cy,
+            cw,
+            ch,
+        ),
+        cr: copy_rect(
+            &rec.cr.samples,
+            rec.cr.stride,
+            rec.cr.width,
+            rec.cr.height,
+            cx,
+            cy,
+            cw,
+            ch,
+        ),
+        av_l: copy_rect(&avail.luma, avail.w, avail.w, avail.h, x, y, w, h),
+        av_c: copy_rect(&avail.chroma, avail.cw, avail.cw, avail.ch, cx, cy, cw, ch),
+        modes: copy_rect(
+            &avail.modes,
+            avail.mcb_w,
+            avail.mcb_w,
+            avail.h.div_ceil(4),
+            x / 4,
+            y / 4,
+            w.div_ceil(4),
+            h.div_ceil(4),
+        ),
+    }
+}
+
+fn restore_region(rec: &mut PictureBuffer, avail: &mut EncAvail, snap: &RegionSnap) {
+    let (x, y, w, h) = (snap.x, snap.y, snap.w, snap.h);
+    let (cx, cy, cw, ch) = (
+        x / avail.sub_w,
+        y / avail.sub_h,
+        w / avail.sub_w,
+        h / avail.sub_h,
+    );
+    paste_rect(
+        &mut rec.luma.samples,
+        rec.luma.stride,
+        rec.luma.width,
+        rec.luma.height,
+        x,
+        y,
+        w,
+        h,
+        &snap.luma,
+    );
+    paste_rect(
+        &mut rec.cb.samples,
+        rec.cb.stride,
+        rec.cb.width,
+        rec.cb.height,
+        cx,
+        cy,
+        cw,
+        ch,
+        &snap.cb,
+    );
+    paste_rect(
+        &mut rec.cr.samples,
+        rec.cr.stride,
+        rec.cr.width,
+        rec.cr.height,
+        cx,
+        cy,
+        cw,
+        ch,
+        &snap.cr,
+    );
+    paste_rect(
+        &mut avail.luma,
+        avail.w,
+        avail.w,
+        avail.h,
+        x,
+        y,
+        w,
+        h,
+        &snap.av_l,
+    );
+    paste_rect(
+        &mut avail.chroma,
+        avail.cw,
+        avail.cw,
+        avail.ch,
+        cx,
+        cy,
+        cw,
+        ch,
+        &snap.av_c,
+    );
+    let mh = avail.h.div_ceil(4);
+    paste_rect(
+        &mut avail.modes,
+        avail.mcb_w,
+        avail.mcb_w,
+        mh,
+        x / 4,
+        y / 4,
+        w.div_ceil(4),
+        h.div_ceil(4),
+        &snap.modes,
+    );
+}
+
+/// r474 — smallest CU the CU-size RDO descends to (an 8x8 QT split
+/// would open the §7.3.11.4 local dual tree).
+const MIN_RDO_LEAF: usize = 8;
+
+/// r474 — CU-size rate-distortion decision for one fully-inside square
+/// node: code it as ONE CU (the intra mode decision, or the MTT picker
+/// at 64 when enabled, or the lossless transform-skip leaf) and, down
+/// to [`MIN_RDO_LEAF`], as an explicit quad split of four recursively
+/// decided children; keep the lower `SSE(Y + Cb + Cr) + λ · bits`.
+/// Returns the chosen CU with the reconstruction / availability / mode
+/// state of that choice left in place.
+#[allow(clippy::too_many_arguments)]
+fn prepare_cu_rdo(
+    src: &PictureBuffer,
+    rec: &mut PictureBuffer,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    size: usize,
+    cqt_depth: u32,
+    cu_qp: i32,
+    slice_qp_y: i32,
+    rc: crate::residual::RcOpts,
+    chroma_scale: Option<u32>,
+    lossless: bool,
+    try_bt: bool,
+    try_tt: bool,
+    rdo_split: bool,
+    constraints: &SplitConstraints,
+    lambda: f64,
+) -> Result<(PreparedCu, f64)> {
+    let snap0 = snapshot_region(rec, avail, x, y, size, size);
+    let cu_a = if lossless {
+        prepare_leaf_cu_lossless(src, rec, avail, x, y, size, size, cu_qp)?
+    } else if (try_bt || try_tt) && size == 64 {
+        prepare_cu_with_mtt_picker(
+            src,
+            rec,
+            avail,
+            x,
+            y,
+            size,
+            cu_qp,
+            slice_qp_y,
+            try_bt,
+            try_tt,
+            rc,
+            chroma_scale,
+        )?
+    } else {
+        prepare_leaf_cu(src, rec, avail, x, y, size, size, cu_qp, rc, chroma_scale)?
+    };
+    let region_sse = |rec: &PictureBuffer| -> u64 {
+        let mut sse = region_sse_y(&src.luma, &rec.luma, x, y, size, size);
+        if avail.chroma_present {
+            let (cx, cy, cw, ch) = (
+                x / avail.sub_w,
+                y / avail.sub_h,
+                size / avail.sub_w,
+                size / avail.sub_h,
+            );
+            sse += region_sse_y(&src.cb, &rec.cb, cx, cy, cw, ch);
+            sse += region_sse_y(&src.cr, &rec.cr, cx, cy, cw, ch);
+        }
+        sse
+    };
+    let bits_a = measure_cu_bits(&cu_a, slice_qp_y, rc, constraints, x as u32, y as u32)?;
+    let cost_a = region_sse(rec) as f64 + lambda * bits_a;
+    let allows = constraints.allows(
+        x as u32,
+        y as u32,
+        size as u32,
+        size as u32,
+        0,
+        crate::coding_tree::TreeType::SingleTree,
+        None,
+        0,
+    );
+    if !rdo_split || size <= MIN_RDO_LEAF || !allows.qt {
+        return Ok((cu_a, cost_a));
+    }
+    let snap_a = snapshot_region(rec, avail, x, y, size, size);
+    restore_region(rec, avail, &snap0);
+    let half = size / 2;
+    let mut children = Vec::with_capacity(4);
+    // split_cu_flag = 1 plus split_qt_flag when an MTT split is also
+    // allowed (ctx-coded bins; ~1 bit each).
+    let mut cost_b = lambda * if allows.any_mtt() { 2.0 } else { 1.0 };
+    for (cx, cy) in [(x, y), (x + half, y), (x, y + half), (x + half, y + half)] {
+        let (child, c_cost) = prepare_cu_rdo(
+            src,
+            rec,
+            avail,
+            cx,
+            cy,
+            half,
+            cqt_depth + 1,
+            cu_qp,
+            slice_qp_y,
+            rc,
+            chroma_scale,
+            lossless,
+            try_bt,
+            try_tt,
+            rdo_split,
+            constraints,
+            lambda,
+        )?;
+        cost_b += c_cost;
+        children.push(child);
+    }
+    if cost_b < cost_a {
+        Ok((
+            PreparedCu::QtSplit {
+                cqt_depth,
+                children,
+            },
+            cost_b,
+        ))
+    } else {
+        restore_region(rec, avail, &snap_a);
+        Ok((cu_a, cost_a))
+    }
+}
+
+/// r474 — the DM chroma prediction mode of a CU whose luma mode is
+/// `luma_mode` (Table 20 `intra_chroma_pred_mode = 4`; §8.4.3 Table 21
+/// re-targets angular modes for 4:2:2).
+fn chroma_dm_mode(avail: &EncAvail, luma_mode: u32) -> u32 {
+    if avail.sub_w == 2 && avail.sub_h == 1 {
+        crate::leaf_cu::map_chroma_mode_422(luma_mode)
+    } else {
+        luma_mode
+    }
+}
+
+/// Compute residual + reconstruction for one luma TB without touching
+/// any CABAC stream. Returns the quantised levels, the chosen luma
+/// intra mode and its §7.3.11.5 cascade for the later per-CTU CABAC
+/// emit pass.
+///
+/// Round-56 — accepts independent `n_tb_w` / `n_tb_h` so the BT picker
+/// can prepare non-square TBs (e.g. 32×64 after a `BT_VERT` split).
+/// Both dims must be powers of two in `[4, 64]`.
+///
+/// r474 — the mode comes from [`decide_luma_mode`] (SATD ranking of
+/// every §8.4.5.2 mode + RD over the best few) instead of a fixed
+/// INTRA_DC; the reconstruction is the decoder-exact prediction plus
+/// the dequantised residual.
+#[allow(clippy::too_many_arguments)]
+fn prepare_luma_tb(
+    src: &PicturePlane,
+    rec_plane: &mut PicturePlane,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    rc: crate::residual::RcOpts,
+) -> Result<(Vec<i32>, u32, IntraModeSyntax)> {
+    let trial = decide_luma_mode(src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc)?;
+    commit_luma_trial(rec_plane, avail, x, y, n_tb_w, n_tb_h, &trial);
+    Ok((trial.levels, trial.mode, trial.syntax))
 }
 
 /// Round-51 — emit the §7.3.10 `transform_unit()` for one prepared TB:
@@ -698,7 +1396,7 @@ fn emit_tu_with_cbf(
 ) -> Result<()> {
     // r412 — §7.3.11.5 orders the intra-mode cascade before
     // transform_tree(): signal INTRA_DC via the MPM path + DM chroma.
-    emit_intra_dc_mode_bins(enc, ictx, tb.n_tb_chroma_w > 0)?;
+    emit_intra_mode_bins(enc, ictx, &tb.mode_syntax, tb.n_tb_chroma_w > 0)?;
 
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
@@ -856,6 +1554,7 @@ fn prepare_chroma_tb(
     chroma_rec: &mut PicturePlane,
     avail: &mut EncAvail,
     c_idx: u32,
+    mode: u32,
     cx: usize,
     cy: usize,
     n_tb_c_w: usize,
@@ -864,10 +1563,10 @@ fn prepare_chroma_tb(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<Vec<i32>> {
-    // r412 — DM chroma inherits the luma INTRA_DC mode (Table 20), so
-    // the chroma prediction is the decoder-mirrored §8.4.5.2.12 DC
-    // (+ PDPC) on the chroma plane.
-    let pred = predict_dc_block(
+    // r412 / r474 — DM chroma inherits the luma mode (Table 20, with
+    // the §8.4.3 4:2:2 re-targeting), so the chroma prediction is the
+    // decoder-mirrored §8.4.5.2 process in that mode on the chroma plane.
+    let pred = predict_block(
         chroma_rec,
         &avail.chroma,
         avail.cw,
@@ -878,6 +1577,7 @@ fn prepare_chroma_tb(
         n_tb_c_w,
         n_tb_c_h,
         c_idx,
+        mode,
     )?;
     let bd = chroma_rec.bit_depth;
     let qp_prime = qp_c + 6 * (bd as i32 - 8);
@@ -1213,7 +1913,7 @@ fn prepare_leaf_cu(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<PreparedCu> {
-    let levels = prepare_luma_tb(
+    let (levels, luma_mode, mode_syntax) = prepare_luma_tb(
         &src.luma,
         &mut rec.luma,
         avail,
@@ -1238,8 +1938,11 @@ fn prepare_leaf_cu(
             cr_levels: Vec::new(),
             cu_qp_local: cu_qp,
             transform_skip: false,
+            luma_mode,
+            mode_syntax,
         }));
     }
+    let chroma_mode = chroma_dm_mode(avail, luma_mode);
     let chr_x = x / avail.sub_w;
     let chr_y = y / avail.sub_h;
     let n_tb_chroma_w = (n_tb_w / avail.sub_w).max(4);
@@ -1250,6 +1953,7 @@ fn prepare_leaf_cu(
         &mut rec.cb,
         avail,
         1,
+        chroma_mode,
         chr_x,
         chr_y,
         n_tb_chroma_w,
@@ -1263,6 +1967,7 @@ fn prepare_leaf_cu(
         &mut rec.cr,
         avail,
         2,
+        chroma_mode,
         chr_x,
         chr_y,
         n_tb_chroma_w,
@@ -1281,6 +1986,8 @@ fn prepare_leaf_cu(
         cr_levels,
         cu_qp_local: cu_qp,
         transform_skip: false,
+        luma_mode,
+        mode_syntax,
     }))
 }
 
@@ -1298,7 +2005,8 @@ fn prepare_leaf_cu_lossless(
     n_tb_h: usize,
     cu_qp: i32,
 ) -> Result<PreparedCu> {
-    let levels = prepare_luma_tb_ts(&src.luma, &mut rec.luma, avail, x, y, n_tb_w, n_tb_h)?;
+    let (levels, luma_mode, mode_syntax) =
+        prepare_luma_tb_ts(&src.luma, &mut rec.luma, avail, x, y, n_tb_w, n_tb_h)?;
     if !avail.chroma_present {
         return Ok(PreparedCu::Leaf(PreparedLumaTb {
             n_tb_w,
@@ -1310,8 +2018,11 @@ fn prepare_leaf_cu_lossless(
             cr_levels: Vec::new(),
             cu_qp_local: cu_qp,
             transform_skip: true,
+            luma_mode,
+            mode_syntax,
         }));
     }
+    let chroma_mode = chroma_dm_mode(avail, luma_mode);
     let chr_x = x / avail.sub_w;
     let chr_y = y / avail.sub_h;
     let n_tb_chroma_w = (n_tb_w / avail.sub_w).max(4);
@@ -1321,6 +2032,7 @@ fn prepare_leaf_cu_lossless(
         &mut rec.cb,
         avail,
         1,
+        chroma_mode,
         chr_x,
         chr_y,
         n_tb_chroma_w,
@@ -1331,6 +2043,7 @@ fn prepare_leaf_cu_lossless(
         &mut rec.cr,
         avail,
         2,
+        chroma_mode,
         chr_x,
         chr_y,
         n_tb_chroma_w,
@@ -1346,12 +2059,15 @@ fn prepare_leaf_cu_lossless(
         cr_levels,
         cu_qp_local: cu_qp,
         transform_skip: true,
+        luma_mode,
+        mode_syntax,
     }))
 }
 
-/// r474 — transform-skip luma TB: decoder-mirrored DC prediction, the
-/// residual IS the level array (§8.7.2 eq. 1129 `res = d`, identity
-/// scaling at `Qp′ = 4`), reconstruction = source.
+/// r474 — transform-skip luma TB: the decoder-mirrored prediction in
+/// the mode with the smallest residual SAD (every §8.4.5.2 mode is
+/// tried — the residual IS the level array, §8.7.2 eq. 1129 `res = d`
+/// with identity scaling at `Qp′ = 4`), reconstruction = source.
 fn prepare_luma_tb_ts(
     src: &PicturePlane,
     rec_plane: &mut PicturePlane,
@@ -1360,32 +2076,54 @@ fn prepare_luma_tb_ts(
     y: usize,
     n_tb_w: usize,
     n_tb_h: usize,
-) -> Result<Vec<i32>> {
-    let pred = predict_dc_block(
-        rec_plane,
-        &avail.luma,
-        avail.w,
-        avail.h,
-        avail.region_for(0),
-        x,
-        y,
-        n_tb_w,
-        n_tb_h,
-        0,
-    )?;
-    let mut levels = vec![0i32; n_tb_w * n_tb_h];
+) -> Result<(Vec<i32>, u32, IntraModeSyntax)> {
+    let cand = avail.mpm_cand_list(x, y, n_tb_w, n_tb_h);
+    let region = avail.region_for(0);
+    let mut best: Option<(u64, u32, Vec<i32>)> = None;
+    for mode in 0..=66u32 {
+        let pred = predict_block(
+            rec_plane,
+            &avail.luma,
+            avail.w,
+            avail.h,
+            region,
+            x,
+            y,
+            n_tb_w,
+            n_tb_h,
+            0,
+            mode,
+        )?;
+        let mut levels = vec![0i32; n_tb_w * n_tb_h];
+        let mut sad = 0u64;
+        for ty in 0..n_tb_h {
+            for tx in 0..n_tb_w {
+                let p = pred[ty * n_tb_w + tx] as i32;
+                let s = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(p);
+                levels[ty * n_tb_w + tx] = s - p;
+                sad += u64::from((s - p).unsigned_abs());
+            }
+        }
+        // A few bits of mode rate: non-MPM modes pay ~6 extra bins.
+        let ms = mode_syntax_for(mode, &cand);
+        let sad = sad + if ms.mpm_flag { 0 } else { 6 };
+        if best.as_ref().map(|(b, _, _)| sad < *b).unwrap_or(true) {
+            best = Some((sad, mode, levels));
+        }
+    }
+    let (_, mode, levels) = best.expect("67 candidate modes");
     for ty in 0..n_tb_h {
         for tx in 0..n_tb_w {
-            let p = pred[ty * n_tb_w + tx] as i32;
-            let s = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(p);
-            levels[ty * n_tb_w + tx] = s - p;
             if x + tx < rec_plane.width && y + ty < rec_plane.height {
-                rec_plane.samples[(y + ty) * rec_plane.stride + x + tx] = s as u16;
+                if let Some(s) = src.get(x + tx, y + ty) {
+                    rec_plane.samples[(y + ty) * rec_plane.stride + x + tx] = s;
+                }
             }
         }
     }
     avail.mark_luma(x, y, n_tb_w, n_tb_h);
-    Ok(levels)
+    avail.mark_modes(x, y, n_tb_w, n_tb_h, mode as u8);
+    Ok((levels, mode, mode_syntax_for(mode, &cand)))
 }
 
 /// r474 — transform-skip chroma TB (see [`prepare_luma_tb_ts`]).
@@ -1395,12 +2133,13 @@ fn prepare_chroma_tb_ts(
     chroma_rec: &mut PicturePlane,
     avail: &mut EncAvail,
     c_idx: u32,
+    mode: u32,
     cx: usize,
     cy: usize,
     n_tb_c_w: usize,
     n_tb_c_h: usize,
 ) -> Result<Vec<i32>> {
-    let pred = predict_dc_block(
+    let pred = predict_block(
         chroma_rec,
         &avail.chroma,
         avail.cw,
@@ -1411,6 +2150,7 @@ fn prepare_chroma_tb_ts(
         n_tb_c_w,
         n_tb_c_h,
         c_idx,
+        mode,
     )?;
     let mut levels = vec![0i32; n_tb_c_w * n_tb_c_h];
     for ty in 0..n_tb_c_h {
@@ -1447,7 +2187,7 @@ fn measure_cu_bits(
     constraints: &SplitConstraints,
     x: u32,
     y: u32,
-) -> Result<u64> {
+) -> Result<f64> {
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
     let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
@@ -1468,8 +2208,10 @@ fn measure_cu_bits(
         y,
     )?;
     enc.encode_terminate(1)?;
-    let bytes = enc.finish();
-    Ok((bytes.len() as u64) * 8)
+    // r474 — fractional information content (the wire rounds up to
+    // bytes only once per slice; per-CU byte granularity distorted the
+    // small-CU trade-offs).
+    Ok(enc.estimated_bits())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1560,6 +2302,51 @@ fn measure_cu_bits_recurse(
                         qp_state,
                         *cd,
                         *md + 1,
+                        rc_opts,
+                        constraints,
+                        cx,
+                        cy,
+                    )
+                },
+            )
+        }
+        PreparedCu::QtSplit {
+            cqt_depth: cd,
+            children,
+        } => {
+            let _ = (cqt_depth, mtt_depth);
+            let (cb_w, cb_h) = parent_cu_dims(cu);
+            let allows = constraints.allows(
+                x,
+                y,
+                cb_w as u32,
+                cb_h as u32,
+                0,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
+            let half = (cb_w / 2) as u32;
+            let origins = [(x, y), (x + half, y), (x, y + half), (x + half, y + half)];
+            crate::syntax_enc::encode_coding_quadtree_split(
+                enc,
+                tree_ctxs,
+                cb_w as u32,
+                cb_h as u32,
+                TreeNeighbours::default(),
+                *cd,
+                allows,
+                |e, ctxs, q, _w, _h| {
+                    let (cx, cy) = origins[q as usize];
+                    measure_cu_bits_recurse(
+                        &children[q as usize],
+                        e,
+                        ctxs,
+                        residual_ctxs,
+                        intra_ctxs,
+                        qp_state,
+                        *cd + 1,
+                        0,
                         rc_opts,
                         constraints,
                         cx,
@@ -1676,6 +2463,7 @@ fn leaf_dims(cu: &PreparedCu) -> (usize, usize) {
         PreparedCu::Palette(p) => (p.n_w, p.n_h),
         PreparedCu::BtSplit { sub_a, .. } => leaf_dims(sub_a),
         PreparedCu::TtSplit { sub_a, .. } => leaf_dims(sub_a),
+        PreparedCu::QtSplit { children, .. } => leaf_dims(&children[0]),
     }
 }
 
@@ -1761,6 +2549,7 @@ fn prepare_cu_with_mtt_picker(
     let snap_cr = rec.cr.samples.clone();
     let snap_av_l = avail.luma.clone();
     let snap_av_c = avail.chroma.clone();
+    let snap_modes = avail.modes.clone();
     #[allow(clippy::too_many_arguments)]
     fn restore(
         rec: &mut PictureBuffer,
@@ -1770,12 +2559,14 @@ fn prepare_cu_with_mtt_picker(
         snap_cr: &[u16],
         snap_av_l: &[bool],
         snap_av_c: &[bool],
+        snap_modes: &[u8],
     ) {
         rec.luma.samples.copy_from_slice(snap_luma);
         rec.cb.samples.copy_from_slice(snap_cb);
         rec.cr.samples.copy_from_slice(snap_cr);
         avail.luma.copy_from_slice(snap_av_l);
         avail.chroma.copy_from_slice(snap_av_c);
+        avail.modes.copy_from_slice(snap_modes);
     }
 
     // Generic trial state — the prepared CU, its cost, and the
@@ -1790,6 +2581,7 @@ fn prepare_cu_with_mtt_picker(
         snap_cr: Vec<u16>,
         snap_av_l: Vec<bool>,
         snap_av_c: Vec<bool>,
+        snap_modes: Vec<u8>,
     }
 
     let mut trials: Vec<Trial> = Vec::with_capacity(5);
@@ -1817,6 +2609,7 @@ fn prepare_cu_with_mtt_picker(
         snap_cr: rec.cr.samples.clone(),
         snap_av_l: avail.luma.clone(),
         snap_av_c: avail.chroma.clone(),
+        snap_modes: avail.modes.clone(),
     });
 
     let half = cb_size / 2;
@@ -1825,7 +2618,14 @@ fn prepare_cu_with_mtt_picker(
     if try_bt {
         // --- BT_VERT (two 32×64 sub-CUs) ---
         restore(
-            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+            rec,
+            avail,
+            &snap_luma,
+            &snap_cb,
+            &snap_cr,
+            &snap_av_l,
+            &snap_av_c,
+            &snap_modes,
         );
         let bt_v_a = prepare_leaf_cu(
             src,
@@ -1875,11 +2675,19 @@ fn prepare_cu_with_mtt_picker(
             snap_cr: rec.cr.samples.clone(),
             snap_av_l: avail.luma.clone(),
             snap_av_c: avail.chroma.clone(),
+            snap_modes: avail.modes.clone(),
         });
 
         // --- BT_HORZ (two 64×32 sub-CUs) ---
         restore(
-            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+            rec,
+            avail,
+            &snap_luma,
+            &snap_cb,
+            &snap_cr,
+            &snap_av_l,
+            &snap_av_c,
+            &snap_modes,
         );
         let bt_h_a = prepare_leaf_cu(
             src,
@@ -1929,13 +2737,21 @@ fn prepare_cu_with_mtt_picker(
             snap_cr: rec.cr.samples.clone(),
             snap_av_l: avail.luma.clone(),
             snap_av_c: avail.chroma.clone(),
+            snap_modes: avail.modes.clone(),
         });
     }
 
     if try_tt {
         // --- TT_VERT (16×64, 32×64, 16×64 — 1:2:1 ratio) ---
         restore(
-            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+            rec,
+            avail,
+            &snap_luma,
+            &snap_cb,
+            &snap_cr,
+            &snap_av_l,
+            &snap_av_c,
+            &snap_modes,
         );
         let tt_v_a = prepare_leaf_cu(
             src,
@@ -1998,11 +2814,19 @@ fn prepare_cu_with_mtt_picker(
             snap_cr: rec.cr.samples.clone(),
             snap_av_l: avail.luma.clone(),
             snap_av_c: avail.chroma.clone(),
+            snap_modes: avail.modes.clone(),
         });
 
         // --- TT_HORZ (64×16, 64×32, 64×16 — 1:2:1 ratio) ---
         restore(
-            rec, avail, &snap_luma, &snap_cb, &snap_cr, &snap_av_l, &snap_av_c,
+            rec,
+            avail,
+            &snap_luma,
+            &snap_cb,
+            &snap_cr,
+            &snap_av_l,
+            &snap_av_c,
+            &snap_modes,
         );
         let tt_h_a = prepare_leaf_cu(
             src,
@@ -2065,6 +2889,7 @@ fn prepare_cu_with_mtt_picker(
             snap_cr: rec.cr.samples.clone(),
             snap_av_l: avail.luma.clone(),
             snap_av_c: avail.chroma.clone(),
+            snap_modes: avail.modes.clone(),
         });
     }
 
@@ -2081,6 +2906,7 @@ fn prepare_cu_with_mtt_picker(
     rec.cr.samples.copy_from_slice(&best.snap_cr);
     avail.luma.copy_from_slice(&best.snap_av_l);
     avail.chroma.copy_from_slice(&best.snap_av_c);
+    avail.modes.copy_from_slice(&best.snap_modes);
     Ok(best.cu)
 }
 
@@ -2232,6 +3058,10 @@ fn parent_cu_dims(cu: &PreparedCu) -> (usize, usize) {
                 crate::syntax_enc::MttSplitDir::Vertical => (aw * 4, ah),
                 crate::syntax_enc::MttSplitDir::Horizontal => (aw, ah * 4),
             }
+        }
+        PreparedCu::QtSplit { children, .. } => {
+            let (cw, ch) = parent_cu_dims(&children[0]);
+            (cw * 2, ch * 2)
         }
     }
 }
@@ -2391,6 +3221,26 @@ fn emit_prepared_cu(
             Ok(())
         }
         PreparedCu::Leaf(tb) => {
+            // r474 triage hook: `H266_ENC_DBG_CU=1` prints one line per
+            // emitted leaf CU (companion of the decoder's `H266_DBG_CU`).
+            if std::env::var_os("H266_ENC_DBG_CU").is_some() {
+                eprintln!(
+                    "ENC CU ({x},{y}) {}x{} modeY={} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
+                    tb.n_tb_w,
+                    tb.n_tb_h,
+                    tb.luma_mode,
+                    tb.levels.iter().any(|&l| l != 0),
+                    tb.cb_levels.iter().any(|&l| l != 0),
+                    tb.cr_levels.iter().any(|&l| l != 0),
+                    tb.transform_skip,
+                    tb.cu_qp_local,
+                );
+                if std::env::var_os("H266_ENC_DBG_LEVELS").is_some() {
+                    eprintln!("ENC LEVELS Y {:?}", tb.levels);
+                    eprintln!("ENC LEVELS CB {:?}", tb.cb_levels);
+                    eprintln!("ENC LEVELS CR {:?}", tb.cr_levels);
+                }
+            }
             // r412 — the leaf's split_cu_flag = 0 is emitted only when
             // §6.4.1 – §6.4.3 allow a split here (e.g. an MTT child at
             // maxMttDepth has no bin — a conforming decoder infers 0).
@@ -2493,6 +3343,53 @@ fn emit_prepared_cu(
                         cy,
                         *cd,
                         *md + 1,
+                        &mut *cu_map,
+                        rc_opts,
+                        constraints,
+                        &mut *pal,
+                    )
+                },
+            )
+        }
+        PreparedCu::QtSplit {
+            cqt_depth: cd,
+            children,
+        } => {
+            let (cb_w, cb_h) = parent_cu_dims(cu);
+            let allows = constraints.allows(
+                x,
+                y,
+                cb_w as u32,
+                cb_h as u32,
+                0,
+                crate::coding_tree::TreeType::SingleTree,
+                None,
+                0,
+            );
+            let half = (cb_w / 2) as u32;
+            let origins = [(x, y), (x + half, y), (x, y + half), (x + half, y + half)];
+            crate::syntax_enc::encode_coding_quadtree_split(
+                enc,
+                tree_ctxs,
+                cb_w as u32,
+                cb_h as u32,
+                nbrs,
+                *cd,
+                allows,
+                |e, ctxs, q, _w, _h| {
+                    let (cx, cy) = origins[q as usize];
+                    qp_state.begin_cu();
+                    emit_prepared_cu(
+                        e,
+                        ctxs,
+                        residual_ctxs,
+                        intra_ctxs,
+                        qp_state,
+                        &children[q as usize],
+                        cx,
+                        cy,
+                        *cd + 1,
+                        0,
                         &mut *cu_map,
                         rc_opts,
                         constraints,
@@ -2646,6 +3543,13 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 }
             }
             let _ = (aw, ah);
+        }
+        PreparedCu::QtSplit { children, .. } => {
+            let (cw, ch) = parent_cu_dims(&children[0]);
+            accumulate_deblock_cus(&children[0], x, y, out);
+            accumulate_deblock_cus(&children[1], x + cw, y, out);
+            accumulate_deblock_cus(&children[2], x, y + ch, out);
+            accumulate_deblock_cus(&children[3], x + cw, y + ch, out);
         }
         PreparedCu::TtSplit {
             dir,
@@ -3017,14 +3921,6 @@ pub fn encode_idr_with_qp_picker_cfg(
                         qp_picker(rx, ry, tx, ty).clamp(0, 63)
                     };
 
-                    // Round-56 / Round-57 — when the MTT picker is enabled
-                    // (BT and/or TT) and the candidate CU is a full 64×64
-                    // slot, evaluate leaf vs the chosen MTT splits on
-                    // `cost = SSE_Y + λ·bits` and pick the lowest-cost
-                    // option. Otherwise (or when both flags are off) fall
-                    // back to the round-55 leaf path.
-                    let mtt_eligible = (config.enable_mtt_bt_picker || config.enable_mtt_tt_picker)
-                        && n_tb_sq == 64;
                     // r391 — §8.7.5.3 chroma residual scaling: derive the
                     // per-CU `varScale` from the mapped-domain
                     // reconstructed luma neighbours BEFORE this CU's
@@ -3065,40 +3961,39 @@ pub fn encode_idr_with_qp_picker_cfg(
                     } else {
                         None
                     };
-                    let cu = if lossless {
-                        prepare_leaf_cu_lossless(
-                            coding_src, &mut rec, &mut avail, tb_x, tb_y, n_tb_sq, n_tb_sq, cu_qp,
-                        )?
-                    } else if let Some(p) = palette_cu {
+                    if palette_cu.is_some() {
+                        // §8.4.2 — a MODE_PLT neighbour reads PLANAR.
+                        avail.mark_modes(tb_x, tb_y, n_tb_sq, n_tb_sq, NON_INTRA_MODE);
+                    }
+                    // r474 — CU-size RDO: one CU (intra mode decision /
+                    // MTT picker / lossless leaf) against an explicit quad
+                    // split down to 8x8, on `SSE + λ · bits`. Palette CUs
+                    // stay whole (their predictor state forbids trials).
+                    let cu = if let Some(p) = palette_cu {
                         PreparedCu::Palette(p)
-                    } else if mtt_eligible {
-                        prepare_cu_with_mtt_picker(
+                    } else {
+                        let bd_scale = f64::from(1u32 << (2 * (rec.bit_depth() - 8)));
+                        let lambda_rd = lambda_for_qp(cu_qp) * bd_scale;
+                        prepare_cu_rdo(
                             coding_src,
                             &mut rec,
                             &mut avail,
                             tb_x,
                             tb_y,
                             n_tb_sq,
+                            slot.cqt_depth,
                             cu_qp,
                             slice_qp_y,
+                            rc_opts,
+                            chroma_scale,
+                            lossless,
                             config.enable_mtt_bt_picker,
                             config.enable_mtt_tt_picker,
-                            rc_opts,
-                            chroma_scale,
+                            config.rdo_cu_split,
+                            &split_constraints,
+                            lambda_rd,
                         )?
-                    } else {
-                        prepare_leaf_cu(
-                            coding_src,
-                            &mut rec,
-                            &mut avail,
-                            tb_x,
-                            tb_y,
-                            n_tb_sq,
-                            n_tb_sq,
-                            cu_qp,
-                            rc_opts,
-                            chroma_scale,
-                        )?
+                        .0
                     };
 
                     // Accumulate deblock-CU records over every TB inside
@@ -3782,6 +4677,9 @@ pub fn encode_idr_with_qp_picker_cfg(
         sh_cabac_init_flag: false,
     };
 
+    // r474 triage aid — `H266_ENC_DBG_BINS=1` traces every second-pass
+    // bin (the dual of the decoder's `H266_DBG_BINS=x,y`).
+    crate::cabac::set_bin_trace(std::env::var_os("H266_ENC_DBG_BINS").is_some());
     let mut cabac_enc = ArithEncoder::new();
     // Round-56 — picture-wide neighbour map for the §9.3.4.2 ctxInc
     // derivations. `cu_map` is the *read-only* snapshot the current
@@ -4095,6 +4993,7 @@ pub fn encode_idr_with_qp_picker_cfg(
             }
         }
     }
+    crate::cabac::set_bin_trace(false);
     // r429/r431 — one VCL NAL per slice: §7.4.8 entry-point offsets
     // are the EP-aware byte lengths of every subset but the slice's
     // last (subset boundaries fall on alignment stop bytes, so no
@@ -4802,6 +5701,7 @@ mod tests {
             &mut rec,
             &mut avail,
             1,
+            crate::leaf_cu::INTRA_DC,
             0,
             0,
             4,
@@ -4843,6 +5743,7 @@ mod tests {
             &mut rec,
             &mut avail,
             1,
+            crate::leaf_cu::INTRA_DC,
             0,
             0,
             4,
@@ -5440,6 +6341,8 @@ mod tests {
         let mk_leaf = |w: usize, h: usize| {
             PreparedCu::Leaf(PreparedLumaTb {
                 transform_skip: false,
+                luma_mode: crate::leaf_cu::INTRA_DC,
+                mode_syntax: IntraModeSyntax::DC_DEFAULT,
                 n_tb_w: w,
                 n_tb_h: h,
                 levels: vec![0; w * h],

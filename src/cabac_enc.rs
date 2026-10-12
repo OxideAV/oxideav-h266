@@ -4,47 +4,37 @@
 //! The H.266 spec only defines the *decoding* process. The encoder
 //! side is the unique inverse: produce a bit stream such that
 //! [`crate::cabac::ArithDecoder`] reads back the same `(bin, context
-//! state, range)` trajectory. This module implements that inverse
-//! using a high-precision tracking of the live arithmetic interval
-//! and emitting just enough bits at finalisation to identify a value
-//! inside it.
-//!
-//! Round-16 scope:
+//! state, range)` trajectory.
 //!
 //! * Encode side of `DecodeDecision` → [`ArithEncoder::encode_decision`]
 //! * Encode side of `DecodeBypass` → [`ArithEncoder::encode_bypass`]
 //! * Encode side of `DecodeTerminate` → [`ArithEncoder::encode_terminate`]
-//! * [`ArithEncoder::finish`] flushes the partial low/range state into
-//!   bits the decoder's 9-bit `ivlOffset` init reads back correctly.
+//!   (a `1` flushes the code word, ending on the `rbsp_stop_one_bit`)
+//! * [`ArithEncoder::finish`] byte-aligns (and, without a terminate,
+//!   writes the register so a decoder lands inside the live interval)
+//! * [`ArithEncoder::estimated_bits`] — fractional rate estimate for
+//!   encoder decisions.
 //!
 //! # Implementation notes
 //!
-//! The math here is the well-known recursive-interval-subdivision
-//! arithmetic encoder dual of the recursive-interval-subdivision
-//! decoder in §9.3.4.3 — invented in Pasco/Rissanen 1976 and used in
-//! H.263, H.264, H.265, and now H.266 with only the per-symbol
-//! probability state estimator changing.
+//! The math is the classical recursive-interval-subdivision arithmetic
+//! encoder dual of the §9.3.4.3 decoder: a 10-bit interval lower bound
+//! `low` (bit 9 is the carry position) next to the decoder's
+//! `ivlCurrRange`, renormalised one bit at a time. A window bit whose
+//! value is not yet determined — the interval straddles the midpoint —
+//! is deferred as an *outstanding* bit and written, as the complement of
+//! the bit that finally resolves it, once a later bin settles the
+//! interval below (`0 1…1`) or carries it above (`1 0…0`) the midpoint.
 //!
-//! ## Strategy
+//! r474 — the pre-r474 engine instead kept every undetermined bit
+//! inside a `u64 low`; the transform-skip tail of a repeating residual
+//! (bins 1,1,0,0,… at `range = 310`) kept the interval straddling for
+//! hundreds of bins, the window overflowed 64 bits and the slice tail
+//! was corrupt (lossless 4:4:4 / 4:2:2 pictures failed to decode). The
+//! bounded register has no such limit.
 //!
-//! Rather than the classical 10-bit-register-with-carry-propagation
-//! formulation (which trades correctness footguns for amortised
-//! O(1) emission), this module uses a **large-precision** running
-//! interval that mirrors the decoder's `(ivlCurrRange, virtualBits)`
-//! state exactly. At finalisation we choose the minimum-prefix value
-//! inside the live interval and emit it.
-//!
-//! Concretely: `low` and `range` together describe the set of all
-//! decoder-bitstreams that would have produced the bin sequence we've
-//! encoded so far, when interpreted as `bits_emitted_count`-bit
-//! integers. We track everything in `u64` (more than enough headroom
-//! for tens of thousands of bins) and emit committed bits whenever the
-//! top bit of `low` and `low + range - 1` agree (i.e. the next bit is
-//! determined). This avoids the carry-propagation footgun and is a
-//! straightforward inverse of the decoder.
-//!
-//! No third-party VVC encoder source was consulted; the encoder math is
-//! mechanically derived from [`crate::cabac::ArithDecoder`]'s decode
+//! No third-party VVC encoder source was consulted; the encoder is the
+//! mechanical inverse of [`crate::cabac::ArithDecoder`]'s decode
 //! functions.
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026), §9.3.4.3.
@@ -53,35 +43,39 @@ use oxideav_core::Result;
 
 use crate::cabac::ContextModel;
 
-/// Arithmetic encoder mirroring [`crate::cabac::ArithDecoder`].
+/// CABAC arithmetic encoder — the exact dual of [`ArithDecoder`]
+/// (§9.3.4.3): the same `ivlCurrRange` evolution per decision /
+/// bypass / terminate bin, so the byte stream it emits decodes
+/// bin-for-bin.
 ///
-/// State: `low` is the lower bound of the live interval in a
-/// `precision`-bit window; `range` is the interval width. The decoder's
-/// equivalent register is `ivl_offset ∈ [low_decoder, low_decoder + range)`
-/// after consuming the same operations, where `low_decoder` is the
-/// projection of our `low` into the decoder's 9-bit window.
+/// r474 — the interval lower bound lives in a bounded 10-bit `low`
+/// register with the classic *outstanding-bit* carry resolution: a bit
+/// whose value is not yet determined (the interval straddles the
+/// midpoint of the current window) is counted in `bits_outstanding`
+/// and emitted once a later bin resolves it — as `0 1…1` when the
+/// interval settles below the midpoint, as `1 0…0` when it carries
+/// above. The pre-r474 engine kept every undetermined bit inside a
+/// `u64 low`; a periodic bypass pattern (the transform-skip tail of a
+/// repeating residual) can keep the interval straddling for hundreds
+/// of bins, and the window overflowed 64 bits and corrupted the slice
+/// tail (lossless 4:4:4 / 4:2:2 pictures failed to decode).
 ///
-/// Initial state: `low = 0, range = 510`. This matches the decoder's
-/// post-init state (`ivlCurrRange = 510, ivlOffset = read_bits(9)`).
-///
-/// Each operation extends `precision` (the meaningful bit-width of
-/// `low`) by 0 or more bits. We emit committed prefix bits whenever
-/// `low`'s and `(low + range - 1)`'s top bit agree (definite bit).
+/// `precision` counts the window bits consumed so far (9 at init, +1
+/// per renormalisation shift or bypass bin) for the fractional
+/// [`Self::estimated_bits`] rate estimate.
 pub struct ArithEncoder {
-    /// Lower bound of the live interval. Tracked to full precision.
-    low: u64,
-    /// Interval width. Always ∈ [256, 510] right after decision
-    /// renormalisation; can briefly grow (during bypass shifts) and
-    /// shrink (during LPS / terminate paths).
-    range: u64,
-    /// Current bit-precision of `low`. After init `precision = 9`
-    /// (matching the decoder's 9-bit init `read_bits(9)`).
-    /// Renormalisation steps (`while range < 256: range <<= 1, low <<= 1,
-    /// precision++`) increase this. Bypass also adds 1.
+    /// 10-bit interval lower bound (bit 9 is the carry position).
+    low: u32,
+    /// `ivlCurrRange`, in [256, 510] after renormalisation.
+    range: u32,
+    /// Determined-but-unwritten bits awaiting carry resolution.
+    bits_outstanding: u32,
+    /// The very first PutBit is the virtual carry position above the
+    /// decoder's 9-bit init window and is not written.
+    first_bit: bool,
+    /// Window bits consumed (rate estimate).
     precision: u32,
-    /// Number of bits already committed to `data`. We never emit a bit
-    /// until it's determined (top bit of `low` matches top bit of
-    /// `low + range - 1`).
+    /// Bits actually written to `data`.
     committed: u32,
     /// Output bytes (MSB-first packed).
     data: Vec<u8>,
@@ -102,6 +96,8 @@ impl ArithEncoder {
         Self {
             low: 0,
             range: 510,
+            bits_outstanding: 0,
+            first_bit: true,
             precision: 9,
             committed: 0,
             data: Vec::new(),
@@ -116,97 +112,121 @@ impl ArithEncoder {
     }
 
     /// Encode one decision bin, mirroring
-    /// [`crate::cabac::ArithDecoder::decode_decision`].
+    /// [`ArithDecoder::decode_decision`]: the LPS sub-interval from the
+    /// context's state and `ivlCurrRange >> 5`, MPS / LPS selection,
+    /// state update, renormalisation.
     pub fn encode_decision(&mut self, ctx: &mut ContextModel, bin: u32) -> Result<()> {
         debug_assert!(!self.finished);
         debug_assert!(bin <= 1);
-        let q_range_idx = (self.range as u32) >> 5;
+        // r474 triage aid — mirrors the decoder's `H266_DBG_BINS` trace
+        // (armed by the pipeline under `H266_ENC_DBG_BINS`).
+        if crate::cabac::bin_trace_on() {
+            eprintln!(
+                "E BIN ctx=({},{}) -> {bin} @{:p} s{}",
+                ctx.p_state_idx0, ctx.p_state_idx1, ctx as *const ContextModel, ctx.shift_idx
+            );
+        }
+        let q_range_idx = self.range >> 5;
         let (val_mps, ivl_lps_range) = ctx.lps_range(q_range_idx);
-        let ivl_mps_range = self.range - ivl_lps_range as u64;
+        let ivl_mps_range = self.range - ivl_lps_range;
         if bin == val_mps {
             self.range = ivl_mps_range;
         } else {
             self.low += ivl_mps_range;
-            self.range = ivl_lps_range as u64;
+            self.range = ivl_lps_range;
         }
         ctx.update(bin);
-        self.renormalize_decision();
-        self.flush_committed_bits();
+        self.renormalize();
         Ok(())
     }
 
-    /// Encode a bypass bin (§9.3.4.3.4).
+    /// Encode a bypass bin (§9.3.4.3.4 dual): the window shifts by one
+    /// bit, the interval moves up by `range` for a 1.
     pub fn encode_bypass(&mut self, bin: u32) -> Result<()> {
+        if crate::cabac::bin_trace_on() {
+            eprintln!("E BYP -> {bin}");
+        }
         debug_assert!(!self.finished);
         debug_assert!(bin <= 1);
-        // The decoder's bypass: `ivl_offset = (ivl_offset << 1) | bit;
-        // if ivl_offset >= range: bin=1; ivl_offset -= range`.
-        // Inverse: shift `low` left (extending precision by 1) and
-        // bump by `range` for bin=1.
         self.low <<= 1;
-        self.precision += 1;
         if bin == 1 {
             self.low += self.range;
         }
-        self.flush_committed_bits();
+        self.precision += 1;
+        if self.low >= 1024 {
+            self.put_bit(1);
+            self.low -= 1024;
+        } else if self.low < 512 {
+            self.put_bit(0);
+        } else {
+            self.low -= 512;
+            self.bits_outstanding += 1;
+        }
         Ok(())
     }
 
-    /// Encode a terminate bin (§9.3.4.3.5).
+    /// Encode a terminate bin (§9.3.4.3.5 dual). A `1` closes the
+    /// arithmetic code word: the flush writes the interval's identifying
+    /// bits with the final `1` being the `rbsp_stop_one_bit` the decoder
+    /// consumes as its last bit.
     pub fn encode_terminate(&mut self, bin: u32) -> Result<()> {
         debug_assert!(!self.finished);
         debug_assert!(bin <= 1);
         self.range -= 2;
         if bin == 0 {
-            self.renormalize_decision();
-            self.flush_committed_bits();
+            self.renormalize();
         } else {
             self.terminated = true;
             self.low += self.range;
+            // Flush: range = 2 renormalises through seven shifts (low's
+            // bottom seven bits become zero), then the top register bit
+            // and the two bits below it (the last forced to 1).
             self.range = 2;
-            self.renormalize_decision();
-            self.flush_committed_bits();
+            self.renormalize();
+            self.put_bit((self.low >> 9) & 1);
+            self.write_raw_bit(((self.low >> 8) & 1) as u8);
+            self.write_raw_bit(1);
         }
         Ok(())
     }
 
-    /// Renormalisation for decision / terminate paths: while
-    /// `range < 256`, double both registers (extending precision).
-    fn renormalize_decision(&mut self) {
+    /// Renormalisation (decision / terminate paths): while `range <
+    /// 256`, resolve or defer the window's top bit and double both
+    /// registers.
+    fn renormalize(&mut self) {
         while self.range < 256 {
+            if self.low < 256 {
+                self.put_bit(0);
+            } else if self.low >= 512 {
+                self.low -= 512;
+                self.put_bit(1);
+            } else {
+                self.low -= 256;
+                self.bits_outstanding += 1;
+            }
             self.range <<= 1;
             self.low <<= 1;
             self.precision += 1;
         }
     }
 
-    /// Emit any bits at the front of `low` whose value is determined
-    /// (i.e. the same in `low` and in `low + range - 1`).
-    fn flush_committed_bits(&mut self) {
-        // Loop: while the top bit (at position `precision - 1`) is
-        // determined, emit it and reduce precision.
-        loop {
-            if self.precision <= self.committed {
-                break;
-            }
-            // The "top bit" we're trying to commit is at position
-            // (precision - committed - 1) within the low-precision
-            // window (counting from LSB). Equivalently: bit
-            // (precision - 1) of `low` and `low + range - 1`.
-            let top_bit_pos = self.precision - self.committed - 1;
-            let mask: u64 = 1u64 << top_bit_pos;
-            let lo_top = (self.low & mask) != 0;
-            let hi = self.low + self.range - 1;
-            let hi_top = (hi & mask) != 0;
-            if lo_top != hi_top {
-                break;
-            }
-            self.commit_bit(if lo_top { 1 } else { 0 });
+    /// Emit a resolved bit followed by the outstanding bits it
+    /// determines (their complement); the first call is the virtual
+    /// carry position and writes nothing.
+    fn put_bit(&mut self, bit: u32) {
+        if self.first_bit {
+            self.first_bit = false;
+        } else {
+            self.write_raw_bit(bit as u8);
+        }
+        while self.bits_outstanding > 0 {
+            self.write_raw_bit((1 - bit) as u8);
+            self.bits_outstanding -= 1;
         }
     }
 
     /// Append a single bit (MSB-first) to the byte stream.
-    fn commit_bit(&mut self, bit: u8) {
+    fn write_raw_bit(&mut self, bit: u8) {
         if self.bit_pos == 0 {
             self.data.push(0);
         }
@@ -219,73 +239,33 @@ impl ArithEncoder {
         self.committed += 1;
     }
 
-    /// Finalise the stream. Pushes enough bits to identify the live
-    /// interval, then byte-aligns.
+    /// Finalise the stream and return the bytes. After
+    /// [`Self::encode_terminate`]`(1)` the code word is already complete
+    /// (the flush ended on the stop bit) and only the byte alignment
+    /// remains; without a terminate (rate probes, unit tests) the
+    /// register's ten bits are written verbatim so a decoder lands
+    /// inside the live interval.
     pub fn finish(&mut self) -> Vec<u8> {
         if self.finished {
             return std::mem::take(&mut self.data);
         }
         self.finished = true;
-        // Commit the remaining (precision - committed) bits of `low`
-        // (or actually of the midpoint, to maximise robustness against
-        // future stream reads).
-        //
-        // The decoder will land its `ivlOffset` at the chosen value
-        // (interpreted as a `precision`-bit integer) and any further
-        // bits read are zero-padding (bypass / decision renorm reads
-        // shift in zeros). For the encoder to land safely, pick a
-        // value `v ∈ [low, low + range)` and emit its remaining bits.
-        //
-        // Safest choice: pick `v = low` (lower bound) — the decoder's
-        // future zero-pad reads will give `(v << k) | 0 = v * 2^k` as
-        // the running register, which compares against the running
-        // `range` — the comparison stays inside the live interval as
-        // long as `v` was chosen inside it.
-        //
-        // Even safer: emit one extra "1" bit after `v` so any future
-        // bit-9 register comparison falls comfortably inside.
-        let remaining_bits = self.precision - self.committed;
-        if self.terminated && remaining_bits >= 8 {
-            // r412 — §9.3.4.3.5 termination flush. The decoder's total
-            // consumption is `precision − 7` bits (the 9-bit §9.3.2.5
-            // init plus one bit per renormalization, EXCEPT the final
-            // terminate-1 bin which renormalizes only on the encoder
-            // side), and the spec pins "the last bit inserted in
-            // register ivlOffset is equal to 1" — that bit is the
-            // `rbsp_stop_one_bit` of `rbsp_slice_trailing_bits()`. So
-            // the flush emits exactly `remaining − 7` bits: the value
-            // `w` must satisfy `low <= (w << 7) < low + range`
-            // (range = 256 after the terminate renormalization; the
-            // 7 dropped bits are never read and decode as zeros) and
-            // must be ODD so the stop bit lands on the last consumed
-            // position. `w = ceil(low / 128)` rounded up to odd fits:
-            // `(w << 7) <= low + 127 + 128 < low + 256`. The pre-r412
-            // tail emitted `low` verbatim + zero alignment — fine for
-            // this crate's reader (which never checked the stop bit)
-            // but structurally broken for a conforming decoder.
-            let w0 = (self.low + 127) >> 7;
-            let w = if w0 & 1 == 1 { w0 } else { w0 + 1 };
-            for i in (0..remaining_bits - 7).rev() {
-                let bit = ((w >> i) & 1) as u8;
-                self.commit_bit(bit);
-            }
-        } else {
-            let target = self.low;
-            for i in (0..remaining_bits).rev() {
-                let bit = ((target >> i) & 1) as u8;
-                self.commit_bit(bit);
+        if !self.terminated {
+            self.put_bit((self.low >> 9) & 1);
+            for i in (0..9).rev() {
+                self.write_raw_bit(((self.low >> i) & 1) as u8);
             }
         }
         // Byte-align with zeros.
         while self.bit_pos != 0 {
-            self.commit_bit_no_count(0);
+            self.write_raw_bit_no_count(0);
         }
         std::mem::take(&mut self.data)
     }
 
-    /// Append a bit but do not increment `committed` (used during
-    /// the byte-alignment tail in `finish`).
-    fn commit_bit_no_count(&mut self, bit: u8) {
+    /// Append a bit but do not increment `committed` (byte-alignment
+    /// tail in `finish`).
+    fn write_raw_bit_no_count(&mut self, bit: u8) {
         if self.bit_pos == 0 {
             self.data.push(0);
         }
@@ -297,10 +277,31 @@ impl ArithEncoder {
         }
     }
 
-    /// Number of bits committed so far (excludes pending tail / partial
-    /// byte). For tests.
+    /// Number of bits written so far (excludes the byte-alignment
+    /// tail). For tests.
     pub fn committed_bits(&self) -> u64 {
         self.committed as u64
+    }
+
+    /// r474 triage — `(low, range, precision, outstanding)`.
+    #[doc(hidden)]
+    pub fn debug_state(&self) -> (u64, u64, u32, u32) {
+        (
+            u64::from(self.low),
+            u64::from(self.range),
+            self.precision,
+            self.bits_outstanding,
+        )
+    }
+
+    /// r474 — fractional information content of everything coded so
+    /// far: the live interval has width `range / 2^precision`, so the
+    /// code length is `precision − log2(range)` bits (written bits plus
+    /// the outstanding / partially-determined tail). Encoder-side rate
+    /// estimation for mode / split decisions; the wire length after
+    /// [`Self::finish`] rounds this up to whole bytes.
+    pub fn estimated_bits(&self) -> f64 {
+        f64::from(self.precision) - f64::from(self.range.max(1)).log2()
     }
 }
 
@@ -308,6 +309,123 @@ impl ArithEncoder {
 mod tests {
     use super::*;
     use crate::cabac::{ArithDecoder, ContextModel};
+
+    /// r474 regression — a periodic bypass pattern can keep the coding
+    /// interval straddling the window midpoint for hundreds of bins
+    /// (the transform-skip tail of a repeating residual did exactly
+    /// that at `range = 310` with the bins 1,1,0,0,…). The pre-r474
+    /// engine accumulated every undetermined bit in a `u64` and
+    /// overflowed; the outstanding-bit engine must round-trip any such
+    /// run. Several decision prefixes vary the range the run starts at.
+    #[test]
+    fn periodic_bypass_runs_keep_straddling_without_overflow() {
+        let patterns: [&[u32]; 6] = [
+            &[1, 1, 0, 0],
+            &[0, 0, 1, 1],
+            &[1, 0],
+            &[0, 1],
+            &[1, 0, 0, 1],
+            &[1, 1, 1, 0, 0, 0],
+        ];
+        for prefix_len in 0..64u32 {
+            for (pi, pat) in patterns.iter().enumerate() {
+                let mut ctx = ContextModel::init(0x29, 7, 30);
+                let mut dctx = ctx;
+                let mut enc = ArithEncoder::new();
+                let mut bins: Vec<(bool, u32)> = Vec::new();
+                for i in 0..prefix_len {
+                    let b = u32::from(i % 5 == 0);
+                    enc.encode_decision(&mut ctx, b).unwrap();
+                    bins.push((false, b));
+                }
+                for i in 0..3000usize {
+                    let b = pat[i % pat.len()];
+                    enc.encode_bypass(b).unwrap();
+                    bins.push((true, b));
+                }
+                enc.encode_terminate(1).unwrap();
+                let mut bytes = enc.finish();
+                bytes.extend_from_slice(&[0u8; 16]);
+                let mut dec = ArithDecoder::new(&bytes).unwrap();
+                for (i, &(bypass, b)) in bins.iter().enumerate() {
+                    let got = if bypass {
+                        dec.decode_bypass().unwrap()
+                    } else {
+                        dec.decode_decision(&mut dctx).unwrap()
+                    };
+                    assert_eq!(got, b, "prefix {prefix_len} pattern {pi} bin {i}");
+                }
+                assert_eq!(
+                    dec.decode_terminate().unwrap(),
+                    1,
+                    "prefix {prefix_len} pattern {pi}"
+                );
+            }
+        }
+    }
+
+    /// r474 — engine stress: long pseudo-random mixes of decision bins
+    /// (a few contexts, skewed values) and bypass runs of up to ~120
+    /// bins (the lossless `residual_ts_coding()` tails), encoded then
+    /// decoded bin-for-bin.
+    #[test]
+    fn stress_mixed_decision_and_long_bypass_runs() {
+        let mut seed = 0xC0FF_EE11u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..6 {
+            let n = 60_000 + round * 7_000;
+            let mut ectx: Vec<ContextModel> = (0..8)
+                .map(|i| ContextModel::init(20 + i * 5, 4, 30))
+                .collect();
+            let mut dctx = ectx.clone();
+            let mut enc = ArithEncoder::new();
+            let mut ops: Vec<(u8, u8, u32)> = Vec::with_capacity(n); // (kind, ctx, bin)
+            let mut run = 0u32;
+            while ops.len() < n {
+                let r = next();
+                if run > 0 {
+                    run -= 1;
+                    let bin = (r >> 3) & 1;
+                    enc.encode_bypass(bin).unwrap();
+                    ops.push((1, 0, bin));
+                } else if r % 7 == 0 {
+                    run = (r >> 8) % 120;
+                } else {
+                    let c = ((r >> 4) % 8) as u8;
+                    // Skewed: mostly 0 for even contexts, mostly 1 for odd.
+                    let bin = if (r >> 12) % 10 < 8 {
+                        (c & 1) as u32
+                    } else {
+                        1 - (c & 1) as u32
+                    };
+                    enc.encode_decision(&mut ectx[c as usize], bin).unwrap();
+                    ops.push((0, c, bin));
+                }
+            }
+            enc.encode_terminate(1).unwrap();
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 32]);
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            for (i, &(kind, c, bin)) in ops.iter().enumerate() {
+                let got = if kind == 0 {
+                    dec.decode_decision(&mut dctx[c as usize]).unwrap()
+                } else {
+                    dec.decode_bypass().unwrap()
+                };
+                assert_eq!(got, bin, "round {round}: bin {i} (kind {kind}) mismatch");
+            }
+            assert_eq!(
+                dec.decode_terminate().unwrap(),
+                1,
+                "round {round}: terminate"
+            );
+        }
+    }
 
     fn pad(bytes: Vec<u8>) -> Vec<u8> {
         let mut out = bytes;

@@ -441,6 +441,13 @@ pub struct EncoderConfig {
     /// `dep_quant` / `sign_data_hiding` / `lmcs` / the MTT pickers /
     /// `palette` / `enable_chroma_sao_merge`. Default `false`.
     pub lossless: bool,
+    /// r474 — **CU-size rate-distortion decision**: every fully-inside
+    /// 64x64 node is coded both as one CU and as an explicit quad
+    /// split (recursively down to 8x8), keeping the lower
+    /// `SSE + λ · bits`. Default `true`; `false` keeps one CU per
+    /// 64x64 slot (the historical layout — faster, far lower quality
+    /// on detailed content).
+    pub rdo_cu_split: bool,
 }
 
 impl EncoderConfig {
@@ -468,6 +475,7 @@ impl EncoderConfig {
             raster_slice_count: 1,
             loop_filter_across_slices: true,
             lossless: false,
+            rdo_cu_split: true,
         }
     }
 

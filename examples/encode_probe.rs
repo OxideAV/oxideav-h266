@@ -29,16 +29,45 @@ fn main() {
     let mid = 1u16 << (bd - 1);
     let sh = bd - 8;
     let mut src = PictureBuffer::with_chroma_format_bd(w, h, fmt, mid, bd);
+    // PATTERN=noise (default) is a pseudo-random texture; PATTERN=smooth
+    // is a gradient with ripples, a diagonal edge and a few discs —
+    // structured content where intra prediction matters.
+    let smooth = std::env::var("PATTERN")
+        .map(|p| p == "smooth")
+        .unwrap_or(false);
     for y in 0..h {
         for x in 0..w {
-            src.luma.samples[y * w + x] = (((x * 7 + y * 13 + (x * y) % 31) & 0xff) << sh) as u16;
+            let v = if smooth {
+                let base = 40 + (x * 150) / w.max(1) + (y * 60) / h.max(1);
+                let ripple = ((x * 5 + y * 3) % 17) * 3;
+                let edge = if x + y > (w + h) / 2 { 30 } else { 0 };
+                let dx = x as i64 - (w / 3) as i64;
+                let dy = y as i64 - (h / 3) as i64;
+                let disc = if dx * dx + dy * dy < ((w.min(h) / 6) as i64).pow(2) {
+                    60
+                } else {
+                    0
+                };
+                (base + ripple + edge).saturating_sub(disc).min(255)
+            } else {
+                (x * 7 + y * 13 + (x * y) % 31) & 0xff
+            };
+            src.luma.samples[y * w + x] = (v << sh) as u16;
         }
     }
     let cw = src.cb.width;
     for y in 0..src.cb.height {
         for x in 0..cw {
-            src.cb.samples[y * cw + x] = (((x * 5 + y * 3) & 0xff) << sh) as u16;
-            src.cr.samples[y * cw + x] = (((x * 11 + y * 2 + 100) & 0xff) << sh) as u16;
+            let (cb, cr) = if smooth {
+                (
+                    100 + (x * 60) / cw.max(1),
+                    160 - (y * 50) / src.cb.height.max(1),
+                )
+            } else {
+                ((x * 5 + y * 3) & 0xff, (x * 11 + y * 2 + 100) & 0xff)
+            };
+            src.cb.samples[y * cw + x] = (cb << sh) as u16;
+            src.cr.samples[y * cw + x] = (cr << sh) as u16;
         }
     }
     let mut cfg = EncoderConfig::new(w as u32, h as u32);

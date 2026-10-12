@@ -1171,6 +1171,114 @@ pub fn encode_ts_tb_coefficients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r474 — the three TS level fields of the last CU of a lossless
+    /// 4:4:4 32x100 encode (the stream's `end_of_slice_one_bit` failed),
+    /// replayed through the coder pair in isolation.
+    #[test]
+    fn ts_residual_regression_last_cu_444() {
+        use crate::cabac::ArithDecoder;
+        let y: Vec<i32> = vec![
+            -6, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0,
+            0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 3, 1,
+            0, 0, 0, 0, 0, 0,
+        ];
+        let cb: Vec<i32> = vec![
+            0, -1, -1, -1, -1, -1, -1, 0, 0, -1, -2, -2, -2, -2, -2, 0, 0, -2, -3, -3, -3, -3, -2,
+            0, -1, -4, -5, -5, -5, -4, -2, 0, -2, -5, -6, -6, -6, -4, -2, 0, -2, -6, -7, -7, -6,
+            -4, -2, 0, -3, -7, -8, -8, -6, -4, -2, 0, -3, -8, -9, -8, -6, -4, -2, 0,
+        ];
+        let cr: Vec<i32> = vec![
+            0, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1, -1, -2, -2, -2, -2, -2,
+            -2, -2, -1, -2, -2, -2, -2, -2, -2, -2, -1, -2, -2, -2, -2, -2, -2, -2, -1, -2, -2, -2,
+            -2, -2, -2, -2, -1, -2, -2, -2, -2, -2, -2, -2, -1, -2, -2, -2, -2, -2, -2, -2,
+        ];
+        for (name, levels) in [("Y", &y), ("Cb", &cb), ("Cr", &cr)] {
+            let mut enc = ArithEncoder::new();
+            let mut ectx = ResidualCtxs::init(4);
+            encode_ts_tb_coefficients(&mut enc, &mut ectx, 8, 8, 0, 1, false, levels).unwrap();
+            enc.encode_terminate(1).unwrap();
+            let mut bytes = enc.finish();
+            bytes.extend_from_slice(&[0u8; 16]);
+            let mut dec = ArithDecoder::new(&bytes).unwrap();
+            let mut dctx = ResidualCtxs::init(4);
+            let out = crate::residual::decode_ts_tb_coefficients_range(
+                &mut dec, &mut dctx, 8, 8, 0, 1, false, 15,
+            )
+            .unwrap();
+            assert_eq!(&out, levels, "{name}");
+            assert_eq!(dec.decode_terminate().unwrap(), 1, "{name}: terminate");
+        }
+    }
+
+    /// r474 — `encode_ts_tb_coefficients` ⇄ `decode_ts_tb_coefficients_range`
+    /// on pseudo-random level fields of every TB shape the lossless
+    /// pipeline codes (square and 4:2:2 chroma shapes), magnitudes from
+    /// sparse ±1 up to the 10-bit residual range, so the `RemCcbs`
+    /// budget exhaustion, the gtX cascade, the bypass tail and the
+    /// level-prediction fold are all exercised.
+    #[test]
+    fn ts_residual_random_round_trips() {
+        use crate::cabac::ArithDecoder;
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let shapes = [
+            (4usize, 4usize),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (4, 8),
+            (8, 4),
+            (16, 32),
+            (8, 16),
+        ];
+        for &(w, h) in &shapes {
+            for trial in 0..40 {
+                let total = w * h;
+                let mut levels = vec![0i32; total];
+                // Density / magnitude regime per trial.
+                let density = 1 + (trial % 4) * 3; // 1 → every position; 10 → sparse
+                let mag: i32 = match trial % 5 {
+                    0 => 1,
+                    1 => 3,
+                    2 => 12,
+                    3 => 255,
+                    _ => 1023,
+                };
+                for v in levels.iter_mut() {
+                    let r = next();
+                    if (r % density as u32) == 0 {
+                        let m = (r >> 8) as i32 % (mag + 1);
+                        *v = if (r >> 4) & 1 == 1 { -m } else { m };
+                    }
+                }
+                if levels.iter().all(|&l| l == 0) {
+                    levels[0] = 1;
+                }
+                let mut enc = ArithEncoder::new();
+                let mut ectx = ResidualCtxs::init(4);
+                encode_ts_tb_coefficients(&mut enc, &mut ectx, w, h, 0, 1, false, &levels).unwrap();
+                enc.encode_terminate(1).unwrap();
+                let mut bytes = enc.finish();
+                bytes.extend_from_slice(&[0u8; 16]);
+                let mut dec = ArithDecoder::new(&bytes).unwrap();
+                let mut dctx = ResidualCtxs::init(4);
+                let out = crate::residual::decode_ts_tb_coefficients_range(
+                    &mut dec, &mut dctx, w, h, 0, 1, false, 15,
+                )
+                .unwrap();
+                assert_eq!(
+                    out, levels,
+                    "{w}x{h} trial {trial} (mag {mag}, density {density})"
+                );
+            }
+        }
+    }
     use crate::residual::{decode_tb_coefficients, ResidualCtxs};
 
     fn pad(bytes: Vec<u8>) -> Vec<u8> {

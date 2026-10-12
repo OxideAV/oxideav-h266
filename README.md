@@ -513,6 +513,26 @@ chroma geometry over-ran the floor-sized planes of an odd source; SAO's
 region clip gets the same clamp). `examples/encode_probe` drives the
 encode → own decode → black-box external-decode comparison for one geometry.
 
+r474 — **intra decision + CU-size RDO**: each CU picks its luma mode
+among all 67 §8.4.5.2 modes (SATD ranking, RD over the best three +
+PLANAR / DC with a fractional CABAC bit estimate), codes the real
+§7.3.11.5 cascade against the §8.4.2 `candModeList[]` (DM chroma,
+Table 21 for 4:2:2), and every fully-inside 64x64 node is RD-compared
+against an explicit quad split down to 8x8
+(`EncoderConfig::rdo_cu_split`, default on; the MTT pickers run on top).
+256x256 structured picture, before → after: QP 22 25.72 → 41.66 dB,
+QP 32 25.58 → 34.14 dB, QP 37 25.42 → 31.29 dB (the DC-only 64x64
+layout capped at ~25.7 dB at every QP); lossless 74083 → 57736 bytes.
+
+r474 — the CABAC **encoder engine** runs a bounded 10-bit register with
+outstanding-bit carry resolution: the previous `u64` window overflowed
+on a periodic bypass run (a repeating lossless residual kept the
+interval straddling for hundreds of bins) and corrupted the slice tail.
+Triage hooks on the encoder side: `H266_ENC_DBG_CU=1` (per-CU line,
+`H266_ENC_DBG_LEVELS=1` adds the levels), `H266_ENC_DBG_BINS=1` (bin
+trace, dual of `H266_DBG_BINS`), `examples/cabac_replay` (replays a bin
+log through the engine pair).
+
 r474 — **chroma formats and bit depth**: 4:0:0 / 4:2:0 / 4:2:2 /
 4:4:4 (`EncoderConfig::chroma_format_idc`) at 8 – 10 bits (the depth of
 the source planes), lossy and lossless — quantisers at Qp′ = QpY +

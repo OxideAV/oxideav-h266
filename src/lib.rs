@@ -88,7 +88,8 @@
 //!   [`DequantParams::bdpcm_dir`].
 //! * [`cabac_enc`] — round-16 forward-side CABAC engine (`encode_decision`
 //!   / `encode_bypass` / `encode_terminate` + `finish`). Uses
-//!   high-precision interval tracking so the emitted byte stream
+//!   a bounded 10-bit low register with outstanding-bit carry
+//!   resolution so the emitted byte stream
 //!   round-trips bit-identically through [`cabac::ArithDecoder`].
 //!   Shares [`cabac::ContextModel`] with the decoder so probability
 //!   state stays in lockstep.

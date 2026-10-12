@@ -46,10 +46,13 @@ fn encoder_pipeline_cfg() -> AlfSyntaxConfig {
     }
 }
 
-/// r412 — the §7.3.11.5 intra-mode cascade the encoder pipeline now
-/// codes before every transform_unit(): `intra_luma_mpm_flag = 1`,
-/// `intra_luma_not_planar_flag = 1`, `intra_luma_mpm_idx = 0` (one
-/// bypass 0-bin) and `intra_chroma_pred_mode` = DM ("0" ctx bin).
+/// r412 / r474 — the §7.3.11.5 intra-mode cascade the encoder pipeline
+/// codes before every transform_unit(): `intra_luma_mpm_flag`, then
+/// either `intra_luma_not_planar_flag` + `intra_luma_mpm_idx` (bypass
+/// TR, cMax = 4) or `intra_luma_mpm_remainder` (bypass TB, cMax = 60),
+/// and `intra_chroma_pred_mode` = DM ("0" ctx bin). Since r474 the
+/// luma mode is chosen per CU, so the reader mirrors the full cascade
+/// and only pins the DM chroma choice.
 struct IntraCascadeCtxs {
     mpm: Vec<oxideav_h266::cabac::ContextModel>,
     np: Vec<oxideav_h266::cabac::ContextModel>,
@@ -73,19 +76,31 @@ fn read_intra_dc_cascade(
         ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
         ctx_inc_intra_luma_not_planar_flag,
     };
-    let b = dec
+    let mpm = dec
         .decode_decision(&mut icx.mpm[ctx_inc_intra_luma_mpm_flag() as usize])
         .unwrap();
-    assert_eq!(b, 1, "pipeline CU signals intra_luma_mpm_flag = 1");
-    let b = dec
-        .decode_decision(&mut icx.np[ctx_inc_intra_luma_not_planar_flag(false) as usize])
-        .unwrap();
-    assert_eq!(b, 1, "pipeline CU signals intra_luma_not_planar_flag = 1");
-    assert_eq!(
-        dec.decode_bypass().unwrap(),
-        0,
-        "pipeline CU signals intra_luma_mpm_idx = 0"
-    );
+    if mpm == 1 {
+        let not_planar = dec
+            .decode_decision(&mut icx.np[ctx_inc_intra_luma_not_planar_flag(false) as usize])
+            .unwrap();
+        if not_planar == 1 {
+            // intra_luma_mpm_idx — TR(cMax = 4): up to four 1-bins.
+            let mut idx = 0;
+            while idx < 4 && dec.decode_bypass().unwrap() == 1 {
+                idx += 1;
+            }
+        }
+    } else {
+        // intra_luma_mpm_remainder — TB(cMax = 60): 5 bits, a 6th when
+        // the prefix reaches u = 3.
+        let mut prefix = 0u32;
+        for _ in 0..5 {
+            prefix = (prefix << 1) | dec.decode_bypass().unwrap();
+        }
+        if prefix >= 3 {
+            let _ = dec.decode_bypass().unwrap();
+        }
+    }
     let b = dec
         .decode_decision(&mut icx.cm[ctx_inc_intra_chroma_pred_mode() as usize])
         .unwrap();
@@ -1121,7 +1136,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
-    use oxideav_h266::encoder_pipeline::encode_idr_with_qp_picker;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_qp_picker_cfg;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
@@ -1156,7 +1171,12 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
         }
     };
     let slice_qp_y = 22;
-    let (bs, _) = encode_idr_with_qp_picker(&src, slice_qp_y, qp_for).unwrap();
+    // r474 — this hand-rolled CABAC walk pins the one-CU-per-64x64
+    // layout (the §9.3.4.2.2 split ctxIncs below use default
+    // neighbours), so the CU-size RDO stays off here.
+    let mut cfg = oxideav_h266::encoder::EncoderConfig::new(128, 128);
+    cfg.rdo_cu_split = false;
+    let (bs, _) = encode_idr_with_qp_picker_cfg(&src, slice_qp_y, cfg, qp_for).unwrap();
 
     // Parse VPS / SPS / PPS / PH / SH.
     let nals: Vec<_> = iter_annex_b(&bs).collect();
