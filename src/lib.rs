@@ -11,8 +11,12 @@
 //! `dpb_parameters()` bumping bounds, truthful pixel-format labels
 //! (4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 at 8 / 10 / 12 / 16 bits), decoder
 //! limits honoured before allocation. The encoder
-//! ([`encoder_pipeline`], [`encoder::EncoderConfig`]) codes intra
-//! pictures of any geometry and format, lossy and lossless.
+//! ([`encoder_pipeline`], [`encoder::EncoderConfig`]; the registry
+//! face [`h266_encoder::H266CodecEncoder`] with its typed options)
+//! codes intra pictures of any geometry and format at 8 – 10 bits,
+//! lossy and lossless, with matrix-based intra prediction, intra
+//! sub-partitions (opt-in) and lossless BDPCM in its per-CU decision,
+//! and hands containers a `vvcC` record.
 //!
 //! ## Crate layout
 //!

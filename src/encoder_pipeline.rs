@@ -228,6 +228,13 @@ struct PreparedLumaTb {
     /// (equal sizes), each coded as its own luma TB; the chroma TBs
     /// span the CU (closing the last partition's TU).
     isp: Option<crate::leaf_cu::IspSplitType>,
+    /// r477 — block-based delta pulse code modulation of the luma TB
+    /// (`intra_bdpcm_luma_flag = 1`, `Some(dir)`: `false` horizontal,
+    /// `true` vertical — `intra_bdpcm_luma_dir_flag`): `levels` holds
+    /// the §8.7.3 eq. 1153 / 1154 differences the decoder accumulates,
+    /// coded through `residual_ts_coding()` without a
+    /// `transform_skip_flag`; `luma_mode` reads ANGULAR18 / ANGULAR50.
+    bdpcm: Option<bool>,
 }
 
 /// r477 — the intra coding tools the emitted SPS enables for this
@@ -241,7 +248,16 @@ struct IntraTools {
     /// `sps_isp_enabled_flag` — `intra_subpartitions_mode_flag` (and
     /// the split flag) precede the MPM cascade on eligible CUs.
     isp: bool,
+    /// `sps_bdpcm_enabled_flag` — `intra_bdpcm_luma_flag` opens the
+    /// cascade and `intra_bdpcm_chroma_flag` the chroma mode on CUs
+    /// within `MaxTsSize` (the lossless pipeline, which enables
+    /// transform skip).
+    bdpcm: bool,
 }
+
+/// `MaxTsSize` of the emitted SPS (`sps_log2_transform_skip_max_size_minus2
+/// = 3`).
+const MAX_TS_SIZE: usize = 32;
 
 /// r477 — §7.3.11.5: the CU sizes on which `intra_subpartitions_mode_flag`
 /// is present (`cbWidth <= MaxTbSizeY && cbHeight <= MaxTbSizeY &&
@@ -723,6 +739,11 @@ struct IntraModeCtxs {
     /// r477 — `intra_subpartitions_mode_flag` / `_split_flag`.
     isp_mode: Vec<ContextModel>,
     isp_split: Vec<ContextModel>,
+    /// r477 — `intra_bdpcm_luma_flag` / `_dir_flag` /
+    /// `intra_bdpcm_chroma_flag`.
+    bdpcm_luma: Vec<ContextModel>,
+    bdpcm_dir: Vec<ContextModel>,
+    bdpcm_chroma: Vec<ContextModel>,
 }
 
 impl IntraModeCtxs {
@@ -734,6 +755,9 @@ impl IntraModeCtxs {
             mip_flag: init_contexts(SyntaxCtx::IntraMipFlag, slice_qp_y),
             isp_mode: init_contexts(SyntaxCtx::IntraSubpartitionsModeFlag, slice_qp_y),
             isp_split: init_contexts(SyntaxCtx::IntraSubpartitionsSplitFlag, slice_qp_y),
+            bdpcm_luma: init_contexts(SyntaxCtx::IntraBdpcmLumaFlag, slice_qp_y),
+            bdpcm_dir: init_contexts(SyntaxCtx::IntraBdpcmLumaDirFlag, slice_qp_y),
+            bdpcm_chroma: init_contexts(SyntaxCtx::IntraBdpcmChromaFlag, slice_qp_y),
         }
     }
 }
@@ -776,6 +800,12 @@ struct LumaIntraSyntax<'a> {
     ms: &'a IntraModeSyntax,
     /// `intra_subpartitions_mode_flag = 1` with its split direction.
     isp: Option<crate::leaf_cu::IspSplitType>,
+    /// `intra_bdpcm_luma_flag = 1` with its direction.
+    bdpcm: Option<bool>,
+    /// The chroma TB size (`cbWidth / SubWidthC`, `cbHeight /
+    /// SubHeightC`) when the CU carries chroma — the
+    /// `intra_bdpcm_chroma_flag` gate and the DM bin.
+    chroma: Option<(usize, usize)>,
 }
 
 /// r474 — the §7.3.11.5 luma intra-mode cascade of one CU, resolved
@@ -846,8 +876,25 @@ fn emit_intra_mode_bins(
     enc: &mut crate::cabac_enc::ArithEncoder,
     ictx: &mut IntraModeCtxs,
     lx: LumaIntraSyntax<'_>,
-    chroma: bool,
 ) -> Result<()> {
+    // r477 — §7.3.11.5: `intra_bdpcm_luma_flag` (ctx 0) opens the
+    // cascade on CUs within MaxTsSize when the SPS enables BDPCM; a
+    // BDPCM CU then codes `intra_bdpcm_luma_dir_flag` (ctx 0) and
+    // nothing else of the luma cascade.
+    if lx.tools.bdpcm && lx.n_w <= MAX_TS_SIZE && lx.n_h <= MAX_TS_SIZE {
+        let inc = crate::ctx::ctx_inc_intra_bdpcm_luma_flag() as usize;
+        let n = ictx.bdpcm_luma.len() - 1;
+        enc.encode_decision(
+            &mut ictx.bdpcm_luma[inc.min(n)],
+            u32::from(lx.bdpcm.is_some()),
+        )?;
+        if let Some(dir) = lx.bdpcm {
+            let inc = crate::ctx::ctx_inc_intra_bdpcm_luma_dir_flag() as usize;
+            let n = ictx.bdpcm_dir.len() - 1;
+            enc.encode_decision(&mut ictx.bdpcm_dir[inc.min(n)], u32::from(dir))?;
+            return emit_chroma_mode_bins(enc, ictx, lx);
+        }
+    }
     let ms = lx.ms;
     // r477 — §7.3.11.5: `intra_mip_flag` (ctx per §9.3.4.2.2 — the
     // left / above `IntraMipFlag`, or 3 for a strongly non-square CU)
@@ -869,12 +916,7 @@ fn emit_intra_mode_bins(
             enc.encode_bypass(u32::from(m.transposed))?;
             let c_max = num_mip_modes(mip_size_id(lx.n_w as u32, lx.n_h as u32)) - 1;
             encode_tb_bypass(enc, m.mode, c_max)?;
-            if chroma {
-                let inc = ctx_inc_intra_chroma_pred_mode() as usize;
-                let n = ictx.chroma_mode.len() - 1;
-                enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
-            }
-            return Ok(());
+            return emit_chroma_mode_bins(enc, ictx, lx);
         }
     }
     // r477 — §7.3.11.5: `intra_subpartitions_mode_flag` (ctx 0) and,
@@ -924,13 +966,30 @@ fn emit_intra_mode_bins(
             }
         }
     }
-    // §7.3.11.5 — intra_chroma_pred_mode is present only with a chroma
-    // format (`sps_chroma_format_idc != 0`).
-    if chroma {
-        let inc = ctx_inc_intra_chroma_pred_mode() as usize;
-        let n = ictx.chroma_mode.len() - 1;
-        enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
+    emit_chroma_mode_bins(enc, ictx, lx)
+}
+
+/// r477 — the chroma half of the §7.3.11.5 cascade on a single-tree
+/// CU with chroma: `intra_bdpcm_chroma_flag = 0` (ctx 0) when the SPS
+/// enables BDPCM and the chroma TB is within MaxTsSize (this encoder
+/// codes chroma without BDPCM), then `intra_chroma_pred_mode` = DM
+/// (Table 130 "0" bin; CCLM is off in the SPS).
+fn emit_chroma_mode_bins(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    ictx: &mut IntraModeCtxs,
+    lx: LumaIntraSyntax<'_>,
+) -> Result<()> {
+    let Some((cw, ch)) = lx.chroma else {
+        return Ok(());
+    };
+    if lx.tools.bdpcm && cw <= MAX_TS_SIZE && ch <= MAX_TS_SIZE {
+        let inc = crate::ctx::ctx_inc_intra_bdpcm_chroma_flag() as usize;
+        let n = ictx.bdpcm_chroma.len() - 1;
+        enc.encode_decision(&mut ictx.bdpcm_chroma[inc.min(n)], 0)?;
     }
+    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+    let n = ictx.chroma_mode.len() - 1;
+    enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
     Ok(())
 }
 
@@ -996,6 +1055,9 @@ struct LumaTrial {
     /// r477 — the ISP split when the trial is sub-partitioned
     /// (`levels` holds the partitions back to back).
     isp: Option<crate::leaf_cu::IspSplitType>,
+    /// r477 — the BDPCM direction when the trial is DPCM-coded
+    /// (lossless pipeline).
+    bdpcm: Option<bool>,
     levels: Vec<i32>,
     rec: Vec<u16>,
     sse: u64,
@@ -1148,6 +1210,7 @@ fn code_luma_tb_with_pred(
         syntax,
         mip,
         isp: None,
+        bdpcm: None,
         levels,
         rec,
         sse,
@@ -1406,6 +1469,7 @@ fn code_luma_cu_isp_trial(
         syntax,
         mip: None,
         isp: Some(split),
+        bdpcm: None,
         levels,
         rec,
         sse,
@@ -1445,6 +1509,7 @@ fn estimate_luma_tb_bits(
         mip: trial.mip,
         tools,
         isp: trial.isp,
+        bdpcm: trial.bdpcm,
     };
     let mut qp_state = QpDeltaState::new(false, qp);
     emit_tu_with_cbf(&mut enc, &mut rctx, &mut ictx, &tb, &mut qp_state, rc, nbr)?;
@@ -2114,8 +2179,9 @@ fn emit_tu_with_cbf(
             n_h: tb.n_tb_h,
             ms: &tb.mode_syntax,
             isp: tb.isp,
+            bdpcm: tb.bdpcm,
+            chroma: (tb.n_tb_chroma_w > 0).then_some((tb.n_tb_chroma_w, tb.n_tb_chroma_h)),
         },
-        tb.n_tb_chroma_w > 0,
     )?;
     if let Some(split) = tb.isp {
         return emit_isp_transform_tree(enc, ctxs, tb, qp_state, rc_opts, split);
@@ -2133,9 +2199,9 @@ fn emit_tu_with_cbf(
         write_tu_cb_coded_flag(enc, ctxs, cbf_cb, false)?;
         write_tu_cr_coded_flag(enc, ctxs, cbf_cr, false, cbf_cb)?;
     }
-    // Luma CBF — `bdpcm_y = false`, `isp_split = false`,
-    // `prev_tu_cbf_y = false` (single TU, non-ISP path).
-    write_tu_y_coded_flag(enc, ctxs, cbf_y, false, false, false)?;
+    // Luma CBF — Table 127 ctxInc 1 under luma BDPCM (r477), else 0;
+    // `isp_split = false`, `prev_tu_cbf_y = false` (single TU).
+    write_tu_y_coded_flag(enc, ctxs, cbf_y, tb.bdpcm.is_some(), false, false)?;
 
     // Round-52 — `cu_qp_delta_abs` + `cu_qp_delta_sign_flag` per
     // §7.3.13 / §9.3.3.10. The spec gate (§7.3.11.10):
@@ -2165,7 +2231,14 @@ fn emit_tu_with_cbf(
     // = 32 ≥ every lossless TB, no BDPCM / ISP / SBT) and ships the
     // levels through `residual_ts_coding()` (§7.3.11.12, Rice 1).
     if cbf_y {
-        if tb.transform_skip {
+        if let Some(_dir) = tb.bdpcm {
+            // r477 — BDPCM: `transform_skip_flag` is not present
+            // (BdpcmFlag infers transform skip); the levels are the
+            // eq. 1153 / 1154 differences, coded with the BDPCM arms
+            // of `residual_ts_coding()` (no level-prediction fold,
+            // BDPCM sign / gt1 contexts).
+            encode_ts_tb_coefficients(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, 1, true, &tb.levels)?;
+        } else if tb.transform_skip {
             write_transform_skip_flag(enc, ctxs, 0, true)?;
             encode_ts_tb_coefficients(enc, ctxs, tb.n_tb_w, tb.n_tb_h, 0, 1, false, &tb.levels)?;
         } else {
@@ -2809,6 +2882,7 @@ fn prepare_leaf_cu(
             mip,
             tools,
             isp,
+            bdpcm: None,
         }));
     }
     // §8.4.3 — DM chroma of a MIP CU reads PLANAR, except a 4:4:4
@@ -2890,6 +2964,7 @@ fn prepare_leaf_cu(
         mip,
         tools,
         isp,
+        bdpcm: None,
     }))
 }
 
@@ -2907,7 +2982,7 @@ fn prepare_leaf_cu_lossless(
     n_tb_h: usize,
     cu_qp: i32,
 ) -> Result<PreparedCu> {
-    let (levels, luma_mode, mode_syntax) =
+    let (levels, luma_mode, mode_syntax, bdpcm) =
         prepare_luma_tb_ts(&src.luma, &mut rec.luma, avail, x, y, n_tb_w, n_tb_h)?;
     if !avail.chroma_present {
         return Ok(PreparedCu::Leaf(PreparedLumaTb {
@@ -2925,6 +3000,7 @@ fn prepare_leaf_cu_lossless(
             mip: None,
             tools: avail.tools,
             isp: None,
+            bdpcm,
         }));
     }
     let chroma_mode = chroma_dm_mode(avail, luma_mode);
@@ -2969,6 +3045,7 @@ fn prepare_leaf_cu_lossless(
         mip: None,
         tools: avail.tools,
         isp: None,
+        bdpcm,
     }))
 }
 
@@ -2984,10 +3061,73 @@ fn prepare_luma_tb_ts(
     y: usize,
     n_tb_w: usize,
     n_tb_h: usize,
-) -> Result<(Vec<i32>, u32, IntraModeSyntax)> {
+) -> Result<(Vec<i32>, u32, IntraModeSyntax, Option<bool>)> {
     let cand = avail.mpm_cand_list(x, y, n_tb_w, n_tb_h);
     let region = avail.region_for(0);
     let mut best: Option<(u64, u32, Vec<i32>)> = None;
+    // r477 — BDPCM candidates (lossless): the horizontal / vertical
+    // DPCM of the residual of the ANGULAR18 / ANGULAR50 prediction
+    // made with the §8.4.5.2 BDPCM switches (no PDPC); the coded
+    // levels are the eq. 1153 / 1154 differences, so their magnitude
+    // sum is the rate proxy next to the plain residual SAD of the
+    // angular modes (which also pay the MPM cascade).
+    let mut best_bdpcm: Option<(u64, bool, Vec<i32>)> = None;
+    if avail.tools.bdpcm && n_tb_w <= MAX_TS_SIZE && n_tb_h <= MAX_TS_SIZE {
+        for dir in [false, true] {
+            let mode = if dir {
+                crate::leaf_cu::INTRA_ANGULAR50
+            } else {
+                crate::leaf_cu::INTRA_ANGULAR18
+            };
+            let pred = predict_block_bdpcm(
+                rec_plane,
+                &avail.luma,
+                avail.w,
+                avail.h,
+                region,
+                x,
+                y,
+                n_tb_w,
+                n_tb_h,
+                mode,
+            )?;
+            let mut res = vec![0i32; n_tb_w * n_tb_h];
+            for ty in 0..n_tb_h {
+                for tx in 0..n_tb_w {
+                    let p = pred[ty * n_tb_w + tx] as i32;
+                    let s = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(p);
+                    res[ty * n_tb_w + tx] = s - p;
+                }
+            }
+            let mut levels = vec![0i32; n_tb_w * n_tb_h];
+            let mut sad = 0u64;
+            for ty in 0..n_tb_h {
+                for tx in 0..n_tb_w {
+                    let prev = if dir {
+                        if ty > 0 {
+                            res[(ty - 1) * n_tb_w + tx]
+                        } else {
+                            0
+                        }
+                    } else if tx > 0 {
+                        res[ty * n_tb_w + tx - 1]
+                    } else {
+                        0
+                    };
+                    let d = res[ty * n_tb_w + tx] - prev;
+                    levels[ty * n_tb_w + tx] = d;
+                    sad += u64::from(d.unsigned_abs());
+                }
+            }
+            if best_bdpcm
+                .as_ref()
+                .map(|(b, _, _)| sad < *b)
+                .unwrap_or(true)
+            {
+                best_bdpcm = Some((sad, dir, levels));
+            }
+        }
+    }
     for mode in 0..=66u32 {
         let pred = predict_block(
             rec_plane,
@@ -3019,7 +3159,20 @@ fn prepare_luma_tb_ts(
             best = Some((sad, mode, levels));
         }
     }
-    let (_, mode, levels) = best.expect("67 candidate modes");
+    let (best_sad, mode, levels) = best.expect("67 candidate modes");
+    // BDPCM wins on the proxy when its difference magnitudes undercut
+    // the best plain residual (its two flag bins replace the cascade).
+    let (mode, levels, bdpcm) = match best_bdpcm {
+        Some((sad, dir, lv)) if sad < best_sad => {
+            let mode = if dir {
+                crate::leaf_cu::INTRA_ANGULAR50
+            } else {
+                crate::leaf_cu::INTRA_ANGULAR18
+            };
+            (mode, lv, Some(dir))
+        }
+        _ => (mode, levels, None),
+    };
     for ty in 0..n_tb_h {
         for tx in 0..n_tb_w {
             if x + tx < rec_plane.width && y + ty < rec_plane.height {
@@ -3031,7 +3184,54 @@ fn prepare_luma_tb_ts(
     }
     avail.mark_luma(x, y, n_tb_w, n_tb_h);
     avail.mark_modes(x, y, n_tb_w, n_tb_h, mode as u8);
-    Ok((levels, mode, mode_syntax_for(mode, &cand)))
+    Ok((levels, mode, mode_syntax_for(mode, &cand), bdpcm))
+}
+
+/// r477 — the §8.4.5.2 prediction of a BDPCM luma block: the
+/// decoder's `predict_intra` in ANGULAR18 / ANGULAR50 with the BDPCM
+/// switch set (no PDPC), availability through the eq. 1212 mask.
+#[allow(clippy::too_many_arguments)]
+fn predict_block_bdpcm(
+    plane: &PicturePlane,
+    avail: &[bool],
+    aw: usize,
+    ah: usize,
+    region: (i32, i32, i32, i32, i32),
+    x0: usize,
+    y0: usize,
+    n_w: usize,
+    n_h: usize,
+    mode: u32,
+) -> Result<Vec<i16>> {
+    let (rx0, ry0, rx1, ry1, rcap) = region;
+    predict_intra(
+        &IntraPredParams {
+            mode,
+            n_tb_w: n_w,
+            n_tb_h: n_h,
+            n_cb_w: n_w,
+            n_cb_h: n_h,
+            c_idx: 0,
+            isp_no_split: true,
+            ref_idx: 0,
+            bdpcm: true,
+            bit_depth: plane.bit_depth,
+        },
+        |dx: i32, dy: i32| {
+            let x = x0 as i32 + dx;
+            let y = y0 as i32 + dy;
+            if x < 0 || y < 0 || x >= aw as i32 || y >= ah as i32 {
+                return None;
+            }
+            if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
+                return None;
+            }
+            if !avail[(y as usize) * aw + x as usize] {
+                return None;
+            }
+            plane.get(x as usize, y as usize).map(|v| v as i16)
+        },
+    )
 }
 
 /// r474 — transform-skip chroma TB (see [`prepare_luma_tb_ts`]).
@@ -4164,12 +4364,13 @@ fn emit_prepared_cu(
             // emitted leaf CU (companion of the decoder's `H266_DBG_CU`).
             if std::env::var_os("H266_ENC_DBG_CU").is_some() {
                 eprintln!(
-                    "ENC CU ({x},{y}) {}x{} modeY={} mip={:?} isp={:?} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
+                    "ENC CU ({x},{y}) {}x{} modeY={} mip={:?} isp={:?} bdpcm={:?} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
                     tb.n_tb_w,
                     tb.n_tb_h,
                     tb.luma_mode,
                     tb.mip,
                     tb.isp,
+                    tb.bdpcm,
                     tb.levels.iter().any(|&l| l != 0),
                     tb.cb_levels.iter().any(|&l| l != 0),
                     tb.cr_levels.iter().any(|&l| l != 0),
@@ -4491,7 +4692,7 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 tu_y_coded: true,
                 tu_cb_coded: cbf_cb,
                 tu_cr_coded: cbf_cr,
-                bdpcm_luma: false,
+                bdpcm_luma: tb.bdpcm.is_some(),
                 bdpcm_chroma: false,
                 qp_c: crate::deblock::DEBLOCK_QP_C_LEGACY,
                 tu_c_res_mode: 0,
@@ -4791,6 +4992,9 @@ fn encode_idr_impl(
     avail.tools = IntraTools {
         mip: config.intra_mip,
         isp: config.intra_isp,
+        // BDPCM rides transform skip, which the SPS enables on the
+        // lossless path only.
+        bdpcm: config.intra_bdpcm && config.lossless,
     };
     // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
     // partition fields; drive every split-bin presence + ctxInc.
@@ -5032,6 +5236,9 @@ fn encode_idr_impl(
                             if matches!(split, crate::leaf_cu::IspSplitType::HorSplit) {
                                 stats.isp_hor_cus += 1;
                             }
+                        }
+                        if tb.bdpcm.is_some() {
+                            stats.bdpcm_cus += 1;
                         }
                     });
                     accumulate_deblock_cus(&cu, tb_x, tb_y, &mut all_deblock_cus);
@@ -7382,6 +7589,7 @@ mod tests {
                 mip: None,
                 tools: IntraTools::default(),
                 isp: None,
+                bdpcm: None,
             })
         };
         let a = mk_leaf(16, 64);

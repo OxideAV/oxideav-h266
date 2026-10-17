@@ -5,14 +5,19 @@
 Pure-Rust **H.266 / VVC** (ITU-T H.266 | ISO/IEC 23090-3) codec for
 oxideav. Zero C dependencies, no FFI, no `*-sys` crates.
 
-VVC is a very large specification (500+ pages); this crate is an
-in-progress, spec-driven implementation. It provides a complete NAL
-framing + parameter-set parsing layer, a reconstruction pipeline that
-covers the intra tools and — as of r447 — the full inter tool chain
-(affine merge + non-merge, SbTMVP, GPM, MMVD, CIIP, SMVD, AMVR incl.
-the affine arm, BCW, BDOF, PROF, DMVR) validated tool-by-tool against
-black-box fixture streams, and an IDR-frame encoder pipeline. A
-complete encoder is still being built up incrementally.
+VVC is a very large specification (500+ pages); this crate is a
+spec-driven implementation. It provides a complete NAL framing +
+parameter-set parsing layer, a decoder that reconstructs every staged
+JVET conformance stream byte-exactly (the intra tools and the full
+inter tool chain — affine merge + non-merge, SbTMVP, GPM, MMVD, CIIP,
+SMVD, AMVR incl. the affine arm, BCW, BDOF, PROF, DMVR), a stills
+(all-intra) encoder for any geometry and chroma format at 8 – 10 bits,
+lossy and lossless, with matrix-based intra prediction, intra
+sub-partitions and BDPCM in its decision, and — since r477 — a real
+framework face for both: the registry decoder streams Annex B or
+`vvcC`-framed packets in output order, the registry encoder declares
+its layouts and hands containers a `VvcDecoderConfigurationRecord`.
+Production inter (P / B) encoding and the VUI are not built yet.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -24,6 +29,89 @@ framework but usable standalone.
 oxideav-core = "0.1"
 oxideav-h266 = "0.0"
 ```
+
+## Framework (registry) surface
+
+`oxideav_h266::register(&mut ctx)` installs the codec under the `h266`
+id with the ISOBMFF sample-entry FourCCs (`vvc1`, `vvi1`, `VVC1`,
+`H266`, `h266`).
+
+### Decoder (`decoder::H266Decoder`, r477)
+
+A streaming `oxideav_core::Decoder` over `stream::StreamDecoder`:
+
+* **Framing** — Annex B packets (start codes), or ISO/IEC 14496-15
+  §4.2.3 length-prefixed samples when `CodecParameters::extradata`
+  holds a `VvcDecoderConfigurationRecord` (`vvcc` module: builder,
+  parser, serialiser, sample re-framing); the record's DCI / OPI / VPS /
+  SPS / PPS / APS arrays are pushed before the first sample. Without a
+  record every packet is sniffed (start code → Annex B, else a 4-byte
+  length-prefixed walk must cover the packet exactly).
+* **Access units** — a packet holds one or more access units; the
+  picture a packet ends with is decoded at the end of the packet.
+  `decoder::split_access_units` splits an Annex B stream at the
+  §7.4.2.4.3 boundaries.
+* **Output order** — pictures with `ph_pic_output_flag = 1` leave in
+  `PicOrderCntVal` order under the §C.5.2.2 bumping bounds of the SPS
+  `dpb_parameters()` (`dpb_max_num_reorder_pics`, `MaxLatencyPictures`),
+  every picture of a CVS leaves at the next CLVS boundary, `flush`
+  drains, `reset` forgets pictures (the parameter sets survive a seek).
+* **Timestamps** — a picture inherits the `pts` of the packet that
+  completed it; without one, a POC-derived clock in
+  `num_units_in_tick / time_scale` ticks when the SPS signals timing,
+  else one tick per POC step (`output_time_base` / `output_frame_rate`).
+* **Labels** — `Gray8` … `Yuv444P16Le` for 4:0:0 / 4:2:0 / 4:2:2 /
+  4:4:4 at 8 / 10 / 12 / 16 bits (`Decoder::output_pixel_format`, from
+  the record or the first SPS); any other depth is a typed
+  `Unsupported` before a picture decodes.
+* **Limits** — `CodecParameters::limits` (pixels, bytes) and the
+  registry's 16384 × 16384 ceiling are checked against every SPS / PPS
+  before the parameter set is accepted; no plane is allocated for a
+  hostile header, and every malformed input is an error, never a panic
+  (`fuzz/`: `parse_annexb`, `registry_decode`, `encode_roundtrip`
+  under the daily `Fuzz` workflow).
+
+`tests/registry_decoder.rs` runs **every staged JVET conformance stream
+through the registry** one packet per access unit (and a sample as
+whole-stream packets): 56 / 56 match the `.opl` plane MD5s row for row
+in output order.
+
+### Encoder (`h266_encoder::H266CodecEncoder`, r477)
+
+The stills encoder behind `oxideav_core::Encoder`: one IDR access unit
+per frame (`pts == dts`, keyframes, duration one tick of
+`1 / frame_rate`), `flush` has nothing to drain.
+
+| Input layout (declared on the descriptor) | Coded as |
+| --- | --- |
+| `Gray8`, `Gray10Le` | 4:0:0 at 8 / 10 bits |
+| `Yuv420P`, `Yuv420P10Le` | 4:2:0 (even dimensions) |
+| `Yuv422P`, `Yuv422P10Le` | 4:2:2 (even width) |
+| `Yuv444P`, `Yuv444P10Le` | 4:4:4 (any size) |
+
+12- / 16-bit input is a typed `Unsupported`; the gateway ladder
+converts ahead of the encoder.
+
+| Option | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `qp` | 0..=63 | 30 | slice QP |
+| `quality` | 0..=100 | unset | framework quality: 100 = lossless, 0..=99 → QP 51..=2 (`quality_to_qp`) |
+| `lossless` | bool | false | transform-skip residuals at Qp′ = QpPrimeTsMin; the reconstruction is the source |
+| `format` | `annexb` / `vvcc` | `annexb` | start codes with in-band VPS / SPS / PPS, or 4-byte length-prefixed samples without them and `output_params().extradata` = the `VvcDecoderConfigurationRecord` |
+| `rdo` | bool | true | CU-size rate-distortion decision |
+| `mtt` | bool | false | MTT binary + ternary split pickers |
+| `dep_quant` / `sign_data_hiding` | bool | false | dependent quantisation / sign hiding (mutually exclusive) |
+| `tile_columns` / `tile_rows` | >= 1 | 1 | tile grid |
+| `wpp` | bool | false | wavefront entry points |
+| `palette` | bool | false | palette mode (8-bit 4:2:0) |
+| `mip` | bool | true | matrix-based intra prediction candidates |
+| `isp` | bool | false | intra sub-partition candidates (opt-in, see below) |
+| `bdpcm` | bool | true | BDPCM candidates on the lossless path |
+
+`tests/registry_encoder.rs` round-trips every layout in both framings
+through the registry encoder and decoder, checks the quality ladder and
+the typed refusals, and a black-box decoder reproduces the registry
+decoder's output for the `vvcc` samples.
 
 ## Parse support
 
@@ -490,6 +578,20 @@ plus a substantial P + B-slice merge subset:
 An IDR-frame encoder pipeline (`encode_idr_with_residuals_cfg`) builds
 an Annex-B bitstream with real coded residuals, deblock, SAO, ALF, and
 CC-ALF.
+
+r477 — **intra tools in the decision** (`EncoderConfig::intra_mip` /
+`intra_isp` / `intra_bdpcm`; `encode_idr_with_stats_cfg` reports the
+per-picture `EncodeStats` tool counts):
+
+| Tool | Decision | Default | Measured |
+| --- | --- | --- | --- |
+| **MIP** (§8.4.5.2.2) | every matrix mode of the TB's size class, plain and transposed, ranked by Hadamard SATD + rate next to the 67 angular modes; the best matrix candidate always joins the RD stage; `intra_mip_flag` / `_transposed_flag` / `_mode` on the wire, PLANAR to the neighbours' MPM list, §8.4.3 chroma (DM = PLANAR; 4:4:4 `MipChromaDirectFlag`) | on | 256x256 textured, QP 22 / 32 / 37: −1.1 % / −0.8 % / −1.0 % bytes at +0.02 … +0.03 dB, 24 – 25 % of the CUs matrix-predicted; smooth content within ±0.3 % |
+| **ISP** (§8.4.5.1) | the best-ranked angular mode under each 4-sample-or-wider split, partitions predicted from each other, one TB each (`tu_y_coded_flag` inference, chroma closing the last TU), boundaries deblocked as TB edges | **off** | conformant and byte-exact everywhere; the pre-filter `SSE + λ · bits` does not price the bS = 2 deblocking of the new edges: +0.2 … +0.7 % bytes at −0.04 dB on the 256x256 textured probe, −0.3 % at +0.02 dB on the 128x96 cells of `tests/r477_intra_tools.rs` |
+| **BDPCM** (§7.3.11.5, §8.7.3 eqs. 1153 / 1154) | lossless path: horizontal / vertical DPCM of the ANGULAR18 / ANGULAR50 residual (BDPCM prediction switches, no PDPC), elected when its difference magnitudes undercut the best plain residual; `residual_ts_coding()` BDPCM arms, no `transform_skip_flag`, `intra_bdpcm_chroma_flag = 0` | on | lossless gradient cells (every format, 8 / 10-bit): 51499 → 36937 B (−28 %); 256x256 lossless textured 110341 → 99151 B (−10 %), smooth −0.2 %; always bit-exact |
+
+Every tool decodes byte-exact through this crate's decoder and a
+black-box decoder in every chroma format at 8 and 10 bits
+(`tests/r477_intra_tools.rs`).
 
 r474 — **any picture geometry** (1x1 upwards, odd sizes included)
 encodes to a conforming stream: the coded size is the source padded to
@@ -1090,8 +1192,8 @@ being added.
 
 ## Usage
 
-Registering the codec wires the decoder into `oxideav`'s codec
-registry:
+Registering the codec wires the decoder and the encoder into
+`oxideav`'s codec registry:
 
 ```rust
 use oxideav_core::CodecRegistry;
@@ -1104,6 +1206,39 @@ Or, via the unified `RuntimeContext` entry point:
 ```rust
 let mut ctx = oxideav_core::RuntimeContext::new();
 oxideav_h266::register(&mut ctx);
+```
+
+Decoding packets through the registry (Annex B here; a `vvcC` record
+goes in `params.extradata`):
+
+```rust,ignore
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
+let mut ctx = oxideav_core::RuntimeContext::new();
+oxideav_h266::register(&mut ctx);
+let params = CodecParameters::video(CodecId::new("h266"));
+let mut dec = ctx.codecs.first_decoder(&params)?;
+for (i, au) in oxideav_h266::decoder::split_access_units(&annex_b).iter().enumerate() {
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), au.to_vec()).with_pts(i as i64))?;
+    while let Ok(Frame::Video(frame)) = dec.receive_frame() {
+        // frame.pts, frame.image_planes(); dec.output_pixel_format() labels them
+    }
+}
+dec.flush()?;
+```
+
+Encoding through the registry (`vvcc` framing, quality 80):
+
+```rust,ignore
+use oxideav_core::{CodecId, CodecOptions, CodecParameters, PixelFormat, Rational};
+let mut params = CodecParameters::video(CodecId::new("h266"));
+params.width = Some(640);
+params.height = Some(480);
+params.pixel_format = Some(PixelFormat::Yuv420P);
+params.frame_rate = Some(Rational::new(30, 1));
+params.options = CodecOptions::new().set("format", "vvcc").set("quality", "80");
+let mut enc = ctx.codecs.first_encoder(&params)?;
+// enc.output_params().extradata is the VvcDecoderConfigurationRecord;
+// enc.send_frame(&frame)?; enc.receive_packet()? gives one sample per frame.
 ```
 
 Parsing parameter sets directly without going through the registry:

@@ -477,3 +477,124 @@ fn black_box_matches(
         "{label}: black-box output differs from the reconstruction"
     );
 }
+
+/// A smooth-gradient source with ramps, bands and a few flat plateaus —
+/// the content where DPCM of the prediction residual pays.
+fn gradient_source(w: usize, h: usize, cf: u32, bd: u32) -> PictureBuffer {
+    let mid = 1u16 << (bd - 1);
+    let sh = bd - 8;
+    let mut src = PictureBuffer::with_chroma_format_bd(w, h, cf, mid, bd);
+    for y in 0..h {
+        for x in 0..w {
+            let ramp = (x * 180) / w.max(1) + (y * 50) / h.max(1);
+            let band = if (y / 9) % 3 == 0 { (x / 3) % 7 } else { 0 };
+            let plateau = if x > w / 2 && y > h / 2 { 20 } else { 0 };
+            let v = (20 + ramp + band + plateau).min(255);
+            src.luma.samples[y * w + x] = ((v << sh) + ((x + y) % (1 << sh).max(1))) as u16;
+        }
+    }
+    let cw = src.cb.width;
+    for y in 0..src.cb.height {
+        for x in 0..cw {
+            src.cb.samples[y * cw + x] = (((100 + (x * 60) / cw.max(1)) << sh) as u32) as u16;
+            src.cr.samples[y * cw + x] =
+                (((140 - (y * 40) / src.cb.height.max(1)) << sh) as u32) as u16;
+        }
+    }
+    src
+}
+
+/// Lossless BDPCM: on gradient content in every chroma format at 8 /
+/// 10 bits the DPCM candidates are elected, the decoded picture is the
+/// source bit for bit, and the eight cells together are smaller than
+/// the plain lossless stream.
+#[test]
+fn bdpcm_shrinks_lossless_streams_and_decodes_bit_exact() {
+    let (mut total_on, mut total_off) = (0usize, 0usize);
+    for &cf in &[0u32, 1, 2, 3] {
+        for &bd in &[8u32, 10] {
+            let (w, h) = (96usize, 64usize);
+            let src = gradient_source(w, h, cf, bd);
+            let mut off = cfg_for(w, h, cf, false, false, false);
+            off.lossless = true;
+            let mut on = off;
+            on.intra_bdpcm = true;
+            let (bs_off, rec_off, s_off, _) = round_trip(&src, off, 0, "lossless");
+            let (bs_on, rec_on, s_on, _) = round_trip(&src, on, 0, "lossless + bdpcm");
+            assert_eq!(s_off.bdpcm_cus, 0);
+            assert!(
+                s_on.bdpcm_cus > 0,
+                "cf{cf} {bd}-bit: no CU elected BDPCM ({} CUs)",
+                s_on.cus
+            );
+            for rec in [&rec_off, &rec_on] {
+                assert!(
+                    plane_eq(&rec.luma, &src.luma),
+                    "cf{cf} {bd}-bit: not lossless"
+                );
+                if cf != 0 {
+                    assert!(plane_eq(&rec.cb, &src.cb) && plane_eq(&rec.cr, &src.cr));
+                }
+            }
+            println!(
+                "cf{cf} {bd}-bit lossless: BDPCM {}/{} CUs, {} -> {} B",
+                s_on.bdpcm_cus,
+                s_on.cus,
+                bs_off.len(),
+                bs_on.len()
+            );
+            total_on += bs_on.len();
+            total_off += bs_off.len();
+        }
+    }
+    assert!(
+        total_on < total_off,
+        "BDPCM does not shrink the lossless streams: {total_on} vs {total_off}"
+    );
+    println!("all cells: {total_off} -> {total_on} B");
+    // Textured content too: still bit-exact, never larger than +0.5 %.
+    let src = textured_source(128, 96, 1, 8, 77);
+    let mut off = cfg_for(128, 96, 1, false, false, false);
+    off.lossless = true;
+    let mut on = off;
+    on.intra_bdpcm = true;
+    let (bs_off, _, _, _) = round_trip(&src, off, 0, "textured lossless");
+    let (bs_on, rec, _, _) = round_trip(&src, on, 0, "textured lossless + bdpcm");
+    assert!(plane_eq(&rec.luma, &src.luma));
+    assert!(
+        bs_on.len() as f64 <= bs_off.len() as f64 * 1.005,
+        "{} vs {}",
+        bs_on.len(),
+        bs_off.len()
+    );
+}
+
+/// Black-box validation through `ffmpeg` (opaque process; no-op where
+/// the binary is absent): lossless BDPCM streams of every format and
+/// depth decode to the source.
+#[test]
+fn black_box_decoder_agrees_on_bdpcm_streams() {
+    let probe = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(probe, Ok(s) if s.success()) {
+        eprintln!("ffmpeg not installed — black-box leg skipped");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("oxideav-h266-r477-bdpcm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for &cf in &[0u32, 1, 2, 3] {
+        for &bd in &[8u32, 10] {
+            let (w, h) = (96usize, 64usize);
+            let src = gradient_source(w, h, cf, bd);
+            let mut cfg = cfg_for(w, h, cf, false, false, true);
+            cfg.lossless = true;
+            let label = format!("bdpcm cf{cf} {bd}-bit");
+            let (bs, rec, stats, _) = round_trip(&src, cfg, 0, &label);
+            assert!(stats.bdpcm_cus > 0, "{label}: no BDPCM CU to validate");
+            black_box_matches(&dir, &label, &bs, &rec, cf, bd, w, h, &cfg);
+        }
+    }
+}

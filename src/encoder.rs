@@ -463,8 +463,10 @@ pub struct EncoderConfig {
     pub intra_isp: bool,
     /// r477 — block-based delta pulse code modulation (§7.3.11.5
     /// `intra_bdpcm_luma_flag`, §8.7.3 eqs. 1153 / 1154) candidates in
-    /// the per-CU intra decision; `sps_bdpcm_enabled_flag` (and the
-    /// transform-skip gate it needs) follow. Default `true`.
+    /// the per-CU decision of the **lossless** pipeline (BDPCM rides
+    /// transform skip, which the SPS enables under
+    /// [`Self::lossless`]); `sps_bdpcm_enabled_flag` follows. Default
+    /// `true`; no effect on lossy pictures.
     pub intra_bdpcm: bool,
 }
 
@@ -956,7 +958,7 @@ impl VvcEncoder {
         bw.write_bit(self.config.lossless as u8); // sps_transform_skip_enabled_flag
         if self.config.lossless {
             bw.write_ue(3); // sps_log2_transform_skip_max_size_minus2 → MaxTsSize 32
-            bw.write_bit(0); // sps_bdpcm_enabled_flag
+            bw.write_bit(self.config.intra_bdpcm as u8); // sps_bdpcm_enabled_flag (r477)
         }
         bw.write_bit(0); // mts_enabled
         bw.write_bit(0); // lfnst_enabled
