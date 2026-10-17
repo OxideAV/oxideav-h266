@@ -324,6 +324,7 @@ pub mod sei_rbsp;
 pub mod slice_header;
 pub mod sps;
 // r434 — stream-level decode driver (AU assembly, POC, RPL/DPB, walker wiring)
+pub mod h266_encoder;
 pub mod stream;
 pub mod subpic_level_info;
 pub mod vvcc;
@@ -351,8 +352,10 @@ use oxideav_core::{CodecInfo, CodecRegistry};
 pub const CODEC_ID_STR: &str = "h266";
 
 /// Register the VVC implementation with a codec registry: the
-/// streaming decoder ([`decoder::make_decoder`]) under the `h266`
-/// codec id and the ISOBMFF sample-entry FourCCs.
+/// streaming decoder ([`decoder::make_decoder`]) and the stills
+/// encoder ([`h266_encoder::make_encoder`], options
+/// [`h266_encoder::H266EncoderOptions`]) under the `h266` codec id
+/// and the ISOBMFF sample-entry FourCCs.
 ///
 /// Prefer the unified [`register`] entry point when you have a
 /// [`oxideav_core::RuntimeContext`] in hand.
@@ -361,7 +364,10 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_lossless(true)
         .with_intra_only(false)
-        .with_max_size(decoder::MAX_DIMENSION, decoder::MAX_DIMENSION);
+        .with_max_size(decoder::MAX_DIMENSION, decoder::MAX_DIMENSION)
+        // r477 — the encoder input layouts (8 / 10-bit 4:0:0 / 4:2:0 /
+        // 4:2:2 / 4:4:4); the gateway ladder reads this list.
+        .with_pixel_formats(h266_encoder::accepted_pixel_formats().to_vec());
     // ISOBMFF sample-description FourCCs defined in ISO/IEC 14496-15:
     //   `vvc1` — in-band parameter sets
     //   `vvi1` — inband parameter sets, VVC inband picture header
@@ -370,6 +376,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .encoder(h266_encoder::make_encoder)
+            .encoder_options::<h266_encoder::H266EncoderOptions>()
             .tags([
                 CodecTag::fourcc(b"vvc1"),
                 CodecTag::fourcc(b"vvi1"),

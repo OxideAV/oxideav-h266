@@ -448,6 +448,19 @@ pub struct EncoderConfig {
     /// 64x64 slot (the historical layout — faster, far lower quality
     /// on detailed content).
     pub rdo_cu_split: bool,
+    /// r477 — matrix-based intra prediction (§8.4.5.2.2) candidates in
+    /// the per-CU intra decision; the SPS signals
+    /// `sps_mip_enabled_flag` accordingly. Default `true`.
+    pub intra_mip: bool,
+    /// r477 — intra sub-partition (§8.4.5.1 / §7.3.11.5
+    /// `intra_subpartitions_mode_flag`) candidates in the per-CU intra
+    /// decision; `sps_isp_enabled_flag` follows. Default `true`.
+    pub intra_isp: bool,
+    /// r477 — block-based delta pulse code modulation (§7.3.11.5
+    /// `intra_bdpcm_luma_flag`, §8.7.3 eqs. 1153 / 1154) candidates in
+    /// the per-CU intra decision; `sps_bdpcm_enabled_flag` (and the
+    /// transform-skip gate it needs) follow. Default `true`.
+    pub intra_bdpcm: bool,
 }
 
 impl EncoderConfig {
@@ -476,6 +489,9 @@ impl EncoderConfig {
             loop_filter_across_slices: true,
             lossless: false,
             rdo_cu_split: true,
+            intra_mip: true,
+            intra_isp: true,
+            intra_bdpcm: true,
         }
     }
 
