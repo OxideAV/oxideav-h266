@@ -499,6 +499,20 @@ pub fn parse_slice_header_stateful(
             ceil_log2(num_tiles_in_pic)
         };
         sh_slice_address = br.u(width)?;
+        // §7.4.8: 0..=NumSlicesInSubpic − 1 (rectangular) or
+        // 0..=NumTilesInPic − 1 (raster) — an out-of-range address
+        // would underflow the tile-count arithmetic below (found by the
+        // r477 fuzzer).
+        let limit = if pps.pps_rect_slice_flag {
+            num_slices_in_subpic
+        } else {
+            num_tiles_in_pic
+        };
+        if sh_slice_address >= limit {
+            return Err(Error::invalid(format!(
+                "h266 SH: sh_slice_address {sh_slice_address} out of range (limit {limit})"
+            )));
+        }
     }
     // Picture-level slice index (§3.103) — identity for
     // single-subpicture rectangular layouts, eq. 23-mapped otherwise.

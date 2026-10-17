@@ -3,3 +3,13 @@
 # Rust build lockfile — this crate is a library, so we do
 # not commit Cargo.lock. See https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control-but-not-libraries
 Cargo.lock
+
+# cargo-fuzz build + crash artifacts. The corpus directory is CI-cached
+# (not committed) except for the hand-placed `seed-*` starter inputs.
+fuzz/target/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/Cargo.lock
+fuzz/corpus/**
+!fuzz/corpus/*/
+!fuzz/corpus/*/seed-*

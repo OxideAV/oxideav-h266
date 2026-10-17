@@ -1,0 +1,44 @@
+[package]
+name = "oxideav-h266-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-h266]
+path = ".."
+
+[dependencies.oxideav-core]
+version = "0.1"
+
+[[bin]]
+name = "parse_annexb"
+path = "fuzz_targets/parse_annexb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_decode"
+path = "fuzz_targets/registry_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Stand-alone workspace: keeps the fuzz harness out of any enclosing
+# workspace's member resolution (the harness builds with nightly-only
+# instrumentation flags the surrounding crates never want).
+[workspace]
+members = ["."]

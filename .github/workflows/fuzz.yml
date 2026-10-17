@@ -1,0 +1,21 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The shared
+# workflow auto-discovers the targets from fuzz/fuzz_targets/*.rs and
+# splits the 30-minute total budget evenly across them. Current
+# targets: parse_annexb (Annex B walk + every header / SEI parser),
+# registry_decode (vvcC record + packet through the registry decoder —
+# the whole decode under a picture limit) and encode_roundtrip (the
+# stills encoder → registry decoder identity in both framings).
+
+on:
+  schedule:
+    - cron: "41 6 * * *"   # daily 06:41 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

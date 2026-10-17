@@ -108,7 +108,10 @@ impl<'a> BitReader<'a> {
         let mut zeros: u32 = 0;
         while self.u1()? == 0 {
             zeros += 1;
-            if zeros > 32 {
+            // §9.2: codeNum = 2^leadingZeroBits − 1 + suffix must fit
+            // 32 bits, so at most 31 leading zeros are legal (32 would
+            // overflow the shift below — found by the r477 fuzzer).
+            if zeros > 31 {
                 return Err(Error::invalid("h266 ue(v): too many leading zeros"));
             }
         }
@@ -239,5 +242,18 @@ mod tests {
         let data = [0b1000_0000u8];
         let mut br = BitReader::new(&data);
         assert!(!br.has_more_rbsp_data());
+    }
+
+    #[test]
+    fn ue_with_32_leading_zeros_is_an_error_not_a_panic() {
+        // 32 zero bits, then a one bit and 32 suffix bits: codeNum
+        // would be 2^32 - 1 + suffix — out of the u32 codeNum range.
+        let data = [0u8, 0, 0, 0, 0x80, 0, 0, 0, 0];
+        let mut br = BitReader::new(&data);
+        assert!(br.ue().is_err());
+        // 31 leading zeros is the largest legal prefix.
+        let data = [0u8, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFE];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.ue().unwrap(), u32::MAX - 1);
     }
 }

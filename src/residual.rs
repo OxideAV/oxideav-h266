@@ -216,7 +216,19 @@ pub fn read_cu_qp_delta(dec: &mut ArithDecoder<'_>, ctxs: &mut ResidualCtxs) -> 
     let abs = if prefix < 5 {
         prefix
     } else {
-        5 + decode_exp_golomb_k(dec, 0)?
+        let suffix = decode_exp_golomb_k(dec, 0)?;
+        // §7.4.11.10: CuQpDeltaVal lies in −(32 + QpBdOffset / 2) ..=
+        // 31 + QpBdOffset / 2, and QpBdOffset <= 48 — so |cu_qp_delta|
+        // never exceeds 56. A hostile suffix beyond that is refused
+        // here instead of overflowing the §8.7.1 QpY arithmetic (found
+        // by the r477 fuzzer).
+        if suffix > 56 - 5 {
+            return Err(Error::invalid(format!(
+                "h266 residual: cu_qp_delta_abs {} out of range",
+                u64::from(suffix) + 5
+            )));
+        }
+        5 + suffix
     };
     if abs == 0 {
         return Ok(0);
@@ -421,6 +433,16 @@ pub fn decode_exp_golomb_k(dec: &mut ArithDecoder<'_>, k: u32) -> Result<u32> {
         let b = dec.decode_bypass()?;
         if b == 1 {
             log += 1;
+            // No legal EGk value needs a prefix of 32 or more ones
+            // (the value would exceed the 32-bit syntax-element range);
+            // a run of one bins from a hostile stream stops here
+            // instead of overflowing the shift below (found by the r477
+            // fuzzer).
+            if log + k >= 32 {
+                return Err(Error::invalid(
+                    "h266 residual: EGk prefix too long for a 32-bit value",
+                ));
+            }
         } else {
             break;
         }
@@ -657,6 +679,18 @@ pub fn decode_tb_coefficients_opts_sbt(
         return Err(Error::invalid(
             "h266 residual: nTbW / nTbH must be power of two",
         ));
+    }
+    // §7.3.11.11: the `1 << log2SbW` x `1 << log2SbH` sub-block tiles
+    // the TB exactly — a TB thinner than its sub-block shape (a 1-wide
+    // or 2x4 block a hostile coding tree can reach) has no legal scan
+    // (found by the r477 fuzzer).
+    {
+        let (sb_w, sb_h) = crate::scan::sb_coeff_dims(n_tb_w, n_tb_h);
+        if n_tb_w % sb_w != 0 || n_tb_h % sb_h != 0 {
+            return Err(Error::invalid(format!(
+                "h266 residual: {n_tb_w}x{n_tb_h} TB is not tiled by its {sb_w}x{sb_h} sub-block"
+            )));
+        }
     }
     let log2_w = n_tb_w.trailing_zeros();
     let log2_h = n_tb_h.trailing_zeros();

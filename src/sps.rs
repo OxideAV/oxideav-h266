@@ -685,6 +685,15 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     }
     let sps_poc_msb_cycle_flag = br.u1()? == 1;
     let sps_poc_msb_cycle_len_minus1 = if sps_poc_msb_cycle_flag { br.ue()? } else { 0 };
+    // §7.4.3.4: sps_poc_msb_cycle_len_minus1 in 0..=32 −
+    // sps_log2_max_pic_order_cnt_lsb_minus4 − 5 (the PH reads
+    // ph_poc_msb_cycle_val with that many bits + 1 — found by the r477
+    // fuzzer as an over-wide u(v) read).
+    if sps_poc_msb_cycle_len_minus1 > 32 - u32::from(sps_log2_max_pic_order_cnt_lsb_minus4) - 5 {
+        return Err(Error::invalid(format!(
+            "h266 SPS: sps_poc_msb_cycle_len_minus1 out of range ({sps_poc_msb_cycle_len_minus1})"
+        )));
+    }
     let sps_num_extra_ph_bytes = br.u(2)? as u8;
     // §7.4.3.4 eq. 41 — NumExtraPhBits = Σ sps_extra_ph_bit_present_flag[i].
     let mut num_extra_ph_bits = 0u8;
@@ -1149,6 +1158,14 @@ fn parse_tool_flags(
         for _ in 0..num_qp_tables {
             let start = br.se()?;
             let num_points_minus1 = br.ue()?;
+            // §7.4.3.4: 0..=36 + QpBdOffset, and QpBdOffset <= 48
+            // (16-bit) — reject a runaway count before allocating
+            // (found by the r477 fuzzer).
+            if num_points_minus1 > 36 + 48 {
+                return Err(Error::invalid(format!(
+                    "h266 SPS: sps_num_points_in_qp_table_minus1 out of range ({num_points_minus1})"
+                )));
+            }
             let mut entries = Vec::with_capacity((num_points_minus1 as usize) + 1);
             for _ in 0..=num_points_minus1 {
                 let a = br.ue()?;
@@ -1328,11 +1345,23 @@ fn parse_tool_flags(
         t.virtual_boundaries_present_flag = br.u1()? == 1;
         if t.virtual_boundaries_present_flag {
             let num_ver = br.ue()?;
+            // §7.4.3.4: sps_num_ver_virtual_boundaries in 0..=3.
+            if num_ver > 3 {
+                return Err(Error::invalid(format!(
+                    "h266 SPS: sps_num_ver_virtual_boundaries out of range ({num_ver})"
+                )));
+            }
             let mut pos_x = Vec::with_capacity(num_ver as usize);
             for _ in 0..num_ver {
                 pos_x.push(br.ue()?);
             }
             let num_hor = br.ue()?;
+            // §7.4.3.4: sps_num_hor_virtual_boundaries in 0..=3.
+            if num_hor > 3 {
+                return Err(Error::invalid(format!(
+                    "h266 SPS: sps_num_hor_virtual_boundaries out of range ({num_hor})"
+                )));
+            }
             let mut pos_y = Vec::with_capacity(num_hor as usize);
             for _ in 0..num_hor {
                 pos_y.push(br.ue()?);

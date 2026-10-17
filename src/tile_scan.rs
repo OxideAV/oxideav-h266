@@ -249,6 +249,18 @@ impl TileScan {
                 let right_x = left_x + sp.width_minus1;
                 let top_y = sp.ctu_top_left_y;
                 let bottom_y = top_y + sp.height_minus1;
+                // §7.4.3.4: every subpicture lies inside the picture
+                // (its CTB rectangle is in SPS units — a PPS picture
+                // smaller than the SPS maximum, or a hostile layout,
+                // would index past the tile maps; found by the r477
+                // fuzzer).
+                if right_x >= self.pic_width_in_ctbs || bottom_y >= self.pic_height_in_ctbs {
+                    return Err(Error::invalid(format!(
+                        "h266 tile scan: subpicture {i} ({left_x}..={right_x}, {top_y}..={bottom_y}) \
+                         lies outside the {}x{} CTB picture",
+                        self.pic_width_in_ctbs, self.pic_height_in_ctbs
+                    )));
+                }
                 let width_in_tiles = self.ctb_to_tile_col_idx[right_x as usize] + 1
                     - self.ctb_to_tile_col_idx[left_x as usize];
                 let height_in_tiles = self.ctb_to_tile_row_idx[bottom_y as usize] + 1
