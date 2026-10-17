@@ -4,6 +4,17 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-h266/compare/v0.0.10...v0.0.11) - 2026-10-17
+
+### Other
+
+- r477 lossless BDPCM in the encoder, README framework / tool sections, EncodeStats bdpcm_cus
+- r477 intra sub-partitions in the encoder (opt-in) — ISP splits in the per-TB RD decision, the §7.3.11.9 transform tree with CBF inference, partition edges in the deblocker
+- r477 matrix-based intra prediction in the encoder — MIP candidates in the per-TB RD decision, intra_mip_flag / transposed / mode syntax, MipChromaDirect 4:4:4 chroma, EncodeStats
+- r477 cargo-fuzz sub-crate (parse_annexb / registry_decode / encode_roundtrip) + daily Fuzz workflow; eight hostile-input fixes it found
+- r477 registry encoder — declared 8/10-bit 4:0:0/4:2:0/4:2:2/4:4:4 layouts, quality→QP (100 = lossless), format=annexb|vvcc with the vvcC record as extradata
+- r477 registry decoder — streaming Annex B / vvcC packets, POC output order, labels, limits; 56/56 JVET streams through the registry
+
 ### Added
 
 - r477 — **cargo-fuzz sub-crate** (`fuzz/`, the fleet's daily `Fuzz` workflow): `parse_annexb` (Annex B walk through every header / SEI parser and the stateful picture-header / slice-header parses), `registry_decode` (a `vvcC` record + packet through `decoder::make_decoder` — the whole decode under a 512 × 512 limit, plus a `reset` + re-feed), `encode_roundtrip` (fuzz-shaped pictures and tool sets through the stills encoder, then the registry decoder in both framings must reproduce the encoder's reconstruction). Seeds under `fuzz/corpus/*/seed-*`.
