@@ -1018,7 +1018,7 @@ impl VvcEncoder {
         bw.write_ue(0); // log2_parallel_merge_level_minus2
         bw.write_bit(0); // isp
         bw.write_bit(0); // mrl
-        bw.write_bit(0); // mip
+        bw.write_bit(self.config.intra_mip as u8); // sps_mip_enabled_flag (r477)
         if chroma {
             bw.write_bit(0); // cclm (chroma_format_idc != 0)
         }

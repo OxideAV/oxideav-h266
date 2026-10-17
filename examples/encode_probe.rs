@@ -3,7 +3,8 @@
 //! `ffmpeg` is installed) with `ffmpeg` as an opaque black-box
 //! validator, and compare both against the encoder's own
 //! reconstruction. `MTT=1` enables the MTT pickers; `LOSSLESS=1` the
-//! lossless (transform-skip) mode; `FMT=0..3` the chroma format and
+//! lossless (transform-skip) mode; `MIP=0` / `ISP=0` / `BDPCM=0` drop
+//! an intra tool (r477); `FMT=0..3` the chroma format and
 //! `BD=8|10` the bit depth.
 //!
 //! `cargo run --release --example encode_probe -- W H [QP] [SCRATCH_DIR]`
@@ -80,6 +81,12 @@ fn main() {
     if std::env::var_os("LOSSLESS").is_some() {
         cfg.lossless = true;
     }
+    // r477 — `MIP=0` / `ISP=0` / `BDPCM=0` drop an intra tool from the
+    // decision (the SPS flag follows), for A/B measurements.
+    let tool = |name: &str| std::env::var(name).map(|v| v != "0").unwrap_or(true);
+    cfg.intra_mip = tool("MIP");
+    cfg.intra_isp = tool("ISP");
+    cfg.intra_bdpcm = tool("BDPCM");
     let (bs, rec) = encode_idr_with_residuals_cfg(&src, qp, cfg).unwrap();
     let psnr = oxideav_h266::encoder_pipeline::psnr_y(&src.luma, &rec.luma).unwrap();
     println!(

@@ -685,7 +685,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
-    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals_cfg;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
@@ -697,7 +697,11 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
 
     let src = PictureBuffer::yuv420_filled(128, 128, 128);
-    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+    // r477 — this hand-rolled CABAC walk reads the §7.3.11.5 cascade
+    // without an `intra_mip_flag` bin, so the SPS must not enable MIP.
+    let mut cfg = oxideav_h266::encoder::EncoderConfig::new(128, 128);
+    cfg.intra_mip = false;
+    let (bs, _) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
 
     let nals: Vec<_> = iter_annex_b(&bs).collect();
     let sps = parse_sps(&extract_rbsp(
@@ -1176,6 +1180,9 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     // neighbours), so the CU-size RDO stays off here.
     let mut cfg = oxideav_h266::encoder::EncoderConfig::new(128, 128);
     cfg.rdo_cu_split = false;
+    // r477 — the walk reads the cascade without an `intra_mip_flag`
+    // bin: MIP stays off in the SPS.
+    cfg.intra_mip = false;
     let (bs, _) = encode_idr_with_qp_picker_cfg(&src, slice_qp_y, cfg, qp_for).unwrap();
 
     // Parse VPS / SPS / PPS / PH / SH.

@@ -56,12 +56,14 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::ContextModel;
 use crate::coding_tree::SplitConstraints;
+use crate::ctx::ctx_inc_intra_mip_flag;
 use crate::ctx::{
     ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag,
 };
 use crate::deblock::{DeblockCu, DeblockParams};
 use crate::dequant::{dequantize_tb_flat, DequantParams};
-use crate::intra::{predict_intra, IntraPredParams};
+use crate::intra::{predict_intra, IntraPredParams, RefSamples};
+use crate::mip::{mip_size_id, num_mip_modes, predict_mip};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::ResidualCtxs;
 use crate::residual_enc::{
@@ -214,6 +216,42 @@ struct PreparedLumaTb {
     luma_mode: u32,
     /// r474 — its §7.3.11.5 cascade against the CU's §8.4.2 list.
     mode_syntax: IntraModeSyntax,
+    /// r477 — matrix-based intra prediction chosen for the luma TB
+    /// (`intra_mip_flag = 1`): `mode_syntax` is then unused and
+    /// `luma_mode` reads PLANAR (the §8.4.2 candidate a MIP CU presents
+    /// to its neighbours).
+    mip: Option<MipChoice>,
+    /// r477 — the SPS intra tools of this picture.
+    tools: IntraTools,
+}
+
+/// r477 — the intra coding tools the emitted SPS enables for this
+/// picture. Copied into every prepared TB so the second-pass CABAC
+/// emit knows which §7.3.11.5 flags the cascade carries (a tool that
+/// is enabled but unused still codes its `0` bin).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IntraTools {
+    /// `sps_mip_enabled_flag` — `intra_mip_flag` precedes the cascade.
+    mip: bool,
+}
+
+/// r477 — matrix-based intra prediction (§8.4.5.2.2) chosen for a
+/// luma TB: `intra_mip_mode` / `intra_mip_transposed_flag`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MipChoice {
+    mode: u32,
+    transposed: bool,
+}
+
+/// r477 — the §9.3.4.2.2 neighbour state of `intra_mip_flag`'s ctxInc:
+/// availability (§6.4.4) and `IntraMipFlag` of the left `(x0 − 1, y0)`
+/// and above `(x0, y0 − 1)` positions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MipNbr {
+    left_avail: bool,
+    above_avail: bool,
+    left_mip: bool,
+    above_mip: bool,
 }
 
 /// r431 — one palette CU prepared by the first pass (§7.3.11.6 /
@@ -411,6 +449,11 @@ struct EncAvail {
     /// [`NON_INTRA_MODE`] marks palette CUs (candidate → PLANAR).
     modes: Vec<u8>,
     mcb_w: usize,
+    /// r477 — `IntraMipFlag` per 4x4 luma cell (the §9.3.4.2.2
+    /// `intra_mip_flag` ctxInc inputs).
+    mip: Vec<bool>,
+    /// r477 — the SPS intra tools of this picture.
+    tools: IntraTools,
     /// r429 — §6.4.4 availability region `(x0, y0, x1, y1, col_cap)`
     /// in luma samples: the current tile's rectangle plus the WPP
     /// exclusive column cap. Reference fetches outside it read
@@ -442,7 +485,49 @@ impl EncAvail {
             chroma_present: chroma_format_idc != 0,
             modes: vec![crate::leaf_cu::INTRA_PLANAR as u8; w.div_ceil(4) * h.div_ceil(4)],
             mcb_w: w.div_ceil(4),
+            mip: vec![false; w.div_ceil(4) * h.div_ceil(4)],
+            tools: IntraTools::default(),
             region: (0, 0, w, h, usize::MAX),
+        }
+    }
+
+    /// r477 — record `IntraMipFlag` of a committed CU on its 4x4 cells.
+    fn mark_mip(&mut self, x: usize, y: usize, bw: usize, bh: usize, mip: bool) {
+        let mcb_h = self.h.div_ceil(4);
+        for my in (y / 4)..((y + bh).div_ceil(4)).min(mcb_h) {
+            for mx in (x / 4)..((x + bw).div_ceil(4)).min(self.mcb_w) {
+                self.mip[my * self.mcb_w + mx] = mip;
+            }
+        }
+    }
+
+    /// r477 — §6.4.4 availability + `IntraMipFlag` of one luma
+    /// position (for the `intra_mip_flag` ctxInc).
+    fn mip_at(&self, nx: i64, ny: i64) -> (bool, bool) {
+        if nx < 0 || ny < 0 || nx as usize >= self.w || ny as usize >= self.h {
+            return (false, false);
+        }
+        let (rx0, ry0, rx1, ry1, cap) = self.region;
+        let (ux, uy) = (nx as usize, ny as usize);
+        if ux < rx0 || uy < ry0 || ux >= rx1 || uy >= ry1 || ux >= cap {
+            return (false, false);
+        }
+        if !self.luma[uy * self.w + ux] {
+            return (false, false);
+        }
+        (true, self.mip[(uy / 4) * self.mcb_w + ux / 4])
+    }
+
+    /// r477 — the `intra_mip_flag` ctxInc neighbours of the CU at
+    /// `(x, y)`: left `(x − 1, y)`, above `(x, y − 1)`.
+    fn mip_nbr(&self, x: usize, y: usize) -> MipNbr {
+        let (left_avail, left_mip) = self.mip_at(x as i64 - 1, y as i64);
+        let (above_avail, above_mip) = self.mip_at(x as i64, y as i64 - 1);
+        MipNbr {
+            left_avail,
+            above_avail,
+            left_mip,
+            above_mip,
         }
     }
 
@@ -597,6 +682,8 @@ struct IntraModeCtxs {
     mpm_flag: Vec<ContextModel>,
     not_planar: Vec<ContextModel>,
     chroma_mode: Vec<ContextModel>,
+    /// r477 — `intra_mip_flag` (Table 132 ctxInc 0..=3).
+    mip_flag: Vec<ContextModel>,
 }
 
 impl IntraModeCtxs {
@@ -605,8 +692,47 @@ impl IntraModeCtxs {
             mpm_flag: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp_y),
             not_planar: init_contexts(SyntaxCtx::IntraLumaNotPlanarFlag, slice_qp_y),
             chroma_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
+            mip_flag: init_contexts(SyntaxCtx::IntraMipFlag, slice_qp_y),
         }
     }
+}
+
+/// r477 — §9.3.3.4 truncated-binary bypass writer (the dual of the
+/// leaf-CU reader): `cMax = 0` codes nothing.
+fn encode_tb_bypass(enc: &mut crate::cabac_enc::ArithEncoder, val: u32, c_max: u32) -> Result<()> {
+    if c_max == 0 {
+        return Ok(());
+    }
+    let n = c_max + 1;
+    let k = 31 - n.leading_zeros(); // floor(log2(n))
+    let u = (1u32 << (k + 1)) - n;
+    if val < u {
+        for i in (0..k).rev() {
+            enc.encode_bypass((val >> i) & 1)?;
+        }
+    } else {
+        let v = val + u;
+        for i in (0..=k).rev() {
+            enc.encode_bypass((v >> i) & 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// r477 — what the §7.3.11.5 luma cascade of one CU carries.
+#[derive(Clone, Copy, Debug)]
+struct LumaIntraSyntax<'a> {
+    tools: IntraTools,
+    /// `intra_mip_flag = 1` with its mode / transpose.
+    mip: Option<MipChoice>,
+    /// The ctxInc neighbours of `intra_mip_flag` (unused when the SPS
+    /// does not enable MIP).
+    nbr: MipNbr,
+    /// CU size (the ctxInc's non-square rule and the TB `cMax`).
+    n_w: usize,
+    n_h: usize,
+    /// The MPM cascade (unused for a MIP CU).
+    ms: &'a IntraModeSyntax,
 }
 
 /// r474 — the §7.3.11.5 luma intra-mode cascade of one CU, resolved
@@ -676,9 +802,38 @@ fn mode_syntax_for(mode: u32, cand: &[u32; 5]) -> IntraModeSyntax {
 fn emit_intra_mode_bins(
     enc: &mut crate::cabac_enc::ArithEncoder,
     ictx: &mut IntraModeCtxs,
-    ms: &IntraModeSyntax,
+    lx: LumaIntraSyntax<'_>,
     chroma: bool,
 ) -> Result<()> {
+    let ms = lx.ms;
+    // r477 — §7.3.11.5: `intra_mip_flag` (ctx per §9.3.4.2.2 — the
+    // left / above `IntraMipFlag`, or 3 for a strongly non-square CU)
+    // precedes the cascade whenever the SPS enables MIP; a MIP CU then
+    // codes `intra_mip_transposed_flag` (bypass) and `intra_mip_mode`
+    // (TB, cMax = modes − 1) instead of the MPM cascade.
+    if lx.tools.mip {
+        let inc = ctx_inc_intra_mip_flag(
+            lx.n_w as u32,
+            lx.n_h as u32,
+            lx.nbr.left_avail,
+            lx.nbr.above_avail,
+            lx.nbr.left_mip,
+            lx.nbr.above_mip,
+        ) as usize;
+        let n = ictx.mip_flag.len() - 1;
+        enc.encode_decision(&mut ictx.mip_flag[inc.min(n)], u32::from(lx.mip.is_some()))?;
+        if let Some(m) = lx.mip {
+            enc.encode_bypass(u32::from(m.transposed))?;
+            let c_max = num_mip_modes(mip_size_id(lx.n_w as u32, lx.n_h as u32)) - 1;
+            encode_tb_bypass(enc, m.mode, c_max)?;
+            if chroma {
+                let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+                let n = ictx.chroma_mode.len() - 1;
+                enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
+            }
+            return Ok(());
+        }
+    }
     let inc = ctx_inc_intra_luma_mpm_flag() as usize;
     enc.encode_decision(&mut ictx.mpm_flag[inc], u32::from(ms.mpm_flag))?;
     if ms.mpm_flag {
@@ -775,9 +930,89 @@ fn hadamard_satd(residual: &[i32], w: usize, h: usize) -> u64 {
 struct LumaTrial {
     mode: u32,
     syntax: IntraModeSyntax,
+    /// r477 — the MIP choice when the trial is matrix-predicted
+    /// (`mode` then reads PLANAR).
+    mip: Option<MipChoice>,
     levels: Vec<i32>,
     rec: Vec<u16>,
     sse: u64,
+}
+
+/// r477 — §8.4.5.2.2 eqs. 263 – 266: the `refT` / `refL` rows of a
+/// MIP TB from the eq. 1212-gated reconstruction (the same §6.4.4
+/// availability gate as [`predict_block`], the §8.4.5.2.9 substitution
+/// through [`RefSamples::build`]).
+#[allow(clippy::too_many_arguments)]
+fn mip_reference_rows(
+    plane: &PicturePlane,
+    avail: &[bool],
+    aw: usize,
+    ah: usize,
+    region: (i32, i32, i32, i32, i32),
+    x0: usize,
+    y0: usize,
+    n_w: usize,
+    n_h: usize,
+) -> Result<(Vec<i16>, Vec<i16>)> {
+    let (rx0, ry0, rx1, ry1, rcap) = region;
+    let fetch = |dx: i32, dy: i32| -> Option<i16> {
+        let x = x0 as i32 + dx;
+        let y = y0 as i32 + dy;
+        if x < 0 || y < 0 || x >= aw as i32 || y >= ah as i32 {
+            return None;
+        }
+        if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
+            return None;
+        }
+        if !avail[(y as usize) * aw + x as usize] {
+            return None;
+        }
+        plane.get(x as usize, y as usize).map(|v| v as i16)
+    };
+    let refs = RefSamples::build(fetch, 0, n_w + 1, n_h + 1, plane.bit_depth);
+    let ref_t = (0..n_w)
+        .map(|x| refs.p(x as i32, -1))
+        .collect::<Result<Vec<_>>>()?;
+    let ref_l = (0..n_h)
+        .map(|y| refs.p(-1, y as i32))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((ref_t, ref_l))
+}
+
+/// r477 — the MIP prediction of one TB (luma, or a 4:4:4 chroma plane
+/// under `MipChromaDirectFlag`).
+#[allow(clippy::too_many_arguments)]
+fn predict_block_mip(
+    plane: &PicturePlane,
+    avail: &[bool],
+    aw: usize,
+    ah: usize,
+    region: (i32, i32, i32, i32, i32),
+    x0: usize,
+    y0: usize,
+    n_w: usize,
+    n_h: usize,
+    m: MipChoice,
+) -> Result<Vec<i16>> {
+    let (ref_t, ref_l) = mip_reference_rows(plane, avail, aw, ah, region, x0, y0, n_w, n_h)?;
+    predict_mip(
+        n_w,
+        n_h,
+        m.mode,
+        m.transposed,
+        &ref_t,
+        &ref_l,
+        plane.bit_depth,
+    )
+}
+
+/// r477 — one luma intra candidate of the per-TB decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LumaCand {
+    /// PLANAR / DC / an angular mode (`IntraPredModeY`).
+    Angular(u32),
+    /// Matrix-based prediction.
+    Mip(MipChoice),
 }
 
 /// r474 — forward-code one luma TB in intra `mode` without touching
@@ -811,6 +1046,29 @@ fn code_luma_tb_trial(
         0,
         mode,
     )?;
+    code_luma_tb_with_pred(
+        src, rec_plane, x, y, n_tb_w, n_tb_h, qp, rc, pred, mode, syntax, None,
+    )
+}
+
+/// r477 — [`code_luma_tb_trial`] from an already computed prediction
+/// (angular or MIP): residual, DCT-II + zero-out, quantisation,
+/// reconstruction and SSE.
+#[allow(clippy::too_many_arguments)]
+fn code_luma_tb_with_pred(
+    src: &PicturePlane,
+    rec_plane: &PicturePlane,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    rc: crate::residual::RcOpts,
+    pred: Vec<i16>,
+    mode: u32,
+    syntax: IntraModeSyntax,
+    mip: Option<MipChoice>,
+) -> Result<LumaTrial> {
     let bd = rec_plane.bit_depth;
     let qp_prime = qp + 6 * (bd as i32 - 8);
     let max_v = (1i32 << bd) - 1;
@@ -869,6 +1127,7 @@ fn code_luma_tb_trial(
     Ok(LumaTrial {
         mode,
         syntax,
+        mip,
         levels,
         rec,
         sse,
@@ -879,7 +1138,7 @@ fn code_luma_tb_trial(
 /// §7.3.11.5 mode cascade, `tu_y_coded_flag` and the §7.3.11.11
 /// residual bins, coded into a scratch engine with fresh contexts.
 fn estimate_luma_tb_bits(
-    syntax: &IntraModeSyntax,
+    lx: LumaIntraSyntax<'_>,
     levels: &[i32],
     n_tb_w: usize,
     n_tb_h: usize,
@@ -889,7 +1148,7 @@ fn estimate_luma_tb_bits(
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut ictx = IntraModeCtxs::init(qp);
     let mut rctx = ResidualCtxs::init(qp);
-    emit_intra_mode_bins(&mut enc, &mut ictx, syntax, false)?;
+    emit_intra_mode_bins(&mut enc, &mut ictx, lx, false)?;
     let cbf = levels.iter().any(|&l| l != 0);
     write_tu_y_coded_flag(&mut enc, &mut rctx, cbf, false, false, false)?;
     if cbf {
@@ -927,7 +1186,11 @@ fn decide_luma_mode(
             src_blk[ty * n_tb_w + tx] = src.get(x + tx, y + ty).map(|v| v as i32).unwrap_or(0);
         }
     }
-    let mut scored: Vec<(f64, u32)> = Vec::with_capacity(67);
+    let tools = avail.tools;
+    let nbr = avail.mip_nbr(x, y);
+    // The `intra_mip_flag` bin every CU pays when the SPS enables MIP.
+    let flag_bits = if tools.mip { 1.0 } else { 0.0 };
+    let mut scored: Vec<(f64, LumaCand)> = Vec::with_capacity(67 + 32);
     let mut residual = vec![0i32; n_tb_w * n_tb_h];
     for mode in 0..=66u32 {
         let pred = predict_block(
@@ -956,22 +1219,106 @@ fn decide_luma_mode(
         } else {
             3.0 + ms.mpm_idx.min(4) as f64
         };
-        scored.push((satd + lambda_satd * mode_bits, mode));
+        scored.push((
+            satd + lambda_satd * (mode_bits + flag_bits),
+            LumaCand::Angular(mode),
+        ));
+    }
+    // r477 — the §8.4.5.2.2 matrix candidates: every mode of the TB's
+    // MIP size class, plain and transposed, ranked by the same SATD
+    // measure with their own rate (flag + transpose bin + the TB mode
+    // bins); the best one always joins the RD stage.
+    let mut best_mip: Option<(f64, LumaCand)> = None;
+    if tools.mip {
+        let size_id = mip_size_id(n_tb_w as u32, n_tb_h as u32);
+        let n_modes = num_mip_modes(size_id);
+        let mode_bits = 2.0 + f64::from(32 - (n_modes - 1).leading_zeros());
+        let (ref_t, ref_l) = mip_reference_rows(
+            rec_plane,
+            &avail.luma,
+            avail.w,
+            avail.h,
+            region,
+            x,
+            y,
+            n_tb_w,
+            n_tb_h,
+        )?;
+        for transposed in [false, true] {
+            for mode in 0..n_modes {
+                let pred = predict_mip(n_tb_w, n_tb_h, mode, transposed, &ref_t, &ref_l, bd)?;
+                for i in 0..n_tb_w * n_tb_h {
+                    residual[i] = src_blk[i] - pred[i] as i32;
+                }
+                let satd = hadamard_satd(&residual, n_tb_w, n_tb_h) as f64;
+                let score = satd + lambda_satd * mode_bits;
+                let c = LumaCand::Mip(MipChoice { mode, transposed });
+                if best_mip.map(|(s, _)| score < s).unwrap_or(true) {
+                    best_mip = Some((score, c));
+                }
+                scored.push((score, c));
+            }
+        }
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut cands: Vec<u32> = scored.iter().take(RD_CANDIDATES).map(|s| s.1).collect();
+    let mut cands: Vec<LumaCand> = scored.iter().take(RD_CANDIDATES).map(|s| s.1).collect();
     for m in [crate::leaf_cu::INTRA_PLANAR, crate::leaf_cu::INTRA_DC] {
-        if !cands.contains(&m) {
-            cands.push(m);
+        if !cands.contains(&LumaCand::Angular(m)) {
+            cands.push(LumaCand::Angular(m));
+        }
+    }
+    if let Some((_, c)) = best_mip {
+        if !cands.contains(&c) {
+            cands.push(c);
         }
     }
     let mut best: Option<(f64, LumaTrial)> = None;
-    for mode in cands {
-        let syntax = mode_syntax_for(mode, &cand);
-        let trial = code_luma_tb_trial(
-            src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc, mode, syntax,
-        )?;
-        let bits = estimate_luma_tb_bits(&syntax, &trial.levels, n_tb_w, n_tb_h, qp, rc)?;
+    for c in cands {
+        let trial = match c {
+            LumaCand::Angular(mode) => {
+                let syntax = mode_syntax_for(mode, &cand);
+                code_luma_tb_trial(
+                    src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc, mode, syntax,
+                )?
+            }
+            LumaCand::Mip(m) => {
+                let pred = predict_block_mip(
+                    rec_plane,
+                    &avail.luma,
+                    avail.w,
+                    avail.h,
+                    region,
+                    x,
+                    y,
+                    n_tb_w,
+                    n_tb_h,
+                    m,
+                )?;
+                code_luma_tb_with_pred(
+                    src,
+                    rec_plane,
+                    x,
+                    y,
+                    n_tb_w,
+                    n_tb_h,
+                    qp,
+                    rc,
+                    pred,
+                    crate::leaf_cu::INTRA_PLANAR,
+                    mode_syntax_for(crate::leaf_cu::INTRA_PLANAR, &cand),
+                    Some(m),
+                )?
+            }
+        };
+        let lx = LumaIntraSyntax {
+            tools,
+            mip: trial.mip,
+            nbr,
+            n_w: n_tb_w,
+            n_h: n_tb_h,
+            ms: &trial.syntax,
+        };
+        let bits = estimate_luma_tb_bits(lx, &trial.levels, n_tb_w, n_tb_h, qp, rc)?;
         let cost = trial.sse as f64 + lambda * bits;
         if best.as_ref().map(|(c, _)| cost < *c).unwrap_or(true) {
             best = Some((cost, trial));
@@ -1002,6 +1349,7 @@ fn commit_luma_trial(
     }
     avail.mark_luma(x, y, n_tb_w, n_tb_h);
     avail.mark_modes(x, y, n_tb_w, n_tb_h, trial.mode as u8);
+    avail.mark_mip(x, y, n_tb_w, n_tb_h, trial.mip.is_some());
 }
 
 /// r474 — snapshot of everything a CU trial may modify inside its
@@ -1019,6 +1367,8 @@ struct RegionSnap {
     av_l: Vec<bool>,
     av_c: Vec<bool>,
     modes: Vec<u8>,
+    /// r477 — the `IntraMipFlag` cells.
+    mip: Vec<bool>,
 }
 
 fn copy_rect<T: Copy>(
@@ -1124,6 +1474,16 @@ fn snapshot_region(
             w.div_ceil(4),
             h.div_ceil(4),
         ),
+        mip: copy_rect(
+            &avail.mip,
+            avail.mcb_w,
+            avail.mcb_w,
+            avail.h.div_ceil(4),
+            x / 4,
+            y / 4,
+            w.div_ceil(4),
+            h.div_ceil(4),
+        ),
     }
 }
 
@@ -1201,6 +1561,17 @@ fn restore_region(rec: &mut PictureBuffer, avail: &mut EncAvail, snap: &RegionSn
         w.div_ceil(4),
         h.div_ceil(4),
         &snap.modes,
+    );
+    paste_rect(
+        &mut avail.mip,
+        avail.mcb_w,
+        avail.mcb_w,
+        mh,
+        x / 4,
+        y / 4,
+        w.div_ceil(4),
+        h.div_ceil(4),
+        &snap.mip,
     );
 }
 
@@ -1364,10 +1735,10 @@ fn prepare_luma_tb(
     n_tb_h: usize,
     qp: i32,
     rc: crate::residual::RcOpts,
-) -> Result<(Vec<i32>, u32, IntraModeSyntax)> {
+) -> Result<(Vec<i32>, u32, IntraModeSyntax, Option<MipChoice>)> {
     let trial = decide_luma_mode(src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc)?;
     commit_luma_trial(rec_plane, avail, x, y, n_tb_w, n_tb_h, &trial);
-    Ok((trial.levels, trial.mode, trial.syntax))
+    Ok((trial.levels, trial.mode, trial.syntax, trial.mip))
 }
 
 /// Round-51 — emit the §7.3.10 `transform_unit()` for one prepared TB:
@@ -1393,10 +1764,24 @@ fn emit_tu_with_cbf(
     tb: &PreparedLumaTb,
     qp_state: &mut QpDeltaState,
     rc_opts: crate::residual::RcOpts,
+    nbr: MipNbr,
 ) -> Result<()> {
     // r412 — §7.3.11.5 orders the intra-mode cascade before
-    // transform_tree(): signal INTRA_DC via the MPM path + DM chroma.
-    emit_intra_mode_bins(enc, ictx, &tb.mode_syntax, tb.n_tb_chroma_w > 0)?;
+    // transform_tree(): the chosen mode via the MPM path (or the MIP
+    // bins, r477) + DM chroma.
+    emit_intra_mode_bins(
+        enc,
+        ictx,
+        LumaIntraSyntax {
+            tools: tb.tools,
+            mip: tb.mip,
+            nbr,
+            n_w: tb.n_tb_w,
+            n_h: tb.n_tb_h,
+            ms: &tb.mode_syntax,
+        },
+        tb.n_tb_chroma_w > 0,
+    )?;
 
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
@@ -1549,6 +1934,7 @@ impl QpDeltaState {
 /// residual).clamp(0, 255)` reconstruction. The quantised levels are
 /// returned for the second-pass CABAC emit.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn prepare_chroma_tb(
     chroma_src: &PicturePlane,
     chroma_rec: &mut PicturePlane,
@@ -1563,22 +1949,60 @@ fn prepare_chroma_tb(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<Vec<i32>> {
-    // r412 / r474 — DM chroma inherits the luma mode (Table 20, with
-    // the §8.4.3 4:2:2 re-targeting), so the chroma prediction is the
-    // decoder-mirrored §8.4.5.2 process in that mode on the chroma plane.
-    let pred = predict_block(
+    prepare_chroma_tb_pred(
+        chroma_src,
         chroma_rec,
-        &avail.chroma,
-        avail.cw,
-        avail.ch,
-        avail.region_for(c_idx),
+        avail,
+        c_idx,
+        mode,
         cx,
         cy,
         n_tb_c_w,
         n_tb_c_h,
-        c_idx,
-        mode,
-    )?;
+        qp_c,
+        rc,
+        chroma_scale,
+        None,
+    )
+}
+
+/// r477 — [`prepare_chroma_tb`] with an optional prediction override
+/// (the `MipChromaDirectFlag` matrix prediction of a 4:4:4 MIP CU).
+#[allow(clippy::too_many_arguments)]
+fn prepare_chroma_tb_pred(
+    chroma_src: &PicturePlane,
+    chroma_rec: &mut PicturePlane,
+    avail: &mut EncAvail,
+    c_idx: u32,
+    mode: u32,
+    cx: usize,
+    cy: usize,
+    n_tb_c_w: usize,
+    n_tb_c_h: usize,
+    qp_c: i32,
+    rc: crate::residual::RcOpts,
+    chroma_scale: Option<u32>,
+    pred_override: Option<Vec<i16>>,
+) -> Result<Vec<i32>> {
+    // r412 / r474 — DM chroma inherits the luma mode (Table 20, with
+    // the §8.4.3 4:2:2 re-targeting), so the chroma prediction is the
+    // decoder-mirrored §8.4.5.2 process in that mode on the chroma plane.
+    let pred = match pred_override {
+        Some(p) => p,
+        None => predict_block(
+            chroma_rec,
+            &avail.chroma,
+            avail.cw,
+            avail.ch,
+            avail.region_for(c_idx),
+            cx,
+            cy,
+            n_tb_c_w,
+            n_tb_c_h,
+            c_idx,
+            mode,
+        )?,
+    };
     let bd = chroma_rec.bit_depth;
     let qp_prime = qp_c + 6 * (bd as i32 - 8);
     let max_v = (1i32 << bd) - 1;
@@ -1913,7 +2337,7 @@ fn prepare_leaf_cu(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<PreparedCu> {
-    let (levels, luma_mode, mode_syntax) = prepare_luma_tb(
+    let (levels, luma_mode, mode_syntax, mip) = prepare_luma_tb(
         &src.luma,
         &mut rec.luma,
         avail,
@@ -1924,6 +2348,7 @@ fn prepare_leaf_cu(
         cu_qp,
         rc,
     )?;
+    let tools = avail.tools;
     // r474 — monochrome CUs carry no chroma TB (the §7.3.11.10 chroma
     // CBFs are absent); otherwise the chroma TB is the luma TB divided
     // by SubWidthC / SubHeightC (§6.2 Table 2).
@@ -1940,15 +2365,44 @@ fn prepare_leaf_cu(
             transform_skip: false,
             luma_mode,
             mode_syntax,
+            mip,
+            tools,
         }));
     }
+    // §8.4.3 — DM chroma of a MIP CU reads PLANAR, except a 4:4:4
+    // single-tree CU where `MipChromaDirectFlag` predicts the chroma
+    // planes with the luma matrix (`luma_mode` already reads PLANAR
+    // for a MIP trial).
     let chroma_mode = chroma_dm_mode(avail, luma_mode);
     let chr_x = x / avail.sub_w;
     let chr_y = y / avail.sub_h;
     let n_tb_chroma_w = (n_tb_w / avail.sub_w).max(4);
     let n_tb_chroma_h = (n_tb_h / avail.sub_h).max(4);
+    let mip_direct = match mip {
+        Some(m) if avail.sub_w == 1 && avail.sub_h == 1 => Some(m),
+        _ => None,
+    };
     let qp_c = chroma_qp_identity_bd(cu_qp, rec.bit_depth());
-    let cb_levels = prepare_chroma_tb(
+    let chroma_pred =
+        |plane: &PicturePlane, avail: &EncAvail, c_idx: u32| -> Result<Option<Vec<i16>>> {
+            match mip_direct {
+                Some(m) => Ok(Some(predict_block_mip(
+                    plane,
+                    &avail.chroma,
+                    avail.cw,
+                    avail.ch,
+                    avail.region_for(c_idx),
+                    chr_x,
+                    chr_y,
+                    n_tb_chroma_w,
+                    n_tb_chroma_h,
+                    m,
+                )?)),
+                None => Ok(None),
+            }
+        };
+    let cb_pred = chroma_pred(&rec.cb, avail, 1)?;
+    let cb_levels = prepare_chroma_tb_pred(
         &src.cb,
         &mut rec.cb,
         avail,
@@ -1961,8 +2415,10 @@ fn prepare_leaf_cu(
         qp_c,
         rc,
         chroma_scale,
+        cb_pred,
     )?;
-    let cr_levels = prepare_chroma_tb(
+    let cr_pred = chroma_pred(&rec.cr, avail, 2)?;
+    let cr_levels = prepare_chroma_tb_pred(
         &src.cr,
         &mut rec.cr,
         avail,
@@ -1975,6 +2431,7 @@ fn prepare_leaf_cu(
         qp_c,
         rc,
         chroma_scale,
+        cr_pred,
     )?;
     Ok(PreparedCu::Leaf(PreparedLumaTb {
         n_tb_w,
@@ -1988,6 +2445,8 @@ fn prepare_leaf_cu(
         transform_skip: false,
         luma_mode,
         mode_syntax,
+        mip,
+        tools,
     }))
 }
 
@@ -2020,6 +2479,8 @@ fn prepare_leaf_cu_lossless(
             transform_skip: true,
             luma_mode,
             mode_syntax,
+            mip: None,
+            tools: avail.tools,
         }));
     }
     let chroma_mode = chroma_dm_mode(avail, luma_mode);
@@ -2061,6 +2522,8 @@ fn prepare_leaf_cu_lossless(
         transform_skip: true,
         luma_mode,
         mode_syntax,
+        mip: None,
+        tools: avail.tools,
     }))
 }
 
@@ -2255,7 +2718,17 @@ fn measure_cu_bits_recurse(
                 tb.n_tb_h as u32,
                 TreeNeighbours::default(),
                 allows,
-                |e| emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts),
+                |e| {
+                    emit_tu_with_cbf(
+                        e,
+                        residual_ctxs,
+                        intra_ctxs,
+                        tb,
+                        qp_state,
+                        rc_opts,
+                        MipNbr::default(),
+                    )
+                },
             )
         }
         PreparedCu::BtSplit {
@@ -2957,6 +3430,9 @@ struct CuDescriptor {
     cb_w: u32,
     cb_h: u32,
     cqt_depth: u32,
+    /// r477 — `IntraMipFlag` of the CU (the `intra_mip_flag` ctxInc
+    /// of its right / below neighbours).
+    mip: bool,
 }
 
 impl CuStateMap {
@@ -2983,10 +3459,16 @@ impl CuStateMap {
     /// Insert one CU rectangle into the map. All cells inside the
     /// rectangle are marked with the same descriptor.
     fn insert(&mut self, x: u32, y: u32, cb_w: u32, cb_h: u32, cqt_depth: u32) {
+        self.insert_with_mip(x, y, cb_w, cb_h, cqt_depth, false);
+    }
+
+    /// r477 — [`Self::insert`] recording the CU's `IntraMipFlag`.
+    fn insert_with_mip(&mut self, x: u32, y: u32, cb_w: u32, cb_h: u32, cqt_depth: u32, mip: bool) {
         let desc = CuDescriptor {
             cb_w,
             cb_h,
             cqt_depth,
+            mip,
         };
         let mcb_x0 = (x as usize) / 4;
         let mcb_y0 = (y as usize) / 4;
@@ -3191,6 +3673,18 @@ fn emit_prepared_cu(
     pal: &mut Option<EncPalette>,
 ) -> Result<()> {
     let nbrs = build_tree_neighbours(cu_map, x, y);
+    // r477 — the `intra_mip_flag` ctxInc neighbours (same positions as
+    // the split-flag neighbours: left `(x − 1, y)`, above `(x, y − 1)`).
+    let mip_nbr = {
+        let left = cu_map.get(x as i64 - 1, y as i64);
+        let above = cu_map.get(x as i64, y as i64 - 1);
+        MipNbr {
+            left_avail: left.is_some(),
+            above_avail: above.is_some(),
+            left_mip: left.map(|d| d.mip).unwrap_or(false),
+            above_mip: above.map(|d| d.mip).unwrap_or(false),
+        }
+    };
     match cu {
         PreparedCu::Palette(pcu) => {
             let allows = constraints.allows(
@@ -3225,10 +3719,11 @@ fn emit_prepared_cu(
             // emitted leaf CU (companion of the decoder's `H266_DBG_CU`).
             if std::env::var_os("H266_ENC_DBG_CU").is_some() {
                 eprintln!(
-                    "ENC CU ({x},{y}) {}x{} modeY={} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
+                    "ENC CU ({x},{y}) {}x{} modeY={} mip={:?} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
                     tb.n_tb_w,
                     tb.n_tb_h,
                     tb.luma_mode,
+                    tb.mip,
                     tb.levels.iter().any(|&l| l != 0),
                     tb.cb_levels.iter().any(|&l| l != 0),
                     tb.cr_levels.iter().any(|&l| l != 0),
@@ -3271,7 +3766,7 @@ fn emit_prepared_cu(
                             e.encode_decision(&mut ps.ctxs.pred_mode_plt_flag[0], 0)?;
                         }
                     }
-                    emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts)
+                    emit_tu_with_cbf(e, residual_ctxs, intra_ctxs, tb, qp_state, rc_opts, mip_nbr)
                 },
             )?;
             // r412 — record the leaf IMMEDIATELY (decoding-order
@@ -3281,7 +3776,14 @@ fn emit_prepared_cu(
             // pre-r412 post-CTB commit fed stale neighbour state to
             // every within-CTB lookup, desyncing the ctx selection on
             // mixed-size (MTT) layouts.
-            cu_map.insert(x, y, tb.n_tb_w as u32, tb.n_tb_h as u32, cqt_depth);
+            cu_map.insert_with_mip(
+                x,
+                y,
+                tb.n_tb_w as u32,
+                tb.n_tb_h as u32,
+                cqt_depth,
+                tb.mip.is_some(),
+            );
             Ok(())
         }
         PreparedCu::BtSplit {
@@ -3643,9 +4145,48 @@ pub fn encode_idr_with_qp_picker(
 pub fn encode_idr_with_qp_picker_cfg(
     src: &PictureBuffer,
     slice_qp_y: i32,
-    mut config: crate::encoder::EncoderConfig,
+    config: crate::encoder::EncoderConfig,
     qp_picker: impl Fn(usize, usize, usize, usize) -> i32,
 ) -> Result<(Vec<u8>, PictureBuffer)> {
+    let (bs, rec, _) = encode_idr_impl(src, slice_qp_y, config, qp_picker)?;
+    Ok((bs, rec))
+}
+
+/// r477 — per-picture coding statistics of the stills encoder: how
+/// many transform-coded leaf CUs the picture has and how many of them
+/// elected each intra tool. Read through
+/// [`encode_idr_with_stats_cfg`]; `#[non_exhaustive]` so later tools
+/// can add counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EncodeStats {
+    /// Transform-coded leaf CUs (palette CUs are not counted).
+    pub cus: u32,
+    /// CUs coded with `intra_mip_flag = 1` (§8.4.5.2.2).
+    pub mip_cus: u32,
+    /// CUs coded with `intra_subpartitions_mode_flag = 1` (§8.4.5.1).
+    pub isp_cus: u32,
+    /// CUs coded with `intra_bdpcm_luma_flag = 1` (§7.3.11.5).
+    pub bdpcm_cus: u32,
+}
+
+/// r477 — [`encode_idr_with_residuals_cfg`] that also returns the
+/// picture's [`EncodeStats`].
+pub fn encode_idr_with_stats_cfg(
+    src: &PictureBuffer,
+    qp: i32,
+    cfg: crate::encoder::EncoderConfig,
+) -> Result<(Vec<u8>, PictureBuffer, EncodeStats)> {
+    encode_idr_impl(src, qp, cfg, |_, _, _, _| qp)
+}
+
+fn encode_idr_impl(
+    src: &PictureBuffer,
+    slice_qp_y: i32,
+    mut config: crate::encoder::EncoderConfig,
+    qp_picker: impl Fn(usize, usize, usize, usize) -> i32,
+) -> Result<(Vec<u8>, PictureBuffer, EncodeStats)> {
+    let mut stats = EncodeStats::default();
     use crate::cabac_enc::ArithEncoder;
     use crate::encoder::VvcEncoder;
     use crate::nal::NalUnitType;
@@ -3770,6 +4311,11 @@ pub fn encode_idr_with_qp_picker_cfg(
     // r412 — eq. 1212 availability masks for the decoder-mirrored
     // intra prediction in the coding loop.
     let mut avail = EncAvail::with_format(w as usize, h as usize, chroma_format_idc);
+    // r477 — the SPS intra tools (MIP candidates in the decision; the
+    // emit pass writes the flag bins the SPS declares).
+    avail.tools = IntraTools {
+        mip: config.intra_mip,
+    };
     // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
     // partition fields; drive every split-bin presence + ctxInc.
     let split_constraints = encoder_split_constraints(
@@ -3999,12 +4545,12 @@ pub fn encode_idr_with_qp_picker_cfg(
                     // Accumulate deblock-CU records over every TB inside
                     // the (possibly split) CU. For BT-split CUs each
                     // sub-leaf contributes its own deblock entry.
+                    // r477 — the per-picture tool statistics.
                     cu.for_each_leaf(&mut |tb| {
-                        // The leaf tracks its sample-coordinate origin
-                        // implicitly via prepare ordering; we recompute
-                        // it from the BT split walk in a second pass
-                        // below.
-                        let _ = tb;
+                        stats.cus += 1;
+                        if tb.mip.is_some() {
+                            stats.mip_cus += 1;
+                        }
                     });
                     accumulate_deblock_cus(&cu, tb_x, tb_y, &mut all_deblock_cus);
 
@@ -5032,7 +5578,7 @@ pub fn encode_idr_with_qp_picker_cfg(
     // coded padding is cropped away, mirroring the conformance window
     // a decoder applies).
     let rec = crop_picture(&rec, out_dims.0, out_dims.1, out_dims.2, out_dims.3);
-    Ok((bitstream, rec))
+    Ok((bitstream, rec, stats))
 }
 
 /// r474 — one leaf slot of a CTB's §7.4.12.4 boundary walk: a square
@@ -6351,6 +6897,8 @@ mod tests {
                 cb_levels: vec![0; (w / 2).max(4) * (h / 2).max(4)],
                 cr_levels: vec![0; (w / 2).max(4) * (h / 2).max(4)],
                 cu_qp_local: 26,
+                mip: None,
+                tools: IntraTools::default(),
             })
         };
         let a = mk_leaf(16, 64);
