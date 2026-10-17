@@ -31,7 +31,7 @@ use crate::aps::{parse_aps, AlfApsData, ApsParamsType};
 use crate::ctu::{CtuLayout, CtuWalker};
 use crate::inter::{ExplicitWpTables, MotionField, ReferencePicture};
 use crate::lmcs::LmcsData;
-use crate::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+use crate::nal::{extract_rbsp, iter_annex_b, NalHeader, NalUnitType};
 use crate::picture_header::{parse_picture_header, parse_picture_header_stateful, PictureHeader};
 use crate::pps::{parse_pps, PicParameterSet};
 use crate::reconstruct::PictureBuffer;
@@ -104,6 +104,68 @@ pub struct StreamDecoder {
     discard_rasl: bool,
     cvs_idx: u32,
     started: bool,
+    /// r477 — the picture header NAL waiting for its first slice
+    /// (separate-PH streams), held across [`Self::push_nal`] calls.
+    pending_ph: Option<PictureHeader>,
+    /// r477 — the picture whose slices are being collected, held
+    /// across [`Self::push_nal`] calls until the next picture starts
+    /// or [`Self::finish_picture`] runs.
+    cur: Option<PictureUnit>,
+    /// r477 — `width × height` ceiling (luma samples) checked against
+    /// every SPS / PPS before the parameter set is accepted, so a
+    /// hostile header never reaches an allocation.
+    max_pixels: Option<u64>,
+    /// r477 — output-process parameters of the SPS the most recently
+    /// decoded picture referenced (DPB sizing + timing), for the
+    /// framework decoder's output-order bumping.
+    last_output_info: Option<OutputInfo>,
+}
+
+/// r477 — the SPS-level facts a presentation layer needs per decoded
+/// picture: the §C.5.2 output-order bumping bounds and the
+/// §7.4.6.1 timing pair. Read through
+/// [`StreamDecoder::last_output_info`] after a picture reaches the
+/// sink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OutputInfo {
+    /// `dpb_max_num_reorder_pics[ Htid ]` — the maximum number of
+    /// pictures that may precede any picture in decoding order and
+    /// follow it in output order (0 when the SPS carries no
+    /// `dpb_parameters()` — single-layer streams always do).
+    pub max_num_reorder_pics: u32,
+    /// `dpb_max_latency_increase_plus1[ Htid ]` (0 = no latency
+    /// limit); `MaxLatencyPictures = max_num_reorder_pics +
+    /// max_latency_increase_plus1 − 1`.
+    pub max_latency_increase_plus1: u32,
+    /// `dpb_max_dec_pic_buffering_minus1[ Htid ] + 1`.
+    pub max_dec_pic_buffering: u32,
+    /// `num_units_in_tick` / `time_scale` of the SPS
+    /// `general_timing_hrd_parameters()` when signalled.
+    pub num_units_in_tick: Option<u32>,
+    /// See [`Self::num_units_in_tick`].
+    pub time_scale: Option<u32>,
+    /// `sps_max_sublayers_minus1 + 1`.
+    pub num_sublayers: u32,
+}
+
+impl OutputInfo {
+    fn from_sps(sps: &SeqParameterSet) -> Self {
+        let last = sps
+            .dpb_parameters
+            .as_ref()
+            .and_then(|d| d.sublayers.last().copied());
+        Self {
+            max_num_reorder_pics: last.map(|l| l.max_num_reorder_pics).unwrap_or(0),
+            max_latency_increase_plus1: last.map(|l| l.max_latency_increase_plus1).unwrap_or(0),
+            max_dec_pic_buffering: last
+                .map(|l| l.max_dec_pic_buffering_minus1 + 1)
+                .unwrap_or(1),
+            num_units_in_tick: sps.general_timing_hrd.as_ref().map(|t| t.num_units_in_tick),
+            time_scale: sps.general_timing_hrd.as_ref().map(|t| t.time_scale),
+            num_sublayers: u32::from(sps.sps_max_sublayers_minus1) + 1,
+        }
+    }
 }
 
 impl StreamDecoder {
@@ -114,6 +176,76 @@ impl StreamDecoder {
         }
     }
 
+    /// r477 — cap the picture area (`pps_pic_width_in_luma_samples ×
+    /// pps_pic_height_in_luma_samples`, and the SPS maxima) accepted
+    /// from parameter sets. A parameter set above the cap is refused
+    /// with [`Error::ResourceExhausted`] before any plane is
+    /// allocated. `None` (the default) keeps the level-independent
+    /// 16384 × 16384 parser bound only.
+    pub fn set_max_pixels(&mut self, max_pixels: Option<u64>) {
+        self.max_pixels = max_pixels;
+    }
+
+    /// r477 — the output-process parameters of the SPS referenced by
+    /// the most recently decoded picture (`None` before the first
+    /// picture).
+    pub fn last_output_info(&self) -> Option<OutputInfo> {
+        self.last_output_info
+    }
+
+    /// r477 — a parameter set already in the pools, by id.
+    pub fn sps(&self, id: u8) -> Option<&SeqParameterSet> {
+        self.spss.get(&id)
+    }
+
+    /// r477 — the SPS a presentation layer should describe the stream
+    /// with before the first picture decodes: the one the most recent
+    /// PPS references, else the lowest-id SPS in the pool.
+    pub fn any_sps(&self) -> Option<&SeqParameterSet> {
+        let mut ids: Vec<u8> = self.spss.keys().copied().collect();
+        ids.sort_unstable();
+        ids.first().and_then(|id| self.spss.get(id))
+    }
+
+    /// r477 — mark the end of the current coded video sequence: the
+    /// next IRAP / GDR picture starts a new CLVS (what an EOS / EOB
+    /// NAL unit does in-band). The in-flight picture is finished first
+    /// through `sink`.
+    pub fn end_of_sequence(&mut self, sink: &mut dyn FnMut(DecodedPicture)) -> Result<()> {
+        self.finish_picture(sink)?;
+        self.clvss_pending = true;
+        Ok(())
+    }
+
+    /// r477 — forget every decoded picture and the in-flight state
+    /// (a container seek): the DPB, the POC anchor, the pending
+    /// picture header and the picture being collected. Parameter sets
+    /// stay in their pools (the ones a configuration record supplied
+    /// must survive the seek); the next IRAP / GDR picture starts a
+    /// new CLVS.
+    pub fn reset_pictures(&mut self) {
+        self.dpb.clear();
+        self.prev_tid0 = None;
+        self.pending_ph = None;
+        self.cur = None;
+        self.clvss_pending = true;
+        self.discard_rasl = false;
+        self.started = false;
+    }
+
+    fn check_area(&self, what: &str, w: u64, h: u64) -> Result<()> {
+        if let Some(cap) = self.max_pixels {
+            let area = w.saturating_mul(h);
+            if area > cap {
+                return Err(Error::resource_exhausted(format!(
+                    "h266 stream: {what} {w}x{h} ({area} luma samples) exceeds the {cap}-sample \
+                     decoder limit"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Decode a whole Annex-B elementary stream, feeding every decoded
     /// picture (in decode order) to `sink`.
     pub fn decode_annex_b(
@@ -121,116 +253,133 @@ impl StreamDecoder {
         bs: &[u8],
         sink: &mut dyn FnMut(DecodedPicture),
     ) -> Result<()> {
-        let mut pending_ph: Option<PictureHeader> = None;
-        let mut cur: Option<PictureUnit> = None;
-
         for nal in iter_annex_b(bs) {
-            let t = nal.header.nal_unit_type;
-            match t {
-                NalUnitType::SpsNut | NalUnitType::PpsNut | NalUnitType::PrefixApsNut => {
-                    // A prefix non-VCL NAL opens a new access unit —
-                    // finish the picture in flight before the pools
-                    // change under it.
-                    if let Some(pic) = cur.take() {
-                        self.decode_picture(pic, sink)?;
-                    }
-                    let rbsp = extract_rbsp(nal.payload());
-                    match t {
-                        NalUnitType::SpsNut => {
-                            let sps = parse_sps(&rbsp)?;
-                            self.spss.insert(sps.sps_seq_parameter_set_id, sps);
-                        }
-                        NalUnitType::PpsNut => {
-                            let pps = parse_pps(&rbsp)?;
-                            self.ppss.insert(pps.pps_pic_parameter_set_id, pps);
-                        }
-                        _ => self.stash_aps(&rbsp)?,
-                    }
-                }
-                NalUnitType::SuffixApsNut => {
-                    if let Some(pic) = cur.take() {
-                        self.decode_picture(pic, sink)?;
-                    }
-                    let rbsp = extract_rbsp(nal.payload());
-                    self.stash_aps(&rbsp)?;
-                }
-                NalUnitType::PhNut => {
-                    if let Some(pic) = cur.take() {
-                        self.decode_picture(pic, sink)?;
-                    }
-                    let rbsp = extract_rbsp(nal.payload());
-                    let lead = parse_picture_header(&rbsp)?;
-                    let (sps, pps) = self.resolve_ps(lead.ph_pic_parameter_set_id)?;
-                    pending_ph = Some(parse_picture_header_stateful(&rbsp, sps, pps)?);
-                }
-                NalUnitType::EosNut | NalUnitType::EobNut => {
-                    if let Some(pic) = cur.take() {
-                        self.decode_picture(pic, sink)?;
-                    }
-                    self.clvss_pending = true;
-                }
-                _ if t.is_vcl() => {
-                    let rbsp = extract_rbsp(nal.payload());
-                    let temporal_id = nal.header.nuh_temporal_id_plus1.saturating_sub(1);
-                    // Peek the first bit: PH-in-SH starts a new picture.
-                    let ph_in_sh = rbsp.first().map(|b| b & 0x80 != 0).unwrap_or(false);
-                    if ph_in_sh {
-                        if let Some(pic) = cur.take() {
-                            self.decode_picture(pic, sink)?;
-                        }
-                        let lead = crate::slice_header::parse_slice_header(&rbsp)?;
-                        let pps_id = lead
-                            .embedded_picture_header
-                            .as_ref()
-                            .map(|l| l.ph_pic_parameter_set_id)
-                            .ok_or_else(|| Error::invalid("h266 stream: PH-in-SH without PH"))?;
-                        let (sps, pps) = self.resolve_ps(pps_id)?;
-                        let ph_state = PhState {
-                            nal_unit_type: t,
-                            num_extra_sh_bits: sps.num_extra_sh_bits,
-                            ..Default::default()
-                        };
-                        let sh = parse_slice_header_stateful(&rbsp, sps, pps, &ph_state)?;
-                        let ph =
-                            sh.embedded_ph.as_deref().cloned().ok_or_else(|| {
-                                Error::invalid("h266 stream: embedded PH missing")
-                            })?;
-                        cur = Some(PictureUnit {
-                            nal_type: t,
-                            temporal_id,
-                            ph,
-                            slices: vec![sh],
-                        });
-                    } else {
-                        // Separate PH: either the pending PhNut opens a
-                        // new picture, or this slice continues the
-                        // current one.
-                        if let Some(ph) = pending_ph.take() {
-                            if let Some(pic) = cur.take() {
-                                self.decode_picture(pic, sink)?;
-                            }
-                            let sh = self.parse_slice_with_ph(&rbsp, &ph, t)?;
-                            cur = Some(PictureUnit {
-                                nal_type: t,
-                                temporal_id,
-                                ph,
-                                slices: vec![sh],
-                            });
-                        } else {
-                            let pic = cur.as_mut().ok_or_else(|| {
-                                Error::invalid("h266 stream: VCL NAL before any picture header")
-                            })?;
-                            let ph = pic.ph.clone();
-                            let sh = self.parse_slice_with_ph(&rbsp, &ph, t)?;
-                            cur.as_mut().unwrap().slices.push(sh);
-                        }
-                    }
-                }
-                _ => {} // AUD / SEI / filler / reserved — no decode state.
-            }
+            self.push_nal(nal.raw, sink)?;
         }
-        if let Some(pic) = cur.take() {
+        self.finish_picture(sink)
+    }
+
+    /// r477 — finish the picture whose slices are being collected (if
+    /// any): decode it and hand it to `sink`. Call at the end of an
+    /// access unit / packet, before a flush, and whenever the caller
+    /// knows no further slice of the current picture will arrive.
+    pub fn finish_picture(&mut self, sink: &mut dyn FnMut(DecodedPicture)) -> Result<()> {
+        if let Some(pic) = self.cur.take() {
             self.decode_picture(pic, sink)?;
+        }
+        Ok(())
+    }
+
+    /// r477 — push one NAL unit (`raw` = the 2-byte NAL header plus the
+    /// still emulation-prevented payload, no start code / length
+    /// prefix). Parameter sets go to the pools, a picture header /
+    /// first slice opens a picture (decoding the previous one through
+    /// `sink`), further slices join it, EOS / EOB end the CVS. The
+    /// picture a packet ends with is NOT decoded here —
+    /// [`Self::finish_picture`] does that — so a picture may span
+    /// several pushes.
+    pub fn push_nal(&mut self, raw: &[u8], sink: &mut dyn FnMut(DecodedPicture)) -> Result<()> {
+        let header = NalHeader::parse(raw)?;
+        let payload = &raw[2..];
+        let t = header.nal_unit_type;
+        match t {
+            NalUnitType::SpsNut | NalUnitType::PpsNut | NalUnitType::PrefixApsNut => {
+                // A prefix non-VCL NAL opens a new access unit —
+                // finish the picture in flight before the pools
+                // change under it.
+                self.finish_picture(sink)?;
+                let rbsp = extract_rbsp(payload);
+                match t {
+                    NalUnitType::SpsNut => {
+                        let sps = parse_sps(&rbsp)?;
+                        self.check_area(
+                            "SPS maximum picture size",
+                            u64::from(sps.sps_pic_width_max_in_luma_samples),
+                            u64::from(sps.sps_pic_height_max_in_luma_samples),
+                        )?;
+                        self.spss.insert(sps.sps_seq_parameter_set_id, sps);
+                    }
+                    NalUnitType::PpsNut => {
+                        let pps = parse_pps(&rbsp)?;
+                        self.check_area(
+                            "PPS picture size",
+                            u64::from(pps.pps_pic_width_in_luma_samples),
+                            u64::from(pps.pps_pic_height_in_luma_samples),
+                        )?;
+                        self.ppss.insert(pps.pps_pic_parameter_set_id, pps);
+                    }
+                    _ => self.stash_aps(&rbsp)?,
+                }
+            }
+            NalUnitType::SuffixApsNut => {
+                self.finish_picture(sink)?;
+                let rbsp = extract_rbsp(payload);
+                self.stash_aps(&rbsp)?;
+            }
+            NalUnitType::PhNut => {
+                self.finish_picture(sink)?;
+                let rbsp = extract_rbsp(payload);
+                let lead = parse_picture_header(&rbsp)?;
+                let (sps, pps) = self.resolve_ps(lead.ph_pic_parameter_set_id)?;
+                self.pending_ph = Some(parse_picture_header_stateful(&rbsp, sps, pps)?);
+            }
+            NalUnitType::EosNut | NalUnitType::EobNut => {
+                self.finish_picture(sink)?;
+                self.clvss_pending = true;
+            }
+            _ if t.is_vcl() => {
+                let rbsp = extract_rbsp(payload);
+                let temporal_id = header.nuh_temporal_id_plus1.saturating_sub(1);
+                // Peek the first bit: PH-in-SH starts a new picture.
+                let ph_in_sh = rbsp.first().map(|b| b & 0x80 != 0).unwrap_or(false);
+                if ph_in_sh {
+                    self.finish_picture(sink)?;
+                    let lead = crate::slice_header::parse_slice_header(&rbsp)?;
+                    let pps_id = lead
+                        .embedded_picture_header
+                        .as_ref()
+                        .map(|l| l.ph_pic_parameter_set_id)
+                        .ok_or_else(|| Error::invalid("h266 stream: PH-in-SH without PH"))?;
+                    let (sps, pps) = self.resolve_ps(pps_id)?;
+                    let ph_state = PhState {
+                        nal_unit_type: t,
+                        num_extra_sh_bits: sps.num_extra_sh_bits,
+                        ..Default::default()
+                    };
+                    let sh = parse_slice_header_stateful(&rbsp, sps, pps, &ph_state)?;
+                    let ph = sh
+                        .embedded_ph
+                        .as_deref()
+                        .cloned()
+                        .ok_or_else(|| Error::invalid("h266 stream: embedded PH missing"))?;
+                    self.cur = Some(PictureUnit {
+                        nal_type: t,
+                        temporal_id,
+                        ph,
+                        slices: vec![sh],
+                    });
+                } else if let Some(ph) = self.pending_ph.take() {
+                    // Separate PH: the pending PhNut opens a new picture.
+                    self.finish_picture(sink)?;
+                    let sh = self.parse_slice_with_ph(&rbsp, &ph, t)?;
+                    self.cur = Some(PictureUnit {
+                        nal_type: t,
+                        temporal_id,
+                        ph,
+                        slices: vec![sh],
+                    });
+                } else {
+                    // …or this slice continues the current picture.
+                    let ph = self.cur.as_ref().map(|pic| pic.ph.clone()).ok_or_else(|| {
+                        Error::invalid("h266 stream: VCL NAL before any picture header")
+                    })?;
+                    let sh = self.parse_slice_with_ph(&rbsp, &ph, t)?;
+                    if let Some(pic) = self.cur.as_mut() {
+                        pic.slices.push(sh);
+                    }
+                }
+            }
+            _ => {} // AUD / SEI / filler / reserved — no decode state.
         }
         Ok(())
     }
@@ -427,6 +576,7 @@ impl StreamDecoder {
         let (sps, pps) = self.resolve_ps(ph.ph_pic_parameter_set_id)?;
         let sps = sps.clone();
         let pps = pps.clone();
+        self.last_output_info = Some(OutputInfo::from_sps(&sps));
 
         // §7.4.3.4 / §7.4.3.7 eq. 77 — VirtualBoundariesPresentFlag and
         // the VirtualBoundaryPosX / Y arrays (units of 8 luma samples).

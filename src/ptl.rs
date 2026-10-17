@@ -293,6 +293,16 @@ pub fn parse_profile_tier_level(
     Ok(ptl)
 }
 
+/// r477 — walk one `general_constraints_info()` (§7.3.3.2) and leave
+/// the reader at its byte-aligned end (the structure ends on
+/// `gci_alignment_zero_bit`s). Used by the ISO/IEC 14496-15 `vvcC`
+/// builder to measure the raw constraint bytes of an SPS.
+#[doc(hidden)]
+pub fn skip_general_constraints_info(br: &mut BitReader<'_>) -> Result<()> {
+    let mut scratch = ProfileTierLevel::default();
+    parse_general_constraints_info(br, &mut scratch)
+}
+
 /// Walk `general_constraints_info()` (§7.3.3.2) into a typed
 /// [`GeneralConstraintsInfo`]. Each named flag is read in spec order;
 /// the V4 (01/2026) additional-bit block is read when

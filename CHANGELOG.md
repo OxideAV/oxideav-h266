@@ -4,6 +4,13 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- r477 — **the registry decoder is real**: `decoder::H266Decoder` (`decoder::make_decoder`, what `register` installs) is a streaming `oxideav_core::Decoder` over `stream::StreamDecoder` — Annex B packets or ISO/IEC 14496-15 §4.2.3 length-prefixed samples (the prefix size from a `vvcC` record in `CodecParameters::extradata`, whose parameter-set arrays are pushed before the first sample; without a record every packet is sniffed), access-unit assembly (a packet holds one or more access units; the picture a packet ends with is decoded at the end of the packet), output in `PicOrderCntVal` order under the §C.5.2.2 bumping bounds of the SPS `dpb_parameters()` (`dpb_max_num_reorder_pics`, `MaxLatencyPictures`, CLVS boundaries, `flush`), packet `pts` carried to the picture it completes else a POC-derived presentation clock in `num_units_in_tick / time_scale` ticks (`H266Decoder::output_time_base` / `output_frame_rate`), truthful labels (`Gray8` … `Yuv444P16Le` for 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 at 8 / 10 / 12 / 16 bits, a typed `Unsupported` for any other depth before a picture decodes, `Decoder::output_pixel_format` from the record or the first SPS), `CodecParameters::limits` and the 16384 × 16384 ceiling checked against every SPS / PPS before any plane is allocated, `reset` for seeks. `tests/registry_decoder.rs` runs **every staged JVET conformance stream through the registry** one packet per access unit (and a sample as whole-stream packets): 56 / 56 match the `.opl` plane MD5s row for row in output order.
+- r477 — `vvcc`: ISO/IEC 14496-15 §11.2.4 `VvcDecoderConfigurationRecord` builder (`from_annex_b` — DCI / OPI / VPS / SPS / PPS / prefix APS arrays, the `VvcPTLRecord` from the SPS's or the VPS's `profile_tier_level()` with the raw `general_constraints_info()` bytes), parser, serialiser and `annex_b_to_length_prefixed` sample re-framing.
+- r477 — `stream::StreamDecoder` gains the push face the framework decoder is built on: `push_nal` / `finish_picture` / `end_of_sequence` / `reset_pictures`, `set_max_pixels` (SPS / PPS area refused with `ResourceExhausted` before allocation), `last_output_info` (`stream::OutputInfo`: DPB bumping bounds + timing of the active SPS), `sps` / `any_sps`. `decode_annex_b` is unchanged in behaviour. `decoder::split_access_units` splits an Annex B stream at the §7.4.2.4.3 boundaries.
+- r477 — the registry descriptor declares `lossless` (the encoder's transform-skip path) next to `lossy`.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-h266/compare/v0.0.9...v0.0.10) - 2026-10-12
 
 ### Other

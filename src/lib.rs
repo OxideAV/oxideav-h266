@@ -1,13 +1,18 @@
-//! Pure-Rust VVC / H.266 (ITU-T H.266 | ISO/IEC 23090-3) decoder foundation.
+//! Pure-Rust VVC / H.266 (ITU-T H.266 | ISO/IEC 23090-3) decoder and
+//! stills encoder.
 //!
-//! This crate currently implements the **parser foundation** only. VVC is a
-//! 500+ page spec — we bring in NAL framing, RBSP extraction, an Exp-Golomb
-//! bit reader, and (incrementally) the VPS / SPS / PPS / APS + picture
-//! header + slice header parsers so the workspace has a reliable surface on
-//! top of which a CTU walker can be wired up in later increments. Actual
-//! CTU decode, intra / inter prediction, transforms, deblock, ALF, LMCS,
-//! SAO-replacement, reference-picture-list construction, etc. are **out of
-//! scope** for this pass.
+//! The decoder reconstructs every staged JVET conformance stream
+//! byte-exactly through [`stream::StreamDecoder`] (the direct API:
+//! whole Annex B streams or NAL-by-NAL pushes) and, since r477,
+//! through the framework face [`decoder::H266Decoder`] — the
+//! `oxideav_core::Decoder` the registry hands out: Annex B or
+//! ISO/IEC 14496-15 length-prefixed packets, `vvcC` extradata
+//! ([`vvcc`]), access-unit assembly, POC output order under the SPS
+//! `dpb_parameters()` bumping bounds, truthful pixel-format labels
+//! (4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 at 8 / 10 / 12 / 16 bits), decoder
+//! limits honoured before allocation. The encoder
+//! ([`encoder_pipeline`], [`encoder::EncoderConfig`]) codes intra
+//! pictures of any geometry and format, lossy and lossless.
 //!
 //! ## Crate layout
 //!
@@ -22,13 +27,13 @@
 //!   semantics give the same two `shall be equal` constraints, which
 //!   the validators surface as typed errors instead of silently
 //!   tolerating framing bugs.
-//! * [`decoder`] — registry factory; returns `Error::Unsupported` for any
-//!   packet that would require pixel output. The
-//!   [`ctu::CtuWalker::reconstruct_leaf_cu`] / [`ctu::CtuWalker::decode_picture_into`]
-//!   path now produces real reconstructed luma samples for the
-//!   intra-only single-tile single-slice subset (PLANAR / DC / cardinal
-//!   angular modes + DCT-II inverse transform), but the framework-level
-//!   packet → frame glue is still pending and surfaces Unsupported.
+//! * [`decoder`] — the registry decoder ([`decoder::H266Decoder`],
+//!   [`decoder::make_decoder`]): packet framing, access units, output
+//!   order, timestamps, labels and limits over [`stream`].
+//! * [`vvcc`] — ISO/IEC 14496-15 §11.2.4 `VvcDecoderConfigurationRecord`
+//!   (builder from Annex B, parser, sample re-framing).
+//! * [`stream`] — the whole-stream / push-NAL decode driver (parameter
+//!   set pools, POC, reference lists, DPB retention, CLVS handling).
 //! * [`dci`] — Decoding Capability Information parser (§7.3.2.1).
 //! * [`opi`] — Operating Point Information parser (§7.3.2.2).
 //! * [`ctu`] — CTU walker scaffold: picture → CTU-address scan, per-CTU
@@ -321,6 +326,7 @@ pub mod sps;
 // r434 — stream-level decode driver (AU assembly, POC, RPL/DPB, walker wiring)
 pub mod stream;
 pub mod subpic_level_info;
+pub mod vvcc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod syntax_enc;
@@ -344,17 +350,18 @@ use oxideav_core::{CodecInfo, CodecRegistry};
 /// Canonical oxideav codec id for H.266 / VVC.
 pub const CODEC_ID_STR: &str = "h266";
 
-/// Register the VVC implementation (currently parser-only) with a codec
-/// registry. The registered decoder factory returns an unsupported-error
-/// decoder — parameter-set inspection lives in the parser modules for now.
+/// Register the VVC implementation with a codec registry: the
+/// streaming decoder ([`decoder::make_decoder`]) under the `h266`
+/// codec id and the ISOBMFF sample-entry FourCCs.
 ///
 /// Prefer the unified [`register`] entry point when you have a
 /// [`oxideav_core::RuntimeContext`] in hand.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("h266_sw")
         .with_lossy(true)
+        .with_lossless(true)
         .with_intra_only(false)
-        .with_max_size(16384, 16384);
+        .with_max_size(decoder::MAX_DIMENSION, decoder::MAX_DIMENSION);
     // ISOBMFF sample-description FourCCs defined in ISO/IEC 14496-15:
     //   `vvc1` — in-band parameter sets
     //   `vvi1` — inband parameter sets, VVC inband picture header
