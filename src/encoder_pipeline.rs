@@ -223,6 +223,11 @@ struct PreparedLumaTb {
     mip: Option<MipChoice>,
     /// r477 — the SPS intra tools of this picture.
     tools: IntraTools,
+    /// r477 — intra sub-partitions (§8.4.5.1): `levels` then holds the
+    /// partitions' level arrays back to back in §7.3.11.9 walk order
+    /// (equal sizes), each coded as its own luma TB; the chroma TBs
+    /// span the CU (closing the last partition's TU).
+    isp: Option<crate::leaf_cu::IspSplitType>,
 }
 
 /// r477 — the intra coding tools the emitted SPS enables for this
@@ -233,6 +238,37 @@ struct PreparedLumaTb {
 struct IntraTools {
     /// `sps_mip_enabled_flag` — `intra_mip_flag` precedes the cascade.
     mip: bool,
+    /// `sps_isp_enabled_flag` — `intra_subpartitions_mode_flag` (and
+    /// the split flag) precede the MPM cascade on eligible CUs.
+    isp: bool,
+}
+
+/// r477 — §7.3.11.5: the CU sizes on which `intra_subpartitions_mode_flag`
+/// is present (`cbWidth <= MaxTbSizeY && cbHeight <= MaxTbSizeY &&
+/// cbWidth * cbHeight > MinTbSizeY * MinTbSizeY`, MaxTbSizeY = 64,
+/// MinTbSizeY = 4 on the emitted SPS; MRL is off so `intra_luma_ref_idx`
+/// is always 0).
+fn isp_flag_present(n_w: usize, n_h: usize) -> bool {
+    n_w <= 64 && n_h <= 64 && n_w * n_h > 16
+}
+
+/// r477 — the ISP splits this encoder tries on a CU: every
+/// sub-partition must be at least 4 samples along the split axis (the
+/// thinner 1- / 2-wide partitions share prediction windows — a
+/// conforming shape this encoder does not elect).
+fn isp_candidate_splits(n_w: usize, n_h: usize) -> Vec<crate::leaf_cu::IspSplitType> {
+    use crate::leaf_cu::IspSplitType;
+    let mut out = Vec::with_capacity(2);
+    if !isp_flag_present(n_w, n_h) {
+        return out;
+    }
+    for split in [IspSplitType::HorSplit, IspSplitType::VerSplit] {
+        let parts = crate::isp::iter_isp_partitions(split, n_w as u32, n_h as u32);
+        if parts.len() >= 2 && parts.iter().all(|p| p.n_w >= 4 && p.n_h >= 4) {
+            out.push(split);
+        }
+    }
+    out
 }
 
 /// r477 — matrix-based intra prediction (§8.4.5.2.2) chosen for a
@@ -684,6 +720,9 @@ struct IntraModeCtxs {
     chroma_mode: Vec<ContextModel>,
     /// r477 — `intra_mip_flag` (Table 132 ctxInc 0..=3).
     mip_flag: Vec<ContextModel>,
+    /// r477 — `intra_subpartitions_mode_flag` / `_split_flag`.
+    isp_mode: Vec<ContextModel>,
+    isp_split: Vec<ContextModel>,
 }
 
 impl IntraModeCtxs {
@@ -693,6 +732,8 @@ impl IntraModeCtxs {
             not_planar: init_contexts(SyntaxCtx::IntraLumaNotPlanarFlag, slice_qp_y),
             chroma_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
             mip_flag: init_contexts(SyntaxCtx::IntraMipFlag, slice_qp_y),
+            isp_mode: init_contexts(SyntaxCtx::IntraSubpartitionsModeFlag, slice_qp_y),
+            isp_split: init_contexts(SyntaxCtx::IntraSubpartitionsSplitFlag, slice_qp_y),
         }
     }
 }
@@ -733,6 +774,8 @@ struct LumaIntraSyntax<'a> {
     n_h: usize,
     /// The MPM cascade (unused for a MIP CU).
     ms: &'a IntraModeSyntax,
+    /// `intra_subpartitions_mode_flag = 1` with its split direction.
+    isp: Option<crate::leaf_cu::IspSplitType>,
 }
 
 /// r474 — the §7.3.11.5 luma intra-mode cascade of one CU, resolved
@@ -834,10 +877,27 @@ fn emit_intra_mode_bins(
             return Ok(());
         }
     }
+    // r477 — §7.3.11.5: `intra_subpartitions_mode_flag` (ctx 0) and,
+    // when set, `intra_subpartitions_split_flag` (ctx 0; 1 = vertical)
+    // precede `intra_luma_mpm_flag` on every ISP-eligible CU when the
+    // SPS enables ISP (MRL is off, so `intra_luma_ref_idx == 0`).
+    if lx.tools.isp && isp_flag_present(lx.n_w, lx.n_h) {
+        let inc = crate::ctx::ctx_inc_intra_subpartitions_mode_flag() as usize;
+        let n = ictx.isp_mode.len() - 1;
+        enc.encode_decision(&mut ictx.isp_mode[inc.min(n)], u32::from(lx.isp.is_some()))?;
+        if let Some(split) = lx.isp {
+            let inc = crate::ctx::ctx_inc_intra_subpartitions_split_flag() as usize;
+            let n = ictx.isp_split.len() - 1;
+            let vertical = matches!(split, crate::leaf_cu::IspSplitType::VerSplit);
+            enc.encode_decision(&mut ictx.isp_split[inc.min(n)], u32::from(vertical))?;
+        }
+    }
     let inc = ctx_inc_intra_luma_mpm_flag() as usize;
     enc.encode_decision(&mut ictx.mpm_flag[inc], u32::from(ms.mpm_flag))?;
     if ms.mpm_flag {
-        let inc = ctx_inc_intra_luma_not_planar_flag(false) as usize;
+        // Table 132: the ctxInc of `intra_luma_not_planar_flag` is the
+        // CU's `intra_subpartitions_mode_flag` (r477).
+        let inc = ctx_inc_intra_luma_not_planar_flag(lx.isp.is_some()) as usize;
         let n = ictx.not_planar.len() - 1;
         enc.encode_decision(&mut ictx.not_planar[inc.min(n)], u32::from(ms.not_planar))?;
         if ms.not_planar {
@@ -933,6 +993,9 @@ struct LumaTrial {
     /// r477 — the MIP choice when the trial is matrix-predicted
     /// (`mode` then reads PLANAR).
     mip: Option<MipChoice>,
+    /// r477 — the ISP split when the trial is sub-partitioned
+    /// (`levels` holds the partitions back to back).
+    isp: Option<crate::leaf_cu::IspSplitType>,
     levels: Vec<i32>,
     rec: Vec<u16>,
     sse: u64,
@@ -1069,7 +1132,44 @@ fn code_luma_tb_with_pred(
     syntax: IntraModeSyntax,
     mip: Option<MipChoice>,
 ) -> Result<LumaTrial> {
-    let bd = rec_plane.bit_depth;
+    let (levels, rec, sse) = code_residual_block(
+        src,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        &pred,
+        qp,
+        rc,
+        rec_plane.bit_depth,
+    )?;
+    Ok(LumaTrial {
+        mode,
+        syntax,
+        mip,
+        isp: None,
+        levels,
+        rec,
+        sse,
+    })
+}
+
+/// r477 — forward-code one luma block from its prediction: residual,
+/// DCT-II + the §7.3.11.11 32-corner zero-out, quantisation (flat /
+/// dep-quant / SDH), dequantisation and inverse transform;
+/// returns `(levels, reconstruction, SSE against the source)`.
+#[allow(clippy::too_many_arguments)]
+fn code_residual_block(
+    src: &PicturePlane,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    pred: &[i16],
+    qp: i32,
+    rc: crate::residual::RcOpts,
+    bd: u32,
+) -> Result<(Vec<i32>, Vec<u16>, u64)> {
     let qp_prime = qp + 6 * (bd as i32 - 8);
     let max_v = (1i32 << bd) - 1;
     let mut residual = vec![0i32; n_tb_w * n_tb_h];
@@ -1124,10 +1224,188 @@ fn code_luma_tb_with_pred(
         let d = i64::from(v - src_blk[i]);
         sse += (d * d) as u64;
     }
+    Ok((levels, rec, sse))
+}
+
+/// r477 — the §8.4.5.1 prediction of one ISP sub-partition: the
+/// decoder's `predict_intra` with the transform block set to the
+/// partition and the coding block to the CU (eqs. 315 / 316 reference
+/// extension, the §8.4.5.2.7 remap on the CU dims, no reference
+/// filter), availability through the eq. 1212 mask — the partitions
+/// reconstructed before this one are already marked.
+#[allow(clippy::too_many_arguments)]
+fn predict_block_isp(
+    plane: &PicturePlane,
+    avail: &[bool],
+    aw: usize,
+    ah: usize,
+    region: (i32, i32, i32, i32, i32),
+    x0: usize,
+    y0: usize,
+    n_w: usize,
+    n_h: usize,
+    cu_w: usize,
+    cu_h: usize,
+    mode: u32,
+) -> Result<Vec<i16>> {
+    let (rx0, ry0, rx1, ry1, rcap) = region;
+    predict_intra(
+        &IntraPredParams {
+            mode,
+            n_tb_w: n_w,
+            n_tb_h: n_h,
+            n_cb_w: cu_w,
+            n_cb_h: cu_h,
+            c_idx: 0,
+            isp_no_split: false,
+            ref_idx: 0,
+            bdpcm: false,
+            bit_depth: plane.bit_depth,
+        },
+        |dx: i32, dy: i32| {
+            let x = x0 as i32 + dx;
+            let y = y0 as i32 + dy;
+            if x < 0 || y < 0 || x >= aw as i32 || y >= ah as i32 {
+                return None;
+            }
+            if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= rcap {
+                return None;
+            }
+            if !avail[(y as usize) * aw + x as usize] {
+                return None;
+            }
+            plane.get(x as usize, y as usize).map(|v| v as i16)
+        },
+    )
+}
+
+/// r477 — code a CU under one ISP split in `mode`: the partitions are
+/// predicted and reconstructed in §7.3.11.9 order, each from the
+/// reconstruction of the ones before it (written into `rec_plane`
+/// and marked in `avail` for the duration of the trial, then
+/// restored). Returns the trial with `levels` holding the partitions
+/// back to back and `rec` the whole CU.
+#[allow(clippy::too_many_arguments)]
+fn code_luma_cu_isp_trial(
+    src: &PicturePlane,
+    rec_plane: &mut PicturePlane,
+    avail: &mut EncAvail,
+    x: usize,
+    y: usize,
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    rc: crate::residual::RcOpts,
+    mode: u32,
+    syntax: IntraModeSyntax,
+    split: crate::leaf_cu::IspSplitType,
+) -> Result<LumaTrial> {
+    let parts = crate::isp::iter_isp_partitions(split, n_tb_w as u32, n_tb_h as u32);
+    let bd = rec_plane.bit_depth;
+    // Snapshot the CU rectangle (samples + eq. 1212 mask).
+    let snap_luma = copy_rect(
+        &rec_plane.samples,
+        rec_plane.stride,
+        rec_plane.width,
+        rec_plane.height,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+    );
+    let snap_avail = copy_rect(&avail.luma, avail.w, avail.w, avail.h, x, y, n_tb_w, n_tb_h);
+    let region = avail.region_for(0);
+    let mut levels = Vec::with_capacity(n_tb_w * n_tb_h);
+    let mut sse = 0u64;
+    let mut result: Result<()> = Ok(());
+    for p in &parts {
+        let (n_w, n_h) = (p.n_w as usize, p.n_h as usize);
+        let (ax, ay) = (x + p.x_offset as usize, y + p.y_offset as usize);
+        let pred = match predict_block_isp(
+            rec_plane,
+            &avail.luma,
+            avail.w,
+            avail.h,
+            region,
+            ax,
+            ay,
+            n_w,
+            n_h,
+            n_tb_w,
+            n_tb_h,
+            mode,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
+        let (l, rec, e) = match code_residual_block(src, ax, ay, n_w, n_h, &pred, qp, rc, bd) {
+            Ok(v) => v,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
+        for ty in 0..n_h {
+            for tx in 0..n_w {
+                let (rx, ry) = (ax + tx, ay + ty);
+                if rx < rec_plane.width && ry < rec_plane.height {
+                    rec_plane.samples[ry * rec_plane.stride + rx] = rec[ty * n_w + tx];
+                }
+            }
+        }
+        avail.mark_luma(ax, ay, n_w, n_h);
+        levels.extend_from_slice(&l);
+        sse += e;
+    }
+    // The whole-CU reconstruction, then restore the trial's writes.
+    let rec = copy_rect(
+        &rec_plane.samples,
+        rec_plane.stride,
+        rec_plane.width,
+        rec_plane.height,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+    );
+    paste_rect(
+        &mut rec_plane.samples,
+        rec_plane.stride,
+        rec_plane.width,
+        rec_plane.height,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        &snap_luma,
+    );
+    paste_rect(
+        &mut avail.luma,
+        avail.w,
+        avail.w,
+        avail.h,
+        x,
+        y,
+        n_tb_w,
+        n_tb_h,
+        &snap_avail,
+    );
+    result?;
+    // `copy_rect` clips at the plane edge; every CU lies inside the
+    // coded picture (a multiple of 8), so the rectangle is complete.
+    if rec.len() != n_tb_w * n_tb_h {
+        return Err(Error::invalid(
+            "h266 encoder: ISP trial on a CU crossing the coded picture",
+        ));
+    }
     Ok(LumaTrial {
         mode,
         syntax,
-        mip,
+        mip: None,
+        isp: Some(split),
         levels,
         rec,
         sse,
@@ -1138,8 +1416,9 @@ fn code_luma_tb_with_pred(
 /// §7.3.11.5 mode cascade, `tu_y_coded_flag` and the §7.3.11.11
 /// residual bins, coded into a scratch engine with fresh contexts.
 fn estimate_luma_tb_bits(
-    lx: LumaIntraSyntax<'_>,
-    levels: &[i32],
+    trial: &LumaTrial,
+    tools: IntraTools,
+    nbr: MipNbr,
     n_tb_w: usize,
     n_tb_h: usize,
     qp: i32,
@@ -1148,12 +1427,27 @@ fn estimate_luma_tb_bits(
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut ictx = IntraModeCtxs::init(qp);
     let mut rctx = ResidualCtxs::init(qp);
-    emit_intra_mode_bins(&mut enc, &mut ictx, lx, false)?;
-    let cbf = levels.iter().any(|&l| l != 0);
-    write_tu_y_coded_flag(&mut enc, &mut rctx, cbf, false, false, false)?;
-    if cbf {
-        encode_tb_coefficients_opts(&mut enc, &mut rctx, n_tb_w, n_tb_h, 0, levels, rc)?;
-    }
+    // A luma-only view of the trial through the real TU emitter (the
+    // cascade, the CBF bins — ISP inference included — and the
+    // residual bins); `cu_qp_delta` is left out.
+    let tb = PreparedLumaTb {
+        n_tb_w,
+        n_tb_h,
+        levels: trial.levels.clone(),
+        n_tb_chroma_w: 0,
+        n_tb_chroma_h: 0,
+        cb_levels: Vec::new(),
+        cr_levels: Vec::new(),
+        cu_qp_local: qp,
+        transform_skip: false,
+        luma_mode: trial.mode,
+        mode_syntax: trial.syntax,
+        mip: trial.mip,
+        tools,
+        isp: trial.isp,
+    };
+    let mut qp_state = QpDeltaState::new(false, qp);
+    emit_tu_with_cbf(&mut enc, &mut rctx, &mut ictx, &tb, &mut qp_state, rc, nbr)?;
     Ok(enc.estimated_bits())
 }
 
@@ -1165,8 +1459,8 @@ fn estimate_luma_tb_bits(
 #[allow(clippy::too_many_arguments)]
 fn decide_luma_mode(
     src: &PicturePlane,
-    rec_plane: &PicturePlane,
-    avail: &EncAvail,
+    rec_plane: &mut PicturePlane,
+    avail: &mut EncAvail,
     x: usize,
     y: usize,
     n_tb_w: usize,
@@ -1310,18 +1604,58 @@ fn decide_luma_mode(
                 )?
             }
         };
-        let lx = LumaIntraSyntax {
-            tools,
-            mip: trial.mip,
-            nbr,
-            n_w: n_tb_w,
-            n_h: n_tb_h,
-            ms: &trial.syntax,
-        };
-        let bits = estimate_luma_tb_bits(lx, &trial.levels, n_tb_w, n_tb_h, qp, rc)?;
+        let bits = estimate_luma_tb_bits(&trial, tools, nbr, n_tb_w, n_tb_h, qp, rc)?;
         let cost = trial.sse as f64 + lambda * bits;
         if best.as_ref().map(|(c, _)| cost < *c).unwrap_or(true) {
             best = Some((cost, trial));
+        }
+    }
+    // r477 — §8.4.5.1 intra sub-partitions: the best-ranked angular
+    // mode (and the RD winner's mode when it is a different angular
+    // one) coded under each candidate split, partitions predicted
+    // from each other; the lowest `SSE + λ · bits` over the whole CU
+    // wins against the single-TB choice.
+    if tools.isp {
+        let splits = isp_candidate_splits(n_tb_w, n_tb_h);
+        if !splits.is_empty() {
+            let mut modes: Vec<u32> = Vec::with_capacity(2);
+            if let Some(LumaCand::Angular(m)) = scored
+                .iter()
+                .map(|s| s.1)
+                .find(|c| matches!(c, LumaCand::Angular(_)))
+            {
+                modes.push(m);
+            }
+            if let Some((_, t)) = best.as_ref() {
+                if t.mip.is_none() && !modes.contains(&t.mode) {
+                    modes.push(t.mode);
+                }
+            }
+            for split in splits {
+                for &mode in &modes {
+                    let syntax = mode_syntax_for(mode, &cand);
+                    let trial = code_luma_cu_isp_trial(
+                        src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc, mode, syntax, split,
+                    )?;
+                    // §7.3.11.10: the last partition's `tu_y_coded_flag`
+                    // is inferred 1 when every earlier one is 0, so an
+                    // ISP CU must carry at least one non-zero level —
+                    // an all-zero split is not a legal choice.
+                    if trial.levels.iter().all(|&l| l == 0) {
+                        continue;
+                    }
+                    let bits = estimate_luma_tb_bits(&trial, tools, nbr, n_tb_w, n_tb_h, qp, rc)?;
+                    // NB the partition boundaries become §8.8.3.3
+                    // transform edges the deblocker filters at bS = 2
+                    // afterwards — a cost this pre-filter measure does
+                    // not see (the reason ISP is opt-in; see
+                    // `EncoderConfig::intra_isp`).
+                    let cost = trial.sse as f64 + lambda * bits;
+                    if best.as_ref().map(|(c, _)| cost < *c).unwrap_or(true) {
+                        best = Some((cost, trial));
+                    }
+                }
+            }
         }
     }
     Ok(best.map(|(_, t)| t).expect("at least one intra candidate"))
@@ -1735,10 +2069,10 @@ fn prepare_luma_tb(
     n_tb_h: usize,
     qp: i32,
     rc: crate::residual::RcOpts,
-) -> Result<(Vec<i32>, u32, IntraModeSyntax, Option<MipChoice>)> {
+) -> Result<LumaTrial> {
     let trial = decide_luma_mode(src, rec_plane, avail, x, y, n_tb_w, n_tb_h, qp, rc)?;
     commit_luma_trial(rec_plane, avail, x, y, n_tb_w, n_tb_h, &trial);
-    Ok((trial.levels, trial.mode, trial.syntax, trial.mip))
+    Ok(trial)
 }
 
 /// Round-51 — emit the §7.3.10 `transform_unit()` for one prepared TB:
@@ -1779,9 +2113,13 @@ fn emit_tu_with_cbf(
             n_w: tb.n_tb_w,
             n_h: tb.n_tb_h,
             ms: &tb.mode_syntax,
+            isp: tb.isp,
         },
         tb.n_tb_chroma_w > 0,
     )?;
+    if let Some(split) = tb.isp {
+        return emit_isp_transform_tree(enc, ctxs, tb, qp_state, rc_opts, split);
+    }
 
     let cbf_y = tb.levels.iter().any(|&l| l != 0);
     let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
@@ -1882,6 +2220,102 @@ fn emit_tu_with_cbf(
                 &tb.cr_levels,
                 rc_opts,
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// r477 — §7.3.11.9 / §7.3.11.10 transform tree of an ISP CU: one
+/// `transform_unit()` per sub-partition in walk order. The chroma CBFs
+/// open the last partition's TU; `tu_y_coded_flag` is coded with the
+/// ISP ctxInc (`2 + prev_tu_cbf_y`) except on the last partition when
+/// every earlier one was zero (inferred 1 — the encoder then codes
+/// that partition's residual even if its levels are all zero);
+/// `cu_qp_delta` rides the first TU whose CBFs open the gate; each
+/// partition's luma residual follows its CBF bins and the chroma
+/// residuals close the last TU. `transform_skip_flag` is never present
+/// on an ISP luma TB.
+fn emit_isp_transform_tree(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    ctxs: &mut ResidualCtxs,
+    tb: &PreparedLumaTb,
+    qp_state: &mut QpDeltaState,
+    rc_opts: crate::residual::RcOpts,
+    split: crate::leaf_cu::IspSplitType,
+) -> Result<()> {
+    let parts = crate::isp::iter_isp_partitions(split, tb.n_tb_w as u32, tb.n_tb_h as u32);
+    let n = parts.len();
+    if n < 2 {
+        return Err(Error::invalid("h266 encoder: ISP emit on an unsplit CU"));
+    }
+    let per = tb.n_tb_w * tb.n_tb_h / n;
+    if tb.levels.len() != per * n {
+        return Err(Error::invalid(
+            "h266 encoder: ISP level array does not cover the partitions",
+        ));
+    }
+    let chroma_present = tb.n_tb_chroma_w > 0;
+    let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
+    let cbf_cr = tb.cr_levels.iter().any(|&l| l != 0);
+    let mut infer_luma = true;
+    let mut prev_cbf_y = false;
+    for (i, p) in parts.iter().enumerate() {
+        let is_last = i == n - 1;
+        let levels = &tb.levels[i * per..(i + 1) * per];
+        let has_levels = levels.iter().any(|&l| l != 0);
+        if is_last && chroma_present {
+            write_tu_cb_coded_flag(enc, ctxs, cbf_cb, false)?;
+            write_tu_cr_coded_flag(enc, ctxs, cbf_cr, false, cbf_cb)?;
+        }
+        let coded = if !is_last || !infer_luma {
+            write_tu_y_coded_flag(enc, ctxs, has_levels, false, true, prev_cbf_y)?;
+            has_levels
+        } else {
+            true // inferred: the last partition after all-zero ones
+        };
+        prev_cbf_y = coded;
+        infer_luma = infer_luma && !coded;
+        let chroma_cbf_here = is_last && chroma_present && (cbf_cb || cbf_cr);
+        if (coded || chroma_cbf_here) && qp_state.enabled && qp_state.pending {
+            let delta = tb.cu_qp_local - qp_state.prev_qp_in_qg;
+            write_cu_qp_delta(enc, ctxs, delta)?;
+            qp_state.prev_qp_in_qg = tb.cu_qp_local;
+            qp_state.pending = false;
+        }
+        if coded {
+            encode_tb_coefficients_opts(
+                enc,
+                ctxs,
+                p.n_w as usize,
+                p.n_h as usize,
+                0,
+                levels,
+                rc_opts,
+            )?;
+        }
+        if is_last && chroma_present {
+            if cbf_cb {
+                encode_tb_coefficients_opts(
+                    enc,
+                    ctxs,
+                    tb.n_tb_chroma_w,
+                    tb.n_tb_chroma_h,
+                    1,
+                    &tb.cb_levels,
+                    rc_opts,
+                )?;
+            }
+            if cbf_cr {
+                encode_tb_coefficients_opts(
+                    enc,
+                    ctxs,
+                    tb.n_tb_chroma_w,
+                    tb.n_tb_chroma_h,
+                    2,
+                    &tb.cr_levels,
+                    rc_opts,
+                )?;
+            }
         }
     }
     Ok(())
@@ -2337,7 +2771,14 @@ fn prepare_leaf_cu(
     rc: crate::residual::RcOpts,
     chroma_scale: Option<u32>,
 ) -> Result<PreparedCu> {
-    let (levels, luma_mode, mode_syntax, mip) = prepare_luma_tb(
+    let LumaTrial {
+        levels,
+        mode: luma_mode,
+        syntax: mode_syntax,
+        mip,
+        isp,
+        ..
+    } = prepare_luma_tb(
         &src.luma,
         &mut rec.luma,
         avail,
@@ -2367,6 +2808,7 @@ fn prepare_leaf_cu(
             mode_syntax,
             mip,
             tools,
+            isp,
         }));
     }
     // §8.4.3 — DM chroma of a MIP CU reads PLANAR, except a 4:4:4
@@ -2447,6 +2889,7 @@ fn prepare_leaf_cu(
         mode_syntax,
         mip,
         tools,
+        isp,
     }))
 }
 
@@ -2481,6 +2924,7 @@ fn prepare_leaf_cu_lossless(
             mode_syntax,
             mip: None,
             tools: avail.tools,
+            isp: None,
         }));
     }
     let chroma_mode = chroma_dm_mode(avail, luma_mode);
@@ -2524,6 +2968,7 @@ fn prepare_leaf_cu_lossless(
         mode_syntax,
         mip: None,
         tools: avail.tools,
+        isp: None,
     }))
 }
 
@@ -3719,11 +4164,12 @@ fn emit_prepared_cu(
             // emitted leaf CU (companion of the decoder's `H266_DBG_CU`).
             if std::env::var_os("H266_ENC_DBG_CU").is_some() {
                 eprintln!(
-                    "ENC CU ({x},{y}) {}x{} modeY={} mip={:?} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
+                    "ENC CU ({x},{y}) {}x{} modeY={} mip={:?} isp={:?} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
                     tb.n_tb_w,
                     tb.n_tb_h,
                     tb.luma_mode,
                     tb.mip,
+                    tb.isp,
                     tb.levels.iter().any(|&l| l != 0),
                     tb.cb_levels.iter().any(|&l| l != 0),
                     tb.cr_levels.iter().any(|&l| l != 0),
@@ -4008,6 +4454,33 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
         PreparedCu::Leaf(tb) => {
             let cbf_cb = tb.cb_levels.iter().any(|&l| l != 0);
             let cbf_cr = tb.cr_levels.iter().any(|&l| l != 0);
+            // r477 — §8.8.3.3: an ISP CU's interior partition
+            // boundaries are transform-block edges (the decoder's
+            // record shape: luma-only split, per-TB `y_coded` = the
+            // CU-level flag).
+            let tb_split = tb.isp.and_then(|split| {
+                let parts =
+                    crate::isp::iter_isp_partitions(split, tb.n_tb_w as u32, tb.n_tb_h as u32);
+                if parts.len() < 2 {
+                    return None;
+                }
+                let vertical = matches!(split, crate::leaf_cu::IspSplitType::VerSplit);
+                let mut bounds = [0u32; 3];
+                for (i, p) in parts.iter().skip(1).enumerate() {
+                    bounds[i] = if vertical { p.x_offset } else { p.y_offset };
+                }
+                let y_coded = tb.levels.iter().any(|&l| l != 0);
+                Some(crate::deblock::TbSplit {
+                    vertical,
+                    n_bounds: (parts.len() - 1) as u8,
+                    bounds,
+                    y_coded: [y_coded; 4],
+                    cb_coded: [false; 4],
+                    cr_coded: [false; 4],
+                    jc2: [false; 4],
+                    luma_only: true,
+                })
+            });
             out.push(DeblockCu {
                 x: x as u32,
                 y: y as u32,
@@ -4027,7 +4500,7 @@ fn accumulate_deblock_cus(cu: &PreparedCu, x: usize, y: usize, out: &mut Vec<Deb
                 ibc: false,
                 num_sb: None,
                 tu64: None,
-                tb_split: None,
+                tb_split,
             });
         }
         PreparedCu::BtSplit {
@@ -4166,6 +4639,8 @@ pub struct EncodeStats {
     pub mip_cus: u32,
     /// CUs coded with `intra_subpartitions_mode_flag = 1` (§8.4.5.1).
     pub isp_cus: u32,
+    /// The horizontally split ones among [`Self::isp_cus`].
+    pub isp_hor_cus: u32,
     /// CUs coded with `intra_bdpcm_luma_flag = 1` (§7.3.11.5).
     pub bdpcm_cus: u32,
 }
@@ -4315,6 +4790,7 @@ fn encode_idr_impl(
     // emit pass writes the flag bins the SPS declares).
     avail.tools = IntraTools {
         mip: config.intra_mip,
+        isp: config.intra_isp,
     };
     // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
     // partition fields; drive every split-bin presence + ctxInc.
@@ -4550,6 +5026,12 @@ fn encode_idr_impl(
                         stats.cus += 1;
                         if tb.mip.is_some() {
                             stats.mip_cus += 1;
+                        }
+                        if let Some(split) = tb.isp {
+                            stats.isp_cus += 1;
+                            if matches!(split, crate::leaf_cu::IspSplitType::HorSplit) {
+                                stats.isp_hor_cus += 1;
+                            }
                         }
                     });
                     accumulate_deblock_cus(&cu, tb_x, tb_y, &mut all_deblock_cus);
@@ -6899,6 +7381,7 @@ mod tests {
                 cu_qp_local: 26,
                 mip: None,
                 tools: IntraTools::default(),
+                isp: None,
             })
         };
         let a = mk_leaf(16, 64);

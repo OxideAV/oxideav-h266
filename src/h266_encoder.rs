@@ -83,7 +83,9 @@ pub struct H266EncoderOptions {
     /// Matrix-based intra prediction candidates in the intra decision
     /// (default true).
     pub mip: bool,
-    /// Intra sub-partitions in the intra decision (default true).
+    /// Intra sub-partitions in the intra decision (default false —
+    /// conformant but a net loss on textured content with the current
+    /// pre-filter decision; see `EncoderConfig::intra_isp`).
     pub isp: bool,
     /// Block-based delta pulse code modulation in the intra decision
     /// (default true).
@@ -113,7 +115,7 @@ impl Default for H266EncoderOptions {
             wpp: false,
             palette: false,
             mip: true,
-            isp: true,
+            isp: false,
             bdpcm: true,
         }
     }
@@ -202,8 +204,8 @@ impl CodecOptionsStruct for H266EncoderOptions {
         OptionField {
             name: "isp",
             kind: OptionKind::Bool,
-            default: OptionValue::Bool(true),
-            help: "intra sub-partition candidates in the intra decision",
+            default: OptionValue::Bool(false),
+            help: "intra sub-partition candidates in the intra decision (opt-in: conformant, a net loss on textured content with the pre-filter decision)",
         },
         OptionField {
             name: "bdpcm",

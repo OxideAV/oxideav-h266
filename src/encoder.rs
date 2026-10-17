@@ -454,7 +454,12 @@ pub struct EncoderConfig {
     pub intra_mip: bool,
     /// r477 — intra sub-partition (§8.4.5.1 / §7.3.11.5
     /// `intra_subpartitions_mode_flag`) candidates in the per-CU intra
-    /// decision; `sps_isp_enabled_flag` follows. Default `true`.
+    /// decision; `sps_isp_enabled_flag` follows. Default `false`:
+    /// the election is conformant and byte-exact but, with the
+    /// pre-filter `SSE + λ · bits` measure, it cost 0.2 – 0.7 % bytes
+    /// at −0.04 dB on textured probes (the partition edges are
+    /// deblocked at bS = 2 afterwards) — opt in for content where it
+    /// pays, or until the decision prices the deblocking.
     pub intra_isp: bool,
     /// r477 — block-based delta pulse code modulation (§7.3.11.5
     /// `intra_bdpcm_luma_flag`, §8.7.3 eqs. 1153 / 1154) candidates in
@@ -490,7 +495,7 @@ impl EncoderConfig {
             lossless: false,
             rdo_cu_split: true,
             intra_mip: true,
-            intra_isp: true,
+            intra_isp: false,
             intra_bdpcm: true,
         }
     }
@@ -1016,7 +1021,7 @@ impl VvcEncoder {
                          // MaxNumMergeCand = 6 >= 2 → gpm_enabled.
         bw.write_bit(0); // gpm_enabled = 0
         bw.write_ue(0); // log2_parallel_merge_level_minus2
-        bw.write_bit(0); // isp
+        bw.write_bit(self.config.intra_isp as u8); // sps_isp_enabled_flag (r477)
         bw.write_bit(0); // mrl
         bw.write_bit(self.config.intra_mip as u8); // sps_mip_enabled_flag (r477)
         if chroma {

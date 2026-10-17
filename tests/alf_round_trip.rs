@@ -701,6 +701,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     // without an `intra_mip_flag` bin, so the SPS must not enable MIP.
     let mut cfg = oxideav_h266::encoder::EncoderConfig::new(128, 128);
     cfg.intra_mip = false;
+    cfg.intra_isp = false;
     let (bs, _) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
 
     let nals: Vec<_> = iter_annex_b(&bs).collect();
@@ -1183,6 +1184,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     // r477 — the walk reads the cascade without an `intra_mip_flag`
     // bin: MIP stays off in the SPS.
     cfg.intra_mip = false;
+    cfg.intra_isp = false;
     let (bs, _) = encode_idr_with_qp_picker_cfg(&src, slice_qp_y, cfg, qp_for).unwrap();
 
     // Parse VPS / SPS / PPS / PH / SH.

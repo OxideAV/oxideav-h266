@@ -286,3 +286,194 @@ fn black_box_decoder_agrees_on_mip_streams() {
         }
     }
 }
+
+/// ISP (opt-in) is elected on textured content in every chroma format
+/// at 8 and 10 bits — both split directions, 4-sample partitions
+/// upwards — and the streams decode byte-exact through this crate's
+/// decoder. The size / PSNR effect against the same encoder without it
+/// is reported (the pre-filter decision does not see the deblocking of
+/// the partition edges, which is why the tool is off by default).
+#[test]
+fn isp_is_elected_and_decodes_byte_exact() {
+    let (mut total_on, mut total_off) = (0usize, 0usize);
+    let (mut psnr_on, mut psnr_off) = (0.0f64, 0.0f64);
+    let mut hor = 0u32;
+    let mut ver = 0u32;
+    for &cf in &[0u32, 1, 2, 3] {
+        for &bd in &[8u32, 10] {
+            let (w, h) = (128usize, 96usize);
+            let src = textured_source(w, h, cf, bd, 21 + cf * 3 + bd);
+            let qp = 30;
+            let (bs_off, _, s_off, p_off) =
+                round_trip(&src, cfg_for(w, h, cf, false, false, false), qp, "isp off");
+            let (bs_on, _, s_on, p_on) =
+                round_trip(&src, cfg_for(w, h, cf, false, true, false), qp, "isp on");
+            assert_eq!(s_off.isp_cus, 0);
+            assert!(
+                s_on.isp_cus > 0,
+                "cf{cf} {bd}-bit: no CU elected ISP ({} CUs)",
+                s_on.cus
+            );
+            hor += s_on.isp_hor_cus;
+            ver += s_on.isp_cus - s_on.isp_hor_cus;
+            println!(
+                "cf{cf} {bd}-bit QP{qp}: ISP {}/{} CUs, {} -> {} B, {p_off:.2} -> {p_on:.2} dB",
+                s_on.isp_cus,
+                s_on.cus,
+                bs_off.len(),
+                bs_on.len()
+            );
+            total_on += bs_on.len();
+            total_off += bs_off.len();
+            psnr_on += p_on;
+            psnr_off += p_off;
+        }
+    }
+    assert!(
+        hor > 0 && ver > 0,
+        "both split directions elected ({hor} / {ver})"
+    );
+    println!(
+        "all cells: {total_off} -> {total_on} B, mean PSNR {:.3} -> {:.3} dB, {hor} horizontal / {ver} vertical",
+        psnr_off / 8.0,
+        psnr_on / 8.0
+    );
+}
+
+/// ISP next to MIP and the MTT pickers, across QPs, with dependent
+/// quantisation / sign hiding, on odd geometry: every stream decodes
+/// byte-exact.
+#[test]
+fn isp_with_the_other_tools() {
+    let (w, h) = (192usize, 128usize);
+    let src = textured_source(w, h, 1, 8, 42);
+    let mut elected = 0;
+    for qp in [18, 27, 36, 45] {
+        let (_, _, s, p) = round_trip(&src, cfg_for(w, h, 1, true, true, false), qp, "qp");
+        println!(
+            "QP{qp}: ISP {} + MIP {} of {} CUs, {p:.2} dB",
+            s.isp_cus, s.mip_cus, s.cus
+        );
+        elected += s.isp_cus;
+    }
+    assert!(elected > 0, "no ISP CU across the QP sweep");
+    let mut cfg = cfg_for(w, h, 1, true, true, false);
+    cfg.enable_mtt_bt_picker = true;
+    cfg.enable_mtt_tt_picker = true;
+    round_trip(&src, cfg, 30, "mtt + isp + mip");
+    let src_odd = textured_source(77, 45, 1, 8, 8);
+    round_trip(&src_odd, cfg_for(77, 45, 1, true, true, false), 28, "odd");
+    let src_small = textured_source(64, 64, 1, 8, 12);
+    for (dq, sdh) in [(true, false), (false, true)] {
+        let mut cfg = cfg_for(64, 64, 1, true, true, false);
+        cfg.dep_quant = dq;
+        cfg.sign_data_hiding = sdh;
+        round_trip(&src_small, cfg, 30, "dq/sdh + isp");
+    }
+}
+
+/// Black-box validation through `ffmpeg` (opaque process; no-op where
+/// the binary is absent): ISP-heavy streams of every format and depth
+/// decode to the encoder reconstruction.
+#[test]
+fn black_box_decoder_agrees_on_isp_streams() {
+    let probe = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(probe, Ok(s) if s.success()) {
+        eprintln!("ffmpeg not installed — black-box leg skipped");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("oxideav-h266-r477-isp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for &cf in &[0u32, 1, 2, 3] {
+        for &bd in &[8u32, 10] {
+            let (w, h) = (128usize, 96usize);
+            let src = textured_source(w, h, cf, bd, 60 + cf * 2 + bd);
+            let cfg = cfg_for(w, h, cf, true, true, false);
+            let label = format!("cf{cf} {bd}-bit");
+            let (bs, rec, stats, _) = round_trip(&src, cfg, 28, &label);
+            assert!(stats.isp_cus > 0, "{label}: no ISP CU to validate");
+            black_box_matches(&dir, &label, &bs, &rec, cf, bd, w, h, &cfg);
+        }
+    }
+}
+
+/// Run `ffmpeg` on `bs` and compare its raw output with `rec`.
+#[allow(clippy::too_many_arguments)]
+fn black_box_matches(
+    dir: &std::path::Path,
+    label: &str,
+    bs: &[u8],
+    rec: &PictureBuffer,
+    cf: u32,
+    bd: u32,
+    w: usize,
+    h: usize,
+    cfg: &EncoderConfig,
+) {
+    let pix_fmt = match (cf, bd) {
+        (0, 8) => "gray",
+        (0, _) => "gray10le",
+        (1, 8) => "yuv420p",
+        (1, _) => "yuv420p10le",
+        (2, 8) => "yuv422p",
+        (2, _) => "yuv422p10le",
+        (_, 8) => "yuv444p",
+        (_, _) => "yuv444p10le",
+    };
+    let bit = dir.join(format!("{}.266", label.replace(' ', "_")));
+    let yuv = dir.join(format!("{}.yuv", label.replace(' ', "_")));
+    std::fs::write(&bit, bs).unwrap();
+    let st = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&bit)
+        .args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
+        .arg(&yuv)
+        .status()
+        .unwrap();
+    assert!(st.success(), "{label}: black-box decode failed");
+    let raw = std::fs::read(&yuv).unwrap();
+    let data: Vec<u16> = if bd > 8 {
+        raw.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    } else {
+        raw.iter().map(|&b| u16::from(b)).collect()
+    };
+    let (sw, shh) = cfg.chroma_subsampling();
+    let (ocw, och) = if cf == 0 {
+        (0, 0)
+    } else {
+        (w / sw as usize, h / shh as usize)
+    };
+    assert_eq!(data.len(), w * h + 2 * ocw * och, "{label}: geometry");
+    let mut n = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if data[y * w + x] != rec.luma.samples[y * rec.luma.stride + x] {
+                n += 1;
+            }
+        }
+    }
+    if cf != 0 {
+        let cb0 = w * h;
+        let cr0 = cb0 + ocw * och;
+        for y in 0..och {
+            for x in 0..ocw {
+                if data[cb0 + y * ocw + x] != rec.cb.samples[y * rec.cb.stride + x] {
+                    n += 1;
+                }
+                if data[cr0 + y * ocw + x] != rec.cr.samples[y * rec.cr.stride + x] {
+                    n += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        n, 0,
+        "{label}: black-box output differs from the reconstruction"
+    );
+}
