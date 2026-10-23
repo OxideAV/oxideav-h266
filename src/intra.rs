@@ -63,7 +63,7 @@ pub fn predict_planar(n_tb_w: usize, n_tb_h: usize, refs: &IntraRefs<'_>) -> Res
         for x in 0..n_tb_w {
             let p_a = refs.above[x] as i32; // p[x][-1]
             let p_l = refs.left[y] as i32; // p[-1][y]
-                                           // eq. 330 / 331
+            // eq. 330 / 331
             let pred_v = ((n_tb_h as i32 - 1 - y as i32) * p_a + (y as i32 + 1) * p_bl) << log2_w;
             let pred_h = ((n_tb_w as i32 - 1 - x as i32) * p_l + (x as i32 + 1) * p_tr) << log2_h;
             // eq. 332
@@ -325,11 +325,7 @@ pub fn inv_angle(intra_pred_angle: i32) -> i32 {
     debug_assert_ne!(intra_pred_angle, 0);
     let a = intra_pred_angle.unsigned_abs() as i64;
     let v = ((16384 * 2 + a) / (2 * a)) as i32;
-    if intra_pred_angle < 0 {
-        -v
-    } else {
-        v
-    }
+    if intra_pred_angle < 0 { -v } else { v }
 }
 
 /// Table 25 — `fC[ phase ][ j ]` interpolation filter coefficients.
@@ -768,11 +764,7 @@ pub fn pdpc_applies(mode: i32, n_tb_w: usize, n_tb_h: usize, ref_idx: usize, bdp
 #[inline]
 fn pdpc_weight(coord: i32, n_scale: i32) -> i32 {
     let shift = (coord << 1) >> n_scale;
-    if shift >= 6 {
-        0
-    } else {
-        32 >> shift
-    }
+    if shift >= 6 { 0 } else { 32 >> shift }
 }
 
 /// §8.4.5.2.15 — position-dependent intra prediction sample filtering.
@@ -1567,11 +1559,7 @@ mod tests {
         let pred = predict_intra(
             &params,
             |x, y| {
-                if y == -1 && x >= 0 {
-                    Some(80)
-                } else {
-                    None
-                }
+                if y == -1 && x >= 0 { Some(80) } else { None }
             },
         )
         .unwrap();

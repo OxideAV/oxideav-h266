@@ -90,7 +90,7 @@
 
 use oxideav_core::Result;
 
-use crate::affine::{derive_motion_model_idc, MotionModel};
+use crate::affine::{MotionModel, derive_motion_model_idc};
 use crate::affine_syntax_enc::encode_non_merge_inter_affine;
 use crate::cabac_enc::ArithEncoder;
 use crate::inter::MotionVector;
@@ -99,8 +99,8 @@ use crate::leaf_cu::{
 };
 use crate::mvd_coding_enc::encode_mvd_coding;
 use crate::non_merge_mvp_syntax_enc::{
-    encode_inter_pred_idc, encode_mvp_lx_flag, encode_ref_idx_lx, encode_sym_mvd_flag,
-    NonMergeMvpSyntaxDecision, NonMergeMvpSyntaxGate,
+    NonMergeMvpSyntaxDecision, NonMergeMvpSyntaxGate, encode_inter_pred_idc, encode_mvp_lx_flag,
+    encode_ref_idx_lx, encode_sym_mvd_flag,
 };
 
 /// Round-190 — input to [`encode_non_merge_inter_pre_residual`].

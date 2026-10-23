@@ -347,7 +347,9 @@ mod tests {
         // First-row spot-check vs spec §8.7.4.3.
         assert_eq!(
             LFNST_16_SET0_IDX1[0],
-            [108, -44, -15, 1, -44, 19, 7, -1, -11, 6, 2, -1, 0, -1, -1, 0]
+            [
+                108, -44, -15, 1, -44, 19, 7, -1, -11, 6, 2, -1, 0, -1, -1, 0
+            ]
         );
         assert_eq!(
             LFNST_48_SET0_IDX1[0],
@@ -413,7 +415,7 @@ mod tests {
     fn inverse_lfnst_4x4_dc_only_fills_corner() {
         let mut d = vec![0i32; 16];
         d[0] = 100; // DC
-                    // Mode 0 (PLANAR) -> set 0, not transposed.
+        // Mode 0 (PLANAR) -> set 0, not transposed.
         apply_inverse_lfnst(&mut d, 4, 4, INTRA_PLANAR, 1, -32768, 32767).unwrap();
         // Column 0 of LFNST_16_SET0_IDX1 scaled by 100 then (x+64)>>7.
         // Verify the (0,0) output matches the eq. 1176 / 1165 fold.
@@ -438,9 +440,9 @@ mod tests {
         };
         let a = make(0); // not transposed
         let b = make(66); // transposed
-                          // The two corners must be transposes of each other only if the
-                          // set index is identical; mode 0 -> set 0, mode 66 -> set 1, so
-                          // they differ. Just assert both produce output and differ.
+        // The two corners must be transposes of each other only if the
+        // set index is identical; mode 0 -> set 0, mode 66 -> set 1, so
+        // they differ. Just assert both produce output and differ.
         assert_ne!(a, b);
     }
 

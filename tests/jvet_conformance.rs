@@ -24,7 +24,7 @@ fn corpus_dir() -> Option<PathBuf> {
 /// Probe mode: dump one line of SPS-derived facts per stream.
 #[test]
 fn probe_corpus_sps() {
-    use oxideav_h266::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+    use oxideav_h266::nal::{NalUnitType, extract_rbsp, iter_annex_b};
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::sps::parse_sps;
     let Some(dir) = corpus_dir() else {
@@ -114,11 +114,11 @@ fn probe_corpus_sps() {
 #[test]
 fn corpus_headers_parse() {
     use oxideav_h266::aps::parse_aps;
-    use oxideav_h266::nal::{extract_rbsp, iter_annex_b, NalUnitType};
-    use oxideav_h266::picture_header::{parse_picture_header_stateful, PictureHeader};
-    use oxideav_h266::pps::{parse_pps, PicParameterSet};
-    use oxideav_h266::slice_header::{parse_slice_header, parse_slice_header_stateful, PhState};
-    use oxideav_h266::sps::{parse_sps, SeqParameterSet};
+    use oxideav_h266::nal::{NalUnitType, extract_rbsp, iter_annex_b};
+    use oxideav_h266::picture_header::{PictureHeader, parse_picture_header_stateful};
+    use oxideav_h266::pps::{PicParameterSet, parse_pps};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header, parse_slice_header_stateful};
+    use oxideav_h266::sps::{SeqParameterSet, parse_sps};
     use std::collections::HashMap;
 
     let Some(dir) = corpus_dir() else {

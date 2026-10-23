@@ -246,7 +246,7 @@ mod tests {
         }
         fn bytes(mut self) -> Vec<u8> {
             self.bits.push(1); // stop-ish pad
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(0);
             }
             self.bits
@@ -371,7 +371,7 @@ mod tests {
                 bw.u1(0); // copy = 0
                 bw.u1(0); // pred = 0
                 bw.se(10); // dc_coef
-                           // 64 scan positions; 16 of them (x>=4 && y>=4) skipped.
+                // 64 scan positions; 16 of them (x>=4 && y>=4) skipped.
                 let scan = diag_scan_order(8, 8);
                 let mut wrote_first = false;
                 for &(x, y) in &scan {

@@ -70,35 +70,35 @@ use oxideav_core::{Error, Result};
 use crate::alf::{AlfApsBinding, AlfConfig, AlfPicture};
 use crate::bdof::{bdof_refine_into, bdof_used_flag};
 use crate::cabac::ArithDecoder;
-use crate::cclm::{predict_cclm, CclmInputs, LumaPlane};
+use crate::cclm::{CclmInputs, LumaPlane, predict_cclm};
 use crate::coding_tree::{Cu, CuNeighbourMap, MttSplitRec, TreeCtxs, TreeType, TreeWalker};
 use crate::deblock::{DeblockCu, DeblockParams};
 use crate::dequant::{
-    dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, log2_matrix_size,
-    scaling_matrix_id, DequantParams, PredModeKind,
+    DequantParams, PredModeKind, dequantize_tb_flat, dequantize_tb_with_scaling_list,
+    expand_scaling_matrix, log2_matrix_size, scaling_matrix_id,
 };
-use crate::gpm::{derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motion, GpmContext};
+use crate::gpm::{GpmContext, derive_gpm_mn, derive_gpm_partition, derive_gpm_partition_motion};
 use crate::inter::{
+    HmvpTable, MotionField, MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
     apply_mmvd_to_base_with_poc, build_merge_cand_list, build_merge_cand_list_b, ciip_intra_weight,
     derive_mmvd_offset, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
     predict_chroma_block, predict_chroma_block_bipred_bcw, predict_luma_block_bipred_bcw_hpel,
-    predict_luma_block_high_precision_hpel, predict_luma_block_hpel, HmvpTable, MotionField,
-    MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
+    predict_luma_block_high_precision_hpel, predict_luma_block_hpel,
 };
-use crate::intra::{predict_intra, IntraPredParams, RefSamples};
+use crate::intra::{IntraPredParams, RefSamples, predict_intra};
 use crate::leaf_cu::{
-    CuNeighbourhood, CuPredMode, CuToolFlags, IntraNeighbour, LeafCuCtxs, LeafCuInfo, LeafCuReader,
-    LeafCuResidual, INTRA_LT_CCLM, INTRA_L_CCLM, INTRA_PLANAR, INTRA_T_CCLM,
+    CuNeighbourhood, CuPredMode, CuToolFlags, INTRA_L_CCLM, INTRA_LT_CCLM, INTRA_PLANAR,
+    INTRA_T_CCLM, IntraNeighbour, LeafCuCtxs, LeafCuInfo, LeafCuReader, LeafCuResidual,
 };
 use crate::lmcs::{LmcsData, LmcsDerived};
 use crate::mip::predict_mip;
 use crate::pps::PicParameterSet;
-use crate::reconstruct::{clip_pixel, reconstruct_tb_into, PictureBuffer, PicturePlane};
+use crate::reconstruct::{PictureBuffer, PicturePlane, clip_pixel, reconstruct_tb_into};
 use crate::sao::{SaoConfig, SaoPicture};
-use crate::sao_syntax::{decode_sao_ctb, SaoCtxs, SaoSyntaxConfig};
+use crate::sao_syntax::{SaoCtxs, SaoSyntaxConfig, decode_sao_ctb};
 use crate::slice_header::{SliceType, StatefulSliceHeader};
 use crate::sps::SeqParameterSet;
-use crate::transform::{inverse_transform_2d, TrType};
+use crate::transform::{TrType, inverse_transform_2d};
 
 /// Build the chroma neighbour rows / columns that [`predict_cclm`] needs
 /// from the partially-reconstructed chroma plane. Returns `(top, left)`
@@ -2511,7 +2511,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // r429 — "within a tile": the row-start column is the tile's
         // left boundary, not picture x == 0.
         let ctb_size = 1u32 << ctb_log2;
-        if avail_b_row && x_qg == self.region_rect.0 && y_qg % ctb_size == 0 {
+        if avail_b_row && x_qg == self.region_rect.0 && y_qg.is_multiple_of(ctb_size) {
             return qp_at(x_qg, y_qg - 1);
         }
         (qp_a + qp_b + 1) >> 1
@@ -2783,11 +2783,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             .ok_or_else(|| Error::invalid("h266 explicit WP: no tables bound"))?;
         for c_idx in 1u32..=2 {
             fn plane_of(r: &ReferencePicture, c_idx: u32) -> &PicturePlane {
-                if c_idx == 1 {
-                    &r.frame.cb
-                } else {
-                    &r.frame.cr
-                }
+                if c_idx == 1 { &r.frame.cb } else { &r.frame.cr }
             }
             let hp =
                 |rp: Option<(&ReferencePicture, MotionVector, i32)>| -> Result<Option<Vec<i32>>> {
@@ -2889,7 +2885,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<()> {
         let (sw, sh) = self.sub_wh();
-        use crate::affine::{predict_luma_block_affine_prof_hp, AffineLumaFilterSet};
+        use crate::affine::{AffineLumaFilterSet, predict_luma_block_affine_prof_hp};
         let tables = self
             .explicit_wp
             .as_ref()
@@ -4262,11 +4258,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         }
                         let cap = ctxs.len() - 1;
                         let bit = self.arith.decode_decision(&mut ctxs[inc.min(cap)])?;
-                        if bit == 1 {
-                            1
-                        } else {
-                            2
-                        }
+                        if bit == 1 { 1 } else { 2 }
                     }
                     _ => n.mode_type,
                 };
@@ -4402,11 +4394,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // when it sits at the far side (`pos_flag == 1`), else its
         // trailing edge.
         let bound = if vertical {
-            if geo.res_x > 0 {
-                geo.res_x
-            } else {
-                geo.res_w
-            }
+            if geo.res_x > 0 { geo.res_x } else { geo.res_w }
         } else if geo.res_y > 0 {
             geo.res_y
         } else {
@@ -6243,7 +6231,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         .luma_levels
                         .iter()
                         .enumerate()
-                        .filter(|(_, &l)| l != 0)
+                        .filter(|&(_, &l)| l != 0)
                         .map(|(i, &l)| (i % n_tb_w, i / n_tb_w, l))
                         .collect::<Vec<_>>()
                 );
@@ -6769,7 +6757,18 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         f.pred_flag_l1
                     ))
                     .collect::<Vec<_>>(),
-                self.hmvp.entries.iter().map(|f| (f.mv_l0, f.ref_idx_l0, f.pred_flag_l0, f.mv_l1, f.ref_idx_l1, f.pred_flag_l1)).collect::<Vec<_>>(),
+                self.hmvp
+                    .entries
+                    .iter()
+                    .map(|f| (
+                        f.mv_l0,
+                        f.ref_idx_l0,
+                        f.pred_flag_l0,
+                        f.mv_l1,
+                        f.ref_idx_l1,
+                        f.pred_flag_l1
+                    ))
+                    .collect::<Vec<_>>(),
             );
         }
         // Round-40 §8.5.4 + §8.5.7 — Geometric Partitioning Mode (GPM).
@@ -8391,9 +8390,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::amvp::{
-            build_mvp_cand_list, derive_final_mv, derive_hmvp_mvp_candidates,
-            derive_spatial_mvp_candidates, round_mv_amvr, select_mvp, AmvpRefContext, RefList,
-            SpatialMvpCandidate,
+            AmvpRefContext, RefList, SpatialMvpCandidate, build_mvp_cand_list, derive_final_mv,
+            derive_hmvp_mvp_candidates, derive_spatial_mvp_candidates, round_mv_amvr, select_mvp,
         };
         use crate::leaf_cu::InterPredDir;
 
@@ -8646,7 +8644,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<()> {
         let (sw, sh) = self.sub_wh();
-        use crate::affine::{predict_luma_block_affine_prof_hp, AffineLumaFilterSet};
+        use crate::affine::{AffineLumaFilterSet, predict_luma_block_affine_prof_hp};
         use crate::inter::blend_bi_hp_into;
         let chroma = self.sps.sps_chroma_format_idc != 0;
         let bd = out.luma.bit_depth;
@@ -8954,7 +8952,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         amvr: crate::amvr::AmvrShift,
     ) -> crate::affine_amvp::ConstructedAffineMvpCorner {
         use crate::affine_amvp::{
-            round_constructed_corner_amvr, ConstructedAffineMvpCorner, RefList,
+            ConstructedAffineMvpCorner, RefList, round_constructed_corner_amvr,
         };
         let cur_list = ctx.list;
         for &(xnb, ynb) in positions {
@@ -9056,8 +9054,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cb_h: u32,
     ) -> crate::affine_merge::InheritedAffineCandidate {
         use crate::affine_merge::{
-            derive_inherited_affine_cpmvs, AffineMergeCandidate, InheritedAffineCandidate,
-            InheritedAffineGeom, NeighbourCpmvSource,
+            AffineMergeCandidate, InheritedAffineCandidate, InheritedAffineGeom,
+            NeighbourCpmvSource, derive_inherited_affine_cpmvs,
         };
         for &(xnb, ynb) in positions {
             let Some(nb) = self.affine_neighbour_query(xnb, ynb, xcb, ycb) else {
@@ -9208,8 +9206,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<crate::inter::AffineCbRecord> {
         use crate::affine_amvp::{
-            build_affine_mvp_cand_list, cumulate_affine_mvd_cp, derive_final_affine_cpmvs,
-            select_affine_mvp, AffineMvpListInputs, AffineMvpRefContext, RefList,
+            AffineMvpListInputs, AffineMvpRefContext, RefList, build_affine_mvp_cand_list,
+            cumulate_affine_mvd_cp, derive_final_affine_cpmvs, select_affine_mvp,
         };
         use crate::leaf_cu::InterPredDir;
 
@@ -9877,8 +9875,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         cb_h: i32,
     ) -> Option<(crate::sbtmvp::SbTmvpRecord, ReferencePicture)> {
         use crate::sbtmvp::{
-            derive_temp_mv, is_sbtmvp_available, ColBlockMotion, SbTmvpAvailability,
-            SbTmvpCenterLoc, SbTmvpFuseInputs, SbTmvpGrid, SbTmvpRecord, SbTmvpTempMvInputs,
+            ColBlockMotion, SbTmvpAvailability, SbTmvpCenterLoc, SbTmvpFuseInputs, SbTmvpGrid,
+            SbTmvpRecord, SbTmvpTempMvInputs, derive_temp_mv, is_sbtmvp_available,
         };
 
         // §8.5.5.3 first-bullet gate.
@@ -10060,7 +10058,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         col_pic: &ReferencePicture,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        use crate::sbtmvp::{fill_subblock_motion, ColBlockMotion, SbTmvpFuseInputs};
+        use crate::sbtmvp::{ColBlockMotion, SbTmvpFuseInputs, fill_subblock_motion};
 
         let xcb = cu.cu.x as i32;
         let ycb = cu.cu.y as i32;
@@ -10410,8 +10408,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         out: &mut PictureBuffer,
     ) -> Result<()> {
         use crate::affine_merge::{
-            build_subblock_merge_cand_list, derive_constructed_affine_merge_candidates,
             ConstructedAffineFlags, SubblockMergeCandidateKind, SubblockMergeListInputs,
+            build_subblock_merge_cand_list, derive_constructed_affine_merge_candidates,
         };
 
         let xcb = cu.cu.x as i32;
@@ -10801,7 +10799,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     ) -> Result<()> {
         let (sw, sh) = self.sub_wh();
         use crate::affine::{
-            derive_subblock_mvs, predict_luma_block_affine_prof, AffineLumaFilterSet,
+            AffineLumaFilterSet, derive_subblock_mvs, predict_luma_block_affine_prof,
         };
         // §8.5.6.3.2 — the default affine filter set (no RPR scaling in
         // the scaffold). The sub-block MV grid is anchored at the
@@ -11131,7 +11129,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         lmcs_chroma_var_scale: Option<u32>,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
+        use crate::transform::{CodedTransform, TrType, TuCResMode, scaling_and_transformation};
         if c_w == 0 || c_h == 0 {
             return Ok(());
         }
@@ -11283,7 +11281,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         lfnst_pred_mode: Option<u32>,
         out: &mut PictureBuffer,
     ) -> Result<()> {
-        use crate::transform::{scaling_and_transformation, CodedTransform, TrType, TuCResMode};
+        use crate::transform::{CodedTransform, TrType, TuCResMode, scaling_and_transformation};
         let (sw, sh) = self.sub_wh();
         let c_w = (cu.cu.w / sw) as usize;
         let c_h = (cu.cu.h / sh) as usize;
@@ -11438,7 +11436,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                         coded_levels
                             .iter()
                             .enumerate()
-                            .filter(|(_, &l)| l != 0)
+                            .filter(|&(_, &l)| l != 0)
                             .map(|(i, &l)| (i % c_w, i / c_w, l))
                             .collect::<Vec<_>>()
                     );
@@ -11578,8 +11576,17 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         if dbg_cu_enabled() {
             eprintln!(
                 "GPM ({},{}) {}x{} part={} m={m} n={n} A: X={x_a} mv=({},{}) ref={ref_idx_a} poc={} B: X={x_b} mv=({},{}) ref={ref_idx_b} poc={} candA={cand_a:?} candB={cand_b:?}",
-                cu.cu.x, cu.cu.y, cb_w, cb_h, info.inter.merge_data.gpm_partition_idx,
-                mv_a.x, mv_a.y, ref_a.poc, mv_b.x, mv_b.y, ref_b.poc
+                cu.cu.x,
+                cu.cu.y,
+                cb_w,
+                cb_h,
+                info.inter.merge_data.gpm_partition_idx,
+                mv_a.x,
+                mv_a.y,
+                ref_a.poc,
+                mv_b.x,
+                mv_b.y,
+                ref_b.poc
             );
         }
 
@@ -11617,7 +11624,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 info.inter.merge_data.gpm_idx1,
                 mlist
                     .iter()
-                    .map(|f| (f.mv_l0, f.ref_idx_l0, f.pred_flag_l0, f.mv_l1, f.ref_idx_l1, f.pred_flag_l1))
+                    .map(|f| (
+                        f.mv_l0,
+                        f.ref_idx_l0,
+                        f.pred_flag_l0,
+                        f.mv_l1,
+                        f.ref_idx_l1,
+                        f.pred_flag_l1
+                    ))
                     .collect::<Vec<_>>(),
             );
         }

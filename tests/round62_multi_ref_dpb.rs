@@ -45,7 +45,11 @@ fn translation_frame(w: usize, h: usize, dx: i32) -> PictureBuffer {
     for y in 0..h {
         for x in 0..w {
             let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-            let v = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
+            let v = if (sx / 8).is_multiple_of(2) {
+                80u16
+            } else {
+                180u16
+            };
             buf.luma.samples[y * buf.luma.stride + x] = v;
         }
     }

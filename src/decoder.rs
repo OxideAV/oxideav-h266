@@ -46,12 +46,12 @@ use oxideav_core::{
     TimeBase, VideoFrame, VideoPlane,
 };
 
-use crate::nal::{extract_rbsp, iter_annex_b, iter_length_prefixed, NalHeader, NalUnitType};
+use crate::CODEC_ID_STR;
+use crate::nal::{NalHeader, NalUnitType, extract_rbsp, iter_annex_b, iter_length_prefixed};
 use crate::reconstruct::PicturePlane;
-use crate::sps::{parse_sps, SeqParameterSet};
+use crate::sps::{SeqParameterSet, parse_sps};
 use crate::stream::{DecodedPicture, OutputInfo, StreamDecoder};
 use crate::vvcc::VvcDecoderConfigurationRecord;
-use crate::CODEC_ID_STR;
 
 /// Largest picture the registry decoder accepts, per side (the
 /// `CodecCapabilities::max_size` it declares).
@@ -88,12 +88,12 @@ pub fn output_pixel_format_for(chroma_format_idc: u8, bit_depth: u32) -> Result<
                 "h266: {bd}-bit {} output has no pixel-format label (8 / 10 / 12 / 16-bit are \
                  labelled)",
                 chroma_format_name(cf)
-            )))
+            )));
         }
         (cf, _) => {
             return Err(Error::invalid(format!(
                 "h266: sps_chroma_format_idc {cf} is out of range"
-            )))
+            )));
         }
     };
     Ok(pf)
@@ -771,12 +771,14 @@ mod tests {
             let _ = drain(&mut dec);
         }
         let mut dec = H266Decoder::new(&params).unwrap();
-        assert!(dec
-            .send_packet(&Packet::new(0, TimeBase::new(1, 1), vec![0x12, 0x34, 0x56]))
-            .is_err());
-        assert!(dec
-            .send_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-            .is_ok());
+        assert!(
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), vec![0x12, 0x34, 0x56]))
+                .is_err()
+        );
+        assert!(
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+                .is_ok()
+        );
         // A hostile record.
         let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         params.extradata = vec![0xFF; 40];

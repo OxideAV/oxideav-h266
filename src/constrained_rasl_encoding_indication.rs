@@ -127,8 +127,7 @@ impl ConstrainedRaslEncodingIndication {
 pub fn parse_constrained_rasl_encoding_indication(
     payload: &[u8],
 ) -> Result<ConstrainedRaslEncodingIndication> {
-    const ERR: &str =
-        "h266 constrained_rasl_encoding_indication: malformed sei_payload trailing bits / length (§D.2.1, §7.4.6)";
+    const ERR: &str = "h266 constrained_rasl_encoding_indication: malformed sei_payload trailing bits / length (§D.2.1, §7.4.6)";
 
     let mut reader = BitReader::new(payload);
 

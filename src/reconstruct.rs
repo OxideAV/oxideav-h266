@@ -472,8 +472,8 @@ mod tests {
     /// produce values in the valid 8-bit range.
     #[test]
     fn mini_end_to_end_dc_impulse() {
-        use crate::intra::{predict_dc, IntraRefs};
-        use crate::transform::{inverse_transform_2d, TrType};
+        use crate::intra::{IntraRefs, predict_dc};
+        use crate::transform::{TrType, inverse_transform_2d};
 
         // 4x4 TB with constant-grey (128) neighbours → DC prediction 128.
         let above = vec![128i16; 5];
@@ -583,8 +583,8 @@ mod tests {
     /// `u16` plane without any narrowing.
     #[test]
     fn mini_end_to_end_main10_dc_impulse() {
-        use crate::intra::{predict_dc, IntraRefs};
-        use crate::transform::{inverse_transform_2d, TrType};
+        use crate::intra::{IntraRefs, predict_dc};
+        use crate::transform::{TrType, inverse_transform_2d};
 
         // Main10 mid-grey neighbours → DC prediction 512.
         let above = vec![512i16; 5];

@@ -32,7 +32,7 @@
 use std::collections::VecDeque;
 
 use oxideav_core::options::{
-    parse_options, CodecOptionsStruct, OptionField, OptionKind, OptionValue,
+    CodecOptionsStruct, OptionField, OptionKind, OptionValue, parse_options,
 };
 use oxideav_core::{
     CodecId, CodecParameters, Encoder as CoreEncoder, Error, Frame, Packet, PixelFormat, Result,
@@ -41,9 +41,9 @@ use oxideav_core::{
 
 use crate::encoder::EncoderConfig;
 use crate::encoder_pipeline::encode_idr_with_residuals_cfg;
-use crate::nal::{iter_annex_b, NalUnitType};
+use crate::nal::{NalUnitType, iter_annex_b};
 use crate::reconstruct::PictureBuffer;
-use crate::vvcc::{annex_b_to_length_prefixed, VvcDecoderConfigurationRecord};
+use crate::vvcc::{VvcDecoderConfigurationRecord, annex_b_to_length_prefixed};
 
 /// Typed option struct for the registry encoder. See the module docs
 /// for the semantics of each knob.
@@ -295,13 +295,13 @@ impl Layout {
                 return Err(Error::unsupported(format!(
                     "h266 encoder: {pf:?} input is deeper than the 8 – 10-bit coding loop (feed \
                      an 8- or 10-bit layout)"
-                )))
+                )));
             }
             other => {
                 return Err(Error::unsupported(format!(
                     "h266 encoder input must be one of {:?}, got {other:?}",
                     accepted_pixel_formats()
-                )))
+                )));
             }
         };
         Ok(Self {
@@ -359,7 +359,7 @@ impl H266CodecEncoder {
         let pf = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
         let layout = Layout::of(pf)?;
         let (sw, sh) = layout.subsampling();
-        if width as usize % sw != 0 || height as usize % sh != 0 {
+        if !(width as usize).is_multiple_of(sw) || !(height as usize).is_multiple_of(sh) {
             return Err(Error::invalid(format!(
                 "h266 encoder: {pf:?} input needs dimensions that are multiples of the chroma \
                  subsampling ({sw}x{sh}), got {width}x{height} — the §7.4.3.4 conformance window \
@@ -491,8 +491,8 @@ impl H266CodecEncoder {
             let row = &src.data[y * src.stride..y * src.stride + need];
             let out = &mut dst.samples[y * dst.stride..y * dst.stride + w];
             if wide {
-                for (o, px) in out.iter_mut().zip(row.chunks_exact(2)) {
-                    let v = u16::from_le_bytes([px[0], px[1]]);
+                for (o, px) in out.iter_mut().zip(row.as_chunks::<2>().0) {
+                    let v = u16::from_le_bytes(*px);
                     *o = (u32::from(v).min(max)) as u16;
                 }
             } else {

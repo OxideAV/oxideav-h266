@@ -183,11 +183,7 @@ pub fn fold_bv_with_bvd(bv_pred: MotionVector, bvd: MotionVector) -> MotionVecto
     #[inline]
     fn fold(p: i32, d: i32) -> i32 {
         let u = (p.wrapping_add(d)) & ((1 << 18) - 1);
-        if u >= (1 << 17) {
-            u - (1 << 18)
-        } else {
-            u
-        }
+        if u >= (1 << 17) { u - (1 << 18) } else { u }
     }
     MotionVector {
         x: fold(bv_pred.x, bvd.x),
@@ -307,7 +303,7 @@ impl IbcVirtualBuffer {
             self.luma.fill(-1);
             self.reset_pending = false;
         }
-        if x0 % vsize == 0 && y0 % vsize == 0 {
+        if x0.is_multiple_of(vsize) && y0.is_multiple_of(vsize) {
             let w = cb_width.max(vsize);
             let h = cb_height.max(vsize);
             for y in y0..y0 + h {

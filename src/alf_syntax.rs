@@ -43,7 +43,7 @@ use crate::alf::AlfPicture;
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::cabac_enc::ArithEncoder;
 use crate::slice_header::SliceType;
-use crate::tables::{init_contexts, SyntaxCtx};
+use crate::tables::{SyntaxCtx, init_contexts};
 
 /// CABAC context bundle used by the per-CTU ALF syntax parser /
 /// emitter. Each field is the full per-syntax-element ctxIdx array

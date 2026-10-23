@@ -46,7 +46,7 @@ use crate::sao::{
     SaoCtb, SaoCtbParams, SaoEoClass, SaoMergeChoice, SaoMergeMap, SaoPicture, SaoTypeIdx,
 };
 use crate::slice_header::SliceType;
-use crate::tables::{init_contexts, SyntaxCtx};
+use crate::tables::{SyntaxCtx, init_contexts};
 
 /// CABAC context bundle used by the SAO syntax parser. Sized off
 /// Table 51 — both arrays carry one ctxIdx per initType but the parser
@@ -308,11 +308,7 @@ fn decode_sao_type_idx(dec: &mut ArithDecoder<'_>, ctx: &mut ContextModel) -> Re
         return Ok(0);
     }
     let bin1 = dec.decode_bypass()?;
-    if bin1 == 0 {
-        Ok(1)
-    } else {
-        Ok(2)
-    }
+    if bin1 == 0 { Ok(1) } else { Ok(2) }
 }
 
 /// TR(cMax, cRice = 0) entirely under bypass coding (§9.3.3.3). All

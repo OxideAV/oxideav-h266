@@ -7,7 +7,7 @@
 //! `cargo run --release --example cabac_replay -- <bin-log> <stream.266>`
 use oxideav_h266::cabac::{ArithDecoder, ContextModel};
 use oxideav_h266::cabac_enc::ArithEncoder;
-use oxideav_h266::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+use oxideav_h266::nal::{NalUnitType, extract_rbsp, iter_annex_b};
 use std::collections::HashMap;
 
 fn main() {

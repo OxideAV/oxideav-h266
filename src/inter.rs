@@ -1819,8 +1819,15 @@ pub fn derive_temporal_merge_candidate(inputs: &TemporalMergeInputs<'_>) -> Opti
             let raw = mf.get_at_luma(x_col_cb, y_col_cb);
             eprintln!(
                 "TMVP-MERGE ({},{}) {}x{} X={} BR=({x_col_cb},{y_col_cb}) cell={raw:?} pocs={:?} cur={} curRef={} colPoc={}",
-                inputs.xcb, inputs.ycb, inputs.cb_w, inputs.cb_h, inputs.x,
-                mf.ref_pocs_at_luma(x_col_cb, y_col_cb), inputs.current_poc, inputs.current_ref_poc, inputs.col_pic.poc
+                inputs.xcb,
+                inputs.ycb,
+                inputs.cb_w,
+                inputs.cb_h,
+                inputs.x,
+                mf.ref_pocs_at_luma(x_col_cb, y_col_cb),
+                inputs.current_poc,
+                inputs.current_ref_poc,
+                inputs.col_pic.poc
             );
         }
         if let Some(mv) = fetch_collocated_mv(mf, x_col_cb, y_col_cb, inputs) {
@@ -3851,8 +3858,8 @@ mod tests {
         // Write the SAME MV into both the above row (covers B1) and the
         // left column (covers A1).
         mf.write_block(16, 0, 16, 4, mvf); // above row (covers B1 at (31, -1)? No — B1 at (xCb + w - 1, yCb - 1) = (31, -1)... hmm needs y >= 0)
-                                           // For B1 to be available, yCb must be > 0.
-                                           // Use CU at (16, 16) size 16x16; B1 at (31, 15), A1 at (15, 31).
+        // For B1 to be available, yCb must be > 0.
+        // Use CU at (16, 16) size 16x16; B1 at (31, 15), A1 at (15, 31).
         mf.write_block(16, 12, 16, 4, mvf); // covers (31, 15)
         mf.write_block(12, 16, 4, 16, mvf); // covers (15, 31)
         let cands = derive_spatial_merge_candidates(16, 16, 16, 16, &mf, 2);
@@ -5208,9 +5215,9 @@ mod tests {
         assert_eq!(list[0].mv_l0, MotionVector::from_int_pel(1, 0)); // B1
         assert_eq!(list[1].mv_l0, MotionVector::from_int_pel(2, 0)); // Col
         assert_eq!(list[2].mv_l0, MotionVector::from_int_pel(3, 0)); // HMVP
-                                                                     // Slot 3 = §8.5.2.4 pairwise-average of B1 + Col = (1+2, 0)
-                                                                     // int-pel sum = (48, 0) in 1/16-pel units, rounded by §8.5.2.14
-                                                                     // (rightShift=1) → (24, 0). Slots 4..5 = zero-MV pad.
+        // Slot 3 = §8.5.2.4 pairwise-average of B1 + Col = (1+2, 0)
+        // int-pel sum = (48, 0) in 1/16-pel units, rounded by §8.5.2.14
+        // (rightShift=1) → (24, 0). Slots 4..5 = zero-MV pad.
         assert_eq!(list[3].mv_l0, MotionVector { x: 24, y: 0 });
         for entry in &list[4..] {
             assert_eq!(entry.mv_l0, MotionVector::ZERO);
@@ -5660,8 +5667,8 @@ mod tests {
             hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
-                                                   // currPocDiffL0 = +1, currPocDiffL1 = +1 — equal distance
-                                                   // (eqs. 557 – 560).
+        // currPocDiffL0 = +1, currPocDiffL1 = +1 — equal distance
+        // (eqs. 557 – 560).
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 1, false, false);
         assert_eq!(out.mv_l0, MotionVector::from_int_pel(3, 0));
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(-1, 0));
@@ -5686,8 +5693,8 @@ mod tests {
             hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
-                                                   // currPocDiffL0 = +1 (L0 ref earlier), currPocDiffL1 = -1 (L1
-                                                   // ref later) → opposite-sign branch.
+        // currPocDiffL0 = +1 (L0 ref earlier), currPocDiffL1 = -1 (L1
+        // ref later) → opposite-sign branch.
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, -1, false, false);
         assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(-1, 0));
@@ -5719,9 +5726,9 @@ mod tests {
             hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel = (16, 0)
-                                                   // §8.5.2.7 eqs. 571 – 578: |currPocDiffL0| = 1 < |currPocDiffL1|
-                                                   // = 2, so the RAW offset lands on L1 and L0 takes the
-                                                   // distScaleFactor chain (td = 2, tb = 1 → factor 1/2 → 8).
+        // §8.5.2.7 eqs. 571 – 578: |currPocDiffL0| = 1 < |currPocDiffL1|
+        // = 2, so the RAW offset lands on L1 and L0 takes the
+        // distScaleFactor chain (td = 2, tb = 1 → factor 1/2 → 8).
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, false, false);
         assert_eq!(out.mv_l0, MotionVector { x: 8, y: 0 });
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(1, 0));
@@ -5746,8 +5753,8 @@ mod tests {
             hpel_if_idx: 0,
         };
         let off = derive_mmvd_offset(2, 0, false); // (+1, 0) int-pel
-                                                   // Distances that would normally scale (1 vs 2), but `lt_l0 =
-                                                   // true` flips us back to the LT shortcut.
+        // Distances that would normally scale (1 vs 2), but `lt_l0 =
+        // true` flips us back to the LT shortcut.
         let out = apply_mmvd_to_base_with_poc(&base, off, 1, 2, true, false);
         assert_eq!(out.mv_l0, MotionVector::from_int_pel(1, 0));
         assert_eq!(out.mv_l1, MotionVector::from_int_pel(1, 0));
@@ -6433,22 +6440,24 @@ mod tests {
             offset: 0,
         };
         let l0 = [8192i32; 3];
-        assert!(explicit_weighted_sample_pred(
-            2,
-            2,
-            Some(&l0),
-            None,
-            true,
-            false,
-            6,
-            wp,
-            ExplicitWpParams {
-                weight: 0,
-                offset: 0
-            },
-            8
-        )
-        .is_err());
+        assert!(
+            explicit_weighted_sample_pred(
+                2,
+                2,
+                Some(&l0),
+                None,
+                true,
+                false,
+                6,
+                wp,
+                ExplicitWpParams {
+                    weight: 0,
+                    offset: 0
+                },
+                8
+            )
+            .is_err()
+        );
     }
 
     /// r456 — §8.5.6.3.2 eqs. 928 / 929: with the subpicture arm armed,

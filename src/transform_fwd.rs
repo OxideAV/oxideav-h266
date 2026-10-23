@@ -412,7 +412,7 @@ mod tests {
     /// the orthogonality of the spec's matrix.
     #[test]
     fn forward_then_inverse_1d_recovers_input_up_to_scale() {
-        use crate::transform::{one_d_transform, TrType};
+        use crate::transform::{TrType, one_d_transform};
         let x = vec![10, -5, 3, -7, 12, -2, 1, 8];
         let y_fwd = forward_dct_ii_1d(8, &x).unwrap();
         let y_inv = one_d_transform(TrType::DctII, 8, 8, &y_fwd).unwrap();
@@ -438,7 +438,7 @@ mod tests {
     /// coefficients to within a few units (the quantisation step).
     #[test]
     fn quantise_then_dequantise_round_trip_small_qp() {
-        use crate::dequant::{dequantize_tb_flat, DequantParams};
+        use crate::dequant::{DequantParams, dequantize_tb_flat};
         // QP = 0 (minimum quantisation). Small-magnitude coefficients.
         let coeffs = vec![1000i32; 16];
         let levels = quantize_tb_flat(&coeffs, 4, 4, 0, 8, 15).unwrap();
@@ -503,8 +503,8 @@ mod tests {
     /// approximation of the input.
     #[test]
     fn forward_quantise_dequantise_inverse_2d_round_trip() {
-        use crate::dequant::{dequantize_tb_flat, DequantParams};
-        use crate::transform::{inverse_transform_2d, TrType};
+        use crate::dequant::{DequantParams, dequantize_tb_flat};
+        use crate::transform::{TrType, inverse_transform_2d};
 
         // 4×4 block of small residual values.
         let block: Vec<i32> = vec![10, -5, 3, 1, -2, 4, -1, 6, 0, 2, -3, 5, 1, -4, 7, 0];
@@ -551,8 +551,8 @@ mod tests {
     fn dep_quant_forward_quant_is_trellis_feasible_and_round_trips() {
         use crate::cabac::ArithDecoder;
         use crate::cabac_enc::ArithEncoder;
-        use crate::dequant::{dequantize_tb_flat, DequantParams};
-        use crate::residual::{decode_tb_coefficients_opts, RcOpts, ResidualCtxs};
+        use crate::dequant::{DequantParams, dequantize_tb_flat};
+        use crate::residual::{RcOpts, ResidualCtxs, decode_tb_coefficients_opts};
         use crate::residual_enc::encode_tb_coefficients_opts;
 
         let mut state = 0xC0FFEEu32;

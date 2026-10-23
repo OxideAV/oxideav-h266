@@ -80,11 +80,7 @@ use crate::leaf_cu::{BcwIdxGate, LeafCuCtxs};
 /// into the eq. 981 BCW weight lookup `bcwWLut[k] = {4, 5, 3, 10, -2}`
 /// via the round-129 [`crate::leaf_cu::MvField::bcw_idx`] field.
 pub const fn bcw_idx_c_max(no_backward_pred_flag: bool) -> u32 {
-    if no_backward_pred_flag {
-        4
-    } else {
-        2
-    }
+    if no_backward_pred_flag { 4 } else { 2 }
 }
 
 /// Encode one `bcw_idx[x0][y0]` value per §7.3.10.5 / Table 132.

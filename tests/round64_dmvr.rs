@@ -24,8 +24,8 @@
 //!   3. Decoder-bypass roundtrip: when the DMVR gate is off the
 //!      refinement output equals the unrefined MV pair byte-for-byte.
 
-use oxideav_h266::dmvr::{apply_dmvr, dmvr_used_flag, DMVR_SEARCH_RANGE};
-use oxideav_h266::inter::{predict_luma_block_bipred, MotionVector};
+use oxideav_h266::dmvr::{DMVR_SEARCH_RANGE, apply_dmvr, dmvr_used_flag};
+use oxideav_h266::inter::{MotionVector, predict_luma_block_bipred};
 use oxideav_h266::reconstruct::PicturePlane;
 
 /// Build a smooth 2D-aperiodic synthetic luma plane carrying a low-

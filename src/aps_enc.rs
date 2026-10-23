@@ -73,7 +73,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::aps::{
-    AlfApsData, ALF_CC_NUM_COEFF, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS,
+    ALF_CC_NUM_COEFF, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, AlfApsData, NUM_ALF_FILTERS,
 };
 use crate::encoder::BitWriter;
 
@@ -431,7 +431,7 @@ fn ceil_log2(x: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aps::{parse_aps, ApsParamsType};
+    use crate::aps::{ApsParamsType, parse_aps};
 
     fn flat_chroma_aps() -> AlfApsData {
         let mut row = [0i32; ALF_CHROMA_NUM_COEFF];

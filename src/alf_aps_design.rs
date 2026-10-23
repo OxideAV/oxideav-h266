@@ -78,7 +78,7 @@
 //! * §8.8.5.2 — luma filter (eq. 1448 / 1449 / 1450 / 1451).
 //! * §8.8.5.3 — per-4×4 sub-block classification.
 
-use crate::aps::{AlfApsData, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS};
+use crate::aps::{ALF_LUMA_NUM_COEFF, AlfApsData, NUM_ALF_FILTERS};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 
 /// Mirror of [`crate::alf::transpose_idx_table`] — kept private to this

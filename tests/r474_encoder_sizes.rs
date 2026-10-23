@@ -5,7 +5,7 @@
 //!
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
-use oxideav_h266::encoder::{EncoderConfig, CODED_SIZE_ALIGN};
+use oxideav_h266::encoder::{CODED_SIZE_ALIGN, EncoderConfig};
 use oxideav_h266::encoder_pipeline::encode_idr_with_residuals_cfg;
 use oxideav_h266::reconstruct::PictureBuffer;
 use oxideav_h266::stream::{DecodedPicture, StreamDecoder};

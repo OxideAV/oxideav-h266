@@ -504,7 +504,7 @@ mod tests {
         push_bits(&mut buf, &mut bp, 0x5A, 8); // general_level_idc
         push_bits(&mut buf, &mut bp, 1, 1); // ptl_frame_only = 1
         push_bits(&mut buf, &mut bp, 0, 1); // ptl_multilayer = 0
-                                            // gci_present_flag = 1, all named flags = 0.
+        // gci_present_flag = 1, all named flags = 0.
         push_bits(&mut buf, &mut bp, 1, 1);
         // 3 general + 6 picture format + 10 NAL + 6 partitioning +
         // 5 CTU/block + 6 intra + 16 inter + 13 t/q/r + 6 loop = 71
@@ -590,7 +590,7 @@ mod tests {
         // picture format _idc fields at their max widths.
         push_bits(&mut buf, &mut bp, 0xF, 4); // sixteen_minus_max_bitdepth
         push_bits(&mut buf, &mut bp, 0x3, 2); // three_minus_max_chroma_format
-                                              // 10 NAL flags = 1.
+        // 10 NAL flags = 1.
         for _ in 0..10 {
             push_bits(&mut buf, &mut bp, 1, 1);
         }

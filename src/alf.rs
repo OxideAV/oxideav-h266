@@ -54,7 +54,7 @@
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026) §8.8.5.
 
 use crate::aps::{
-    AlfApsData, ALF_CC_NUM_COEFF, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS,
+    ALF_CC_NUM_COEFF, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, AlfApsData, NUM_ALF_FILTERS,
 };
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 
@@ -301,7 +301,14 @@ pub(crate) fn apply_alf_regions(
             if std::env::var_os("H266_DBG_ALF_CTB").is_some() {
                 eprintln!(
                     "ALF ctb ({rx},{ry}): luma_on={} set={} cb_on={} cb_alt={} cr_on={} cr_alt={} cc_cb={} cc_cr={}",
-                    p.luma_on, p.luma_filt_set_idx, p.cb_on, p.cb_alt_idx, p.cr_on, p.cr_alt_idx, p.cc_cb_idc, p.cc_cr_idc
+                    p.luma_on,
+                    p.luma_filt_set_idx,
+                    p.cb_on,
+                    p.cb_alt_idx,
+                    p.cr_on,
+                    p.cr_alt_idx,
+                    p.cc_cb_idc,
+                    p.cc_cr_idc
                 );
             }
             if p.luma_on {

@@ -32,8 +32,8 @@
 //!      a real affine fixture ⇒ identical to PROF-off.
 
 use oxideav_h266::affine::{
-    cb_prof_flag_lx, derive_prof_diff_mv_array, predict_luma_block_affine,
-    predict_luma_block_affine_prof, AffineCpmvs, AffineLumaFilterSet,
+    AffineCpmvs, AffineLumaFilterSet, cb_prof_flag_lx, derive_prof_diff_mv_array,
+    predict_luma_block_affine, predict_luma_block_affine_prof,
 };
 use oxideav_h266::inter::MotionVector;
 use oxideav_h266::reconstruct::PicturePlane;

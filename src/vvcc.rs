@@ -19,9 +19,9 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::nal::{extract_rbsp, iter_annex_b, NalHeader, NalUnitType};
+use crate::nal::{NalHeader, NalUnitType, extract_rbsp, iter_annex_b};
 use crate::ptl::ProfileTierLevel;
-use crate::sps::{parse_sps, SeqParameterSet};
+use crate::sps::{SeqParameterSet, parse_sps};
 use crate::vps::parse_vps;
 
 /// One `nal_unit_type` array of the record.
@@ -125,7 +125,7 @@ impl VvccPtl {
             (None, None) => {
                 return Err(Error::invalid(
                     "vvcC: neither the SPS nor a VPS carries a profile_tier_level()",
-                ))
+                ));
             }
         };
         let n = usize::from(sps.sps_max_sublayers_minus1) + 1;
@@ -224,7 +224,7 @@ impl VvcDecoderConfigurationRecord {
             other => {
                 return Err(Error::invalid(format!(
                     "vvcC: length size must be 1, 2 or 4 bytes, got {other}"
-                )))
+                )));
             }
         };
         Ok(self)
@@ -713,9 +713,10 @@ mod tests {
         assert!(types.contains(&NalUnitType::IdrNLp));
         let full = annex_b_to_length_prefixed(&bs, 2, false).expect("frame");
         let nals = crate::nal::iter_length_prefixed(&full, 2).expect("walk");
-        assert!(nals
-            .iter()
-            .any(|n| n.header.nal_unit_type == NalUnitType::SpsNut));
+        assert!(
+            nals.iter()
+                .any(|n| n.header.nal_unit_type == NalUnitType::SpsNut)
+        );
         assert!(annex_b_to_length_prefixed(&bs, 3, false).is_err());
     }
 

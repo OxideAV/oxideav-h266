@@ -776,7 +776,7 @@ mod tests {
     fn sao_decide_ctb_bo_direction_correct() {
         let src = PicturePlane::filled(16, 16, 100);
         let rec = PicturePlane::filled(16, 16, 120); // rec > src, diff = -20
-                                                     // SAO should prefer a negative offset for the dominant band.
+        // SAO should prefer a negative offset for the dominant band.
         let result = sao_decide_ctb(
             PlaneRef {
                 src: &src,

@@ -70,7 +70,7 @@
 //! pre-luma-ALF luma plane separately so each trial's `recPictureL`
 //! reads come from the correct §8.8.5.7 source.
 
-use crate::alf::{apply_alf_clipped, AlfApsBinding, AlfConfig, AlfCtb, AlfPicture};
+use crate::alf::{AlfApsBinding, AlfConfig, AlfCtb, AlfPicture, apply_alf_clipped};
 use crate::aps::AlfApsData;
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 

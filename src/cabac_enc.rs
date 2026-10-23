@@ -714,7 +714,7 @@ mod tests {
     /// `SyntaxCtx` machinery without further glue.
     #[test]
     fn integration_synthetic_cbf_and_sig_flags() {
-        use crate::tables::{init_contexts, SyntaxCtx};
+        use crate::tables::{SyntaxCtx, init_contexts};
 
         let slice_qp_y = 26;
         let mut enc_tu_y = init_contexts(SyntaxCtx::TuYCodedFlag, slice_qp_y);

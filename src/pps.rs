@@ -868,7 +868,7 @@ mod tests {
                 cur = 0;
             }
         }
-        if bits.len() % 8 != 0 {
+        if !bits.len().is_multiple_of(8) {
             out.push(cur);
         }
         out
@@ -919,31 +919,31 @@ mod tests {
         push_u(&mut bits, 0, 1); // output_flag_present
         push_u(&mut bits, 0, 1); // no_pic_partition = 0 → partition block
         push_u(&mut bits, 0, 1); // subpic_id_mapping_present
-                                 // ---- partition block ----
+        // ---- partition block ----
         push_u(&mut bits, 2, 2); // pps_log2_ctu_size_minus5 = 2 → 128
         push_ue(&mut bits, 0); // num_exp_tile_columns_minus1 = 0
         push_ue(&mut bits, 0); // num_exp_tile_rows_minus1 = 0
         push_ue(&mut bits, 1); // tile_column_width_minus1[0] = 1 → 2 CTBs
         push_ue(&mut bits, 3); // tile_row_height_minus1[0] = 3 → 4 CTBs
-                               // 1x2 tiles → NumTilesInPic = 2 > 1:
+        // 1x2 tiles → NumTilesInPic = 2 > 1:
         push_u(&mut bits, 0, 1); // loop_filter_across_tiles
         push_u(&mut bits, 1, 1); // rect_slice_flag = 1
         push_u(&mut bits, 0, 1); // single_slice_per_subpic = 0
         push_ue(&mut bits, 3); // num_slices_in_pic_minus1 = 3 → 4 slices
         push_u(&mut bits, 0, 1); // tile_idx_delta_present = 0
-                                 // Syntax slice 0 (tile 0, 1x1 covering a 4-CTB-tall tile):
-                                 // width absent (last col), height read (tile_x == 0):
+        // Syntax slice 0 (tile 0, 1x1 covering a 4-CTB-tall tile):
+        // width absent (last col), height read (tile_x == 0):
         push_ue(&mut bits, 0); // slice_height_in_tiles_minus1 = 0
         push_ue(&mut bits, 0); // num_exp_slices_in_tile = 0 → whole tile
-                               // Syntax slice 1 (tile 1, the LAST tile row → height absent,
-                               // inferred 0):
+        // Syntax slice 1 (tile 1, the LAST tile row → height absent,
+        // inferred 0):
         push_ue(&mut bits, 2); // num_exp_slices_in_tile = 2
         push_ue(&mut bits, 0); // exp_slice_height_minus1[0] = 0 → 1 CTU row
         push_ue(&mut bits, 1); // exp_slice_height_minus1[1] = 1 → 2 CTU rows
-                               // eq. 21: explicit [1, 2], remainder 1 → heights [1, 2, 1] →
-                               // NumSlicesInTile = 3; i advances past picture-level indices
-                               // 1..3 → loop ends.
-                               // ---- partition block done ----
+        // eq. 21: explicit [1, 2], remainder 1 → heights [1, 2, 1] →
+        // NumSlicesInTile = 3; i advances past picture-level indices
+        // 1..3 → loop ends.
+        // ---- partition block done ----
         push_u(&mut bits, 0, 1); // loop_filter_across_slices
         push_u(&mut bits, 0, 1); // cabac_init_present
         push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[0]
@@ -996,7 +996,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // output_flag_present
         push_u(&mut bits, 1, 1); // no_pic_partition = 1 (foundation path)
         push_u(&mut bits, 0, 1); // subpic_id_mapping_present = 0
-                                 // Cabac + ref-idx defaults + rpl1 flag.
+        // Cabac + ref-idx defaults + rpl1 flag.
         push_u(&mut bits, 0, 1); // cabac_init_present
         push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[0]
         push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[1]
@@ -1008,7 +1008,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // cu_qp_delta_enabled
         push_u(&mut bits, 0, 1); // chroma_tool_offsets_present
         push_u(&mut bits, 0, 1); // deblocking_filter_control_present
-                                 // partition block skipped. Extension-flag tail.
+        // partition block skipped. Extension-flag tail.
         push_u(&mut bits, 0, 1); // picture_header_ext_present
         push_u(&mut bits, 0, 1); // slice_header_ext_present
         push_u(&mut bits, 0, 1); // pps_extension_flag
@@ -1104,25 +1104,25 @@ mod tests {
         push_u(&mut bits, 0, 1); // output_flag_present
         push_u(&mut bits, 0, 1); // no_pic_partition = 0
         push_u(&mut bits, 0, 1); // subpic_id_mapping_present = 0
-                                 // --- Partition block ---
-                                 // CtbSize = 128 (log2_ctu_size_minus5 = 2).
-                                 // PicWidthInCtbsY = ceil(256/128) = 2.
-                                 // PicHeightInCtbsY = ceil(128/128) = 1.
+        // --- Partition block ---
+        // CtbSize = 128 (log2_ctu_size_minus5 = 2).
+        // PicWidthInCtbsY = ceil(256/128) = 2.
+        // PicHeightInCtbsY = ceil(128/128) = 1.
         push_u(&mut bits, 2, 2); // pps_log2_ctu_size_minus5
         push_ue(&mut bits, 1); // pps_num_exp_tile_columns_minus1 = 1 → 2 exp widths
         push_ue(&mut bits, 0); // pps_num_exp_tile_rows_minus1 = 0 → 1 exp height
         push_ue(&mut bits, 0); // pps_tile_column_width_minus1[0] = 0 → width 1
         push_ue(&mut bits, 0); // pps_tile_column_width_minus1[1] = 0 → width 1
         push_ue(&mut bits, 0); // pps_tile_row_height_minus1[0] = 0 → height 1
-                               // NumTileColumns = 2, NumTileRows = 1 → NumTilesInPic = 2.
-                               // (NumTilesInPic > 1) branch:
+        // NumTileColumns = 2, NumTileRows = 1 → NumTilesInPic = 2.
+        // (NumTilesInPic > 1) branch:
         push_u(&mut bits, 1, 1); // pps_loop_filter_across_tiles_enabled_flag
         push_u(&mut bits, 1, 1); // pps_rect_slice_flag
-                                 // (pps_rect_slice_flag) branch:
+        // (pps_rect_slice_flag) branch:
         push_u(&mut bits, 1, 1); // pps_single_slice_per_subpic_flag = 1
-                                 // !pps_rect_slice_flag || pps_single_slice_per_subpic || num_slices>0 → loop_filter_across_slices:
+        // !pps_rect_slice_flag || pps_single_slice_per_subpic || num_slices>0 → loop_filter_across_slices:
         push_u(&mut bits, 0, 1); // pps_loop_filter_across_slices_enabled_flag
-                                 // --- End partition block ---
+        // --- End partition block ---
         push_u(&mut bits, 0, 1); // cabac_init_present
         push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[0]
         push_ue(&mut bits, 0); // num_ref_idx_default_active_minus1[1]
@@ -1134,11 +1134,11 @@ mod tests {
         push_u(&mut bits, 0, 1); // cu_qp_delta_enabled
         push_u(&mut bits, 0, 1); // chroma_tool_offsets_present
         push_u(&mut bits, 0, 1); // deblocking_filter_control_present
-                                 // Now the (!pps_no_pic_partition_flag) block: five in_ph_flag.
+        // Now the (!pps_no_pic_partition_flag) block: five in_ph_flag.
         push_u(&mut bits, 1, 1); // pps_rpl_info_in_ph_flag
         push_u(&mut bits, 1, 1); // pps_sao_info_in_ph_flag
         push_u(&mut bits, 1, 1); // pps_alf_info_in_ph_flag
-                                 // wp_info_in_ph not emitted because weighted_pred/bipred = 0.
+        // wp_info_in_ph not emitted because weighted_pred/bipred = 0.
         push_u(&mut bits, 1, 1); // pps_qp_delta_info_in_ph_flag
         push_u(&mut bits, 0, 1); // picture_header_ext_present
         push_u(&mut bits, 0, 1); // slice_header_ext_present
@@ -1191,10 +1191,10 @@ mod tests {
         push_u(&mut bits, 0, 1); // output_flag_present
         push_u(&mut bits, 1, 1); // no_pic_partition = 1
         push_u(&mut bits, 1, 1); // subpic_id_mapping_present = 1
-                                 // pps_num_subpics_minus1 NOT read — inferred to 0.
+        // pps_num_subpics_minus1 NOT read — inferred to 0.
         push_ue(&mut bits, 7); // pps_subpic_id_len_minus1 = 7 → u(8)
         push_u(&mut bits, 0xA5, 8); // pps_subpic_id[0]
-                                    // Trailing tail (CABAC init etc).
+        // Trailing tail (CABAC init etc).
         push_u(&mut bits, 0, 1); // cabac_init_present
         push_ue(&mut bits, 0);
         push_ue(&mut bits, 0);
@@ -1239,7 +1239,7 @@ mod tests {
         push_u(&mut bits, 0x1, 4); // pps_subpic_id[0]
         push_u(&mut bits, 0x9, 4); // pps_subpic_id[1]
         push_u(&mut bits, 0x5, 4); // pps_subpic_id[2]
-                                   // --- Partition block ---
+        // --- Partition block ---
         push_u(&mut bits, 2, 2); // pps_log2_ctu_size_minus5
         push_ue(&mut bits, 1); // pps_num_exp_tile_columns_minus1
         push_ue(&mut bits, 0); // pps_num_exp_tile_rows_minus1
@@ -1250,7 +1250,7 @@ mod tests {
         push_u(&mut bits, 1, 1); // pps_rect_slice_flag
         push_u(&mut bits, 1, 1); // pps_single_slice_per_subpic_flag
         push_u(&mut bits, 0, 1); // pps_loop_filter_across_slices
-                                 // --- End partition ---
+        // --- End partition ---
         push_u(&mut bits, 0, 1); // cabac_init
         push_ue(&mut bits, 0);
         push_ue(&mut bits, 0);

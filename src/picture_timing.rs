@@ -473,9 +473,9 @@ mod tests {
 
         /// Append `sei_payload()` trailing bits (§D.2.1) and pack to bytes.
         fn finish_payload(mut self) -> Vec<u8> {
-            if self.bits.len() % 8 != 0 {
+            if !self.bits.len().is_multiple_of(8) {
                 self.bits.push(1);
-                while self.bits.len() % 8 != 0 {
+                while !self.bits.len().is_multiple_of(8) {
                     self.bits.push(0);
                 }
             }
@@ -564,7 +564,7 @@ mod tests {
         ctx.bp_max_sublayers_minus1 = 1;
         let mut w = BitWriter::new();
         w.put(0x11, 8); // pt_cpb_removal_delay_minus1[top=1]
-                        // i = 0 (< 1): pt_sublayer_delays_present_flag[0]
+        // i = 0 (< 1): pt_sublayer_delays_present_flag[0]
         w.put(1, 1);
         // deltas not present -> no enabled flag; delta_enabled inferred 0
         // -> explicit pt_cpb_removal_delay_minus1[0]
@@ -622,7 +622,7 @@ mod tests {
         w.put(0x11, 8); // top delay
         w.put(0x22, 8); // dpb_output_delay
         w.put(1, 1); // pt_cpb_alt_timing_info_present_flag
-                     // NAL HRD, i = 0..=0, j = 0..=0:
+        // NAL HRD, i = 0..=0, j = 0..=0:
         w.put(0xA1, 8); // nal alt initial removal delay delta[0][0]
         w.put(0xA2, 8); // nal alt initial removal offset delta[0][0]
         w.put(0xA3, 8); // nal cpb delay offset[0]
@@ -653,14 +653,14 @@ mod tests {
         let mut w = BitWriter::new();
         w.put(0x11, 8); // top delay
         w.put(0x22, 8); // dpb_output_delay
-                        // DU DPB block:
+        // DU DPB block:
         w.put(0x55, 8); // pt_dpb_output_du_delay
-                        // DU CPB block: num_decoding_units_minus1 = 1 (ue)
+        // DU CPB block: num_decoding_units_minus1 = 1 (ue)
         w.ue(1);
         w.put(1, 1); // pt_du_common_cpb_removal_delay_flag
-                     // common increment loop: i = 0..=0, top sublayer present -> read 1
+        // common increment loop: i = 0..=0, top sublayer present -> read 1
         w.put(0x66, 8); // pt_du_common_cpb_removal_delay_increment_minus1[0]
-                        // for i in 0..=1: pt_num_nalus_in_du_minus1[i]
+        // for i in 0..=1: pt_num_nalus_in_du_minus1[i]
         w.ue(3); // du0
         w.ue(4); // du1
         w.put(0x33, 8); // display periods
@@ -674,9 +674,11 @@ mod tests {
         assert_eq!(pt.decoding_units.len(), 2);
         assert_eq!(pt.decoding_units[0].num_nalus_in_du_minus1, 3);
         assert_eq!(pt.decoding_units[1].num_nalus_in_du_minus1, 4);
-        assert!(pt.decoding_units[0]
-            .cpb_removal_delay_increment_minus1
-            .is_empty());
+        assert!(
+            pt.decoding_units[0]
+                .cpb_removal_delay_increment_minus1
+                .is_empty()
+        );
     }
 
     /// Concatenation flag tail.

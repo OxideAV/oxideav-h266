@@ -29,7 +29,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
+use crate::ptl::{ProfileTierLevel, parse_profile_tier_level};
 
 /// Parsed DCI RBSP contents.
 #[derive(Clone, Debug)]
@@ -105,7 +105,7 @@ mod tests {
                 cur = 0;
             }
         }
-        if bits.len() % 8 != 0 {
+        if !bits.len().is_multiple_of(8) {
             out.push(cur);
         }
         out
@@ -129,8 +129,8 @@ mod tests {
         push_u(bits, 1, 1); // frame_only
         push_u(bits, 0, 1); // multilayer_enabled
         push_u(bits, 0, 1); // gci_present
-                            // Align to byte boundary.
-        while bits.len() % 8 != 0 {
+        // Align to byte boundary.
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         push_u(bits, 0, 8); // ptl_num_sub_profiles
@@ -143,8 +143,8 @@ mod tests {
         push_u(&mut bits, 0, 4); // dci_num_ptls_minus1 = 0 → 1 PTL
         push_minimal_ptl(&mut bits);
         push_u(&mut bits, 0, 1); // dci_extension_flag = 0
-                                 // rbsp_trailing_bits() — emit a 1 + zeros to byte-align. Not
-                                 // needed for the parse itself (we stop at dci_extension_flag).
+        // rbsp_trailing_bits() — emit a 1 + zeros to byte-align. Not
+        // needed for the parse itself (we stop at dci_extension_flag).
         let bytes = pack_bits(&bits);
 
         let dci = parse_dci(&bytes).unwrap();

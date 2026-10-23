@@ -15,7 +15,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::lmcs::{parse_lmcs_data, LmcsData};
+use crate::lmcs::{LmcsData, parse_lmcs_data};
 
 /// Number of ALF luma classes per APS — §7.4.3.18 sets `NumAlfFilters = 25`.
 pub const NUM_ALF_FILTERS: usize = 25;
@@ -390,19 +390,19 @@ mod tests {
         let header_byte = 0b0000_0011u8;
         let mut bits = String::new();
         bits.push('1'); // chroma_present
-                        // alf_data
+        // alf_data
         bits.push('1'); // alf_luma_filter_signal_flag
         bits.push('0'); // alf_chroma
         bits.push('0'); // cc_cb
         bits.push('0'); // cc_cr
         bits.push('0'); // alf_luma_clip_flag
         bits.push('1'); // ue(v) = 0 → "1"
-                        // 12 ue(v) = 0 each
+        // 12 ue(v) = 0 each
         for _ in 0..12 {
             bits.push('1');
         }
         // pad to byte boundary
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push('0');
         }
         let mut data = vec![header_byte];

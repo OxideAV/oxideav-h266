@@ -75,8 +75,8 @@
 use oxideav_core::Result;
 
 use crate::amvr::{
-    amvr_precision_idx_c_max, apply_amvr_shift, ctx_inc_amvr_flag, ctx_inc_amvr_precision_idx,
-    ctx_inc_amvr_precision_idx_bin1, AmvrShift,
+    AmvrShift, amvr_precision_idx_c_max, apply_amvr_shift, ctx_inc_amvr_flag,
+    ctx_inc_amvr_precision_idx, ctx_inc_amvr_precision_idx_bin1,
 };
 use crate::cabac_enc::ArithEncoder;
 use crate::inter::MotionVector;

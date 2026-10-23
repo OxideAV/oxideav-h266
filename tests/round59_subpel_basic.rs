@@ -83,7 +83,11 @@ fn round59_integer_pel_regression_holds() {
                 let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
                 a.luma.samples[y * a.luma.stride + x] = v;
                 let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-                let v2 = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
+                let v2 = if (sx / 8).is_multiple_of(2) {
+                    80u16
+                } else {
+                    180u16
+                };
                 b.luma.samples[y * b.luma.stride + x] = v2;
             }
         }

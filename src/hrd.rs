@@ -249,7 +249,7 @@ mod tests {
 
     fn pack(bits: &[u8]) -> Vec<u8> {
         let mut padded = bits.to_vec();
-        while padded.len() % 8 != 0 {
+        while !padded.len().is_multiple_of(8) {
             padded.push(0);
         }
         let mut out = Vec::with_capacity(padded.len() / 8);
@@ -370,7 +370,7 @@ mod tests {
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 1, 1); // low_delay_hrd_flag = 1
-                                 // NAL sublayer_hrd_parameters: one CPB, no DU branch.
+        // NAL sublayer_hrd_parameters: one CPB, no DU branch.
         push_ue(&mut bits, 17); // bit_rate_value_minus1
         push_ue(&mut bits, 33); // cpb_size_value_minus1
         push_u(&mut bits, 1, 1); // cbr_flag

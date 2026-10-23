@@ -142,10 +142,10 @@ fn check_stream(dir: &Path, name: &str, whole: bool) -> Result<(), String> {
         // one access unit, so pts must be strictly increasing when
         // the stream's output order equals its decode order, and
         // never repeat otherwise.
-        if let (Some(p), Some(l)) = (pts, last_pts) {
-            if *p == l {
-                return Err(format!("output frame {i}: repeated pts {p}"));
-            }
+        if let (Some(p), Some(l)) = (pts, last_pts)
+            && *p == l
+        {
+            return Err(format!("output frame {i}: repeated pts {p}"));
         }
         last_pts = *pts;
     }

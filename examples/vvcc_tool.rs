@@ -4,7 +4,7 @@
 //!
 //! `cargo run --example vvcc_tool -- build IN.266 OUT.vvcC OUT.sample`
 //! `cargo run --example vvcc_tool -- dump IN.vvcC`
-use oxideav_h266::vvcc::{annex_b_to_length_prefixed, VvcDecoderConfigurationRecord};
+use oxideav_h266::vvcc::{VvcDecoderConfigurationRecord, annex_b_to_length_prefixed};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

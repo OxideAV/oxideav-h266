@@ -71,8 +71,8 @@
 
 use crate::amvr::AmvrShift;
 use crate::inter::{
-    derive_temporal_merge_candidate, HmvpTable, MotionField, MotionVector, MvField,
-    TemporalMergeInputs,
+    HmvpTable, MotionField, MotionVector, MvField, TemporalMergeInputs,
+    derive_temporal_merge_candidate,
 };
 
 /// Maximum AMVP candidate-list length (§8.5.2.9 — the list is padded to
@@ -173,7 +173,7 @@ impl AmvpRefContext<'_> {
     /// CU's reference picture contributes *twice*. Yields the matching
     /// list MVs in `X`-then-`(1 − X)` order; the caller AMVR-rounds and
     /// applies the `until numCurrMvpCand == 2` cap.
-    fn hmvp_entry_mvs(&self, e: &MvField) -> impl Iterator<Item = MotionVector> {
+    fn hmvp_entry_mvs(&self, e: &MvField) -> impl Iterator<Item = MotionVector> + use<> {
         let mut found: [Option<MotionVector>; 2] = [None, None];
         if let Some((poc, mv)) = self.neighbour_list_match(e, self.list) {
             if poc == self.current_ref_poc {
@@ -540,11 +540,7 @@ pub fn derive_final_mv(mvp: MotionVector, raw_mvd: MotionVector, amvr: AmvrShift
     // : u`), it does not clamp.
     let wrap18 = |v: i32| -> i32 {
         let u = v & 0x3_FFFF;
-        if u >= 0x2_0000 {
-            u - 0x4_0000
-        } else {
-            u
-        }
+        if u >= 0x2_0000 { u - 0x4_0000 } else { u }
     };
     MotionVector {
         x: wrap18(mvp.x + shifted.x),

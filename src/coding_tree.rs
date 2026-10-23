@@ -100,7 +100,7 @@ impl TreeCtxs {
     /// P / B slices previously initialised every split bin from the
     /// I-slice columns and desynced on the first inter picture).
     pub fn init_with_init_type(slice_qp_y: i32, init_type: u8) -> Self {
-        use crate::tables::{init_contexts, init_contexts_for_type as ict, SyntaxCtx};
+        use crate::tables::{SyntaxCtx, init_contexts, init_contexts_for_type as ict};
         // Table 63 has no I column: P addresses entries 0..1, B 2..3.
         let non_inter = match init_type {
             1 => init_contexts(SyntaxCtx::NonInterFlag, slice_qp_y)[0..2].to_vec(),

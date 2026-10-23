@@ -61,11 +61,11 @@ use crate::ctx::{
 };
 use crate::inter::{InterCuInfo, MergeData, MotionVector, MvField};
 use crate::residual::{
-    decode_tb_coefficients_opts, read_cu_chroma_qp_offset, read_cu_qp_delta, read_tu_cb_coded_flag,
-    read_tu_cr_coded_flag, read_tu_joint_cbcr_residual_flag, read_tu_y_coded_flag, RcOpts,
-    ResidualCtxs,
+    RcOpts, ResidualCtxs, decode_tb_coefficients_opts, read_cu_chroma_qp_offset, read_cu_qp_delta,
+    read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_joint_cbcr_residual_flag,
+    read_tu_y_coded_flag,
 };
-use crate::tables::{init_contexts, SyntaxCtx};
+use crate::tables::{SyntaxCtx, init_contexts};
 
 /// §7.4.12.11 `TuCResMode[ x0 ][ y0 ]` derivation from the joint Cb-Cr
 /// residual flag and the Cb coded flag:
@@ -1773,7 +1773,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         // TR(cMax=2, cRice=0) is a context-coded truncated-unary up to 2
         // bins. Each bin gets its own ctxInc per
         // [`ctx_inc_intra_luma_ref_idx`].
-        if self.tools.mrl && (info.y0 % self.tools.ctb_size_y) > 0 {
+        if self.tools.mrl && !info.y0.is_multiple_of(self.tools.ctb_size_y) {
             let off = self.ctxs.init_type as usize * 2;
             let ctxs = &mut self.ctxs.intra_luma_ref_idx;
             let n = ctxs.len() - 1;
@@ -2023,11 +2023,11 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
         cclm_enabled: bool,
     ) -> Result<()> {
         info.pred_mode = CuPredMode::Intra; // I-slice (§7.4.12.2).
-                                            // sps_ibc_enabled_flag needs no gate here: §7.3.11.5 keys the
-                                            // whole cu_skip / pred_mode_ibc prologue on `treeType !=
-                                            // DUAL_TREE_CHROMA`, and §7.4.12.5 infers `pred_mode_ibc_flag
-                                            // = 0` for a DUAL_TREE_CHROMA CU — the chroma tree is always
-                                            // intra (r409; the pre-r409 reader refused the whole slice).
+        // sps_ibc_enabled_flag needs no gate here: §7.3.11.5 keys the
+        // whole cu_skip / pred_mode_ibc prologue on `treeType !=
+        // DUAL_TREE_CHROMA`, and §7.4.12.5 infers `pred_mode_ibc_flag
+        // = 0` for a DUAL_TREE_CHROMA CU — the chroma tree is always
+        // intra (r409; the pre-r409 reader refused the whole slice).
         let (sub_w, sub_h) = match self.tools.chroma_format_idc {
             1 => (2u32, 2u32),
             2 => (2, 1),
@@ -2035,7 +2035,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
             _ => {
                 return Err(Error::invalid(
                     "h266 leaf CU (dual-tree chroma): chroma tree on a monochrome SPS",
-                ))
+                ));
             }
         };
 
@@ -2112,11 +2112,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                     0
                 } else {
                     let bin1 = self.dec.decode_bypass()?;
-                    if bin1 == 0 {
-                        1
-                    } else {
-                        2
-                    }
+                    if bin1 == 0 { 1 } else { 2 }
                 };
                 // Table 20 (cclm_mode_flag == 1): 81 + cclm_mode_idx.
                 info.intra_pred_mode_c = INTRA_LT_CCLM + cclm_idx;
@@ -4307,11 +4303,7 @@ impl<'a, 'b> LeafCuReader<'a, 'b> {
                             == 1
                     } else {
                         // §7.4.12.5 inference.
-                        if quad {
-                            allow_hor_q
-                        } else {
-                            allow_hor_h
-                        }
+                        if quad { allow_hor_q } else { allow_hor_h }
                     };
                     info.cu_sbt_pos_flag = self
                         .dec
@@ -5527,7 +5519,7 @@ mod tests {
         let l = build_mpm_cand_list(10, 11);
         assert_eq!(l[0], 10); // candA
         assert_eq!(l[1], 11); // candB
-                              // minAB=10, maxAB=11.
+        // minAB=10, maxAB=11.
         assert_eq!(l[2], 2 + ((10 + 61) % 64)); // = 2 + 7 = 9
         assert_eq!(l[3], 2 + ((11 - 1) % 64)); // = 2 + 10 = 12
         assert_eq!(l[4], 2 + ((10 + 60) % 64)); // = 2 + 6 = 8
@@ -5539,7 +5531,7 @@ mod tests {
         let l = build_mpm_cand_list(3, 65);
         assert_eq!(l[0], 3); // candA
         assert_eq!(l[1], 65); // candB
-                              // eqs 222-224.
+        // eqs 222-224.
         assert_eq!(l[2], 2 + ((3u32.wrapping_sub(1)) % 64)); // = 2 + 2 = 4
         assert_eq!(l[3], 2 + ((65 + 61) % 64)); // = 2 + 62 = 64
         assert_eq!(l[4], 2 + (3 % 64)); // = 2 + 3 = 5
@@ -9140,7 +9132,7 @@ mod tests {
     fn leaf_cu_reader_threads_rc_opts_into_residual_coding() {
         use crate::cabac_enc::ArithEncoder;
         use crate::ctx::{ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag};
-        use crate::residual::{q_state_advance, RcOpts};
+        use crate::residual::{RcOpts, q_state_advance};
         use crate::residual_enc::{encode_tb_coefficients_opts, write_tu_y_coded_flag};
         use crate::scan::coeff_scan_positions;
 

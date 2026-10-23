@@ -12,11 +12,11 @@
 
 use oxideav_h266::encoder::EncoderConfig;
 use oxideav_h266::encoder_pipeline::{encode_idr_with_residuals_cfg, psnr_y};
-use oxideav_h266::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+use oxideav_h266::nal::{NalUnitType, extract_rbsp, iter_annex_b};
 use oxideav_h266::picture_header::parse_picture_header_stateful;
 use oxideav_h266::pps::parse_pps;
 use oxideav_h266::reconstruct::PictureBuffer;
-use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
 use oxideav_h266::sps::parse_sps;
 
 fn gradient_source(n: usize) -> PictureBuffer {

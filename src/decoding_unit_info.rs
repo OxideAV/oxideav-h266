@@ -307,9 +307,9 @@ mod tests {
 
         /// Append `sei_payload()` trailing bits (§D.2.1) and pack to bytes.
         fn finish_payload(mut self) -> Vec<u8> {
-            if self.bits.len() % 8 != 0 {
+            if !self.bits.len().is_multiple_of(8) {
                 self.bits.push(1); // sei_payload_bit_equal_to_one
-                while self.bits.len() % 8 != 0 {
+                while !self.bits.len().is_multiple_of(8) {
                     self.bits.push(0);
                 }
             }
@@ -344,7 +344,7 @@ mod tests {
         let ctx = ctx_default();
         let mut w = BitWriter::new();
         w.ue(2); // dui_decoding_unit_idx
-                 // i = 0 == bp_max_sublayers_minus1 -> flag inferred 1, no u(1).
+        // i = 0 == bp_max_sublayers_minus1 -> flag inferred 1, no u(1).
         w.put(0x55, 8); // dui_du_cpb_removal_delay_increment[0]
         w.put(1, 1); // dui_dpb_output_du_delay_present_flag
         w.put(0xAB, 8); // dui_dpb_output_du_delay
@@ -394,7 +394,7 @@ mod tests {
         };
         let mut w = BitWriter::new();
         w.ue(1); // decoding_unit_idx
-                 // i = 0: i < 2 -> read flag = 1, then 4-bit increment 0x3
+        // i = 0: i < 2 -> read flag = 1, then 4-bit increment 0x3
         w.put(1, 1);
         w.put(0x3, 4);
         // i = 1: i < 2 -> read flag = 0, no increment
@@ -585,7 +585,7 @@ mod tests {
         }
         bits.push(0); // dpb present flag = 0 -> 10 bits
         bits.push(0); // WRONG: should be sei_payload_bit_equal_to_one (1)
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut payload = Vec::new();

@@ -335,7 +335,7 @@ impl DeblockCu {
         if let Some(map) = &self.tu64 {
             let tile = map.tile();
             if dim > tile {
-                return off % tile == 0;
+                return off.is_multiple_of(tile);
             }
         }
         if let Some(ts) = &self.tb_split {
@@ -359,7 +359,7 @@ impl DeblockCu {
         if let Some(map) = &self.tu64 {
             let tile = map.tile();
             if dim > tile {
-                return off % tile == 0;
+                return off.is_multiple_of(tile);
             }
         }
         if let Some(ts) = &self.tb_split {
@@ -1039,7 +1039,7 @@ fn deblock_cu_dir(
     // excluded luma positions).
     let filter_edge = lead_luma != 0
         && !no_filter.contains(&lead_luma)
-        && region.map_or(true, |r| r.edge_allowed(vertical, cu.x, cu.y));
+        && region.is_none_or(|r| r.edge_allowed(vertical, cu.x, cu.y));
     // Edge-position step along the normal (luma units): the luma
     // 4-grid, or the chroma 8-grid scaled to luma.
     let grid_step = if c_idx == 0 {
@@ -1083,8 +1083,10 @@ fn deblock_cu_dir(
         // §8.8.3.4 — sub-block edge (edgeIdc = 2)? Every luma CU marks
         // its own leading edge (xEdge = 0); sub-block CUs additionally
         // mark interior edges at multiples of sbW.
-        let is_sb_edge =
-            c_idx == 0 && off % sb == 0 && off / sb <= last_sb_edge && (off > 0 || filter_edge);
+        let is_sb_edge = c_idx == 0
+            && off.is_multiple_of(sb)
+            && off / sb <= last_sb_edge
+            && (off > 0 || filter_edge);
         if !(is_tb || is_sb_edge) {
             off += grid_step;
             continue;
@@ -1205,8 +1207,10 @@ fn deblock_cu_dir(
                 // §8.8.3.6.2 step 6 — an EDGE_HOR edge on a luma CTB
                 // row boundary suppresses sidePisLargeBlk (only the
                 // CU's own top edge can sit on a CTB row).
-                let ctb_row_edge =
-                    !vertical && off == 0 && plane.ctb_size_y > 0 && cu.y % plane.ctb_size_y == 0;
+                let ctb_row_edge = !vertical
+                    && off == 0
+                    && plane.ctb_size_y > 0
+                    && cu.y.is_multiple_of(plane.ctb_size_y);
                 // r456 — §8.8.3.6.2 eq. 1272: lumaLevel from the
                 // segment's p0,0 / p0,3 / q0,0 / q0,3 (k runs along the
                 // edge), eq. 1273 qpOffset via the SPS LADF intervals.
@@ -1259,13 +1263,11 @@ fn deblock_cu_dir(
                 let wq = q_cu.chroma_tb_len(qx, qy, vertical, sub_axis);
                 let wp = p_cu.chroma_tb_len(px, py, vertical, sub_axis);
                 let (mfl_p, mfl_q) = if wp >= 8 && wq >= 8 {
-                    let ctb_row =
-                        !vertical && off == 0 && ctb_h_c > 0 && (cu.y / plane.sub_h) % ctb_h_c == 0;
-                    if ctb_row {
-                        (1, 3)
-                    } else {
-                        (3, 3)
-                    }
+                    let ctb_row = !vertical
+                        && off == 0
+                        && ctb_h_c > 0
+                        && (cu.y / plane.sub_h).is_multiple_of(ctb_h_c);
+                    if ctb_row { (1, 3) } else { (3, 3) }
                 } else {
                     (1, 1)
                 };
@@ -1292,11 +1294,7 @@ fn deblock_cu_dir(
                 }
                 // §8.8.3.6.5 eqs. 1335 / 1336 — segment rows / columns.
                 let max_k = if vertical {
-                    if plane.sub_h == 1 {
-                        3
-                    } else {
-                        1
-                    }
+                    if plane.sub_h == 1 { 3 } else { 1 }
                 } else if plane.sub_w == 1 {
                     3
                 } else {

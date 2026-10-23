@@ -47,7 +47,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::sei_message::{parse_sei_message, SeiMessage};
+use crate::sei_message::{SeiMessage, parse_sei_message};
 
 /// The canonical byte-aligned `rbsp_trailing_bits()` encoding: a `1`
 /// `rbsp_stop_one_bit` followed by seven `0` `rbsp_alignment_zero_bit`

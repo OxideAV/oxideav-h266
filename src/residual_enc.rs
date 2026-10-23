@@ -49,7 +49,7 @@ use crate::ctx::{
     ctx_inc_tu_y_coded_flag, loc_num_sig_and_sum_abs_pass1, loc_sum_abs_rice,
     rice_param_from_loc_sum_abs,
 };
-use crate::residual::{q_state_advance, RcOpts, ResidualCtxs};
+use crate::residual::{RcOpts, ResidualCtxs, q_state_advance};
 use crate::scan::{coeff_scan_positions, sb_grid, sb_scan_positions};
 
 /// Write `tu_y_coded_flag` per §7.3.11.10 / §9.3.4.2.5.
@@ -1279,7 +1279,7 @@ mod tests {
             }
         }
     }
-    use crate::residual::{decode_tb_coefficients, ResidualCtxs};
+    use crate::residual::{ResidualCtxs, decode_tb_coefficients};
 
     fn pad(bytes: Vec<u8>) -> Vec<u8> {
         let mut out = bytes;
@@ -1622,7 +1622,7 @@ mod tests {
         levels[0] = -3; // (0,0) — scan pos 0, hidden
         levels[4] = 2; // (0,1) — scan pos 1
         levels[9] = 2; // (1,2) — some later scan position
-                       // Verify the span condition holds via a round-trip.
+        // Verify the span condition holds via a round-trip.
         assert_eq!(roundtrip_opts(&levels, 4, 4, 0, opts), levels);
 
         // Positive hidden sign ⇒ even abs sum: 4 + 2 + 2 = 8 ✓.
@@ -1682,7 +1682,7 @@ mod tests {
         levels[0] = -1; // (0,0)
         levels[2] = 2; // inside first 4×4
         levels[3 * 8 + 1] = 2; // (1,3) still in first sub-block
-                               // A later sub-block with a short span: explicit signs.
+        // A later sub-block with a short span: explicit signs.
         levels[4] = -6; // (4,0) — second 4×4 sub-block
         assert_eq!(roundtrip_opts(&levels, 8, 8, 0, opts), levels);
     }
@@ -1745,14 +1745,9 @@ mod tests {
         let bytes = pad(vec![0u8; 8]);
         let mut dec = crate::cabac::ArithDecoder::new(&bytes).unwrap();
         let mut dec_ctxs = ResidualCtxs::init(26);
-        assert!(crate::residual::decode_tb_coefficients_opts(
-            &mut dec,
-            &mut dec_ctxs,
-            4,
-            4,
-            0,
-            opts
-        )
-        .is_err());
+        assert!(
+            crate::residual::decode_tb_coefficients_opts(&mut dec, &mut dec_ctxs, 4, 4, 0, opts)
+                .is_err()
+        );
     }
 }

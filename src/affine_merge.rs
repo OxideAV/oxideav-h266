@@ -519,8 +519,8 @@ pub fn derive_constructed_affine_merge_candidates(
     }
 
     let _ = flags.slice_type_b; // §8.5.5.6 fourth-corner bullet already
-                                // baked into corners[3] by the caller
-                                // (B-slice handling). Suppress warning.
+    // baked into corners[3] by the caller
+    // (B-slice handling). Suppress warning.
 
     out
 }
@@ -813,11 +813,7 @@ fn clip_mv17(v: i64) -> i32 {
 /// production but kept for defensive correctness in tests that
 /// hypothetically pass an oversized CB.
 fn shift_signed(v: i64, n: i32) -> i64 {
-    if n >= 0 {
-        v << n
-    } else {
-        v >> (-n)
-    }
+    if n >= 0 { v << n } else { v >> (-n) }
 }
 
 // =====================================================================

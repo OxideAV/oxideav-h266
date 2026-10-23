@@ -19,8 +19,8 @@ use oxideav_core::{Error, Result};
 use crate::bitreader::BitReader;
 use crate::pps::PicParameterSet;
 use crate::sps::{
-    parse_ref_pic_list_struct, RefPicListEntry as SpsRefPicListEntry, RefPicListStruct,
-    SeqParameterSet,
+    RefPicListEntry as SpsRefPicListEntry, RefPicListStruct, SeqParameterSet,
+    parse_ref_pic_list_struct,
 };
 
 /// Classification of a built [`RefPicListEntry`].
@@ -161,7 +161,7 @@ pub fn build_ref_pic_list(inputs: &RefPicListInputs<'_>) -> Result<Vec<BuiltRefP
                         None => {
                             return Err(Error::invalid(
                                 "h266 RPL build: LT entry with neither inline POC LSB nor ltrp_in_header",
-                            ))
+                            ));
                         }
                     }
                 };
@@ -586,7 +586,7 @@ mod tests {
     }
     fn pack(bits: &[u8]) -> Vec<u8> {
         let mut padded = bits.to_vec();
-        while padded.len() % 8 != 0 {
+        while !padded.len().is_multiple_of(8) {
             padded.push(0);
         }
         let mut out = Vec::with_capacity(padded.len() / 8);
@@ -770,7 +770,7 @@ mod tests {
         push_ue(&mut bits, 0);
         // abs = abs_delta_poc_st + 1 = 1 > 0, strp_entry_sign_flag present.
         push_u(&mut bits, 0, 1); // sign = 0 → positive.
-                                 // List 1: rpl_sps_flag = 1 (num = 1, single SPS candidate).
+        // List 1: rpl_sps_flag = 1 (num = 1, single SPS candidate).
         push_u(&mut bits, 1, 1);
         // rpl_idx inferred to 0 (num = 1).
         // No LT info block.

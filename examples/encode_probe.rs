@@ -130,7 +130,9 @@ fn main() {
         Ok(_) => {
             let raw = std::fs::read(&yuv).unwrap();
             let data: Vec<u16> = if bd > 8 {
-                raw.chunks_exact(2)
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             } else {

@@ -4,7 +4,7 @@
 //! comes from `H266_CONFORMANCE_DIR` or the workspace docs staging
 //! path).
 
-use oxideav_h266::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+use oxideav_h266::nal::{NalUnitType, extract_rbsp, iter_annex_b};
 use oxideav_h266::pps::parse_pps;
 use oxideav_h266::sps::parse_sps;
 

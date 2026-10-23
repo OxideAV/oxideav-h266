@@ -18,7 +18,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
+use crate::ptl::{ProfileTierLevel, parse_profile_tier_level};
 
 #[derive(Clone, Debug)]
 pub struct VideoParameterSet {

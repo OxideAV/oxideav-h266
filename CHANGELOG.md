@@ -4,6 +4,10 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - r477 — **cargo-fuzz sub-crate** (`fuzz/`, the fleet's daily `Fuzz` workflow): `parse_annexb` (Annex B walk through every header / SEI parser and the stateful picture-header / slice-header parses), `registry_decode` (a `vvcC` record + packet through `decoder::make_decoder` — the whole decode under a 512 × 512 limit, plus a `reset` + re-feed), `encode_roundtrip` (fuzz-shaped pictures and tool sets through the stills encoder, then the registry decoder in both framings must reproduce the encoder's reconstruction). Seeds under `fuzz/corpus/*/seed-*`.

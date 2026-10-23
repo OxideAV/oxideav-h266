@@ -61,8 +61,8 @@ use crate::ctx::{
     ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag, ctx_inc_intra_luma_not_planar_flag,
 };
 use crate::deblock::{DeblockCu, DeblockParams};
-use crate::dequant::{dequantize_tb_flat, DequantParams};
-use crate::intra::{predict_intra, IntraPredParams, RefSamples};
+use crate::dequant::{DequantParams, dequantize_tb_flat};
+use crate::intra::{IntraPredParams, RefSamples, predict_intra};
 use crate::mip::{mip_size_id, num_mip_modes, predict_mip};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
 use crate::residual::ResidualCtxs;
@@ -74,8 +74,8 @@ use crate::residual_enc::{
 use crate::sao::SaoConfig;
 use crate::sao_enc::sao_decide_picture;
 use crate::syntax_enc::TreeNeighbours;
-use crate::tables::{init_contexts, SyntaxCtx};
-use crate::transform::{inverse_transform_2d, TrType};
+use crate::tables::{SyntaxCtx, init_contexts};
+use crate::transform::{TrType, inverse_transform_2d};
 use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_dep_quant, quantize_tb_flat};
 
 /// Compute PSNR_Y (luma only) between two [`PicturePlane`]s.
@@ -612,7 +612,7 @@ impl EncAvail {
         if !self.luma[uy * self.w + ux] {
             return crate::leaf_cu::INTRA_PLANAR;
         }
-        if side_b && cu_y % CTB_SIZE == 0 {
+        if side_b && cu_y.is_multiple_of(CTB_SIZE) {
             return crate::leaf_cu::INTRA_PLANAR;
         }
         let m = self.modes[(uy / 4) * self.mcb_w + ux / 4];
@@ -6550,7 +6550,7 @@ fn crop_picture(
 /// off when the trial does not lower SSE, so this helper degrades to a
 /// no-op on flat / well-reconstructed chroma.
 fn build_chroma_alf_aps() -> crate::aps::AlfApsData {
-    use crate::aps::{AlfApsData, ALF_CHROMA_NUM_COEFF};
+    use crate::aps::{ALF_CHROMA_NUM_COEFF, AlfApsData};
     // 6 signalled taps; clip indices stay at 0 (= max-clip per Table 8,
     // i.e. effectively no clipping for an 8-bit pipeline).
     let mut row = [0i32; ALF_CHROMA_NUM_COEFF];
@@ -6582,7 +6582,7 @@ fn build_chroma_alf_aps() -> crate::aps::AlfApsData {
 /// [`crate::alf_enc::cc_alf_decide_and_apply`] strictly leaves CTBs off
 /// whenever the trial does not lower SSE.
 fn build_cc_alf_aps() -> crate::aps::AlfApsData {
-    use crate::aps::{AlfApsData, ALF_CC_NUM_COEFF};
+    use crate::aps::{ALF_CC_NUM_COEFF, AlfApsData};
     let mut row_cb = [0i32; ALF_CC_NUM_COEFF];
     row_cb[1] = 4;
     row_cb[2] = -4;
@@ -7633,9 +7633,9 @@ mod tests {
     #[test]
     fn round384_lmcs_encode_ships_parseable_lmcs_chain() {
         use crate::aps::ApsParamsType;
-        use crate::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+        use crate::nal::{NalUnitType, extract_rbsp, iter_annex_b};
         use crate::picture_header::parse_picture_header_stateful;
-        use crate::slice_header::{parse_slice_header_stateful, PhState};
+        use crate::slice_header::{PhState, parse_slice_header_stateful};
 
         let src = gradient_frame(64, 64);
         let payload = lmcs_enc_payload();
@@ -7763,7 +7763,7 @@ mod tests {
     /// reconstruction) still clears a sane chroma PSNR floor.
     #[test]
     fn r391_lmcs_chroma_scaling_on_wire_and_recon() {
-        use crate::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+        use crate::nal::{NalUnitType, extract_rbsp, iter_annex_b};
         use crate::picture_header::parse_picture_header_stateful;
 
         // Chroma-structured source so the chroma TBs carry real

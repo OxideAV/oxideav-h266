@@ -817,11 +817,11 @@ impl VvcEncoder {
         bw.write_bits(1, 4); // vps_video_parameter_set_id
         bw.write_bits(0, 6); // vps_max_layers_minus1
         bw.write_bits(0, 3); // vps_max_sublayers_minus1
-                             // Single-layer + single-sublayer → neither
-                             // `vps_default_ptl_dpb_hrd_max_tid_flag` nor
-                             // `vps_all_independent_layers_flag` is transmitted.
-                             //
-                             // vps_layer_id[0] for the only layer.
+        // Single-layer + single-sublayer → neither
+        // `vps_default_ptl_dpb_hrd_max_tid_flag` nor
+        // `vps_all_independent_layers_flag` is transmitted.
+        //
+        // vps_layer_id[0] for the only layer.
         bw.write_bits(0, 6);
         // vps_max_layers_minus1 == 0 → skip the `each_layer_is_an_ols`
         // / `vps_ols_mode_idc` / output-layer-flags block entirely —
@@ -854,7 +854,7 @@ impl VvcEncoder {
         bw.write_bits(0x5A, 8); // general_level_idc = 0x5A
         bw.write_bit(1); // ptl_frame_only_constraint_flag = 1
         bw.write_bit(0); // ptl_multilayer_enabled_flag = 0
-                         // gci_present_flag = 0 → no GCI body.
+        // gci_present_flag = 0 → no GCI body.
         bw.write_bit(0);
         // Byte-align GCI (§7.3.3.2 tail).
         while !bw.is_byte_aligned() {
@@ -895,9 +895,9 @@ impl VvcEncoder {
         bw.write_bit(0);
         bw.write_bit(0); // sps_gdr_enabled_flag = 0
         bw.write_bit(0); // sps_ref_pic_resampling_enabled_flag = 0
-                         // r474 — the coded size is the configured size padded to the
-                         // §7.4.3.5 Max(8, MinCbSizeY) multiple; the §7.4.3.4
-                         // conformance window crops the padding back out.
+        // r474 — the coded size is the configured size padded to the
+        // §7.4.3.5 Max(8, MinCbSizeY) multiple; the §7.4.3.4
+        // conformance window crops the padding back out.
         bw.write_ue(self.config.coded_width()); // sps_pic_width_max_in_luma_samples
         bw.write_ue(self.config.coded_height()); // sps_pic_height_max_in_luma_samples
         let (cw_l, cw_r, cw_t, cw_b) = self.config.conformance_window();
@@ -911,9 +911,9 @@ impl VvcEncoder {
         }
         bw.write_bit(0); // sps_subpic_info_present_flag
         bw.write_ue((self.config.bit_depth - 8) as u32); // sps_bitdepth_minus8 = 0
-                                                         // r429 — WPP + entry points: entropy sync mirrors the config
-                                                         // knob; entry-point offsets go on the wire whenever the slice
-                                                         // data splits into byte-aligned subsets (tiles and/or WPP).
+        // r429 — WPP + entry points: entropy sync mirrors the config
+        // knob; entry-point offsets go on the wire whenever the slice
+        // data splits into byte-aligned subsets (tiles and/or WPP).
         bw.write_bit(self.config.wpp as u8); // sps_entropy_coding_sync_enabled_flag
         let subsets = self.config.tile_grid().is_some() || self.config.wpp;
         bw.write_bit(subsets as u8); // sps_entry_point_offsets_present_flag
@@ -926,12 +926,12 @@ impl VvcEncoder {
         bw.write_ue(0); // log2_min_luma_cb_size_minus2
         bw.write_bit(0); // partition_constraints_override_enabled
         bw.write_ue(0); // log2_diff_min_qt_min_cb_intra_luma
-                        // r412 — the MTT pickers emit BT/TT splits at the 64x64 level,
-                        // which §6.4.2 / §6.4.3 only allow when the SPS signals a
-                        // non-zero MTT depth and MaxBtSizeY / MaxTtSizeY >= 64
-                        // (MinQtSizeY is 4, so both log2 diffs are 4). With the
-                        // pickers off the fields stay 0 and a conforming decoder
-                        // never reads BT/TT bins — matching the emitted stream.
+        // r412 — the MTT pickers emit BT/TT splits at the 64x64 level,
+        // which §6.4.2 / §6.4.3 only allow when the SPS signals a
+        // non-zero MTT depth and MaxBtSizeY / MaxTtSizeY >= 64
+        // (MinQtSizeY is 4, so both log2 diffs are 4). With the
+        // pickers off the fields stay 0 and a conforming decoder
+        // never reads BT/TT bins — matching the emitted stream.
         let mtt_on = self.config.enable_mtt_bt_picker || self.config.enable_mtt_tt_picker;
         if mtt_on {
             bw.write_ue(1); // max_mtt_depth_intra_luma = 1
@@ -946,10 +946,10 @@ impl VvcEncoder {
         }
         bw.write_ue(0); // log2_diff_min_qt_min_cb_inter
         bw.write_ue(0); // max_mtt_depth_inter = 0 → skip bt/tt
-                        // r412 wire-conformance fix — the pipeline codes 64x64 luma
-                        // TBs, so the SPS must signal MaxTbSizeY = 64; with the bit at
-                        // 0 a conforming decoder tiles every 64x64 CU into four 32x32
-                        // transform_tree() TUs and desyncs on our single-TB layout.
+        // r412 wire-conformance fix — the pipeline codes 64x64 luma
+        // TBs, so the SPS must signal MaxTbSizeY = 64; with the bit at
+        // 0 a conforming decoder tiles every 64x64 CU into four 32x32
+        // transform_tree() TUs and desyncs on our single-TB layout.
         bw.write_bit(1); // max_luma_transform_size_64_flag
 
         // ---- Tool flags (§7.3.2.4 tail) ----
@@ -970,13 +970,13 @@ impl VvcEncoder {
             bw.write_se(0); // qp_table_start_minus26
             bw.write_ue(0); // num_points_minus1 = 0
             bw.write_ue(0); // delta_qp_in_val_minus1[0][0]
-                            // r415 — delta_qp_diff_val = 1 makes the §7.4.3.4
-                            // derived table the IDENTITY (qpOut steps with qpIn
-                            // through the pivot, then +1 per step above it),
-                            // matching the pipeline's QpC = QpY dequant. The
-                            // pre-r415 all-zero point derived to QpC = QpY - 1
-                            // above the table start (26): every chroma recon at
-                            // QP > 27 desynced against conforming decoders.
+            // r415 — delta_qp_diff_val = 1 makes the §7.4.3.4
+            // derived table the IDENTITY (qpOut steps with qpIn
+            // through the pivot, then +1 per step above it),
+            // matching the pipeline's QpC = QpY dequant. The
+            // pre-r415 all-zero point derived to QpC = QpY - 1
+            // above the table start (26): every chroma recon at
+            // QP > 27 desynced against conforming decoders.
             bw.write_ue(1); // delta_qp_diff_val[0][0]
         }
         // Round-54 — `sps_sao_enabled_flag` is gated by the encoder
@@ -986,12 +986,12 @@ impl VvcEncoder {
         // `sao_merge_*_flag`) is emitted by the second-pass CABAC walk
         // and the PH carries `ph_sao_chroma_enabled_flag = 1`.
         bw.write_bit(self.config.enable_chroma_sao_merge as u8); // sao_enabled
-                                                                 // Round-46 — flip `sps_alf_enabled_flag` on so the
-                                                                 // PH-level ALF chain (`ph_alf_*`) becomes the
-                                                                 // decoder-visible gate for the per-CTU ALF CABAC
-                                                                 // emit. With `sps_chroma_format_idc != 0`,
-                                                                 // §7.3.2.4 also emits `sps_ccalf_enabled_flag`;
-                                                                 // we set both to 1.
+        // Round-46 — flip `sps_alf_enabled_flag` on so the
+        // PH-level ALF chain (`ph_alf_*`) becomes the
+        // decoder-visible gate for the per-CTU ALF CABAC
+        // emit. With `sps_chroma_format_idc != 0`,
+        // §7.3.2.4 also emits `sps_ccalf_enabled_flag`;
+        // we set both to 1.
         bw.write_bit(1); // alf_enabled
         if chroma {
             bw.write_bit(1); // ccalf_enabled (gated by alf_enabled && chroma_format_idc != 0)
@@ -1003,7 +1003,7 @@ impl VvcEncoder {
         bw.write_bit(0); // weighted_pred
         bw.write_bit(0); // weighted_bipred
         bw.write_bit(0); // long_term_ref_pics
-                         // sps_video_parameter_set_id = 0 → no inter_layer_prediction_enabled
+        // sps_video_parameter_set_id = 0 → no inter_layer_prediction_enabled
         bw.write_bit(0); // idr_rpl_present
         bw.write_bit(0); // rpl1_same_as_rpl0 → 2 loops
         bw.write_ue(0); // num_ref_pic_lists[0] = 0
@@ -1020,7 +1020,7 @@ impl VvcEncoder {
         bw.write_bit(0); // affine
         bw.write_bit(0); // bcw
         bw.write_bit(0); // ciip
-                         // MaxNumMergeCand = 6 >= 2 → gpm_enabled.
+        // MaxNumMergeCand = 6 >= 2 → gpm_enabled.
         bw.write_bit(0); // gpm_enabled = 0
         bw.write_ue(0); // log2_parallel_merge_level_minus2
         bw.write_bit(self.config.intra_isp as u8); // sps_isp_enabled_flag (r477)
@@ -1067,17 +1067,17 @@ impl VvcEncoder {
         bw.write_bits(0, 6); // pps_pic_parameter_set_id
         bw.write_bits(0, 4); // pps_seq_parameter_set_id
         bw.write_bit(0); // pps_mixed_nalu_types_in_pic_flag
-                         // r474 — the PPS size equals the SPS maximum, so §7.4.3.5
-                         // requires pps_conformance_window_flag = 0 and the window is
-                         // inferred from the SPS.
+        // r474 — the PPS size equals the SPS maximum, so §7.4.3.5
+        // requires pps_conformance_window_flag = 0 and the window is
+        // inferred from the SPS.
         bw.write_ue(self.config.coded_width()); // pps_pic_width_in_luma_samples
         bw.write_ue(self.config.coded_height()); // pps_pic_height_in_luma_samples
         bw.write_bit(0); // pps_conformance_window_flag
         bw.write_bit(0); // pps_scaling_window_explicit_signalling_flag
         bw.write_bit(0); // pps_output_flag_present_flag
-                         // r429 — §7.3.2.5 partition block for the configured tile
-                         // grid. Single-tile keeps the historical
-                         // `pps_no_pic_partition_flag = 1` profile bit-for-bit.
+        // r429 — §7.3.2.5 partition block for the configured tile
+        // grid. Single-tile keeps the historical
+        // `pps_no_pic_partition_flag = 1` profile bit-for-bit.
         match self.config.tile_grid() {
             None => {
                 bw.write_bit(1); // pps_no_pic_partition_flag = 1
@@ -1153,17 +1153,17 @@ impl VvcEncoder {
         bw.write_bit(0); // pps_weighted_bipred_flag
         bw.write_bit(0); // pps_ref_wraparound_enabled_flag
         bw.write_se(0); // pps_init_qp_minus26 → QP 26
-                        // Round-52 — enable per-CU QP delta signalling so the encoder
-                        // pipeline can emit `cu_qp_delta_abs` + `cu_qp_delta_sign_flag`
-                        // on CUs whose CBFs are non-zero (§7.3.13 + §8.7.1). The
-                        // decoder already respects `cu_qp_delta_val` in
-                        // `CtuWalker::reconstruct_leaf_cu` (luma dequant) and the
-                        // §8.8.3 deblocker.
+        // Round-52 — enable per-CU QP delta signalling so the encoder
+        // pipeline can emit `cu_qp_delta_abs` + `cu_qp_delta_sign_flag`
+        // on CUs whose CBFs are non-zero (§7.3.13 + §8.7.1). The
+        // decoder already respects `cu_qp_delta_val` in
+        // `CtuWalker::reconstruct_leaf_cu` (luma dequant) and the
+        // §8.8.3 deblocker.
         bw.write_bit(1); // pps_cu_qp_delta_enabled_flag
         bw.write_bit(0); // pps_chroma_tool_offsets_present_flag
-                         // r474 — lossless switches deblocking off picture-wide:
-                         // control present, no override, disabled (no beta / tc offsets
-                         // follow).
+        // r474 — lossless switches deblocking off picture-wide:
+        // control present, no override, disabled (no beta / tc offsets
+        // follow).
         bw.write_bit(self.config.lossless as u8); // pps_deblocking_filter_control_present_flag
         if self.config.lossless {
             bw.write_bit(0); // pps_deblocking_filter_override_enabled_flag
@@ -1226,7 +1226,7 @@ impl VvcEncoder {
         bw.write_bit(0); // ph_gdr_pic_flag = 0
         bw.write_bit(0); // ph_inter_slice_allowed_flag = 0
         bw.write_ue(0); // ph_pic_parameter_set_id = 0
-                        // ph_pic_order_cnt_lsb — 8 bits.
+        // ph_pic_order_cnt_lsb — 8 bits.
         bw.write_bits(0, 8);
         // Round-384 — §7.3.2.8 LMCS chain, gated by
         // sps_lmcs_enabled_flag (== config.lmcs.is_some()). The
@@ -1531,10 +1531,10 @@ impl AlfPhChain {
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::nal::{extract_rbsp, iter_annex_b, NalHeader};
+    use crate::nal::{NalHeader, extract_rbsp, iter_annex_b};
     use crate::picture_header::parse_picture_header_stateful;
     use crate::pps::parse_pps;
-    use crate::slice_header::{parse_slice_header_stateful, PhState};
+    use crate::slice_header::{PhState, parse_slice_header_stateful};
     use crate::sps::parse_sps;
     use crate::vps::parse_vps;
     use oxideav_core::{VideoFrame, VideoPlane};
@@ -1628,26 +1628,34 @@ mod tests {
         assert!(VvcEncoder::new(EncoderConfig::new(320, 0)).is_err());
         // r474 — 8..=10-bit and every §6.2 chroma format are accepted;
         // out-of-range values are not.
-        assert!(VvcEncoder::new(EncoderConfig {
-            bit_depth: 10,
-            ..EncoderConfig::new(320, 240)
-        })
-        .is_ok());
-        assert!(VvcEncoder::new(EncoderConfig {
-            bit_depth: 12,
-            ..EncoderConfig::new(320, 240)
-        })
-        .is_err());
-        assert!(VvcEncoder::new(EncoderConfig {
-            chroma_format_idc: 3,
-            ..EncoderConfig::new(320, 240)
-        })
-        .is_ok());
-        assert!(VvcEncoder::new(EncoderConfig {
-            chroma_format_idc: 4,
-            ..EncoderConfig::new(320, 240)
-        })
-        .is_err());
+        assert!(
+            VvcEncoder::new(EncoderConfig {
+                bit_depth: 10,
+                ..EncoderConfig::new(320, 240)
+            })
+            .is_ok()
+        );
+        assert!(
+            VvcEncoder::new(EncoderConfig {
+                bit_depth: 12,
+                ..EncoderConfig::new(320, 240)
+            })
+            .is_err()
+        );
+        assert!(
+            VvcEncoder::new(EncoderConfig {
+                chroma_format_idc: 3,
+                ..EncoderConfig::new(320, 240)
+            })
+            .is_ok()
+        );
+        assert!(
+            VvcEncoder::new(EncoderConfig {
+                chroma_format_idc: 4,
+                ..EncoderConfig::new(320, 240)
+            })
+            .is_err()
+        );
     }
 
     #[test]

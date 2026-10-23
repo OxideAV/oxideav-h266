@@ -386,7 +386,7 @@ pub fn derive_subblock_mvs(
             "h266 affine: CU {cb_width}x{cb_height} below the 8×8 affine floor"
         )));
     }
-    if cb_width % AFFINE_SB_SIZE != 0 || cb_height % AFFINE_SB_SIZE != 0 {
+    if !cb_width.is_multiple_of(AFFINE_SB_SIZE) || !cb_height.is_multiple_of(AFFINE_SB_SIZE) {
         return Err(Error::invalid(format!(
             "h266 affine: CU {cb_width}x{cb_height} not aligned to {AFFINE_SB_SIZE}x{AFFINE_SB_SIZE} sub-block grid"
         )));
@@ -936,7 +936,7 @@ pub fn derive_prof_diff_mv_array(
             "h266 PROF diffMv: CU {cb_width}x{cb_height} below the 8×8 affine floor"
         )));
     }
-    if cb_width % AFFINE_SB_SIZE != 0 || cb_height % AFFINE_SB_SIZE != 0 {
+    if !cb_width.is_multiple_of(AFFINE_SB_SIZE) || !cb_height.is_multiple_of(AFFINE_SB_SIZE) {
         return Err(Error::invalid(format!(
             "h266 PROF diffMv: CU {cb_width}x{cb_height} not aligned to {AFFINE_SB_SIZE}x{AFFINE_SB_SIZE} sub-block grid"
         )));
@@ -1303,7 +1303,9 @@ pub fn predict_luma_block_affine_prof(
                                 diff_mv.is_some(),
                                 block.samples[(ly as usize + 1) * stride + lx as usize + 1],
                                 refined_dbg,
-                                diff_mv.as_ref().map(|dm| dm.entries[(ly * sb_w + lx) as usize]),
+                                diff_mv
+                                    .as_ref()
+                                    .map(|dm| dm.entries[(ly * sb_w + lx) as usize]),
                                 &block.samples[..stride.min(6)],
                             );
                         }

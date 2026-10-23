@@ -269,11 +269,7 @@ impl LmcsDerived {
             0
         } else {
             let mag = (res.unsigned_abs() * u64::from(var_scale) + (1 << 10)) >> 11;
-            if res < 0 {
-                -(mag as i64)
-            } else {
-                mag as i64
-            }
+            if res < 0 { -(mag as i64) } else { mag as i64 }
         };
         self.clip1(pred_sample + scaled)
     }
@@ -861,7 +857,7 @@ mod tests {
         assert_eq!(got.lmcs_cw[0], 2);
         assert_eq!(got.scale_coeff[0], 256); // (2 * 2048 + 8) >> 4
         assert_eq!(got.inv_scale_coeff[0], 16384); // 32768 / 2
-                                                   // lmcsCW = 16 − 15 = 1 < 2: rejected.
+        // lmcsCW = 16 − 15 = 1 < 2: rejected.
         d.lmcs_delta_abs_cw[0] = 15;
         assert!(d.derive(8).is_err());
         // lmcsCW = 16 + 111 = 127: upper boundary accepted.
@@ -871,7 +867,7 @@ mod tests {
         assert_eq!(got.lmcs_cw[0], 127);
         assert_eq!(got.scale_coeff[0], 16256); // (127 * 2048 + 8) >> 4
         assert_eq!(got.inv_scale_coeff[0], 258); // 32768 / 127
-                                                 // lmcsCW = 16 + 112 = 128 > 127: rejected.
+        // lmcsCW = 16 + 112 = 128 > 127: rejected.
         d.lmcs_delta_abs_cw[0] = 112;
         assert!(d.derive(8).is_err());
     }

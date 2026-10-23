@@ -168,7 +168,11 @@ fn round63_chroma_constant_plane_preserved_through_subpel() {
             let v = if (x / 8) % 2 == 0 { 60u16 } else { 200u16 };
             frame_i.luma.samples[y * frame_i.luma.stride + x] = v;
             let sx = ((x as i32 - 4).rem_euclid(64)) as usize;
-            let v2 = if (sx / 8) % 2 == 0 { 60u16 } else { 200u16 };
+            let v2 = if (sx / 8).is_multiple_of(2) {
+                60u16
+            } else {
+                200u16
+            };
             frame_p.luma.samples[y * frame_p.luma.stride + x] = v2;
         }
     }

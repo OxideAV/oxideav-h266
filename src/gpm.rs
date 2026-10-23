@@ -428,7 +428,8 @@ pub fn gpm_storage_s_type(
     let displacement_x = angle_idx as usize;
     let displacement_y = ((angle_idx + 8) % 32) as usize;
     let is_flip = (13..=27).contains(&angle_idx);
-    let shift_hor = !(angle_idx % 16 == 8 || (angle_idx % 16 != 0 && cb_height >= cb_width));
+    let shift_hor =
+        !(angle_idx % 16 == 8 || (!angle_idx.is_multiple_of(16) && cb_height >= cb_width));
     let (offset_x, offset_y) = if !shift_hor {
         (
             -(cb_width as i32) >> 1,

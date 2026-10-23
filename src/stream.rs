@@ -27,22 +27,22 @@ use oxideav_core::{Error, Result};
 
 use crate::alf::AlfApsBinding;
 use crate::alf_syntax::AlfSyntaxConfig;
-use crate::aps::{parse_aps, AlfApsData, ApsParamsType};
+use crate::aps::{AlfApsData, ApsParamsType, parse_aps};
 use crate::ctu::{CtuLayout, CtuWalker};
 use crate::inter::{ExplicitWpTables, MotionField, ReferencePicture};
 use crate::lmcs::LmcsData;
-use crate::nal::{extract_rbsp, iter_annex_b, NalHeader, NalUnitType};
-use crate::picture_header::{parse_picture_header, parse_picture_header_stateful, PictureHeader};
-use crate::pps::{parse_pps, PicParameterSet};
+use crate::nal::{NalHeader, NalUnitType, extract_rbsp, iter_annex_b};
+use crate::picture_header::{PictureHeader, parse_picture_header, parse_picture_header_stateful};
+use crate::pps::{PicParameterSet, parse_pps};
 use crate::reconstruct::PictureBuffer;
 use crate::ref_pic_list::{
-    build_ref_pic_list, BuiltRefPicEntry, HeaderRefPicList, RefPicKind, RefPicListInputs,
+    BuiltRefPicEntry, HeaderRefPicList, RefPicKind, RefPicListInputs, build_ref_pic_list,
 };
 use crate::scaling_list::ScalingListData;
 use crate::slice_header::{
-    parse_slice_header_stateful, PhAlfState, PhState, SliceType, StatefulSliceHeader,
+    PhAlfState, PhState, SliceType, StatefulSliceHeader, parse_slice_header_stateful,
 };
-use crate::sps::{parse_sps, SeqParameterSet};
+use crate::sps::{SeqParameterSet, parse_sps};
 
 /// One decoded picture, in decode order.
 pub struct DecodedPicture {
@@ -508,22 +508,23 @@ impl StreamDecoder {
     ) -> Result<Vec<ReferencePicture>> {
         let mut out = Vec::new();
         for entry in built.iter().take(active) {
-            let found =
-                match entry.kind {
-                    RefPicKind::ShortTerm => self.dpb.iter().find(|d| d.poc == entry.poc),
-                    RefPicKind::LongTerm => {
-                        if entry.is_poc_lsb_only {
-                            self.dpb.iter().find(|d| {
-                                d.poc & (max_poc_lsb - 1) == entry.poc & (max_poc_lsb - 1)
-                            })
-                        } else {
-                            self.dpb.iter().find(|d| d.poc == entry.poc)
-                        }
+            let found = match entry.kind {
+                RefPicKind::ShortTerm => self.dpb.iter().find(|d| d.poc == entry.poc),
+                RefPicKind::LongTerm => {
+                    if entry.is_poc_lsb_only {
+                        self.dpb
+                            .iter()
+                            .find(|d| d.poc & (max_poc_lsb - 1) == entry.poc & (max_poc_lsb - 1))
+                    } else {
+                        self.dpb.iter().find(|d| d.poc == entry.poc)
                     }
-                    RefPicKind::InterLayer => return Err(Error::unsupported(
+                }
+                RefPicKind::InterLayer => {
+                    return Err(Error::unsupported(
                         "h266 stream: inter-layer reference pictures (multilayer) not supported",
-                    )),
-                };
+                    ));
+                }
+            };
             let found = found.ok_or_else(|| {
                 Error::invalid(format!(
                     "h266 stream: reference POC {} not in DPB (have {:?})",

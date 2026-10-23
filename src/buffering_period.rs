@@ -609,9 +609,9 @@ mod tests {
 
         /// Append `sei_payload()` trailing bits (§D.2.1) and pack to bytes.
         fn finish_payload(mut self) -> Vec<u8> {
-            if self.bits.len() % 8 != 0 {
+            if !self.bits.len().is_multiple_of(8) {
                 self.bits.push(1); // sei_payload_bit_equal_to_one
-                while self.bits.len() % 8 != 0 {
+                while !self.bits.len().is_multiple_of(8) {
                     self.bits.push(0);
                 }
             }
@@ -660,8 +660,8 @@ mod tests {
         w.put(0x12, 8); // cpb_removal_delay_delta_minus1 (8-bit)
         w.put(0, 3); // max_sublayers_minus1 = 0 -> no deltas_present flag
         w.ue(0); // cpb_cnt_minus1 = 0 -> cpb_cnt = 1
-                 // max_sublayers_minus1 == 0: no sublayer_present flag,
-                 // i_start = 0, single i = 0; NAL entries only.
+        // max_sublayers_minus1 == 0: no sublayer_present flag,
+        // i_start = 0, single i = 0; NAL entries only.
         w.put(0xAB, 8); // nal_initial_cpb_removal_delay[0][0]
         w.put(0xCD, 8); // nal_initial_cpb_removal_offset[0][0]
         w.put(0, 1); // alt_cpb_params_present_flag
@@ -711,7 +711,7 @@ mod tests {
         w.put(0x05, 8); // cpb_removal_delay_delta_minus1
         w.put(0, 3); // max_sublayers_minus1 = 0
         w.ue(0); // cpb_cnt_minus1 = 0
-                 // single i = 0, NAL: delay, offset, alt_delay, alt_offset.
+        // single i = 0, NAL: delay, offset, alt_delay, alt_offset.
         w.put(0x11, 8);
         w.put(0x22, 8);
         w.put(0x33, 8); // alt delay
@@ -853,7 +853,7 @@ mod tests {
         w.put(0, 1); // cpb_removal_delay_deltas_present_flag = 0
         w.ue(0); // cpb_cnt_minus1 = 0
         w.put(0, 1); // sublayer_initial_cpb_removal_delay_present_flag = 0
-                     // i_start = 3, single i = 3.
+        // i_start = 3, single i = 3.
         w.put(0x7E, 8); // nal delay
         w.put(0x7F, 8); // nal offset
         w.put(0, 1); // sublayer_dpb_output_offsets_present_flag = 0

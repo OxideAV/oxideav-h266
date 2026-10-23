@@ -31,10 +31,10 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::hrd::{
-    parse_general_timing_hrd_parameters, parse_ols_timing_hrd_parameters,
-    GeneralTimingHrdParameters, OlsTimingHrdParameters,
+    GeneralTimingHrdParameters, OlsTimingHrdParameters, parse_general_timing_hrd_parameters,
+    parse_ols_timing_hrd_parameters,
 };
-use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
+use crate::ptl::{ProfileTierLevel, parse_profile_tier_level};
 
 #[derive(Clone, Debug)]
 pub struct SeqParameterSet {
@@ -240,7 +240,7 @@ impl ChromaQpTable {
     /// tail extrapolation lands on `k − 1` above it (r415).
     pub fn build(&self, qp_bd_offset: i32) -> Vec<i32> {
         let num_points = self.entries.len(); // sps_num_points_in_qp_table_minus1 + 1
-                                             // qpInVal / qpOutVal pivot arrays (length num_points + 1).
+        // qpInVal / qpOutVal pivot arrays (length num_points + 1).
         let mut qp_in = vec![0i32; num_points + 1];
         let mut qp_out = vec![0i32; num_points + 1];
         qp_in[0] = self.qp_table_start_minus26 + 26;
@@ -1579,7 +1579,7 @@ mod tests {
 
     fn pack(bits: &[u8]) -> Vec<u8> {
         let mut padded = bits.to_vec();
-        while padded.len() % 8 != 0 {
+        while !padded.len().is_multiple_of(8) {
             padded.push(0);
         }
         let mut bytes = Vec::with_capacity(padded.len() / 8);
@@ -1624,18 +1624,18 @@ mod tests {
         push_u(&mut bits, 0, 1); // partition_constraints_override_enabled
         push_ue(&mut bits, 0); // log2_diff_min_qt_min_cb_intra_luma
         push_ue(&mut bits, 0); // max_mtt_depth_intra_luma (=> skip bt/tt)
-                               // chroma_format_idc = 1 ≠ 0 → emit qtbtt_dual_tree_intra_flag
+        // chroma_format_idc = 1 ≠ 0 → emit qtbtt_dual_tree_intra_flag
         push_u(&mut bits, 0, 1); // qtbtt_dual_tree_intra = 0 → skip chroma block
         push_ue(&mut bits, 0); // log2_diff_min_qt_min_cb_inter
         push_ue(&mut bits, 0); // max_mtt_depth_inter (=> skip bt/tt)
-                               // CtbSizeY = 128 > 32 → emit max_luma_transform_size_64_flag
+        // CtbSizeY = 128 > 32 → emit max_luma_transform_size_64_flag
         push_u(&mut bits, 0, 1); // max_luma_transform_size_64_flag
 
         // ---- tool flags (§7.3.2.4 tail) ----
         push_u(&mut bits, 0, 1); // transform_skip_enabled
         push_u(&mut bits, 0, 1); // mts_enabled
         push_u(&mut bits, 0, 1); // lfnst_enabled
-                                 // chroma_format_idc ≠ 0 → joint_cbcr + same_qp_table + tables
+        // chroma_format_idc ≠ 0 → joint_cbcr + same_qp_table + tables
         push_u(&mut bits, 0, 1); // joint_cbcr_enabled
         push_u(&mut bits, 1, 1); // same_qp_table_for_chroma (→ 1 table)
         push_se(&mut bits, 0); // qp_table_start_minus26 (se)
@@ -1648,7 +1648,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // weighted_pred
         push_u(&mut bits, 0, 1); // weighted_bipred
         push_u(&mut bits, 0, 1); // long_term_ref_pics
-                                 // vps_id = 0 → no inter_layer_prediction_enabled
+        // vps_id = 0 → no inter_layer_prediction_enabled
         push_u(&mut bits, 0, 1); // idr_rpl_present
         push_u(&mut bits, 0, 1); // rpl1_same_as_rpl0 = 0 → 2 loops
         push_ue(&mut bits, 0); // num_ref_pic_lists[0] = 0
@@ -1665,29 +1665,29 @@ mod tests {
         push_u(&mut bits, 0, 1); // affine (=> skip affine block)
         push_u(&mut bits, 0, 1); // bcw
         push_u(&mut bits, 0, 1); // ciip
-                                 // MaxNumMergeCand=6 >= 2 → gpm_enabled
+        // MaxNumMergeCand=6 >= 2 → gpm_enabled
         push_u(&mut bits, 0, 1); // gpm_enabled = 0
         push_ue(&mut bits, 0); // log2_parallel_merge_level_minus2
         push_u(&mut bits, 0, 1); // isp
         push_u(&mut bits, 0, 1); // mrl
         push_u(&mut bits, 0, 1); // mip
         push_u(&mut bits, 0, 1); // cclm (chroma_format_idc ≠ 0)
-                                 // chroma_format_idc == 1 → chroma-collocated flags
+        // chroma_format_idc == 1 → chroma-collocated flags
         push_u(&mut bits, 0, 1); // chroma_horizontal_collocated
         push_u(&mut bits, 0, 1); // chroma_vertical_collocated
         push_u(&mut bits, 0, 1); // palette
-                                 // chroma_format_idc != 3 → no act flag
-                                 // transform_skip=0 && palette=0 → no min_qp_prime_ts
+        // chroma_format_idc != 3 → no act flag
+        // transform_skip=0 && palette=0 → no min_qp_prime_ts
         push_u(&mut bits, 0, 1); // ibc
         push_u(&mut bits, 0, 1); // ladf
         push_u(&mut bits, 0, 1); // explicit_scaling_list
         push_u(&mut bits, 0, 1); // dep_quant
         push_u(&mut bits, 0, 1); // sign_data_hiding
         push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
-                                 // Tail block (§7.3.2.4): no HRD timing (ptl_dpb_hrd=0 →
-                                 // sps_timing_hrd_params_present_flag is not emitted), then
-                                 // sps_field_seq_flag=0, sps_vui_parameters_present_flag=0,
-                                 // sps_extension_flag=0.
+        // Tail block (§7.3.2.4): no HRD timing (ptl_dpb_hrd=0 →
+        // sps_timing_hrd_params_present_flag is not emitted), then
+        // sps_field_seq_flag=0, sps_vui_parameters_present_flag=0,
+        // sps_extension_flag=0.
         push_u(&mut bits, 0, 1); // sps_field_seq_flag
         push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
         push_u(&mut bits, 0, 1); // sps_extension_flag
@@ -1946,12 +1946,12 @@ mod tests {
         push_ue(&mut bits, 240); // height
         push_u(&mut bits, 0, 1); // conformance_window_flag
         push_u(&mut bits, 1, 1); // subpic_info_present = 1
-                                 // Subpic block: num_subpics_minus1 = 0 → no indep/same flags,
-                                 // no per-entry loop body.
+        // Subpic block: num_subpics_minus1 = 0 → no indep/same flags,
+        // no per-entry loop body.
         push_ue(&mut bits, 0);
         push_ue(&mut bits, 0); // subpic_id_len_minus1 = 0
         push_u(&mut bits, 0, 1); // subpic_id_mapping_explicitly_signalled_flag = 0
-                                 // Continue with the usual identifier tail.
+        // Continue with the usual identifier tail.
         push_ue(&mut bits, 2); // bitdepth_minus8
         push_u(&mut bits, 0, 1); // entropy_coding_sync
         push_u(&mut bits, 0, 1); // entry_point_offsets
@@ -1959,7 +1959,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // poc_msb_cycle
         push_u(&mut bits, 0, 2); // num_extra_ph_bytes
         push_u(&mut bits, 0, 2); // num_extra_sh_bytes
-                                 // Partition constraints — all-zero.
+        // Partition constraints — all-zero.
         push_ue(&mut bits, 0);
         push_u(&mut bits, 0, 1);
         push_ue(&mut bits, 0);
@@ -1968,7 +1968,7 @@ mod tests {
         push_ue(&mut bits, 0);
         push_ue(&mut bits, 0);
         push_u(&mut bits, 0, 1); // max_luma_transform_size_64 (CtbSizeY=128)
-                                 // Tool flags — mirror build_minimal_sps_bits' minimal tail.
+        // Tool flags — mirror build_minimal_sps_bits' minimal tail.
         push_u(&mut bits, 0, 1); // transform_skip
         push_u(&mut bits, 0, 1); // mts
         push_u(&mut bits, 0, 1); // lfnst
@@ -2155,7 +2155,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // dep_quant
         push_u(&mut bits, 0, 1); // sign_data_hiding
         push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
-                                 // Tail: field_seq=0, vui=0, ext=0.
+        // Tail: field_seq=0, vui=0, ext=0.
         push_u(&mut bits, 0, 1); // sps_field_seq_flag
         push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
         push_u(&mut bits, 0, 1); // sps_extension_flag
@@ -2179,8 +2179,8 @@ mod tests {
         weighted_pred: bool,
     ) {
         push_u(bits, 0, 4); // sps_id
-                            // `inter_layer_prediction_enabled_flag` is only transmitted when
-                            // `vps_id > 0`, so use vps_id=1 when we want ILRP support.
+        // `inter_layer_prediction_enabled_flag` is only transmitted when
+        // `vps_id > 0`, so use vps_id=1 when we want ILRP support.
         push_u(bits, if inter_layer { 1 } else { 0 }, 4); // vps_id
         push_u(bits, 0, 3); // max_sublayers_minus1
         push_u(bits, 1, 2); // chroma = 4:2:0
@@ -2265,7 +2265,7 @@ mod tests {
         push_u(bits, 0, 1); // dep_quant
         push_u(bits, 0, 1); // sign_data_hiding
         push_u(bits, 0, 1); // virtual_boundaries_enabled
-                            // Tail: no HRD (ptl_dpb_hrd=0), field_seq=0, vui=0, ext=0.
+        // Tail: no HRD (ptl_dpb_hrd=0), field_seq=0, vui=0, ext=0.
         push_u(bits, 0, 1); // sps_field_seq_flag
         push_u(bits, 0, 1); // sps_vui_parameters_present_flag
         push_u(bits, 0, 1); // sps_extension_flag
@@ -2283,11 +2283,11 @@ mod tests {
         push_ue(&mut bits, 1);
         // ---- ref_pic_list_struct(0, 0) ----
         push_ue(&mut bits, 2); // num_ref_entries = 2
-                               // long_term=0 → no ltrp_in_header_flag, no st_ref_pic_flag.
-                               // Entry 0: abs_delta_poc_st = 0 → Abs = 0+1 = 1, sign=0 (+1)
+        // long_term=0 → no ltrp_in_header_flag, no st_ref_pic_flag.
+        // Entry 0: abs_delta_poc_st = 0 → Abs = 0+1 = 1, sign=0 (+1)
         push_ue(&mut bits, 0);
         push_u(&mut bits, 0, 1); // strp_entry_sign_flag (+)
-                                 // Entry 1: abs_delta_poc_st = 1 → Abs = 1+1 = 2, sign=1 (-2)
+        // Entry 1: abs_delta_poc_st = 1 → Abs = 1+1 = 2, sign=1 (-2)
         push_ue(&mut bits, 1);
         push_u(&mut bits, 1, 1); // strp_entry_sign_flag (-)
         emit_sps_tail_after_rpl(&mut bits);
@@ -2340,15 +2340,15 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         emit_sps_preamble_for_rpl(&mut bits, true, false, false);
         push_ue(&mut bits, 1); // num_ref_pic_lists[0] = 1
-                               // ---- ref_pic_list_struct(0, 0) ----
-                               // rplsIdx=0 < num_ref_pic_lists_listidx=1 and num_ref_entries>0 →
-                               // ltrp_in_header_flag is transmitted.
+        // ---- ref_pic_list_struct(0, 0) ----
+        // rplsIdx=0 < num_ref_pic_lists_listidx=1 and num_ref_entries>0 →
+        // ltrp_in_header_flag is transmitted.
         push_ue(&mut bits, 2); // num_ref_entries = 2
         push_u(&mut bits, 0, 1); // ltrp_in_header_flag = 0 → POC LSBs inlined.
-                                 // Entry 0: st_ref_pic_flag = 0 → LT with inlined POC LSB.
+        // Entry 0: st_ref_pic_flag = 0 → LT with inlined POC LSB.
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 0xA5, 8); // rpls_poc_lsb_lt[0] = 0xA5
-                                    // Entry 1: st_ref_pic_flag = 0 → LT with inlined POC LSB.
+        // Entry 1: st_ref_pic_flag = 0 → LT with inlined POC LSB.
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 0x42, 8); // rpls_poc_lsb_lt[1] = 0x42
         emit_sps_tail_after_rpl(&mut bits);
@@ -2382,15 +2382,15 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         emit_sps_preamble_for_rpl(&mut bits, true, true, false);
         push_ue(&mut bits, 1); // num_ref_pic_lists[0] = 1
-                               // ---- ref_pic_list_struct(0, 0) ----
+        // ---- ref_pic_list_struct(0, 0) ----
         push_ue(&mut bits, 3); // num_ref_entries = 3
         push_u(&mut bits, 1, 1); // ltrp_in_header_flag = 1 → no inlined POC LSB
-                                 // Entry 0: ILRP flag=0 → not ILRP; st_ref_pic_flag=1 → STRP; Abs=2+1=3.
+        // Entry 0: ILRP flag=0 → not ILRP; st_ref_pic_flag=1 → STRP; Abs=2+1=3.
         push_u(&mut bits, 0, 1); // inter_layer_ref_pic_flag
         push_u(&mut bits, 1, 1); // st_ref_pic_flag
         push_ue(&mut bits, 2); // abs_delta_poc_st → Abs = 3
         push_u(&mut bits, 0, 1); // sign = 0 → +3
-                                 // Entry 1: ILRP flag=1 → ilrp_idx = 2
+        // Entry 1: ILRP flag=1 → ilrp_idx = 2
         push_u(&mut bits, 1, 1);
         push_ue(&mut bits, 2);
         // Entry 2: ILRP flag=0, st_ref_pic_flag=0 → LT, deferred POC LSB.
@@ -2510,7 +2510,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // dep_quant
         push_u(&mut bits, 0, 1); // sign_data_hiding
         push_u(&mut bits, 0, 1); // virtual_boundaries_enabled
-                                 // Tail: field_seq=0, vui=0, ext=0.
+        // Tail: field_seq=0, vui=0, ext=0.
         push_u(&mut bits, 0, 1); // sps_field_seq_flag
         push_u(&mut bits, 0, 1); // sps_vui_parameters_present_flag
         push_u(&mut bits, 0, 1); // sps_extension_flag
@@ -2747,7 +2747,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // chroma_horizontal_collocated
         push_u(&mut bits, 0, 1); // chroma_vertical_collocated
         push_u(&mut bits, 0, 1); // palette
-                                 // transform_skip || palette → min_qp_prime_ts
+        // transform_skip || palette → min_qp_prime_ts
         if cfg.transform_skip_enabled {
             push_ue(&mut bits, 0); // min_qp_prime_ts
         }

@@ -15,12 +15,12 @@
 //!      transcription is invertible.
 
 use oxideav_h266::alf::{AlfCtb, AlfPicture};
-use oxideav_h266::alf_syntax::{decode_alf_picture, encode_alf_picture, AlfCtxs, AlfSyntaxConfig};
-use oxideav_h266::aps::{parse_aps, ApsParamsType, ALF_CC_NUM_COEFF, ALF_CHROMA_NUM_COEFF};
+use oxideav_h266::alf_syntax::{AlfCtxs, AlfSyntaxConfig, decode_alf_picture, encode_alf_picture};
+use oxideav_h266::aps::{ALF_CC_NUM_COEFF, ALF_CHROMA_NUM_COEFF, ApsParamsType, parse_aps};
 use oxideav_h266::aps_enc::emit_alf_aps_rbsp;
 use oxideav_h266::cabac::ArithDecoder;
 use oxideav_h266::cabac_enc::ArithEncoder;
-use oxideav_h266::nal::{extract_rbsp, iter_annex_b, NalUnitType};
+use oxideav_h266::nal::{NalUnitType, extract_rbsp, iter_annex_b};
 use oxideav_h266::slice_header::SliceType;
 
 fn pad(bytes: Vec<u8>) -> Vec<u8> {
@@ -60,7 +60,7 @@ struct IntraCascadeCtxs {
 }
 
 fn intra_cascade_ctxs(slice_qp: i32) -> IntraCascadeCtxs {
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
     IntraCascadeCtxs {
         mpm: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp),
         np: init_contexts(SyntaxCtx::IntraLumaNotPlanarFlag, slice_qp),
@@ -500,7 +500,7 @@ fn encoder_pipeline_ph_alf_chain_round_trip() {
     );
 
     // Parse the slice header for the chain.
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     let slice_nal = nals
         .iter()
         .find(|n| n.header.nal_unit_type == NalUnitType::IdrNLp)
@@ -562,13 +562,13 @@ fn encoder_pipeline_ph_alf_chain_round_trip() {
 #[test]
 fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
     use oxideav_h266::alf::AlfPicture;
-    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::alf_syntax::{AlfCtxs, AlfSyntaxConfig, decode_alf_picture};
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     use oxideav_h266::sps::parse_sps;
 
     // 128×128 IDR — 1×1 CTU grid (CTB = 128).
@@ -681,7 +681,7 @@ fn encoder_pipeline_slice_alf_cabac_inlined_in_ctu_walk() {
 #[test]
 fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     use oxideav_h266::alf::AlfPicture;
-    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::alf_syntax::{AlfCtxs, AlfSyntaxConfig, decode_alf_picture};
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
@@ -690,11 +690,11 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
     use oxideav_h266::residual::{
-        read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
+        ResidualCtxs, read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag,
     };
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{TreeNeighbours, decode_coding_tree_split_cu_flag};
 
     let src = PictureBuffer::yuv420_filled(128, 128, 128);
     // r477 — this hand-rolled CABAC walk reads the §7.3.11.5 cascade
@@ -842,7 +842,7 @@ fn round51_cbf_round_trip_flat_source_emits_zero_cbfs() {
 #[test]
 fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     use oxideav_h266::alf::AlfPicture;
-    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::alf_syntax::{AlfCtxs, AlfSyntaxConfig, decode_alf_picture};
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
@@ -851,11 +851,11 @@ fn round51_cbf_round_trip_non_flat_source_emits_some_nonzero_cbfs() {
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
     use oxideav_h266::residual::{
-        read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag, ResidualCtxs,
+        ResidualCtxs, read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag,
     };
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{TreeNeighbours, decode_coding_tree_split_cu_flag};
 
     // High-contrast luma + chroma noise → the encoder's flat quant
     // ladder leaves non-trivial residuals on every plane.
@@ -1137,7 +1137,7 @@ fn round51_chroma_aps_rdo_skips_aps_on_flat_source() {
 #[test]
 fn round52_cu_qp_delta_round_trips_per_cu() {
     use oxideav_h266::alf::AlfPicture;
-    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::alf_syntax::{AlfCtxs, AlfSyntaxConfig, decode_alf_picture};
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
@@ -1146,12 +1146,12 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
     use oxideav_h266::residual::{
-        read_cu_qp_delta, read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag,
-        ResidualCtxs,
+        ResidualCtxs, read_cu_qp_delta, read_tu_cb_coded_flag, read_tu_cr_coded_flag,
+        read_tu_y_coded_flag,
     };
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{TreeNeighbours, decode_coding_tree_split_cu_flag};
 
     // 128×64 source: two stacked 64×64 CUs in row 0 of a 128×128 CTB
     // grid. CU(0,0) is the left half (flat 128 → all-zero residuals at
@@ -1168,13 +1168,8 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
     }
     // QP picker: CU index by tx (0 → 22, 1 → 30); rows + ry irrelevant
     // for this single-CTB fixture.
-    let qp_for = |_rx: usize, _ry: usize, tx: usize, _ty: usize| -> i32 {
-        if tx == 0 {
-            22
-        } else {
-            30
-        }
-    };
+    let qp_for =
+        |_rx: usize, _ry: usize, tx: usize, _ty: usize| -> i32 { if tx == 0 { 22 } else { 30 } };
     let slice_qp_y = 22;
     // r474 — this hand-rolled CABAC walk pins the one-CU-per-64x64
     // layout (the §9.3.4.2.2 split ctxIncs below use default
@@ -1361,7 +1356,7 @@ fn round52_cu_qp_delta_round_trips_per_cu() {
 #[test]
 fn round52_constant_qp_path_round_trips_zero_delta() {
     use oxideav_h266::alf::AlfPicture;
-    use oxideav_h266::alf_syntax::{decode_alf_picture, AlfCtxs, AlfSyntaxConfig};
+    use oxideav_h266::alf_syntax::{AlfCtxs, AlfSyntaxConfig, decode_alf_picture};
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
@@ -1370,12 +1365,12 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
     use oxideav_h266::residual::{
-        read_cu_qp_delta, read_tu_cb_coded_flag, read_tu_cr_coded_flag, read_tu_y_coded_flag,
-        ResidualCtxs,
+        ResidualCtxs, read_cu_qp_delta, read_tu_cb_coded_flag, read_tu_cr_coded_flag,
+        read_tu_y_coded_flag,
     };
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     use oxideav_h266::sps::parse_sps;
-    use oxideav_h266::syntax_enc::{decode_coding_tree_split_cu_flag, TreeNeighbours};
+    use oxideav_h266::syntax_enc::{TreeNeighbours, decode_coding_tree_split_cu_flag};
 
     // 128×128 source with structured luma so at least one CU emits a
     // non-zero CBF.
@@ -1542,7 +1537,7 @@ fn round54_chroma_sao_merge_header_chain_round_trips() {
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
-    use oxideav_h266::slice_header::{parse_slice_header_stateful, PhState};
+    use oxideav_h266::slice_header::{PhState, parse_slice_header_stateful};
     use oxideav_h266::sps::parse_sps;
 
     let mut src = PictureBuffer::yuv420_filled(128, 128, 100);

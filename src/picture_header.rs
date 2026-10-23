@@ -17,7 +17,7 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::pps::PicParameterSet;
-use crate::ref_pic_list::{parse_ref_pic_lists, HeaderRefPicList};
+use crate::ref_pic_list::{HeaderRefPicList, parse_ref_pic_lists};
 use crate::sps::SeqParameterSet;
 
 /// Virtual-boundary positions supplied by the picture header (§7.3.2.8).
@@ -1029,7 +1029,7 @@ mod tests {
     }
     fn pack(bits: &[u8]) -> Vec<u8> {
         let mut padded = bits.to_vec();
-        while padded.len() % 8 != 0 {
+        while !padded.len().is_multiple_of(8) {
             padded.push(0);
         }
         let mut out = Vec::with_capacity(padded.len() / 8);
@@ -1157,7 +1157,7 @@ mod tests {
         push_u(&mut bits, 0, 1);
         push_u(&mut bits, 0, 1); // ph_gdr_pic_flag
         push_u(&mut bits, 0, 1); // ph_inter_slice_allowed_flag = 0
-                                 // ph_pic_parameter_set_id = 0 → ue "1"
+        // ph_pic_parameter_set_id = 0 → ue "1"
         push_ue(&mut bits, 0);
         // ph_pic_order_cnt_lsb: 8 bits (log2_max = 4 + 4 = 8).
         push_u(&mut bits, 0b0000_0101, 8);
@@ -1177,11 +1177,11 @@ mod tests {
         // ph_inter_slice_allowed_flag = 0 → skip whole inter block.
         // pps_qp_delta_info_in_ph_flag = 1 → read ph_qp_delta.
         push_ue(&mut bits, 0); // ph_qp_delta = 0 → se "1"
-                               // sps_joint_cbcr_enabled_flag = 0 → skip sign flag.
-                               // sps_sao_enabled_flag = 0 → skip.
-                               // pps_dbf_info_in_ph_flag = 1 → read deblocking block gate.
+        // sps_joint_cbcr_enabled_flag = 0 → skip sign flag.
+        // sps_sao_enabled_flag = 0 → skip.
+        // pps_dbf_info_in_ph_flag = 1 → read deblocking block gate.
         push_u(&mut bits, 0, 1); // ph_deblocking_params_present_flag = 0
-                                 // pps_picture_header_extension_present_flag = 0 → skip.
+        // pps_picture_header_extension_present_flag = 0 → skip.
         let bytes = pack(&bits);
         let ph = parse_picture_header_stateful(&bytes, &sps, &pps).unwrap();
         assert!(ph.ph_gdr_or_irap_pic_flag);
@@ -1206,7 +1206,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // ph_inter_slice_allowed = 0
         push_ue(&mut bits, 0);
         push_u(&mut bits, 0, 8); // ph_pic_order_cnt_lsb = 0
-                                 // ph_qp_delta = 0
+        // ph_qp_delta = 0
         push_ue(&mut bits, 0);
         // sao_luma + sao_chroma
         push_u(&mut bits, 1, 1);
@@ -1298,7 +1298,7 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         push_ue(&mut bits, 5); // luma_log2_weight_denom = 5
         push_se(&mut bits, 1); // delta_chroma_log2 = 1 → ChromaLog2 = 6
-                               // L0
+        // L0
         push_ue(&mut bits, 2); // num_l0_weights = 2
         push_u(&mut bits, 1, 1); // luma_weight_l0_flag[0] = 1
         push_u(&mut bits, 0, 1); // luma_weight_l0_flag[1] = 0
@@ -1306,7 +1306,7 @@ mod tests {
         push_u(&mut bits, 0, 1); // chroma_weight_l0_flag[1] = 0
         push_se(&mut bits, 4); // delta_luma_weight_l0[0]
         push_se(&mut bits, -2); // luma_offset_l0[0]
-                                // L1
+        // L1
         push_ue(&mut bits, 1); // num_l1_weights = 1
         push_u(&mut bits, 0, 1); // luma_weight_l1_flag[0] = 0
         push_u(&mut bits, 0, 1); // chroma_weight_l1_flag[0] = 0
@@ -1319,7 +1319,7 @@ mod tests {
         assert_eq!(pwt.l0.luma[0].luma_offset, -2);
         assert_eq!(pwt.l1.num_weights, 1);
         assert!(pwt.l1.luma.is_empty()); // luma_weight_l1_flag[0] == 0
-                                         // Inferred values: LumaWeightL0[1] = 32 (1 << 5), L1[0] = 32.
+        // Inferred values: LumaWeightL0[1] = 32 (1 << 5), L1[0] = 32.
         assert_eq!(
             derive_luma_weight(&pwt.l0, pwt.luma_log2_weight_denom, 1),
             32
@@ -1364,10 +1364,10 @@ mod tests {
     fn pred_weight_table_skips_chroma_when_not_present() {
         let mut bits: Vec<u8> = Vec::new();
         push_ue(&mut bits, 3); // luma_log2_weight_denom
-                               // chroma fields skipped.
+        // chroma fields skipped.
         push_ue(&mut bits, 1); // num_l0_weights = 1
         push_u(&mut bits, 0, 1); // luma_weight_l0_flag[0] = 0
-                                 // No chroma_weight_l0_flag emitted because chroma_present = false.
+        // No chroma_weight_l0_flag emitted because chroma_present = false.
         let bytes = pack(&bits);
         let mut br = BitReader::new(&bytes);
         let pwt = parse_pred_weight_table(&mut br, false, false, true, 0).unwrap();

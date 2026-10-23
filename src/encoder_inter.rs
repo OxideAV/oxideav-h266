@@ -47,13 +47,13 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::{ArithDecoder, ContextModel};
 use crate::cabac_enc::ArithEncoder;
-use crate::dequant::{dequantize_tb_flat, DequantParams};
-use crate::inter::{predict_chroma_block, predict_luma_block, MotionVector};
+use crate::dequant::{DequantParams, dequantize_tb_flat};
+use crate::inter::{MotionVector, predict_chroma_block, predict_luma_block};
 use crate::reconstruct::{PictureBuffer, PicturePlane};
-use crate::residual::{read_tu_y_coded_flag, ResidualCtxs};
+use crate::residual::{ResidualCtxs, read_tu_y_coded_flag};
 use crate::residual_enc::{encode_tb_coefficients, write_tu_y_coded_flag};
-use crate::tables::{init_contexts, SyntaxCtx};
-use crate::transform::{inverse_transform_2d, TrType};
+use crate::tables::{SyntaxCtx, init_contexts};
+use crate::transform::{TrType, inverse_transform_2d};
 use crate::transform_fwd::{forward_dct_ii_2d, quantize_tb_flat};
 
 // =====================================================================
@@ -928,7 +928,7 @@ pub fn encode_p_slice_multi_ref(
             ));
         }
     }
-    if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
+    if !w.is_multiple_of(INTER_BLOCK_W) || !h.is_multiple_of(INTER_BLOCK_H) {
         return Err(Error::invalid(format!(
             "h266 P-slice scaffold requires picture {}x{} divisible by 16x16",
             w, h
@@ -1204,7 +1204,7 @@ pub fn decode_p_slice_multi_ref(
             )));
         }
     }
-    if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
+    if !w.is_multiple_of(INTER_BLOCK_W) || !h.is_multiple_of(INTER_BLOCK_H) {
         return Err(Error::invalid(
             "h266 P-slice decode: dims not divisible by 16",
         ));
@@ -1589,11 +1589,7 @@ fn estimate_wp_params(
             }
         }
         let n = (p.width * p.height) as i64;
-        if n == 0 {
-            128
-        } else {
-            (s + n / 2) / n
-        }
+        if n == 0 { 128 } else { (s + n / 2) / n }
     }
     let mc = plane_mean(curr);
     let m0 = plane_mean(ref_l0);
@@ -1676,7 +1672,7 @@ pub fn encode_b_slice_multi_ref(
             ));
         }
     }
-    if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
+    if !w.is_multiple_of(INTER_BLOCK_W) || !h.is_multiple_of(INTER_BLOCK_H) {
         return Err(Error::invalid(format!(
             "h266 B-slice scaffold requires picture {}x{} divisible by {}x{}",
             w, h, INTER_BLOCK_W, INTER_BLOCK_H,
@@ -2126,7 +2122,7 @@ pub fn decode_b_slice_multi_ref(
             )));
         }
     }
-    if w % INTER_BLOCK_W != 0 || h % INTER_BLOCK_H != 0 {
+    if !w.is_multiple_of(INTER_BLOCK_W) || !h.is_multiple_of(INTER_BLOCK_H) {
         return Err(Error::invalid(format!(
             "h266 B-slice decode: dims not divisible by {}",
             INTER_BLOCK_W,
@@ -2363,7 +2359,11 @@ mod tests {
                 let v = if (x / 8) % 2 == 0 { 80u16 } else { 180u16 };
                 a.luma.samples[y * a.luma.stride + x] = v;
                 let sx = ((x as i32 - dx).rem_euclid(w as i32)) as usize;
-                let v2 = if (sx / 8) % 2 == 0 { 80u16 } else { 180u16 };
+                let v2 = if (sx / 8).is_multiple_of(2) {
+                    80u16
+                } else {
+                    180u16
+                };
                 b.luma.samples[y * b.luma.stride + x] = v2;
             }
         }

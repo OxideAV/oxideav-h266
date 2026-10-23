@@ -686,7 +686,7 @@ pub fn decode_tb_coefficients_opts_sbt(
     // (found by the r477 fuzzer).
     {
         let (sb_w, sb_h) = crate::scan::sb_coeff_dims(n_tb_w, n_tb_h);
-        if n_tb_w % sb_w != 0 || n_tb_h % sb_h != 0 {
+        if !n_tb_w.is_multiple_of(sb_w) || !n_tb_h.is_multiple_of(sb_h) {
             return Err(Error::invalid(format!(
                 "h266 residual: {n_tb_w}x{n_tb_h} TB is not tiled by its {sb_w}x{sb_h} sub-block"
             )));

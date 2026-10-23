@@ -102,7 +102,7 @@
 
 use crate::affine::{AffineCpmvs, MotionModel};
 use crate::affine_merge::{
-    derive_inherited_affine_cpmvs, InheritedAffineGeom, NeighbourCpmvSource,
+    InheritedAffineGeom, NeighbourCpmvSource, derive_inherited_affine_cpmvs,
 };
 use crate::amvr::AmvrShift;
 use crate::inter::MotionVector;

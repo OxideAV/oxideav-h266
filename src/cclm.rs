@@ -299,8 +299,14 @@ pub fn predict_cclm(inp: &CclmInputs<'_>) -> Result<Vec<i16>> {
         if want.len() == 2 && inp.x_tb_c == want[0] && inp.y_tb_c == want[1] {
             eprintln!(
                 "CCLM ({},{}) {}x{} mode={} ctu_boundary={} top_len={} left_len={} numSampT={num_samp_t} numSampL={num_samp_l} picksT={pick_pos_t:?} picksL={pick_pos_l:?} selDsY={p_sel_dsy:?} selC={p_sel_c:?} minY={min_y} maxY={max_y} minC={min_c} maxC={max_c} a={a} b={b} k={k}",
-                inp.x_tb_c, inp.y_tb_c, n_tb_w, n_tb_h, inp.mode, inp.b_ctu_boundary,
-                inp.neigh_top_chroma.len(), inp.neigh_left_chroma.len(),
+                inp.x_tb_c,
+                inp.y_tb_c,
+                n_tb_w,
+                n_tb_h,
+                inp.mode,
+                inp.b_ctu_boundary,
+                inp.neigh_top_chroma.len(),
+                inp.neigh_left_chroma.len(),
             );
             eprintln!("CCLM pDsY row0: {:?}", &p_ds_y[..n_tb_w.min(16)]);
         }

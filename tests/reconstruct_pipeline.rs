@@ -11,9 +11,9 @@
 //! without producing measurable noise.
 
 use oxideav_h266::alf::{AlfApsBinding, AlfCtb, AlfPicture};
-use oxideav_h266::aps::{AlfApsData, ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, NUM_ALF_FILTERS};
+use oxideav_h266::aps::{ALF_CHROMA_NUM_COEFF, ALF_LUMA_NUM_COEFF, AlfApsData, NUM_ALF_FILTERS};
 use oxideav_h266::ctu::{CtuLayout, CtuWalker};
-use oxideav_h266::deblock::{apply_deblocking, DeblockCu, DeblockParams};
+use oxideav_h266::deblock::{DeblockCu, DeblockParams, apply_deblocking};
 use oxideav_h266::inter::ReferencePicture;
 use oxideav_h266::pps::PicParameterSet;
 use oxideav_h266::reconstruct::PictureBuffer;
@@ -189,7 +189,7 @@ fn decode_picture_into_64x64_zero_stream() {
 /// the per-sample §8.8.2.2 fold of the non-LMCS reconstruction.
 #[test]
 fn decode_picture_into_zero_stream_with_lmcs_inverse_maps_in_loop() {
-    use oxideav_h266::lmcs::{LmcsData, LMCS_NUM_BINS};
+    use oxideav_h266::lmcs::{LMCS_NUM_BINS, LmcsData};
 
     let sps = dummy_sps(0, 64, 64);
     let pps = dummy_pps(64, 64);
@@ -670,7 +670,7 @@ fn decode_p_slice_all_skip_matches_reference() {
     use oxideav_h266::cabac::ContextModel;
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_general_merge_flag, ctx_inc_merge_idx};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     // ---- Reference (IDR) frame ------------------------------------------
     // Paint a deterministic ramp into the reference picture so the
@@ -701,15 +701,15 @@ fn decode_p_slice_all_skip_matches_reference() {
     // sh_slice_type = P with sh_cabac_init_flag = 0, init_type = 1.
     let slice_qp = 26;
     let init_type = 1u8; // P-slice, cabac_init_flag = 0
-                         // CTU is 32 (sps_log2_ctu_size_minus5 = 0), the picture is 8x8 so
-                         // the walker calls walk(0, 0, 8, 8). For an 8x8 root the leaf
-                         // walker reads split_cu_flag at depth 0 (since trailing_zeros(8) =
-                         // 3 > min_cb_log2 = 2). split_cu_flag's ctxInc with all neighbours
-                         // unavailable + the partition gate (no allowed splits at depth 0
-                         // beyond the root) lands at the formula in §9.3.4.2.2.
-                         //
-                         // Calling [`ctx_inc_split_cu_flag`] with the same args as the
-                         // walker keeps the encoder and decoder in lockstep.
+    // CTU is 32 (sps_log2_ctu_size_minus5 = 0), the picture is 8x8 so
+    // the walker calls walk(0, 0, 8, 8). For an 8x8 root the leaf
+    // walker reads split_cu_flag at depth 0 (since trailing_zeros(8) =
+    // 3 > min_cb_log2 = 2). split_cu_flag's ctxInc with all neighbours
+    // unavailable + the partition gate (no allowed splits at depth 0
+    // beyond the root) lands at the formula in §9.3.4.2.2.
+    //
+    // Calling [`ctx_inc_split_cu_flag`] with the same args as the
+    // walker keeps the encoder and decoder in lockstep.
     let mut split_cu_ctxs = init_contexts(SyntaxCtx::SplitCuFlag, slice_qp);
     let mut cu_skip_ctxs = init_contexts(SyntaxCtx::CuSkipFlag, slice_qp);
     let mut general_merge_ctxs = init_contexts(SyntaxCtx::GeneralMergeFlag, slice_qp);
@@ -799,7 +799,7 @@ fn decode_p_slice_all_skip_matches_reference() {
 fn decode_p_slice_writes_motion_field() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -879,7 +879,7 @@ fn decode_p_slice_writes_motion_field() {
 fn decode_b_slice_all_skip_bipred_matches_average() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -1003,7 +1003,7 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
 fn decode_b_slice_writes_bipred_motion_field() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -1100,7 +1100,7 @@ fn decode_b_slice_writes_bipred_motion_field() {
 fn decode_p_slice_populates_hmvp_table() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -1245,7 +1245,7 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
     use oxideav_h266::ctx::{
         ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
     };
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     // 16x16 picture inside a single 32-CTU. The walker recurses
     // walk(0,0,16,16): split_cu_flag(1) + split_qt_flag(1) → four 8x8
@@ -1452,7 +1452,7 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
     use oxideav_h266::inter::{MotionField, MotionVector, MvField};
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -1689,7 +1689,7 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
         ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
     };
     use oxideav_h266::inter::{MotionField, MotionVector, MvField};
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -1955,7 +1955,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_split_cu_flag};
     use oxideav_h266::inter::MotionVector;
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -2151,7 +2151,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 8u32;
     let pic_h = 8u32;
@@ -2345,7 +2345,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
 fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     use oxideav_h266::cabac_enc::ArithEncoder;
     use oxideav_h266::ctx::{ctx_inc_cu_skip_flag, ctx_inc_merge_idx, ctx_inc_split_cu_flag};
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 8u32;
@@ -2530,7 +2530,7 @@ fn decode_b_slice_gpm_fires_and_decodes() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -2702,10 +2702,10 @@ fn decode_b_slice_gpm_fires_and_decodes() {
 fn reconstruct_leaf_cu_inverse_lfnst_changes_pixels() {
     use oxideav_h266::coding_tree::Cu;
     use oxideav_h266::ctu::CtuCu;
-    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
-    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
+    use oxideav_h266::dequant::{DequantParams, dequantize_tb_flat};
+    use oxideav_h266::leaf_cu::{CuPredMode, INTRA_PLANAR, LeafCuInfo, LeafCuResidual};
     use oxideav_h266::lfnst::apply_inverse_lfnst;
-    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+    use oxideav_h266::transform::{TrType, inverse_transform_2d};
 
     // SPS with sps_lfnst_enabled_flag = 1.
     let mut sps = dummy_sps(0, 32, 32);
@@ -2833,9 +2833,9 @@ fn reconstruct_leaf_cu_inverse_lfnst_changes_pixels() {
 fn reconstruct_leaf_cu_explicit_mts_changes_pixels() {
     use oxideav_h266::coding_tree::Cu;
     use oxideav_h266::ctu::CtuCu;
-    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
-    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
-    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+    use oxideav_h266::dequant::{DequantParams, dequantize_tb_flat};
+    use oxideav_h266::leaf_cu::{CuPredMode, INTRA_PLANAR, LeafCuInfo, LeafCuResidual};
+    use oxideav_h266::transform::{TrType, inverse_transform_2d};
 
     // SPS with sps_mts_enabled_flag + sps_explicit_mts_intra_enabled_flag.
     let mut sps = dummy_sps(0, 32, 32);
@@ -2952,9 +2952,9 @@ fn reconstruct_leaf_cu_explicit_mts_changes_pixels() {
 fn reconstruct_leaf_cu_transform_skip_bypasses_transform() {
     use oxideav_h266::coding_tree::Cu;
     use oxideav_h266::ctu::CtuCu;
-    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
-    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
-    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+    use oxideav_h266::dequant::{DequantParams, dequantize_tb_flat};
+    use oxideav_h266::leaf_cu::{CuPredMode, INTRA_PLANAR, LeafCuInfo, LeafCuResidual};
+    use oxideav_h266::transform::{TrType, inverse_transform_2d};
 
     let mut sps = dummy_sps(0, 32, 32);
     sps.tool_flags.transform_skip_enabled_flag = true;
@@ -3078,9 +3078,9 @@ fn reconstruct_leaf_cu_transform_skip_bypasses_transform() {
 fn reconstruct_leaf_cu_chroma_transform_skip_bypasses_transform() {
     use oxideav_h266::coding_tree::Cu;
     use oxideav_h266::ctu::CtuCu;
-    use oxideav_h266::dequant::{dequantize_tb_flat, DequantParams};
-    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_DC, INTRA_PLANAR};
-    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+    use oxideav_h266::dequant::{DequantParams, dequantize_tb_flat};
+    use oxideav_h266::leaf_cu::{CuPredMode, INTRA_DC, INTRA_PLANAR, LeafCuInfo, LeafCuResidual};
+    use oxideav_h266::transform::{TrType, inverse_transform_2d};
 
     let mut sps = dummy_sps(0, 32, 32);
     sps.tool_flags.transform_skip_enabled_flag = true;
@@ -3203,11 +3203,11 @@ fn reconstruct_leaf_cu_explicit_scaling_list_changes_pixels() {
     use oxideav_h266::coding_tree::Cu;
     use oxideav_h266::ctu::CtuCu;
     use oxideav_h266::dequant::{
-        dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix, DequantParams,
+        DequantParams, dequantize_tb_flat, dequantize_tb_with_scaling_list, expand_scaling_matrix,
     };
-    use oxideav_h266::leaf_cu::{CuPredMode, LeafCuInfo, LeafCuResidual, INTRA_PLANAR};
+    use oxideav_h266::leaf_cu::{CuPredMode, INTRA_PLANAR, LeafCuInfo, LeafCuResidual};
     use oxideav_h266::scaling_list::ScalingListData;
-    use oxideav_h266::transform::{inverse_transform_2d, TrType};
+    use oxideav_h266::transform::{TrType, inverse_transform_2d};
 
     let sps = dummy_sps(0, 32, 32);
     let pps = dummy_pps(32, 32);
@@ -3346,7 +3346,7 @@ fn decode_i_slice_ibc_cu_copies_intra_ctu() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 64u32;
     let pic_h = 32u32;
@@ -3512,7 +3512,7 @@ fn decode_i_slice_ibc_skip_merge_amvr_chain() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 128u32;
     let pic_h = 32u32;
@@ -3672,7 +3672,7 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
     use oxideav_h266::residual_enc::{
         write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -3834,7 +3834,7 @@ fn decode_p_slice_ibc_cu_copies_inter_ctu() {
     use oxideav_h266::leaf_cu::LeafCuCtxs;
     use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
     use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
-    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts_for_type};
 
     let pic_w = 64u32;
     let pic_h = 32u32;
@@ -4022,7 +4022,7 @@ fn decode_dual_tree_ibc_luma_cu_copies_previous_ctu() {
         encode_tb_coefficients, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
         write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 64u32;
     let pic_h = 32u32;
@@ -4152,7 +4152,7 @@ fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
     use oxideav_h266::leaf_cu::LeafCuCtxs;
     use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
     use oxideav_h266::non_merge_mvp_syntax_enc::encode_mvp_lx_flag;
-    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4269,7 +4269,7 @@ fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
     use oxideav_h266::leaf_cu::{InterPredDir, LeafCuCtxs};
     use oxideav_h266::mvd_coding_enc::encode_mvd_coding;
     use oxideav_h266::non_merge_mvp_syntax_enc::{encode_inter_pred_idc, encode_mvp_lx_flag};
-    use oxideav_h266::tables::{init_contexts_for_type, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts_for_type};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4371,11 +4371,11 @@ fn decode_i_slice_mpm_candidate_threads_left_neighbour_mode() {
         ctx_inc_intra_chroma_pred_mode, ctx_inc_intra_luma_mpm_flag,
         ctx_inc_intra_luma_not_planar_flag, ctx_inc_split_cu_flag, ctx_inc_split_qt_flag,
     };
-    use oxideav_h266::leaf_cu::{build_mpm_cand_list, LeafCuCtxs, INTRA_PLANAR};
+    use oxideav_h266::leaf_cu::{INTRA_PLANAR, LeafCuCtxs, build_mpm_cand_list};
     use oxideav_h266::residual_enc::{
         write_tu_cb_coded_flag, write_tu_cr_coded_flag, write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4502,7 +4502,7 @@ fn qg_subdiv0_single_delta_read_spans_all_cus() {
         encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag,
         write_tu_cr_coded_flag, write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4623,7 +4623,7 @@ fn qg_per_cu_qp_y_pred_neighbour_average() {
         encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag,
         write_tu_cr_coded_flag, write_tu_y_coded_flag,
     };
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4714,10 +4714,10 @@ fn palette_cu_reconstructs_planes_through_walker() {
     use oxideav_h266::coding_tree::TreeType;
     use oxideav_h266::ctx::ctx_inc_split_cu_flag;
     use oxideav_h266::palette::{
-        write_palette_coding, PaletteCtxs, PaletteParams, PalettePlan, PalettePredictor,
+        PaletteCtxs, PaletteParams, PalettePlan, PalettePredictor, write_palette_coding,
     };
     use oxideav_h266::residual::ResidualCtxs;
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 16u32;
     let pic_h = 16u32;
@@ -4814,11 +4814,11 @@ fn palette_predictor_propagates_across_cus_through_walker() {
     use oxideav_h266::coding_tree::TreeType;
     use oxideav_h266::ctx::{ctx_inc_split_cu_flag, ctx_inc_split_qt_flag};
     use oxideav_h266::palette::{
-        update_predictor, write_palette_coding, PaletteCtxs, PaletteParams, PalettePlan,
-        PalettePredictor,
+        PaletteCtxs, PaletteParams, PalettePlan, PalettePredictor, update_predictor,
+        write_palette_coding,
     };
     use oxideav_h266::residual::ResidualCtxs;
-    use oxideav_h266::tables::{init_contexts, SyntaxCtx};
+    use oxideav_h266::tables::{SyntaxCtx, init_contexts};
 
     let pic_w = 16u32;
     let pic_h = 16u32;

@@ -152,7 +152,9 @@ fn psnr(a: &[u8], b: &[u8], wide: bool, bd: u32) -> f64 {
     let to: fn(&[u8]) -> Vec<f64> = |d| d.iter().map(|&v| f64::from(v)).collect();
     let (a, b) = if wide {
         let w = |d: &[u8]| {
-            d.chunks_exact(2)
+            d.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f64::from(u16::from_le_bytes([c[0], c[1]])))
                 .collect::<Vec<f64>>()
         };

@@ -1871,10 +1871,9 @@ mod tests {
     // ==================================================================
 
     use crate::non_merge_inter_pre_residual_enc::{
-        encode_non_merge_inter_pre_residual_affine,
+        NonMergeInterPreResidualAffineDecision, encode_non_merge_inter_pre_residual_affine,
         encode_non_merge_inter_pre_residual_affine_with_amvr,
         encode_non_merge_inter_pre_residual_affine_with_amvr_and_bcw,
-        NonMergeInterPreResidualAffineDecision,
     };
 
     fn affine_gate_on() -> NonMergeInterAffineGate {

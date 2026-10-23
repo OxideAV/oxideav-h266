@@ -32,8 +32,8 @@
 //!      path (no precision loss introduced by the §8.5.5.9 eqs. when
 //!      partials are zero).
 
-use oxideav_h266::affine::{predict_luma_block_affine, AffineCpmvs, AffineLumaFilterSet};
-use oxideav_h266::inter::{predict_luma_block, MotionVector};
+use oxideav_h266::affine::{AffineCpmvs, AffineLumaFilterSet, predict_luma_block_affine};
+use oxideav_h266::inter::{MotionVector, predict_luma_block};
 use oxideav_h266::reconstruct::PicturePlane;
 
 /// PSNR_Y over a sub-rectangle of `truth` and `rec` (dB). `INF` when
@@ -244,7 +244,9 @@ fn round65_6param_affine_outperforms_translational_on_zoom_fixture() {
 
     assert!(psnr_aff.is_finite() && psnr_aff > 10.0);
     assert!(best_psnr_trans.is_finite() && best_psnr_trans > 10.0);
-    eprintln!("[round65-zoom] affine PSNR_Y = {psnr_aff:.2} dB, best translational = {best_psnr_trans:.2} dB");
+    eprintln!(
+        "[round65-zoom] affine PSNR_Y = {psnr_aff:.2} dB, best translational = {best_psnr_trans:.2} dB"
+    );
     // Headline assertion: affine must beat translational by at least
     // +3 dB on this zoom fixture.
     assert!(
@@ -337,7 +339,9 @@ fn round65_6param_affine_recovers_shear_fixture() {
 
     assert!(psnr_aff.is_finite());
     assert!(best_psnr_trans.is_finite());
-    eprintln!("[round65-shear] affine PSNR_Y = {psnr_aff:.2} dB, best translational = {best_psnr_trans:.2} dB");
+    eprintln!(
+        "[round65-shear] affine PSNR_Y = {psnr_aff:.2} dB, best translational = {best_psnr_trans:.2} dB"
+    );
     // Headline: at least +3 dB improvement.
     assert!(
         psnr_aff >= best_psnr_trans + 3.0,

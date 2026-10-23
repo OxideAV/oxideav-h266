@@ -9,7 +9,7 @@
 //! Spec reference: ITU-T H.266 | ISO/IEC 23090-3 (V4, 01/2026).
 
 use oxideav_h266::encoder::EncoderConfig;
-use oxideav_h266::encoder_pipeline::{encode_idr_with_stats_cfg, psnr_y, EncodeStats};
+use oxideav_h266::encoder_pipeline::{EncodeStats, encode_idr_with_stats_cfg, psnr_y};
 use oxideav_h266::reconstruct::{PictureBuffer, PicturePlane};
 use oxideav_h266::stream::{DecodedPicture, StreamDecoder};
 
@@ -244,7 +244,9 @@ fn black_box_decoder_agrees_on_mip_streams() {
             assert!(st.success(), "{label}: black-box decode failed");
             let raw = std::fs::read(&yuv).unwrap();
             let data: Vec<u16> = if bd > 8 {
-                raw.chunks_exact(2)
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             } else {
@@ -437,7 +439,9 @@ fn black_box_matches(
     assert!(st.success(), "{label}: black-box decode failed");
     let raw = std::fs::read(&yuv).unwrap();
     let data: Vec<u16> = if bd > 8 {
-        raw.chunks_exact(2)
+        raw.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     } else {

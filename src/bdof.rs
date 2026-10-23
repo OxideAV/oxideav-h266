@@ -870,7 +870,7 @@ mod tests {
     ///       loss).
     #[test]
     fn hp_path_matches_8bit_lifter_within_1_lsb_at_8bit() {
-        use crate::inter::{predict_luma_block, predict_luma_block_high_precision, MotionVector};
+        use crate::inter::{MotionVector, predict_luma_block, predict_luma_block_high_precision};
         let n_cb_w: u32 = 8;
         let n_cb_h: u32 = 16;
         // Build a 32×32 reference plane with a smooth gradient so MC
@@ -986,7 +986,7 @@ mod tests {
     /// within ≤ 1 LSB.
     #[test]
     fn hp_subpel_path_matches_8bit_within_1_lsb() {
-        use crate::inter::{predict_luma_block, predict_luma_block_high_precision, MotionVector};
+        use crate::inter::{MotionVector, predict_luma_block, predict_luma_block_high_precision};
         let n_cb_w: u32 = 8;
         let n_cb_h: u32 = 16;
         let ref_w: usize = 32;
@@ -1041,7 +1041,7 @@ mod tests {
     /// precision contract the BDOF gradient pipeline relies on.
     #[test]
     fn hp_path_precision_scales_with_bit_depth() {
-        use crate::inter::{predict_luma_block_high_precision, MotionVector};
+        use crate::inter::{MotionVector, predict_luma_block_high_precision};
         // Build a tiny "10-bit" reference: PicturePlane stores u16 so
         // values are capped at 255, but the lift is `<< 4` for BD=10
         // so 255 lands at `255 * 16 = 4080`, still in 16-bit range.
@@ -1070,7 +1070,7 @@ mod tests {
     /// lifter.
     #[test]
     fn hp_path_identical_predictors_pass_through_constant() {
-        use crate::inter::{predict_luma_block_high_precision, MotionVector};
+        use crate::inter::{MotionVector, predict_luma_block_high_precision};
         let n_cb_w: u32 = 8;
         let n_cb_h: u32 = 16;
         let ref_p = PicturePlane::filled(n_cb_w as usize, n_cb_h as usize, 130);
@@ -1121,7 +1121,7 @@ mod tests {
     /// sample value, which can sit anywhere in `[0, 1023]`.
     #[test]
     fn bdof_u16_main10_preserves_range() {
-        use crate::inter::{predict_luma_block_high_precision_u16, MotionVector};
+        use crate::inter::{MotionVector, predict_luma_block_high_precision_u16};
         let n_cb_w: u32 = 8;
         let n_cb_h: u32 = 16;
         let ref_p = PicturePlane::filled_bd(n_cb_w as usize, n_cb_h as usize, 900, 10);

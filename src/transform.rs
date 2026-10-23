@@ -2050,18 +2050,20 @@ mod tests {
     #[test]
     fn scaling_xfm_rejects_bad_length() {
         let d = vec![0; 8];
-        assert!(scaling_and_transformation(
-            0,
-            TuCResMode::None,
-            false,
-            4,
-            4,
-            &d,
-            CodedTransform::Skip,
-            8,
-            15,
-        )
-        .is_err());
+        assert!(
+            scaling_and_transformation(
+                0,
+                TuCResMode::None,
+                false,
+                4,
+                4,
+                &d,
+                CodedTransform::Skip,
+                8,
+                15,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -203,11 +203,7 @@ pub fn ctx_inc_intra_bdpcm_chroma_dir_flag() -> u32 {
 /// `!intra_subpartitions_mode_flag` at binIdx 0 (so ctx 0 when ISP is
 /// enabled for the current CU, ctx 1 when ISP is disabled).
 pub fn ctx_inc_intra_luma_not_planar_flag(intra_subpartitions_mode_flag: bool) -> u32 {
-    if intra_subpartitions_mode_flag {
-        0
-    } else {
-        1
-    }
+    if intra_subpartitions_mode_flag { 0 } else { 1 }
 }
 
 /// ctxInc for `intra_mip_flag` per §9.3.4.2.1 Table 132 + §9.3.4.2.2
@@ -332,11 +328,7 @@ pub fn ctx_inc_copy_above_palette_indices_flag() -> u32 {
 /// ctxInc for `regular_merge_flag[x0][y0]` per Table 132 — yields 0
 /// when `cu_skip_flag` is 1 and 1 otherwise.
 pub fn ctx_inc_regular_merge_flag(cu_skip_flag: bool) -> u32 {
-    if cu_skip_flag {
-        0
-    } else {
-        1
-    }
+    if cu_skip_flag { 0 } else { 1 }
 }
 
 /// ctxInc for `merge_idx[x0][y0]` — fixed 0 (Table 132). Subsequent
@@ -628,11 +620,7 @@ pub fn ctx_inc_tu_y_coded_flag(bdpcm_y: bool, isp_split: bool, prev_tu_cbf_y: bo
 /// ctxInc for `tu_cb_coded_flag` per Table 127 — simply the
 /// `intra_bdpcm_chroma_flag` bit (1 if BDPCM-chroma, else 0).
 pub fn ctx_inc_tu_cb_coded_flag(bdpcm_chroma: bool) -> u32 {
-    if bdpcm_chroma {
-        1
-    } else {
-        0
-    }
+    if bdpcm_chroma { 1 } else { 0 }
 }
 
 /// ctxInc for `tu_cr_coded_flag` per Table 127:
@@ -647,11 +635,7 @@ pub fn ctx_inc_tu_cr_coded_flag(bdpcm_chroma: bool, tu_cb_coded_flag: bool) -> u
 
 /// ctxInc for `cu_qp_delta_abs` per Table 127: bin 0 ctx 0, bins 1-4 ctx 1.
 pub fn ctx_inc_cu_qp_delta_abs(bin_idx: u32) -> u32 {
-    if bin_idx == 0 {
-        0
-    } else {
-        1
-    }
+    if bin_idx == 0 { 0 } else { 1 }
 }
 
 /// ctxInc for `cu_chroma_qp_offset_flag` — fixed 0 (Table 127).
@@ -674,11 +658,7 @@ pub fn ctx_inc_tu_joint_cbcr_residual_flag(tu_cb_coded_flag: bool, tu_cr_coded_f
 
 /// ctxInc for `transform_skip_flag` per Table 132: `cIdx == 0 ? 0 : 1`.
 pub fn ctx_inc_transform_skip_flag(c_idx: u32) -> u32 {
-    if c_idx == 0 {
-        0
-    } else {
-        1
-    }
+    if c_idx == 0 { 0 } else { 1 }
 }
 
 /// ctxInc for `last_sig_coeff_x_prefix` / `last_sig_coeff_y_prefix`

@@ -45,10 +45,10 @@ use crate::ctx::{
     ctx_inc_copy_above_palette_indices_flag, ctx_inc_palette_transpose_flag, ctx_inc_run_copy_flag,
 };
 use crate::residual::{
-    decode_exp_golomb_k, read_cu_chroma_qp_offset, read_cu_qp_delta, ResidualCtxs,
+    ResidualCtxs, decode_exp_golomb_k, read_cu_chroma_qp_offset, read_cu_qp_delta,
 };
 use crate::residual_enc::{encode_exp_golomb_k, write_cu_chroma_qp_offset, write_cu_qp_delta};
-use crate::tables::{init_contexts, SyntaxCtx};
+use crate::tables::{SyntaxCtx, init_contexts};
 
 /// `maxNumPalettePredictorSize` for SINGLE_TREE (§8.4.5.3 eq. 427) —
 /// also the joint size used by the local-dual-tree fold (eq. 449).
@@ -886,7 +886,7 @@ pub fn write_palette_coding(
         if !plan.transpose {
             (cur >= bw).then(|| cur - bw)
         } else {
-            (cur % bw > 0).then(|| cur - 1)
+            (!cur.is_multiple_of(bw)).then(|| cur - 1)
         }
     };
     let mut copy_above = vec![false; npos];
