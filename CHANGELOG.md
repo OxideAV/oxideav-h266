@@ -4,6 +4,12 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- API hygiene: `encoder::EncoderConfig`, `encoder::EmittedNalKind`, `stream::DecodedPicture` and `sps::ToolFlags` are now `#[non_exhaustive]` (build `EncoderConfig` with `EncoderConfig::new` and assign fields; `ToolFlags` with `ToolFlags::default()`).
+- API hygiene: the syntax-structure and decode-tool modules `aps`, `aud`, `bitreader`, `buffering_period`, `constrained_rasl_encoding_indication`, `dci`, `decoding_unit_info`, `encoder_inter`, `end_of_bitstream`, `end_of_seq`, `filler_data`, `hrd`, `lmcs`, `opi`, `palette`, `picture_header`, `picture_timing`, `pps`, `ptl`, `rbsp_trailing`, `ref_pic_list`, `scaling_list`, `sei_manifest`, `sei_message`, `sei_prefix_indication`, `sei_rbsp`, `slice_header`, `subpic_level_info` and `vps` are now `#[doc(hidden)]`, as are `encoder::BitWriter` and `encoder::AlfPhChain`. They stay `pub` for tests and fuzzing. The documented surface is the registry, `decoder`, `stream`, `encoder`, `encoder_pipeline`, `h266_encoder`, `reconstruct`, `vvcc`, `nal` and `sps`.
+- `sps::SeqParameterSet` stays exhaustive because the integration tests build it directly as a fixture. `nal::NalUnitType` and `nal::NalHeader` stay exhaustive because the 2-byte NAL header fixes them.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-h266/compare/v0.0.10...v0.0.11) - 2026-10-23
 
 ### Other

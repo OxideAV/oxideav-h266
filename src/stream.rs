@@ -45,6 +45,7 @@ use crate::slice_header::{
 use crate::sps::{SeqParameterSet, parse_sps};
 
 /// One decoded picture, in decode order.
+#[non_exhaustive]
 pub struct DecodedPicture {
     /// 0-based index of the CVS this picture belongs to (increments at
     /// every CLVSS picture — IDR, or CRA/GDR starting the sequence).

@@ -195,10 +195,14 @@ pub mod amvr;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod amvr_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod aps;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod aps_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod aud;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -206,7 +210,11 @@ pub mod bcw_idx_enc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod bdof;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bitreader;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod buffering_period;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -220,6 +228,8 @@ pub mod cclm;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod coding_tree;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod constrained_rasl_encoding_indication;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -227,11 +237,15 @@ pub mod ctu;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ctx;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dci;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod deblock;
 pub mod decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod decoding_unit_info;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -240,14 +254,24 @@ pub mod dequant;
 #[doc(hidden)]
 pub mod dmvr;
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod encoder_inter;
 pub mod encoder_pipeline;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod end_of_bitstream;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod end_of_seq;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod filler_data;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod gpm;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod hrd;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -270,6 +294,8 @@ pub mod lfnst;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod lfnst_matrices;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod lmcs;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -290,14 +316,30 @@ pub mod non_merge_inter_pre_residual_enc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod non_merge_mvp_syntax_enc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod opi;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod palette;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod picture_header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod picture_timing;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pps;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ptl;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod rbsp_trailing;
 pub mod reconstruct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ref_pic_list;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -317,19 +359,33 @@ pub mod sao_syntax;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod sbtmvp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scaling_list;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod scan;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sei_manifest;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sei_message;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sei_prefix_indication;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sei_rbsp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod slice_header;
 pub mod sps;
 // r434 — stream-level decode driver (AU assembly, POC, RPL/DPB, walker wiring)
 pub mod h266_encoder;
 pub mod stream;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod subpic_level_info;
 pub mod vvcc;
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -347,6 +403,8 @@ pub mod transform;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod transform_fwd;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vps;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};

@@ -45,6 +45,7 @@ use crate::nal::NalUnitType;
 /// MSB-first bit writer over a growing `Vec<u8>`. Mirrors the reader
 /// order used by [`crate::bitreader::BitReader`] so encoder tests can
 /// round-trip the same byte layouts the parser tests exercise.
+#[doc(hidden)]
 pub struct BitWriter {
     data: Vec<u8>,
     /// Number of valid bits inside the partial tail byte (0..8). When
@@ -263,6 +264,7 @@ pub fn annex_b_wrap(nal_payload: &[u8], out: &mut Vec<u8>) {
 pub const CODED_SIZE_ALIGN: u32 = 8;
 
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Picture width in luma samples. Any value `1..=16384`; the coded
     /// size is padded to [`CODED_SIZE_ALIGN`] and cropped back by the
@@ -1448,6 +1450,7 @@ impl VvcEncoder {
 
 /// Which single NAL to emit via [`VvcEncoder::emit_nal`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EmittedNalKind {
     Vps,
     Sps,
@@ -1468,6 +1471,7 @@ pub enum EmittedNalKind {
 /// fix, the chain is emitted in the **slice header** (§7.3.7 `sh_alf_*`)
 /// rather than the PH; the historical `ph_alf_*` field names are kept
 /// (the values are the same syntax elements under their SH spelling).
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlfPhChain {
     /// `ph_num_alf_aps_ids_luma` — 0 when the round-48 trade-off skipped

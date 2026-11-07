@@ -419,6 +419,7 @@ impl RefPicListStruct {
 /// derivation paths to take. Field names mirror the spec 1:1 minus the
 /// `sps_` prefix.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ToolFlags {
     // Transforms.
     pub transform_skip_enabled_flag: bool,
