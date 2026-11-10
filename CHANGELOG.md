@@ -4,6 +4,10 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- r487 — **the scheduled Fuzz workflow's crashes** (red on every run since the harness landed; 24 artifacts, six panic sites, all library defects reached through `registry_decode` / `parse_annexb` on parameter sets whose values lie outside the ranges §7.4.3.4 / §7.4.3.5 / §7.4.3.8 state): the SPS parser now enforces the partition-constraint ranges (`sps_log2_min_luma_coding_block_size_minus2`, the min-QT / MTT-depth / max-BT / max-TT differences of all three slice classes — the coding-tree walk shifts by them), the chroma QP mapping-table pivots (`qpInVal` / `qpOutVal` inside `−QpBdOffset..=63` — the table build indexes with them), `sps_six_minus_max_num_merge_cand <= 5` (the GPM gate subtracted it from 6 unchecked), `sps_log2_transform_skip_max_size_minus2 <= 3` (a larger transform-skip block reached the 4x4-sub-block scan with a size it has no order for), the subblock / GPM / IBC merge-candidate counts, `sps_log2_parallel_merge_level_minus2`, `sps_min_qp_prime_ts`, the LADF offsets and thresholds, the virtual-boundary positions, the picture size on the `Max( 8, MinCbSizeY )` grid and the conformance window inside the picture; the stream decoder cross-checks every PPS against the SPS it activates before a picture decodes (size inside the SPS maximum and on the grid, equal to it without `sps_res_change_in_clvs_allowed_flag`, conformance window inside the picture — the output crop subtracted it unchecked —, `pps_pic_width_minus_wraparound_offset` inside its range) and validates the picture-level partition constraints after a PH override. `sps::PartitionConstraints::validate` and `sps::ChromaQpTable::validate` are the two new checks; `tests/fuzz_regressions.rs` replays all 24 artifacts (`tests/data/fuzz_regressions/`).
+
 ### Changed
 
 - API hygiene: `encoder::EncoderConfig`, `encoder::EmittedNalKind`, `stream::DecodedPicture` and `sps::ToolFlags` are now `#[non_exhaustive]` (build `EncoderConfig` with `EncoderConfig::new` and assign fields; `ToolFlags` with `ToolFlags::default()`).

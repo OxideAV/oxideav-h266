@@ -226,6 +226,33 @@ pub struct ChromaQpTable {
 }
 
 impl ChromaQpTable {
+    /// §7.4.3.4 conformance check on the pivot arrays: every
+    /// `qpInVal[ j ]` / `qpOutVal[ j ]` shall lie in
+    /// `−QpBdOffset ..= 63`. [`Self::build`] indexes its table with the
+    /// pivots, so a table that fails this check must never reach it.
+    pub fn validate(&self, qp_bd_offset: i32) -> Result<()> {
+        let lo = i64::from(-qp_bd_offset);
+        let in_range = |v: i64| (lo..=63).contains(&v);
+        let mut qp_in = i64::from(self.qp_table_start_minus26) + 26;
+        let mut qp_out = qp_in;
+        if !in_range(qp_in) {
+            return Err(Error::invalid(format!(
+                "h266 SPS: sps_qp_table_start_minus26 out of range ({})",
+                self.qp_table_start_minus26
+            )));
+        }
+        for &(d_in_minus1, d_diff) in &self.entries {
+            qp_in += i64::from(d_in_minus1) + 1;
+            qp_out += i64::from(d_in_minus1 ^ d_diff);
+            if !in_range(qp_in) || !in_range(qp_out) {
+                return Err(Error::invalid(
+                    "h266 SPS: chroma QP mapping table pivot outside −QpBdOffset..=63",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// §7.4.3.4 eqs. 54 – 57 — build the `ChromaQpTable[k]` mapping array
     /// for `k ∈ [−QpBdOffset, 63]`. The returned vector is indexed by
     /// `k + qp_bd_offset` (so `ChromaQpTable[k]` lives at index
@@ -730,6 +757,19 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     // ---- Partition constraints + tool flags (§7.3.2.4 tail) ----
     let partition_constraints =
         parse_partition_constraints(&mut br, sps_chroma_format_idc, sps_log2_ctu_size_minus5)?;
+    let ctb_log2 = u32::from(sps_log2_ctu_size_minus5) + 5;
+    partition_constraints.validate(ctb_log2)?;
+    // §7.4.3.4: the maximum picture size is a multiple of
+    // Max( 8, MinCbSizeY ).
+    let size_unit =
+        8u32.max(1 << (partition_constraints.log2_min_luma_coding_block_size_minus2 + 2));
+    if sps_pic_width_max_in_luma_samples % size_unit != 0
+        || sps_pic_height_max_in_luma_samples % size_unit != 0
+    {
+        return Err(Error::invalid(format!(
+            "h266 SPS: picture size {sps_pic_width_max_in_luma_samples}x{sps_pic_height_max_in_luma_samples} is not a multiple of {size_unit}"
+        )));
+    }
     let tool_flags = parse_tool_flags(
         &mut br,
         sps_chroma_format_idc,
@@ -737,6 +777,105 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         partition_constraints.max_luma_transform_size_64_flag,
         sps_log2_max_pic_order_cnt_lsb_minus4,
     )?;
+    let qp_bd_offset = 6 * sps_bitdepth_minus8 as i32;
+    for table in &tool_flags.chroma_qp_tables {
+        table.validate(qp_bd_offset)?;
+    }
+    let t = &tool_flags;
+    let range_err = |name: &str, v: i64| {
+        Err(Error::invalid(format!(
+            "h266 SPS: {name} out of range ({v})"
+        )))
+    };
+    if t.log2_transform_skip_max_size_minus2 > 3 {
+        return range_err(
+            "sps_log2_transform_skip_max_size_minus2",
+            t.log2_transform_skip_max_size_minus2.into(),
+        );
+    }
+    if t.five_minus_max_num_subblock_merge_cand > 5 - u32::from(t.sbtmvp_enabled_flag) {
+        return range_err(
+            "sps_five_minus_max_num_subblock_merge_cand",
+            t.five_minus_max_num_subblock_merge_cand.into(),
+        );
+    }
+    if t.gpm_enabled_flag
+        && t.max_num_merge_cand_minus_max_num_gpm_cand + 2 > 6 - t.six_minus_max_num_merge_cand
+    {
+        return range_err(
+            "sps_max_num_merge_cand_minus_max_num_gpm_cand",
+            t.max_num_merge_cand_minus_max_num_gpm_cand.into(),
+        );
+    }
+    if t.log2_parallel_merge_level_minus2 > ctb_log2 - 2 {
+        return range_err(
+            "sps_log2_parallel_merge_level_minus2",
+            t.log2_parallel_merge_level_minus2.into(),
+        );
+    }
+    if t.min_qp_prime_ts > 8 {
+        return range_err("sps_min_qp_prime_ts", t.min_qp_prime_ts.into());
+    }
+    if t.six_minus_max_num_ibc_merge_cand > 5 {
+        return range_err(
+            "sps_six_minus_max_num_ibc_merge_cand",
+            t.six_minus_max_num_ibc_merge_cand.into(),
+        );
+    }
+    if let Some(ladf) = &t.ladf {
+        if !(-63..=63).contains(&ladf.lowest_interval_qp_offset) {
+            return range_err(
+                "sps_ladf_lowest_interval_qp_offset",
+                ladf.lowest_interval_qp_offset.into(),
+            );
+        }
+        for &(qp_off, thresh) in &ladf.intervals {
+            if !(-63..=63).contains(&qp_off) {
+                return range_err("sps_ladf_qp_offset", qp_off.into());
+            }
+            // §7.4.3.4: 0 ..= ( 2^BitDepth ) − 3.
+            if u64::from(thresh) + 3 > 1u64 << (sps_bitdepth_minus8 + 8) {
+                return range_err("sps_ladf_delta_threshold_minus1", thresh.into());
+            }
+        }
+    }
+    if let Some(vb) = &t.virtual_boundaries {
+        // §7.4.3.4: positions in 0 ..= Ceil( size ÷ 8 ) − 2.
+        let cap_x = sps_pic_width_max_in_luma_samples.div_ceil(8);
+        let cap_y = sps_pic_height_max_in_luma_samples.div_ceil(8);
+        if let Some(&p) = vb
+            .pos_x_minus1
+            .iter()
+            .find(|&&p| p.saturating_add(2) > cap_x)
+        {
+            return range_err("sps_virtual_boundary_pos_x_minus1", p.into());
+        }
+        if let Some(&p) = vb
+            .pos_y_minus1
+            .iter()
+            .find(|&&p| p.saturating_add(2) > cap_y)
+        {
+            return range_err("sps_virtual_boundary_pos_y_minus1", p.into());
+        }
+    }
+    // §7.4.3.4: SubWidthC * ( left + right ) < width, likewise
+    // vertically — the output crop subtracts these from the picture.
+    if let Some(c) = &conformance_window {
+        let (sub_w, sub_h): (u64, u64) = match sps_chroma_format_idc {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        if sub_w * (u64::from(c.left_offset) + u64::from(c.right_offset))
+            >= u64::from(sps_pic_width_max_in_luma_samples)
+            || sub_h * (u64::from(c.top_offset) + u64::from(c.bottom_offset))
+                >= u64::from(sps_pic_height_max_in_luma_samples)
+        {
+            return Err(Error::invalid(
+                "h266 SPS: conformance window exceeds the picture",
+            ));
+        }
+    }
 
     // ---- HRD timing block (§7.3.2.4 / §7.3.5) ----
     let mut sps_timing_hrd_params_present_flag = false;
@@ -1047,6 +1186,77 @@ fn parse_dpb_parameters(
     Ok(DpbParameters { sublayers })
 }
 
+impl PartitionConstraints {
+    /// §7.4.3.4 / §7.4.3.8 value ranges of the partition-constraint
+    /// syntax elements for a `CtbLog2SizeY` — applied to the SPS set
+    /// and again to the picture-level set after a PH override. The
+    /// coding-tree walk shifts by these values, so nothing outside the
+    /// ranges may reach it.
+    pub fn validate(&self, ctb_log2: u32) -> Result<()> {
+        let bad = |name: &str, v: u32| {
+            Err(Error::invalid(format!(
+                "h266: partition constraint {name} out of range ({v})"
+            )))
+        };
+        let min_cb = self.log2_min_luma_coding_block_size_minus2;
+        if min_cb > 4.min(ctb_log2 - 2) {
+            return bad("log2_min_luma_coding_block_size_minus2", min_cb);
+        }
+        let min_cb_log2 = min_cb + 2;
+        // MinCbSizeY <= VSize = Min( 64, CtbSizeY ).
+        if min_cb_log2 > 6.min(ctb_log2) {
+            return bad("log2_min_luma_coding_block_size_minus2", min_cb);
+        }
+        let qt_cap = 6.min(ctb_log2) - min_cb_log2;
+        let depth_cap = 2 * (ctb_log2 - min_cb_log2);
+        // (min-QT diff, MTT depth, max-BT diff, max-TT diff, BT cap is
+        // CtbLog2SizeY-based) per slice class.
+        let classes = [
+            (
+                "intra_slice_luma",
+                self.log2_diff_min_qt_min_cb_intra_slice_luma,
+                self.max_mtt_hierarchy_depth_intra_slice_luma,
+                self.log2_diff_max_bt_min_qt_intra_slice_luma,
+                self.log2_diff_max_tt_min_qt_intra_slice_luma,
+                true,
+            ),
+            (
+                "intra_slice_chroma",
+                self.log2_diff_min_qt_min_cb_intra_slice_chroma,
+                self.max_mtt_hierarchy_depth_intra_slice_chroma,
+                self.log2_diff_max_bt_min_qt_intra_slice_chroma,
+                self.log2_diff_max_tt_min_qt_intra_slice_chroma,
+                false,
+            ),
+            (
+                "inter_slice",
+                self.log2_diff_min_qt_min_cb_inter_slice,
+                self.max_mtt_hierarchy_depth_inter_slice,
+                self.log2_diff_max_bt_min_qt_inter_slice,
+                self.log2_diff_max_tt_min_qt_inter_slice,
+                true,
+            ),
+        ];
+        for (name, min_qt, depth, bt, tt, bt_to_ctb) in classes {
+            if min_qt > qt_cap {
+                return bad(name, min_qt);
+            }
+            if depth > depth_cap {
+                return bad(name, depth);
+            }
+            let min_qt_log2 = min_qt + min_cb_log2;
+            let bt_cap = if bt_to_ctb { ctb_log2 } else { 6.min(ctb_log2) } - min_qt_log2;
+            if bt > bt_cap {
+                return bad(name, bt);
+            }
+            if tt > 6.min(ctb_log2) - min_qt_log2 {
+                return bad(name, tt);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// §7.3.2.4 partition-constraints block.
 fn parse_partition_constraints(
     br: &mut BitReader<'_>,
@@ -1258,6 +1468,14 @@ fn parse_tool_flags(
         t.mmvd_fullpel_only_enabled_flag = br.u1()? == 1;
     }
     t.six_minus_max_num_merge_cand = br.ue()?;
+    // §7.4.3.4: 0..=5 (MaxNumMergeCand = 6 − value gates the GPM syntax
+    // just below).
+    if t.six_minus_max_num_merge_cand > 5 {
+        return Err(Error::invalid(format!(
+            "h266 SPS: sps_six_minus_max_num_merge_cand out of range ({})",
+            t.six_minus_max_num_merge_cand
+        )));
+    }
     t.sbt_enabled_flag = br.u1()? == 1;
     t.affine_enabled_flag = br.u1()? == 1;
     if t.affine_enabled_flag {

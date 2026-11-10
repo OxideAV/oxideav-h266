@@ -578,6 +578,7 @@ impl StreamDecoder {
         let (sps, pps) = self.resolve_ps(ph.ph_pic_parameter_set_id)?;
         let sps = sps.clone();
         let pps = pps.clone();
+        check_pps_against_sps(&sps, &pps)?;
         self.last_output_info = Some(OutputInfo::from_sps(&sps));
 
         // §7.4.3.4 / §7.4.3.7 eq. 77 — VirtualBoundariesPresentFlag and
@@ -775,6 +776,7 @@ impl StreamDecoder {
                     pc.log2_diff_max_tt_min_qt_inter_slice = 0;
                 }
             }
+            pc.validate(u32::from(sps.sps_log2_ctu_size_minus5) + 5)?;
             walker.set_partition_constraints(pc);
         }
 
@@ -1159,4 +1161,73 @@ impl StreamDecoder {
         });
         Ok(())
     }
+}
+
+/// §7.4.3.5 cross-checks of a PPS against the SPS it activates — the
+/// relations the picture decode relies on (picture size inside the SPS
+/// maximum and on the minimum-coding-block grid, conformance window
+/// inside the picture, wraparound offset inside its range). The PPS
+/// parser cannot check these on its own: it does not see the SPS.
+fn check_pps_against_sps(sps: &SeqParameterSet, pps: &PicParameterSet) -> Result<()> {
+    let (w, h) = (
+        pps.pps_pic_width_in_luma_samples,
+        pps.pps_pic_height_in_luma_samples,
+    );
+    let min_cb_log2 = sps
+        .partition_constraints
+        .log2_min_luma_coding_block_size_minus2
+        + 2;
+    let unit = 8u32.max(1 << min_cb_log2);
+    if w > sps.sps_pic_width_max_in_luma_samples
+        || h > sps.sps_pic_height_max_in_luma_samples
+        || w % unit != 0
+        || h % unit != 0
+    {
+        return Err(Error::invalid(format!(
+            "h266 stream: PPS picture size {w}x{h} does not fit the SPS ({}x{} maximum, {unit}-sample grid)",
+            sps.sps_pic_width_max_in_luma_samples, sps.sps_pic_height_max_in_luma_samples
+        )));
+    }
+    if !sps.sps_res_change_in_clvs_allowed_flag
+        && (w != sps.sps_pic_width_max_in_luma_samples
+            || h != sps.sps_pic_height_max_in_luma_samples)
+    {
+        return Err(Error::invalid(
+            "h266 stream: PPS picture size differs from the SPS maximum without resolution change",
+        ));
+    }
+    let win = pps
+        .conformance_window
+        .map(|c| (c.left_offset, c.top_offset, c.right_offset, c.bottom_offset))
+        .or_else(|| {
+            sps.conformance_window
+                .map(|c| (c.left_offset, c.top_offset, c.right_offset, c.bottom_offset))
+        });
+    if let Some((left, top, right, bottom)) = win {
+        let (sub_w, sub_h): (u64, u64) = match sps.sps_chroma_format_idc {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        if sub_w * (u64::from(left) + u64::from(right)) >= u64::from(w)
+            || sub_h * (u64::from(top) + u64::from(bottom)) >= u64::from(h)
+        {
+            return Err(Error::invalid(
+                "h266 stream: conformance window exceeds the picture",
+            ));
+        }
+    }
+    if pps.pps_ref_wraparound_enabled_flag {
+        // §7.4.3.5: pps_pic_width_minus_wraparound_offset <=
+        // ( width / MinCbSizeY ) − ( CtbSizeY / MinCbSizeY ) − 2.
+        let ctb_log2 = u32::from(sps.sps_log2_ctu_size_minus5) + 5;
+        let cap = i64::from(w >> min_cb_log2) - i64::from(1u32 << (ctb_log2 - min_cb_log2)) - 2;
+        if i64::from(pps.pps_pic_width_minus_wraparound_offset) > cap {
+            return Err(Error::invalid(format!(
+                "h266 stream: pps_pic_width_minus_wraparound_offset out of range ({})",
+                pps.pps_pic_width_minus_wraparound_offset
+            )));
+        }
+    }
+    Ok(())
 }
