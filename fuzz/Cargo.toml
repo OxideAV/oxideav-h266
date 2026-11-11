@@ -38,6 +38,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "vui_sei"
+path = "fuzz_targets/vui_sei.rs"
+test = false
+doc = false
+bench = false
+
 # Stand-alone workspace: keeps the fuzz harness out of any enclosing
 # workspace's member resolution (the harness builds with nightly-only
 # instrumentation flags the surrounding crates never want).

@@ -6263,6 +6263,30 @@ fn encode_idr_impl(
         annex_b(&mut bitstream, &slice_nal);
     }
 
+    // r487 — decoded picture hash SEI message (Rec. ITU-T H.274 §8.8)
+    // in a suffix SEI NAL unit: the hash of the whole coded picture
+    // (padding included — the conformance window is not applied), so
+    // any decoder can check its reconstruction against ours.
+    if let Some(method) = config.picture_hash {
+        let hash = crate::picture_hash::picture_hash(
+            &rec,
+            config.coded_width() as usize,
+            config.coded_height() as usize,
+            config.chroma_format_idc,
+            u32::from(config.bit_depth),
+            method,
+        );
+        let mut sei_rbsp = crate::sei_payload::write_sei_message(
+            crate::sei_payload::payload_type::DECODED_PICTURE_HASH,
+            &hash.write_payload(),
+        );
+        sei_rbsp.push(0x80); // rbsp_trailing_bits()
+        annex_b(
+            &mut bitstream,
+            &build_nal(NalUnitType::SuffixSeiNut, 0, 1, &sei_rbsp),
+        );
+    }
+
     // r474 — hand back the reconstruction at the SOURCE geometry (the
     // coded padding is cropped away, mirroring the conformance window
     // a decoder applies).

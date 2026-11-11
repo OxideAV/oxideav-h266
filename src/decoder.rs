@@ -32,6 +32,27 @@
 //!   `Yuv444P16Le`); an SPS at another bit depth is refused with a
 //!   typed `Unsupported` before any picture decodes (the core
 //!   `PixelFormat` set has no label for it).
+//! * **Stream parameters (r487).** [`Decoder::output_params`] states
+//!   the shape of the frames — cropped size, pixel format, frame rate
+//!   when the SPS signals timing, and the colour description of the
+//!   SPS VUI (Rec. ITU-T H.274 `vui_parameters()`: primaries, transfer
+//!   characteristics, matrix coefficients, range; the transfer
+//!   characteristics give way to an alternative transfer
+//!   characteristics SEI message's preferred value). Frames carry
+//!   none of it. A mid-stream change (a new CLVS with another size,
+//!   format or colour description) bumps
+//!   [`Decoder::output_params_generation`] and is announced in-band by
+//!   a [`Frame::StreamParams`] event immediately before the first
+//!   frame of the new shape. The sample aspect ratio, chroma sample
+//!   location, source scan type, mastering display colour volume and
+//!   content light level have no core field: read them from
+//!   [`H266Decoder::stream_info`].
+//! * **Picture hash (r487).** With the `verify_picture_hash` option
+//!   every picture is checked against its decoded picture hash SEI
+//!   message (MD5 / CRC / checksum); a mismatch fails the
+//!   `send_packet` that decoded the picture with `InvalidData` (the
+//!   pictures still come out), and [`H266Decoder::picture_hash_stats`]
+//!   counts both outcomes.
 //! * **Limits.** `CodecParameters::limits` and the registry's
 //!   16384 × 16384 ceiling are checked against every SPS / PPS before
 //!   the parameter set is accepted — no plane is allocated for a
@@ -41,13 +62,17 @@
 use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
+use oxideav_core::options::{
+    CodecOptionsStruct, OptionField, OptionKind, OptionValue, parse_options,
+};
 use oxideav_core::{
-    CodecId, CodecParameters, DecoderLimits, Error, Frame, Packet, PixelFormat, Rational, Result,
-    TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, ColorSignal, DecoderLimits, Error, Frame, Packet, PixelFormat,
+    Rational, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::CODEC_ID_STR;
 use crate::nal::{NalHeader, NalUnitType, extract_rbsp, iter_annex_b, iter_length_prefixed};
+use crate::picture_hash::PictureHashStatus;
 use crate::reconstruct::PicturePlane;
 use crate::sps::{SeqParameterSet, parse_sps};
 use crate::stream::{DecodedPicture, OutputInfo, StreamDecoder};
@@ -117,6 +142,64 @@ enum Framing {
     LengthPrefixed(u8),
 }
 
+/// Typed options of the registry decoder.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct H266DecoderOptions {
+    /// Check every picture against its decoded picture hash SEI
+    /// message (default false).
+    pub verify_picture_hash: bool,
+}
+
+impl H266DecoderOptions {
+    /// The defaults (see each field).
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl CodecOptionsStruct for H266DecoderOptions {
+    const SCHEMA: &'static [OptionField] = &[OptionField {
+        name: "verify_picture_hash",
+        kind: OptionKind::Bool,
+        default: OptionValue::Bool(false),
+        help: "check each picture against its decoded picture hash SEI message; a mismatch is InvalidData",
+    }];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        match key {
+            "verify_picture_hash" => self.verify_picture_hash = value.as_bool()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// Outcome counts of the decoded picture hash check
+/// ([`H266Decoder::picture_hash_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PictureHashStats {
+    /// Pictures whose hash message matched the reconstruction.
+    pub matched: u64,
+    /// Pictures whose hash message did not match.
+    pub mismatched: u64,
+    /// Pictures decoded without a usable hash message.
+    pub unchecked: u64,
+}
+
+/// The shape of an output frame — what [`Decoder::output_params`]
+/// states and a [`Frame::StreamParams`] event announces a change of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shape {
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    color: ColorSignal,
+    /// `time_scale / num_units_in_tick`, when the SPS signals timing.
+    frame_rate: Option<(u32, u32)>,
+}
+
 /// A decoded picture waiting for its output turn.
 struct Pending {
     cvs: u32,
@@ -124,6 +207,8 @@ struct Pending {
     /// Packet `pts` the picture inherited, if any.
     packet_pts: Option<i64>,
     frame: VideoFrame,
+    shape: Shape,
+    info: OutputInfo,
     /// §C.5.2.2 `PicLatencyCount`.
     latency: u32,
 }
@@ -137,8 +222,19 @@ pub struct H266Decoder {
     limits: DecoderLimits,
     /// Pictures decoded but not yet output (reorder set).
     pending: Vec<Pending>,
-    /// Frames ready for `receive_frame`, in output order.
-    ready: VecDeque<VideoFrame>,
+    /// Frames ready for `receive_frame`, in output order, each with
+    /// its shape and the stream-level facts of its picture.
+    ready: VecDeque<(VideoFrame, Shape, OutputInfo)>,
+    /// Shape of the frame most recently returned.
+    current_shape: Option<Shape>,
+    /// Stream-level facts of the frame most recently returned.
+    current_info: Option<OutputInfo>,
+    /// Colour description of the SPS most recently accepted (the
+    /// answer before the first frame).
+    announced_color: ColorSignal,
+    /// `output_params_generation`.
+    generation: u64,
+    hash_stats: PictureHashStats,
     /// Bumping bounds of the current CVS.
     info: OutputInfo,
     /// `pts` of the packet being decoded, consumed by the first
@@ -161,6 +257,7 @@ impl H266Decoder {
     /// ISO/IEC 14496-15 `VvcDecoderConfigurationRecord`; `limits`
     /// caps the pictures the decoder will allocate.
     pub fn new(params: &CodecParameters) -> Result<Self> {
+        let opts: H266DecoderOptions = parse_options(&params.options)?;
         let mut dec = Self {
             codec_id: CodecId::new(CODEC_ID_STR),
             inner: StreamDecoder::new(),
@@ -168,6 +265,11 @@ impl H266Decoder {
             limits: params.limits,
             pending: Vec::new(),
             ready: VecDeque::new(),
+            current_shape: None,
+            current_info: None,
+            announced_color: ColorSignal::unspecified(),
+            generation: 0,
+            hash_stats: PictureHashStats::default(),
             info: OutputInfo::default(),
             packet_pts: None,
             clock_next: 0,
@@ -181,6 +283,7 @@ impl H266Decoder {
         let side_cap = u64::from(MAX_DIMENSION) * u64::from(MAX_DIMENSION);
         dec.inner
             .set_max_pixels(Some(params.limits.max_pixels_per_frame.min(side_cap)));
+        dec.inner.set_verify_picture_hash(opts.verify_picture_hash);
         if !params.extradata.is_empty() {
             let rec = VvcDecoderConfigurationRecord::parse(&params.extradata)?;
             dec.framing = Framing::LengthPrefixed(rec.length_size());
@@ -222,7 +325,43 @@ impl H266Decoder {
     /// The cropped output picture size, once known (from the `vvcC`
     /// record or the first SPS).
     pub fn output_dimensions(&self) -> Option<(u32, u32)> {
-        self.output_dims
+        self.current_shape
+            .map(|s| (s.width, s.height))
+            .or(self.output_dims)
+    }
+
+    /// r487 — the stream-level facts of the frame most recently
+    /// returned by `receive_frame` (`None` before the first): the SPS
+    /// VUI (sample aspect ratio, chroma sample location, source scan
+    /// type, colour description), `sps_field_seq_flag`, and the
+    /// CLVS-persistent SEI state (mastering display colour volume,
+    /// content light level, preferred transfer characteristics).
+    pub fn stream_info(&self) -> Option<OutputInfo> {
+        self.current_info
+    }
+
+    /// r487 — check every picture against its decoded picture hash
+    /// SEI message (the `verify_picture_hash` option).
+    pub fn set_verify_picture_hash(&mut self, on: bool) {
+        self.inner.set_verify_picture_hash(on);
+    }
+
+    /// r487 — how the decoded picture hash checks went so far.
+    pub fn picture_hash_stats(&self) -> PictureHashStats {
+        self.hash_stats
+    }
+
+    /// The answer of `output_params` for a shape.
+    fn params_of(&self, shape: &Shape) -> CodecParameters {
+        let mut p = CodecParameters::video(self.codec_id.clone());
+        p.width = Some(shape.width);
+        p.height = Some(shape.height);
+        p.pixel_format = Some(shape.pixel_format);
+        p.color_signal = shape.color;
+        p.frame_rate = shape
+            .frame_rate
+            .map(|(num, den)| Rational::new(i64::from(num), i64::from(den)));
+        p
     }
 
     /// Pre-flight an SPS before the stream decoder stores it: the
@@ -267,6 +406,10 @@ impl H266Decoder {
         }
         self.output_pf = Some(pf);
         self.output_dims = Some((sps.cropped_width(), sps.cropped_height()));
+        self.announced_color = sps
+            .vui
+            .map(|v| v.color_signal())
+            .unwrap_or_else(ColorSignal::unspecified);
         if let Some(t) = sps.general_timing_hrd.as_ref() {
             if t.num_units_in_tick > 0 && t.time_scale > 0 {
                 let tb = TimeBase::new(i64::from(t.num_units_in_tick), i64::from(t.time_scale));
@@ -329,18 +472,31 @@ impl H266Decoder {
         })();
         // Pictures decoded before an error still go out (the error
         // itself is reported to the caller).
+        let mut hash_mismatch: Option<(i32, PictureHashStatus)> = None;
         for pic in out {
+            match pic.hash_status {
+                Some(PictureHashStatus::Match(_)) => self.hash_stats.matched += 1,
+                Some(status) => {
+                    self.hash_stats.mismatched += 1;
+                    hash_mismatch.get_or_insert((pic.poc, status));
+                }
+                None => self.hash_stats.unchecked += 1,
+            }
             self.admit(pic)?;
         }
-        result
+        result?;
+        if let Some((poc, status)) = hash_mismatch {
+            return Err(Error::invalid(format!(
+                "h266: picture POC {poc} does not match its decoded picture hash SEI message                  ({status:?})"
+            )));
+        }
+        Ok(())
     }
 
     /// Take a decoded picture into the reorder set and run the
     /// bumping rules.
     fn admit(&mut self, pic: DecodedPicture) -> Result<()> {
-        if let Some(info) = self.inner.last_output_info() {
-            self.info = info;
-        }
+        self.info = pic.output_info;
         // CLVS boundary: everything of the previous CVS leaves first.
         if let Some(prev) = self.pending.first().map(|p| p.cvs) {
             if prev != pic.cvs_idx {
@@ -351,6 +507,17 @@ impl H266Decoder {
             return Ok(());
         }
         let frame = picture_to_video_frame(&pic);
+        let info = pic.output_info;
+        let shape = Shape {
+            width: pic.crop.2 as u32,
+            height: pic.crop.3 as u32,
+            pixel_format: output_pixel_format_for(pic.chroma_format_idc, pic.bit_depth)?,
+            color: info.color_signal(),
+            frame_rate: match (info.time_scale, info.num_units_in_tick) {
+                (Some(scale), Some(tick)) if scale > 0 && tick > 0 => Some((scale, tick)),
+                _ => None,
+            },
+        };
         for p in &mut self.pending {
             p.latency += 1;
         }
@@ -359,6 +526,8 @@ impl H266Decoder {
             poc: pic.poc,
             packet_pts: self.packet_pts.take(),
             frame,
+            shape,
+            info,
             latency: 0,
         });
         self.bump_by_rules();
@@ -400,7 +569,7 @@ impl H266Decoder {
         let p = self.pending.remove(idx);
         let mut frame = p.frame;
         frame.pts = Some(self.stamp(p.cvs, p.poc, p.packet_pts));
-        self.ready.push_back(frame);
+        self.ready.push_back((frame, p.shape, p.info));
     }
 
     /// Output every waiting picture in POC order.
@@ -509,8 +678,24 @@ impl Decoder for H266Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.ready.pop_front() {
-            return Ok(Frame::Video(f));
+        if let Some((_, shape, _)) = self.ready.front() {
+            let shape = *shape;
+            match self.current_shape {
+                // A change after the first frame: announce it in-band,
+                // immediately before the first frame of the new shape
+                // (which stays queued for the next call).
+                Some(current) if current != shape => {
+                    self.current_shape = Some(shape);
+                    self.generation = self.generation.wrapping_add(1);
+                    return Ok(Frame::StreamParams(Box::new(self.params_of(&shape))));
+                }
+                Some(_) => {}
+                // The first shape is not a change.
+                None => self.current_shape = Some(shape),
+            }
+            let (frame, _, info) = self.ready.pop_front().expect("front was Some");
+            self.current_info = Some(info);
+            return Ok(Frame::Video(frame));
         }
         if self.eos {
             Err(Error::Eof)
@@ -543,7 +728,29 @@ impl Decoder for H266Decoder {
     }
 
     fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.output_pf
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        if let Some(shape) = &self.current_shape {
+            return Some(self.params_of(shape));
+        }
+        // Before the first frame: what the configuration record or the
+        // SPS seen so far announce.
+        let pf = self.output_pf?;
+        let mut p = CodecParameters::video(self.codec_id.clone());
+        p.pixel_format = Some(pf);
+        if let Some((w, h)) = self.output_dims {
+            p.width = Some(w);
+            p.height = Some(h);
+        }
+        p.color_signal = self.announced_color;
+        p.frame_rate = self.output_frame_rate();
+        Some(p)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
 }
 

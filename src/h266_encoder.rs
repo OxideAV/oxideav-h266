@@ -42,7 +42,9 @@ use oxideav_core::{
 use crate::encoder::EncoderConfig;
 use crate::encoder_pipeline::encode_idr_with_residuals_cfg;
 use crate::nal::{NalUnitType, iter_annex_b};
+use crate::picture_hash::PictureHashMethod;
 use crate::reconstruct::PictureBuffer;
+use crate::vui::{VuiColourDescription, VuiParameters};
 use crate::vvcc::{VvcDecoderConfigurationRecord, annex_b_to_length_prefixed};
 
 /// Typed option struct for the registry encoder. See the module docs
@@ -90,6 +92,9 @@ pub struct H266EncoderOptions {
     /// Block-based delta pulse code modulation in the intra decision
     /// (default true).
     pub bdpcm: bool,
+    /// Decoded picture hash SEI message after every picture: `none`
+    /// (default), `md5`, `crc` or `checksum`.
+    pub picture_hash: String,
 }
 
 impl H266EncoderOptions {
@@ -117,6 +122,7 @@ impl Default for H266EncoderOptions {
             mip: true,
             isp: false,
             bdpcm: true,
+            picture_hash: "none".to_string(),
         }
     }
 }
@@ -213,6 +219,12 @@ impl CodecOptionsStruct for H266EncoderOptions {
             default: OptionValue::Bool(true),
             help: "block-based delta pulse code modulation candidates in the intra decision",
         },
+        OptionField {
+            name: "picture_hash",
+            kind: OptionKind::Enum(&["none", "md5", "crc", "checksum"]),
+            default: OptionValue::String(String::new()),
+            help: "decoded picture hash SEI message after every picture (of the encoder's reconstruction)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -232,6 +244,7 @@ impl CodecOptionsStruct for H266EncoderOptions {
             "mip" => self.mip = value.as_bool()?,
             "isp" => self.isp = value.as_bool()?,
             "bdpcm" => self.bdpcm = value.as_bool()?,
+            "picture_hash" => self.picture_hash = value.as_str()?.to_string(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -414,6 +427,26 @@ impl H266CodecEncoder {
         config.intra_mip = opts.mip;
         config.intra_isp = opts.isp;
         config.intra_bdpcm = opts.bdpcm;
+        config.picture_hash = match opts.picture_hash.as_str() {
+            "" | "none" => None,
+            "md5" => Some(PictureHashMethod::Md5),
+            "crc" => Some(PictureHashMethod::Crc),
+            "checksum" => Some(PictureHashMethod::Checksum),
+            other => return Err(Error::invalid(format!("unknown picture_hash '{other}'"))),
+        };
+        // The stream's colour description goes into the SPS VUI. Rec.
+        // ITU-T H.274 §7.3 bars vui_matrix_coeffs 0, 16 and 17 outside
+        // 4:4:4: such a request is written as 2 (unspecified) and the
+        // output parameters say so.
+        let colour = VuiColourDescription::from_color_signal(&params.color_signal).map(|mut c| {
+            if matches!(c.matrix_coeffs, 0 | 16 | 17) && layout.chroma_format_idc != 3 {
+                c.matrix_coeffs = 2;
+            }
+            c
+        });
+        if let Some(c) = colour {
+            config.vui = Some(VuiParameters::new().with_colour_description(c));
+        }
         // Validate up front (geometry, tile grid, tool exclusions).
         let probe = crate::encoder::VvcEncoder::new(config)?;
 
@@ -428,6 +461,9 @@ impl H266CodecEncoder {
         output_params.height = Some(height);
         output_params.pixel_format = Some(pf);
         output_params.frame_rate = params.frame_rate;
+        if let Some(c) = colour {
+            output_params.color_signal = c.color_signal();
+        }
         if vvcc {
             // The record from the session's parameter sets (the same
             // VPS / SPS / PPS every access unit carries in-band).

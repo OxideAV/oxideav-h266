@@ -85,6 +85,11 @@ fuzz_target!(|data: &[u8]| {
             NalUnitType::PrefixSeiNut | NalUnitType::SuffixSeiNut => {
                 if let Ok(sei) = oxideav_h266::sei_rbsp::parse_sei_rbsp(&rbsp) {
                     for m in &sei.messages {
+                        let _ = oxideav_h266::sei_payload::parse_sei_payload(
+                            m.payload_type,
+                            m.payload,
+                            t == NalUnitType::SuffixSeiNut,
+                        );
                         match m.payload_type {
                             0 => {
                                 let _ = oxideav_h266::buffering_period::parse_buffering_period(

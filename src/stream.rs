@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use oxideav_core::{Error, Result};
+use oxideav_core::{ColorSignal, Error, Result, TransferCharacteristics};
 
 use crate::alf::AlfApsBinding;
 use crate::alf_syntax::AlfSyntaxConfig;
@@ -32,6 +32,7 @@ use crate::ctu::{CtuLayout, CtuWalker};
 use crate::inter::{ExplicitWpTables, MotionField, ReferencePicture};
 use crate::lmcs::LmcsData;
 use crate::nal::{NalHeader, NalUnitType, extract_rbsp, iter_annex_b};
+use crate::picture_hash::PictureHashStatus;
 use crate::picture_header::{PictureHeader, parse_picture_header, parse_picture_header_stateful};
 use crate::pps::{PicParameterSet, parse_pps};
 use crate::reconstruct::PictureBuffer;
@@ -39,10 +40,14 @@ use crate::ref_pic_list::{
     BuiltRefPicEntry, HeaderRefPicList, RefPicKind, RefPicListInputs, build_ref_pic_list,
 };
 use crate::scaling_list::ScalingListData;
+use crate::sei_payload::{
+    ContentLightLevelInfo, MasteringDisplayColourVolume, SeiPayload, parse_sei_payload,
+};
 use crate::slice_header::{
     PhAlfState, PhState, SliceType, StatefulSliceHeader, parse_slice_header_stateful,
 };
 use crate::sps::{SeqParameterSet, parse_sps};
+use crate::vui::VuiParameters;
 
 /// One decoded picture, in decode order.
 #[non_exhaustive]
@@ -66,7 +71,27 @@ pub struct DecodedPicture {
     pub chroma_format_idc: u8,
     /// Luma/chroma bit depth (from the SPS).
     pub bit_depth: u32,
+    /// r487 — the stream-level facts in force for this picture: the
+    /// output-order bounds and timing of its SPS, the VUI colour
+    /// description, and the CLVS-persistent SEI state (mastering
+    /// display, content light level, preferred transfer
+    /// characteristics) as of this picture.
+    pub output_info: OutputInfo,
+    /// r487 — the SEI messages of this picture's access unit, typed:
+    /// the prefix SEI NAL units that preceded its first slice, then
+    /// its suffix SEI NAL units (at most [`MAX_SEI_MESSAGES_PER_PICTURE`]).
+    pub sei: Vec<SeiPayload>,
+    /// r487 — the result of checking the reconstruction against the
+    /// picture's decoded picture hash SEI message. `None` when the
+    /// check is off ([`StreamDecoder::set_verify_picture_hash`]), the
+    /// picture carried no such message, or the message is one a
+    /// decoder ignores (reserved hash type).
+    pub hash_status: Option<PictureHashStatus>,
 }
+
+/// Most SEI messages kept per picture (prefix and suffix together); a
+/// hostile access unit cannot grow the per-picture list past this.
+pub const MAX_SEI_MESSAGES_PER_PICTURE: usize = 64;
 
 /// A reference picture retained in the decoded-picture buffer.
 struct DpbEntry {
@@ -82,6 +107,8 @@ struct PictureUnit {
     ph: PictureHeader,
     /// Parsed slice headers in decode order.
     slices: Vec<StatefulSliceHeader>,
+    /// SEI messages of the picture (prefix, then suffix).
+    sei: Vec<SeiPayload>,
 }
 
 /// Annex-B VVC elementary-stream decoder (stream-level glue over the
@@ -120,6 +147,24 @@ pub struct StreamDecoder {
     /// decoded picture referenced (DPB sizing + timing), for the
     /// framework decoder's output-order bumping.
     last_output_info: Option<OutputInfo>,
+    /// r487 — prefix SEI messages waiting for the picture they
+    /// precede.
+    pending_sei: Vec<SeiPayload>,
+    /// r487 — SEI state that persists to the end of the CLVS.
+    clvs_sei: ClvsSeiState,
+    /// r487 — check each picture against its decoded picture hash SEI
+    /// message.
+    verify_picture_hash: bool,
+}
+
+/// The SEI messages whose content persists from the picture that
+/// carries them to the end of the CLVS (Rec. ITU-T H.274 §8.9.2,
+/// §8.10.2, §8.12.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClvsSeiState {
+    mastering_display: Option<MasteringDisplayColourVolume>,
+    content_light_level: Option<ContentLightLevelInfo>,
+    preferred_transfer_characteristics: Option<u8>,
 }
 
 /// r477 — the SPS-level facts a presentation layer needs per decoded
@@ -148,6 +193,21 @@ pub struct OutputInfo {
     pub time_scale: Option<u32>,
     /// `sps_max_sublayers_minus1 + 1`.
     pub num_sublayers: u32,
+    /// r487 — the SPS `vui_parameters()` (Rec. ITU-T H.274 §7), when
+    /// the SPS carries one.
+    pub vui: Option<VuiParameters>,
+    /// r487 — `sps_field_seq_flag`: the pictures of the CLVS are
+    /// fields.
+    pub field_seq_flag: bool,
+    /// r487 — the mastering display colour volume SEI message in
+    /// force for the CLVS.
+    pub mastering_display: Option<MasteringDisplayColourVolume>,
+    /// r487 — the content light level information SEI message in
+    /// force for the CLVS.
+    pub content_light_level: Option<ContentLightLevelInfo>,
+    /// r487 — `preferred_transfer_characteristics` of the alternative
+    /// transfer characteristics SEI message in force for the CLVS.
+    pub preferred_transfer_characteristics: Option<u8>,
 }
 
 impl OutputInfo {
@@ -165,7 +225,30 @@ impl OutputInfo {
             num_units_in_tick: sps.general_timing_hrd.as_ref().map(|t| t.num_units_in_tick),
             time_scale: sps.general_timing_hrd.as_ref().map(|t| t.time_scale),
             num_sublayers: u32::from(sps.sps_max_sublayers_minus1) + 1,
+            vui: sps.vui,
+            field_seq_flag: sps.sps_field_seq_flag,
+            mastering_display: None,
+            content_light_level: None,
+            preferred_transfer_characteristics: None,
         }
+    }
+
+    /// The colour description of the output as a core
+    /// [`ColorSignal`]: the VUI colour description, with the transfer
+    /// characteristics replaced by the alternative transfer
+    /// characteristics SEI message's preferred value when one is in
+    /// force (H.274 §8.12.2 — the value a decoder that understands the
+    /// message should interpret the pictures with). Unspecified
+    /// without a VUI colour description and without that message.
+    pub fn color_signal(&self) -> ColorSignal {
+        let mut signal = self
+            .vui
+            .map(|v| v.color_signal())
+            .unwrap_or_else(ColorSignal::unspecified);
+        if let Some(t) = self.preferred_transfer_characteristics {
+            signal = signal.with_transfer(TransferCharacteristics(t));
+        }
+        signal
     }
 }
 
@@ -192,6 +275,33 @@ impl StreamDecoder {
     /// picture).
     pub fn last_output_info(&self) -> Option<OutputInfo> {
         self.last_output_info
+    }
+
+    /// r487 — check every decoded picture against its decoded picture
+    /// hash SEI message (Rec. ITU-T H.274 §8.8: MD5, CRC or checksum
+    /// per colour component) and report the outcome in
+    /// [`DecodedPicture::hash_status`]. Off by default — hashing a
+    /// picture costs a pass over its samples. A mismatch is reported,
+    /// not turned into an error: the picture is still handed out.
+    pub fn set_verify_picture_hash(&mut self, on: bool) {
+        self.verify_picture_hash = on;
+    }
+
+    /// Parse the messages of one SEI NAL unit. A malformed SEI NAL
+    /// unit or message body is dropped — SEI never stops the decode
+    /// (§D.1: not required for constructing the samples).
+    fn collect_sei(&self, rbsp: &[u8], suffix: bool, into: &mut Vec<SeiPayload>) {
+        let Ok(sei) = crate::sei_rbsp::parse_sei_rbsp(rbsp) else {
+            return;
+        };
+        for m in &sei.messages {
+            if into.len() >= MAX_SEI_MESSAGES_PER_PICTURE {
+                break;
+            }
+            if let Ok(p) = parse_sei_payload(m.payload_type, m.payload, suffix) {
+                into.push(p);
+            }
+        }
     }
 
     /// r477 — a parameter set already in the pools, by id.
@@ -229,6 +339,7 @@ impl StreamDecoder {
         self.prev_tid0 = None;
         self.pending_ph = None;
         self.cur = None;
+        self.pending_sei.clear();
         self.clvss_pending = true;
         self.discard_rasl = false;
         self.started = false;
@@ -358,6 +469,7 @@ impl StreamDecoder {
                         temporal_id,
                         ph,
                         slices: vec![sh],
+                        sei: std::mem::take(&mut self.pending_sei),
                     });
                 } else if let Some(ph) = self.pending_ph.take() {
                     // Separate PH: the pending PhNut opens a new picture.
@@ -368,6 +480,7 @@ impl StreamDecoder {
                         temporal_id,
                         ph,
                         slices: vec![sh],
+                        sei: std::mem::take(&mut self.pending_sei),
                     });
                 } else {
                     // …or this slice continues the current picture.
@@ -380,7 +493,26 @@ impl StreamDecoder {
                     }
                 }
             }
-            _ => {} // AUD / SEI / filler / reserved — no decode state.
+            NalUnitType::PrefixSeiNut => {
+                // A prefix SEI NAL unit precedes the first VCL NAL
+                // unit of its picture unit: the picture in flight is
+                // complete.
+                self.finish_picture(sink)?;
+                let rbsp = extract_rbsp(payload);
+                let mut pending = std::mem::take(&mut self.pending_sei);
+                self.collect_sei(&rbsp, false, &mut pending);
+                self.pending_sei = pending;
+            }
+            NalUnitType::SuffixSeiNut => {
+                // A suffix SEI NAL unit follows the last VCL NAL unit
+                // of the picture it belongs to.
+                if let Some(mut pic) = self.cur.take() {
+                    let rbsp = extract_rbsp(payload);
+                    self.collect_sei(&rbsp, true, &mut pic.sei);
+                    self.cur = Some(pic);
+                }
+            }
+            _ => {} // AUD / filler / reserved — no decode state.
         }
         Ok(())
     }
@@ -567,6 +699,7 @@ impl StreamDecoder {
                 }
             }
         }
+        let sei = std::mem::take(&mut pic.sei);
         let ph = &pic.ph;
         // Triage aid (`H266_DBG_PH`): one Debug dump per picture header.
         if std::env::var_os("H266_DBG_PH").is_some() {
@@ -618,6 +751,7 @@ impl StreamDecoder {
             self.cvs_idx += 1;
             self.clvss_pending = false;
             self.discard_rasl = is_irap && !is_idr; // CLVSS CRA → drop its RASLs
+            self.clvs_sei = ClvsSeiState::default();
         } else if is_irap || pic.nal_type == NalUnitType::GdrNut {
             self.discard_rasl = false;
         }
@@ -630,6 +764,32 @@ impl StreamDecoder {
         if pic.nal_type == NalUnitType::RaslNut && self.discard_rasl {
             return Ok(());
         }
+
+        // CLVS-persistent SEI messages carried by this picture.
+        for m in &sei {
+            match m {
+                SeiPayload::MasteringDisplayColourVolume(v) => {
+                    self.clvs_sei.mastering_display = Some(*v);
+                }
+                SeiPayload::ContentLightLevelInfo(v) => {
+                    self.clvs_sei.content_light_level = Some(*v);
+                }
+                SeiPayload::AlternativeTransferCharacteristics {
+                    preferred_transfer_characteristics,
+                } => {
+                    self.clvs_sei.preferred_transfer_characteristics =
+                        Some(*preferred_transfer_characteristics);
+                }
+                _ => {}
+            }
+        }
+        let output_info = OutputInfo {
+            mastering_display: self.clvs_sei.mastering_display,
+            content_light_level: self.clvs_sei.content_light_level,
+            preferred_transfer_characteristics: self.clvs_sei.preferred_transfer_characteristics,
+            ..OutputInfo::from_sps(&sps)
+        };
+        self.last_output_info = Some(output_info);
 
         // §8.3.1 — prevTid0Pic update happens for the *decoded*
         // picture below (after RASL discard), before the next call.
@@ -1150,6 +1310,24 @@ impl StreamDecoder {
         let crop_w = w - left - right;
         let crop_h = h - top - bottom;
 
+        // Decoded picture hash (Rec. ITU-T H.274 §8.8) over the whole
+        // decoded picture, before the conformance crop.
+        let hash_status = if self.verify_picture_hash {
+            sei.iter().find_map(|m| match m {
+                SeiPayload::DecodedPictureHash(msg) => crate::picture_hash::verify(
+                    msg,
+                    &out,
+                    w,
+                    h,
+                    sps.sps_chroma_format_idc,
+                    sps.bit_depth_y(),
+                ),
+                _ => None,
+            })
+        } else {
+            None
+        };
+
         sink(DecodedPicture {
             cvs_idx: self.cvs_idx.saturating_sub(1),
             poc,
@@ -1158,6 +1336,9 @@ impl StreamDecoder {
             crop: (left, top, crop_w, crop_h),
             chroma_format_idc: sps.sps_chroma_format_idc,
             bit_depth: sps.bit_depth_y(),
+            output_info,
+            sei,
+            hash_status,
         });
         Ok(())
     }

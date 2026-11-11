@@ -307,6 +307,9 @@ pub mod mip_tables;
 #[doc(hidden)]
 pub mod mvd_coding_enc;
 pub mod nal;
+pub mod picture_hash;
+pub mod sei_payload;
+pub mod vui;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod non_merge_inter_pre_residual_dec;
@@ -438,6 +441,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .decoder_options::<decoder::H266DecoderOptions>()
             .encoder(h266_encoder::make_encoder)
             .encoder_options::<h266_encoder::H266EncoderOptions>()
             .tags([

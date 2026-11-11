@@ -470,6 +470,16 @@ pub struct EncoderConfig {
     /// [`Self::lossless`]); `sps_bdpcm_enabled_flag` follows. Default
     /// `true`; no effect on lossy pictures.
     pub intra_bdpcm: bool,
+    /// r487 — the Rec. ITU-T H.274 `vui_parameters()` written into the
+    /// SPS (`sps_vui_parameters_present_flag = 1`): colour description,
+    /// sample aspect ratio, chroma sample location, source scan type.
+    /// `None` (the default) writes no VUI.
+    pub vui: Option<crate::vui::VuiParameters>,
+    /// r487 — append a decoded picture hash SEI message (Rec. ITU-T
+    /// H.274 §8.8) of this method after the picture's slices, computed
+    /// over the encoder's own reconstruction. `None` (the default)
+    /// writes none.
+    pub picture_hash: Option<crate::picture_hash::PictureHashMethod>,
 }
 
 impl EncoderConfig {
@@ -501,7 +511,22 @@ impl EncoderConfig {
             intra_mip: true,
             intra_isp: false,
             intra_bdpcm: true,
+            vui: None,
+            picture_hash: None,
         }
+    }
+
+    /// r487 — builder: write `vui` as the SPS `vui_payload()`.
+    pub fn with_vui(mut self, vui: crate::vui::VuiParameters) -> Self {
+        self.vui = Some(vui);
+        self
+    }
+
+    /// r487 — builder: follow the picture with a decoded picture hash
+    /// SEI message of this method.
+    pub fn with_picture_hash(mut self, method: crate::picture_hash::PictureHashMethod) -> Self {
+        self.picture_hash = Some(method);
+        self
     }
 
     /// r474 — `(SubWidthC, SubHeightC)` of [`Self::chroma_format_idc`]
@@ -1051,7 +1076,22 @@ impl VvcEncoder {
         bw.write_bit(0); // virtual_boundaries_enabled
 
         bw.write_bit(0); // sps_field_seq_flag
-        bw.write_bit(0); // sps_vui_parameters_present_flag
+        // §7.3.2.4 — the VUI: size, alignment to a byte boundary, then
+        // the vui_payload() bytes (§7.3.2.21 around the H.274 syntax).
+        match &self.config.vui {
+            Some(vui) => {
+                let payload = vui.write_payload();
+                bw.write_bit(1); // sps_vui_parameters_present_flag
+                bw.write_ue(payload.len() as u32 - 1); // sps_vui_payload_size_minus1
+                while !bw.is_byte_aligned() {
+                    bw.write_bit(0); // sps_vui_alignment_zero_bit
+                }
+                for byte in payload {
+                    bw.write_bits(u32::from(byte), 8);
+                }
+            }
+            None => bw.write_bit(0), // sps_vui_parameters_present_flag
+        }
         bw.write_bit(0); // sps_extension_flag
 
         bw.rbsp_trailing_bits();

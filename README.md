@@ -17,7 +17,10 @@ sub-partitions and BDPCM in its decision, and — since r477 — a real
 framework face for both: the registry decoder streams Annex B or
 `vvcC`-framed packets in output order, the registry encoder declares
 its layouts and hands containers a `VvcDecoderConfigurationRecord`.
-Production inter (P / B) encoding and the VUI are not built yet.
+The SPS VUI and the SEI messages of Rec. ITU-T H.274 are parsed and
+written: the colour description is stated on the stream parameters,
+the decoded picture hash checks every picture. Production inter
+(P / B) encoding and multilayer decoding are not built yet.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -64,12 +67,35 @@ A streaming `oxideav_core::Decoder` over `stream::StreamDecoder`:
   4:4:4 at 8 / 10 / 12 / 16 bits (`Decoder::output_pixel_format`, from
   the record or the first SPS); any other depth is a typed
   `Unsupported` before a picture decodes.
+* **Stream parameters** (r487) — `Decoder::output_params` states the
+  shape of the frames: cropped size, pixel format, frame rate when the
+  SPS signals timing, and the **colour description of the SPS VUI**
+  (primaries / transfer characteristics / matrix coefficients / range
+  as a core `ColorSignal`; unspecified without one). Frames carry none
+  of it. A change between coded video sequences bumps
+  `output_params_generation` and is announced in-band by one
+  `Frame::StreamParams` event immediately before the first frame of
+  the new shape. `H266Decoder::stream_info` adds what the core type has
+  no field for: the whole `VuiParameters` (sample aspect ratio, chroma
+  sample location, source scan type), `sps_field_seq_flag`, and the
+  CLVS-persistent SEI state (mastering display colour volume, content
+  light level, preferred transfer characteristics — the last one also
+  replaces the VUI transfer characteristics in the colour signal).
+* **Picture hash** (r487) — option `verify_picture_hash=true` checks
+  every picture against its decoded picture hash SEI message (MD5 /
+  CRC / checksum per colour component); a mismatch fails the
+  `send_packet` that decoded the picture with `InvalidData` (the
+  picture still comes out) and `picture_hash_stats` counts the
+  outcomes.
 * **Limits** — `CodecParameters::limits` (pixels, bytes) and the
   registry's 16384 × 16384 ceiling are checked against every SPS / PPS
-  before the parameter set is accepted; no plane is allocated for a
-  hostile header, and every malformed input is an error, never a panic
-  (`fuzz/`: `parse_annexb`, `registry_decode`, `encode_roundtrip`
-  under the daily `Fuzz` workflow).
+  before the parameter set is accepted, and every parameter set is
+  held to the value ranges of its semantics before a picture decodes;
+  no plane is allocated for a hostile header, and every malformed input
+  is an error, never a panic (`fuzz/`: `parse_annexb`,
+  `registry_decode`, `encode_roundtrip`, `vui_sei` under the daily
+  `Fuzz` workflow; `tests/fuzz_regressions.rs` replays every input the
+  workflow ever crashed on).
 
 `tests/registry_decoder.rs` runs **every staged JVET conformance stream
 through the registry** one packet per access unit (and a sample as
@@ -107,11 +133,49 @@ converts ahead of the encoder.
 | `mip` | bool | true | matrix-based intra prediction candidates |
 | `isp` | bool | false | intra sub-partition candidates (opt-in, see below) |
 | `bdpcm` | bool | true | BDPCM candidates on the lossless path |
+| `picture_hash` | `none` / `md5` / `crc` / `checksum` | `none` | a decoded picture hash SEI message (of the encoder's reconstruction) after every picture |
+
+The stream's `CodecParameters::color_signal` is written as the SPS VUI
+colour description (no VUI when it is unspecified) and repeated in
+`output_params().color_signal`; matrix coefficients 0 / 16 / 17 outside
+4:4:4 — barred by H.274 §7.3 — are written as 2 (unspecified).
 
 `tests/registry_encoder.rs` round-trips every layout in both framings
 through the registry encoder and decoder, checks the quality ladder and
 the typed refusals, and a black-box decoder reproduces the registry
 decoder's output for the `vvcc` samples.
+
+## VUI and SEI (Rec. ITU-T H.274, r487)
+
+| Structure | Module | Read | Written |
+| --- | --- | --- | --- |
+| `vui_payload()` / `vui_parameters()` — source scan flags, constraint flags, sample aspect ratio (idc or explicit), overscan, colour description, chroma sample location | `vui` | `VuiParameters::parse_payload` (from `SeqParameterSet::vui`; reserved extension data ignored; a payload that breaks its own syntax leaves `vui = None` and the pictures decodable) | `VuiParameters::write_payload`, `EncoderConfig::with_vui` |
+| decoded picture hash (132, suffix SEI) | `sei_payload`, `picture_hash` | typed, verified against the reconstruction on request (`StreamDecoder::set_verify_picture_hash` → `DecodedPicture::hash_status`) | `EncoderConfig::with_picture_hash` (MD5 / CRC / checksum of the coded picture) |
+| mastering display colour volume (137), content light level (144), alternative transfer characteristics (147) | `sei_payload` | typed; persistent to the end of the CLVS in `stream::OutputInfo` | `write_payload` + `write_sei_message` |
+| ambient viewing environment (148), content colour volume (149), frame-field information (168), sample aspect ratio information (204), display orientation (47), parameter sets inclusion indication (129), dependent RAP indication (145), user data registered / unregistered (4 / 5), filler (3) | `sei_payload` | typed (`SeiPayload`), per picture in `DecodedPicture::sei` (at most 64 messages a picture, user data capped at 1 MiB) | — |
+
+SEI never stops a decode: a NAL unit or message body that does not
+parse is dropped. Every other `payloadType` is reported as
+`SeiPayload::Other`.
+
+**The picture hash as a conformance oracle** — independent of the
+`.opl` sidecars, the expected values travel inside the bitstreams:
+`tests/r487_picture_hash.rs` decodes the staged JVET conformance
+streams with the check on. **56 / 56 streams carry an MD5 hash on every
+picture and all 1777 / 1777 pictures match.** The encoder's own hash
+messages (all three methods, every chroma format, 8 and 10 bits, padded
+geometries) verify the same way, and a black-box decoder decodes the
+VUI + hash streams to the encoder's reconstruction and reports the
+signalled primaries / transfer / matrix / range
+(`tests/r487_vui_sei.rs`).
+
+Not covered: `vui_aspect_ratio_idc` values other than 255 and the
+colour code points are passed through as Rec. ITU-T H.273 code points
+(the H.273 tables are not among the staged documents, so no
+idc → ratio mapping and no reserved-value folding is done); the
+remaining H.274 messages (film grain, frame packing, omnidirectional
+projection, annotated regions, neural-network post-filter, …) are
+reported by type only.
 
 ## Parse support
 

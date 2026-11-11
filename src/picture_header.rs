@@ -1082,6 +1082,7 @@ mod tests {
             sps_field_seq_flag: false,
             sps_vui_parameters_present_flag: false,
             vui_payload: Vec::new(),
+            vui: None,
             sps_extension_flag: false,
             sps_range_extension_flag: false,
             sps_extension_7bits: 0,

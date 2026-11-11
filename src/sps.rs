@@ -90,14 +90,19 @@ pub struct SeqParameterSet {
     /// `sps_field_seq_flag` (§7.4.3.4).
     pub sps_field_seq_flag: bool,
     /// `sps_vui_parameters_present_flag` (§7.4.3.4). When set, the
-    /// `vui_parameters()` bytes are captured verbatim in
-    /// [`Self::vui_payload`] (the reference decoder treats them as
-    /// opaque — see ITU-T H.274).
+    /// `vui_payload()` bytes are captured verbatim in
+    /// [`Self::vui_payload`] and parsed into [`Self::vui`].
     pub sps_vui_parameters_present_flag: bool,
-    /// Raw VUI payload bytes. The first byte starts at
-    /// `vui_payload_bit_offset` within the SPS RBSP — kept for
-    /// later increments that wire the H.274 parser in.
+    /// Raw `vui_payload()` bytes (`sps_vui_payload_size_minus1 + 1` of
+    /// them, starting byte-aligned in the SPS RBSP).
     pub vui_payload: Vec<u8>,
+    /// The parsed Rec. ITU-T H.274 `vui_parameters()` of
+    /// [`Self::vui_payload`]. `None` without a VUI — and for a payload
+    /// the H.274 parser rejects (truncated, a chroma sample location
+    /// outside `0..=6`, no stop bit before its padding): the VUI is
+    /// advisory, so a broken one costs the stream its colour
+    /// description, never its pictures.
+    pub vui: Option<crate::vui::VuiParameters>,
     /// `sps_extension_flag` (§7.4.3.4).
     pub sps_extension_flag: bool,
     /// `sps_range_extension_flag` — only transmitted under
@@ -909,7 +914,14 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     let sps_field_seq_flag = br.u1()? == 1;
     let sps_vui_parameters_present_flag = br.u1()? == 1;
     let vui_payload = if sps_vui_parameters_present_flag {
-        let payload_size = br.ue()? + 1;
+        // §7.4.3.4: sps_vui_payload_size_minus1 in 0..=1023.
+        let payload_size = br.ue()?.saturating_add(1);
+        if payload_size as usize > crate::vui::MAX_VUI_PAYLOAD_BYTES {
+            return Err(Error::invalid(format!(
+                "h266 SPS: sps_vui_payload_size_minus1 out of range ({})",
+                payload_size - 1
+            )));
+        }
         // vui_alignment_zero_bits to the next byte boundary.
         while !br.is_byte_aligned() {
             if br.u1()? != 0 {
@@ -932,6 +944,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         buf
     } else {
         Vec::new()
+    };
+    let vui = if sps_vui_parameters_present_flag {
+        crate::vui::VuiParameters::parse_payload(&vui_payload).ok()
+    } else {
+        None
     };
     let sps_extension_flag = br.u1()? == 1;
     let mut sps_range_extension_flag = false;
@@ -1021,6 +1038,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         sps_field_seq_flag,
         sps_vui_parameters_present_flag,
         vui_payload,
+        vui,
         sps_extension_flag,
         sps_range_extension_flag,
         sps_extension_7bits,
@@ -1753,6 +1771,7 @@ pub(crate) fn test_minimal_sps(ctb_log2_minus5: u8, pic_w: u32, pic_h: u32) -> S
         sps_field_seq_flag: false,
         sps_vui_parameters_present_flag: false,
         vui_payload: Vec::new(),
+        vui: None,
         sps_extension_flag: false,
         sps_range_extension_flag: false,
         sps_extension_7bits: 0,
