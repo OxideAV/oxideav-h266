@@ -649,7 +649,7 @@ pub fn read_palette_coding(
                             // `H266_DBG_LENIENT` — triage aid: clamp a
                             // desynced escape value instead of aborting so
                             // the picture can still be diffed.
-                            if std::env::var_os("H266_DBG_LENIENT").is_none() {
+                            if crate::dbg_env::var_os("H266_DBG_LENIENT").is_none() {
                                 return Err(Error::invalid(
                                     "h266 palette_coding: palette_escape_val exceeds \
                                      (1 << BitDepth) - 1",

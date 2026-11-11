@@ -252,7 +252,7 @@ pub(crate) fn apply_alf_regions(
     tile_bounds: Option<(&[u32], &[u32])>,
     region: Option<&LfRegionMap>,
 ) {
-    if std::env::var_os("H266_DBG_ALF_CTB").is_some() {
+    if crate::dbg_env::var_os("H266_DBG_ALF_CTB").is_some() {
         eprintln!(
             "ALF apply: enabled={} all_off={} cb={} cr={} cc_cb={} cc_cr={}",
             cfg.alf_enabled,
@@ -298,7 +298,7 @@ pub(crate) fn apply_alf_regions(
     for ry in 0..alf_pic.pic_height_in_ctbs_y {
         for rx in 0..alf_pic.pic_width_in_ctbs_y {
             let p = alf_pic.get(rx, ry);
-            if std::env::var_os("H266_DBG_ALF_CTB").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_ALF_CTB").is_some() {
                 eprintln!(
                     "ALF ctb ({rx},{ry}): luma_on={} set={} cb_on={} cb_alt={} cr_on={} cr_alt={} cc_cb={} cc_cr={}",
                     p.luma_on,
@@ -330,7 +330,7 @@ pub(crate) fn apply_alf_regions(
                     apply_alf_luma_ctb(
                         &mut out.luma,
                         &luma_pre,
-                        regions_y.clone(),
+                        &regions_y,
                         rx,
                         ry,
                         ctb_size_y,
@@ -341,7 +341,7 @@ pub(crate) fn apply_alf_regions(
                 }
             }
             if cfg.chroma_format_idc != 0 {
-                let dbg_no_calf = std::env::var_os("H266_DBG_NO_CHROMA_ALF").is_some();
+                let dbg_no_calf = crate::dbg_env::var_os("H266_DBG_NO_CHROMA_ALF").is_some();
                 if cfg.cb_enabled && p.cb_on && !dbg_no_calf {
                     if let Some(aps) = binding.chroma_aps {
                         if let Some((coeff, clip_idx)) =
@@ -350,7 +350,7 @@ pub(crate) fn apply_alf_regions(
                             apply_alf_chroma_ctb(
                                 &mut out.cb,
                                 &cb_pre,
-                                regions_c.clone(),
+                                &regions_c,
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -371,7 +371,7 @@ pub(crate) fn apply_alf_regions(
                             apply_alf_chroma_ctb(
                                 &mut out.cr,
                                 &cr_pre,
-                                regions_c.clone(),
+                                &regions_c,
                                 rx,
                                 ry,
                                 ctb_size_y,
@@ -391,7 +391,7 @@ pub(crate) fn apply_alf_regions(
     // §8.8.5.1 second pass — CC-ALF runs after primary chroma ALF and
     // reads from the *pre-luma-ALF* `recPictureL`. The accumulated
     // delta is added to the post-chroma-ALF chroma plane.
-    if cfg.chroma_format_idc != 0 && std::env::var_os("H266_DBG_NO_CCALF").is_none() {
+    if cfg.chroma_format_idc != 0 && crate::dbg_env::var_os("H266_DBG_NO_CCALF").is_none() {
         for ry in 0..alf_pic.pic_height_in_ctbs_y {
             for rx in 0..alf_pic.pic_width_in_ctbs_y {
                 let p = alf_pic.get(rx, ry);
@@ -484,55 +484,84 @@ fn apply_cc_alf_ctb(
     let ph = luma_h as i32;
     let regions: ClipRegions = fetch_clip.into();
 
+    let (sw, sh) = (sub_w as i32, sub_h as i32);
     for y in 0..j_max {
-        for x in 0..i_max {
-            // Map chroma → luma per eq. 1510.
-            let xl = ((x_ctb_c + x) as i32) * (sub_w as i32);
-            let yl = ((y_ctb_c + y) as i32) * (sub_h as i32);
-            let fetch_clip = regions.clip_at(xl, yl);
-
-            // Table 47 yP1 / yP2: in the single-slice / no-virtual-
-            // boundary scaffold `applyAlfLineBufBoundary` is treated as
-            // 1 for non-bottom CTBs (the line-buffer carve-out fires
-            // inside the CTB) and 0 for the picture-bottom row.
-            let y_line = (y as i32) * (sub_h as i32);
-            let apply_lbb = !(yl + (ctb_size_y as i32) >= ph
-                && (ph - (y_ctb_c as i32) * (sub_h as i32)) <= (ctb_size_y as i32) - 4);
-            let (y_p1, y_p2) = cc_alf_table_47(y_line, ctb_size_y as i32, apply_lbb);
-
-            // Eq. 1513.
-            let curr_chroma = chroma.samples[(y_ctb_c + y) * chroma.stride + (x_ctb_c + x)] as i32;
-            // Centre luma sample for delta calculation.
-            let centre = sample(luma_pre, luma_stride, fetch_clip, xl, yl) as i32;
-            // Eq. 1515 — seven luma-deltas weighted by f[0..6].
-            let mut sum: i32 = 0;
-            sum += coeff[0]
-                * (sample(luma_pre, luma_stride, fetch_clip, xl, yl - y_p1) as i32 - centre);
-            sum +=
-                coeff[1] * (sample(luma_pre, luma_stride, fetch_clip, xl - 1, yl) as i32 - centre);
-            sum +=
-                coeff[2] * (sample(luma_pre, luma_stride, fetch_clip, xl + 1, yl) as i32 - centre);
-            sum += coeff[3]
-                * (sample(luma_pre, luma_stride, fetch_clip, xl - 1, yl + y_p1) as i32 - centre);
-            sum += coeff[4]
-                * (sample(luma_pre, luma_stride, fetch_clip, xl, yl + y_p1) as i32 - centre);
-            sum += coeff[5]
-                * (sample(luma_pre, luma_stride, fetch_clip, xl + 1, yl + y_p1) as i32 - centre);
-            sum += coeff[6]
-                * (sample(luma_pre, luma_stride, fetch_clip, xl, yl + y_p2) as i32 - centre);
-            // Eq. 1516.
-            let scaled_sum = ((sum + 64) >> 7).clamp(-half, half - 1);
-            // Eq. 1517 — suppression rule for `SubHeightC == 1` rows.
-            let suppress = sub_h == 1
-                && (y_line == (ctb_size_y as i32) - 3 || y_line == (ctb_size_y as i32) - 4);
-            let new = if suppress {
-                curr_chroma
-            } else {
-                curr_chroma + scaled_sum
-            };
-            // Eq. 1518.
-            let new = new.clamp(0, max_val) as u16;
-            chroma.samples[(y_ctb_c + y) * chroma.stride + (x_ctb_c + x)] = new;
+        let yl = ((y_ctb_c + y) as i32) * sh;
+        // Table 47 yP1 / yP2: in the single-slice / no-virtual-
+        // boundary scaffold `applyAlfLineBufBoundary` is treated as
+        // 1 for non-bottom CTBs (the line-buffer carve-out fires
+        // inside the CTB) and 0 for the picture-bottom row.
+        let y_line = (y as i32) * sh;
+        let apply_lbb = !(yl + (ctb_size_y as i32) >= ph
+            && (ph - (y_ctb_c as i32) * sh) <= (ctb_size_y as i32) - 4);
+        let (y_p1, y_p2) = cc_alf_table_47(y_line, ctb_size_y as i32, apply_lbb);
+        // Eq. 1517 — suppression rule for `SubHeightC == 1` rows.
+        let suppress =
+            sub_h == 1 && (y_line == (ctb_size_y as i32) - 3 || y_line == (ctb_size_y as i32) - 4);
+        let chroma_row = (y_ctb_c + y) * chroma.stride + x_ctb_c;
+        // r487 — runs of four chroma samples: a run whose two ends
+        // share one §8.8.5.6 padding rule and whose luma support lies
+        // inside it reads the luma taps directly.
+        for x0 in (0..i_max).step_by(4) {
+            let bw = 4.min(i_max - x0);
+            let xl0 = ((x_ctb_c + x0) as i32) * sw;
+            let xl_last = xl0 + (bw as i32 - 1) * sw;
+            let first = regions.clip_at(xl0, yl);
+            let shared = first == regions.clip_at(xl_last, yl);
+            let interior = shared
+                && first.tl.is_none()
+                && first.br.is_none()
+                && xl0 > first.x0
+                && xl_last + 1 < first.x1
+                && yl - y_p1 >= first.y0
+                && yl + y_p1.max(y_p2) < first.y1;
+            for x in x0..x0 + bw {
+                // Map chroma → luma per eq. 1510.
+                let xl = ((x_ctb_c + x) as i32) * sw;
+                // Eq. 1513.
+                let curr_chroma = chroma.samples[chroma_row + x] as i32;
+                // Eq. 1515 — seven luma-deltas weighted by f[0..6].
+                let sum = if interior {
+                    let p = yl as usize * luma_stride + xl as usize;
+                    let (o1, o2) = (y_p1 as usize * luma_stride, y_p2 as usize * luma_stride);
+                    let centre = i32::from(luma_pre[p]);
+                    let d = |q: usize| i32::from(luma_pre[q]) - centre;
+                    coeff[0] * d(p - o1)
+                        + coeff[1] * d(p - 1)
+                        + coeff[2] * d(p + 1)
+                        + coeff[3] * d(p + o1 - 1)
+                        + coeff[4] * d(p + o1)
+                        + coeff[5] * d(p + o1 + 1)
+                        + coeff[6] * d(p + o2)
+                } else {
+                    let fetch_clip = if shared {
+                        first
+                    } else {
+                        regions.clip_at(xl, yl)
+                    };
+                    // Centre luma sample for delta calculation.
+                    let centre = sample(luma_pre, luma_stride, fetch_clip, xl, yl) as i32;
+                    let d = |dx: i32, dy: i32| {
+                        sample(luma_pre, luma_stride, fetch_clip, xl + dx, yl + dy) as i32 - centre
+                    };
+                    coeff[0] * d(0, -y_p1)
+                        + coeff[1] * d(-1, 0)
+                        + coeff[2] * d(1, 0)
+                        + coeff[3] * d(-1, y_p1)
+                        + coeff[4] * d(0, y_p1)
+                        + coeff[5] * d(1, y_p1)
+                        + coeff[6] * d(0, y_p2)
+                };
+                // Eq. 1516.
+                let scaled_sum = ((sum + 64) >> 7).clamp(-half, half - 1);
+                let new = if suppress {
+                    curr_chroma
+                } else {
+                    curr_chroma + scaled_sum
+                };
+                // Eq. 1518.
+                chroma.samples[chroma_row + x] = new.clamp(0, max_val) as u16;
+            }
         }
     }
 }
@@ -663,11 +692,19 @@ pub fn resolve_clip_value(bit_depth: u32, clip_idx: u8) -> i32 {
 /// `plane`). `filters` provides all 25 filter rows for this CTB; the
 /// per-4×4-sub-block classification `cls` (from §8.8.5.3) picks one
 /// row plus a transpose variant for every 16-pixel block.
+/// r487 — the work is organised per 4x4 sub-block, the unit that
+/// shares one filter (§8.8.5.3): the coefficient / clip permutation is
+/// resolved once per sub-block instead of once per sample, and so is
+/// the §8.8.5.6 padding rule when the sub-block's first and last
+/// sample agree on it. A sub-block whose whole 7x7 filter support lies
+/// inside that rule's rectangle (no corner substitution) reads its
+/// taps straight from the pre-ALF plane; every other sub-block goes
+/// through the clamped fetch, sample by sample, exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_luma_ctb(
     plane: &mut PicturePlane,
     pre: &[u16],
-    fetch_clip: impl Into<ClipRegions>,
+    regions: &ClipRegions,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -681,61 +718,151 @@ fn apply_alf_luma_ctb(
     let i_max = (ctb_size_y as usize).min(plane.width.saturating_sub(x_ctb));
     let j_max = (ctb_size_y as usize).min(plane.height.saturating_sub(y_ctb));
     let max_val = (1i32 << bit_depth) - 1;
-    let regions: ClipRegions = fetch_clip.into();
 
-    for j in 0..j_max {
-        for i in 0..i_max {
-            let xs = (x_ctb + i) as i32;
-            let ys = (y_ctb + j) as i32;
-            let fetch_clip = regions.clip_at(xs, ys);
+    for j0 in (0..j_max).step_by(4) {
+        let bh = 4.min(j_max - j0);
+        for i0 in (0..i_max).step_by(4) {
+            let bw = 4.min(i_max - i0);
             // §8.8.5.3 — every 4×4 sub-block shares one (filtIdx,
-            // transposeIdx). Look up the entry for this pixel.
-            let sx = i >> 2;
-            let sy = j >> 2;
-            let (filt_idx, transpose_idx) = cls.get(sx, sy);
+            // transposeIdx).
+            let (filt_idx, transpose_idx) = cls.get(i0 >> 2, j0 >> 2);
             let (f, clip_idx) = &filters[filt_idx];
-            // Eqs. 1442 – 1445: pick the coefficient/clip-index
+            // Eqs. 1442 – 1445: the coefficient / clip-index
             // permutation that realises the geometric transform.
             let idx = transpose_idx_table(transpose_idx);
-            let mut c = [0i32; ALF_LUMA_NUM_COEFF];
+            let mut coeff = [0i32; ALF_LUMA_NUM_COEFF];
+            let mut bound = [0i32; ALF_LUMA_NUM_COEFF];
             for k in 0..ALF_LUMA_NUM_COEFF {
-                c[k] = resolve_clip_value(bit_depth, clip_idx[k]);
+                coeff[k] = f[idx[k]];
+                bound[k] = resolve_clip_value(bit_depth, clip_idx[idx[k]]);
             }
-            // Table 45: pick alfShiftY / y1 / y2 / y3 from the vertical
-            // sample position. The boundary suppression case
-            // (`applyAlfLineBufBoundary == 1`) only fires on inter-CTB
-            // line-buffer rows; in the single-slice scaffold we treat
-            // the bottom of the picture per the spec — which collapses
-            // to "applyAlfLineBufBoundary == 0" for the very last CTB
-            // row when it doesn't span CtbSizeY-4 rows past yCtb.
-            let (alf_shift_y, y1, y2, y3) = table_45(j as i32, ctb_size_y as i32, true);
-            // Eq. 1448.
-            let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
-            // Eq. 1449.
-            let mut sum: i32 = 0;
-            // Helper: clipped neighbour minus curr.
-            let clip = |k: usize, dx: i32, dy: i32| -> i32 {
-                let v = sample(pre, stride, fetch_clip, xs + dx, ys + dy) as i32 - curr;
-                v.clamp(-c[idx[k]], c[idx[k]])
-            };
-            sum += f[idx[0]] * (clip(0, 0, y3) + clip(0, 0, -y3));
-            sum += f[idx[1]] * (clip(1, 1, y2) + clip(1, -1, -y2));
-            sum += f[idx[2]] * (clip(2, 0, y2) + clip(2, 0, -y2));
-            sum += f[idx[3]] * (clip(3, -1, y2) + clip(3, 1, -y2));
-            sum += f[idx[4]] * (clip(4, 2, y1) + clip(4, -2, -y1));
-            sum += f[idx[5]] * (clip(5, 1, y1) + clip(5, -1, -y1));
-            sum += f[idx[6]] * (clip(6, 0, y1) + clip(6, 0, -y1));
-            sum += f[idx[7]] * (clip(7, -1, y1) + clip(7, 1, -y1));
-            sum += f[idx[8]] * (clip(8, -2, y1) + clip(8, 2, -y1));
-            sum += f[idx[9]] * (clip(9, 3, 0) + clip(9, -3, 0));
-            sum += f[idx[10]] * (clip(10, 2, 0) + clip(10, -2, 0));
-            sum += f[idx[11]] * (clip(11, 1, 0) + clip(11, -1, 0));
-            // Eq. 1450.
-            let bias = 1i32 << (alf_shift_y - 1);
-            let new = curr + ((sum + bias) >> alf_shift_y);
-            // Eq. 1451.
-            let new = new.clamp(0, max_val) as u16;
-            plane.samples[(ys as usize) * stride + (xs as usize)] = new;
+            let xb = (x_ctb + i0) as i32;
+            let yb = (y_ctb + j0) as i32;
+            let first = regions.clip_at(xb, yb);
+            let shared = first == regions.clip_at(xb + bw as i32 - 1, yb + bh as i32 - 1);
+            let interior = shared
+                && first.tl.is_none()
+                && first.br.is_none()
+                && xb - 3 >= first.x0
+                && xb + bw as i32 + 2 < first.x1
+                && yb - 3 >= first.y0
+                && yb + bh as i32 + 2 < first.y1;
+            for j in j0..j0 + bh {
+                // Table 45: alfShiftY / y1 / y2 / y3 from the vertical
+                // sample position (`applyAlfLineBufBoundary == 1`).
+                let (alf_shift_y, y1, y2, y3) = table_45(j as i32, ctb_size_y as i32, true);
+                let bias = 1i32 << (alf_shift_y - 1);
+                let ys = (y_ctb + j) as i32;
+                if interior && bw == 4 {
+                    // The four samples of the row share every tap
+                    // offset: accumulate tap by tap over fixed-size
+                    // runs (straight-line code a vectoriser can widen).
+                    let p = ys as usize * stride + x_ctb + i0;
+                    let (o1, o2, o3) = (
+                        y1 as usize * stride,
+                        y2 as usize * stride,
+                        y3 as usize * stride,
+                    );
+                    // Eq. 1448.
+                    let curr = run4(pre, p);
+                    let mut sum = [0i32; 4];
+                    // Eq. 1449 — the twelve tap pairs: (index of the
+                    // first sample's tap, index of its mirror).
+                    let pairs: [(usize, usize); ALF_LUMA_NUM_COEFF] = [
+                        (p + o3, p - o3),
+                        (p + o2 + 1, p - o2 - 1),
+                        (p + o2, p - o2),
+                        (p + o2 - 1, p - o2 + 1),
+                        (p + o1 + 2, p - o1 - 2),
+                        (p + o1 + 1, p - o1 - 1),
+                        (p + o1, p - o1),
+                        (p + o1 - 1, p - o1 + 1),
+                        (p + o1 - 2, p - o1 + 2),
+                        (p + 3, p - 3),
+                        (p + 2, p - 2),
+                        (p + 1, p - 1),
+                    ];
+                    for (k, &(a, b)) in pairs.iter().enumerate() {
+                        tap4(pre, &curr, &mut sum, coeff[k], bound[k], a, b);
+                    }
+                    // Eqs. 1450 / 1451.
+                    for i in 0..4 {
+                        let new = curr[i] + ((sum[i] + bias) >> alf_shift_y);
+                        plane.samples[p + i] = new.clamp(0, max_val) as u16;
+                    }
+                    continue;
+                }
+                if interior {
+                    let row = ys as usize * stride;
+                    let (o1, o2, o3) = (
+                        y1 as usize * stride,
+                        y2 as usize * stride,
+                        y3 as usize * stride,
+                    );
+                    for i in i0..i0 + bw {
+                        let p = row + x_ctb + i;
+                        // Eq. 1448.
+                        let curr = i32::from(pre[p]);
+                        let tap = |k: usize, a: usize, b: usize| -> i32 {
+                            let (lo, hi) = (-bound[k], bound[k]);
+                            coeff[k]
+                                * ((i32::from(pre[a]) - curr).clamp(lo, hi)
+                                    + (i32::from(pre[b]) - curr).clamp(lo, hi))
+                        };
+                        // Eq. 1449.
+                        let sum = tap(0, p + o3, p - o3)
+                            + tap(1, p + o2 + 1, p - o2 - 1)
+                            + tap(2, p + o2, p - o2)
+                            + tap(3, p + o2 - 1, p - o2 + 1)
+                            + tap(4, p + o1 + 2, p - o1 - 2)
+                            + tap(5, p + o1 + 1, p - o1 - 1)
+                            + tap(6, p + o1, p - o1)
+                            + tap(7, p + o1 - 1, p - o1 + 1)
+                            + tap(8, p + o1 - 2, p - o1 + 2)
+                            + tap(9, p + 3, p - 3)
+                            + tap(10, p + 2, p - 2)
+                            + tap(11, p + 1, p - 1);
+                        // Eqs. 1450 / 1451.
+                        let new = curr + ((sum + bias) >> alf_shift_y);
+                        plane.samples[p] = new.clamp(0, max_val) as u16;
+                    }
+                    continue;
+                }
+                for i in i0..i0 + bw {
+                    let xs = (x_ctb + i) as i32;
+                    let fetch_clip = if shared {
+                        first
+                    } else {
+                        regions.clip_at(xs, ys)
+                    };
+                    // Eq. 1448.
+                    let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
+                    // Clipped neighbour pair minus curr, weighted.
+                    let tap = |k: usize, dx: i32, dy: i32| -> i32 {
+                        let (lo, hi) = (-bound[k], bound[k]);
+                        let a = sample(pre, stride, fetch_clip, xs + dx, ys + dy) as i32 - curr;
+                        let b = sample(pre, stride, fetch_clip, xs - dx, ys - dy) as i32 - curr;
+                        coeff[k] * (a.clamp(lo, hi) + b.clamp(lo, hi))
+                    };
+                    // Eq. 1449.
+                    let sum = tap(0, 0, y3)
+                        + tap(1, 1, y2)
+                        + tap(2, 0, y2)
+                        + tap(3, -1, y2)
+                        + tap(4, 2, y1)
+                        + tap(5, 1, y1)
+                        + tap(6, 0, y1)
+                        + tap(7, -1, y1)
+                        + tap(8, -2, y1)
+                        + tap(9, 3, 0)
+                        + tap(10, 2, 0)
+                        + tap(11, 1, 0);
+                    // Eqs. 1450 / 1451.
+                    let new = curr + ((sum + bias) >> alf_shift_y);
+                    plane.samples[(ys as usize) * stride + (xs as usize)] =
+                        new.clamp(0, max_val) as u16;
+                }
+            }
         }
     }
 }
@@ -921,43 +1048,37 @@ pub(crate) fn derive_luma_classification(
                 v
             };
 
-            // Eqs. 1454 – 1457 + 1458 – 1462.
-            let mut sh = 0i32;
-            let mut sv = 0i32;
-            let mut sd0 = 0i32;
-            let mut sd1 = 0i32;
-            for j in min_y..=max_y {
-                for i in -2i32..=5i32 {
-                    // Checkerboard mask: only (i,j both even) or
-                    // (i,j both odd) contribute. Otherwise filtH/V/D0/D1
-                    // are 0 (eq. text immediately under 1457).
-                    if (i.rem_euclid(2)) != (j.rem_euclid(2)) {
-                        continue;
-                    }
-                    let cx = x_ctb + x4 + i;
-                    let cy = pad_y(y_ctb + y4 + j);
-                    let cy_up = pad_y(y_ctb + y4 + j - 1);
-                    let cy_dn = pad_y(y_ctb + y4 + j + 1);
-                    let centre = sample(pre, stride, fetch_clip, cx, cy) as i32;
-                    let centre2 = centre << 1;
-                    // filtH: horizontal Laplacian.
-                    let l = sample(pre, stride, fetch_clip, cx - 1, cy) as i32;
-                    let r = sample(pre, stride, fetch_clip, cx + 1, cy) as i32;
-                    sh += (centre2 - l - r).abs();
-                    // filtV: vertical Laplacian (vb-padded rows).
-                    let u = sample(pre, stride, fetch_clip, cx, cy_up) as i32;
-                    let d = sample(pre, stride, fetch_clip, cx, cy_dn) as i32;
-                    sv += (centre2 - u - d).abs();
-                    // filtD0: 135°-diagonal Laplacian (top-left ↔ bottom-right).
-                    let ul = sample(pre, stride, fetch_clip, cx - 1, cy_up) as i32;
-                    let dr = sample(pre, stride, fetch_clip, cx + 1, cy_dn) as i32;
-                    sd0 += (centre2 - ul - dr).abs();
-                    // filtD1: 45°-diagonal Laplacian (top-right ↔ bottom-left).
-                    let ur = sample(pre, stride, fetch_clip, cx + 1, cy_up) as i32;
-                    let dl = sample(pre, stride, fetch_clip, cx - 1, cy_dn) as i32;
-                    sd1 += (centre2 - ur - dl).abs();
-                }
-            }
+            // Eqs. 1454 – 1457 + 1458 – 1462. r487 — when the whole
+            // gradient window (columns −3 … 6, rows −3 … 6 around the
+            // sub-block origin) lies inside the padding rectangle and
+            // no corner substitution applies, the clamped fetch is the
+            // identity: read the samples directly.
+            let (ox, oy) = (x_ctb + x4, y_ctb + y4);
+            let interior = fetch_clip.tl.is_none()
+                && fetch_clip.br.is_none()
+                && ox - 3 >= fetch_clip.x0
+                && ox + 6 < fetch_clip.x1
+                && oy - 3 >= fetch_clip.y0
+                && oy + 6 < fetch_clip.y1;
+            let (sh, sv, sd0, sd1) = if interior {
+                laplacian_sums(
+                    |x, y| i32::from(pre[y as usize * stride + x as usize]),
+                    &pad_y,
+                    ox,
+                    oy,
+                    min_y,
+                    max_y,
+                )
+            } else {
+                laplacian_sums(
+                    |x, y| sample(pre, stride, fetch_clip, x, y) as i32,
+                    &pad_y,
+                    ox,
+                    oy,
+                    min_y,
+                    max_y,
+                )
+            };
             sum_h[s_get(sx, sy)] = sh;
             sum_v[s_get(sx, sy)] = sv;
             sum_d0[s_get(sx, sy)] = sd0;
@@ -1030,12 +1151,86 @@ pub(crate) fn derive_luma_classification(
     out
 }
 
+/// Four consecutive samples starting at `at`, widened.
+#[inline(always)]
+fn run4(pre: &[u16], at: usize) -> [i32; 4] {
+    let r: &[u16; 4] = pre[at..at + 4].try_into().unwrap();
+    [
+        i32::from(r[0]),
+        i32::from(r[1]),
+        i32::from(r[2]),
+        i32::from(r[3]),
+    ]
+}
+
+/// One term of eq. 1449 for four horizontally adjacent samples: the
+/// clipped differences of the tap pair at `a` / `b` (indices of the
+/// first sample's taps) against `curr`, weighted and accumulated.
+#[inline(always)]
+fn tap4(
+    pre: &[u16],
+    curr: &[i32; 4],
+    sum: &mut [i32; 4],
+    weight: i32,
+    bound: i32,
+    a: usize,
+    b: usize,
+) {
+    let (ra, rb) = (run4(pre, a), run4(pre, b));
+    for i in 0..4 {
+        sum[i] += weight
+            * ((ra[i] - curr[i]).clamp(-bound, bound) + (rb[i] - curr[i]).clamp(-bound, bound));
+    }
+}
+
+/// §8.8.5.3 eqs. 1454 – 1462 — the four Laplacian sums of one 4x4
+/// sub-block with origin `(ox, oy)`: rows `min_y..=max_y`, columns
+/// `−2..=5`, on the checkerboard (only positions with `i` and `j` of
+/// equal parity contribute). `fetch` reads one pre-ALF sample; `pad_y`
+/// is the ALF virtual-boundary row padding.
+#[inline(always)]
+fn laplacian_sums(
+    fetch: impl Fn(i32, i32) -> i32,
+    pad_y: &impl Fn(i32) -> i32,
+    ox: i32,
+    oy: i32,
+    min_y: i32,
+    max_y: i32,
+) -> (i32, i32, i32, i32) {
+    let (mut sh, mut sv, mut sd0, mut sd1) = (0i32, 0i32, 0i32, 0i32);
+    for j in min_y..=max_y {
+        let cy = pad_y(oy + j);
+        let cy_up = pad_y(oy + j - 1);
+        let cy_dn = pad_y(oy + j + 1);
+        // First column of this row's checkerboard phase.
+        let mut i = -2 + (j & 1);
+        while i <= 5 {
+            let cx = ox + i;
+            let centre2 = fetch(cx, cy) << 1;
+            // filtH: horizontal Laplacian.
+            sh += (centre2 - fetch(cx - 1, cy) - fetch(cx + 1, cy)).abs();
+            // filtV: vertical Laplacian (vb-padded rows).
+            sv += (centre2 - fetch(cx, cy_up) - fetch(cx, cy_dn)).abs();
+            // filtD0: 135°-diagonal Laplacian (top-left ↔ bottom-right).
+            sd0 += (centre2 - fetch(cx - 1, cy_up) - fetch(cx + 1, cy_dn)).abs();
+            // filtD1: 45°-diagonal Laplacian (top-right ↔ bottom-left).
+            sd1 += (centre2 - fetch(cx + 1, cy_up) - fetch(cx - 1, cy_dn)).abs();
+            i += 2;
+        }
+    }
+    (sh, sv, sd0, sd1)
+}
+
 /// Apply the §8.8.5.4 chroma filter to a single CTB.
+/// r487 — rows are walked in runs of four samples: a run whose two ends share one
+/// §8.8.5.6 padding rule and whose 5x5 filter support lies inside it
+/// reads its taps directly; any other run takes the clamped fetch per
+/// sample, as before.
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_chroma_ctb(
     plane: &mut PicturePlane,
     pre: &[u16],
-    fetch_clip: impl Into<ClipRegions>,
+    regions: &ClipRegions,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -1057,32 +1252,71 @@ fn apply_alf_chroma_ctb(
     for k in 0..ALF_CHROMA_NUM_COEFF {
         c[k] = resolve_clip_value(bit_depth, clip_idx[k]);
     }
-    let regions: ClipRegions = fetch_clip.into();
     for j in 0..j_max {
-        for i in 0..i_max {
-            let xs = (x_ctb_c + i) as i32;
-            let ys = (y_ctb_c + j) as i32;
-            let fetch_clip = regions.clip_at(xs, ys);
-            let (alf_shift_c, y1, y2) = table_46(j as i32, ctb_h_c as i32, true);
-            let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
-            let clip = |k: usize, dx: i32, dy: i32| -> i32 {
-                let v = sample(pre, stride, fetch_clip, xs + dx, ys + dy) as i32 - curr;
-                v.clamp(-c[k], c[k])
-            };
-            // Eq. 1490.
-            let mut sum: i32 = 0;
-            sum += f[0] * (clip(0, 0, y2) + clip(0, 0, -y2));
-            sum += f[1] * (clip(1, 1, y1) + clip(1, -1, -y1));
-            sum += f[2] * (clip(2, 0, y1) + clip(2, 0, -y1));
-            sum += f[3] * (clip(3, -1, y1) + clip(3, 1, -y1));
-            sum += f[4] * (clip(4, 2, 0) + clip(4, -2, 0));
-            sum += f[5] * (clip(5, 1, 0) + clip(5, -1, 0));
-            // Eq. 1491.
-            let bias = 1i32 << (alf_shift_c - 1);
-            let new = curr + ((sum + bias) >> alf_shift_c);
-            // Eq. 1492.
-            let new = new.clamp(0, max_val) as u16;
-            plane.samples[(ys as usize) * stride + (xs as usize)] = new;
+        let ys = (y_ctb_c + j) as i32;
+        let (alf_shift_c, y1, y2) = table_46(j as i32, ctb_h_c as i32, true);
+        let bias = 1i32 << (alf_shift_c - 1);
+        for i0 in (0..i_max).step_by(4) {
+            let bw = 4.min(i_max - i0);
+            let xb = (x_ctb_c + i0) as i32;
+            let first = regions.clip_at(xb, ys);
+            let shared = first == regions.clip_at(xb + bw as i32 - 1, ys);
+            let interior = shared
+                && first.tl.is_none()
+                && first.br.is_none()
+                && xb - 2 >= first.x0
+                && xb + bw as i32 + 1 < first.x1
+                && ys - 2 >= first.y0
+                && ys + 2 < first.y1;
+            if interior {
+                let row = ys as usize * stride;
+                let (o1, o2) = (y1 as usize * stride, y2 as usize * stride);
+                for i in i0..i0 + bw {
+                    let p = row + x_ctb_c + i;
+                    let curr = i32::from(pre[p]);
+                    let tap = |k: usize, a: usize, b: usize| -> i32 {
+                        f[k] * ((i32::from(pre[a]) - curr).clamp(-c[k], c[k])
+                            + (i32::from(pre[b]) - curr).clamp(-c[k], c[k]))
+                    };
+                    // Eq. 1490.
+                    let sum = tap(0, p + o2, p - o2)
+                        + tap(1, p + o1 + 1, p - o1 - 1)
+                        + tap(2, p + o1, p - o1)
+                        + tap(3, p + o1 - 1, p - o1 + 1)
+                        + tap(4, p + 2, p - 2)
+                        + tap(5, p + 1, p - 1);
+                    // Eqs. 1491 / 1492.
+                    let new = curr + ((sum + bias) >> alf_shift_c);
+                    plane.samples[p] = new.clamp(0, max_val) as u16;
+                }
+                continue;
+            }
+            for i in i0..i0 + bw {
+                let xs = (x_ctb_c + i) as i32;
+                let fetch_clip = if shared {
+                    first
+                } else {
+                    regions.clip_at(xs, ys)
+                };
+                let curr = sample(pre, stride, fetch_clip, xs, ys) as i32;
+                let clip = |k: usize, dx: i32, dy: i32| -> i32 {
+                    let v = sample(pre, stride, fetch_clip, xs + dx, ys + dy) as i32 - curr;
+                    v.clamp(-c[k], c[k])
+                };
+                // Eq. 1490.
+                let mut sum: i32 = 0;
+                sum += f[0] * (clip(0, 0, y2) + clip(0, 0, -y2));
+                sum += f[1] * (clip(1, 1, y1) + clip(1, -1, -y1));
+                sum += f[2] * (clip(2, 0, y1) + clip(2, 0, -y1));
+                sum += f[3] * (clip(3, -1, y1) + clip(3, 1, -y1));
+                sum += f[4] * (clip(4, 2, 0) + clip(4, -2, 0));
+                sum += f[5] * (clip(5, 1, 0) + clip(5, -1, 0));
+                // Eq. 1491.
+                let new = curr + ((sum + bias) >> alf_shift_c);
+                // Eq. 1492.
+                let new = new.clamp(0, max_val) as u16;
+                plane.samples[(ys as usize) * stride + (xs as usize)] = new;
+            }
         }
     }
 }
@@ -1380,6 +1614,26 @@ impl ClipRegions {
             tl,
             br,
         }
+    }
+
+    /// r487 — `true` when the component rectangle with opposite
+    /// corners `(x0, y0)` and `(x1, y1)` — the samples of one CTB —
+    /// lies in a single boundary strip and every sample of it reaches
+    /// every other one ([`Self::neighbour_in_region`] holds for any
+    /// pair inside): the strips are a grid of rectangles, so equal
+    /// strips at two opposite corners cover the rectangle, and the
+    /// slice / subpicture gates are CTB-granular.
+    #[inline]
+    pub(crate) fn ctb_is_one_region(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+        self.strip_at(x0, y0) == self.strip_at(x1, y1)
+            && self.neighbour_in_region(x0, y0, x1, y1)
+            && match &self.region {
+                Some(r) => {
+                    r.ctb_of(x0 * self.sub_w, y0 * self.sub_h)
+                        == r.ctb_of(x1 * self.sub_w, y1 * self.sub_h)
+                }
+                None => true,
+            }
     }
 
     /// §8.8.4.2 — is component neighbour `(nx, ny)` of sample `(x, y)`

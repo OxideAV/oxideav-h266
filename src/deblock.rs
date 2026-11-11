@@ -633,7 +633,7 @@ static DBG_CUNIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// `alf_c`, `ccalf` are consumed by the ctu-level driver). Coarse
 /// localization aid for corpus triage.
 pub(crate) fn dbg_skip_stage(stage: &str) -> bool {
-    if let Ok(v) = std::env::var("H266_DBG_SKIP") {
+    if let Ok(v) = crate::dbg_env::var("H266_DBG_SKIP") {
         let pic = DBG_PIC
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(1);
@@ -653,7 +653,7 @@ pub(crate) fn dbg_pic_ordinal() -> u32 {
 /// RECONSTRUCTED has not run its deblocking pass yet, so its ordinal
 /// is the raw counter (stages: `dmvr`, `bdof`).
 pub(crate) fn dbg_skip_stage_recon(stage: &str) -> bool {
-    if let Ok(v) = std::env::var("H266_DBG_SKIP") {
+    if let Ok(v) = crate::dbg_env::var("H266_DBG_SKIP") {
         let pic = DBG_PIC.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((p, st)) = v.split_once(',') {
             return p.trim().parse() == Ok(pic) && st.trim() == stage;
@@ -666,13 +666,13 @@ fn dbg_chroma_unit(c_idx: u32, vertical: bool, cx: i32, cy: i32, b_s: i32) -> bo
     use std::sync::atomic::Ordering;
     let n = DBG_CUNIT.fetch_add(1, Ordering::Relaxed);
     let pic = DBG_PIC.load(Ordering::Relaxed).saturating_sub(1);
-    if std::env::var_os("H266_DBG_DBLK_CUNIT").is_some() {
+    if crate::dbg_env::var_os("H266_DBG_DBLK_CUNIT").is_some() {
         eprintln!(
             "CUNIT pic={pic} c={c_idx} n={n} {} ({cx},{cy}) bS={b_s}",
             if vertical { "V" } else { "H" }
         );
     }
-    if let Ok(v) = std::env::var("H266_DBG_CHROMA_OFF") {
+    if let Ok(v) = crate::dbg_env::var("H266_DBG_CHROMA_OFF") {
         let f: Vec<u32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
         if f.len() == 3 && f[0] == pic && f[1] == c_idx && f[2] == n {
             return true;
@@ -685,13 +685,13 @@ fn dbg_chroma_strong(c_idx: u32, vertical: bool, cx: i32, cy: i32, beta: i32, tc
     use std::sync::atomic::Ordering;
     let n = DBG_CSTRONG.fetch_add(1, Ordering::Relaxed);
     let pic = DBG_PIC.load(Ordering::Relaxed).saturating_sub(1);
-    if std::env::var_os("H266_DBG_DBLK_CSTRONG").is_some() {
+    if crate::dbg_env::var_os("H266_DBG_DBLK_CSTRONG").is_some() {
         eprintln!(
             "CSTRONG pic={pic} c={c_idx} n={n} {} ({cx},{cy}) beta={beta} tc={tc}",
             if vertical { "V" } else { "H" }
         );
     }
-    if let Ok(v) = std::env::var("H266_DBG_CHROMA_FLIP") {
+    if let Ok(v) = crate::dbg_env::var("H266_DBG_CHROMA_FLIP") {
         let f: Vec<u32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
         if f.len() == 3 && f[0] == pic && f[1] == c_idx && f[2] == n {
             return true;
@@ -763,7 +763,7 @@ pub(crate) fn apply_deblocking_regions(
     DBG_PIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DBG_CSTRONG.store(0, std::sync::atomic::Ordering::Relaxed);
     DBG_CUNIT.store(0, std::sync::atomic::Ordering::Relaxed);
-    if std::env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
+    if crate::dbg_env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
         eprintln!(
             "DBLK apply: cus={} chroma_cus={:?} cfi={chroma_format_idc} disabled={}",
             cus.len(),
@@ -967,7 +967,7 @@ fn deblock_one_direction(
     // the START of each pass (files count up: pass order is V then H
     // per component), so the horizontal pass's decision inputs — the
     // vertically-filtered intermediate — can be inspected offline.
-    if let Ok(dir) = std::env::var("H266_DUMP_MIDLF") {
+    if let Ok(dir) = crate::dbg_env::var("H266_DUMP_MIDLF") {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1128,7 +1128,7 @@ fn deblock_cu_dir(
                 is_tb,
                 is_sb_edge,
             );
-            if c_idx != 0 && std::env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
+            if c_idx != 0 && crate::dbg_env::var_os("H266_DBG_DBLK_CHROMA2").is_some() {
                 eprintln!(
                     "DBLKC2 c={c_idx} {} q=({qx},{qy}) off={off} is_tb={is_tb} bS={b_s} p_intra={} q_intra={} p_cu=({},{})",
                     if vertical { "V" } else { "H" },
@@ -1275,7 +1275,7 @@ fn deblock_cu_dir(
                     compute_thresholds_chroma(plane, p_cu, q_cu, (px, py), (qx, qy), b_s);
                 let ex = qx / plane.sub_w as i32;
                 let ey = qy / plane.sub_h as i32;
-                if std::env::var_os("H266_DBG_DBLK_CHROMA").is_some() {
+                if crate::dbg_env::var_os("H266_DBG_DBLK_CHROMA").is_some() {
                     eprintln!(
                         "DBLKC c={} {} edge ({ex},{ey}) bS={b_s} mfl=({mfl_p},{mfl_q}) beta={beta} tc={tc} cu=({},{}) off={off} p_cu=({},{}) qpY=({},{}) qpC=({:?},{:?}) joint2=({},{})",
                         c_idx,

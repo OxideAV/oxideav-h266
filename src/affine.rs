@@ -706,8 +706,17 @@ fn h_tap(
     let pic_w = plane.width as i32;
     let mut acc = 0i32;
     let row_base = y_clamped * plane.stride;
+    let clip = crate::inter::RefClip::current();
+    if clip.x_run_is_identity(x_int - 3, x_int + 4, pic_w) {
+        // r487 — the eight taps are one contiguous run of the row.
+        let run = &plane.samples[row_base + (x_int - 3) as usize..][..8];
+        for (c, &s) in coeffs.iter().zip(run) {
+            acc += c * i32::from(s);
+        }
+        return acc;
+    }
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = crate::inter::clip_ref_x(x_int + (i as i32) - 3, pic_w, 1);
+        let xi = clip.x(x_int + (i as i32) - 3, pic_w, 1);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     acc // shift1 = 0 for BitDepth = 8
@@ -1283,7 +1292,7 @@ pub fn predict_luma_block_affine_prof(
             let block = predict_luma_subblock_affine_high_precision(
                 sb_x, sb_y, sb_w, sb_h, src, mv, filter_set,
             )?;
-            if let Ok(spec) = std::env::var("H266_DBG_AFFUNI") {
+            if let Ok(spec) = crate::dbg_env::var("H266_DBG_AFFUNI") {
                 if let Some((xs, ys)) = spec.split_once(',') {
                     if let (Ok(px), Ok(py)) = (xs.parse::<u32>(), ys.parse::<u32>()) {
                         if px >= sb_x && px < sb_x + sb_w && py >= sb_y && py < sb_y + sb_h {

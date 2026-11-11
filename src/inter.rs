@@ -455,13 +455,15 @@ impl AffineCpmvField {
 #[derive(Clone, Debug)]
 pub struct ReferencePicture {
     pub poc: i32,
-    pub frame: PictureBuffer,
+    /// r487 — shared: a reference list entry (and every clone of it)
+    /// points at the decoded picture instead of copying its planes.
+    pub frame: std::sync::Arc<PictureBuffer>,
     /// Per-4x4-block motion field of the reference picture (round-25
     /// §8.5.2.11). `None` when this reference was decoded as intra-only
     /// or the caller has not wired MF capture yet — temporal merge
     /// derivation against this reference will short-circuit to
     /// "availableFlagLXCol = 0" in that case.
-    pub motion_field: Option<MotionField>,
+    pub motion_field: Option<std::sync::Arc<MotionField>>,
 }
 
 /// Spatial-merge neighbour position labels used by §8.5.2.3.
@@ -1815,7 +1817,7 @@ pub fn derive_temporal_merge_candidate(inputs: &TemporalMergeInputs<'_>) -> Opti
     if same_ctb_row && y_col_br <= bot_boundary && x_col_br <= right_boundary {
         let x_col_cb = (x_col_br >> 3) << 3;
         let y_col_cb = (y_col_br >> 3) << 3;
-        if std::env::var_os("H266_DBG_TMVP").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_TMVP").is_some() {
             let raw = mf.get_at_luma(x_col_cb, y_col_cb);
             eprintln!(
                 "TMVP-MERGE ({},{}) {}x{} X={} BR=({x_col_cb},{y_col_cb}) cell={raw:?} pocs={:?} cur={} curRef={} colPoc={}",
@@ -2178,16 +2180,16 @@ thread_local! {
     /// picture being reconstructed on this thread; 0 = wraparound off.
     /// The walker sets it per picture from the active PPS
     /// (§7.4.3.5); the chroma fetchers divide by `SubWidthC`.
-    static REF_WRAPAROUND_LUMA: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
-    /// r456 — §7.4.8 eq. 114 `(SubpicLeftBoundaryPos,
-    /// SubpicTopBoundaryPos, SubpicRightBoundaryPos,
-    /// SubpicBotBoundaryPos)` (luma samples, inclusive) for the slice
-    /// being reconstructed on this thread when
-    /// `sps_subpic_treated_as_pic_flag[ CurrSubpicIdx ] == 1` and the
-    /// SPS carries more than one subpicture (the §8.5.6.3.2 eqs. 631 /
-    /// 632 arm); `None` = the picture-wide eqs. 633 / 634 arm.
-    static REF_SUBPIC_CLIP: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
-        const { std::cell::Cell::new(None) };
+    ///
+    /// r487 — this and the subpicture clamp below live in one cell
+    /// ([`RefClip`]) so a reference fetch loads both with a single
+    /// thread-local access.
+    static REF_CLIP: std::cell::Cell<RefClip> = const {
+        std::cell::Cell::new(RefClip {
+            wrap: 0,
+            subpic: None,
+        })
+    };
     /// r456 — `(SubWidthC, SubHeightC)` of the picture being
     /// reconstructed on this thread (§6.2 Table 2); the chroma
     /// fetchers scale the luma MV to chroma units with it (§8.5.6.3.1
@@ -2228,7 +2230,12 @@ fn chroma_mv(mv: MotionVector) -> MotionVector {
 /// `SubHeightC` (§8.5.6.3.4 eqs. 949 / 950).
 #[doc(hidden)]
 pub fn set_ref_subpic_clip(bounds: Option<(i32, i32, i32, i32)>) {
-    REF_SUBPIC_CLIP.with(|c| c.set(bounds));
+    REF_CLIP.with(|c| {
+        c.set(RefClip {
+            subpic: bounds,
+            ..c.get()
+        })
+    });
 }
 
 /// `Clip3( SubpicTopBoundaryPos / SubHeightC, SubpicBotBoundaryPos /
@@ -2237,17 +2244,19 @@ pub fn set_ref_subpic_clip(bounds: Option<(i32, i32, i32, i32)>) {
 /// `sub_h` is 1 for luma and `SubHeightC` for a chroma plane.
 #[inline]
 pub(crate) fn clip_ref_y(y: i32, pic_h: i32, sub_h: i32) -> usize {
-    match REF_SUBPIC_CLIP.with(|c| c.get()) {
-        Some((_, top, _, bot)) => y.clamp(top / sub_h, (bot / sub_h).min(pic_h - 1)) as usize,
-        None => y.clamp(0, pic_h - 1) as usize,
-    }
+    RefClip::current().y(y, pic_h, sub_h)
 }
 
 /// Set the §8.5.6.3.2 horizontal wraparound offset (in luma samples;
 /// `0` disables) for every reference fetch on the calling thread.
 #[doc(hidden)]
 pub fn set_ref_wraparound(offset_luma: i32) {
-    REF_WRAPAROUND_LUMA.with(|c| c.set(offset_luma.max(0)));
+    REF_CLIP.with(|c| {
+        c.set(RefClip {
+            wrap: offset_luma.max(0),
+            ..c.get()
+        })
+    });
 }
 
 /// Run `f` with wraparound suspended — for predictors that read from a
@@ -2256,13 +2265,16 @@ pub fn set_ref_wraparound(offset_luma: i32) {
 /// through `ClipH`, and eq. 5 must not fire again on patch-local
 /// coordinates.
 pub(crate) fn without_ref_wraparound<T>(f: impl FnOnce() -> T) -> T {
-    let saved = REF_WRAPAROUND_LUMA.with(|c| c.replace(0));
     // The subpicture clamp is a reference-picture-coordinate rule
     // too (eqs. 631 / 632); patch-local reads suspend it alongside.
-    let saved_sub = REF_SUBPIC_CLIP.with(|c| c.replace(None));
+    let saved = REF_CLIP.with(|c| {
+        c.replace(RefClip {
+            wrap: 0,
+            subpic: None,
+        })
+    });
     let out = f();
-    REF_WRAPAROUND_LUMA.with(|c| c.set(saved));
-    REF_SUBPIC_CLIP.with(|c| c.set(saved_sub));
+    REF_CLIP.with(|c| c.set(saved));
     out
 }
 
@@ -2275,21 +2287,72 @@ pub(crate) fn without_ref_wraparound<T>(f: impl FnOnce() -> T) -> T {
 /// PpsRefWraparoundOffset * MinCbSizeY / SubWidthC`).
 #[inline]
 pub(crate) fn clip_ref_x(x: i32, pic_w: i32, sub_w: i32) -> usize {
-    let wrap = REF_WRAPAROUND_LUMA.with(|c| c.get()) / sub_w;
-    let x = if wrap > 0 {
-        if x < 0 {
-            x + wrap
-        } else if x > pic_w - 1 {
-            x - wrap
+    RefClip::current().x(x, pic_w, sub_w)
+}
+
+/// r487 — the reference-fetch clip state of the calling thread, loaded
+/// once ([`RefClip::current`]) and applied to as many positions as a
+/// filter needs: the §8.5.6.3.2 wraparound offset and the subpicture
+/// clamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RefClip {
+    /// `PpsRefWraparoundOffset * MinCbSizeY` in luma samples; 0 = off.
+    wrap: i32,
+    /// §7.4.8 eq. 114 `(SubpicLeftBoundaryPos, SubpicTopBoundaryPos,
+    /// SubpicRightBoundaryPos, SubpicBotBoundaryPos)` (luma samples,
+    /// inclusive) for the slice being reconstructed when
+    /// `sps_subpic_treated_as_pic_flag[ CurrSubpicIdx ] == 1` and the
+    /// SPS carries more than one subpicture (the §8.5.6.3.2 eqs. 631 /
+    /// 632 arm); `None` = the picture-wide eqs. 633 / 634 arm.
+    subpic: Option<(i32, i32, i32, i32)>,
+}
+
+impl RefClip {
+    /// The state of the calling thread.
+    #[inline]
+    pub(crate) fn current() -> Self {
+        REF_CLIP.with(|c| c.get())
+    }
+
+    /// [`clip_ref_x`] against this state.
+    #[inline]
+    pub(crate) fn x(&self, x: i32, pic_w: i32, sub_w: i32) -> usize {
+        let wrap = self.wrap / sub_w;
+        let x = if wrap > 0 {
+            if x < 0 {
+                x + wrap
+            } else if x > pic_w - 1 {
+                x - wrap
+            } else {
+                x
+            }
         } else {
             x
+        };
+        match self.subpic {
+            Some((left, _, right, _)) => {
+                x.clamp(left / sub_w, (right / sub_w).min(pic_w - 1)) as usize
+            }
+            None => x.clamp(0, pic_w - 1) as usize,
         }
-    } else {
-        x
-    };
-    match REF_SUBPIC_CLIP.with(|c| c.get()) {
-        Some((left, _, right, _)) => x.clamp(left / sub_w, (right / sub_w).min(pic_w - 1)) as usize,
-        None => x.clamp(0, pic_w - 1) as usize,
+    }
+
+    /// [`clip_ref_y`] against this state.
+    #[inline]
+    pub(crate) fn y(&self, y: i32, pic_h: i32, sub_h: i32) -> usize {
+        match self.subpic {
+            Some((_, top, _, bot)) => y.clamp(top / sub_h, (bot / sub_h).min(pic_h - 1)) as usize,
+            None => y.clamp(0, pic_h - 1) as usize,
+        }
+    }
+
+    /// `true` when every position of `lo..=hi` maps to itself: the
+    /// run lies inside the picture (so neither the wraparound nor the
+    /// picture clamp moves it) and no subpicture clamp is armed. A
+    /// filter may then read the run as one contiguous slice.
+    #[inline]
+    pub(crate) fn x_run_is_identity(&self, lo: i32, hi: i32, pic_w: i32) -> bool {
+        self.subpic.is_none() && lo >= 0 && hi < pic_w
     }
 }
 
@@ -2304,8 +2367,17 @@ fn luma_h_8tap(
     let pic_w = plane.width as i32;
     let mut acc = 0i32;
     let row_base = y_clamped * plane.stride;
+    let clip = RefClip::current();
+    if clip.x_run_is_identity(x_int - 3, x_int + 4, pic_w) {
+        // r487 — the eight taps are one contiguous run of the row.
+        let run = &plane.samples[row_base + (x_int - 3) as usize..][..8];
+        for (c, &s) in coeffs.iter().zip(run) {
+            acc += c * i32::from(s);
+        }
+        return acc;
+    }
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = clip_ref_x(x_int + (i as i32) - 3, pic_w, 1);
+        let xi = clip.x(x_int + (i as i32) - 3, pic_w, 1);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     // shift1 = Min(4, BitDepth - 8) = 0 for BitDepth = 8.
@@ -2651,8 +2723,18 @@ fn chroma_h_4tap(plane: &PicturePlane, x_int: i32, y_clamped: usize, x_frac: usi
     let pic_w = plane.width as i32;
     let row_base = y_clamped * plane.stride;
     let mut acc = 0i32;
+    let clip = RefClip::current();
+    if clip.x_run_is_identity(x_int - 1, x_int + 2, pic_w) {
+        // r487 — the four taps are one contiguous run of the row.
+        let run = &plane.samples[row_base + (x_int - 1) as usize..][..4];
+        for (c, &s) in coeffs.iter().zip(run) {
+            acc += c * i32::from(s);
+        }
+        return acc;
+    }
+    let sub_w = chroma_sub().0;
     for (i, c) in coeffs.iter().enumerate() {
-        let xi = clip_ref_x(x_int + (i as i32) - 1, pic_w, chroma_sub().0);
+        let xi = clip.x(x_int + (i as i32) - 1, pic_w, sub_w);
         acc += c * (plane.samples[row_base + xi] as i32);
     }
     acc // shift1 = 0 at BitDepth 8
@@ -4923,8 +5005,12 @@ mod tests {
         mf.write_block(0, 0, pic_w, pic_h, cell);
         ReferencePicture {
             poc,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0),
-            motion_field: Some(mf),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                0,
+            )),
+            motion_field: Some(std::sync::Arc::new(mf)),
         }
     }
 
@@ -4935,7 +5021,7 @@ mod tests {
     fn temporal_merge_returns_none_without_motion_field() {
         let col_pic = ReferencePicture {
             poc: 0,
-            frame: PictureBuffer::yuv420_filled(16, 16, 0),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(16, 16, 0)),
             motion_field: None,
         };
         let inputs = TemporalMergeInputs {
@@ -5134,8 +5220,8 @@ mod tests {
         mf.write_block(0, 0, 16, 16, intra_cell);
         let col_pic = ReferencePicture {
             poc: 1,
-            frame: PictureBuffer::yuv420_filled(16, 16, 0),
-            motion_field: Some(mf),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(16, 16, 0)),
+            motion_field: Some(std::sync::Arc::new(mf)),
         };
         let inputs = TemporalMergeInputs {
             xcb: 0,

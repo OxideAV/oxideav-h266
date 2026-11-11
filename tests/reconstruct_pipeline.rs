@@ -693,7 +693,7 @@ fn decode_p_slice_all_skip_matches_reference() {
     }
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
+        frame: std::sync::Arc::new(ref_buf.clone()),
         motion_field: None,
     };
 
@@ -806,7 +806,11 @@ fn decode_p_slice_writes_motion_field() {
     let pic_h = 8u32;
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            64,
+        )),
         motion_field: None,
     };
     // Synthesize the same all-skip stream as above.
@@ -905,12 +909,12 @@ fn decode_b_slice_all_skip_bipred_matches_average() {
     }
     let ref_l0 = ReferencePicture {
         poc: 0,
-        frame: ref_l0_buf.clone(),
+        frame: std::sync::Arc::new(ref_l0_buf.clone()),
         motion_field: None,
     };
     let ref_l1 = ReferencePicture {
         poc: 2,
-        frame: ref_l1_buf.clone(),
+        frame: std::sync::Arc::new(ref_l1_buf.clone()),
         motion_field: None,
     };
 
@@ -1010,12 +1014,20 @@ fn decode_b_slice_writes_bipred_motion_field() {
     let pic_h = 8u32;
     let ref_l0 = ReferencePicture {
         poc: 0,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            64,
+        )),
         motion_field: None,
     };
     let ref_l1 = ReferencePicture {
         poc: 2,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 192),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            192,
+        )),
         motion_field: None,
     };
 
@@ -1107,7 +1119,11 @@ fn decode_p_slice_populates_hmvp_table() {
     let pic_h = 8u32;
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            64,
+        )),
         motion_field: None,
     };
     let slice_qp = 26;
@@ -1257,7 +1273,11 @@ fn decode_p_slice_quad_split_exercises_hmvp_merge_pull_in() {
     let pic_h = 16u32;
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            64,
+        )),
         motion_field: None,
     };
     let ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64);
@@ -1493,8 +1513,8 @@ fn decode_p_slice_temporal_merge_fires_and_decodes() {
 
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
-        motion_field: Some(mf),
+        frame: std::sync::Arc::new(ref_buf.clone()),
+        motion_field: Some(std::sync::Arc::new(mf)),
     };
 
     // ---- P-slice CABAC payload synthesis ------------------------------
@@ -1733,8 +1753,8 @@ fn decode_p_slice_pairwise_average_fires_and_decodes() {
 
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
-        motion_field: Some(mf),
+        frame: std::sync::Arc::new(ref_buf.clone()),
+        motion_field: Some(std::sync::Arc::new(mf)),
     };
 
     // ---- P-slice CABAC payload synthesis -----------------------------
@@ -1971,7 +1991,7 @@ fn decode_p_slice_mmvd_fires_and_decodes() {
     }
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
+        frame: std::sync::Arc::new(ref_buf.clone()),
         motion_field: None,
     };
 
@@ -2167,7 +2187,7 @@ fn decode_p_slice_ciip_fires_and_decodes() {
     }
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
+        frame: std::sync::Arc::new(ref_buf.clone()),
         motion_field: None,
     };
 
@@ -2372,12 +2392,12 @@ fn decode_b_slice_bdof_refinement_differs_from_bipred_average() {
     // them, so a flat field exposes any accidental write.
     let make_l0 = || ReferencePicture {
         poc: 0,
-        frame: ref_l0_buf.clone(),
+        frame: std::sync::Arc::new(ref_l0_buf.clone()),
         motion_field: None,
     };
     let make_l1 = || ReferencePicture {
         poc: 2,
-        frame: ref_l1_buf.clone(),
+        frame: std::sync::Arc::new(ref_l1_buf.clone()),
         motion_field: None,
     };
 
@@ -2540,12 +2560,12 @@ fn decode_b_slice_gpm_fires_and_decodes() {
     let ref_l1_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200);
     let ref_l0 = ReferencePicture {
         poc: 0,
-        frame: ref_l0_buf,
+        frame: std::sync::Arc::new(ref_l0_buf),
         motion_field: None,
     };
     let ref_l1 = ReferencePicture {
         poc: 2,
-        frame: ref_l1_buf,
+        frame: std::sync::Arc::new(ref_l1_buf),
         motion_field: None,
     };
 
@@ -3680,7 +3700,7 @@ fn decode_p_slice_intra_cu_via_pred_mode_flag() {
     let ref_buf = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 64);
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
+        frame: std::sync::Arc::new(ref_buf.clone()),
         motion_field: None,
     };
 
@@ -3858,7 +3878,7 @@ fn decode_p_slice_ibc_cu_copies_inter_ctu() {
     }
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
+        frame: std::sync::Arc::new(ref_buf.clone()),
         motion_field: None,
     };
 
@@ -4169,7 +4189,7 @@ fn decode_p_slice_non_merge_amvp_cu_to_pixels() {
     }
     let ref_pic = ReferencePicture {
         poc: 0,
-        frame: ref_buf.clone(),
+        frame: std::sync::Arc::new(ref_buf.clone()),
         motion_field: None,
     };
 
@@ -4279,12 +4299,20 @@ fn decode_b_slice_non_merge_bi_pred_cu_to_pixels() {
 
     let ref_a = ReferencePicture {
         poc: 0,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            40,
+        )),
         motion_field: None,
     };
     let ref_b = ReferencePicture {
         poc: 2,
-        frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 81),
+        frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+            pic_w as usize,
+            pic_h as usize,
+            81,
+        )),
         motion_field: None,
     };
 

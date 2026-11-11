@@ -179,6 +179,50 @@ remaining H.274 messages (film grain, frame packing, omnidirectional
 projection, annotated regions, neural-network post-filter, …) are
 reported by type only.
 
+## Performance (r487)
+
+`benches/throughput.rs` (`cargo bench --bench throughput -- decode |
+encode`, plain `std::time`, `H266_BENCH_THREADS` = the
+`ExecutionContext` worker budget) decodes the staged conformance
+streams through the registry decoder and encodes synthetic stills
+through the registry encoder. The numbers below are process CPU time
+and peak resident memory of one whole run (`/usr/bin/time -l`, release
+build, Apple-silicon laptop under load from other jobs — CPU seconds,
+not wall time, are the comparable figure); every run prints an output
+identity per stream and all 56 are unchanged, as are the `.opl` MD5s
+and the in-stream picture hashes (1777 / 1777).
+
+| Workload | Before | After |
+| --- | --- | --- |
+| Decode, 56 streams / 1777 pictures (416x240 … 1920x1080), 1 worker | 283.3 CPU s (6.3 pictures per CPU second), 491 MiB peak | **86.1 CPU s (20.6 pictures per CPU second), 283 MiB peak** |
+| Encode, 416x240 + 1280x720 stills, QP 32 and lossless (four pictures) | 12.7 CPU s | 8.5 CPU s (with the chroma mode decision on: the QP 32 pictures are 15 – 16 % smaller) |
+
+What changed, all bit-identical:
+
+* **Reference pictures are shared, not copied.** A reference list
+  entry used to own a copy of the decoded picture and its motion
+  field, re-copied per slice and per affine / subblock-merge CU that
+  cloned its entry; entries now hold `Arc`s (the peak memory drop).
+* **Adaptive loop filter** — the per-4x4 filter (coefficients, clip
+  bounds, transpose) and the §8.8.5.6 padding rule are resolved once
+  per sub-block instead of once per sample; sub-blocks whose filter
+  support lies inside the padding rectangle read their taps directly,
+  four samples of a row at a time; the classification Laplacians and
+  CC-ALF get the same direct path.
+* **Triage switches** (`H266_DBG_*` …) sit behind one cached gate:
+  the per-CU / per-TB / per-edge environment lookups are gone unless a
+  switch is set.
+* **Motion compensation** — the reference clamp state (wraparound,
+  subpicture) is one thread-local load per filtered sample instead of
+  two per tap, a tap run inside the picture is read as one slice, and
+  the DMVR bilinear arrays resolve their clamped rows / columns once.
+* **Inverse transform** — one flattened kernel per (type, size) built
+  once (the DCT-II sampling / reflection logic used to run per
+  multiplied term), wrapping 32-bit sums, no allocation per line,
+  all-zero lines skipped.
+* **CCLM** no longer copies the luma plane per transform block; SAO
+  asks the region map only on a CTB's outer ring.
+
 ## Parse support
 
 * **NAL framing** — Annex B byte-stream (`0x000001` / `0x00000001`

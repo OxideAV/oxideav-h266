@@ -118,7 +118,7 @@ use crate::transform::{TrType, inverse_transform_2d};
 fn dbg_cu_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("H266_DBG_CU").is_some())
+    *ON.get_or_init(|| crate::dbg_env::var_os("H266_DBG_CU").is_some())
 }
 
 /// Debug aid: `H266_DBG_PIX=x,y` traces one luma sample through the
@@ -129,7 +129,7 @@ fn dbg_pix_target() -> Option<(usize, usize)> {
     use std::sync::OnceLock;
     static TARGET: OnceLock<Option<(usize, usize)>> = OnceLock::new();
     *TARGET.get_or_init(|| {
-        let spec = std::env::var("H266_DBG_PIX").ok()?;
+        let spec = crate::dbg_env::var("H266_DBG_PIX").ok()?;
         let (xs, ys) = spec.split_once(',')?;
         Some((xs.parse().ok()?, ys.parse().ok()?))
     })
@@ -1696,7 +1696,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     pub fn set_lmcs(&mut self, data: &LmcsData, ph_chroma_residual_scale_flag: bool) -> Result<()> {
         let bit_depth = self.sps.sps_bitdepth_minus8 as u32 + 8;
         let derived = data.derive(bit_depth)?;
-        if std::env::var_os("H266_DBG_LMCS").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_LMCS").is_some() {
             eprintln!(
                 "LMCS min={} max={} inputPivot={:?} lmcsPivot={:?} scale={:?} invScale={:?}",
                 data.lmcs_min_bin_idx,
@@ -1950,7 +1950,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             .derived
             .idx_y_inv(inv_avg_luma, l.min_bin_idx, l.max_bin_idx);
         let var_scale = l.derived.chroma_var_scale(idx_y_inv);
-        if std::env::var_os("H266_DBG_LMCS").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_LMCS").is_some() {
             eprintln!(
                 "LMCS varScale cu=({},{}) {}x{} cuCb=({x_cu_cb},{y_cu_cb}) availL={avail_l} availT={avail_t} cnt={cnt} invAvgLuma={inv_avg_luma} idxYInv={idx_y_inv} varScale={var_scale}",
                 cu.cu.x, cu.cu.y, cu.cu.w, cu.cu.h
@@ -3311,7 +3311,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             left_avail,
             up_avail,
         )?;
-        if std::env::var_os("H266_DBG_SAO").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_SAO").is_some() {
             eprintln!(
                 "SAO ctb ({},{}) slice={} left_avail={left_avail} up_avail={up_avail} Y={:?}/{}/{:?}/{:?} Cb={:?}/{}/{:?}/{:?} Cr={:?}/{}/{:?}/{:?}",
                 ctu.x_ctb,
@@ -6217,7 +6217,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // luma pipeline state (parsed non-zero levels, prediction row
         // 0, residual row/column 0) for the CU whose origin matches —
         // companion to `H266_DBG_CU` for corpus triage.
-        if let Ok(v) = std::env::var("H266_DBG_TB") {
+        if let Ok(v) = crate::dbg_env::var("H266_DBG_TB") {
             let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
             if want.len() == 2 && cu.cu.x as usize == want[0] && cu.cu.y as usize == want[1] {
                 eprintln!(
@@ -6479,7 +6479,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         {
             let ibc = self.ibc.as_mut().expect("checked is_some above");
             if !ibc.virbuf.bv_conformance_ok(x_cb, y_cb, cb_w, cb_h, bv) {
-                if std::env::var_os("H266_DBG_IBC").is_some() {
+                if crate::dbg_env::var_os("H266_DBG_IBC").is_some() {
                     eprintln!(
                         "IBC DBG: cu ({x_cb},{y_cb}) {cb_w}x{cb_h} merge={} idx={bv_idx} \
                          a1={a1:?} b1={b1:?} cands={cand_list:?}",
@@ -6489,7 +6489,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 // `H266_DBG_LENIENT` — triage aid: leave the CU
                 // unpredicted and keep decoding so the rest of the
                 // picture can be diffed against an oracle.
-                if std::env::var_os("H266_DBG_LENIENT").is_some() {
+                if crate::dbg_env::var_os("H266_DBG_LENIENT").is_some() {
                     return Ok(());
                 }
                 return Err(Error::invalid(format!(
@@ -6702,7 +6702,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         } else {
             build_merge_cand_list(&spatial, max_merge, col, Some(&self.hmvp), num_ref_idx)
         };
-        if std::env::var_os("H266_DBG_MERGE").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_MERGE").is_some() {
             let raw = |x: i32, y: i32| {
                 let f = self.motion_field.get_at_luma(x, y);
                 (
@@ -6847,7 +6847,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 /*lt_l0*/ false,
                 /*lt_l1*/ false,
             );
-            if std::env::var_os("H266_DBG_MMVD").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_MMVD").is_some() {
                 eprintln!(
                     "MMVD ({},{}) {}x{} cand={} dist={} dir={} off=({},{}) pocd=({},{}) -> l0=({},{})r{}f{} l1=({},{})r{}f{}",
                     cu.cu.x,
@@ -7131,7 +7131,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                                 mv_l0: refined.mv_l0_refined,
                                 mv_l1: refined.mv_l1_refined,
                             });
-                            if std::env::var_os("H266_DBG_DMVR").is_some() {
+                            if crate::dbg_env::var_os("H266_DBG_DMVR").is_some() {
                                 eprintln!(
                                     "DMVR ({x},{y}) {sb_w}x{sb_h} mv0=({},{})->({},{}) mv1=({},{})->({},{}) sad={} sbBdof={}",
                                     chosen.mv_l0.x,
@@ -7475,7 +7475,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 let same_diff_poc =
                     curr_poc.wrapping_sub(rp0.poc) == rp1.poc.wrapping_sub(curr_poc);
                 let bdof_runs = self.sps.tool_flags.bdof_enabled_flag
-                    && std::env::var_os("H266_DBG_NO_BDOF").is_none()
+                    && crate::dbg_env::var_os("H266_DBG_NO_BDOF").is_none()
                     && !crate::deblock::dbg_skip_stage_recon("bdof")
                     && bdof_used_flag(
                         self.ph_bdof_disabled,
@@ -8498,7 +8498,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             let list_lx = build_mvp_cand_list(spatial, col, &hmvp);
             let mvp = select_mvp(&list_lx, mvp_flag);
             let fin = derive_final_mv(mvp, raw_mvd, amvr);
-            if std::env::var_os("H266_DBG_AMVP").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_AMVP").is_some() {
                 eprintln!(
                     "AMVP ({xcb},{ycb}) {cb_w}x{cb_h} {list:?} refIdx={ref_idx} flag={mvp_flag} spatial={:?} col={col:?} hmvp={hmvp:?} list={list_lx:?} mvp={mvp:?} mvd={raw_mvd:?} amvr={amvr:?} -> {fin:?}",
                     raw_spatial
@@ -8678,7 +8678,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             self.ph_prof_disabled,
             /*rpr_constraints_active=*/ false,
         )?;
-        if let Ok(spec) = std::env::var("H266_DBG_AFFBI") {
+        if let Ok(spec) = crate::dbg_env::var("H266_DBG_AFFBI") {
             if let Some((xs, ys)) = spec.split_once(',') {
                 if let (Ok(px), Ok(py)) = (xs.parse::<u32>(), ys.parse::<u32>()) {
                     if px >= cb_x && px < cb_x + cb_w && py >= cb_y && py < cb_y + cb_h {
@@ -9339,7 +9339,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 temporal_col,
                 _phantom: core::marker::PhantomData,
             });
-            if std::env::var_os("H266_DBG_AFFAMVP").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_AFFAMVP").is_some() {
                 eprintln!(
                     "AFFLIST ({xcb},{ycb}) ncp={num_cp_mv} inhA={inherited_a:?} inhB={inherited_b:?} consFull={constructed_full:?} corners={constructed_corners:?} tcol={temporal_col:?} flag={mvp_flag}",
                 );
@@ -9369,7 +9369,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                     &decision.mvd_cp_l0,
                 )?;
                 store_cpmvs_l0 = Some(cpmvs);
-                if std::env::var_os("H266_DBG_AFFCU").is_some() {
+                if crate::dbg_env::var_os("H266_DBG_AFFCU").is_some() {
                     let g = crate::affine::derive_subblock_mvs(cb_w, cb_h, &cpmvs, false);
                     eprintln!(
                         "AFFCU ({cb_x},{cb_y}) {cb_w}x{cb_h} uniL0 refpoc={} cpmvs={:?} sb00={:?} sb10={:?} sb01={:?} fb={:?}",
@@ -9832,7 +9832,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// deliberately mis-clamps the reference fetches (16 luma samples
     /// inside the real bounds) to prove the clamp is live.
     fn subpic_clip_eff(&self) -> Option<(i32, i32, i32, i32)> {
-        match std::env::var_os("H266_DBG_SUBPIC_CLIP") {
+        match crate::dbg_env::var_os("H266_DBG_SUBPIC_CLIP") {
             Some(v) if v == "off" => None,
             Some(v) if v == "shrink" => self
                 .subpic_clip
@@ -10025,7 +10025,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctr_mv_l0,
             ctr_mv_l1,
         };
-        if std::env::var_os("H266_DBG_SBTMVP").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_SBTMVP").is_some() {
             eprintln!(
                 "SBTMVP-REC ({xcb},{ycb}) {cb_w}x{cb_h} a1av={} tempMv=({},{}) ctrCell=({},{}) ctrInter={} ctrRaw=({},{})r{} ctrL0={ctr_pred_l0} ctrL1={ctr_pred_l1}",
                 a1.available,
@@ -10112,7 +10112,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         let sb_grid = fill_subblock_motion(record, &fuse_inputs, &col_sampler);
         let sb_w = record.grid.sb_width as u32;
         let sb_h = record.grid.sb_height as u32;
-        if std::env::var_os("H266_DBG_SBTMVP").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_SBTMVP").is_some() {
             eprintln!(
                 "SBTMVP ({},{}) {}x{} tempMv=({},{}) ctrL0={} ctrL1={} ctrMv0=({},{}) grid={}x{}",
                 cu.cu.x,
@@ -11427,7 +11427,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             // Debug aid (`H266_DBG_TB=x,y`, luma CU origin): the joint
             // Cb-Cr residual pipeline for one CU.
-            if let Ok(v) = std::env::var("H266_DBG_TB") {
+            if let Ok(v) = crate::dbg_env::var("H266_DBG_TB") {
                 let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
                 if want.len() == 2 && cu.cu.x as usize == want[0] && cu.cu.y as usize == want[1] {
                     eprintln!(
@@ -11541,11 +11541,11 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // unchanged).
         // The overrides apply only to the picture named by
         // `H266_DBG_GPM_FORCE_PIC=<recon ordinal>` (see `dbg_skip_stage_recon`).
-        let force_pic_ok = std::env::var("H266_DBG_GPM_FORCE_PIC")
+        let force_pic_ok = crate::dbg_env::var("H266_DBG_GPM_FORCE_PIC")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .is_some_and(|p| p == crate::deblock::dbg_pic_ordinal());
-        let mv_a = match std::env::var("H266_DBG_GPM_FORCE_A")
+        let mv_a = match crate::dbg_env::var("H266_DBG_GPM_FORCE_A")
             .ok()
             .filter(|_| force_pic_ok)
         {
@@ -11559,7 +11559,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             }
             None => mv_a,
         };
-        let mv_b = match std::env::var("H266_DBG_GPM_FORCE_B")
+        let mv_b = match crate::dbg_env::var("H266_DBG_GPM_FORCE_B")
             .ok()
             .filter(|_| force_pic_ok)
         {
@@ -11616,7 +11616,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             bit_depth,
         )?;
 
-        if std::env::var_os("H266_DBG_GPM").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_GPM").is_some() {
             eprintln!(
                 "GPM ({cb_x},{cb_y}) {cb_w}x{cb_h} part={} idx0={} idx1={} m={m} n={n} A: X={x_a} mv={mv_a:?} ref={ref_idx_a} B: X={x_b} mv={mv_b:?} ref={ref_idx_b} list={:?}",
                 info.inter.merge_data.gpm_partition_idx,
@@ -12210,20 +12210,20 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             None
         };
         let is_cclm = matches!(mode_c, INTRA_LT_CCLM | INTRA_L_CCLM | INTRA_T_CCLM);
-        let luma_samples_snapshot: Option<Vec<u16>> = if is_cclm {
-            Some(out.luma.samples.clone())
-        } else {
-            None
-        };
-        let luma_stride = out.luma.stride;
-        let luma_w = out.luma.width;
-        let luma_h = out.luma.height;
+        // r487 — the three planes are disjoint: borrow luma shared
+        // next to the mutable chroma plane (a whole-plane copy per
+        // CCLM transform block used to stand in for this).
+        let PictureBuffer { luma, cb, cr } = out;
+        let luma: &PicturePlane = luma;
+        let luma_stride = luma.stride;
+        let luma_w = luma.width;
+        let luma_h = luma.height;
 
         // Pick the destination plane up front so the borrow on `out`
         // does not have to follow the plane-by-plane reconstruction.
         let plane = match c_idx {
-            1 => &mut out.cb,
-            2 => &mut out.cr,
+            1 => cb,
+            2 => cr,
             _ => return Ok(()),
         };
 
@@ -12272,7 +12272,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // reconstructed luma plane snapshot taken just above. The
         // remaining modes run the full §8.4.5.2.6 pipeline (2-tap
         // chroma angular interpolation, wide-angle remap, PDPC).
-        if let Ok(v) = std::env::var("H266_DBG_CCLM") {
+        if let Ok(v) = crate::dbg_env::var("H266_DBG_CCLM") {
             let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
             if want.len() == 2 && x0 == want[0] && y0 == want[1] {
                 eprintln!(
@@ -12332,7 +12332,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 mode_c,
                 &cclm_cell_avail,
             );
-            let luma_samples = luma_samples_snapshot.as_deref().unwrap_or(&[]);
+            let luma_samples: &[u16] = &luma.samples;
             // §8.4.5.2.14 honours bCTUboundary on the top side. CTU
             // height in the chroma grid is `ctb_size_y / SubHeightC` —
             // for 4:2:0 that's `ctb_size_y / 2`. The luma top-left
@@ -12583,7 +12583,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // r456 — arm the §8.5.6.3.2 eqs. 631 / 632 subpicture
         // reference clamp for this slice's fetches (cleared for
         // slices whose subpicture is not treated as a picture).
-        if std::env::var_os("H266_DBG_TB").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_TB").is_some() {
             eprintln!(
                 "SUBPIC dbg: slice {} curr_subpic_idx={} clip={:?}",
                 self.cur_slice_id, self.sh.curr_subpic_idx, self.subpic_clip
@@ -12795,7 +12795,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// when `CtbAddrX == CtbToTileColBd[CtbAddrX]`.
     fn begin_ctu(&mut self, ctu: &CtuPos) {
         // `H266_DBG_BINS=x,y` — bin-level CABAC trace for one CTB.
-        if let Ok(v) = std::env::var("H266_DBG_BINS") {
+        if let Ok(v) = crate::dbg_env::var("H266_DBG_BINS") {
             let want: Vec<u32> = v.split(',').filter_map(|s| s.parse().ok()).collect();
             crate::cabac::set_bin_trace(want.len() == 2 && want[0] == ctu.x0 && want[1] == ctu.y0);
         }
@@ -13210,7 +13210,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // §8.8.5.6). The boundary prefix lists are in luma samples and
         // include 0 + the CTB-grid extents.
         // `H266_DBG_TILE_GATE=off` — triage aid: filter across tiles.
-        let tile_gate_off = std::env::var_os("H266_DBG_TILE_GATE").is_some_and(|v| v == "off");
+        let tile_gate_off =
+            crate::dbg_env::var_os("H266_DBG_TILE_GATE").is_some_and(|v| v == "off");
         let tile_lf_bounds: Option<(Vec<u32>, Vec<u32>)> = match &self.pps.partition {
             Some(part)
                 if part.num_tiles_in_pic > 1
@@ -13248,7 +13249,8 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
         // `LfRegionMap` rather than the line lists.
         // `H266_DBG_LF_REGION=off` — triage aid: drop the slice /
         // subpicture gate map.
-        let lf_region = if std::env::var_os("H266_DBG_LF_REGION").is_some_and(|v| v == "off") {
+        let lf_region = if crate::dbg_env::var_os("H266_DBG_LF_REGION").is_some_and(|v| v == "off")
+        {
             None
         } else {
             self.lf_region_map()
@@ -14037,7 +14039,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: 4,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic]);
@@ -14154,7 +14156,7 @@ mod tests {
         }
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: 4,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         }]);
 
@@ -14254,12 +14256,20 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: 0,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 80),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                80,
+            )),
             motion_field: None,
         }]);
         walker.set_ref_pic_list_l1(vec![ReferencePicture {
             poc: 8,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                200,
+            )),
             motion_field: None,
         }]);
 
@@ -14344,7 +14354,7 @@ mod tests {
         }
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: 4,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         }]);
         // Empty motion field → no spatial neighbour available, TMVP off
@@ -14476,12 +14486,12 @@ mod tests {
             w.set_ph_dmvr_disabled(dmvr_disabled);
             w.set_ref_pic_list_l0(vec![ReferencePicture {
                 poc: 0,
-                frame: ramp(0),
+                frame: std::sync::Arc::new(ramp(0)),
                 motion_field: None,
             }]);
             w.set_ref_pic_list_l1(vec![ReferencePicture {
                 poc: 8,
-                frame: ramp(shift),
+                frame: std::sync::Arc::new(ramp(shift)),
                 motion_field: None,
             }]);
             w
@@ -14603,12 +14613,12 @@ mod tests {
             w.set_ph_dmvr_disabled(dmvr_disabled);
             w.set_ref_pic_list_l0(vec![ReferencePicture {
                 poc: 0,
-                frame: ramp(0, 0),
+                frame: std::sync::Arc::new(ramp(0, 0)),
                 motion_field: None,
             }]);
             w.set_ref_pic_list_l1(vec![ReferencePicture {
                 poc: 8,
-                frame: ramp(2, 3),
+                frame: std::sync::Arc::new(ramp(2, 3)),
                 motion_field: None,
             }]);
             w
@@ -14732,12 +14742,12 @@ mod tests {
             w.set_ph_bdof_disabled(bdof_disabled);
             w.set_ref_pic_list_l0(vec![ReferencePicture {
                 poc: 0,
-                frame: ramp(0, 0),
+                frame: std::sync::Arc::new(ramp(0, 0)),
                 motion_field: None,
             }]);
             w.set_ref_pic_list_l1(vec![ReferencePicture {
                 poc: 8,
-                frame: ramp(2, 3),
+                frame: std::sync::Arc::new(ramp(2, 3)),
                 motion_field: None,
             }]);
             w
@@ -14838,12 +14848,12 @@ mod tests {
         walker.set_ph_dmvr_disabled(false);
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: 0,
-            frame: ramp(0),
+            frame: std::sync::Arc::new(ramp(0)),
             motion_field: None,
         }]);
         walker.set_ref_pic_list_l1(vec![ReferencePicture {
             poc: 8,
-            frame: ramp(2),
+            frame: std::sync::Arc::new(ramp(2)),
             motion_field: None,
         }]);
         let mut out = PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0);
@@ -14893,7 +14903,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -14990,7 +15004,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -15077,7 +15095,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -15162,7 +15184,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -15250,7 +15276,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -15336,7 +15366,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -15428,7 +15462,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
 
@@ -15482,7 +15516,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
 
@@ -15559,7 +15593,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
@@ -15666,7 +15700,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
@@ -15775,12 +15809,20 @@ mod tests {
             let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
             walker.set_ref_pic_list_l0(vec![ReferencePicture {
                 poc: -1,
-                frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+                frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                    pic_w as usize,
+                    pic_h as usize,
+                    40,
+                )),
                 motion_field: None,
             }]);
             walker.set_ref_pic_list_l1(vec![ReferencePicture {
                 poc: 1,
-                frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+                frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                    pic_w as usize,
+                    pic_h as usize,
+                    200,
+                )),
                 motion_field: None,
             }]);
             let affine = make_non_merge_inter_affine_decision(true, false);
@@ -15866,7 +15908,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
@@ -16058,7 +16100,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
@@ -16231,7 +16273,7 @@ mod tests {
         }
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         }]);
 
@@ -16298,12 +16340,20 @@ mod tests {
         // Two distinct-constant references so a weight change is visible.
         let ref_l0 = ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                40,
+            )),
             motion_field: None,
         };
         let ref_l1 = ReferencePicture {
             poc: 1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                200,
+            )),
             motion_field: None,
         };
 
@@ -16427,8 +16477,8 @@ mod tests {
         mf.write_block(0, 0, pic_w, pic_h, cell);
         let ref_pic = ReferencePicture {
             poc: 0,
-            frame: ref_frame.clone(),
-            motion_field: Some(mf),
+            frame: std::sync::Arc::new(ref_frame.clone()),
+            motion_field: Some(std::sync::Arc::new(mf)),
         };
         walker.set_ref_pic_list_l0(vec![ref_pic]);
         // ph_temporal_mvp on, current POC 2, collocated = RefPicList[0][0].
@@ -16516,7 +16566,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic.clone()]);
@@ -16653,7 +16703,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         let ref_pic2 = ref_pic.clone();
@@ -16741,12 +16791,20 @@ mod tests {
 
         let ref_a = ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                40,
+            )),
             motion_field: None,
         };
         let ref_b = ReferencePicture {
             poc: 1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 200),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                200,
+            )),
             motion_field: None,
         };
         let zero = crate::affine::AffineCpmvs::new_4param(
@@ -16817,7 +16875,11 @@ mod tests {
 
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -16901,7 +16963,11 @@ mod tests {
         // Constant-100 reference frame for the single L0 entry.
         let ref_pic = ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic]);
@@ -17605,7 +17671,7 @@ mod tests {
         }
         let ref_pic = ReferencePicture {
             poc: 4,
-            frame: ref_frame.clone(),
+            frame: std::sync::Arc::new(ref_frame.clone()),
             motion_field: None,
         };
         walker.set_ref_pic_list_l0(vec![ref_pic]);
@@ -17704,7 +17770,11 @@ mod tests {
         let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -17807,7 +17877,11 @@ mod tests {
         let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 
@@ -17917,7 +17991,11 @@ mod tests {
         walker.set_lmcs(&lmcs, false).unwrap();
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 40),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                40,
+            )),
             motion_field: None,
         }]);
 
@@ -18070,7 +18148,11 @@ mod tests {
         let mut walker = CtuWalker::begin_slice(&layout, &sps, &pps, &sh, 0, &data).unwrap();
         walker.set_ref_pic_list_l0(vec![ReferencePicture {
             poc: -1,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 100),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                100,
+            )),
             motion_field: None,
         }]);
 

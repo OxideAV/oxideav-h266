@@ -294,7 +294,7 @@ pub fn predict_cclm(inp: &CclmInputs<'_>) -> Result<Vec<i16>> {
 
     // Debug aid (`H266_DBG_CCLM=x,y` in chroma sample coords): dump
     // the model inputs + coefficients for the CB at that origin.
-    if let Ok(v) = std::env::var("H266_DBG_CCLM") {
+    if let Ok(v) = crate::dbg_env::var("H266_DBG_CCLM") {
         let want: Vec<usize> = v.split(',').filter_map(|s| s.parse().ok()).collect();
         if want.len() == 2 && inp.x_tb_c == want[0] && inp.y_tb_c == want[1] {
             eprintln!(

@@ -16,3 +16,7 @@ categories = ["multimedia::encoding", "multimedia::video"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-pixfmt = "0.1"
+
+[[bench]]
+name = "throughput"
+harness = false

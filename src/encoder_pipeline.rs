@@ -4620,7 +4620,7 @@ fn emit_prepared_cu(
         PreparedCu::Leaf(tb) => {
             // r474 triage hook: `H266_ENC_DBG_CU=1` prints one line per
             // emitted leaf CU (companion of the decoder's `H266_DBG_CU`).
-            if std::env::var_os("H266_ENC_DBG_CU").is_some() {
+            if crate::dbg_env::var_os("H266_ENC_DBG_CU").is_some() {
                 eprintln!(
                     "ENC CU ({x},{y}) {}x{} modeY={} mip={:?} isp={:?} bdpcm={:?} cqt={cqt_depth} cbf_y={} cbf_cb={} cbf_cr={} ts={} qp={}",
                     tb.n_tb_w,
@@ -4635,7 +4635,7 @@ fn emit_prepared_cu(
                     tb.transform_skip,
                     tb.cu_qp_local,
                 );
-                if std::env::var_os("H266_ENC_DBG_LEVELS").is_some() {
+                if crate::dbg_env::var_os("H266_ENC_DBG_LEVELS").is_some() {
                     eprintln!("ENC LEVELS Y {:?}", tb.levels);
                     eprintln!("ENC LEVELS CB {:?}", tb.cb_levels);
                     eprintln!("ENC LEVELS CR {:?}", tb.cr_levels);
@@ -6184,7 +6184,7 @@ fn encode_idr_impl(
 
     // r474 triage aid — `H266_ENC_DBG_BINS=1` traces every second-pass
     // bin (the dual of the decoder's `H266_DBG_BINS=x,y`).
-    crate::cabac::set_bin_trace(std::env::var_os("H266_ENC_DBG_BINS").is_some());
+    crate::cabac::set_bin_trace(crate::dbg_env::var_os("H266_ENC_DBG_BINS").is_some());
     let mut cabac_enc = ArithEncoder::new();
     // Round-56 — picture-wide neighbour map for the §9.3.4.2 ctxInc
     // derivations. `cu_map` is the *read-only* snapshot the current

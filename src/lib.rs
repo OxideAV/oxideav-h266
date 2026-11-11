@@ -237,6 +237,7 @@ pub mod ctu;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ctx;
+mod dbg_env;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod dci;

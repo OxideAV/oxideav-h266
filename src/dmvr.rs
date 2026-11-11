@@ -193,9 +193,33 @@ pub struct DmvrRefineResult {
 /// `Clip3(0, picW−1, …)` / `Clip3(0, picH−1, …)` border handling for the
 /// non-subpicture, non-wraparound case). The returned value is in the
 /// §8.5.3.2.2 internal precision (BitDepth-8 here, so `shift3 = 2`).
+#[cfg(test)]
 #[inline]
 fn bilinear_sample(
     ref_pic: &PicturePlane,
+    int_x: i32,
+    int_y: i32,
+    frac_x: usize,
+    frac_y: usize,
+    bit_depth: u32,
+) -> i32 {
+    let pw = ref_pic.width as i32;
+    let ph = ref_pic.height as i32;
+    // §8.5.3.2.2 eqs. 633 / 634 (no subpic): eq. 5 ClipH for
+    // pps_ref_wraparound_enabled_flag, then the edge clamp.
+    let at = |xi: i32, yi: i32| -> i32 {
+        let xc = crate::inter::clip_ref_x(xi, pw, 1);
+        let yc = crate::inter::clip_ref_y(yi, ph, 1);
+        ref_pic.samples[yc * ref_pic.stride + xc] as i32
+    };
+    bilinear_from(at, int_x, int_y, frac_x, frac_y, bit_depth)
+}
+
+/// The §8.5.3.2.2 interpolation of one sample over a reference fetch
+/// `at( xInt, yInt )` (which applies the reference clamps).
+#[inline(always)]
+fn bilinear_from(
+    at: impl Fn(i32, i32) -> i32,
     int_x: i32,
     int_y: i32,
     frac_x: usize,
@@ -210,16 +234,6 @@ fn bilinear_sample(
     let shift3 = 10 - bit_depth as i32;
     let shift4 = bit_depth as i32 - 10;
     let offset4 = if shift4 > 0 { 1 << (shift4 - 1) } else { 0 };
-
-    let pw = ref_pic.width as i32;
-    let ph = ref_pic.height as i32;
-    // §8.5.3.2.2 eqs. 633 / 634 (no subpic): eq. 5 ClipH for
-    // pps_ref_wraparound_enabled_flag, then the edge clamp.
-    let at = |xi: i32, yi: i32| -> i32 {
-        let xc = crate::inter::clip_ref_x(xi, pw, 1);
-        let yc = crate::inter::clip_ref_y(yi, ph, 1);
-        ref_pic.samples[yc * ref_pic.stride + xc] as i32
-    };
 
     if frac_x == 0 && frac_y == 0 {
         // eq. 635.
@@ -281,13 +295,29 @@ fn bilinear_pred_array(
     let base_x = sb_x + (mv.x >> 4) - sr_range;
     let base_y = sb_y + (mv.y >> 4) - sr_range;
 
+    // r487 — the reference clamps (§8.5.3.2.2 eqs. 631 – 634: eq. 5
+    // ClipH for pps_ref_wraparound_enabled_flag, the subpicture or
+    // picture clamp) of the `predWidth + 1` columns and
+    // `predHeight + 1` rows the array touches are resolved once, not
+    // per fetched sample.
+    let clip = crate::inter::RefClip::current();
+    let pw = ref_pic.width as i32;
+    let ph = ref_pic.height as i32;
+    let cols: Vec<usize> = (0..=pred_w as i32)
+        .map(|i| clip.x(base_x + i, pw, 1))
+        .collect();
+    let rows: Vec<usize> = (0..=pred_h as i32)
+        .map(|i| clip.y(base_y + i, ph, 1) * ref_pic.stride)
+        .collect();
+    let at = |xi: i32, yi: i32| -> i32 {
+        i32::from(ref_pic.samples[rows[(yi - base_y) as usize] + cols[(xi - base_x) as usize]])
+    };
     let mut out = vec![0i32; pred_w * pred_h];
     for yl in 0..pred_h {
         for xl in 0..pred_w {
             let int_x = base_x + xl as i32;
             let int_y = base_y + yl as i32;
-            out[yl * pred_w + xl] =
-                bilinear_sample(ref_pic, int_x, int_y, frac_x, frac_y, bit_depth);
+            out[yl * pred_w + xl] = bilinear_from(at, int_x, int_y, frac_x, frac_y, bit_depth);
         }
     }
     out

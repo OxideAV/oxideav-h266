@@ -96,8 +96,8 @@ pub const MAX_SEI_MESSAGES_PER_PICTURE: usize = 64;
 /// A reference picture retained in the decoded-picture buffer.
 struct DpbEntry {
     poc: i32,
-    frame: PictureBuffer,
-    motion: Option<MotionField>,
+    frame: std::sync::Arc<PictureBuffer>,
+    motion: Option<std::sync::Arc<MotionField>>,
 }
 
 /// One picture's NAL bundle while its slices are being collected.
@@ -593,7 +593,7 @@ impl StreamDecoder {
         let sh = parse_slice_header_stateful(rbsp, sps, pps, &ph_state)?;
         // Triage aid (`H266_DBG_SH`): one Debug dump per parsed slice
         // header (the PH state it resolved against first).
-        if std::env::var_os("H266_DBG_SH").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_SH").is_some() {
             eprintln!("SH dbg: ph_state={ph_state:?}\nSH dbg: {sh:?}");
         }
         Ok(sh)
@@ -702,7 +702,7 @@ impl StreamDecoder {
         let sei = std::mem::take(&mut pic.sei);
         let ph = &pic.ph;
         // Triage aid (`H266_DBG_PH`): one Debug dump per picture header.
-        if std::env::var_os("H266_DBG_PH").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_PH").is_some() {
             eprintln!(
                 "PH full dbg: nal={:?} tid={} {ph:?}",
                 pic.nal_type, pic.temporal_id
@@ -844,7 +844,7 @@ impl StreamDecoder {
             };
             // `H266_DBG_WRAP=off` — triage aid: decode as if the PPS
             // flag were 0.
-            let wrap = if std::env::var_os("H266_DBG_WRAP").is_some_and(|v| v == "off") {
+            let wrap = if crate::dbg_env::var_os("H266_DBG_WRAP").is_some_and(|v| v == "off") {
                 0
             } else {
                 wrap
@@ -959,7 +959,8 @@ impl StreamDecoder {
         walker.set_ph_mvd_l1_zero(ph.ph_mvd_l1_zero_flag);
         walker.set_ph_bdof_disabled(ph.ph_bdof_disabled_flag);
         walker.set_ph_dmvr_disabled(ph.ph_dmvr_disabled_flag);
-        if std::env::var_os("H266_DBG_TB").is_some() && !(vb_cols.is_empty() && vb_rows.is_empty())
+        if crate::dbg_env::var_os("H266_DBG_TB").is_some()
+            && !(vb_cols.is_empty() && vb_rows.is_empty())
         {
             eprintln!("VB dbg: cols={vb_cols:?} rows={vb_rows:?}");
         }
@@ -997,7 +998,7 @@ impl StreamDecoder {
         }
         // Debug aid (shares the `H266_DBG_TB` gate): one line of
         // slice-level tool state per decoded slice for corpus triage.
-        if std::env::var_os("H266_DBG_TB").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_TB").is_some() {
             eprintln!(
                 "SLICE dbg: lmcs_used={} crs={} qp_y={} dep_quant={} sdh={} explicit_sl={} alf={} alf_aps={:?} cb={} cr={} cc_cb={} cc_cr={} type={:?}",
                 sh0.sh_lmcs_used_flag,
@@ -1109,7 +1110,7 @@ impl StreamDecoder {
                 walker.continue_slice(sh, ph.ph_qp_delta, &cabacs[i])?;
             }
             let wp_tables = explicit_wp_for(sh)?;
-            if std::env::var_os("H266_DBG_WP").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_WP").is_some() {
                 eprintln!(
                     "WP poc={poc} slice={i} type={:?} tables={wp_tables:?}",
                     sh.sh_slice_type
@@ -1126,7 +1127,7 @@ impl StreamDecoder {
                     }
                 }
             }
-            if std::env::var_os("H266_DBG_SHQP").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_SHQP").is_some() {
                 eprintln!(
                     "SHQP poc={poc} slice={i} type={:?} shqpd={} cb={} cr={} joint={} jsign={}",
                     sh.sh_slice_type,
@@ -1142,7 +1143,7 @@ impl StreamDecoder {
                     self.resolve_list(&built[0], sh.num_ref_idx_active[0] as usize, max_poc_lsb)?;
                 let l1 =
                     self.resolve_list(&built[1], sh.num_ref_idx_active[1] as usize, max_poc_lsb)?;
-                if std::env::var_os("H266_DBG_RPL").is_some() {
+                if crate::dbg_env::var_os("H266_DBG_RPL").is_some() {
                     eprintln!(
                         "RPL poc={poc} slice={i} type={:?} nact=[{},{}] L0={:?} L1={:?} col_l0={} col_idx={}",
                         sh.sh_slice_type,
@@ -1171,7 +1172,7 @@ impl StreamDecoder {
                 // Debug aid (`H266_DUMP_PARTIAL=dir`): keep the
                 // partially reconstructed picture of a failing decode
                 // for sample-level triage against an oracle.
-                if let Ok(dir) = std::env::var("H266_DUMP_PARTIAL") {
+                if let Ok(dir) = crate::dbg_env::var("H266_DUMP_PARTIAL") {
                     // Run the §8.8 filters over what was decoded so the
                     // dump compares exactly (away from the desync) with
                     // a post-filter oracle.
@@ -1191,7 +1192,7 @@ impl StreamDecoder {
             // `H266_DBG_IGNORE_EOS` (debug aid): downgrade a slice-end
             // marker mismatch to a warning so the reconstructed picture
             // can still be inspected against the conformance sidecars.
-            if std::env::var_os("H266_DBG_IGNORE_EOS").is_some() {
+            if crate::dbg_env::var_os("H266_DBG_IGNORE_EOS").is_some() {
                 if let Err(e) = walker.finish_slice() {
                     eprintln!("finish_slice: {e}");
                 }
@@ -1210,7 +1211,7 @@ impl StreamDecoder {
         // for sample-level triage against a spec-model — the in-loop
         // filters still run afterwards, so reference pictures stay
         // byte-exact (unlike `H266_DBG_NO_LF`).
-        if let Ok(dir) = std::env::var("H266_DUMP_PREFILTER") {
+        if let Ok(dir) = crate::dbg_env::var("H266_DUMP_PREFILTER") {
             let mut raw: Vec<u8> = Vec::new();
             for p in [&out.luma, &out.cb, &out.cr] {
                 for y in 0..p.height {
@@ -1222,12 +1223,12 @@ impl StreamDecoder {
             let cvs = self.cvs_idx.saturating_sub(1);
             let _ = std::fs::write(format!("{dir}/prefilter_cvs{cvs}_poc{poc}.yuv"), raw);
         }
-        if std::env::var_os("H266_DBG_NO_LF").is_none() {
+        if crate::dbg_env::var_os("H266_DBG_NO_LF").is_none() {
             walker.apply_in_loop_filters_with_alf(&mut out, &binding)?;
         }
 
         let motion = walker.motion_field_for_temporal();
-        if std::env::var_os("H266_DBG_TB").is_some() {
+        if crate::dbg_env::var_os("H266_DBG_TB").is_some() {
             let inter = motion
                 .field
                 .iter()
@@ -1239,7 +1240,7 @@ impl StreamDecoder {
                 motion.field.len()
             );
         }
-        if let Ok(spec) = std::env::var("H266_DBG_MFCELL") {
+        if let Ok(spec) = crate::dbg_env::var("H266_DBG_MFCELL") {
             if let Some((xs, ys)) = spec.split_once(',') {
                 if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {
                     eprintln!(
@@ -1270,8 +1271,8 @@ impl StreamDecoder {
         // Store the current picture for future reference.
         self.dpb.push(DpbEntry {
             poc,
-            frame: out.clone(),
-            motion: Some(motion),
+            frame: std::sync::Arc::new(out.clone()),
+            motion: Some(std::sync::Arc::new(motion)),
         });
 
         // prevTid0Pic (§8.3.1).

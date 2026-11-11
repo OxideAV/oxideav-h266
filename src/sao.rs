@@ -550,6 +550,20 @@ fn apply_sao_ctb(
         SaoTypeIdx::EdgeOffset => {
             let (h0, v0) = params.eo_class.pos0();
             let (h1, v1) = params.eo_class.pos1();
+            // r487 — when the whole CTB lies in one boundary strip of
+            // one filter region, a neighbour that is itself inside
+            // this CTB is reachable by construction: only the CTB's
+            // outer ring needs the per-sample region query.
+            let ctb_in_one_region = eo_clip.as_ref().is_some_and(|regions| {
+                i_max > 0
+                    && j_max > 0
+                    && regions.ctb_is_one_region(
+                        x_ctb as i32,
+                        y_ctb as i32,
+                        (x_ctb + i_max - 1) as i32,
+                        (y_ctb + j_max - 1) as i32,
+                    )
+            });
             for j in 0..j_max {
                 for i in 0..i_max {
                     let xs = (x_ctb + i) as i32;
@@ -574,9 +588,12 @@ fn apply_sao_ctb(
                     // neighbour sample in a different tile also forces
                     // edgeIdx = 0.
                     if let Some(regions) = &eo_clip {
-                        outside = outside
-                            || !regions.neighbour_in_region(xs, ys, nx0, ny0)
-                            || !regions.neighbour_in_region(xs, ys, nx1, ny1);
+                        let ring = i == 0 || j == 0 || i + 1 >= i_max || j + 1 >= j_max;
+                        if ring || !ctb_in_one_region {
+                            outside = outside
+                                || !regions.neighbour_in_region(xs, ys, nx0, ny0)
+                                || !regions.neighbour_in_region(xs, ys, nx1, ny1);
+                        }
                     }
                     if outside {
                         // edgeIdx = 0 → offset_val[0] = 0. Copy through.

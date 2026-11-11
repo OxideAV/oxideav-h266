@@ -833,8 +833,12 @@ mod tests {
         mf.write_block(0, 0, pic_w, pic_h, l0_block(mv.x, mv.y, 0));
         ReferencePicture {
             poc,
-            frame: PictureBuffer::yuv420_filled(pic_w as usize, pic_h as usize, 0),
-            motion_field: Some(mf),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(
+                pic_w as usize,
+                pic_h as usize,
+                0,
+            )),
+            motion_field: Some(std::sync::Arc::new(mf)),
         }
     }
 
@@ -899,7 +903,7 @@ mod tests {
         // Intra-only ColPic (no captured MF) → §8.5.2.12 short-circuit.
         let col_pic = ReferencePicture {
             poc: 1,
-            frame: PictureBuffer::yuv420_filled(32, 32, 0),
+            frame: std::sync::Arc::new(PictureBuffer::yuv420_filled(32, 32, 0)),
             motion_field: None,
         };
         let inputs = amvp_temporal_inputs(0, 0, 16, 16, 2, 0, -1);

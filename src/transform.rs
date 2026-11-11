@@ -413,6 +413,7 @@ fn dct_ii_entry(m: usize, n: usize) -> i32 {
 
 /// Apply the inverse DCT-II transform (eq. 1177) at size `n_tb_s` ∈
 /// {4,8,16,32}. `non_zero_s` allows skipping tail-zero columns.
+#[cfg(test)]
 fn apply_dct_ii(n_tb_s: usize, non_zero_s: usize, x: &[i32]) -> Vec<i32> {
     // Column stride per eq. 1177: `j * (64 >> log2(N))`.
     let stride = 64usize >> log2_exact(n_tb_s);
@@ -429,6 +430,7 @@ fn apply_dct_ii(n_tb_s: usize, non_zero_s: usize, x: &[i32]) -> Vec<i32> {
 }
 
 /// `log2(n)` for `n` a power of two in `{4, 8, 16, 32, 64}`.
+#[cfg(test)]
 #[inline]
 fn log2_exact(n: usize) -> u32 {
     debug_assert!(n.is_power_of_two());
@@ -463,33 +465,135 @@ pub fn one_d_transform(
             x.len()
         )));
     }
-    match (tr_type, n_tb_s) {
-        // DST-VII
-        (TrType::DstVII, 4) => Ok(apply_matrix(&DST_VII_4, non_zero_s, x)),
-        (TrType::DstVII, 8) => Ok(apply_matrix(&DST_VII_8, non_zero_s, x)),
-        (TrType::DstVII, 16) => Ok(apply_matrix(&DST_VII_16, non_zero_s, x)),
-        (TrType::DstVII, 32) => Ok(apply_dst_vii_32(non_zero_s, x)),
-        // DCT-VIII
-        (TrType::DctVIII, 4) => Ok(apply_matrix(&DCT_VIII_4, non_zero_s, x)),
-        (TrType::DctVIII, 8) => Ok(apply_matrix(&DCT_VIII_8, non_zero_s, x)),
-        (TrType::DctVIII, 16) => Ok(apply_matrix(&DCT_VIII_16, non_zero_s, x)),
-        (TrType::DctVIII, 32) => Ok(apply_dct_viii_32(non_zero_s, x)),
-        // DCT-II — sizes 4, 8, 16, 32 use the column-stride sampling of
-        // the 64×64 trMatrix (eq. 1177); size 64 reads it directly via
-        // §8.7.4.2 eq. 1184 (the dct_ii_entry helper already covers
-        // m,n ∈ 0..63 by chaining the 0..15 + 16..31 sub-tables and the
-        // §8.7.4.5 antisymmetry reflections).
-        (TrType::DctII, 2)
-        | (TrType::DctII, 4)
-        | (TrType::DctII, 8)
-        | (TrType::DctII, 16)
-        | (TrType::DctII, 32)
-        | (TrType::DctII, 64) => Ok(apply_dct_ii(n_tb_s, non_zero_s, x)),
-        _ => Err(Error::unsupported(format!(
+    let mut y = vec![0i32; n_tb_s];
+    one_d_transform_into(tr_type, n_tb_s, non_zero_s, x, &mut y)?;
+    Ok(y)
+}
+
+/// r487 — one inverse-transform kernel flattened for the multiply:
+/// `weights[ i * n + j ]` is the contribution of coefficient `j` to
+/// output sample `i` (eq. 1177 / 1178), built once per (type, size)
+/// from the §8.7.4.5 tables — the DCT-II column-stride sampling and
+/// antisymmetry reflections, the printed-transposed DST-VII / DCT-VIII
+/// tables and their 32-point split pairs all resolve here instead of
+/// per multiplied term.
+struct Kernel {
+    n: usize,
+    /// Coefficients beyond this index never contribute (the 32-point
+    /// DST-VII / DCT-VIII kernels are limited to the low 16).
+    max_non_zero: usize,
+    weights: Vec<i32>,
+}
+
+impl Kernel {
+    fn build(n: usize, max_non_zero: usize, weight: impl Fn(usize, usize) -> i32) -> Self {
+        let mut weights = vec![0i32; n * n];
+        for i in 0..n {
+            for j in 0..max_non_zero {
+                weights[i * n + j] = weight(i, j);
+            }
+        }
+        Self {
+            n,
+            max_non_zero,
+            weights,
+        }
+    }
+}
+
+/// The kernel of `(tr_type, n_tb_s)`, or `None` for a combination the
+/// specification does not define.
+fn kernel(tr_type: TrType, n_tb_s: usize) -> Option<&'static Kernel> {
+    static KERNELS: std::sync::OnceLock<Vec<Kernel>> = std::sync::OnceLock::new();
+    let kernels = KERNELS.get_or_init(|| {
+        let mut k = Vec::with_capacity(14);
+        // 0..=5 — DCT-II at 2, 4, 8, 16, 32, 64: the column-stride
+        // sampling of the 64x64 trMatrix (eq. 1177).
+        for log2 in 1..=6u32 {
+            let n = 1usize << log2;
+            let stride = 64usize >> log2;
+            k.push(Kernel::build(n, n, |i, j| dct_ii_entry(i, j * stride)));
+        }
+        // 6..=9 — DST-VII at 4, 8, 16, 32; 10..=13 — DCT-VIII. The
+        // printed entry `[ r ][ c ]` is `transMatrix[ c ][ r ]`
+        // (coefficient index `r`, sample position `c`).
+        k.push(Kernel::build(4, 4, |i, j| i32::from(DST_VII_4[j][i])));
+        k.push(Kernel::build(8, 8, |i, j| i32::from(DST_VII_8[j][i])));
+        k.push(Kernel::build(16, 16, |i, j| i32::from(DST_VII_16[j][i])));
+        k.push(Kernel::build(32, 16, |i, j| {
+            i32::from(if i < 16 {
+                DST_VII_32_COL_0_15[j][i]
+            } else {
+                DST_VII_32_COL_16_31[j][i - 16]
+            })
+        }));
+        k.push(Kernel::build(4, 4, |i, j| i32::from(DCT_VIII_4[j][i])));
+        k.push(Kernel::build(8, 8, |i, j| i32::from(DCT_VIII_8[j][i])));
+        k.push(Kernel::build(16, 16, |i, j| i32::from(DCT_VIII_16[j][i])));
+        k.push(Kernel::build(32, 16, |i, j| {
+            i32::from(if i < 16 {
+                DCT_VIII_32_COL_0_15[j][i]
+            } else {
+                DCT_VIII_32_COL_16_31[j][i - 16]
+            })
+        }));
+        k
+    });
+    if !n_tb_s.is_power_of_two() {
+        return None;
+    }
+    let log2 = n_tb_s.trailing_zeros() as usize;
+    let idx = match tr_type {
+        TrType::DctII if (1..=6).contains(&log2) => log2 - 1,
+        TrType::DstVII if (2..=5).contains(&log2) => 6 + log2 - 2,
+        TrType::DctVIII if (2..=5).contains(&log2) => 10 + log2 - 2,
+        _ => return None,
+    };
+    Some(&kernels[idx])
+}
+
+/// [`one_d_transform`] into a caller-provided buffer (`y.len() >=
+/// n_tb_s`) — no allocation per column / row.
+///
+/// The sums are formed in wrapping 32-bit arithmetic. That is the
+/// value eq. 1177 / 1178 assign: the exact sum fits 64 bits (at most
+/// 64 terms of a 9-bit weight times a 32-bit input) and is stored into
+/// a 32-bit variable, i.e. taken modulo 2^32 — which is what wrapping
+/// multiplies and adds compute term by term.
+pub(crate) fn one_d_transform_into(
+    tr_type: TrType,
+    n_tb_s: usize,
+    non_zero_s: usize,
+    x: &[i32],
+    y: &mut [i32],
+) -> Result<()> {
+    if non_zero_s > n_tb_s {
+        return Err(Error::invalid(format!(
+            "h266 transform: nonZeroS={non_zero_s} > nTbS={n_tb_s}"
+        )));
+    }
+    if x.len() < non_zero_s {
+        return Err(Error::invalid(format!(
+            "h266 transform: input slice {} shorter than nonZeroS {non_zero_s}",
+            x.len()
+        )));
+    }
+    let Some(k) = kernel(tr_type, n_tb_s) else {
+        return Err(Error::unsupported(format!(
             "h266 transform: unsupported (trType={:?}, nTbS={n_tb_s})",
             tr_type
-        ))),
+        )));
+    };
+    let nz = non_zero_s.min(k.max_non_zero);
+    let x = &x[..nz];
+    for (y_i, row) in y[..k.n].iter_mut().zip(k.weights.chunks_exact(k.n)) {
+        let mut acc = 0i32;
+        for (w, v) in row[..nz].iter().zip(x) {
+            acc = acc.wrapping_add(w.wrapping_mul(*v));
+        }
+        *y_i = acc;
     }
+    Ok(())
 }
 
 /// Eq. 1178 multiply over a §8.7.4.5 table kept byte-for-byte as
@@ -498,6 +602,7 @@ pub fn one_d_transform(
 /// — coefficient index `r`, transformed-sample position `c` — so the
 /// output sample `y[ i ]` sums `matrix[ j ][ i ] · x[ j ]` over the
 /// coefficients `j`.
+#[cfg(test)]
 fn apply_matrix<const N: usize>(matrix: &[[i16; N]; N], non_zero_s: usize, x: &[i32]) -> Vec<i32> {
     let mut y = vec![0i32; N];
     for (i, y_i) in y.iter_mut().enumerate() {
@@ -825,6 +930,17 @@ pub fn inverse_transform_2d(
             n_tb_h
         )));
     }
+    if n_tb_w > 64 || n_tb_h > 64 || non_zero_w > n_tb_w || non_zero_h > n_tb_h {
+        return Err(Error::invalid(format!(
+            "h266 2D xfm: {n_tb_w}x{n_tb_h} block with a {non_zero_w}x{non_zero_h} non-zero \
+             region is outside the transform sizes"
+        )));
+    }
+    // r487 — one scratch column / row per call instead of a vector
+    // per transformed line; a line of zeros transforms to zeros and
+    // is skipped (the output buffers start zeroed).
+    let mut line_in = [0i32; 64];
+    let mut line_out = [0i32; 64];
     // Step 1 — vertical 1D transform for each non-zero column when
     // nTbH > 1. Result is `e[x][y]`, held as a row-major
     // `n_tb_w * n_tb_h` buffer.
@@ -832,13 +948,26 @@ pub fn inverse_transform_2d(
         let mut e = vec![0i32; n_tb_w * n_tb_h];
         for x in 0..non_zero_w {
             // Gather d[x][y] for y = 0..non_zero_h - 1.
-            let mut col = vec![0i32; non_zero_h];
+            let mut any = 0i32;
             for y in 0..non_zero_h {
-                col[y] = d[y * n_tb_w + x];
+                let v = d[y * n_tb_w + x];
+                line_in[y] = v;
+                any |= v;
             }
-            let out = one_d_transform(tr_type_ver, n_tb_h, non_zero_h, &col)?;
+            if any == 0 {
+                // Still validates the (type, size) pair.
+                one_d_transform_into(tr_type_ver, n_tb_h, 0, &[], &mut line_out)?;
+                continue;
+            }
+            one_d_transform_into(
+                tr_type_ver,
+                n_tb_h,
+                non_zero_h,
+                &line_in[..non_zero_h],
+                &mut line_out,
+            )?;
             for y in 0..n_tb_h {
-                e[y * n_tb_w + x] = out[y];
+                e[y * n_tb_w + x] = line_out[y];
             }
         }
         e
@@ -877,18 +1006,19 @@ pub fn inverse_transform_2d(
     // when nTbW == 1.
     let r = if n_tb_w > 1 {
         let mut r = vec![0i32; n_tb_w * n_tb_h];
-        let stride = if n_tb_h > 1 { non_zero_w } else { non_zero_w };
         for y in 0..n_tb_h {
             let row_slice = if n_tb_h > 1 {
-                &g[y * stride..y * stride + stride]
+                &g[y * non_zero_w..(y + 1) * non_zero_w]
             } else {
                 // nTbH == 1: single row g[0..non_zero_w].
                 &g[..non_zero_w]
             };
-            let out = one_d_transform(tr_type_hor, n_tb_w, non_zero_w, row_slice)?;
-            for x in 0..n_tb_w {
-                r[y * n_tb_w + x] = out[x];
+            if row_slice.iter().all(|&v| v == 0) {
+                one_d_transform_into(tr_type_hor, n_tb_w, 0, &[], &mut line_out)?;
+                continue;
             }
+            one_d_transform_into(tr_type_hor, n_tb_w, non_zero_w, row_slice, &mut line_out)?;
+            r[y * n_tb_w..(y + 1) * n_tb_w].copy_from_slice(&line_out[..n_tb_w]);
         }
         r
     } else {
@@ -1173,11 +1303,13 @@ pub fn scaling_and_transformation(
 /// frequencies (§7.3.11.5 `MtsZeroOutSigCoeffFlag` for explicit MTS,
 /// the §7.3.11.11 `cu_sbt_flag` zero-out arm for SBT). We enforce
 /// `nonZeroS ≤ 16` here.
+#[cfg(test)]
 fn apply_dst_vii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
     apply_split_32(&DST_VII_32_COL_0_15, &DST_VII_32_COL_16_31, non_zero_s, x)
 }
 
 /// 32-point DCT-VIII twin of [`apply_dst_vii_32`] (eqs. 1195 – 1198).
+#[cfg(test)]
 fn apply_dct_viii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
     apply_split_32(&DCT_VIII_32_COL_0_15, &DCT_VIII_32_COL_16_31, non_zero_s, x)
 }
@@ -1186,6 +1318,7 @@ fn apply_dct_viii_32(non_zero_s: usize, x: &[i32]) -> Vec<i32> {
 /// table pair: `lo` carries transformed-sample positions 0..15, `hi`
 /// positions 16..31, both with the coefficient index as the printed
 /// row.
+#[cfg(test)]
 fn apply_split_32(
     lo: &[[i16; 16]; 16],
     hi: &[[i16; 16]; 16],
@@ -1207,6 +1340,85 @@ fn apply_split_32(
 
 #[cfg(test)]
 mod tests {
+
+    /// r487 — the flattened kernels against the per-term reference
+    /// multiplies they replaced: every (type, size, nonZeroS) on
+    /// inputs that span the 16-bit coefficient range and beyond (the
+    /// 32-bit wrap-around included).
+    #[test]
+    fn flattened_kernels_match_the_per_term_reference() {
+        let mut state = 0x2545_f491u32;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..40 {
+            let wide = round % 4 == 3;
+            let x: Vec<i32> = (0..64)
+                .map(|_| {
+                    let r = rnd() as i32;
+                    if wide {
+                        r
+                    } else {
+                        (r >> 16).clamp(-32768, 32767)
+                    }
+                })
+                .collect();
+            for &n in &[2usize, 4, 8, 16, 32, 64] {
+                for nz in 0..=n {
+                    let got = one_d_transform(TrType::DctII, n, nz, &x).unwrap();
+                    // The reference accumulates in 64 bits and stores 32.
+                    assert_eq!(got, apply_dct_ii(n, nz, &x), "DCT-II {n} nz {nz}");
+                }
+            }
+            for nz in 0..=4 {
+                assert_eq!(
+                    one_d_transform(TrType::DstVII, 4, nz, &x).unwrap(),
+                    apply_matrix(&DST_VII_4, nz, &x)
+                );
+                assert_eq!(
+                    one_d_transform(TrType::DctVIII, 4, nz, &x).unwrap(),
+                    apply_matrix(&DCT_VIII_4, nz, &x)
+                );
+            }
+            for nz in 0..=8 {
+                assert_eq!(
+                    one_d_transform(TrType::DstVII, 8, nz, &x).unwrap(),
+                    apply_matrix(&DST_VII_8, nz, &x)
+                );
+                assert_eq!(
+                    one_d_transform(TrType::DctVIII, 8, nz, &x).unwrap(),
+                    apply_matrix(&DCT_VIII_8, nz, &x)
+                );
+            }
+            for nz in 0..=16 {
+                assert_eq!(
+                    one_d_transform(TrType::DstVII, 16, nz, &x).unwrap(),
+                    apply_matrix(&DST_VII_16, nz, &x)
+                );
+                assert_eq!(
+                    one_d_transform(TrType::DctVIII, 16, nz, &x).unwrap(),
+                    apply_matrix(&DCT_VIII_16, nz, &x)
+                );
+            }
+            for nz in 0..=32 {
+                assert_eq!(
+                    one_d_transform(TrType::DstVII, 32, nz, &x).unwrap(),
+                    apply_dst_vii_32(nz, &x)
+                );
+                assert_eq!(
+                    one_d_transform(TrType::DctVIII, 32, nz, &x).unwrap(),
+                    apply_dct_viii_32(nz, &x)
+                );
+            }
+        }
+        assert!(one_d_transform(TrType::DstVII, 64, 1, &[1]).is_err());
+        assert!(one_d_transform(TrType::DstVII, 2, 1, &[1]).is_err());
+        assert!(one_d_transform(TrType::DctII, 12, 1, &[1]).is_err());
+        assert!(one_d_transform(TrType::DctII, 128, 1, &[1]).is_err());
+    }
     use super::*;
 
     /// §7.3.11.4 — a 128×128 CU tiles into four 64×64 TBs. For a square
