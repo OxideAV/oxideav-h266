@@ -308,8 +308,8 @@ fn chroma_tools_do_not_lose_on_uncorrelated_chroma() {
     }
 }
 
-/// Black-box validation through `ffmpeg` (opaque process; a no-op
-/// where the binary is absent): the streams with the chroma decision
+/// Black-box validation through an installed decoder binary (opaque
+/// process; a no-op where it is absent): the streams with the chroma decision
 /// decode to the encoder's reconstruction.
 #[test]
 fn black_box_decoder_agrees_on_the_chroma_decision() {
@@ -319,7 +319,7 @@ fn black_box_decoder_agrees_on_the_chroma_decision() {
         .stderr(std::process::Stdio::null())
         .status();
     if !matches!(probe, Ok(s) if s.success()) {
-        eprintln!("ffmpeg not installed — black-box leg skipped");
+        eprintln!("black-box decoder not installed — leg skipped");
         return;
     }
     let dir = std::env::temp_dir().join(format!("oxideav-h266-r487-chroma-{}", std::process::id()));
