@@ -4,6 +4,19 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-h266/compare/v0.0.11...v0.0.12) - 2026-11-11
+
+### Other
+
+- r487 test wording — the black-box leg names no decoder
+- r487 encoder — chroma-mode bins priced from running context states; B-vs-P test on exact references
+- r487 worker budget — the adaptive loop filter runs its CTB rows on the ExecutionContext thread budget (identical output, 13 – 20 % wall on 1080p)
+- r487 decode throughput 3.3x, peak memory −42 % — shared reference pictures, per-sub-block ALF, cached triage switches, hoisted reference clamps, flattened transform kernels
+- r487 chroma mode decision in the encoder — cross-component linear-model modes + explicit chroma modes (−16.4 % bytes, +1.06 dB chroma on luma-correlated content)
+- r487 VUI + SEI (H.274) — colour description on the stream parameters, typed SEI payloads, decoded picture hash as a conformance oracle (1777/1777 pictures on 56/56 streams)
+- r487 fuzz crashes — SPS / PPS / PH range checks before the decode (24 artifacts, six panic sites)
+- API hygiene: non_exhaustive encoder/stream records, hide syntax-structure modules
+
 ### Changed
 
 - r487 — **decode throughput and memory**, bit-identical (the 56 conformance streams keep their per-plane MD5s and match their in-stream picture hashes): the corpus decodes in 86.1 CPU s instead of 283.3 (1777 pictures; 6.3 → 20.6 pictures per CPU second, one worker) at 283 MiB peak instead of 515 MiB. Reference list entries share the decoded picture and its motion field (`inter::ReferencePicture::frame` / `motion_field` are `Arc`s — construction sites wrap with `Arc::new`); the ALF resolves filter and padding rule per 4x4 sub-block and reads interior taps directly (luma four samples at a time, chroma, classification, CC-ALF); the `H266_DBG_*` / `H266_DUMP_*` / `H266_ENC_*` triage switches are consulted through one cached gate (sampled once per process — set them before the first picture); reference fetches load the wraparound / subpicture clamp state once per sample and read in-picture tap runs as slices; DMVR bilinear arrays precompute their clamped rows / columns; the inverse transform multiplies through flattened per-(type, size) kernels without per-line allocation; CCLM borrows the luma plane instead of copying it per transform block; SAO queries the region map on the CTB ring only. The stills encoder inherits the transform / switch work (four-picture bench 12.7 → 8.5 CPU s with the chroma decision on).
