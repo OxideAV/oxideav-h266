@@ -176,7 +176,7 @@ fn apply_ciip_combine_to_plane(
 ///   (extending into the top-right neighbour), `left` is empty.
 /// * `INTRA_L_CCLM`  — `top` is empty, `left` has up to `n_tb_h + n_tb_w`
 ///   samples (extending into the bottom-left neighbour).
-fn cclm_chroma_neighbours(
+pub(crate) fn cclm_chroma_neighbours(
     plane: &crate::reconstruct::PicturePlane,
     x0: usize,
     y0: usize,

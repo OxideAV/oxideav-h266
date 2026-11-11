@@ -470,6 +470,16 @@ pub struct EncoderConfig {
     /// [`Self::lossless`]); `sps_bdpcm_enabled_flag` follows. Default
     /// `true`; no effect on lossy pictures.
     pub intra_bdpcm: bool,
+    /// r487 — cross-component linear-model chroma prediction
+    /// (§8.4.5.2.14): `sps_cclm_enabled_flag = 1` and the three CCLM
+    /// modes in the chroma mode decision of every lossy CU that carries
+    /// chroma. Default on; ignored for 4:0:0.
+    pub intra_cclm: bool,
+    /// r487 — the chroma mode decision also ranks the four explicit
+    /// `intra_chroma_pred_mode` values (PLANAR / vertical / horizontal
+    /// / DC) next to the direct mode. Default on. With this and
+    /// [`Self::intra_cclm`] off every CU codes the direct mode.
+    pub intra_chroma_modes: bool,
     /// r487 — the Rec. ITU-T H.274 `vui_parameters()` written into the
     /// SPS (`sps_vui_parameters_present_flag = 1`): colour description,
     /// sample aspect ratio, chroma sample location, source scan type.
@@ -513,6 +523,8 @@ impl EncoderConfig {
             intra_bdpcm: true,
             vui: None,
             picture_hash: None,
+            intra_cclm: true,
+            intra_chroma_modes: true,
         }
     }
 
@@ -1054,7 +1066,7 @@ impl VvcEncoder {
         bw.write_bit(0); // mrl
         bw.write_bit(self.config.intra_mip as u8); // sps_mip_enabled_flag (r477)
         if chroma {
-            bw.write_bit(0); // cclm (chroma_format_idc != 0)
+            bw.write_bit(self.config.intra_cclm as u8); // sps_cclm_enabled_flag (r487)
         }
         if self.config.chroma_format_idc == 1 {
             // chroma_format_idc == 1 → chroma-collocated flags.

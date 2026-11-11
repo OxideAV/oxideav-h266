@@ -235,6 +235,26 @@ struct PreparedLumaTb {
     /// coded through `residual_ts_coding()` without a
     /// `transform_skip_flag`; `luma_mode` reads ANGULAR18 / ANGULAR50.
     bdpcm: Option<bool>,
+    /// r487 — how the chroma TBs are predicted and signalled
+    /// (`cclm_mode_flag` / `cclm_mode_idx` / `intra_chroma_pred_mode`).
+    chroma_choice: ChromaChoice,
+}
+
+/// r487 — the chroma intra mode of a CU as the §7.3.11.5 syntax
+/// states it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ChromaChoice {
+    /// `intra_chroma_pred_mode = 4`: the luma mode (Table 20's direct
+    /// mode).
+    #[default]
+    Dm,
+    /// `intra_chroma_pred_mode = 0..=3`: PLANAR / ANGULAR50 /
+    /// ANGULAR18 / DC, re-targeted to ANGULAR66 when the luma mode
+    /// already is that mode (Table 20).
+    Explicit(u8),
+    /// `cclm_mode_flag = 1` with `cclm_mode_idx = 0..=2`:
+    /// INTRA_LT_CCLM / INTRA_L_CCLM / INTRA_T_CCLM (§8.4.5.2.14).
+    Cclm(u8),
 }
 
 /// r477 — the intra coding tools the emitted SPS enables for this
@@ -253,6 +273,12 @@ struct IntraTools {
     /// within `MaxTsSize` (the lossless pipeline, which enables
     /// transform skip).
     bdpcm: bool,
+    /// r487 — `sps_cclm_enabled_flag`: `cclm_mode_flag` opens the
+    /// chroma mode of every CU that carries chroma.
+    cclm: bool,
+    /// r487 — the chroma decision also ranks the four explicit
+    /// `intra_chroma_pred_mode` values (no SPS flag — always legal).
+    chroma_modes: bool,
 }
 
 /// `MaxTsSize` of the emitted SPS (`sps_log2_transform_skip_max_size_minus2
@@ -744,6 +770,9 @@ struct IntraModeCtxs {
     bdpcm_luma: Vec<ContextModel>,
     bdpcm_dir: Vec<ContextModel>,
     bdpcm_chroma: Vec<ContextModel>,
+    /// r487 — `cclm_mode_flag` / `cclm_mode_idx` (Tables 79 / 80).
+    cclm_flag: Vec<ContextModel>,
+    cclm_idx: Vec<ContextModel>,
 }
 
 impl IntraModeCtxs {
@@ -758,6 +787,8 @@ impl IntraModeCtxs {
             bdpcm_luma: init_contexts(SyntaxCtx::IntraBdpcmLumaFlag, slice_qp_y),
             bdpcm_dir: init_contexts(SyntaxCtx::IntraBdpcmLumaDirFlag, slice_qp_y),
             bdpcm_chroma: init_contexts(SyntaxCtx::IntraBdpcmChromaFlag, slice_qp_y),
+            cclm_flag: init_contexts(SyntaxCtx::CclmModeFlag, slice_qp_y),
+            cclm_idx: init_contexts(SyntaxCtx::CclmModeIdx, slice_qp_y),
         }
     }
 }
@@ -804,8 +835,10 @@ struct LumaIntraSyntax<'a> {
     bdpcm: Option<bool>,
     /// The chroma TB size (`cbWidth / SubWidthC`, `cbHeight /
     /// SubHeightC`) when the CU carries chroma — the
-    /// `intra_bdpcm_chroma_flag` gate and the DM bin.
+    /// `intra_bdpcm_chroma_flag` gate and the chroma mode bins.
     chroma: Option<(usize, usize)>,
+    /// r487 — the chroma mode to signal.
+    chroma_choice: ChromaChoice,
 }
 
 /// r474 — the §7.3.11.5 luma intra-mode cascade of one CU, resolved
@@ -987,9 +1020,35 @@ fn emit_chroma_mode_bins(
         let n = ictx.bdpcm_chroma.len() - 1;
         enc.encode_decision(&mut ictx.bdpcm_chroma[inc.min(n)], 0)?;
     }
-    let inc = ctx_inc_intra_chroma_pred_mode() as usize;
-    let n = ictx.chroma_mode.len() - 1;
-    enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?; // DM
+    // §7.3.11.5 — `cclm_mode_flag` (when the SPS enables CCLM; the
+    // single-tree §8.4.4 CclmEnabled derivation is the SPS flag), then
+    // `cclm_mode_idx` (TR cMax = 2: bin 0 context-coded, bin 1 bypass)
+    // or `intra_chroma_pred_mode` (Table 130: "0" = 4, else "1" +
+    // FL(2)). I slices: initType 0, the first context of each table.
+    if lx.tools.cclm {
+        let flag = u32::from(matches!(lx.chroma_choice, ChromaChoice::Cclm(_)));
+        enc.encode_decision(&mut ictx.cclm_flag[0], flag)?;
+    }
+    match lx.chroma_choice {
+        ChromaChoice::Cclm(idx) => {
+            enc.encode_decision(&mut ictx.cclm_idx[0], u32::from(idx != 0))?;
+            if idx != 0 {
+                enc.encode_bypass(u32::from(idx == 2))?;
+            }
+        }
+        ChromaChoice::Dm => {
+            let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+            let n = ictx.chroma_mode.len() - 1;
+            enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?;
+        }
+        ChromaChoice::Explicit(v) => {
+            let inc = ctx_inc_intra_chroma_pred_mode() as usize;
+            let n = ictx.chroma_mode.len() - 1;
+            enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 1)?;
+            enc.encode_bypass(u32::from(v >> 1 & 1))?;
+            enc.encode_bypass(u32::from(v & 1))?;
+        }
+    }
     Ok(())
 }
 
@@ -1510,6 +1569,7 @@ fn estimate_luma_tb_bits(
         tools,
         isp: trial.isp,
         bdpcm: trial.bdpcm,
+        chroma_choice: ChromaChoice::Dm,
     };
     let mut qp_state = QpDeltaState::new(false, qp);
     emit_tu_with_cbf(&mut enc, &mut rctx, &mut ictx, &tb, &mut qp_state, rc, nbr)?;
@@ -2181,6 +2241,7 @@ fn emit_tu_with_cbf(
             isp: tb.isp,
             bdpcm: tb.bdpcm,
             chroma: (tb.n_tb_chroma_w > 0).then_some((tb.n_tb_chroma_w, tb.n_tb_chroma_h)),
+            chroma_choice: tb.chroma_choice,
         },
     )?;
     if let Some(split) = tb.isp {
@@ -2600,6 +2661,173 @@ fn prepare_chroma_tb_pred(
     Ok(levels)
 }
 
+/// r487 — §8.4.5.2.14 cross-component linear-model prediction of one
+/// chroma TB from the CU's reconstructed luma, decoder-mirrored: the
+/// neighbouring chroma row / column (with the §6.4.4 per-cell probe of
+/// the top-right / below-left extensions) from the eq. 1212 mask and
+/// the tile / WPP region, the collocated luma from the reconstruction
+/// plane as it stands (the CU's own luma is already in it).
+#[allow(clippy::too_many_arguments)]
+fn predict_block_cclm(
+    rec: &PictureBuffer,
+    avail: &EncAvail,
+    c_idx: u32,
+    cx: usize,
+    cy: usize,
+    n_w: usize,
+    n_h: usize,
+    mode: u32,
+) -> Result<Vec<i16>> {
+    const CTB_SIZE: usize = 128;
+    let plane = if c_idx == 1 { &rec.cb } else { &rec.cr };
+    let (rx0, ry0, rx1, ry1, rcap) = avail.region_for(c_idx);
+    let (cw, ch) = (avail.cw, avail.ch);
+    let cell_avail = |x: usize, y: usize| -> bool {
+        let (xi, yi) = (x as i32, y as i32);
+        if x >= cw || y >= ch || xi < rx0 || yi < ry0 || xi >= rx1 || yi >= ry1 || xi >= rcap {
+            return false;
+        }
+        avail.chroma[y * cw + x]
+    };
+    let above_avail = cy > 0 && cell_avail(cx, cy - 1);
+    let left_avail = cx > 0 && cell_avail(cx - 1, cy);
+    let (top, left) = crate::ctu::cclm_chroma_neighbours(
+        plane,
+        cx,
+        cy,
+        n_w,
+        n_h,
+        above_avail,
+        left_avail,
+        mode,
+        &cell_avail,
+    );
+    crate::cclm::predict_cclm(&crate::cclm::CclmInputs {
+        mode,
+        n_tb_w: n_w,
+        n_tb_h: n_h,
+        sub_width_c: avail.sub_w as u32,
+        sub_height_c: avail.sub_h as u32,
+        // The emitted SPS writes sps_chroma_vertical_collocated_flag = 0.
+        chroma_vertical_collocated_flag: false,
+        b_ctu_boundary: (cy * avail.sub_h).is_multiple_of(CTB_SIZE),
+        bit_depth: plane.bit_depth,
+        neigh_top_chroma: &top,
+        neigh_left_chroma: &left,
+        luma_plane: crate::cclm::LumaPlane {
+            samples: &rec.luma.samples,
+            stride: rec.luma.stride,
+            width: rec.luma.width,
+            height: rec.luma.height,
+        },
+        x_tb_c: cx,
+        y_tb_c: cy,
+    })
+}
+
+/// r487 — the chroma intra mode of a `ChromaChoice` given the CU's
+/// luma mode: Table 20 (with the §8.4.3 4:2:2 re-targeting) for the
+/// direct and explicit modes, 81 + idx for the linear-model modes.
+fn chroma_mode_of(avail: &EncAvail, luma_mode: u32, choice: ChromaChoice) -> u32 {
+    match choice {
+        ChromaChoice::Dm => chroma_dm_mode(avail, luma_mode),
+        ChromaChoice::Explicit(v) => chroma_dm_mode(
+            avail,
+            crate::leaf_cu::derive_intra_pred_mode_c(u32::from(v), luma_mode),
+        ),
+        ChromaChoice::Cclm(idx) => crate::cclm::INTRA_LT_CCLM + u32::from(idx),
+    }
+}
+
+/// r487 — the Cb and Cr predictions of a decided chroma mode.
+type ChromaPreds = (Vec<i16>, Vec<i16>);
+
+/// r487 — chroma mode decision for one CU. Every candidate the SPS
+/// allows is predicted on both chroma planes from the references as
+/// they stand before the CU's chroma is coded, and ranked by the
+/// Hadamard SATD of the two residuals plus the mode's bin count; the
+/// winner's predictions are returned so the TBs are coded from exactly
+/// what was measured. `(ChromaChoice::Dm, None)` when only the direct
+/// mode is in play.
+fn decide_chroma_mode(
+    src: &PictureBuffer,
+    rec: &PictureBuffer,
+    avail: &EncAvail,
+    luma_mode: u32,
+    (cx, cy, n_w, n_h): (usize, usize, usize, usize),
+    cu_qp: i32,
+) -> Result<(ChromaChoice, Option<ChromaPreds>)> {
+    let tools = avail.tools;
+    if !tools.cclm && !tools.chroma_modes {
+        return Ok((ChromaChoice::Dm, None));
+    }
+    let mut candidates = vec![ChromaChoice::Dm];
+    if tools.chroma_modes {
+        candidates.extend((0..4).map(ChromaChoice::Explicit));
+    }
+    if tools.cclm {
+        candidates.extend((0..3).map(ChromaChoice::Cclm));
+    }
+    let bd = rec.cb.bit_depth;
+    let lambda_satd = (lambda_for_qp(cu_qp) * f64::from(1u32 << (2 * (bd - 8)))).sqrt();
+    let flag_bits = if tools.cclm { 1.0 } else { 0.0 };
+    let mut residual = vec![0i32; n_w * n_h];
+    let mut best: Option<(f64, ChromaChoice, Vec<i16>, Vec<i16>)> = None;
+    for choice in candidates {
+        let mode = chroma_mode_of(avail, luma_mode, choice);
+        let mut preds: [Vec<i16>; 2] = [Vec::new(), Vec::new()];
+        let mut satd = 0u64;
+        for (slot, c_idx) in preds.iter_mut().zip([1u32, 2]) {
+            let (src_plane, rec_plane) = if c_idx == 1 {
+                (&src.cb, &rec.cb)
+            } else {
+                (&src.cr, &rec.cr)
+            };
+            let pred = match choice {
+                ChromaChoice::Cclm(_) => {
+                    predict_block_cclm(rec, avail, c_idx, cx, cy, n_w, n_h, mode)?
+                }
+                _ => predict_block(
+                    rec_plane,
+                    &avail.chroma,
+                    avail.cw,
+                    avail.ch,
+                    avail.region_for(c_idx),
+                    cx,
+                    cy,
+                    n_w,
+                    n_h,
+                    c_idx,
+                    mode,
+                )?,
+            };
+            for ty in 0..n_h {
+                for tx in 0..n_w {
+                    let p = i32::from(pred[ty * n_w + tx]);
+                    let s = src_plane.get(cx + tx, cy + ty).map(i32::from).unwrap_or(p);
+                    residual[ty * n_w + tx] = s - p;
+                }
+            }
+            satd += hadamard_satd(&residual, n_w, n_h);
+            *slot = pred;
+        }
+        let mode_bits = flag_bits
+            + match choice {
+                ChromaChoice::Dm => 1.0,
+                ChromaChoice::Explicit(_) => 3.0,
+                ChromaChoice::Cclm(0) => 1.0,
+                ChromaChoice::Cclm(_) => 2.0,
+            };
+        let cost = satd as f64 + lambda_satd * mode_bits;
+        if best.as_ref().is_none_or(|b| cost < b.0) {
+            let [cb, cr] = preds;
+            best = Some((cost, choice, cb, cr));
+        }
+    }
+    let (_, choice, cb, cr) = best.expect("the direct mode is always a candidate");
+    Ok((choice, Some((cb, cr))))
+}
+
 /// r474 — §8.7.1 chroma QP through the identity `ChromaQpTable` the
 /// emitted SPS derives to: `qPCb = Clip3(−QpBdOffset, 63, QpY)` (no
 /// PPS / SH / CU offsets on this encoder). The caller adds
@@ -2883,6 +3111,7 @@ fn prepare_leaf_cu(
             tools,
             isp,
             bdpcm: None,
+            chroma_choice: ChromaChoice::Dm,
         }));
     }
     // §8.4.3 — DM chroma of a MIP CU reads PLANAR, except a 4:4:4
@@ -2917,7 +3146,30 @@ fn prepare_leaf_cu(
                 None => Ok(None),
             }
         };
-    let cb_pred = chroma_pred(&rec.cb, avail, 1)?;
+    // r487 — the chroma mode decision (direct mode, the four explicit
+    // modes, the three cross-component linear-model modes), made on
+    // both chroma planes before either is coded; a 4:4:4 MIP CU keeps
+    // the direct mode (its chroma is the luma matrix prediction).
+    let (chroma_choice, decided) = if mip_direct.is_none() {
+        decide_chroma_mode(
+            src,
+            rec,
+            avail,
+            luma_mode,
+            (chr_x, chr_y, n_tb_chroma_w, n_tb_chroma_h),
+            cu_qp,
+        )?
+    } else {
+        (ChromaChoice::Dm, None)
+    };
+    let (decided_cb, decided_cr) = match decided {
+        Some((cb, cr)) => (Some(cb), Some(cr)),
+        None => (None, None),
+    };
+    let cb_pred = match decided_cb {
+        Some(p) => Some(p),
+        None => chroma_pred(&rec.cb, avail, 1)?,
+    };
     let cb_levels = prepare_chroma_tb_pred(
         &src.cb,
         &mut rec.cb,
@@ -2933,7 +3185,10 @@ fn prepare_leaf_cu(
         chroma_scale,
         cb_pred,
     )?;
-    let cr_pred = chroma_pred(&rec.cr, avail, 2)?;
+    let cr_pred = match decided_cr {
+        Some(p) => Some(p),
+        None => chroma_pred(&rec.cr, avail, 2)?,
+    };
     let cr_levels = prepare_chroma_tb_pred(
         &src.cr,
         &mut rec.cr,
@@ -2965,6 +3220,7 @@ fn prepare_leaf_cu(
         tools,
         isp,
         bdpcm: None,
+        chroma_choice,
     }))
 }
 
@@ -3001,6 +3257,7 @@ fn prepare_leaf_cu_lossless(
             tools: avail.tools,
             isp: None,
             bdpcm,
+            chroma_choice: ChromaChoice::Dm,
         }));
     }
     let chroma_mode = chroma_dm_mode(avail, luma_mode);
@@ -3046,6 +3303,7 @@ fn prepare_leaf_cu_lossless(
         tools: avail.tools,
         isp: None,
         bdpcm,
+        chroma_choice: ChromaChoice::Dm,
     }))
 }
 
@@ -4844,6 +5102,11 @@ pub struct EncodeStats {
     pub isp_hor_cus: u32,
     /// CUs coded with `intra_bdpcm_luma_flag = 1` (§7.3.11.5).
     pub bdpcm_cus: u32,
+    /// r487 — CUs coded with `cclm_mode_flag = 1` (§8.4.5.2.14).
+    pub cclm_cus: u32,
+    /// r487 — CUs coded with an explicit `intra_chroma_pred_mode`
+    /// (0..=3) instead of the direct mode.
+    pub explicit_chroma_cus: u32,
 }
 
 /// r477 — [`encode_idr_with_residuals_cfg`] that also returns the
@@ -4995,6 +5258,8 @@ fn encode_idr_impl(
         // BDPCM rides transform skip, which the SPS enables on the
         // lossless path only.
         bdpcm: config.intra_bdpcm && config.lossless,
+        cclm: config.intra_cclm && config.chroma_format_idc != 0,
+        chroma_modes: config.intra_chroma_modes,
     };
     // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
     // partition fields; drive every split-bin presence + ctxInc.
@@ -5239,6 +5504,11 @@ fn encode_idr_impl(
                         }
                         if tb.bdpcm.is_some() {
                             stats.bdpcm_cus += 1;
+                        }
+                        match tb.chroma_choice {
+                            ChromaChoice::Dm => {}
+                            ChromaChoice::Explicit(_) => stats.explicit_chroma_cus += 1,
+                            ChromaChoice::Cclm(_) => stats.cclm_cus += 1,
                         }
                     });
                     accumulate_deblock_cus(&cu, tb_x, tb_y, &mut all_deblock_cus);
@@ -7614,6 +7884,7 @@ mod tests {
                 tools: IntraTools::default(),
                 isp: None,
                 bdpcm: None,
+                chroma_choice: ChromaChoice::Dm,
             })
         };
         let a = mk_leaf(16, 64);

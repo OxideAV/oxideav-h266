@@ -92,6 +92,12 @@ pub struct H266EncoderOptions {
     /// Block-based delta pulse code modulation in the intra decision
     /// (default true).
     pub bdpcm: bool,
+    /// Cross-component linear-model chroma prediction in the chroma
+    /// mode decision (default true).
+    pub cclm: bool,
+    /// The explicit `intra_chroma_pred_mode` values in the chroma mode
+    /// decision (default true).
+    pub chroma_modes: bool,
     /// Decoded picture hash SEI message after every picture: `none`
     /// (default), `md5`, `crc` or `checksum`.
     pub picture_hash: String,
@@ -122,6 +128,8 @@ impl Default for H266EncoderOptions {
             mip: true,
             isp: false,
             bdpcm: true,
+            cclm: true,
+            chroma_modes: true,
             picture_hash: "none".to_string(),
         }
     }
@@ -220,6 +228,18 @@ impl CodecOptionsStruct for H266EncoderOptions {
             help: "block-based delta pulse code modulation candidates in the intra decision",
         },
         OptionField {
+            name: "cclm",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "cross-component linear-model chroma prediction in the chroma mode decision",
+        },
+        OptionField {
+            name: "chroma_modes",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "explicit chroma modes (planar / vertical / horizontal / DC) in the chroma mode decision",
+        },
+        OptionField {
             name: "picture_hash",
             kind: OptionKind::Enum(&["none", "md5", "crc", "checksum"]),
             default: OptionValue::String(String::new()),
@@ -244,6 +264,8 @@ impl CodecOptionsStruct for H266EncoderOptions {
             "mip" => self.mip = value.as_bool()?,
             "isp" => self.isp = value.as_bool()?,
             "bdpcm" => self.bdpcm = value.as_bool()?,
+            "cclm" => self.cclm = value.as_bool()?,
+            "chroma_modes" => self.chroma_modes = value.as_bool()?,
             "picture_hash" => self.picture_hash = value.as_str()?.to_string(),
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -427,6 +449,8 @@ impl H266CodecEncoder {
         config.intra_mip = opts.mip;
         config.intra_isp = opts.isp;
         config.intra_bdpcm = opts.bdpcm;
+        config.intra_cclm = opts.cclm;
+        config.intra_chroma_modes = opts.chroma_modes;
         config.picture_hash = match opts.picture_hash.as_str() {
             "" | "none" => None,
             "md5" => Some(PictureHashMethod::Md5),

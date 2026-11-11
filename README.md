@@ -133,6 +133,8 @@ converts ahead of the encoder.
 | `mip` | bool | true | matrix-based intra prediction candidates |
 | `isp` | bool | false | intra sub-partition candidates (opt-in, see below) |
 | `bdpcm` | bool | true | BDPCM candidates on the lossless path |
+| `cclm` | bool | true | cross-component linear-model modes in the chroma mode decision |
+| `chroma_modes` | bool | true | explicit chroma modes (planar / vertical / horizontal / DC) in the chroma mode decision |
 | `picture_hash` | `none` / `md5` / `crc` / `checksum` | `none` | a decoded picture hash SEI message (of the encoder's reconstruction) after every picture |
 
 The stream's `CodecParameters::color_signal` is written as the SPS VUI
@@ -642,6 +644,35 @@ plus a substantial P + B-slice merge subset:
 An IDR-frame encoder pipeline (`encode_idr_with_residuals_cfg`) builds
 an Annex-B bitstream with real coded residuals, deblock, SAO, ALF, and
 CC-ALF.
+
+r487 — **chroma mode decision** (`EncoderConfig::intra_cclm` /
+`intra_chroma_modes`, both default on; `EncodeStats::cclm_cus` /
+`explicit_chroma_cus`): until r487 every CU coded its chroma in the
+direct mode (the luma mode). Each lossy CU now ranks, on both chroma
+planes together (Hadamard SATD of the two residuals + the mode's bins):
+the direct mode, the four explicit `intra_chroma_pred_mode` values
+(Table 20, ANGULAR66 re-targeting, 4:2:2 mapping), and the three
+**cross-component linear-model** modes of §8.4.5.2.14 (LT / L / T:
+chroma predicted from the CU's reconstructed luma through the
+`a · pDsY + b` model fitted on the neighbours), with
+`sps_cclm_enabled_flag`, `cclm_mode_flag` and `cclm_mode_idx` on the
+wire. 256x192 pictures whose chroma follows the luma structure,
+direct mode only → decision on (`tests/r487_chroma_tools.rs`):
+
+| Format | QP 22 | QP 32 | QP 37 |
+| --- | --- | --- | --- |
+| 4:2:0 | 17762 → 16550 B (−6.8 %), chroma 41.77 → 41.78 dB | 6787 → 5680 B (−16.3 %), 34.77 → 35.77 dB | 3318 → 2623 B (−20.9 %), 31.13 → 32.95 dB |
+| 4:2:2 | 21052 → 18358 B (−12.8 %), 41.99 → 41.91 dB | 7798 → 5613 B (−28.0 %), 35.51 → 37.16 dB | 3678 → 2681 B (−27.1 %), 32.17 → 33.92 dB |
+| 4:4:4 | 26597 → 23264 B (−12.5 %), 42.18 → 42.06 dB | 9523 → 6253 B (−34.3 %), 36.22 → 37.70 dB | 4081 → 3083 B (−24.5 %), 32.28 → 34.32 dB |
+
+Nine cells together: 100596 → 84105 B (**−16.4 %**) at +1.06 dB mean
+chroma PSNR; 55 – 90 % of the CUs elect a linear-model mode. On chroma
+that does not follow the luma the decision still gains a little
+(192x128, −0.3 … −6.9 % bytes within ±0.2 dB chroma). Every stream
+decodes byte-exact through this crate's decoder and a black-box
+decoder in 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, with the MTT
+pickers, tiles, WPP, dependent quantisation, sign hiding and ISP. The
+lossless path and 4:4:4 matrix-predicted CUs keep the direct mode.
 
 r477 — **intra tools in the decision** (`EncoderConfig::intra_mip` /
 `intra_isp` / `intra_bdpcm`; `encode_idr_with_stats_cfg` reports the

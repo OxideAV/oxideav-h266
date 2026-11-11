@@ -50,13 +50,16 @@ fn encoder_pipeline_cfg() -> AlfSyntaxConfig {
 /// codes before every transform_unit(): `intra_luma_mpm_flag`, then
 /// either `intra_luma_not_planar_flag` + `intra_luma_mpm_idx` (bypass
 /// TR, cMax = 4) or `intra_luma_mpm_remainder` (bypass TB, cMax = 60),
-/// and `intra_chroma_pred_mode` = DM ("0" ctx bin). Since r474 the
-/// luma mode is chosen per CU, so the reader mirrors the full cascade
-/// and only pins the DM chroma choice.
+/// and the chroma mode. Since r474 the luma mode is chosen per CU and
+/// since r487 the chroma mode too (`cclm_mode_flag` + `cclm_mode_idx`
+/// or `intra_chroma_pred_mode`), so the reader mirrors the full
+/// cascade.
 struct IntraCascadeCtxs {
     mpm: Vec<oxideav_h266::cabac::ContextModel>,
     np: Vec<oxideav_h266::cabac::ContextModel>,
     cm: Vec<oxideav_h266::cabac::ContextModel>,
+    cclm_flag: Vec<oxideav_h266::cabac::ContextModel>,
+    cclm_idx: Vec<oxideav_h266::cabac::ContextModel>,
 }
 
 fn intra_cascade_ctxs(slice_qp: i32) -> IntraCascadeCtxs {
@@ -65,6 +68,8 @@ fn intra_cascade_ctxs(slice_qp: i32) -> IntraCascadeCtxs {
         mpm: init_contexts(SyntaxCtx::IntraLumaMpmFlag, slice_qp),
         np: init_contexts(SyntaxCtx::IntraLumaNotPlanarFlag, slice_qp),
         cm: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp),
+        cclm_flag: init_contexts(SyntaxCtx::CclmModeFlag, slice_qp),
+        cclm_idx: init_contexts(SyntaxCtx::CclmModeIdx, slice_qp),
     }
 }
 
@@ -101,10 +106,22 @@ fn read_intra_dc_cascade(
             let _ = dec.decode_bypass().unwrap();
         }
     }
-    let b = dec
-        .decode_decision(&mut icx.cm[ctx_inc_intra_chroma_pred_mode() as usize])
-        .unwrap();
-    assert_eq!(b, 0, "pipeline CU signals DM chroma");
+    // r487 — the chroma mode: `cclm_mode_flag` (the emitted SPS
+    // enables CCLM), then `cclm_mode_idx` (TR cMax = 2) or
+    // `intra_chroma_pred_mode` (Table 130).
+    if dec.decode_decision(&mut icx.cclm_flag[0]).unwrap() == 1 {
+        if dec.decode_decision(&mut icx.cclm_idx[0]).unwrap() == 1 {
+            let _ = dec.decode_bypass().unwrap();
+        }
+    } else {
+        let b = dec
+            .decode_decision(&mut icx.cm[ctx_inc_intra_chroma_pred_mode() as usize])
+            .unwrap();
+        if b == 1 {
+            let _ = dec.decode_bypass().unwrap();
+            let _ = dec.decode_bypass().unwrap();
+        }
+    }
 }
 
 /// Round-45 — encode a 4×3 grid of mixed ALF decisions, decode it back,
@@ -1360,7 +1377,7 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
     use oxideav_h266::cabac::ArithDecoder;
     use oxideav_h266::coding_tree::SplitAllows;
     use oxideav_h266::coding_tree::TreeCtxs;
-    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals;
+    use oxideav_h266::encoder_pipeline::encode_idr_with_residuals_cfg;
     use oxideav_h266::picture_header::parse_picture_header_stateful;
     use oxideav_h266::pps::parse_pps;
     use oxideav_h266::reconstruct::PictureBuffer;
@@ -1380,7 +1397,16 @@ fn round52_constant_qp_path_round_trips_zero_delta() {
             src.luma.samples[y * src.luma.stride + x] = if x < 64 { 60 } else { 200 };
         }
     }
-    let (bs, _) = encode_idr_with_residuals(&src, 26).unwrap();
+    // The walk below reads the cascade without an `intra_mip_flag`
+    // bin and expects one CU per 64x64 quadrant: MIP / ISP stay off in
+    // the SPS and the CU-size decision is pinned. (With the default
+    // configuration the hand-rolled reader had been out of step with
+    // the stream since r477 and only agreed by coincidence.)
+    let mut cfg = oxideav_h266::encoder::EncoderConfig::new(128, 128);
+    cfg.rdo_cu_split = false;
+    cfg.intra_mip = false;
+    cfg.intra_isp = false;
+    let (bs, _) = encode_idr_with_residuals_cfg(&src, 26, cfg).unwrap();
 
     let nals: Vec<_> = iter_annex_b(&bs).collect();
     let sps = parse_sps(&extract_rbsp(
