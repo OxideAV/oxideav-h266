@@ -66,8 +66,8 @@ use oxideav_core::options::{
     CodecOptionsStruct, OptionField, OptionKind, OptionValue, parse_options,
 };
 use oxideav_core::{
-    CodecId, CodecParameters, ColorSignal, DecoderLimits, Error, Frame, Packet, PixelFormat,
-    Rational, Result, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, ColorSignal, DecoderLimits, Error, ExecutionContext, Frame, Packet,
+    PixelFormat, Rational, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::CODEC_ID_STR;
@@ -725,6 +725,12 @@ impl Decoder for H266Decoder {
         self.clock_anchor = None;
         self.eos = false;
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        // The budget bounds the per-picture fan-out (CTB rows of the
+        // in-loop filter stage); `effective_workers` clamps it.
+        self.inner.set_threads(ctx.effective_workers(usize::MAX));
     }
 
     fn output_pixel_format(&self) -> Option<PixelFormat> {

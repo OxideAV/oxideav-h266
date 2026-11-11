@@ -252,6 +252,26 @@ pub(crate) fn apply_alf_regions(
     tile_bounds: Option<(&[u32], &[u32])>,
     region: Option<&LfRegionMap>,
 ) {
+    apply_alf_regions_with_workers(out, alf_pic, cfg, binding, tile_bounds, region, 1)
+}
+
+/// r487 — [`apply_alf_regions`] on up to `workers` threads.
+///
+/// Every CTB is filtered from the pre-ALF snapshots only (§8.8.5.1)
+/// and writes nothing but its own samples, so CTB rows are
+/// independent: the rows are dealt out in contiguous groups, each
+/// worker owning the sample rows of its group in all three planes.
+/// The result does not depend on `workers`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_alf_regions_with_workers(
+    out: &mut PictureBuffer,
+    alf_pic: &AlfPicture,
+    cfg: &AlfConfig,
+    binding: &AlfApsBinding<'_>,
+    tile_bounds: Option<(&[u32], &[u32])>,
+    region: Option<&LfRegionMap>,
+    workers: usize,
+) {
     if crate::dbg_env::var_os("H266_DBG_ALF_CTB").is_some() {
         eprintln!(
             "ALF apply: enabled={} all_off={} cb={} cr={} cc_cb={} cc_cr={}",
@@ -295,149 +315,289 @@ pub(crate) fn apply_alf_regions(
         .with_region(region)
         .clamp_to_plane(out.cb.width, out.cb.height);
 
-    for ry in 0..alf_pic.pic_height_in_ctbs_y {
-        for rx in 0..alf_pic.pic_width_in_ctbs_y {
-            let p = alf_pic.get(rx, ry);
-            if crate::dbg_env::var_os("H266_DBG_ALF_CTB").is_some() {
-                eprintln!(
-                    "ALF ctb ({rx},{ry}): luma_on={} set={} cb_on={} cb_alt={} cr_on={} cr_alt={} cc_cb={} cc_cr={}",
-                    p.luma_on,
-                    p.luma_filt_set_idx,
-                    p.cb_on,
-                    p.cb_alt_idx,
-                    p.cr_on,
-                    p.cr_alt_idx,
-                    p.cc_cb_idc,
-                    p.cc_cr_idc
-                );
-            }
-            if p.luma_on {
-                if let Some(filters) = resolve_luma_filter_set(p.luma_filt_set_idx, binding) {
-                    // §8.8.5.3 — derive the per-4×4-sub-block (filtIdx,
-                    // transposeIdx) grid for this CTB. Reads come from
-                    // the pre-ALF snapshot per §8.8.5.1.
-                    let cls = derive_luma_classification(
-                        &luma_pre,
-                        out.luma.stride,
-                        out.luma.width as i32,
-                        out.luma.height as i32,
-                        regions_y.clone(),
-                        rx,
-                        ry,
-                        ctb_size_y,
-                        cfg.bit_depth,
-                    );
-                    apply_alf_luma_ctb(
-                        &mut out.luma,
-                        &luma_pre,
-                        &regions_y,
-                        rx,
-                        ry,
-                        ctb_size_y,
-                        cfg.bit_depth,
-                        &filters,
-                        &cls,
+    let pass = AlfPass {
+        alf_pic,
+        cfg,
+        binding,
+        luma_pre: &luma_pre,
+        cb_pre: &cb_pre,
+        cr_pre: &cr_pre,
+        regions_y: &regions_y,
+        regions_c: &regions_c,
+        ctb_size_y,
+        sub_w,
+        sub_h,
+        luma_stride: out.luma.stride,
+        luma_w: out.luma.width,
+        luma_h: out.luma.height,
+    };
+    let rows = alf_pic.pic_height_in_ctbs_y as usize;
+    let workers = workers.clamp(1, rows.max(1));
+    // CTB-row groups and the sample rows each one owns.
+    let group_start = |g: usize| g * rows / workers;
+    let luma_cuts: Vec<usize> = (0..workers)
+        .map(|g| group_start(g) * ctb_size_y as usize)
+        .collect();
+    let chroma_cuts: Vec<usize> = (0..workers)
+        .map(|g| group_start(g) * (ctb_size_y / sub_h) as usize)
+        .collect();
+    let lumas = PlaneRows::split(&mut out.luma, &luma_cuts);
+    let cbs = PlaneRows::split(&mut out.cb, &chroma_cuts);
+    let crs = PlaneRows::split(&mut out.cr, &chroma_cuts);
+    let mut jobs: Vec<_> = lumas
+        .into_iter()
+        .zip(cbs)
+        .zip(crs)
+        .enumerate()
+        .map(|(g, ((luma, cb), cr))| {
+            (
+                group_start(g) as u32..group_start(g + 1) as u32,
+                luma,
+                cb,
+                cr,
+            )
+        })
+        .collect();
+    if jobs.len() == 1 {
+        let (ctb_rows, mut luma, mut cb, mut cr) = jobs.pop().expect("one job");
+        pass.run(ctb_rows, &mut luma, &mut cb, &mut cr);
+        return;
+    }
+    std::thread::scope(|scope| {
+        let pass = &pass;
+        for (ctb_rows, mut luma, mut cb, mut cr) in jobs {
+            scope.spawn(move || pass.run(ctb_rows, &mut luma, &mut cb, &mut cr));
+        }
+    });
+}
+
+/// r487 — a band of whole sample rows of one plane, addressed with
+/// the plane's own sample indices (`row * stride + column`). The ALF
+/// workers each hold the bands of their CTB rows; a single band spans
+/// the plane for the serial case.
+pub(crate) struct PlaneRows<'a> {
+    samples: &'a mut [u16],
+    /// Plane index of `samples[0]`.
+    base: usize,
+    pub(crate) stride: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+impl<'a> PlaneRows<'a> {
+    /// Cut `plane` into bands starting at the sample rows `cuts`
+    /// (ascending, `cuts[0] == 0`); the last band runs to the end of
+    /// the plane. A cut beyond the plane yields an empty band.
+    pub(crate) fn split(plane: &'a mut PicturePlane, cuts: &[usize]) -> Vec<Self> {
+        let (stride, width, height) = (plane.stride, plane.width, plane.height);
+        let total = plane.samples.len();
+        let mut rest: &'a mut [u16] = &mut plane.samples;
+        let mut base = 0usize;
+        let mut out = Vec::with_capacity(cuts.len());
+        for (i, _) in cuts.iter().enumerate() {
+            let end = match cuts.get(i + 1) {
+                Some(&row) => (row * stride).min(total),
+                None => total,
+            };
+            let (band, tail) = std::mem::take(&mut rest).split_at_mut(end.max(base) - base);
+            out.push(Self {
+                samples: band,
+                base,
+                stride,
+                width,
+                height,
+            });
+            base = end.max(base);
+            rest = tail;
+        }
+        out
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> u16 {
+        self.samples[idx - self.base]
+    }
+
+    #[inline]
+    fn put(&mut self, idx: usize, value: u16) {
+        self.samples[idx - self.base] = value;
+    }
+}
+
+/// Everything the per-CTB ALF work reads, shared by the workers.
+struct AlfPass<'a> {
+    alf_pic: &'a AlfPicture,
+    cfg: &'a AlfConfig,
+    binding: &'a AlfApsBinding<'a>,
+    luma_pre: &'a [u16],
+    cb_pre: &'a [u16],
+    cr_pre: &'a [u16],
+    regions_y: &'a ClipRegions,
+    regions_c: &'a ClipRegions,
+    ctb_size_y: u32,
+    sub_w: u32,
+    sub_h: u32,
+    luma_stride: usize,
+    luma_w: usize,
+    luma_h: usize,
+}
+
+impl AlfPass<'_> {
+    /// Filter the CTB rows `ctb_rows`: the §8.8.5.2 / §8.8.5.4 luma
+    /// and chroma filters, then §8.8.5.7 CC-ALF on the same rows (it
+    /// reads the pre-ALF luma and the chroma samples it rewrites —
+    /// nothing of another CTB's output).
+    fn run(
+        &self,
+        ctb_rows: std::ops::Range<u32>,
+        luma: &mut PlaneRows<'_>,
+        cb: &mut PlaneRows<'_>,
+        cr: &mut PlaneRows<'_>,
+    ) {
+        let (alf_pic, cfg, binding) = (self.alf_pic, self.cfg, self.binding);
+        let (ctb_size_y, sub_w, sub_h) = (self.ctb_size_y, self.sub_w, self.sub_h);
+        for ry in ctb_rows.clone() {
+            for rx in 0..alf_pic.pic_width_in_ctbs_y {
+                let p = alf_pic.get(rx, ry);
+                if crate::dbg_env::var_os("H266_DBG_ALF_CTB").is_some() {
+                    eprintln!(
+                        "ALF ctb ({rx},{ry}): luma_on={} set={} cb_on={} cb_alt={} cr_on={} cr_alt={} cc_cb={} cc_cr={}",
+                        p.luma_on,
+                        p.luma_filt_set_idx,
+                        p.cb_on,
+                        p.cb_alt_idx,
+                        p.cr_on,
+                        p.cr_alt_idx,
+                        p.cc_cb_idc,
+                        p.cc_cr_idc
                     );
                 }
-            }
-            if cfg.chroma_format_idc != 0 {
-                let dbg_no_calf = crate::dbg_env::var_os("H266_DBG_NO_CHROMA_ALF").is_some();
-                if cfg.cb_enabled && p.cb_on && !dbg_no_calf {
-                    if let Some(aps) = binding.chroma_aps {
-                        if let Some((coeff, clip_idx)) =
-                            resolve_chroma_filter(aps, p.cb_alt_idx as usize)
-                        {
-                            apply_alf_chroma_ctb(
-                                &mut out.cb,
-                                &cb_pre,
-                                &regions_c,
-                                rx,
-                                ry,
-                                ctb_size_y,
-                                sub_w,
-                                sub_h,
-                                cfg.bit_depth,
-                                &coeff,
-                                &clip_idx,
-                            );
-                        }
+                if p.luma_on {
+                    if let Some(filters) = resolve_luma_filter_set(p.luma_filt_set_idx, binding) {
+                        // §8.8.5.3 — derive the per-4×4-sub-block (filtIdx,
+                        // transposeIdx) grid for this CTB. Reads come from
+                        // the pre-ALF snapshot per §8.8.5.1.
+                        let cls = derive_luma_classification(
+                            self.luma_pre,
+                            self.luma_stride,
+                            self.luma_w as i32,
+                            self.luma_h as i32,
+                            self.regions_y.clone(),
+                            rx,
+                            ry,
+                            ctb_size_y,
+                            cfg.bit_depth,
+                        );
+                        apply_alf_luma_ctb(
+                            luma,
+                            self.luma_pre,
+                            self.regions_y,
+                            rx,
+                            ry,
+                            ctb_size_y,
+                            cfg.bit_depth,
+                            &filters,
+                            &cls,
+                        );
                     }
                 }
-                if cfg.cr_enabled && p.cr_on && !dbg_no_calf {
-                    if let Some(aps) = binding.chroma_aps {
-                        if let Some((coeff, clip_idx)) =
-                            resolve_chroma_filter(aps, p.cr_alt_idx as usize)
-                        {
-                            apply_alf_chroma_ctb(
-                                &mut out.cr,
-                                &cr_pre,
-                                &regions_c,
-                                rx,
-                                ry,
-                                ctb_size_y,
-                                sub_w,
-                                sub_h,
-                                cfg.bit_depth,
-                                &coeff,
-                                &clip_idx,
-                            );
+                if cfg.chroma_format_idc != 0 {
+                    let dbg_no_calf = crate::dbg_env::var_os("H266_DBG_NO_CHROMA_ALF").is_some();
+                    if cfg.cb_enabled && p.cb_on && !dbg_no_calf {
+                        if let Some(aps) = binding.chroma_aps {
+                            if let Some((coeff, clip_idx)) =
+                                resolve_chroma_filter(aps, p.cb_alt_idx as usize)
+                            {
+                                apply_alf_chroma_ctb(
+                                    cb,
+                                    self.cb_pre,
+                                    self.regions_c,
+                                    rx,
+                                    ry,
+                                    ctb_size_y,
+                                    sub_w,
+                                    sub_h,
+                                    cfg.bit_depth,
+                                    &coeff,
+                                    &clip_idx,
+                                );
+                            }
+                        }
+                    }
+                    if cfg.cr_enabled && p.cr_on && !dbg_no_calf {
+                        if let Some(aps) = binding.chroma_aps {
+                            if let Some((coeff, clip_idx)) =
+                                resolve_chroma_filter(aps, p.cr_alt_idx as usize)
+                            {
+                                apply_alf_chroma_ctb(
+                                    cr,
+                                    self.cr_pre,
+                                    self.regions_c,
+                                    rx,
+                                    ry,
+                                    ctb_size_y,
+                                    sub_w,
+                                    sub_h,
+                                    cfg.bit_depth,
+                                    &coeff,
+                                    &clip_idx,
+                                );
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    // §8.8.5.1 second pass — CC-ALF runs after primary chroma ALF and
-    // reads from the *pre-luma-ALF* `recPictureL`. The accumulated
-    // delta is added to the post-chroma-ALF chroma plane.
-    if cfg.chroma_format_idc != 0 && crate::dbg_env::var_os("H266_DBG_NO_CCALF").is_none() {
-        for ry in 0..alf_pic.pic_height_in_ctbs_y {
-            for rx in 0..alf_pic.pic_width_in_ctbs_y {
-                let p = alf_pic.get(rx, ry);
-                if cfg.cc_cb_enabled && p.cc_cb_idc != 0 {
-                    if let Some(aps) = binding.cc_cb_aps {
-                        let filt_idx = (p.cc_cb_idc - 1) as usize;
-                        if filt_idx < aps.cc_cb_coeff.len() {
-                            let coeff = &aps.cc_cb_coeff[filt_idx];
-                            apply_cc_alf_ctb(
-                                &mut out.cb,
-                                &luma_pre,
-                                out.luma.stride,
-                                out.luma.width as u32,
-                                out.luma.height as u32,
-                                regions_y.clone(),
-                                rx,
-                                ry,
-                                ctb_size_y,
-                                sub_w,
-                                sub_h,
-                                cfg.bit_depth,
-                                coeff,
-                            );
+        // §8.8.5.1 second pass — CC-ALF runs after primary chroma ALF and
+        // reads from the *pre-luma-ALF* `recPictureL`. The accumulated
+        // delta is added to the post-chroma-ALF chroma plane.
+        if cfg.chroma_format_idc != 0 && crate::dbg_env::var_os("H266_DBG_NO_CCALF").is_none() {
+            for ry in ctb_rows {
+                for rx in 0..alf_pic.pic_width_in_ctbs_y {
+                    let p = alf_pic.get(rx, ry);
+                    if cfg.cc_cb_enabled && p.cc_cb_idc != 0 {
+                        if let Some(aps) = binding.cc_cb_aps {
+                            let filt_idx = (p.cc_cb_idc - 1) as usize;
+                            if filt_idx < aps.cc_cb_coeff.len() {
+                                apply_cc_alf_ctb(
+                                    cb,
+                                    self.luma_pre,
+                                    self.luma_stride,
+                                    self.luma_w as u32,
+                                    self.luma_h as u32,
+                                    self.regions_y,
+                                    rx,
+                                    ry,
+                                    ctb_size_y,
+                                    sub_w,
+                                    sub_h,
+                                    cfg.bit_depth,
+                                    &aps.cc_cb_coeff[filt_idx],
+                                );
+                            }
                         }
                     }
-                }
-                if cfg.cc_cr_enabled && p.cc_cr_idc != 0 {
-                    if let Some(aps) = binding.cc_cr_aps {
-                        let filt_idx = (p.cc_cr_idc - 1) as usize;
-                        if filt_idx < aps.cc_cr_coeff.len() {
-                            let coeff = &aps.cc_cr_coeff[filt_idx];
-                            apply_cc_alf_ctb(
-                                &mut out.cr,
-                                &luma_pre,
-                                out.luma.stride,
-                                out.luma.width as u32,
-                                out.luma.height as u32,
-                                regions_y.clone(),
-                                rx,
-                                ry,
-                                ctb_size_y,
-                                sub_w,
-                                sub_h,
-                                cfg.bit_depth,
-                                coeff,
-                            );
+                    if cfg.cc_cr_enabled && p.cc_cr_idc != 0 {
+                        if let Some(aps) = binding.cc_cr_aps {
+                            let filt_idx = (p.cc_cr_idc - 1) as usize;
+                            if filt_idx < aps.cc_cr_coeff.len() {
+                                apply_cc_alf_ctb(
+                                    cr,
+                                    self.luma_pre,
+                                    self.luma_stride,
+                                    self.luma_w as u32,
+                                    self.luma_h as u32,
+                                    self.regions_y,
+                                    rx,
+                                    ry,
+                                    ctb_size_y,
+                                    sub_w,
+                                    sub_h,
+                                    cfg.bit_depth,
+                                    &aps.cc_cr_coeff[filt_idx],
+                                );
+                            }
                         }
                     }
                 }
@@ -458,12 +618,12 @@ pub(crate) fn apply_alf_regions(
 /// never fires so it collapses to "always add scaledSum".
 #[allow(clippy::too_many_arguments)]
 fn apply_cc_alf_ctb(
-    chroma: &mut PicturePlane,
+    chroma: &mut PlaneRows<'_>,
     luma_pre: &[u16],
     luma_stride: usize,
     luma_w: u32,
     luma_h: u32,
-    fetch_clip: impl Into<ClipRegions>,
+    regions: &ClipRegions,
     rx: u32,
     ry: u32,
     ctb_size_y: u32,
@@ -482,7 +642,6 @@ fn apply_cc_alf_ctb(
     let half = 1i32 << (bit_depth - 1);
     let _ = luma_w;
     let ph = luma_h as i32;
-    let regions: ClipRegions = fetch_clip.into();
 
     let (sw, sh) = (sub_w as i32, sub_h as i32);
     for y in 0..j_max {
@@ -519,7 +678,7 @@ fn apply_cc_alf_ctb(
                 // Map chroma → luma per eq. 1510.
                 let xl = ((x_ctb_c + x) as i32) * sw;
                 // Eq. 1513.
-                let curr_chroma = chroma.samples[chroma_row + x] as i32;
+                let curr_chroma = chroma.get(chroma_row + x) as i32;
                 // Eq. 1515 — seven luma-deltas weighted by f[0..6].
                 let sum = if interior {
                     let p = yl as usize * luma_stride + xl as usize;
@@ -560,7 +719,7 @@ fn apply_cc_alf_ctb(
                     curr_chroma + scaled_sum
                 };
                 // Eq. 1518.
-                chroma.samples[chroma_row + x] = new.clamp(0, max_val) as u16;
+                chroma.put(chroma_row + x, new.clamp(0, max_val) as u16);
             }
         }
     }
@@ -702,7 +861,7 @@ pub fn resolve_clip_value(bit_depth: u32, clip_idx: u8) -> i32 {
 /// through the clamped fetch, sample by sample, exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_luma_ctb(
-    plane: &mut PicturePlane,
+    plane: &mut PlaneRows<'_>,
     pre: &[u16],
     regions: &ClipRegions,
     rx: u32,
@@ -788,7 +947,7 @@ fn apply_alf_luma_ctb(
                     // Eqs. 1450 / 1451.
                     for i in 0..4 {
                         let new = curr[i] + ((sum[i] + bias) >> alf_shift_y);
-                        plane.samples[p + i] = new.clamp(0, max_val) as u16;
+                        plane.put(p + i, new.clamp(0, max_val) as u16);
                     }
                     continue;
                 }
@@ -824,7 +983,7 @@ fn apply_alf_luma_ctb(
                             + tap(11, p + 1, p - 1);
                         // Eqs. 1450 / 1451.
                         let new = curr + ((sum + bias) >> alf_shift_y);
-                        plane.samples[p] = new.clamp(0, max_val) as u16;
+                        plane.put(p, new.clamp(0, max_val) as u16);
                     }
                     continue;
                 }
@@ -859,8 +1018,10 @@ fn apply_alf_luma_ctb(
                         + tap(11, 1, 0);
                     // Eqs. 1450 / 1451.
                     let new = curr + ((sum + bias) >> alf_shift_y);
-                    plane.samples[(ys as usize) * stride + (xs as usize)] =
-                        new.clamp(0, max_val) as u16;
+                    plane.put(
+                        (ys as usize) * stride + (xs as usize),
+                        new.clamp(0, max_val) as u16,
+                    );
                 }
             }
         }
@@ -1228,7 +1389,7 @@ fn laplacian_sums(
 /// sample, as before.
 #[allow(clippy::too_many_arguments)]
 fn apply_alf_chroma_ctb(
-    plane: &mut PicturePlane,
+    plane: &mut PlaneRows<'_>,
     pre: &[u16],
     regions: &ClipRegions,
     rx: u32,
@@ -1287,7 +1448,7 @@ fn apply_alf_chroma_ctb(
                         + tap(5, p + 1, p - 1);
                     // Eqs. 1491 / 1492.
                     let new = curr + ((sum + bias) >> alf_shift_c);
-                    plane.samples[p] = new.clamp(0, max_val) as u16;
+                    plane.put(p, new.clamp(0, max_val) as u16);
                 }
                 continue;
             }
@@ -1315,7 +1476,7 @@ fn apply_alf_chroma_ctb(
                 let new = curr + ((sum + bias) >> alf_shift_c);
                 // Eq. 1492.
                 let new = new.clamp(0, max_val) as u16;
-                plane.samples[(ys as usize) * stride + (xs as usize)] = new;
+                plane.put((ys as usize) * stride + (xs as usize), new);
             }
         }
     }
@@ -2264,6 +2425,109 @@ mod tests {
         let stride = buf.luma.stride;
         let edge = buf.luma.samples[16 * stride + 16];
         assert_ne!(edge, pre[16 * stride + 16], "edge sample should change");
+    }
+
+    /// r487 — the worker count never changes the picture: every plane
+    /// of a noisy multi-CTB picture (odd size, luma + chroma + CC-ALF
+    /// on a per-CTB mix, with and without tile boundaries that the
+    /// filters must not cross) is identical for 1 .. 9 workers — more
+    /// workers than CTB rows included.
+    #[test]
+    fn worker_count_does_not_change_the_picture() {
+        let (w, h) = (150usize, 106usize);
+        let mut src = fresh_buf(w, h, 0);
+        let mut state = 0x1357_9bdfu32;
+        let mut rnd = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u16
+        };
+        for plane in [&mut src.luma, &mut src.cb, &mut src.cr] {
+            for (i, v) in plane.samples.iter_mut().enumerate() {
+                *v = ((i % 97) as u16 + rnd() / 2).min(255);
+            }
+        }
+        let mut aps = AlfApsData::default();
+        aps.alf_luma_filter_signal_flag = true;
+        aps.luma_coeff = (0..NUM_ALF_FILTERS)
+            .map(|k| {
+                let mut f = [0i32; ALF_LUMA_NUM_COEFF];
+                for (t, c) in f.iter_mut().enumerate() {
+                    *c = ((k * 7 + t * 3) % 11) as i32 - 5;
+                }
+                f
+            })
+            .collect();
+        aps.luma_clip_idx = (0..NUM_ALF_FILTERS)
+            .map(|k| {
+                let mut c = [0u8; ALF_LUMA_NUM_COEFF];
+                for (t, v) in c.iter_mut().enumerate() {
+                    *v = ((k + t) % 4) as u8;
+                }
+                c
+            })
+            .collect();
+        aps.alf_chroma_filter_signal_flag = true;
+        aps.alf_chroma_num_alt_filters_minus1 = 0;
+        aps.chroma_coeff = vec![[9, -4, 12, -4, 6, 20]];
+        aps.chroma_clip_idx = vec![[0, 1, 2, 3, 0, 1]];
+        aps.cc_cb_coeff = vec![[16, -8, -8, 4, -16, 4, 8]];
+        aps.cc_cr_coeff = vec![[-16, 8, 8, -4, 16, -4, -8]];
+        let slot: [Option<&AlfApsData>; 1] = [Some(&aps)];
+        let binding = AlfApsBinding {
+            luma_apses: &slot,
+            chroma_aps: Some(&aps),
+            cc_cb_aps: Some(&aps),
+            cc_cr_aps: Some(&aps),
+        };
+        let cfg = AlfConfig {
+            cb_enabled: true,
+            cr_enabled: true,
+            cc_cb_enabled: true,
+            cc_cr_enabled: true,
+            ..cfg_8bit()
+        };
+        // 32-sample CTBs: 5 x 4 of them, the last column / row partial.
+        let (cw, ch) = (w.div_ceil(32) as u32, h.div_ceil(32) as u32);
+        let mut pic = AlfPicture::empty(cw, ch);
+        for ry in 0..ch {
+            for rx in 0..cw {
+                let k = rx + ry * 3;
+                pic.set(
+                    rx,
+                    ry,
+                    AlfCtb {
+                        luma_on: k % 4 != 0,
+                        luma_filt_set_idx: if k % 3 == 0 { 16 } else { (k % 16) as u8 },
+                        cb_on: k % 2 == 0,
+                        cr_on: k % 3 != 1,
+                        cc_cb_idc: (k % 2) as u8,
+                        cc_cr_idc: ((k + 1) % 2) as u8,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let col_bd = [0u32, 64, w as u32];
+        let row_bd = [0u32, 32, 96, h as u32];
+        for bounds in [None, Some((&col_bd[..], &row_bd[..]))] {
+            let mut reference = src.clone();
+            apply_alf_regions_with_workers(&mut reference, &pic, &cfg, &binding, bounds, None, 1);
+            assert_ne!(reference.luma.samples, src.luma.samples);
+            assert_ne!(reference.cb.samples, src.cb.samples);
+            assert_ne!(reference.cr.samples, src.cr.samples);
+            for workers in 2..=9 {
+                let mut out = src.clone();
+                apply_alf_regions_with_workers(
+                    &mut out, &pic, &cfg, &binding, bounds, None, workers,
+                );
+                assert_eq!(
+                    out.luma.samples, reference.luma.samples,
+                    "{workers} workers"
+                );
+                assert_eq!(out.cb.samples, reference.cb.samples, "{workers} workers");
+                assert_eq!(out.cr.samples, reference.cr.samples, "{workers} workers");
+            }
+        }
     }
 
     /// `apply_alf` skips chroma when `cb_enabled` / `cr_enabled` are off

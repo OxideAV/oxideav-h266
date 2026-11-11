@@ -752,3 +752,32 @@ fn black_box_decoder_reads_the_vui_and_accepts_the_hash_sei() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `ExecutionContext` worker budget never changes the output: the
+/// same streams (in-loop filters on, several CTB rows) through the
+/// registry decoder with 1, 2, 3 and 8 workers give identical planes.
+#[test]
+fn worker_budget_does_not_change_the_output() {
+    use oxideav_core::ExecutionContext;
+    for &(w, h, cf) in &[(416usize, 240usize, 1u32), (200, 520, 3), (136, 136, 2)] {
+        let src = source(w, h, cf, 8, 40 + cf);
+        let mut cfg = EncoderConfig::new(w as u32, h as u32);
+        cfg.chroma_format_idc = cf as u8;
+        let (bs, _) = encode_idr_with_residuals_cfg(&src, 34, cfg).unwrap();
+        let decode = |threads: usize| -> Vec<Vec<u8>> {
+            let mut dec = H266Decoder::new(&dec_params(&[])).unwrap();
+            dec.set_execution_context(&ExecutionContext::with_threads(threads));
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), bs.clone()))
+                .unwrap();
+            dec.flush().unwrap();
+            let Ok(Frame::Video(vf)) = dec.receive_frame() else {
+                panic!("no picture")
+            };
+            vf.planes.into_iter().map(|p| p.data).collect()
+        };
+        let serial = decode(1);
+        for threads in [2usize, 3, 8] {
+            assert_eq!(decode(threads), serial, "{w}x{h} cf{cf}: {threads} workers");
+        }
+    }
+}

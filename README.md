@@ -223,6 +223,19 @@ What changed, all bit-identical:
 * **CCLM** no longer copies the luma plane per transform block; SAO
   asks the region map only on a CTB's outer ring.
 
+**Workers** — `Decoder::set_execution_context` hands the registry
+decoder a thread budget (`StreamDecoder::set_threads` on the direct
+API). The adaptive loop filter — every CTB reads the pre-filter
+snapshot only and writes its own samples — runs its CTB rows on that
+many scoped threads, each owning its rows of the three planes; the
+output is identical for every budget (unit-tested for 1 … 9 workers,
+with tile boundaries, and through the registry). The rest of a picture
+(CABAC, reconstruction, deblocking, SAO) is serial, so the gain is the
+ALF's share: with 8 workers the 1080p streams decode 13 – 20 % faster
+in wall time (medians of three: TILE_A 1477 → 1259 ms, SLICES_A
+2861 → 2434 ms, LMCS_B 5845 → 4662 ms) at the same CPU time (84.7 vs
+84.5 CPU s over the corpus) and peak memory (280 vs 289 MiB).
+
 ## Parse support
 
 * **NAL framing** — Annex B byte-stream (`0x000001` / `0x00000001`

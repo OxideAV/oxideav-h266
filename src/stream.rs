@@ -155,6 +155,9 @@ pub struct StreamDecoder {
     /// r487 — check each picture against its decoded picture hash SEI
     /// message.
     verify_picture_hash: bool,
+    /// r487 — worker threads the per-picture parallel stages may use
+    /// (0 and 1 both mean serial).
+    threads: usize,
 }
 
 /// The SEI messages whose content persists from the picture that
@@ -285,6 +288,14 @@ impl StreamDecoder {
     /// not turned into an error: the picture is still handed out.
     pub fn set_verify_picture_hash(&mut self, on: bool) {
         self.verify_picture_hash = on;
+    }
+
+    /// r487 — let the stages of a picture that are independent per
+    /// CTB row (today: the adaptive loop filter, the largest single
+    /// stage of a decode) run on up to `threads` threads. The default
+    /// is serial. Decoded pictures are identical for every value.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
     }
 
     /// Parse the messages of one SEI NAL unit. A malformed SEI NAL
@@ -956,6 +967,7 @@ impl StreamDecoder {
                 ph.ph_cu_chroma_qp_offset_subdiv_inter_slice
             });
         }
+        walker.set_loop_filter_workers(self.threads);
         walker.set_ph_mvd_l1_zero(ph.ph_mvd_l1_zero_flag);
         walker.set_ph_bdof_disabled(ph.ph_bdof_disabled_flag);
         walker.set_ph_dmvr_disabled(ph.ph_dmvr_disabled_flag);

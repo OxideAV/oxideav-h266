@@ -894,6 +894,8 @@ pub struct CtuWalker<'a, 'b> {
     /// bit yet keep the round-31 plain bi-pred / BDOF path
     /// byte-for-byte. Set via [`Self::set_ph_dmvr_disabled`].
     ph_dmvr_disabled: bool,
+    /// r487 — worker budget of the in-loop filter stage.
+    loop_filter_workers: usize,
     /// r452 — the slice's §8.5.6.6.3 explicit weighted-prediction
     /// tables (`Some` exactly when the §8.5.6.6.1 `weightedPredFlag`
     /// base holds for the slice). Set via [`Self::set_explicit_wp`].
@@ -1440,6 +1442,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ph_mmvd_fullpel_only: false,
             ph_bdof_disabled: true,
             ph_dmvr_disabled: true,
+            loop_filter_workers: 1,
             explicit_wp: None,
             ph_joint_cbcr_sign: false,
             ph_prof_disabled: true,
@@ -2654,6 +2657,14 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
 
     pub fn set_ph_dmvr_disabled(&mut self, disabled: bool) {
         self.ph_dmvr_disabled = disabled;
+    }
+
+    /// r487 — the number of worker threads the in-loop filter stage
+    /// may use for this picture (the caller's `ExecutionContext`
+    /// budget; 1 = serial, the default). The decoded picture does not
+    /// depend on it.
+    pub fn set_loop_filter_workers(&mut self, workers: usize) {
+        self.loop_filter_workers = workers.max(1);
     }
 
     /// r452 — install (or clear) the slice's explicit weighted-
@@ -13445,7 +13456,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             ctb_log2_size_y: self.layout.ctb_log2_size_y,
             chroma_format_idc: self.sps.sps_chroma_format_idc as u32,
         };
-        crate::alf::apply_alf_regions(
+        crate::alf::apply_alf_regions_with_workers(
             out,
             &self.alf_picture,
             &alf_cfg,
@@ -13454,6 +13465,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 .as_ref()
                 .map(|(c, r)| (c.as_slice(), r.as_slice())),
             lf_region.as_ref(),
+            self.loop_filter_workers.max(1),
         );
         Ok(())
     }
