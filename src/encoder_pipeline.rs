@@ -532,6 +532,16 @@ struct EncAvail {
     mip: Vec<bool>,
     /// r477 — the SPS intra tools of this picture.
     tools: IntraTools,
+    /// r487 — where the slice's chroma-mode contexts stand after the
+    /// CUs prepared so far (adapted in coding order, saved / restored
+    /// with the RD trials). The bit estimates of the chroma decision
+    /// and of the CU-size / MTT decisions start from these states: a
+    /// fresh context set per measured CU would charge every CU the
+    /// cost of the first bins of a slice — and the initial
+    /// `cclm_mode_flag` state is far from where a slice settles — so a
+    /// split into four CUs would look four first-bin costs dearer than
+    /// it is.
+    chroma_ctx: ChromaModeCtxs,
     /// r429 — §6.4.4 availability region `(x0, y0, x1, y1, col_cap)`
     /// in luma samples: the current tile's rectangle plus the WPP
     /// exclusive column cap. Reference fetches outside it read
@@ -565,6 +575,7 @@ impl EncAvail {
             mcb_w: w.div_ceil(4),
             mip: vec![false; w.div_ceil(4) * h.div_ceil(4)],
             tools: IntraTools::default(),
+            chroma_ctx: ChromaModeCtxs::init(26),
             region: (0, 0, w, h, usize::MAX),
         }
     }
@@ -1020,31 +1031,103 @@ fn emit_chroma_mode_bins(
         let n = ictx.bdpcm_chroma.len() - 1;
         enc.encode_decision(&mut ictx.bdpcm_chroma[inc.min(n)], 0)?;
     }
-    // §7.3.11.5 — `cclm_mode_flag` (when the SPS enables CCLM; the
-    // single-tree §8.4.4 CclmEnabled derivation is the SPS flag), then
-    // `cclm_mode_idx` (TR cMax = 2: bin 0 context-coded, bin 1 bypass)
-    // or `intra_chroma_pred_mode` (Table 130: "0" = 4, else "1" +
-    // FL(2)). I slices: initType 0, the first context of each table.
-    if lx.tools.cclm {
-        let flag = u32::from(matches!(lx.chroma_choice, ChromaChoice::Cclm(_)));
-        enc.encode_decision(&mut ictx.cclm_flag[0], flag)?;
+    emit_chroma_choice_bins(
+        enc,
+        &mut ictx.cclm_flag,
+        &mut ictx.cclm_idx,
+        &mut ictx.chroma_mode,
+        lx.tools,
+        lx.chroma_choice,
+    )
+}
+
+/// r487 — the three contexts of the chroma mode syntax.
+#[derive(Clone)]
+struct ChromaModeCtxs {
+    cclm_flag: Vec<ContextModel>,
+    cclm_idx: Vec<ContextModel>,
+    chroma_mode: Vec<ContextModel>,
+}
+
+impl ChromaModeCtxs {
+    fn init(slice_qp_y: i32) -> Self {
+        Self {
+            cclm_flag: init_contexts(SyntaxCtx::CclmModeFlag, slice_qp_y),
+            cclm_idx: init_contexts(SyntaxCtx::CclmModeIdx, slice_qp_y),
+            chroma_mode: init_contexts(SyntaxCtx::IntraChromaPredMode, slice_qp_y),
+        }
     }
-    match lx.chroma_choice {
+
+    /// Put these states into a context set used for a bit estimate.
+    fn install(&self, ictx: &mut IntraModeCtxs) {
+        ictx.cclm_flag.clone_from(&self.cclm_flag);
+        ictx.cclm_idx.clone_from(&self.cclm_idx);
+        ictx.chroma_mode.clone_from(&self.chroma_mode);
+    }
+
+    /// The cost in bits of signalling `choice` from these states.
+    fn bits(&self, tools: IntraTools, choice: ChromaChoice) -> Result<f64> {
+        let mut scratch = self.clone();
+        let mut enc = crate::cabac_enc::ArithEncoder::new();
+        scratch.code(&mut enc, tools, choice)?;
+        Ok(enc.estimated_bits())
+    }
+
+    /// Code `choice`, adapting the states.
+    fn code(
+        &mut self,
+        enc: &mut crate::cabac_enc::ArithEncoder,
+        tools: IntraTools,
+        choice: ChromaChoice,
+    ) -> Result<()> {
+        emit_chroma_choice_bins(
+            enc,
+            &mut self.cclm_flag,
+            &mut self.cclm_idx,
+            &mut self.chroma_mode,
+            tools,
+            choice,
+        )
+    }
+
+    /// Adapt the states as if `choice` had just been coded — the
+    /// running estimate of where the slice's contexts stand.
+    fn observe(&mut self, tools: IntraTools, choice: ChromaChoice) {
+        let mut enc = crate::cabac_enc::ArithEncoder::new();
+        // Encoding into a scratch engine cannot fail on these bins.
+        let _ = self.code(&mut enc, tools, choice);
+    }
+}
+
+/// r487 — the chroma mode bins of one CU: §7.3.11.5 `cclm_mode_flag`
+/// (when the SPS enables CCLM; the single-tree §8.4.4 CclmEnabled
+/// derivation is the SPS flag), then `cclm_mode_idx` (TR cMax = 2:
+/// bin 0 context-coded, bin 1 bypass) or `intra_chroma_pred_mode`
+/// (Table 130: "0" = 4, else "1" + FL(2)). I slices: initType 0, the
+/// first context of each table.
+fn emit_chroma_choice_bins(
+    enc: &mut crate::cabac_enc::ArithEncoder,
+    cclm_flag: &mut [ContextModel],
+    cclm_idx: &mut [ContextModel],
+    chroma_mode: &mut [ContextModel],
+    tools: IntraTools,
+    choice: ChromaChoice,
+) -> Result<()> {
+    if tools.cclm {
+        let flag = u32::from(matches!(choice, ChromaChoice::Cclm(_)));
+        enc.encode_decision(&mut cclm_flag[0], flag)?;
+    }
+    let inc = (ctx_inc_intra_chroma_pred_mode() as usize).min(chroma_mode.len() - 1);
+    match choice {
         ChromaChoice::Cclm(idx) => {
-            enc.encode_decision(&mut ictx.cclm_idx[0], u32::from(idx != 0))?;
+            enc.encode_decision(&mut cclm_idx[0], u32::from(idx != 0))?;
             if idx != 0 {
                 enc.encode_bypass(u32::from(idx == 2))?;
             }
         }
-        ChromaChoice::Dm => {
-            let inc = ctx_inc_intra_chroma_pred_mode() as usize;
-            let n = ictx.chroma_mode.len() - 1;
-            enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 0)?;
-        }
+        ChromaChoice::Dm => enc.encode_decision(&mut chroma_mode[inc], 0)?,
         ChromaChoice::Explicit(v) => {
-            let inc = ctx_inc_intra_chroma_pred_mode() as usize;
-            let n = ictx.chroma_mode.len() - 1;
-            enc.encode_decision(&mut ictx.chroma_mode[inc.min(n)], 1)?;
+            enc.encode_decision(&mut chroma_mode[inc], 1)?;
             enc.encode_bypass(u32::from(v >> 1 & 1))?;
             enc.encode_bypass(u32::from(v & 1))?;
         }
@@ -1828,6 +1911,8 @@ struct RegionSnap {
     modes: Vec<u8>,
     /// r477 — the `IntraMipFlag` cells.
     mip: Vec<bool>,
+    /// r487 — the running chroma-mode context states.
+    chroma_ctx: ChromaModeCtxs,
 }
 
 fn copy_rect<T: Copy>(
@@ -1943,10 +2028,12 @@ fn snapshot_region(
             w.div_ceil(4),
             h.div_ceil(4),
         ),
+        chroma_ctx: avail.chroma_ctx.clone(),
     }
 }
 
 fn restore_region(rec: &mut PictureBuffer, avail: &mut EncAvail, snap: &RegionSnap) {
+    avail.chroma_ctx.clone_from(&snap.chroma_ctx);
     let (x, y, w, h) = (snap.x, snap.y, snap.w, snap.h);
     let (cx, cy, cw, ch) = (
         x / avail.sub_w,
@@ -2100,7 +2187,15 @@ fn prepare_cu_rdo(
         }
         sse
     };
-    let bits_a = measure_cu_bits(&cu_a, slice_qp_y, rc, constraints, x as u32, y as u32)?;
+    let bits_a = measure_cu_bits(
+        &cu_a,
+        slice_qp_y,
+        rc,
+        constraints,
+        x as u32,
+        y as u32,
+        &snap0.chroma_ctx,
+    )?;
     let cost_a = region_sse(rec) as f64 + lambda * bits_a;
     let allows = constraints.allows(
         x as u32,
@@ -2770,7 +2865,6 @@ fn decide_chroma_mode(
     }
     let bd = rec.cb.bit_depth;
     let lambda_satd = (lambda_for_qp(cu_qp) * f64::from(1u32 << (2 * (bd - 8)))).sqrt();
-    let flag_bits = if tools.cclm { 1.0 } else { 0.0 };
     let mut residual = vec![0i32; n_w * n_h];
     let mut best: Option<(f64, ChromaChoice, Vec<i16>, Vec<i16>)> = None;
     for choice in candidates {
@@ -2811,13 +2905,7 @@ fn decide_chroma_mode(
             satd += hadamard_satd(&residual, n_w, n_h);
             *slot = pred;
         }
-        let mode_bits = flag_bits
-            + match choice {
-                ChromaChoice::Dm => 1.0,
-                ChromaChoice::Explicit(_) => 3.0,
-                ChromaChoice::Cclm(0) => 1.0,
-                ChromaChoice::Cclm(_) => 2.0,
-            };
+        let mode_bits = avail.chroma_ctx.bits(tools, choice)?;
         let cost = satd as f64 + lambda_satd * mode_bits;
         if best.as_ref().is_none_or(|b| cost < b.0) {
             let [cb, cr] = preds;
@@ -3162,6 +3250,7 @@ fn prepare_leaf_cu(
     } else {
         (ChromaChoice::Dm, None)
     };
+    avail.chroma_ctx.observe(tools, chroma_choice);
     let (decided_cb, decided_cr) = match decided {
         Some((cb, cr)) => (Some(cb), Some(cr)),
         None => (None, None),
@@ -3261,6 +3350,7 @@ fn prepare_leaf_cu_lossless(
         }));
     }
     let chroma_mode = chroma_dm_mode(avail, luma_mode);
+    avail.chroma_ctx.observe(avail.tools, ChromaChoice::Dm);
     let chr_x = x / avail.sub_w;
     let chr_y = y / avail.sub_h;
     let n_tb_chroma_w = (n_tb_w / avail.sub_w).max(4);
@@ -3553,11 +3643,15 @@ fn measure_cu_bits(
     constraints: &SplitConstraints,
     x: u32,
     y: u32,
+    chroma_ctx: &ChromaModeCtxs,
 ) -> Result<f64> {
     let mut enc = crate::cabac_enc::ArithEncoder::new();
     let mut tree_ctxs = crate::coding_tree::TreeCtxs::init(slice_qp_y);
     let mut residual_ctxs = ResidualCtxs::init(slice_qp_y);
     let mut intra_ctxs = IntraModeCtxs::init(slice_qp_y);
+    // r487 — the chroma-mode bins are priced from where the slice's
+    // contexts stood before this CU.
+    chroma_ctx.install(&mut intra_ctxs);
     let mut qp_state = QpDeltaState::new(true, slice_qp_y);
     measure_cu_bits_recurse(
         cu,
@@ -3910,6 +4004,9 @@ fn prepare_cu_with_mtt_picker(
 ) -> Result<PreparedCu> {
     debug_assert_eq!(cb_size, 64);
     let lambda = lambda_for_qp(slice_qp_y);
+    // r487 — every split variant is priced from the same chroma-mode
+    // context states: those in force before this 64x64 node.
+    let chroma_ctx0 = avail.chroma_ctx.clone();
     // r412 — the emitted-SPS split constraints (MTT enabled on this
     // path) drive the measured split-bin presence/ctxIncs.
     let constraints = encoder_split_constraints(
@@ -3976,7 +4073,15 @@ fn prepare_cu_with_mtt_picker(
         chroma_scale,
     )?;
     let leaf_sse = region_sse_y(&src.luma, &rec.luma, x, y, cb_size, cb_size);
-    let leaf_bits = measure_cu_bits(&leaf, slice_qp_y, rc_opts, &constraints, x as u32, y as u32)?;
+    let leaf_bits = measure_cu_bits(
+        &leaf,
+        slice_qp_y,
+        rc_opts,
+        &constraints,
+        x as u32,
+        y as u32,
+        &chroma_ctx0,
+    )?;
     trials.push(Trial {
         cu: leaf,
         cost: leaf_sse as f64 + lambda * leaf_bits as f64,
@@ -4042,6 +4147,7 @@ fn prepare_cu_with_mtt_picker(
             &constraints,
             x as u32,
             y as u32,
+            &chroma_ctx0,
         )?;
         trials.push(Trial {
             cu: bt_v_cu,
@@ -4104,6 +4210,7 @@ fn prepare_cu_with_mtt_picker(
             &constraints,
             x as u32,
             y as u32,
+            &chroma_ctx0,
         )?;
         trials.push(Trial {
             cu: bt_h_cu,
@@ -4181,6 +4288,7 @@ fn prepare_cu_with_mtt_picker(
             &constraints,
             x as u32,
             y as u32,
+            &chroma_ctx0,
         )?;
         trials.push(Trial {
             cu: tt_v_cu,
@@ -4256,6 +4364,7 @@ fn prepare_cu_with_mtt_picker(
             &constraints,
             x as u32,
             y as u32,
+            &chroma_ctx0,
         )?;
         trials.push(Trial {
             cu: tt_h_cu,
@@ -5261,6 +5370,7 @@ fn encode_idr_impl(
         cclm: config.intra_cclm && config.chroma_format_idc != 0,
         chroma_modes: config.intra_chroma_modes,
     };
+    avail.chroma_ctx = ChromaModeCtxs::init(slice_qp_y);
     // r412 — §6.4.1 – §6.4.3 constraints matching the emitted SPS
     // partition fields; drive every split-bin presence + ctxInc.
     let split_constraints = encoder_split_constraints(

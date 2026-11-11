@@ -63,13 +63,19 @@ fn bslice_same_refs_degenerates_to_pslice_quality() {
 fn bslice_split_translation_beats_or_matches_l0_only() {
     let (frame_a, frame_b) = translation_pair(2);
     let (_, _frame_c) = translation_pair(4);
-    // Make the L0 reference a translation-of-2 of frame_a, L1 a
-    // translation-of-4.
-    let (_, rec_l0) = encode_idr_with_residuals(&frame_a, 26).unwrap();
-    let (_, rec_l1) = {
-        let (i_, _) = translation_pair(-2); // shift the other way
-        encode_idr_with_residuals(&i_, 26).unwrap()
-    };
+    // The L0 reference is a translation-of-2 of the current picture,
+    // L1 the same stripes (`translation_pair` returns the unshifted
+    // picture first) — both as EXACT pictures. The comparison below is
+    // about the B decision against the P decision on identical
+    // references, so the references must not depend on how the stills
+    // encoder happens to code them: until r487 it reproduced these
+    // stripes exactly at QP 26 (the test ran on exact references all
+    // along); a different CU-size decision makes its reconstruction
+    // slightly lossy, and with a lossy L1 the per-block rate-distortion
+    // choice of the B scaffold — which minimises `SSE + λ · bits`, not
+    // the SSE alone — is free to land below the P-slice PSNR.
+    let rec_l0 = frame_a.clone();
+    let (rec_l1, _) = translation_pair(-2);
     let (bs_b, rec_b) = encode_b_slice(&frame_b, &rec_l0, &rec_l1, 26, 1, 8).unwrap();
     assert!(!bs_b.is_empty());
     let psnr_b = psnr_y(&frame_b.luma, &rec_b.luma).unwrap();

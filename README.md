@@ -718,18 +718,22 @@ direct mode only → decision on (`tests/r487_chroma_tools.rs`):
 
 | Format | QP 22 | QP 32 | QP 37 |
 | --- | --- | --- | --- |
-| 4:2:0 | 17762 → 16550 B (−6.8 %), chroma 41.77 → 41.78 dB | 6787 → 5680 B (−16.3 %), 34.77 → 35.77 dB | 3318 → 2623 B (−20.9 %), 31.13 → 32.95 dB |
-| 4:2:2 | 21052 → 18358 B (−12.8 %), 41.99 → 41.91 dB | 7798 → 5613 B (−28.0 %), 35.51 → 37.16 dB | 3678 → 2681 B (−27.1 %), 32.17 → 33.92 dB |
-| 4:4:4 | 26597 → 23264 B (−12.5 %), 42.18 → 42.06 dB | 9523 → 6253 B (−34.3 %), 36.22 → 37.70 dB | 4081 → 3083 B (−24.5 %), 32.28 → 34.32 dB |
+| 4:2:0 | 17762 → 16542 B (−6.9 %), chroma 41.77 → 41.75 dB | 6787 → 5624 B (−17.1 %), 34.77 → 35.77 dB | 3318 → 2526 B (−23.9 %), 31.13 → 33.04 dB |
+| 4:2:2 | 21044 → 18284 B (−13.1 %), 41.99 → 41.93 dB | 7784 → 5625 B (−27.7 %), 35.55 → 37.18 dB | 3778 → 2977 B (−21.2 %), 32.17 → 34.19 dB |
+| 4:4:4 | 26623 → 23432 B (−12.0 %), 42.17 → 42.05 dB | 9492 → 6219 B (−34.5 %), 36.21 → 37.76 dB | 4081 → 2997 B (−26.6 %), 32.28 → 34.12 dB |
 
-Nine cells together: 100596 → 84105 B (**−16.4 %**) at +1.06 dB mean
-chroma PSNR; 55 – 90 % of the CUs elect a linear-model mode. On chroma
+Nine cells together: 100669 → 84226 B (**−16.3 %**) at +1.08 dB mean
+chroma PSNR; 55 – 97 % of the CUs elect a linear-model mode. On chroma
 that does not follow the luma the decision still gains a little
-(192x128, −0.3 … −6.9 % bytes within ±0.2 dB chroma). Every stream
-decodes byte-exact through this crate's decoder and a black-box
-decoder in 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, with the MTT
-pickers, tiles, WPP, dependent quantisation, sign hiding and ISP. The
-lossless path and 4:4:4 matrix-predicted CUs keep the direct mode.
+(192x128, −0.2 … −3.3 % bytes within ±0.1 dB chroma). The mode bins
+are priced from where the slice's chroma-mode contexts stand
+(`cclm_mode_flag` starts far from where a slice settles, so a fresh
+context set per measured CU would charge every CU of a split the first
+bins of a slice); the same running states feed the CU-size and MTT
+decisions. Every stream decodes byte-exact through this crate's decoder
+and a black-box decoder in 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, with
+the MTT pickers, tiles, WPP, dependent quantisation, sign hiding and
+ISP. The lossless path and 4:4:4 matrix-predicted CUs keep the direct mode.
 
 r477 — **intra tools in the decision** (`EncoderConfig::intra_mip` /
 `intra_isp` / `intra_bdpcm`; `encode_idr_with_stats_cfg` reports the
