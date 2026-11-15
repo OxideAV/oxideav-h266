@@ -310,6 +310,7 @@ pub mod mvd_coding_enc;
 pub mod nal;
 pub mod picture_hash;
 pub mod sei_payload;
+pub mod video_encoder;
 pub mod vui;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
