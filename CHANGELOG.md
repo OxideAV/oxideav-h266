@@ -4,6 +4,36 @@ All notable changes to this crate are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-h266/compare/v0.0.11...v0.0.12) - 2026-11-15
+
+### Other
+
+- r490 README / CHANGELOG — P pictures with the loop filter decision, temporal motion vector prediction, IDR QP offset; tool-by-tool rate table
+- r490 video encoder — IDR pictures two QP steps finer than the P pictures
+- r490 P pictures — temporal motion vector prediction
+- r490 fuzz crash — PPS slice width / height in tiles and explicit slice heights range-checked as read
+- r490 CI repair — duplicated allow attribute on add_inter_residual_plane
+- r490 P pictures — adaptive loop filter decision (fixed filter sets per luma CTB)
+- r490 README / CHANGELOG — decoder conformance table, decode profile and throughput (1.67x corpus CPU, 1080p 14.7 to 25.1 fps), worker budget
+- r490 scaled references are refused, not read unscaled
+- r490 worker budget — deblocking and SAO filter the colour components side by side
+- r490 BDOF and ALF classification share their overlapping windows
+- r490 motion compensation over clamped reference rectangles — block-form 8-tap / 4-tap passes, DMVR bilinear rows, affine sub-blocks
+- r490 README / CHANGELOG — video encoder section, options, rate against all-intra, encode speed
+- r490 P pictures — widened zero bin in the inter quantiser, forward DCT from cached kernels, final skip CUs
+- r490 registry encoder options keyint / effort / scene_cut, video bench mode, multi-picture fuzz encodes
+- r490 video encoder — IDR + P pictures in one conforming stream
+- r490 encoder headers for inter pictures — SPS profile / DPB parameters, P picture header, P slice header
+- r490 vvcC record — the SPS profile_tier_level() presence bit is bit 15
+- r487 test wording — the black-box leg names no decoder
+- r487 encoder — chroma-mode bins priced from running context states; B-vs-P test on exact references
+- r487 worker budget — the adaptive loop filter runs its CTB rows on the ExecutionContext thread budget (identical output, 13 – 20 % wall on 1080p)
+- r487 decode throughput 3.3x, peak memory −42 % — shared reference pictures, per-sub-block ALF, cached triage switches, hoisted reference clamps, flattened transform kernels
+- r487 chroma mode decision in the encoder — cross-component linear-model modes + explicit chroma modes (−16.4 % bytes, +1.06 dB chroma on luma-correlated content)
+- r487 VUI + SEI (H.274) — colour description on the stream parameters, typed SEI payloads, decoded picture hash as a conformance oracle (1777/1777 pictures on 56/56 streams)
+- r487 fuzz crashes — SPS / PPS / PH range checks before the decode (24 artifacts, six panic sites)
+- API hygiene: non_exhaustive encoder/stream records, hide syntax-structure modules
+
 ### Added
 
 - r490 — P pictures: **adaptive loop filter decision** (`VideoEncoderConfig::with_alf`, efforts 1 – 4; `InterStats::alf_ctbs`): the access unit is decoded once unfiltered, every luma CTB elects one of the 16 fixed filter sets or none against that picture, and the slice is emitted again with `sh_alf_enabled_flag` + the per-CTU ALF syntax (no APS). At equal luma PSNR against all-intra coding: `RAP_B_1` −50.0 % → −52.9 %, `8b420_A_2` −71.6 % → −72.6 %.
