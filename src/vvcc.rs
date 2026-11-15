@@ -169,14 +169,17 @@ fn gci_bytes_from_sps_rbsp(rbsp: &[u8]) -> Result<Vec<u8>> {
     // ptl_frame_only_constraint_flag u(1), ptl_multilayer_enabled_flag
     // u(1) = 18 bits → general_constraints_info() starts at bit 34.
     let mut br = BitReader::new(rbsp);
-    br.skip(16)?;
+    // r490 — the flag is the 16th bit (bit 15), not the bit after it:
+    // the old `skip(16)` tested the first bit of general_profile_idc
+    // and refused every SPS with a profile below 64.
+    br.skip(15)?;
     let present = br.u1()? == 1;
     if !present {
         return Err(Error::invalid(
             "vvcC: the SPS carries no profile_tier_level() (sps_ptl_dpb_hrd_params_present_flag = 0)",
         ));
     }
-    br.skip(17)?;
+    br.skip(18)?;
     debug_assert_eq!(br.bit_position(), 34);
     crate::ptl::skip_general_constraints_info(&mut br)?;
     let end = br.bit_position();
