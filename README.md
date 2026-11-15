@@ -21,8 +21,9 @@ The SPS VUI and the SEI messages of Rec. ITU-T H.274 are parsed and
 written: the colour description is stated on the stream parameters,
 the decoded picture hash checks every picture. Since r490 the encoder
 also codes video: IDR pictures followed by P pictures (skip / merge /
-explicit motion vectors, quarter-sample motion search, an effort
-ladder) in the same conforming stream. B pictures, intra CUs inside
+explicit motion vectors, quarter-sample motion search, temporal motion
+vector prediction, an adaptive loop filter decision, an effort ladder)
+in the same conforming stream. B pictures, intra CUs inside
 P pictures and multilayer decoding are not built yet.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -171,10 +172,12 @@ delay).
 | --- | --- |
 | Coding tree (§7.3.11.4) | quad tree from the 128x128 CTB to 8x8, each split decided by `SSE + λ · bits` against the node's best leaf; the §7.4.12.4 inferred splits at the picture edge |
 | CU modes (§7.3.11.5 / .7) | skip (`merge_idx`), merge + residual, explicit vector (`mvd_coding()`, `mvp_l0_flag`, `cu_coded_flag`) + residual; a 128x128 CU is a skip CU |
-| Predictors | the merge list (§8.5.2.2: spatial, history, pairwise average, zero) and the motion vector predictor list (§8.5.2.8 – .10) are the decoder's own derivations run on a motion field / history table kept in coding order |
+| Predictors | the merge list (§8.5.2.2: spatial, temporal, history, pairwise average, zero) and the motion vector predictor list (§8.5.2.8 – .10, temporal candidate included) are the decoder's own derivations run on a motion field / history table kept in coding order; the temporal candidate (§8.5.2.11, `sps_temporal_mvp_enabled_flag` / `ph_temporal_mvp_enabled_flag`) reads the motion field the decoder stored with the previous picture |
 | Motion search | seeds (merge candidates, both predictors, zero, the enclosing node's vector) → step-halving integer pattern search on SAD + `√λ ·` vector bits → half and quarter sample refinement through the §8.5.6.3 filters |
 | Residual (§7.3.11.10) | one luma + two chroma DCT-II blocks per CU, bits measured through the real residual coder; `cu_qp_delta_abs = 0` once per CTU |
-| Reference | the access unit just written is decoded by this crate's decoder — deblocking and every rounding rule are the decoder's, so both sides predict from the same picture by construction |
+| Adaptive loop filter (§8.8.5) | the access unit is decoded once unfiltered; against that deblocked picture every luma CTB elects one of the 16 fixed filter sets or no filter (`alf_ctb_flag`, `alf_luma_fixed_filter_idx`; no APS), and the slice is emitted again with the filter signalled when a CTB elects one (`VideoEncoderConfig::with_alf`, efforts 1 – 4) |
+| IDR pictures | coded `idr_qp_offset` (default −2) QP steps finer than the P pictures when the sequence has P pictures: every P picture predicts from the IDR picture directly or through its predecessors |
+| Reference | the access unit just written is decoded by this crate's decoder — deblocking, the loop filter and every rounding rule are the decoder's, so both sides predict from the same picture by construction |
 
 Every chroma format (4:0:0 / 4:2:0 / 4:2:2 / 4:4:4) at 8 and 10 bits,
 any picture size. `EncoderConfig::picture_hash` appends the decoded
@@ -182,13 +185,13 @@ picture hash to the P pictures too.
 
 Effort ladder (`VideoEncoderConfig::with_effort`, registry `effort`):
 
-| effort | integer search | fractional | smallest CU |
-| --- | --- | --- | --- |
-| 0 | steps 2, 1 (4 points) | none | 16x16 |
-| 1 | steps 4 … 1 (4 points) | half sample | 16x16 |
-| **2** (default) | steps 8 … 1 (4 points) | quarter sample | 8x8 |
-| 3 | steps 16 … 1 (8 points) | quarter sample | 8x8 |
-| 4 | steps 32 … 1 (8 points), splits tested under skip CUs | quarter sample | 8x8 |
+| effort | integer search | fractional | smallest CU | loop filter decision |
+| --- | --- | --- | --- | --- |
+| 0 | steps 2, 1 (4 points) | none | 16x16 | — |
+| 1 | steps 4 … 1 (4 points) | half sample | 16x16 | ALF |
+| **2** (default) | steps 8 … 1 (4 points) | quarter sample | 8x8 | ALF |
+| 3 | steps 16 … 1 (8 points) | quarter sample | 8x8 | ALF |
+| 4 | steps 32 … 1 (8 points), splits tested under skip CUs | quarter sample | 8x8 | ALF |
 
 **Bitrate at equal luma PSNR, P coding against all-intra coding** by
 the same encoder (`H266_R490_MEASURE=1 cargo test --release --test
@@ -199,8 +202,23 @@ rate curve at the P coding's luma PSNR):
 
 | Clip | QP 22 | QP 27 | QP 32 | QP 37 | Mean |
 | --- | --- | --- | --- | --- | --- |
-| `RAP_B_1` 416x240, 10-bit, 17 pictures | 95559 B at 44.69 dB vs 160619 B (−40.5 %) | 56227 B at 41.14 dB vs 106476 B (−47.2 %) | 31867 B at 37.67 dB vs 68993 B (−53.8 %) | 18072 B at 34.31 dB vs 43624 B (−58.6 %) | **−50.0 %** |
-| `8b420_A_2` 832x480, 8-bit, 9 pictures | 91190 B at 44.74 dB vs 268291 B (−66.0 %) | 51626 B at 41.50 dB vs 176217 B (−70.7 %) | 29857 B at 38.18 dB vs 113612 B (−73.7 %) | 17100 B at 34.87 dB vs 70647 B (−75.8 %) | **−71.6 %** |
+| `RAP_B_1` 416x240, 10-bit, 17 pictures | 94713 B at 45.24 dB vs 170757 B (−44.5 %) | 55875 B at 41.74 dB vs 114556 B (−51.2 %) | 31876 B at 38.30 dB vs 74869 B (−57.4 %) | 18023 B at 34.92 dB vs 47863 B (−62.3 %) | **−53.9 %** |
+| `8b420_A_2` 832x480, 8-bit, 9 pictures | 94852 B at 45.59 dB vs 299377 B (−68.3 %) | 55022 B at 42.56 dB vs 202255 B (−72.8 %) | 32623 B at 39.34 dB vs 133117 B (−75.5 %) | 18926 B at 35.96 dB vs 83611 B (−77.4 %) | **−73.5 %** |
+
+Tool by tool, the mean of each clip (same method; each row adds one
+tool to the row above):
+
+| P coding | `RAP_B_1` | `8b420_A_2` |
+| --- | --- | --- |
+| skip / merge / explicit vectors, deblocked only | −50.0 % | −71.6 % |
+| + adaptive loop filter, fixed filter sets (+0.2 … +0.4 dB luma at ±1 % bytes) | −52.9 % | −72.6 % |
+| + temporal motion vector prediction | −53.8 % | −72.9 % |
+| + IDR pictures 2 QP steps finer (3 steps: −53.8 % / −73.5 %; 4 steps: −53.5 % / −73.2 %) | −53.9 % | −73.5 % |
+
+Measured and left out: luma ALF filters designed per picture and sent
+in an APS (or kept from the previous picture's APS) next to the fixed
+sets — no CTB of either clip at any QP elected them over its best
+fixed set, 0.0 %.
 
 The widened zero bin of the inter quantiser accounts for 12 – 16 % of
 that (rounding at a quarter step against half a step, same clips). A
@@ -215,26 +233,29 @@ decoding each access unit for the next reference):
 
 | Clip | P picture | IDR picture |
 | --- | --- | --- |
-| 416x240 (`RAP_B_1`) | 72 ms — **13.8 pictures/s** (212 ms before the cached forward-DCT kernels and the final-skip rule) | 0.62 s |
-| 832x480 (`8b420_A_2`) | 167 ms — **6.0 pictures/s** (423 ms before) | 2.5 s |
-| 1920x1080 (`8b420_B_2`) | 795 ms — **1.26 pictures/s** (1582 ms before) | 12.8 s |
+| 416x240 (`RAP_B_1`) | 67 ms — **15.0 pictures/s** with the loop filter decision and the second decode (72 ms before them, on the slower decoder; 212 ms before the cached forward-DCT kernels and the final-skip rule) | 0.38 s |
+| 832x480 (`8b420_A_2`) | 168 ms — **5.9 pictures/s** (167 ms; 423 ms) | 1.5 s |
+| 1920x1080 (`8b420_B_2`) | 839 ms — **1.19 pictures/s** (795 ms; 1582 ms) | 7.9 s |
+
+(The 416x240 figure is the median of the three undisturbed runs out of
+six; under load the same binary took up to 127 ms.)
 
 `tests/r490_inter_encoder.rs` decodes every stream from scratch with
 this crate's decoder against the references the encoder predicted from
 (sizes 8x8 … 330x270, QP 20 … 40, every chroma format and depth, every
-effort step, static content, scene changes, `keyint`), with PSNR
-floors, and a black-box decoder outputs the same samples;
+effort step, static content, scene changes, `keyint`, the loop filter
+decision on and off, the IDR QP offset), with PSNR floors, and a black-box decoder outputs the same samples;
 `tests/registry_encoder.rs` runs `keyint` through the registry in both
 framings. The `encode_roundtrip` fuzz target drives multi-picture
 encodes.
 
 Not in the P coding yet: intra CUs inside a P slice (a picture that
 needs them is coded as an IDR picture by the scene-change rule),
-B pictures / bi-prediction, more than one reference picture, temporal
-motion vector prediction, adaptive motion vector resolution, the
-sub-block / affine / geometric tools, SAO and ALF on P slices (the P
-pictures are deblocked only), tiles / WPP / multiple slices, rate
-control.
+B pictures / bi-prediction, more than one reference picture, adaptive
+motion vector resolution, the sub-block / affine / geometric tools,
+SAO, chroma and cross-component ALF and APS-signalled ALF filters on P
+slices, multi-type-tree splits in P pictures, tiles / WPP / multiple
+slices, rate control.
 
 ## VUI and SEI (Rec. ITU-T H.274, r487)
 
