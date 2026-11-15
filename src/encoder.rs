@@ -490,6 +490,13 @@ pub struct EncoderConfig {
     /// over the encoder's own reconstruction. `None` (the default)
     /// writes none.
     pub picture_hash: Option<crate::picture_hash::PictureHashMethod>,
+    /// r490 — the sequence carries inter (P) pictures: the SPS states
+    /// its profile / level and `dpb_parameters()` (two pictures, no
+    /// reordering) so a decoder keeps the reference picture, and
+    /// non-IDR pictures may follow each IDR. Set by
+    /// [`crate::video_encoder::VideoEncoder`]; the stills path leaves
+    /// it off and its parameter sets are unchanged.
+    pub inter_pictures: bool,
 }
 
 impl EncoderConfig {
@@ -525,6 +532,7 @@ impl EncoderConfig {
             picture_hash: None,
             intra_cclm: true,
             intra_chroma_modes: true,
+            inter_pictures: false,
         }
     }
 
@@ -930,8 +938,30 @@ impl VvcEncoder {
         bw.write_bits(self.config.chroma_format_idc as u32, 2);
         // sps_log2_ctu_size_minus5 = 2 → CTB = 128.
         bw.write_bits(2, 2);
-        // sps_ptl_dpb_hrd_params_present_flag = 0 → skip PTL+DPB+HRD.
-        bw.write_bit(0);
+        // sps_ptl_dpb_hrd_params_present_flag — the stills profile
+        // skips PTL + DPB + HRD; r490: a sequence with inter pictures
+        // states them (the DPB size is what lets a decoder keep the
+        // reference picture and output without delay).
+        let inter = self.config.inter_pictures;
+        bw.write_bit(inter as u8);
+        if inter {
+            // profile_tier_level( 1, 0 ) — §7.3.3.1, the VPS's values.
+            let profile_idc = if self.config.chroma_format_idc >= 2 {
+                33
+            } else {
+                1
+            };
+            bw.write_bits(profile_idc, 7); // general_profile_idc
+            bw.write_bit(0); // general_tier_flag
+            bw.write_bits(0x5A, 8); // general_level_idc
+            bw.write_bit(1); // ptl_frame_only_constraint_flag
+            bw.write_bit(0); // ptl_multilayer_enabled_flag
+            bw.write_bit(0); // gci_present_flag
+            while !bw.is_byte_aligned() {
+                bw.write_bit(0); // gci_alignment_zero_bit
+            }
+            bw.write_bits(0, 8); // ptl_num_sub_profiles
+        }
         bw.write_bit(0); // sps_gdr_enabled_flag = 0
         bw.write_bit(0); // sps_ref_pic_resampling_enabled_flag = 0
         // r474 — the coded size is the configured size padded to the
@@ -960,6 +990,13 @@ impl VvcEncoder {
         bw.write_bit(0); // sps_poc_msb_cycle_flag
         bw.write_bits(0, 2); // sps_num_extra_ph_bytes = 0
         bw.write_bits(0, 2); // sps_num_extra_sh_bytes = 0
+        if inter {
+            // dpb_parameters( 0, 0 ) — §7.3.4: the current picture
+            // plus one reference, output in decoding order.
+            bw.write_ue(1); // dpb_max_dec_pic_buffering_minus1[0]
+            bw.write_ue(0); // dpb_max_num_reorder_pics[0]
+            bw.write_ue(0); // dpb_max_latency_increase_plus1[0]
+        }
 
         // ---- Partition constraints (§7.3.2.4 tail) ----
         bw.write_ue(0); // log2_min_luma_cb_size_minus2
@@ -1087,6 +1124,9 @@ impl VvcEncoder {
         bw.write_bit(self.config.sign_data_hiding as u8); // sps_sign_data_hiding_enabled_flag
         bw.write_bit(0); // virtual_boundaries_enabled
 
+        if inter {
+            bw.write_bit(0); // sps_timing_hrd_params_present_flag
+        }
         bw.write_bit(0); // sps_field_seq_flag
         // §7.3.2.4 — the VUI: size, alignment to a byte boundary, then
         // the vui_payload() bytes (§7.3.2.21 around the H.274 syntax).
@@ -1315,6 +1355,73 @@ impl VvcEncoder {
         let mtt_on = self.config.enable_mtt_bt_picker || self.config.enable_mtt_tt_picker;
         let max_subdiv = 2 * (7 - 2 + u32::from(mtt_on));
         bw.write_ue(max_subdiv); // ph_cu_qp_delta_subdiv_intra_slice
+    }
+
+    /// r490 — the §7.3.2.7 PH NAL of an inter (P) picture:
+    /// `ph_inter_slice_allowed_flag = 1`, no intra slices, the
+    /// picture's `ph_pic_order_cnt_lsb`, LMCS off for the picture, one
+    /// quantization group per CTU on inter slices
+    /// (`ph_cu_qp_delta_subdiv_inter_slice = 0`) and
+    /// `ph_mvd_l1_zero_flag = 0`; every other element is closed by the
+    /// SPS / PPS gates this encoder writes.
+    #[doc(hidden)]
+    pub fn emit_inter_picture_header_nal(&self, poc_lsb: u32) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_bit(0); // ph_gdr_or_irap_pic_flag
+        bw.write_bit(0); // ph_non_ref_pic_flag
+        bw.write_bit(1); // ph_inter_slice_allowed_flag
+        bw.write_bit(0); // ph_intra_slice_allowed_flag
+        bw.write_ue(0); // ph_pic_parameter_set_id
+        bw.write_bits(poc_lsb & 0xFF, 8); // ph_pic_order_cnt_lsb
+        if self.config.lmcs.is_some() {
+            bw.write_bit(0); // ph_lmcs_enabled_flag
+        }
+        // pps_cu_qp_delta_enabled_flag = 1.
+        bw.write_ue(0); // ph_cu_qp_delta_subdiv_inter_slice
+        // No temporal MVP / MMVD / BDOF / DMVR / PROF controls (SPS
+        // gates 0); the lists live in the slice header, so the
+        // presence condition of ph_mvd_l1_zero_flag holds.
+        bw.write_bit(0); // ph_mvd_l1_zero_flag
+        bw.rbsp_trailing_bits();
+        Self::wrap_nal(NalUnitType::PhNut, 0, 1, &bw.into_bytes())
+    }
+
+    /// r490 — the §7.3.7 slice header of the single P slice of an
+    /// inter picture (through `byte_alignment()`): slice type P, ALF /
+    /// SAO off for the slice, `ref_pic_lists()` with one short-term
+    /// entry in list 0 (the previous picture) and
+    /// an empty list 1, `sh_qp_delta`, dependent quantisation and sign
+    /// hiding off.
+    #[doc(hidden)]
+    pub fn emit_p_slice_header_bytes(&self, sh_qp_delta: i32) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_bit(0); // sh_picture_header_in_slice_header_flag
+        bw.write_ue(1); // sh_slice_type = P
+        bw.write_bit(0); // sh_alf_enabled_flag (sps_alf_enabled_flag = 1)
+        // ph_lmcs_enabled_flag = 0 → no sh_lmcs_used_flag.
+        // ref_pic_lists( ) — no SPS candidates, so both structures
+        // are coded here.
+        bw.write_ue(1); // num_ref_entries[ 0 ]
+        bw.write_ue(0); // abs_delta_poc_st → AbsDeltaPocSt = 1
+        bw.write_bit(1); // strp_entry_sign_flag → the entry is POC − 1
+        bw.write_ue(0); // num_ref_entries[ 1 ]
+        // One entry: no sh_num_ref_idx_active_override_flag. No
+        // sh_cabac_init_flag / collocated / weights (PPS + PH gates).
+        bw.write_se(sh_qp_delta);
+        if self.config.enable_chroma_sao_merge {
+            bw.write_bit(0); // sh_sao_luma_used_flag
+            if self.config.chroma_format_idc != 0 {
+                bw.write_bit(0); // sh_sao_chroma_used_flag
+            }
+        }
+        if self.config.dep_quant {
+            bw.write_bit(0); // sh_dep_quant_used_flag
+        }
+        if self.config.sign_data_hiding {
+            bw.write_bit(0); // sh_sign_data_hiding_used_flag
+        }
+        bw.byte_alignment();
+        bw.into_bytes()
     }
 
     /// Round-387 — emit the §7.3.7 IDR slice-header bits (through

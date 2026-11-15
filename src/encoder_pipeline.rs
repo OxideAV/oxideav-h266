@@ -130,7 +130,7 @@ fn total_sse_y(src: &PicturePlane, rec: &PicturePlane) -> u64 {
 /// QP test points (QP 0 → ~0.04, QP 26 → ~12.7, QP 51 → ~617). The
 /// caller multiplies `lambda * bits` to convert APS bytes into an SSE-
 /// equivalent overhead.
-fn lambda_for_qp(qp: i32) -> f64 {
+pub(crate) fn lambda_for_qp(qp: i32) -> f64 {
     0.85f64 * 2.0f64.powf((qp as f64 - 12.0) / 3.0)
 }
 
@@ -1364,7 +1364,7 @@ fn code_luma_tb_with_pred(
 /// dep-quant / SDH), dequantisation and inverse transform;
 /// returns `(levels, reconstruction, SSE against the source)`.
 #[allow(clippy::too_many_arguments)]
-fn code_residual_block(
+pub(crate) fn code_residual_block(
     src: &PicturePlane,
     x: usize,
     y: usize,
@@ -2920,7 +2920,7 @@ fn decide_chroma_mode(
 /// emitted SPS derives to: `qPCb = Clip3(−QpBdOffset, 63, QpY)` (no
 /// PPS / SH / CU offsets on this encoder). The caller adds
 /// `QpBdOffset` to obtain Qp′Cb for the quantisers.
-fn chroma_qp_identity_bd(qp_y: i32, bit_depth: u32) -> i32 {
+pub(crate) fn chroma_qp_identity_bd(qp_y: i32, bit_depth: u32) -> i32 {
     let qp_bd_offset = 6 * (bit_depth as i32 - 8);
     qp_y.clamp(-qp_bd_offset, 63)
 }
@@ -6874,7 +6874,7 @@ fn emit_ctb_tree(
 /// r474 — replicate `src` into a `coded_w x coded_h` picture (chroma
 /// at `coded / sub`) by edge extension; `None` when the source already
 /// has the coded geometry.
-fn pad_source_to_coded(
+pub(crate) fn pad_source_to_coded(
     src: &PictureBuffer,
     coded_w: usize,
     coded_h: usize,
@@ -6915,7 +6915,7 @@ fn pad_source_to_coded(
 }
 
 /// r474 — crop a reconstruction back to the source geometry.
-fn crop_picture(
+pub(crate) fn crop_picture(
     rec: &PictureBuffer,
     luma_w: usize,
     luma_h: usize,
@@ -7025,7 +7025,7 @@ fn ep_len(chunk: &[u8]) -> u32 {
     crate::nal::emulation_prevention_len(chunk) as u32
 }
 
-fn build_nal(
+pub(crate) fn build_nal(
     nut: crate::nal::NalUnitType,
     layer_id: u8,
     temporal_id_plus1: u8,
