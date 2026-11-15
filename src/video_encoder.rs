@@ -31,8 +31,10 @@
 //!   `√λ ·` vector bits), refined to half and quarter sample positions
 //!   through the §8.5.6.3 interpolation.
 //! * **Residual** (§7.3.11.10) — one luma and two chroma DCT-II
-//!   transform blocks per CU, `cu_qp_delta_abs = 0` once per CTU (one
-//!   quantization group per CTU on inter slices).
+//!   transform blocks per CU, quantised with the zero bin widened to a
+//!   quarter step above half a step ([`INTER_ROUNDING`]);
+//!   `cu_qp_delta_abs = 0` once per CTU (one quantization group per
+//!   CTU on inter slices).
 //!
 //! The reference picture of the next P picture is obtained by decoding
 //! the access unit just written with [`crate::stream::StreamDecoder`]:
@@ -58,10 +60,11 @@ use crate::amvp::{
 use crate::amvr::AmvrShift;
 use crate::cabac_enc::ArithEncoder;
 use crate::coding_tree::{SplitConstraints, TreeCtxs, TreeType};
+use crate::dequant::{DequantParams, dequantize_tb_flat};
 use crate::encoder::{EncoderConfig, VvcEncoder, annex_b_wrap};
 use crate::encoder_pipeline::{
-    build_nal, chroma_qp_identity_bd, code_residual_block, crop_picture,
-    encode_idr_with_residuals_cfg, lambda_for_qp, pad_source_to_coded,
+    build_nal, chroma_qp_identity_bd, crop_picture, encode_idr_with_residuals_cfg, lambda_for_qp,
+    pad_source_to_coded,
 };
 use crate::inter::{
     HmvpTable, MotionField, MotionVector, MvField, build_merge_cand_list,
@@ -77,6 +80,8 @@ use crate::residual_enc::{
 };
 use crate::stream::StreamDecoder;
 use crate::syntax_enc::TreeNeighbours;
+use crate::transform::{TrType, inverse_transform_2d};
+use crate::transform_fwd::{forward_dct_ii_2d_low, quantize_tb_flat_rounding};
 
 /// Highest value of [`VideoEncoderConfig::effort`].
 pub const MAX_EFFORT: u8 = 4;
@@ -94,6 +99,9 @@ const LOG2_PAR_MRG_LEVEL: u32 = 2;
 const CTB_SIZE: usize = 128;
 /// Largest CU that carries a residual (`MaxTbSizeY`).
 const MAX_RESIDUAL_CU: usize = 64;
+/// Rounding point of the inter residual quantiser, in 1/64 of a
+/// quantisation step (32 would round to nearest).
+const INTER_ROUNDING: i64 = 16;
 
 /// Configuration of a [`VideoEncoder`].
 #[derive(Clone, Copy, Debug)]
@@ -903,7 +911,9 @@ impl<'a> PictureCoder<'a> {
             },
             residual_free: true,
         };
-        if size > MAX_RESIDUAL_CU {
+        // A skip CU that already costs less than the flags of any
+        // other mode is final.
+        if size > MAX_RESIDUAL_CU || best.cost <= self.lambda * 4.0 {
             return Ok(best);
         }
 
@@ -1188,6 +1198,67 @@ impl<'a> PictureCoder<'a> {
         sse
     }
 
+    /// Transform, quantise (zero bin widened to [`INTER_ROUNDING`]) and
+    /// reconstruct one block against `pred`: the levels and the SSE of
+    /// the reconstruction `Clip1( pred + res )` (§8.7.5.1).
+    #[allow(clippy::too_many_arguments)]
+    fn code_block(
+        &self,
+        src: &PicturePlane,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        pred: &[i16],
+        qp: i32,
+    ) -> Result<(Vec<i32>, u64)> {
+        let bd = self.bd;
+        let qp_prime = qp + 6 * (bd as i32 - 8);
+        let max_v = (1i32 << bd) - 1;
+        let mut residual = vec![0i32; w * h];
+        for row in 0..h {
+            let s = &src.samples[(y + row) * src.stride + x..(y + row) * src.stride + x + w];
+            let p = &pred[row * w..(row + 1) * w];
+            for ((r, &sv), &pv) in residual[row * w..(row + 1) * w].iter_mut().zip(s).zip(p) {
+                *r = i32::from(sv) - i32::from(pv);
+            }
+        }
+        let pred_sse = || -> u64 {
+            residual
+                .iter()
+                .map(|&r| (i64::from(r) * i64::from(r)) as u64)
+                .sum()
+        };
+        // §7.3.11.11 — a 64-point transform codes the low 32.
+        let coeffs = forward_dct_ii_2d_low(w, h, &residual, bd, 32, 32)?;
+        let levels = quantize_tb_flat_rounding(
+            &coeffs,
+            w as u32,
+            h as u32,
+            qp_prime,
+            bd,
+            15,
+            INTER_ROUNDING,
+        )?;
+        if !any_nonzero(&levels) {
+            return Ok((levels, pred_sse()));
+        }
+        let mut params = DequantParams::luma_8bit(w as u32, h as u32, qp_prime);
+        params.bit_depth = bd;
+        let dq = dequantize_tb_flat(&levels, &params)?;
+        let rec_res = inverse_transform_2d(w, h, w, h, TrType::DctII, TrType::DctII, &dq, bd, 15)?;
+        let mut sse = 0u64;
+        for row in 0..h {
+            let s = &src.samples[(y + row) * src.stride + x..(y + row) * src.stride + x + w];
+            for col in 0..w {
+                let v = (i32::from(pred[row * w + col]) + rec_res[row * w + col]).clamp(0, max_v);
+                let d = i64::from(v) - i64::from(s[col]);
+                sse += (d * d) as u64;
+            }
+        }
+        Ok((levels, sse))
+    }
+
     /// Transform + quantise the residual of the three components
     /// against the given prediction. Returns the levels and the SSE of
     /// the reconstruction.
@@ -1201,18 +1272,14 @@ impl<'a> PictureCoder<'a> {
         pcb: &[i16],
         pcr: &[i16],
     ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>, u64)> {
-        let rc = RcOpts::default();
-        let (ly, _, mut sse) =
-            code_residual_block(&self.src.luma, x, y, size, size, py, self.qp, rc, self.bd)?;
+        let (ly, mut sse) = self.code_block(&self.src.luma, x, y, size, size, py, self.qp)?;
         if !self.chroma {
             return Ok((ly, Vec::new(), Vec::new(), sse));
         }
         let (cx, cy) = (x / self.sub_w, y / self.sub_h);
         let (cw, ch) = (size / self.sub_w, size / self.sub_h);
-        let (lcb, _, s_cb) =
-            code_residual_block(&self.src.cb, cx, cy, cw, ch, pcb, self.qp_c, rc, self.bd)?;
-        let (lcr, _, s_cr) =
-            code_residual_block(&self.src.cr, cx, cy, cw, ch, pcr, self.qp_c, rc, self.bd)?;
+        let (lcb, s_cb) = self.code_block(&self.src.cb, cx, cy, cw, ch, pcb, self.qp_c)?;
+        let (lcr, s_cr) = self.code_block(&self.src.cr, cx, cy, cw, ch, pcr, self.qp_c)?;
         sse += s_cb + s_cr;
         Ok((ly, lcb, lcr, sse))
     }

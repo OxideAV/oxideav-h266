@@ -1364,7 +1364,7 @@ fn code_luma_tb_with_pred(
 /// dep-quant / SDH), dequantisation and inverse transform;
 /// returns `(levels, reconstruction, SSE against the source)`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn code_residual_block(
+fn code_residual_block(
     src: &PicturePlane,
     x: usize,
     y: usize,

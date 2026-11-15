@@ -59,18 +59,49 @@ pub fn forward_dct_ii_1d(n_tb_s: usize, x: &[i32]) -> Result<Vec<i32>> {
             "h266 fwd xfm: unsupported nTbS {n_tb_s}"
         )));
     }
-    // Column stride per eq. 1177: `j * (64 >> log2(N))`.
-    let stride = 64usize >> n_tb_s.trailing_zeros();
+    let m = forward_kernel(n_tb_s);
     let mut y = vec![0i32; n_tb_s];
-    for (k, y_k) in y.iter_mut().enumerate() {
-        let mut acc: i64 = 0;
-        let col = k * stride;
-        for (i, &x_i) in x.iter().enumerate() {
-            acc += dct_ii_entry(i, col) as i64 * x_i as i64;
-        }
-        *y_k = acc as i32;
-    }
+    forward_line(m, n_tb_s, x, &mut y);
     Ok(y)
+}
+
+/// r490 — the forward DCT-II kernel of one size, row `k` = the basis
+/// function of output coefficient `k` (`transMatrix` column
+/// `k * (64 >> log2(N))` of eq. 1177 sampled at `i = 0..N`), built once
+/// per size.
+fn forward_kernel(n_tb_s: usize) -> &'static [i32] {
+    static KERNELS: [std::sync::OnceLock<Vec<i32>>; 6] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    let log2 = n_tb_s.trailing_zeros() as usize;
+    KERNELS[log2 - 1].get_or_init(|| {
+        let stride = 64usize >> log2;
+        let mut m = Vec::with_capacity(n_tb_s * n_tb_s);
+        for k in 0..n_tb_s {
+            for i in 0..n_tb_s {
+                m.push(dct_ii_entry(i, k * stride));
+            }
+        }
+        m
+    })
+}
+
+/// One forward line: `out[k] = Σ kernel[k][i] · x[i]` for the first
+/// `out.len()` coefficients. The sum wraps at 32 bits — the value the
+/// 64-bit sum truncated to 32 bits has.
+#[inline]
+fn forward_line(kernel: &[i32], n: usize, x: &[i32], out: &mut [i32]) {
+    for (row, o) in kernel.chunks_exact(n).zip(out.iter_mut()) {
+        *o = row
+            .iter()
+            .zip(x)
+            .fold(0i32, |acc, (&m, &v)| acc.wrapping_add(m.wrapping_mul(v)));
+    }
 }
 
 /// Apply the separable 2D forward DCT-II to a `n_tb_w × n_tb_h` block
@@ -92,6 +123,22 @@ pub fn forward_dct_ii_2d(
     samples: &[i32],
     bit_depth: u32,
 ) -> Result<Vec<i32>> {
+    forward_dct_ii_2d_low(n_tb_w, n_tb_h, samples, bit_depth, n_tb_w, n_tb_h)
+}
+
+/// r490 — [`forward_dct_ii_2d`] computing only the coefficients with
+/// `x < keep_w` and `y < keep_h`; the others are returned as 0 (what a
+/// caller that zeroes the high frequencies of a 64-point block —
+/// §7.3.11.11 codes its low 32 — would overwrite them with anyway).
+pub(crate) fn forward_dct_ii_2d_low(
+    n_tb_w: usize,
+    n_tb_h: usize,
+    samples: &[i32],
+    bit_depth: u32,
+    keep_w: usize,
+    keep_h: usize,
+) -> Result<Vec<i32>> {
+    let (keep_w, keep_h) = (keep_w.min(n_tb_w), keep_h.min(n_tb_h));
     if samples.len() != n_tb_w * n_tb_h {
         return Err(Error::invalid(format!(
             "h266 fwd xfm 2D: input length {} != {}x{}",
@@ -100,35 +147,38 @@ pub fn forward_dct_ii_2d(
             n_tb_h
         )));
     }
-    // Step A — horizontal forward over each row. Mirrors the inverse
-    // path's "horizontal then vertical" but swapped.
-    let mut row_out = vec![0i32; n_tb_w * n_tb_h];
-    for y in 0..n_tb_h {
-        let row = &samples[y * n_tb_w..(y + 1) * n_tb_w];
-        let r = forward_dct_ii_1d(n_tb_w, row)?;
-        for x in 0..n_tb_w {
-            row_out[y * n_tb_w + x] = r[x];
+    if !(matches!(n_tb_w, 2 | 4 | 8 | 16 | 32 | 64))
+        || !(matches!(n_tb_h, 2 | 4 | 8 | 16 | 32 | 64))
+    {
+        return Err(Error::invalid(format!(
+            "h266 fwd xfm: unsupported block {n_tb_w}x{n_tb_h}"
+        )));
+    }
+    // Step A — horizontal forward over each row (the kept columns),
+    // with the first-stage `(v + 64) >> 7` shift: the inverse 2D
+    // pipeline shifts by 7 after its first 1D transform, the forward
+    // direction between its two.
+    let mut row_out = vec![0i32; keep_w * n_tb_h];
+    let kernel_w = forward_kernel(n_tb_w);
+    for (row, out_row) in samples
+        .chunks_exact(n_tb_w)
+        .zip(row_out.chunks_exact_mut(keep_w))
+    {
+        forward_line(kernel_w, n_tb_w, row, out_row);
+        for v in out_row.iter_mut() {
+            *v = ((i64::from(*v) + 64) >> 7) as i32;
         }
     }
-    // Step B — first-stage shift. The inverse 2D pipeline does a
-    // `(input + 64) >> 7` mid-shift after its first 1D transform; the
-    // forward direction applies the same shift between its two 1D
-    // transforms so the round-trip cancels.
-    let bd_shift_first = 7u32;
-    let round_first = 1i64 << (bd_shift_first - 1);
-    for v in row_out.iter_mut() {
-        *v = (((*v as i64) + round_first) >> bd_shift_first) as i32;
-    }
-    // Step C — vertical forward per column.
+    // Step C — vertical forward per column, accumulated row by row:
+    // out[ky][x] = Σ_y kernel[ky][y] · row_out[y][x].
     let mut out = vec![0i32; n_tb_w * n_tb_h];
-    for x in 0..n_tb_w {
-        let mut col = vec![0i32; n_tb_h];
-        for y in 0..n_tb_h {
-            col[y] = row_out[y * n_tb_w + x];
-        }
-        let c = forward_dct_ii_1d(n_tb_h, &col)?;
-        for y in 0..n_tb_h {
-            out[y * n_tb_w + x] = c[y];
+    let kernel_h = forward_kernel(n_tb_h);
+    for (ky, k_row) in kernel_h.chunks_exact(n_tb_h).take(keep_h).enumerate() {
+        let dst = &mut out[ky * n_tb_w..ky * n_tb_w + keep_w];
+        for (&m, src_row) in k_row.iter().zip(row_out.chunks_exact(keep_w)) {
+            for (d, &v) in dst.iter_mut().zip(src_row) {
+                *d = d.wrapping_add(m.wrapping_mul(v));
+            }
         }
     }
     // Step D — final normalisation shift to put coefficients into the
@@ -215,6 +265,36 @@ pub fn quantize_tb_flat(
     bit_depth: u32,
     log2_transform_range: u32,
 ) -> Result<Vec<i32>> {
+    quantize_tb_flat_rounding(
+        coeffs,
+        n_tb_w,
+        n_tb_h,
+        qp,
+        bit_depth,
+        log2_transform_range,
+        ROUND_NEAREST,
+    )
+}
+
+/// The rounding point of [`quantize_tb_flat`]: half a quantisation
+/// step, in 1/64 steps.
+pub(crate) const ROUND_NEAREST: i64 = 32;
+
+/// r490 — [`quantize_tb_flat`] with the rounding point as a parameter:
+/// `level = sign(c) · floor(|c| / step + rounding / 64)`. 32 rounds to
+/// nearest; a smaller value widens the zero bin and biases every level
+/// towards zero (fewer and smaller levels for a little more
+/// distortion — the trade the inter residual coder wants, whose
+/// Laplacian-distributed coefficients sit mostly below half a step).
+pub(crate) fn quantize_tb_flat_rounding(
+    coeffs: &[i32],
+    n_tb_w: u32,
+    n_tb_h: u32,
+    qp: i32,
+    bit_depth: u32,
+    log2_transform_range: u32,
+    rounding: i64,
+) -> Result<Vec<i32>> {
     let w = n_tb_w as usize;
     let h = n_tb_h as usize;
     if coeffs.len() != w * h {
@@ -247,10 +327,15 @@ pub fn quantize_tb_flat(
     for (i, &c) in coeffs.iter().enumerate() {
         // level ≈ round(c * scale / ls). Use signed rounding.
         let num = (c as i64) * scale;
-        let level = if num >= 0 {
-            (num + ls / 2) / ls
+        let level = if rounding == ROUND_NEAREST {
+            if num >= 0 {
+                (num + ls / 2) / ls
+            } else {
+                (num - ls / 2) / ls
+            }
         } else {
-            (num - ls / 2) / ls
+            let mag = (num.abs() * 64 + ls * rounding) / (ls * 64);
+            if num >= 0 { mag } else { -mag }
         };
         out[i] = level as i32;
     }
@@ -385,6 +470,93 @@ fn dct_ii_entry(m: usize, n: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r490 — the kernel form equals the per-entry 64-bit sums it
+    /// replaced, for every size, and the low-frequency variant is the
+    /// full transform with the other coefficients zeroed.
+    #[test]
+    fn kernel_forward_matches_the_per_entry_sums() {
+        fn reference(w: usize, h: usize, samples: &[i32], bd: u32) -> Vec<i32> {
+            let line = |n: usize, x: &[i32]| -> Vec<i32> {
+                let stride = 64usize >> n.trailing_zeros();
+                (0..n)
+                    .map(|k| {
+                        let acc: i64 = x
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v)| i64::from(dct_ii_entry(i, k * stride)) * i64::from(v))
+                            .sum();
+                        acc as i32
+                    })
+                    .collect()
+            };
+            let mut rows = vec![0i32; w * h];
+            for y in 0..h {
+                let r = line(w, &samples[y * w..(y + 1) * w]);
+                for x in 0..w {
+                    rows[y * w + x] = ((i64::from(r[x]) + 64) >> 7) as i32;
+                }
+            }
+            let mut out = vec![0i32; w * h];
+            for x in 0..w {
+                let col: Vec<i32> = (0..h).map(|y| rows[y * w + x]).collect();
+                let c = line(h, &col);
+                for y in 0..h {
+                    out[y * w + x] = c[y];
+                }
+            }
+            let shift = (w.trailing_zeros() + h.trailing_zeros() + bd) as i64 - 10;
+            if shift > 0 {
+                let round = 1i64 << (shift - 1);
+                for v in out.iter_mut() {
+                    let vv = i64::from(*v);
+                    *v = if vv >= 0 {
+                        ((vv + round) >> shift) as i32
+                    } else {
+                        (-((-vv + round) >> shift)) as i32
+                    };
+                }
+            }
+            out
+        }
+        let mut state = 0x2545_F491u32;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for &bd in &[8u32, 10, 16] {
+            let amp = 1i32 << bd;
+            for &(w, h) in &[
+                (2usize, 2usize),
+                (4, 4),
+                (8, 4),
+                (4, 16),
+                (16, 16),
+                (32, 8),
+                (64, 64),
+                (64, 16),
+            ] {
+                let samples: Vec<i32> = (0..w * h)
+                    .map(|_| (rnd() % (2 * amp as u32)) as i32 - amp)
+                    .collect();
+                let want = reference(w, h, &samples, bd);
+                assert_eq!(
+                    forward_dct_ii_2d(w, h, &samples, bd).unwrap(),
+                    want,
+                    "{w}x{h} bd {bd}"
+                );
+                let low = forward_dct_ii_2d_low(w, h, &samples, bd, 32, 32).unwrap();
+                for y in 0..h {
+                    for x in 0..w {
+                        let expect = if x < 32 && y < 32 { want[y * w + x] } else { 0 };
+                        assert_eq!(low[y * w + x], expect, "{w}x{h} bd {bd} ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
 
     /// 1D forward DCT-II of a flat (DC-only-input) row should
     /// concentrate all energy at the DC output coefficient.
