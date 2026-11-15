@@ -19,8 +19,11 @@ framework face for both: the registry decoder streams Annex B or
 its layouts and hands containers a `VvcDecoderConfigurationRecord`.
 The SPS VUI and the SEI messages of Rec. ITU-T H.274 are parsed and
 written: the colour description is stated on the stream parameters,
-the decoded picture hash checks every picture. Production inter
-(P / B) encoding and multilayer decoding are not built yet.
+the decoded picture hash checks every picture. Since r490 the encoder
+also codes video: IDR pictures followed by P pictures (skip / merge /
+explicit motion vectors, quarter-sample motion search, an effort
+ladder) in the same conforming stream. B pictures, intra CUs inside
+P pictures and multilayer decoding are not built yet.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -104,9 +107,12 @@ in output order.
 
 ### Encoder (`h266_encoder::H266CodecEncoder`, r477)
 
-The stills encoder behind `oxideav_core::Encoder`: one IDR access unit
-per frame (`pts == dts`, keyframes, duration one tick of
-`1 / frame_rate`), `flush` has nothing to drain.
+The encoder behind `oxideav_core::Encoder`: one access unit per frame
+(`pts == dts`, duration one tick of `1 / frame_rate`), `flush` has
+nothing to drain. With the default `keyint=1` every frame is an IDR
+picture (a still) and every packet a keyframe; with `keyint` above 1
+the frames between two IDR pictures are P pictures (see *Video
+encoder* below) and only the IDR packets carry the keyframe flag.
 
 | Input layout (declared on the descriptor) | Coded as |
 | --- | --- |
@@ -136,6 +142,9 @@ converts ahead of the encoder.
 | `cclm` | bool | true | cross-component linear-model modes in the chroma mode decision |
 | `chroma_modes` | bool | true | explicit chroma modes (planar / vertical / horizontal / DC) in the chroma mode decision |
 | `picture_hash` | `none` / `md5` / `crc` / `checksum` | `none` | a decoded picture hash SEI message (of the encoder's reconstruction) after every picture |
+| `keyint` | >= 1 | 1 | distance between IDR pictures; above 1 the frames in between are P pictures (lossy, single tile / slice, no WPP, no palette — otherwise a typed `Unsupported`) |
+| `effort` | 0..=4 | 2 | motion search / decision effort of the P pictures (ladder below) |
+| `scene_cut` | bool | true | with `keyint` above 1: a frame whose P coding is larger than the last IDR picture is coded as an IDR picture instead |
 
 The stream's `CodecParameters::color_signal` is written as the SPS VUI
 colour description (no VUI when it is unspecified) and repeated in
@@ -146,6 +155,86 @@ colour description (no VUI when it is unspecified) and repeated in
 through the registry encoder and decoder, checks the quality ladder and
 the typed refusals, and a black-box decoder reproduces the registry
 decoder's output for the `vvcc` samples.
+
+## Video encoder (r490)
+
+`video_encoder::VideoEncoder` (registry: `keyint` above 1) codes a
+sequence as `I P P P …`: every `keyint`-th picture — and every picture
+whose P coding would be larger than the last IDR picture — is an IDR
+picture from the stills pipeline, the pictures in between are
+single-slice P pictures predicting from the previous picture (one
+short-term entry in `ref_pic_lists()`, `dpb_parameters()` for two
+pictures without reordering in the SPS, so decoders output without
+delay).
+
+| Stage | What the P coding does |
+| --- | --- |
+| Coding tree (§7.3.11.4) | quad tree from the 128x128 CTB to 8x8, each split decided by `SSE + λ · bits` against the node's best leaf; the §7.4.12.4 inferred splits at the picture edge |
+| CU modes (§7.3.11.5 / .7) | skip (`merge_idx`), merge + residual, explicit vector (`mvd_coding()`, `mvp_l0_flag`, `cu_coded_flag`) + residual; a 128x128 CU is a skip CU |
+| Predictors | the merge list (§8.5.2.2: spatial, history, pairwise average, zero) and the motion vector predictor list (§8.5.2.8 – .10) are the decoder's own derivations run on a motion field / history table kept in coding order |
+| Motion search | seeds (merge candidates, both predictors, zero, the enclosing node's vector) → step-halving integer pattern search on SAD + `√λ ·` vector bits → half and quarter sample refinement through the §8.5.6.3 filters |
+| Residual (§7.3.11.10) | one luma + two chroma DCT-II blocks per CU, bits measured through the real residual coder; `cu_qp_delta_abs = 0` once per CTU |
+| Reference | the access unit just written is decoded by this crate's decoder — deblocking and every rounding rule are the decoder's, so both sides predict from the same picture by construction |
+
+Every chroma format (4:0:0 / 4:2:0 / 4:2:2 / 4:4:4) at 8 and 10 bits,
+any picture size. `EncoderConfig::picture_hash` appends the decoded
+picture hash to the P pictures too.
+
+Effort ladder (`VideoEncoderConfig::with_effort`, registry `effort`):
+
+| effort | integer search | fractional | smallest CU |
+| --- | --- | --- | --- |
+| 0 | steps 2, 1 (4 points) | none | 16x16 |
+| 1 | steps 4 … 1 (4 points) | half sample | 16x16 |
+| **2** (default) | steps 8 … 1 (4 points) | quarter sample | 8x8 |
+| 3 | steps 16 … 1 (8 points) | quarter sample | 8x8 |
+| 4 | steps 32 … 1 (8 points), splits tested under skip CUs | quarter sample | 8x8 |
+
+**Bitrate at equal luma PSNR, P coding against all-intra coding** by
+the same encoder (`H266_R490_MEASURE=1 cargo test --release --test
+r490_inter_encoder inter_gain -- --nocapture`; source pictures are the
+decoded output of two staged conformance streams, default effort,
+`keyint` 64; the all-intra rate is interpolated on its own six-point
+rate curve at the P coding's luma PSNR):
+
+| Clip | QP 22 | QP 27 | QP 32 | QP 37 | Mean |
+| --- | --- | --- | --- | --- | --- |
+| `RAP_B_1` 416x240, 10-bit, 17 pictures | 95559 B at 44.69 dB vs 160619 B (−40.5 %) | 56227 B at 41.14 dB vs 106476 B (−47.2 %) | 31867 B at 37.67 dB vs 68993 B (−53.8 %) | 18072 B at 34.31 dB vs 43624 B (−58.6 %) | **−50.0 %** |
+| `8b420_A_2` 832x480, 8-bit, 9 pictures | 91190 B at 44.74 dB vs 268291 B (−66.0 %) | 51626 B at 41.50 dB vs 176217 B (−70.7 %) | 29857 B at 38.18 dB vs 113612 B (−73.7 %) | 17100 B at 34.87 dB vs 70647 B (−75.8 %) | **−71.6 %** |
+
+The widened zero bin of the inter quantiser accounts for 12 – 16 % of
+that (rounding at a quarter step against half a step, same clips). A
+per-block "leave the block uncoded when its levels cost more than they
+repair" decision was measured at 0.0 % / −1.1 % for 25 – 60 % more
+time and left out.
+
+**Encode speed at the default effort** (`cargo bench --bench
+throughput -- video`: QP 32, IDR + 8 P pictures, one thread, medians
+of three runs on a laptop shared with other jobs; the time includes
+decoding each access unit for the next reference):
+
+| Clip | P picture | IDR picture |
+| --- | --- | --- |
+| 416x240 (`RAP_B_1`) | 72 ms — **13.8 pictures/s** (212 ms before the cached forward-DCT kernels and the final-skip rule) | 0.62 s |
+| 832x480 (`8b420_A_2`) | 167 ms — **6.0 pictures/s** (423 ms before) | 2.5 s |
+| 1920x1080 (`8b420_B_2`) | 795 ms — **1.26 pictures/s** (1582 ms before) | 12.8 s |
+
+`tests/r490_inter_encoder.rs` decodes every stream from scratch with
+this crate's decoder against the references the encoder predicted from
+(sizes 8x8 … 330x270, QP 20 … 40, every chroma format and depth, every
+effort step, static content, scene changes, `keyint`), with PSNR
+floors, and a black-box decoder outputs the same samples;
+`tests/registry_encoder.rs` runs `keyint` through the registry in both
+framings. The `encode_roundtrip` fuzz target drives multi-picture
+encodes.
+
+Not in the P coding yet: intra CUs inside a P slice (a picture that
+needs them is coded as an IDR picture by the scene-change rule),
+B pictures / bi-prediction, more than one reference picture, temporal
+motion vector prediction, adaptive motion vector resolution, the
+sub-block / affine / geometric tools, SAO and ALF on P slices (the P
+pictures are deblocked only), tiles / WPP / multiple slices, rate
+control.
 
 ## VUI and SEI (Rec. ITU-T H.274, r487)
 
@@ -1336,7 +1425,9 @@ writes the pre-filter mapped-domain reconstruction per CVS / poc,
 `H266_DUMP_PARTIAL` keeps the partially reconstructed picture of a
 failing decode. The corpus triage remains the priority pick list.
 
-An inter-frame P-slice and B-slice encoder + decoder scaffold
+The production P-picture path is `video_encoder` (above). An older
+inter-frame P-slice and B-slice encoder + decoder scaffold on an
+in-crate wire
 (`encoder_inter::encode_p_slice` / `encode_b_slice` and their decoders)
 provides single / dual-reference DPB, integer-pel full-search motion
 estimation with half- and quarter-pel sub-pel refinement through the

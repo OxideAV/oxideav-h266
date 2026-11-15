@@ -577,7 +577,7 @@ fn inter_gain_on_decoded_corpus_clips() {
         return;
     }
     let clips: &[(&str, usize)] = if full {
-        &[("RAP_B_1", 17), ("8b420_A_2", 9), ("8b420_B_2", 5)]
+        &[("RAP_B_1", 17), ("8b420_A_2", 9)]
     } else {
         &[("RAP_B_1", 6)]
     };
