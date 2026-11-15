@@ -268,7 +268,85 @@ remaining H.274 messages (film grain, frame packing, omnidirectional
 projection, annotated regions, neural-network post-filter, …) are
 reported by type only.
 
-## Performance (r487)
+## Performance
+
+### Decode, r490
+
+Profile first (`sample` on the 1080p stream `8b420_B_2`, one worker,
+share of the samples by stage):
+
+| Stage | Before | After |
+| --- | --- | --- |
+| Motion compensation (luma / chroma interpolation, affine sub-blocks, bi-prediction blend) | 39.3 % | 27.0 % |
+| Adaptive loop filter | 18.0 % | 24.6 % |
+| DMVR search | 9.9 % | 3.3 % |
+| Deblocking | 8.5 % | 9.1 % |
+| BDOF | 4.9 % | 5.7 % |
+| Allocator, memset, memmove | 6.1 % | 10.7 % |
+| SAO | 0.6 % | 0.8 % |
+| Everything else (CABAC, syntax, intra, transforms, bookkeeping) | 12.8 % | 18.8 % |
+
+The largest stage was the sample-by-sample interpolation: every output
+sample ran its own eight (four) clamped reference fetches, and the
+two-axis arm filtered through a per-sample column buffer. What
+changed, all bit-identical (the 56 streams keep their output
+identities, `.opl` MD5s and in-stream picture hashes; each rewrite is
+unit-tested against the per-sample / per-window form it replaces):
+
+* **Motion compensation** — a prediction fetches ONE reference
+  rectangle under the §8.5.6.3 clamps (a direct view of the reference
+  plane when the rectangle lies inside the picture and no subpicture
+  clamp is armed, a clamped copy otherwise) and runs the separable
+  8-tap / 4-tap passes over row slices. The DMVR-bounded predictors
+  clamp the refined rectangle into the bounding block of the unrefined
+  one (eqs. 926 / 927, 944 / 945) instead of materialising a patch and
+  re-entering the generic predictor; affine sub-blocks take the same
+  path (the PROF border ring is one integer fetch).
+* **DMVR search** — the bilinear arrays (§8.5.3.2.2) are built row by
+  row from one fetched rectangle, the SADs over row slices.
+* **BDOF** — gradients and the five correlation summands are derived
+  once per block, not once per 6x6 window (the windows of neighbouring
+  4x4 sub-blocks overlap).
+* **ALF classification** — each 2x2 Laplacian cell is computed once
+  per CTB instead of once per 8x8 gradient window (four windows share
+  a cell); windows that need the virtual-boundary or region padding
+  keep the per-window form.
+
+Measured with `benches/throughput.rs`, release build, Apple-silicon
+laptop shared with other jobs, old and new binaries run alternately:
+
+| Workload | Before | After |
+| --- | --- | --- |
+| 56 streams / 1777 pictures (416x240 … 1920x1080), 1 worker, process CPU time (two alternating runs each) | 64.5 / 63.9 CPU s (27.7 pictures per CPU second), 247 – 261 MiB peak | **38.3 / 38.5 CPU s (46.3 pictures per CPU second)**, 238 – 253 MiB peak |
+| 1080p `8b420_B_2` (49 pictures), 1 worker, median of 3 | 3334 ms — 14.7 fps | **1950 ms — 25.1 fps** |
+| 1080p `DMVR_A_3` (9 pictures), 1 worker | 736 ms — 12.2 fps | **380 ms — 23.7 fps** |
+| 1080p `SLICES_A_3` (25 pictures), 1 worker | 2322 ms — 10.8 fps | **1549 ms — 16.1 fps** |
+| 1080p `LMCS_B_2` (64 pictures), 1 worker | 4368 ms — 14.7 fps | **3041 ms — 21.0 fps** |
+| 1080p `TILE_A_2` (9 pictures, 676 kB), 1 worker | 1174 ms — 7.7 fps | **870 ms — 10.3 fps** |
+
+**Under a granted worker budget** (`Decoder::set_execution_context` /
+`StreamDecoder::set_threads`; serial by default) the three colour
+components are now deblocked and SAO-filtered side by side (two
+workers: Cb and Cr on one extra thread; three or more: one each) next
+to the ALF's parallel CTB rows; identical output at every budget
+(`tests/r490_worker_budget.rs` verifies the picture hashes of ten
+conformance streams at 1 / 2 / 3 / 6 workers). Medians of 3:
+
+| 1080p stream | r487, 8 workers | 1 worker | 3 workers | 8 workers |
+| --- | --- | --- | --- | --- |
+| `8b420_B_2` | 16.8 fps | 25.1 fps | 28.0 fps | 29.1 fps |
+| `DMVR_A_3` | 14.1 fps | 23.7 fps | 27.6 fps | 28.9 fps |
+| `SLICES_A_3` | 12.5 fps | 16.1 fps | 18.7 fps | 19.2 fps |
+| `LMCS_B_2` | 16.9 fps | 21.0 fps | 24.7 fps | 27.8 fps |
+| `TILE_A_2` | 9.3 fps | 10.3 fps | 12.3 fps | 12.9 fps |
+
+The CABAC parse and the reconstruction of a picture are still one
+thread: wavefront rows and tiles are parsed with their entry points
+but decoded in sequence, so the budget only reaches the in-loop
+filters (the remaining gain is bounded by their share above).
+
+### r487
+
 
 `benches/throughput.rs` (`cargo bench --bench throughput -- decode |
 encode`, plain `std::time`, `H266_BENCH_THREADS` = the
@@ -318,8 +396,9 @@ API). The adaptive loop filter — every CTB reads the pre-filter
 snapshot only and writes its own samples — runs its CTB rows on that
 many scoped threads, each owning its rows of the three planes; the
 output is identical for every budget (unit-tested for 1 … 9 workers,
-with tile boundaries, and through the registry). The rest of a picture
-(CABAC, reconstruction, deblocking, SAO) is serial, so the gain is the
+with tile boundaries, and through the registry). In r487 the rest of a
+picture (CABAC, reconstruction, deblocking, SAO) was serial (r490 adds
+deblocking and SAO per component, see above), so the gain was the
 ALF's share: with 8 workers the 1080p streams decode 13 – 20 % faster
 in wall time (medians of three: TILE_A 1477 → 1259 ms, SLICES_A
 2861 → 2434 ms, LMCS_B 5845 → 4662 ms) at the same CPU time (84.7 vs
@@ -1013,6 +1092,87 @@ foreign-wire CABAC fixtures. The single-tree walker also performs the
 at the edges, coded boundary BT, implicit-BT `depthOffset`,
 implicit-level `cqtDepth`), so non-CTB-multiple picture layouts
 decode end-to-end.
+
+## Decoder conformance table (r490)
+
+Every staged JVET conformance stream
+(`docs/video/h266/conformance/streams/` in the workspace, 56 streams,
+1777 pictures), decoded three ways: against the `.opl` per-plane MD5
+sidecars (`tests/jvet_conformance.rs`), against the decoded picture
+hash SEI messages inside the streams (`tests/r487_picture_hash.rs`,
+1777 / 1777 pictures) and through the registry in output order
+(`tests/registry_decoder.rs`). **56 pass, 0 fail, 0 unsupported.**
+
+| Stream | Size | Pictures | Verdict | Exercises |
+| --- | --- | --- | --- | --- |
+| `8b420_A_2` | 832x480 | 49 | pass | baseline 8-bit 4:2:0 RA, I + P/B |
+| `8b420_B_2` | 1920x1080 | 49 | pass | baseline 8-bit 4:2:0 RA at 1080p |
+| `8b400_A_2` | 832x480 | 49 | pass | monochrome (4:0:0) |
+| `8b444_A_2` | 1280x720 | 65 | pass | 4:4:4 |
+| `10b422_B_5` | 1920x1080 | 3 | pass | 10-bit 4:2:2 |
+| `CST_A_4` | 832x480 | 21 | pass | dual tree / chroma separate tree |
+| `DMVR_A_3` | 1920x1080 | 9 | pass | DMVR |
+| `DMVR_B_4` | 128x128 | 11 | pass | DMVR, minimal picture size |
+| `BDOF_A_4` | 832x480 | 44 | pass | BDOF, implicit on/off + subblock |
+| `PROF_B_3` | 832x480 | 16 | pass | PROF (affine prediction refinement) |
+| `LMCS_A_3` | 1920x1080 | 64 | pass | LMCS slice-level control, 4 tiles / 4 rect slices |
+| `LMCS_B_2` | 1920x1080 | 64 | pass | LMCS with 12 tiles / 8 slices / 2 subpictures |
+| `LMCS_C_1` | 1920x1080 | 32 | pass | LMCS sequence-level constraint flag |
+| `ALF_A_3` | 1280x720 | 3 | pass | ALF |
+| `ALF_B_3` | 1280x128 | 3 | pass | ALF, non-square picture |
+| `ALF_C_3` | 416x240 | 4 | pass | ALF |
+| `SAO_A_3` | 1920x1080 | 60 | pass | SAO × filter-tool combinations |
+| `DEBLOCKING_A_3` | 1280x720 | 17 | pass | deblocking |
+| `DEBLOCKING_C_3` | 1280x720 | 33 | pass | deblocking |
+| `DEBLOCKING_E_3` | 832x480 | 8 | pass | deblocking |
+| `CodingToolsSets_A_2` | 416x240 | 2 | pass | tool-set combination A |
+| `CodingToolsSets_B_2` | 416x240 | 9 | pass | tool-set combination B |
+| `CodingToolsSets_C_2` | 416x240 | 2 | pass | tool-set combination C |
+| `CodingToolsSets_D_2` | 416x240 | 9 | pass | tool-set combination D |
+| `CodingToolsSets_E_1` | 832x480 | 9 | pass | tool-set combination E |
+| `MIP_A_3` | 416x240 | 39 | pass | matrix intra prediction |
+| `MIP_B_3` | 1920x1080 | 17 | pass | matrix intra prediction |
+| `CCLM_A_2` | 416x240 | 7 | pass | cross-component linear model |
+| `ISP_A_3` | 416x240 | 34 | pass | intra subpartitions × LFNST |
+| `MTS_A_4` | 416x240 | 21 | pass | multiple transform selection |
+| `LFNST_A_4` | 416x240 | 53 | pass | LFNST |
+| `LFNST_B_4` | 416x240 | 46 | pass | LFNST |
+| `SBT_A_2` | 256x256 | 57 | pass | subblock transform |
+| `QUANT_A_2` | 832x480 | 5 | pass | quantisation |
+| `QUANT_B_2` | 1280x720 | 17 | pass | quantisation |
+| `JCCR_A_2` | 416x240 | 3 | pass | joint CbCr, all modes forced |
+| `JCCR_C_3` | 416x240 | 66 | pass | joint CbCr combined with other tools |
+| `BDPCM_A_2` | 832x480 | 3 | pass | BDPCM |
+| `LOSSLESS_B_3` | 1280x720 | 17 | pass | lossless / transquant bypass |
+| `IBC_A_2` | 416x240 | 17 | pass | intra block copy |
+| `MERGE_A_2` | 832x480 | 10 | pass | merge list |
+| `MMVD_A_3` | 1920x1080 | 300 | pass | MMVD distance table |
+| `GPM_A_3` | 832x480 | 17 | pass | geometric partitioning |
+| `AFF_A_2` | 1920x1080 | 10 | pass | affine |
+| `AMVR_A_3` | 416x240 | 85 | pass | AMVR (translational + affine), 5 concatenated CVSs |
+| `SMVD_A_2` | 1920x1080 | 10 | pass | symmetric MVD |
+| `TMVP_A_3` | 1280x720 | 64 | pass | temporal MVP |
+| `SbTMVP_A_3` | 832x480 | 49 | pass | subblock TMVP |
+| `WP_A_3` | 416x240 | 17 | pass | weighted prediction |
+| `TILE_A_2` | 1920x1080 | 9 | pass | tiles (single tile / single slice case) |
+| `WPP_A_3` | 832x480 | 49 | pass | WPP (`sps_entropy_coding_sync_enabled_flag = 1`) |
+| `SLICES_A_3` | 1920x1080 | 25 | pass | rectangular slices |
+| `SUBPIC_C_1` | 416x240 | 32 | pass | subpictures |
+| `GDR_A_2` | 176x144 | 29 | pass | gradual decoding refresh |
+| `RAP_A_1` | 416x240 | 1 | pass | CRA + RASL (RASL expected discarded) |
+| `RAP_B_1` | 416x240 | 33 | pass | CRA + RASL + trailing |
+
+What the staged set does not reach — the remaining decoder refusals
+are typed `Unsupported` errors, never wrong pictures:
+
+| Tool | State |
+| --- | --- |
+| Reference picture resampling (a reference coded at another size or under another scaling window, §8.5.6.3.1 scaled arm, Tables 28 – 35) | **unsupported** — refused at reference list construction since r490 (such a reference used to be read at unscaled positions); no staged stream |
+| Multilayer (inter-layer reference pictures, `nuh_layer_id > 0` output) | **unsupported** — refused at reference list construction; no staged stream |
+| Adaptive colour transform (`sps_act_enabled_flag`, `cu_act_enabled_flag`) | **unsupported** — refused at the first coding unit of such a sequence (the §8.7.4.6 inverse transform itself exists); no staged stream |
+| Slices of one picture with different deblocking parameters | **unsupported** — refused at the second slice; no staged stream |
+| Palette mode, sign data hiding, explicit long-term reference pictures | implemented; exercised by this crate's encoder and a black-box decoder (palette, sign hiding) or by construction only (long-term entries) — no staged stream |
+| Bit depths above 10 | the reconstruction is generic over 8 – 16 bits; no staged stream above 10 bits |
 
 ## JVET conformance triage (r434, re-triaged every round since)
 
