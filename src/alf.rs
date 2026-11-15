@@ -1127,6 +1127,45 @@ impl LumaClassification {
 pub(crate) fn derive_luma_classification(
     pre: &[u16],
     stride: usize,
+    pw: i32,
+    ph: i32,
+    fetch_clip: impl Into<ClipRegions>,
+    rx: u32,
+    ry: u32,
+    ctb_size_y: u32,
+    bit_depth: u32,
+) -> LumaClassification {
+    derive_luma_classification_impl(
+        pre, stride, pw, ph, fetch_clip, rx, ry, ctb_size_y, bit_depth, true,
+    )
+}
+
+/// The Laplacians of the two checkerboard positions of one 2x2 cell
+/// with (even) origin `(x, y)`, read directly from the pre-ALF plane:
+/// `(filtH, filtV, filtD0, filtD1)` summed over `(x, y)` and
+/// `(x + 1, y + 1)` (eqs. 1454 – 1457).
+#[inline(always)]
+fn laplacian_cell(pre: &[u16], stride: usize, x: usize, y: usize) -> [i32; 4] {
+    let mut acc = [0i32; 4];
+    for d in 0..2 {
+        let p = (y + d) * stride + x + d;
+        let at = |q: usize| i32::from(pre[q]);
+        let centre2 = at(p) << 1;
+        acc[0] += (centre2 - at(p - 1) - at(p + 1)).abs();
+        acc[1] += (centre2 - at(p - stride) - at(p + stride)).abs();
+        acc[2] += (centre2 - at(p - stride - 1) - at(p + stride + 1)).abs();
+        acc[3] += (centre2 - at(p - stride + 1) - at(p + stride - 1)).abs();
+    }
+    acc
+}
+
+/// [`derive_luma_classification`]; `share_cells = false` computes
+/// every sub-block's sums on its own (the form the shared-cell path is
+/// tested against).
+#[allow(clippy::too_many_arguments)]
+fn derive_luma_classification_impl(
+    pre: &[u16],
+    stride: usize,
     _pw: i32,
     ph: i32,
     fetch_clip: impl Into<ClipRegions>,
@@ -1134,6 +1173,7 @@ pub(crate) fn derive_luma_classification(
     ry: u32,
     ctb_size_y: u32,
     bit_depth: u32,
+    share_cells: bool,
 ) -> LumaClassification {
     let x_ctb = (rx * ctb_size_y) as i32;
     let y_ctb = (ry * ctb_size_y) as i32;
@@ -1161,6 +1201,21 @@ pub(crate) fn derive_luma_classification(
     let mut ac_arr = vec![0i32; sub_size * sub_size];
 
     let s_get = |sx: usize, sy: usize| sy * sub_size + sx;
+
+    // r490 — the 8x8 gradient windows of neighbouring sub-blocks
+    // overlap by half in each direction, so each checkerboard
+    // Laplacian belongs to four windows. The sums of the 2x2 cells
+    // (two checkerboard positions each) are computed once per CTB, on
+    // first use, and a sub-block whose window needs no padding adds
+    // up its 4x4 cells. Cell `(cx, cy)` has its origin at
+    // `(x_ctb − 2 + 2·cx, y_ctb − 2 + 2·cy)`; a first entry of −1
+    // marks a cell not computed yet (the sums are never negative).
+    let cells_w = 2 * sub_size + 2;
+    let mut cells = if share_cells {
+        vec![[-1i32, 0, 0, 0]; cells_w * cells_w]
+    } else {
+        Vec::new()
+    };
 
     for sy in 0..sub_size {
         for sx in 0..sub_size {
@@ -1221,25 +1276,47 @@ pub(crate) fn derive_luma_classification(
                 && ox + 6 < fetch_clip.x1
                 && oy - 3 >= fetch_clip.y0
                 && oy + 6 < fetch_clip.y1;
-            let (sh, sv, sd0, sd1) = if interior {
-                laplacian_sums(
-                    |x, y| i32::from(pre[y as usize * stride + x as usize]),
-                    &pad_y,
-                    ox,
-                    oy,
-                    min_y,
-                    max_y,
-                )
-            } else {
-                laplacian_sums(
-                    |x, y| sample(pre, stride, fetch_clip, x, y) as i32,
-                    &pad_y,
-                    ox,
-                    oy,
-                    min_y,
-                    max_y,
-                )
-            };
+            let (sh, sv, sd0, sd1) =
+                if share_cells && interior && clip_top.is_none() && clip_bottom.is_none() {
+                    // Rows −2 … 5 and columns −2 … 5 of the window: cells
+                    // (2·sx, 2·sy) … (2·sx + 3, 2·sy + 3).
+                    let mut acc = [0i32; 4];
+                    for cy in 2 * sy..2 * sy + 4 {
+                        for cx in 2 * sx..2 * sx + 4 {
+                            let cell = &mut cells[cy * cells_w + cx];
+                            if cell[0] < 0 {
+                                *cell = laplacian_cell(
+                                    pre,
+                                    stride,
+                                    (x_ctb - 2 + 2 * cx as i32) as usize,
+                                    (y_ctb - 2 + 2 * cy as i32) as usize,
+                                );
+                            }
+                            for (a, c) in acc.iter_mut().zip(cell.iter()) {
+                                *a += c;
+                            }
+                        }
+                    }
+                    (acc[0], acc[1], acc[2], acc[3])
+                } else if interior {
+                    laplacian_sums(
+                        |x, y| i32::from(pre[y as usize * stride + x as usize]),
+                        &pad_y,
+                        ox,
+                        oy,
+                        min_y,
+                        max_y,
+                    )
+                } else {
+                    laplacian_sums(
+                        |x, y| sample(pre, stride, fetch_clip, x, y) as i32,
+                        &pad_y,
+                        ox,
+                        oy,
+                        min_y,
+                        max_y,
+                    )
+                };
             sum_h[s_get(sx, sy)] = sh;
             sum_v[s_get(sx, sy)] = sv;
             sum_d0[s_get(sx, sy)] = sd0;
@@ -2742,5 +2819,64 @@ mod tests {
         let c = regions.clip_at(5, 5);
         assert_eq!(c.clamp(33, 33), (31, 33));
         assert_eq!(c.clamp(33, 20), (33, 20));
+    }
+
+    /// r490 — sharing the 2x2 Laplacian cells between the overlapping
+    /// gradient windows gives the classification each window computes
+    /// on its own: every CTB of a noise picture (interior, picture
+    /// edges, a partial last row / column), without and with tile
+    /// boundaries, at 8 and 10 bits and both CTB sizes.
+    #[test]
+    fn r490_shared_laplacian_cells_match_per_window_sums() {
+        for (bd, ctb) in [(8u32, 32u32), (10, 64), (8, 128)] {
+            let (w, h) = (200usize, 152usize);
+            let stride = w + 8;
+            let mut pre = vec![0u16; stride * h];
+            let mut state = 0x9e37_79b9u32 ^ ctb;
+            for v in pre.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = ((state >> 9) & ((1 << bd) - 1)) as u16;
+            }
+            let col_bounds = [0u32, ctb, w as u32];
+            let row_bounds = [0u32, ctb, h as u32];
+            let plain = ClipRegions::new(None, w as i32, h as i32, 1, 1);
+            let tiled = ClipRegions::new(
+                Some((&col_bounds[..], &row_bounds[..])),
+                w as i32,
+                h as i32,
+                1,
+                1,
+            );
+            for regions in [plain, tiled] {
+                for ry in 0..(h as u32).div_ceil(ctb) {
+                    for rx in 0..(w as u32).div_ceil(ctb) {
+                        let run = |share: bool| {
+                            derive_luma_classification_impl(
+                                &pre,
+                                stride,
+                                w as i32,
+                                h as i32,
+                                regions.clone(),
+                                rx,
+                                ry,
+                                ctb,
+                                bd,
+                                share,
+                            )
+                        };
+                        let (shared, single) = (run(true), run(false));
+                        for sy in 0..(ctb as usize >> 2) {
+                            for sx in 0..(ctb as usize >> 2) {
+                                assert_eq!(
+                                    shared.get(sx, sy),
+                                    single.get(sx, sy),
+                                    "bd={bd} ctb={ctb} ctb=({rx},{ry}) sub-block ({sx},{sy})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

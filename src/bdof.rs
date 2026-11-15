@@ -341,103 +341,65 @@ fn bdof_apply_kernel<F>(
     let offset4: i32 = 1 << (shift4 - 1);
     let max_sample: i32 = (1i32 << bit_depth) - 1;
 
-    let n_cb_w_i = n_cb_w as i32;
-    let n_cb_h_i = n_cb_h as i32;
+    let w = n_cb_w as usize;
+    let h = n_cb_h as usize;
 
-    // Helpers to read predSamplesLN[hx][vy] under the §8.5.6.5
-    // convention where the extended array is indexed 0..=nCbW+1 in
-    // x and 0..=nCbH+1 in y. The spec's "hx = Clip3(1, nCbW, x)"
-    // clip is intentional — for the eq. 962/963 gradient reads at
-    // x = xSb-1..xSb+4, the +1 index can hit nCbW+1, which is the
-    // out-of-range slot the spec wants clamped down to nCbW.
-    let read_l0 = |hx: i32, vy: i32| -> i32 {
-        debug_assert!((0..=n_cb_w_i + 1).contains(&hx));
-        debug_assert!((0..=n_cb_h_i + 1).contains(&vy));
-        pred_l0[vy as usize * ext_w + hx as usize]
-    };
-    let read_l1 = |hx: i32, vy: i32| -> i32 {
-        debug_assert!((0..=n_cb_w_i + 1).contains(&hx));
-        debug_assert!((0..=n_cb_h_i + 1).contains(&vy));
-        pred_l1[vy as usize * ext_w + hx as usize]
-    };
+    // r490 — the 6x6 windows of neighbouring 4x4 sub-blocks overlap,
+    // so every per-position quantity is derived once for the block
+    // and the sub-blocks only add their windows up. The spec reads
+    // the gradients at `hx = Clip3(1, nCbW, x)`, `vy = Clip3(1, nCbH,
+    // y)`: a window position outside the block takes the value of the
+    // nearest position inside it, which is why the per-position
+    // arrays cover `1..=nCbW` x `1..=nCbH` only (stored 0-based).
+    //
+    // Per position: the two gradient differences of eq. 976
+    // (`gradientHL0 − gradientHL1`, `gradientVL0 − gradientVL1`,
+    // eqs. 962 – 965) and the five summands of eqs. 969 – 973
+    // (`Abs(tempH)`, `Abs(tempV)`, `Sign(tempV) · tempH`,
+    // `−Sign(tempH) · diff`, `−Sign(tempV) · diff`, with eqs. 966 –
+    // 968 for `diff`, `tempH`, `tempV`).
+    let mut grad = vec![[0i32; 2]; w * h];
+    let mut terms = vec![[0i32; 5]; w * h];
+    for y in 0..h {
+        let row = (y + 1) * ext_w + 1;
+        for x in 0..w {
+            let p = row + x;
+            let gh0 = (pred_l0[p + 1] >> SHIFT1) - (pred_l0[p - 1] >> SHIFT1);
+            let gv0 = (pred_l0[p + ext_w] >> SHIFT1) - (pred_l0[p - ext_w] >> SHIFT1);
+            let gh1 = (pred_l1[p + 1] >> SHIFT1) - (pred_l1[p - 1] >> SHIFT1);
+            let gv1 = (pred_l1[p + ext_w] >> SHIFT1) - (pred_l1[p - ext_w] >> SHIFT1);
+            let d = (pred_l0[p] >> SHIFT2) - (pred_l1[p] >> SHIFT2);
+            let th = (gh0 + gh1) >> SHIFT3;
+            let tv = (gv0 + gv1) >> SHIFT3;
+            grad[y * w + x] = [gh0 - gh1, gv0 - gv1];
+            terms[y * w + x] = [
+                th.abs(),
+                tv.abs(),
+                sign(tv) * th,
+                -sign(th) * d,
+                -sign(tv) * d,
+            ];
+        }
+    }
 
-    // Per the spec, gradient/diff/temp arrays cover the 6x6 window
-    // x ∈ {xSb-1 .. xSb+4}, y ∈ {ySb-1 .. ySb+4} per sub-block. We
-    // allocate them per-sub-block as small fixed-size 6x6 arrays
-    // indexed by the local `i + 1, j + 1` offset (for i, j ∈ -1..=4).
-    type Win = [[i32; 6]; 6];
-
-    let num_sb_x = n_cb_w as usize / 4;
-    let num_sb_y = n_cb_h as usize / 4;
-
-    for sy in 0..num_sb_y {
-        let y_sb = (sy << 2) as i32 + 1;
-        for sx in 0..num_sb_x {
-            let x_sb = (sx << 2) as i32 + 1;
-
-            // Step 1+2: gradients over the 6x6 window. We index by
-            // (i+1, j+1) for i, j ∈ -1..=4.
-            let mut gh0: Win = [[0; 6]; 6];
-            let mut gv0: Win = [[0; 6]; 6];
-            let mut gh1: Win = [[0; 6]; 6];
-            let mut gv1: Win = [[0; 6]; 6];
-            let mut diff: Win = [[0; 6]; 6];
-
+    for sy in 0..h / 4 {
+        for sx in 0..w / 4 {
+            // Correlation sums over the 6x6 window `i, j ∈ −1..=4`
+            // around the sub-block (eqs. 969 – 973): sGx2, sGy2,
+            // sGxGy, sGxdI, sGydI.
+            let mut sums = [0i32; 5];
             for j in -1i32..=4 {
+                let yy = ((4 * sy) as i32 + j).clamp(0, h as i32 - 1) as usize;
                 for i in -1i32..=4 {
-                    let x = x_sb + i;
-                    let y = y_sb + j;
-                    let hx = x.clamp(1, n_cb_w_i);
-                    let vy = y.clamp(1, n_cb_h_i);
-                    // eqs. 962 - 965
-                    let gh0v = (read_l0(hx + 1, vy) >> SHIFT1) - (read_l0(hx - 1, vy) >> SHIFT1);
-                    let gv0v = (read_l0(hx, vy + 1) >> SHIFT1) - (read_l0(hx, vy - 1) >> SHIFT1);
-                    let gh1v = (read_l1(hx + 1, vy) >> SHIFT1) - (read_l1(hx - 1, vy) >> SHIFT1);
-                    let gv1v = (read_l1(hx, vy + 1) >> SHIFT1) - (read_l1(hx, vy - 1) >> SHIFT1);
-                    let dv = (read_l0(hx, vy) >> SHIFT2) - (read_l1(hx, vy) >> SHIFT2);
-
-                    let ii = (i + 1) as usize;
-                    let jj = (j + 1) as usize;
-                    gh0[jj][ii] = gh0v;
-                    gv0[jj][ii] = gv0v;
-                    gh1[jj][ii] = gh1v;
-                    gv1[jj][ii] = gv1v;
-                    diff[jj][ii] = dv;
+                    let xx = ((4 * sx) as i32 + i).clamp(0, w as i32 - 1) as usize;
+                    for (acc, t) in sums.iter_mut().zip(terms[yy * w + xx].iter()) {
+                        *acc += t;
+                    }
                 }
             }
+            let [s_gx2, s_gy2, s_gx_gy, s_gx_di, s_gy_di] = sums;
 
-            // Step 3: tempH / tempV from the gradient sums (eqs. 967, 968).
-            let mut temp_h: Win = [[0; 6]; 6];
-            let mut temp_v: Win = [[0; 6]; 6];
-            for jj in 0..6 {
-                for ii in 0..6 {
-                    temp_h[jj][ii] = (gh0[jj][ii] + gh1[jj][ii]) >> SHIFT3;
-                    temp_v[jj][ii] = (gv0[jj][ii] + gv1[jj][ii]) >> SHIFT3;
-                }
-            }
-
-            // Step 4: per-sub-block correlation sums sGx2, sGy2,
-            // sGxGy, sGxdI, sGydI over i, j ∈ -1..=4 (the full 6x6
-            // window). Eqs. 969 - 973.
-            let mut s_gx2: i32 = 0;
-            let mut s_gy2: i32 = 0;
-            let mut s_gx_gy: i32 = 0;
-            let mut s_gx_di: i32 = 0;
-            let mut s_gy_di: i32 = 0;
-            for jj in 0..6 {
-                for ii in 0..6 {
-                    let th = temp_h[jj][ii];
-                    let tv = temp_v[jj][ii];
-                    let d = diff[jj][ii];
-                    s_gx2 += th.abs();
-                    s_gy2 += tv.abs();
-                    s_gx_gy += sign(tv) * th;
-                    s_gx_di += -sign(th) * d;
-                    s_gy_di += -sign(tv) * d;
-                }
-            }
-
-            // Step 5: refinement (eqs. 974, 975).
+            // Refinement (eqs. 974, 975).
             let vx = if s_gx2 > 0 {
                 let raw = (s_gx_di << 2) >> floor_log2(s_gx2);
                 raw.clamp(-MV_REFINE_THRES + 1, MV_REFINE_THRES - 1)
@@ -452,29 +414,14 @@ fn bdof_apply_kernel<F>(
                 0
             };
 
-            // Step 6: per-pixel pbSamples for x ∈ xSb-1..=xSb+2,
-            // y ∈ ySb-1..=ySb+2 (the 4x4 sub-block). Eqs. 976, 977.
-            for j in -1i32..=2 {
-                for i in -1i32..=2 {
-                    let x = x_sb + i;
-                    let y = y_sb + j;
-                    // gradient-window read at (i+1, j+1) inside
-                    // the 6x6 window — note eq. 976 uses
-                    // gradient[x+1][y+1] = our window[(i+1)+1][(j+1)+1] = [j+2][i+2].
-                    let g_idx_j = (j + 2) as usize;
-                    let g_idx_i = (i + 2) as usize;
-                    let bdof_offset = vx * (gh0[g_idx_j][g_idx_i] - gh1[g_idx_j][g_idx_i])
-                        + vy * (gv0[g_idx_j][g_idx_i] - gv1[g_idx_j][g_idx_i]);
-                    // predSamplesLN[x+1][y+1] in spec terms — the +1
-                    // keeps reads inside (1..=nCbW+1) when (x, y) ∈
-                    // (0..=nCbW).
-                    let p0 = pred_l0[(y + 1) as usize * ext_w + (x + 1) as usize];
-                    let p1 = pred_l1[(y + 1) as usize * ext_w + (x + 1) as usize];
-                    let blended = (p0 + offset4 + p1 + bdof_offset) >> shift4;
-                    let clamped = blended.clamp(0, max_sample);
-                    debug_assert!((0..n_cb_w_i).contains(&x));
-                    debug_assert!((0..n_cb_h_i).contains(&y));
-                    write(x, y, clamped);
+            // pbSamples of the 4x4 sub-block (eqs. 976, 977).
+            for y in 4 * sy..4 * sy + 4 {
+                for x in 4 * sx..4 * sx + 4 {
+                    let [gdh, gdv] = grad[y * w + x];
+                    let bdof_offset = vx * gdh + vy * gdv;
+                    let p = (y + 1) * ext_w + x + 1;
+                    let blended = (pred_l0[p] + offset4 + pred_l1[p] + bdof_offset) >> shift4;
+                    write(x as i32, y as i32, blended.clamp(0, max_sample));
                 }
             }
         }
@@ -1152,5 +1099,115 @@ mod tests {
         let ext_l1 = vec![0i32; ext_w];
         let mut dst = PicturePlane::filled_bd(n_cb_w as usize, n_cb_h as usize, 0, 10);
         assert!(bdof_refine_into_u16(&mut dst, 0, 0, n_cb_w, n_cb_h, &ext_l0, &ext_l1, 8).is_err());
+    }
+
+    /// §8.5.6.5 written window by window, exactly as the text walks
+    /// it: every 4x4 sub-block derives its own 6x6 gradient window
+    /// with the `Clip3` position clamps.
+    fn r490_window_form(w: usize, h: usize, l0: &[i32], l1: &[i32], bit_depth: u32) -> Vec<i32> {
+        let ext_w = w + 2;
+        let shift4 = std::cmp::max(3, 15 - bit_depth as i32);
+        let offset4 = 1 << (shift4 - 1);
+        let at = |a: &[i32], hx: i32, vy: i32| a[vy as usize * ext_w + hx as usize];
+        let mut out = vec![0i32; w * h];
+        for y_sb in (1..=h as i32).step_by(4) {
+            for x_sb in (1..=w as i32).step_by(4) {
+                let (mut gh, mut gv) = ([[[0i32; 6]; 6]; 2], [[[0i32; 6]; 6]; 2]);
+                let mut sums = [0i32; 5];
+                for j in 0..6i32 {
+                    for i in 0..6i32 {
+                        let hx = (x_sb - 1 + i).clamp(1, w as i32);
+                        let vy = (y_sb - 1 + j).clamp(1, h as i32);
+                        for (n, l) in [l0, l1].into_iter().enumerate() {
+                            gh[n][j as usize][i as usize] =
+                                (at(l, hx + 1, vy) >> SHIFT1) - (at(l, hx - 1, vy) >> SHIFT1);
+                            gv[n][j as usize][i as usize] =
+                                (at(l, hx, vy + 1) >> SHIFT1) - (at(l, hx, vy - 1) >> SHIFT1);
+                        }
+                        let d = (at(l0, hx, vy) >> SHIFT2) - (at(l1, hx, vy) >> SHIFT2);
+                        let (ju, iu) = (j as usize, i as usize);
+                        let th = (gh[0][ju][iu] + gh[1][ju][iu]) >> SHIFT3;
+                        let tv = (gv[0][ju][iu] + gv[1][ju][iu]) >> SHIFT3;
+                        sums[0] += th.abs();
+                        sums[1] += tv.abs();
+                        sums[2] += sign(tv) * th;
+                        sums[3] -= sign(th) * d;
+                        sums[4] -= sign(tv) * d;
+                    }
+                }
+                let lim = MV_REFINE_THRES - 1;
+                let vx = if sums[0] > 0 {
+                    ((sums[3] << 2) >> floor_log2(sums[0])).clamp(-lim, lim)
+                } else {
+                    0
+                };
+                let vy = if sums[1] > 0 {
+                    (((sums[4] << 2) - ((vx * sums[2]) >> 1)) >> floor_log2(sums[1]))
+                        .clamp(-lim, lim)
+                } else {
+                    0
+                };
+                for j in 1..5usize {
+                    for i in 1..5usize {
+                        let (x, y) = (x_sb as usize + i - 1, y_sb as usize + j - 1);
+                        let off =
+                            vx * (gh[0][j][i] - gh[1][j][i]) + vy * (gv[0][j][i] - gv[1][j][i]);
+                        let v = (at(l0, x as i32, y as i32)
+                            + offset4
+                            + at(l1, x as i32, y as i32)
+                            + off)
+                            >> shift4;
+                        out[(y - 1) * w + x - 1] = v.clamp(0, (1 << bit_depth) - 1);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// r490 — deriving the per-position quantities once per block
+    /// gives the samples of the window-by-window form, for every
+    /// block size BDOF runs on, at 8 / 10 / 12 bits.
+    #[test]
+    fn r490_shared_gradients_match_the_window_form() {
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for bd in [8u32, 10, 12] {
+            for (w, h) in [(8usize, 8usize), (8, 16), (16, 8), (16, 16)] {
+                for round in 0..6 {
+                    let n = (w + 2) * (h + 2);
+                    // BitDepth + 6 precision values; later rounds are
+                    // smooth ramps plus noise (small gradients).
+                    let gen_plane = |next: &mut dyn FnMut() -> u32, phase: i32| -> Vec<i32> {
+                        (0..n)
+                            .map(|k| {
+                                let (x, y) = ((k % (w + 2)) as i32, (k / (w + 2)) as i32);
+                                let noise = (next() % (1 << (bd + 6))) as i32;
+                                if round < 2 {
+                                    noise - (1 << (bd + 5))
+                                } else {
+                                    (x * 37 * round + y * 53 + phase * 91) % (1 << (bd + 5))
+                                        + (noise >> 7)
+                                }
+                            })
+                            .collect()
+                    };
+                    let l0 = gen_plane(&mut next, 0);
+                    let l1 = gen_plane(&mut next, round);
+                    let mut got = vec![0i32; w * h];
+                    bdof_apply_kernel(w as u32, h as u32, &l0, &l1, bd, w + 2, |x, y, v| {
+                        got[y as usize * w + x as usize] = v;
+                    });
+                    assert_eq!(
+                        got,
+                        r490_window_form(w, h, &l0, &l1, bd),
+                        "bd={bd} {w}x{h} round {round}"
+                    );
+                }
+            }
+        }
     }
 }
