@@ -102,6 +102,8 @@ use crate::transform_fwd::{forward_dct_ii_2d_low, quantize_tb_flat_rounding};
 pub const MAX_EFFORT: u8 = 4;
 /// Default of [`VideoEncoderConfig::effort`].
 pub const DEFAULT_EFFORT: u8 = 2;
+/// Default of [`VideoEncoderConfig::idr_qp_offset`].
+pub const DEFAULT_IDR_QP_OFFSET: i32 = -2;
 /// Default of [`VideoEncoderConfig::keyint`].
 pub const DEFAULT_KEYINT: u32 = 64;
 
@@ -138,6 +140,11 @@ pub struct VideoEncoderConfig {
     /// Decide the adaptive loop filter of the P pictures (effort 1 and
     /// above; effort 0 never runs it).
     pub alf: bool,
+    /// QP of the IDR pictures relative to `qp` when the sequence has
+    /// P pictures (`keyint > 1`): every P picture predicts, directly
+    /// or through its predecessors, from the IDR picture, so bits
+    /// spent there are shared by the pictures that follow.
+    pub idr_qp_offset: i32,
 }
 
 impl VideoEncoderConfig {
@@ -151,6 +158,7 @@ impl VideoEncoderConfig {
             effort: DEFAULT_EFFORT,
             scene_cut: true,
             alf: true,
+            idr_qp_offset: DEFAULT_IDR_QP_OFFSET,
         }
     }
 
@@ -169,6 +177,12 @@ impl VideoEncoderConfig {
     /// Builder: scene-change detection.
     pub fn with_scene_cut(mut self, on: bool) -> Self {
         self.scene_cut = on;
+        self
+    }
+
+    /// Builder: QP offset of the IDR pictures (clamped to −12..=12).
+    pub fn with_idr_qp_offset(mut self, offset: i32) -> Self {
+        self.idr_qp_offset = offset.clamp(-12, 12);
         self
     }
 
@@ -424,7 +438,12 @@ impl VideoEncoder {
                 }
             }
         }
-        let (au, _rec) = encode_idr_with_residuals_cfg(src, self.cfg.qp, p)?;
+        let idr_qp = if self.cfg.keyint > 1 {
+            (self.cfg.qp + self.cfg.idr_qp_offset).clamp(0, 63)
+        } else {
+            self.cfg.qp
+        };
+        let (au, _rec) = encode_idr_with_residuals_cfg(src, idr_qp, p)?;
         self.last_idr_bytes = au.len();
         // The pipeline's own hash message (if any) already closes the
         // access unit; `commit` only decodes it.

@@ -396,6 +396,32 @@ fn adaptive_loop_filter_on_p_pictures_raises_luma_psnr() {
     }
 }
 
+/// The IDR QP offset: the IDR pictures of a sequence with P pictures
+/// are coded finer than the P pictures by default, an offset of 0
+/// codes them at the configured QP, and both streams are conformant.
+#[test]
+fn idr_qp_offset_spends_bits_on_the_idr_picture() {
+    let (w, h) = (192usize, 128usize);
+    let frames = clip(w, h, 1, 8, 6, 5);
+    let base = VideoEncoderConfig::new(picture_cfg(w, h, 1, 8), 34).with_scene_cut(false);
+    assert_eq!(base.idr_qp_offset, -2);
+    let finer = encode_and_check(base, &frames, "idr offset default");
+    let flat = encode_and_check(base.with_idr_qp_offset(0), &frames, "idr offset 0");
+    assert_eq!(finer.kinds[0], PictureKind::Idr);
+    assert!(
+        finer.sizes[0] > flat.sizes[0],
+        "IDR picture {} B at the default offset, {} B at offset 0",
+        finer.sizes[0],
+        flat.sizes[0]
+    );
+    assert!(
+        finer.psnr_y > flat.psnr_y,
+        "{:.2} dB at the default offset, {:.2} dB at offset 0",
+        finer.psnr_y,
+        flat.psnr_y
+    );
+}
+
 #[test]
 fn static_content_is_coded_as_skip() {
     let (w, h) = (256usize, 256usize);
