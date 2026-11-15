@@ -15,6 +15,12 @@
 //! * `encode` codes synthetic 4:2:0 stills (lossy at QP 32 and
 //!   lossless) through the registry encoder and prints the median
 //!   wall time and megapixels per second.
+//! * `video` decodes three staged conformance streams (416x240,
+//!   832x480, 1920x1080) into source pictures and codes the first
+//!   `H266_BENCH_FRAMES` (default 9) of each through the registry
+//!   encoder with `keyint=64` at QP 32 and effort `H266_BENCH_EFFORT`
+//!   (default: the encoder's); prints the frames per second of the P
+//!   pictures (the IDR picture is timed apart) and the stream size.
 //!
 //! Environment: `H266_BENCH_THREADS` (default 1) is handed to the
 //! codec as its `ExecutionContext` worker budget; `H266_BENCH_REPS`
@@ -218,6 +224,94 @@ fn bench_encode(threads: usize, reps: usize) {
     }
 }
 
+/// Decode `name` from the corpus into framework frames (at most `max`).
+fn corpus_frames(name: &str, max: usize) -> Option<(Vec<VideoFrame>, CodecParameters)> {
+    let bs = std::fs::read(corpus_dir()?.join(format!("{name}.bit"))).ok()?;
+    let params = CodecParameters::video(CodecId::new("h266"));
+    let mut dec = oxideav_h266::decoder::make_decoder(&params).expect("decoder");
+    let mut frames = Vec::new();
+    let drain = |dec: &mut dyn oxideav_core::Decoder, frames: &mut Vec<VideoFrame>| {
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                frames.push(v);
+            }
+        }
+    };
+    for au in oxideav_h266::decoder::split_access_units(&bs) {
+        if frames.len() >= max {
+            break;
+        }
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), au.to_vec()))
+            .expect("send_packet");
+        drain(dec.as_mut(), &mut frames);
+    }
+    dec.flush().expect("flush");
+    drain(dec.as_mut(), &mut frames);
+    frames.truncate(max);
+    let out = dec.output_params()?;
+    (!frames.is_empty()).then_some((frames, out))
+}
+
+fn bench_video(threads: usize, reps: usize) {
+    let n = env_usize("H266_BENCH_FRAMES", 9).max(2);
+    let effort = std::env::var("H266_BENCH_EFFORT").ok();
+    println!(
+        "video: IDR + {} P pictures, QP 32, effort {}, {threads} worker(s), median of {reps}",
+        n - 1,
+        effort.as_deref().unwrap_or("default")
+    );
+    println!("| clip | size | IDR ms | P ms / picture | P pictures/s | bytes |");
+    for name in ["RAP_B_1", "8b420_A_2", "8b420_B_2"] {
+        let Some((frames, dparams)) = corpus_frames(name, n) else {
+            println!("| {name} | not available | | | | |");
+            continue;
+        };
+        let mut p = CodecParameters::video(CodecId::new("h266"));
+        p.width = dparams.width;
+        p.height = dparams.height;
+        p.pixel_format = dparams.pixel_format;
+        let mut opts = CodecOptions::new()
+            .set("qp", "32")
+            .set("keyint", "64")
+            .set("scene_cut", "false");
+        if let Some(e) = &effort {
+            opts = opts.set("effort", e);
+        }
+        p.options = opts;
+        let (mut idr_times, mut p_times) = (Vec::new(), Vec::new());
+        let mut bytes = 0usize;
+        for _ in 0..reps {
+            let mut enc = oxideav_h266::h266_encoder::make_encoder(&p).expect("encoder");
+            enc.set_execution_context(&ExecutionContext::with_threads(threads));
+            bytes = 0;
+            let mut p_total = Duration::ZERO;
+            for (i, f) in frames.iter().enumerate() {
+                let t = Instant::now();
+                enc.send_frame(&Frame::Video(f.clone()))
+                    .expect("send_frame");
+                let dt = t.elapsed();
+                bytes += enc.receive_packet().expect("packet").data.len();
+                if i == 0 {
+                    idr_times.push(dt);
+                } else {
+                    p_total += dt;
+                }
+            }
+            p_times.push(p_total);
+        }
+        let idr = median(idr_times);
+        let pt = median(p_times).as_secs_f64() / (frames.len() - 1) as f64;
+        println!(
+            "| {name} | {}x{} | {:.0} | {:.1} | {:.2} | {bytes} |",
+            p.width.unwrap_or(0),
+            p.height.unwrap_or(0),
+            idr.as_secs_f64() * 1e3,
+            pt * 1e3,
+            1.0 / pt
+        );
+    }
+}
+
 fn main() {
     // `cargo bench` passes `--bench`; everything else is ours.
     let args: Vec<String> = std::env::args()
@@ -229,6 +323,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("decode") => bench_decode(args.get(1).map(String::as_str), threads, reps),
         Some("encode") => bench_encode(threads, reps),
+        Some("video") => bench_video(threads, reps),
         _ => {
             bench_decode(None, threads, reps);
             bench_encode(threads, reps);

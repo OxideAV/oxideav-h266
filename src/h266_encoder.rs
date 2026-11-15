@@ -44,6 +44,7 @@ use crate::encoder_pipeline::encode_idr_with_residuals_cfg;
 use crate::nal::{NalUnitType, iter_annex_b};
 use crate::picture_hash::PictureHashMethod;
 use crate::reconstruct::PictureBuffer;
+use crate::video_encoder::{PictureKind, VideoEncoder, VideoEncoderConfig};
 use crate::vui::{VuiColourDescription, VuiParameters};
 use crate::vvcc::{VvcDecoderConfigurationRecord, annex_b_to_length_prefixed};
 
@@ -101,6 +102,17 @@ pub struct H266EncoderOptions {
     /// Decoded picture hash SEI message after every picture: `none`
     /// (default), `md5`, `crc` or `checksum`.
     pub picture_hash: String,
+    /// Distance between IDR pictures. 1 (the default) codes every
+    /// frame as an IDR picture; above 1 the frames between two IDR
+    /// pictures are P pictures predicting from the previous frame
+    /// (`video_encoder::VideoEncoder`).
+    pub keyint: u32,
+    /// Motion search / decision effort of the P pictures, 0..=4
+    /// (default 2).
+    pub effort: u32,
+    /// With `keyint` above 1: code a frame as an IDR picture when its
+    /// P coding is larger than the last IDR picture (default true).
+    pub scene_cut: bool,
 }
 
 impl H266EncoderOptions {
@@ -131,6 +143,9 @@ impl Default for H266EncoderOptions {
             cclm: true,
             chroma_modes: true,
             picture_hash: "none".to_string(),
+            keyint: 1,
+            effort: u32::from(crate::video_encoder::DEFAULT_EFFORT),
+            scene_cut: true,
         }
     }
 }
@@ -245,6 +260,24 @@ impl CodecOptionsStruct for H266EncoderOptions {
             default: OptionValue::String(String::new()),
             help: "decoded picture hash SEI message after every picture (of the encoder's reconstruction)",
         },
+        OptionField {
+            name: "keyint",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "distance between IDR pictures: 1 = every frame an IDR picture, above 1 = P pictures between them",
+        },
+        OptionField {
+            name: "effort",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(crate::video_encoder::DEFAULT_EFFORT as u32),
+            help: "motion search / decision effort of the P pictures, 0 (fastest) ..= 4",
+        },
+        OptionField {
+            name: "scene_cut",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "with keyint above 1: an IDR picture where the P coding is larger than the last IDR picture",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -267,6 +300,9 @@ impl CodecOptionsStruct for H266EncoderOptions {
             "cclm" => self.cclm = value.as_bool()?,
             "chroma_modes" => self.chroma_modes = value.as_bool()?,
             "picture_hash" => self.picture_hash = value.as_str()?.to_string(),
+            "keyint" => self.keyint = value.as_u32()?,
+            "effort" => self.effort = value.as_u32()?,
+            "scene_cut" => self.scene_cut = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -371,6 +407,8 @@ pub struct H266CodecEncoder {
     frame_index: i64,
     /// `format=vvcc`: strip the parameter sets, length-prefix the rest.
     vvcc: bool,
+    /// `keyint` above 1: the IDR + P picture encoder.
+    video: Option<VideoEncoder>,
     queue: VecDeque<Packet>,
 }
 
@@ -471,6 +509,27 @@ impl H266CodecEncoder {
         if let Some(c) = colour {
             config.vui = Some(VuiParameters::new().with_colour_description(c));
         }
+        // r490 — keyint above 1: the P-picture path. Its configuration
+        // (the SPS states the DPB) is the session's from here on.
+        if opts.effort > u32::from(crate::video_encoder::MAX_EFFORT) {
+            return Err(Error::invalid(format!(
+                "effort {} outside 0..={}",
+                opts.effort,
+                crate::video_encoder::MAX_EFFORT
+            )));
+        }
+        let video = if opts.keyint > 1 {
+            let v = VideoEncoder::new(
+                VideoEncoderConfig::new(config, qp)
+                    .with_keyint(opts.keyint)
+                    .with_effort(opts.effort as u8)
+                    .with_scene_cut(opts.scene_cut),
+            )?;
+            config = v.config().picture;
+            Some(v)
+        } else {
+            None
+        };
         // Validate up front (geometry, tile grid, tool exclusions).
         let probe = crate::encoder::VvcEncoder::new(config)?;
 
@@ -514,6 +573,7 @@ impl H266CodecEncoder {
             height: height as usize,
             frame_index: 0,
             vvcc,
+            video,
             queue: VecDeque::new(),
         })
     }
@@ -614,7 +674,16 @@ impl CoreEncoder for H266CodecEncoder {
             _ => return Err(Error::invalid("h266 encoder accepts video frames only")),
         };
         let src = self.frame_to_picture(vf.image_planes())?;
-        let (annex_b, _rec) = encode_idr_with_residuals_cfg(&src, self.qp, self.config)?;
+        let (annex_b, keyframe) = match &mut self.video {
+            Some(video) => {
+                let pic = video.encode(&src)?;
+                (pic.data, pic.kind == PictureKind::Idr)
+            }
+            None => (
+                encode_idr_with_residuals_cfg(&src, self.qp, self.config)?.0,
+                true,
+            ),
+        };
         let data = if self.vvcc {
             // The in-band parameter sets must be the ones the record
             // carries; the record is rebuilt if a picture ever disagrees
@@ -648,7 +717,7 @@ impl CoreEncoder for H266CodecEncoder {
                 .with_pts(pts)
                 .with_dts(pts)
                 .with_duration(1)
-                .with_keyframe(true),
+                .with_keyframe(keyframe),
         );
         self.frame_index += 1;
         Ok(())

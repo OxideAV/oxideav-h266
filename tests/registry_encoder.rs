@@ -424,3 +424,52 @@ fn black_box_decoder_agrees_on_vvcc_samples() {
         );
     }
 }
+
+/// r490 — `keyint` above 1: P pictures between the IDR pictures, in
+/// both framings; the registry decoder outputs every frame in order
+/// and close to the source, the keyframe flags follow the IDR pattern.
+#[test]
+fn keyint_option_codes_p_pictures_in_both_framings() {
+    for &pf in &[PixelFormat::Yuv420P, PixelFormat::Yuv444P10Le] {
+        let (_, bd) = layout(pf);
+        let (w, h) = (136usize, 104usize);
+        let frames: Vec<VideoFrame> = (0..6).map(|t| textured_frame(w, h, pf, t)).collect();
+        for format in ["annexb", "vvcc"] {
+            let label = format!("{pf:?} {format}");
+            let opts = CodecOptions::new()
+                .set("format", format)
+                .set("qp", "26")
+                .set("keyint", "4")
+                .set("scene_cut", "false")
+                .set("effort", "1");
+            let p = params(w as u32, h as u32, pf, opts);
+            let (packets, outp) = encode(&p, &frames);
+            assert_eq!(packets.len(), frames.len(), "{label}");
+            let keys: Vec<bool> = packets.iter().map(|pk| pk.flags.keyframe).collect();
+            assert_eq!(keys, [true, false, false, false, true, false], "{label}");
+            if format == "vvcc" {
+                assert!(!outp.extradata.is_empty(), "{label}: no vvcC record");
+            }
+            let (decoded, dpf) = decode(&outp, &packets);
+            assert_eq!(dpf, Some(pf), "{label}");
+            assert_eq!(decoded.len(), frames.len(), "{label}");
+            for (t, (d, s)) in decoded.iter().zip(&frames).enumerate() {
+                assert_eq!(d.pts, Some(t as i64), "{label}: frame {t} pts");
+                let v = psnr(&d.planes[0].data, &s.planes[0].data, bd > 8, bd);
+                assert!(v > 32.0, "{label}: frame {t} luma PSNR {v:.2}");
+            }
+        }
+    }
+    // An effort outside the ladder and inter coding of a lossless
+    // session are refused when the encoder is built.
+    let ctx = registry();
+    for opts in [
+        CodecOptions::new().set("keyint", "8").set("effort", "9"),
+        CodecOptions::new()
+            .set("keyint", "8")
+            .set("lossless", "true"),
+    ] {
+        let p = params(64, 64, PixelFormat::Yuv420P, opts);
+        assert!(ctx.codecs.first_encoder(&p).is_err());
+    }
+}

@@ -12,6 +12,15 @@
 //! lossless, bit 4 MTT pickers, bit 5 dependent quantisation, bit 6
 //! sign data hiding, bit 7 CU-size RDO; byte 3 → QP (& 63); the rest
 //! fills the planes (cycled).
+//!
+//! r490 — with bit 6 of byte 3 set the same configuration then runs
+//! through the video encoder: 2..=4 pictures (bit 7 of byte 3 and bit 5
+//! of byte 0), every later picture the plane fill restarted
+//! `1 + (byte 1 >> 5)` bytes further into the input (content that
+//! moves), IDR distance 3, effort `(byte 0 >> 6) + bit 7 of byte 2`
+//! (0..=4). A configuration the video encoder refuses is fine; the
+//! registry decoder must output every picture equal to the reference
+//! the encoder predicted the next picture from.
 
 #![no_main]
 
@@ -21,6 +30,7 @@ use oxideav_h266::decoder::H266Decoder;
 use oxideav_h266::encoder::EncoderConfig;
 use oxideav_h266::encoder_pipeline::encode_idr_with_residuals_cfg;
 use oxideav_h266::reconstruct::{PictureBuffer, PicturePlane};
+use oxideav_h266::video_encoder::{VideoEncoder, VideoEncoderConfig};
 use oxideav_h266::vvcc::{annex_b_to_length_prefixed, VvcDecoderConfigurationRecord};
 
 fn plane_bytes(p: &PicturePlane, wide: bool) -> Vec<u8> {
@@ -118,32 +128,37 @@ fuzz_target!(|data: &[u8]| {
 
     let samples = &data[4..];
     let mid = 1u16 << (bd - 1);
-    let mut src = PictureBuffer::with_chroma_format_bd(w, h, cf, mid, bd);
     let max = (1u16 << bd) - 1;
-    let mut k = 0usize;
-    let mut next = |plane: &mut PicturePlane| {
-        for y in 0..plane.height {
-            for x in 0..plane.width {
-                let b = if samples.is_empty() {
-                    0
-                } else {
-                    samples[k % samples.len()]
-                };
-                k += 1;
-                let v = if bd > 8 {
-                    (u16::from(b) << 2) | (u16::from(b) >> 6)
-                } else {
-                    u16::from(b)
-                };
-                plane.samples[y * plane.stride + x] = v.min(max);
+    // The picture whose plane fill starts `start` bytes into the input.
+    let picture = |start: usize| -> PictureBuffer {
+        let mut src = PictureBuffer::with_chroma_format_bd(w, h, cf, mid, bd);
+        let mut k = start;
+        let mut next = |plane: &mut PicturePlane| {
+            for y in 0..plane.height {
+                for x in 0..plane.width {
+                    let b = if samples.is_empty() {
+                        0
+                    } else {
+                        samples[k % samples.len()]
+                    };
+                    k += 1;
+                    let v = if bd > 8 {
+                        (u16::from(b) << 2) | (u16::from(b) >> 6)
+                    } else {
+                        u16::from(b)
+                    };
+                    plane.samples[y * plane.stride + x] = v.min(max);
+                }
             }
+        };
+        next(&mut src.luma);
+        if cf != 0 {
+            next(&mut src.cb);
+            next(&mut src.cr);
         }
+        src
     };
-    next(&mut src.luma);
-    if cf != 0 {
-        next(&mut src.cb);
-        next(&mut src.cr);
-    }
+    let src = picture(0);
 
     let Ok((annex_b, rec)) = encode_idr_with_residuals_cfg(&src, qp, cfg) else {
         return; // an excluded tool combination
@@ -172,4 +187,34 @@ fuzz_target!(|data: &[u8]| {
     let frames = decode_all(&mut dec, sample);
     assert_eq!(frames.len(), 1);
     assert_matches(&frames[0], &rec, cf, wide, "vvcC decode != reconstruction");
+
+    // r490 — IDR + P pictures through the video encoder.
+    if data[3] & 64 == 0 {
+        return;
+    }
+    let count = 2 + usize::from(data[3] >> 7) + usize::from((data[0] >> 5) & 1);
+    let step = 1 + usize::from(data[1] >> 5);
+    let effort = (data[0] >> 6) + (flags >> 7);
+    let vcfg = VideoEncoderConfig::new(cfg, qp)
+        .with_keyint(3)
+        .with_effort(effort);
+    let Ok(mut venc) = VideoEncoder::new(vcfg) else {
+        return; // lossless: no inter coding
+    };
+    let mut stream = Vec::new();
+    let mut refs = Vec::new();
+    for t in 0..count {
+        let Ok(pic) = venc.encode(&picture(t * step)) else {
+            return; // an excluded tool combination
+        };
+        stream.extend_from_slice(&pic.data);
+        refs.push(venc.reconstruction().expect("a coded picture has a reconstruction"));
+    }
+    let params = CodecParameters::video(CodecId::new("h266"));
+    let mut dec = H266Decoder::new(&params).expect("decoder");
+    let frames = decode_all(&mut dec, stream);
+    assert_eq!(frames.len(), count, "every coded picture decodes");
+    for (frame, rec) in frames.iter().zip(&refs) {
+        assert_matches(frame, rec, cf, wide, "inter decode != encoder reference");
+    }
 });
