@@ -98,6 +98,41 @@ struct DpbEntry {
     poc: i32,
     frame: std::sync::Arc<PictureBuffer>,
     motion: Option<std::sync::Arc<MotionField>>,
+    /// r490 — the picture size and scaling window the picture was
+    /// coded with ([`ref_geometry`]).
+    geometry: [i64; 6],
+}
+
+/// §7.4.3.5 — the facts §8.3.2 derives `RefPicScale` /
+/// `RefPicIsScaled` from and §8.5.6.3.1 positions a reference fetch
+/// with: the picture size and the scaling window offsets (the
+/// conformance window offsets when
+/// `pps_scaling_window_explicit_signalling_flag` is 0). Two pictures
+/// with equal values reference each other sample for sample.
+fn ref_geometry(pps: &PicParameterSet) -> [i64; 6] {
+    let win = match (pps.scaling_window, pps.conformance_window) {
+        (Some(w), _) => [
+            i64::from(w.left_offset),
+            i64::from(w.right_offset),
+            i64::from(w.top_offset),
+            i64::from(w.bottom_offset),
+        ],
+        (None, Some(c)) => [
+            i64::from(c.left_offset),
+            i64::from(c.right_offset),
+            i64::from(c.top_offset),
+            i64::from(c.bottom_offset),
+        ],
+        (None, None) => [0; 4],
+    };
+    [
+        i64::from(pps.pps_pic_width_in_luma_samples),
+        i64::from(pps.pps_pic_height_in_luma_samples),
+        win[0],
+        win[1],
+        win[2],
+        win[3],
+    ]
 }
 
 /// One picture's NAL bundle while its slices are being collected.
@@ -649,6 +684,7 @@ impl StreamDecoder {
         built: &[BuiltRefPicEntry],
         active: usize,
         max_poc_lsb: i32,
+        geometry: [i64; 6],
     ) -> Result<Vec<ReferencePicture>> {
         let mut out = Vec::new();
         for entry in built.iter().take(active) {
@@ -676,6 +712,18 @@ impl StreamDecoder {
                     self.dpb.iter().map(|d| d.poc).collect::<Vec<_>>()
                 ))
             })?;
+            // §8.3.2 / §8.5.6.3.1 — a reference coded at another size
+            // or under another scaling window is fetched through the
+            // reference picture resampling arm (scaled positions,
+            // Tables 28 – 35), which this decoder does not carry:
+            // refuse instead of predicting from unscaled positions.
+            if found.geometry != geometry {
+                return Err(Error::unsupported(format!(
+                    "h266 stream: reference picture resampling (reference POC {} is {}x{}, \
+                     the current picture {}x{}, or their scaling windows differ) not supported",
+                    found.poc, found.geometry[0], found.geometry[1], geometry[0], geometry[1],
+                )));
+            }
             out.push(ReferencePicture {
                 poc: found.poc,
                 frame: found.frame.clone(),
@@ -1151,10 +1199,19 @@ impl StreamDecoder {
                 );
             }
             if sh.sh_slice_type != SliceType::I {
-                let l0 =
-                    self.resolve_list(&built[0], sh.num_ref_idx_active[0] as usize, max_poc_lsb)?;
-                let l1 =
-                    self.resolve_list(&built[1], sh.num_ref_idx_active[1] as usize, max_poc_lsb)?;
+                let geometry = ref_geometry(&pps);
+                let l0 = self.resolve_list(
+                    &built[0],
+                    sh.num_ref_idx_active[0] as usize,
+                    max_poc_lsb,
+                    geometry,
+                )?;
+                let l1 = self.resolve_list(
+                    &built[1],
+                    sh.num_ref_idx_active[1] as usize,
+                    max_poc_lsb,
+                    geometry,
+                )?;
                 if crate::dbg_env::var_os("H266_DBG_RPL").is_some() {
                     eprintln!(
                         "RPL poc={poc} slice={i} type={:?} nact=[{},{}] L0={:?} L1={:?} col_l0={} col_idx={}",
@@ -1285,6 +1342,7 @@ impl StreamDecoder {
             poc,
             frame: std::sync::Arc::new(out.clone()),
             motion: Some(std::sync::Arc::new(motion)),
+            geometry: ref_geometry(&pps),
         });
 
         // prevTid0Pic (§8.3.1).
