@@ -216,7 +216,9 @@ fn bilinear_sample(
 }
 
 /// The §8.5.3.2.2 interpolation of one sample over a reference fetch
-/// `at( xInt, yInt )` (which applies the reference clamps).
+/// `at( xInt, yInt )` (which applies the reference clamps) — the
+/// per-sample form the unit tests hold [`bilinear_pred_array`] to.
+#[cfg(test)]
 #[inline(always)]
 fn bilinear_from(
     at: impl Fn(i32, i32) -> i32,
@@ -295,29 +297,71 @@ fn bilinear_pred_array(
     let base_x = sb_x + (mv.x >> 4) - sr_range;
     let base_y = sb_y + (mv.y >> 4) - sr_range;
 
-    // r487 — the reference clamps (§8.5.3.2.2 eqs. 631 – 634: eq. 5
-    // ClipH for pps_ref_wraparound_enabled_flag, the subpicture or
-    // picture clamp) of the `predWidth + 1` columns and
-    // `predHeight + 1` rows the array touches are resolved once, not
-    // per fetched sample.
-    let clip = crate::inter::RefClip::current();
-    let pw = ref_pic.width as i32;
-    let ph = ref_pic.height as i32;
-    let cols: Vec<usize> = (0..=pred_w as i32)
-        .map(|i| clip.x(base_x + i, pw, 1))
-        .collect();
-    let rows: Vec<usize> = (0..=pred_h as i32)
-        .map(|i| clip.y(base_y + i, ph, 1) * ref_pic.stride)
-        .collect();
-    let at = |xi: i32, yi: i32| -> i32 {
-        i32::from(ref_pic.samples[rows[(yi - base_y) as usize] + cols[(xi - base_x) as usize]])
-    };
+    // r490 — the `(predWidth + 1) × (predHeight + 1)` rectangle the
+    // array touches is fetched once under the reference clamps
+    // (§8.5.3.2.2 eqs. 631 – 634: eq. 5 ClipH for
+    // pps_ref_wraparound_enabled_flag, the subpicture or picture
+    // clamp); eqs. 624 – 639 then run over plain rows.
+    let win = crate::inter::ref_window(ref_pic, base_x, base_y, pred_w + 1, pred_h + 1, 1, 1);
+    let shift1 = bit_depth as i32 - 6;
+    let offset1 = 1 << (shift1 - 1);
+    let shift3 = 10 - bit_depth as i32;
+    let shift4 = bit_depth as i32 - 10;
+    let offset4 = if shift4 > 0 { 1 << (shift4 - 1) } else { 0 };
     let mut out = vec![0i32; pred_w * pred_h];
-    for yl in 0..pred_h {
-        for xl in 0..pred_w {
-            let int_x = base_x + xl as i32;
-            let int_y = base_y + yl as i32;
-            out[yl * pred_w + xl] = bilinear_from(at, int_x, int_y, frac_x, frac_y, bit_depth);
+    if pred_w == 0 || pred_h == 0 {
+        return out;
+    }
+    // Horizontal stage of one fetched row (eq. 636 / 638), or the
+    // plain samples when `xFrac == 0`.
+    let fx = FB_L[frac_x];
+    let h_stage = |row: &[u16], dst: &mut [i32]| {
+        for (d, pair) in dst.iter_mut().zip(row.windows(2)) {
+            let s = fx[0] * i32::from(pair[0]) + fx[1] * i32::from(pair[1]);
+            *d = (s + offset1) >> shift1;
+        }
+    };
+    if frac_y == 0 {
+        for (yl, o) in out.chunks_exact_mut(pred_w).enumerate() {
+            let row = win.row(yl, pred_w + 1);
+            if frac_x == 0 {
+                // eq. 635.
+                for (d, &v) in o.iter_mut().zip(row) {
+                    let v = i32::from(v);
+                    *d = if bit_depth <= 10 {
+                        v << shift3
+                    } else {
+                        (v + offset4) >> shift4
+                    };
+                }
+            } else {
+                h_stage(row, o);
+            }
+        }
+    } else if frac_x == 0 {
+        // eq. 637.
+        let fy = FB_L[frac_y];
+        for (yl, o) in out.chunks_exact_mut(pred_w).enumerate() {
+            let r0 = win.row(yl, pred_w);
+            let r1 = win.row(yl + 1, pred_w);
+            for ((d, &a), &b) in o.iter_mut().zip(r0).zip(r1) {
+                let s = fy[0] * i32::from(a) + fy[1] * i32::from(b);
+                *d = (s + offset1) >> shift1;
+            }
+        }
+    } else {
+        // eqs. 638 / 639 — separable horizontal-then-vertical
+        // (shift2 = 4, offset2 = 8).
+        let fy = FB_L[frac_y];
+        let mut prev = vec![0i32; pred_w];
+        let mut next = vec![0i32; pred_w];
+        h_stage(win.row(0, pred_w + 1), &mut prev);
+        for (yl, o) in out.chunks_exact_mut(pred_w).enumerate() {
+            h_stage(win.row(yl + 1, pred_w + 1), &mut next);
+            for ((d, &a), &b) in o.iter_mut().zip(&prev).zip(&next) {
+                *d = (fy[0] * a + fy[1] * b + 8) >> 4;
+            }
+            std::mem::swap(&mut prev, &mut next);
         }
     }
     out
@@ -341,16 +385,15 @@ fn sad_at_offset(
     debug_assert_eq!(DMVR_SEARCH_RANGE, 2);
     let mut sad: u64 = 0;
     let half_h = sb_h / 2;
+    let c0 = (2 + dx) as usize;
+    let c1 = (2 - dx) as usize;
     for y in 0..half_h {
         let row0 = ((2 * y) as i32 + 2 + dy) as usize;
         let row1 = ((2 * y) as i32 + 2 - dy) as usize;
-        for x in 0..sb_w {
-            let c0 = (x as i32 + 2 + dx) as usize;
-            let c1 = (x as i32 + 2 - dx) as usize;
-            let a = p_l0[row0 * pred_w + c0];
-            let b = p_l1[row1 * pred_w + c1];
-            sad += (a - b).unsigned_abs() as u64;
-        }
+        let a = &p_l0[row0 * pred_w + c0..][..sb_w];
+        let b = &p_l1[row1 * pred_w + c1..][..sb_w];
+        let row_sad: u32 = a.iter().zip(b).map(|(&a, &b)| (a - b).unsigned_abs()).sum();
+        sad += u64::from(row_sad);
     }
     if dx == 0 && dy == 0 {
         sad -= sad >> 2;
@@ -857,5 +900,47 @@ mod tests {
             sse_ref <= sse_base,
             "refined SSE {sse_ref} should not exceed baseline {sse_base}",
         );
+    }
+
+    /// r490 — the row-form bilinear array equals the per-sample
+    /// §8.5.3.2.2 derivation for every fractional phase, inside the
+    /// picture and across its edges, at 8 / 10 / 12 bits.
+    #[test]
+    fn r490_bilinear_array_matches_per_sample_derivation() {
+        for bd in [8u32, 10, 12] {
+            let mut plane = PicturePlane::filled_bd(40, 28, 0, bd);
+            let mut state = 0x1234_5678u32 + bd;
+            for v in plane.samples.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = ((state >> 8) & ((1 << bd) - 1)) as u16;
+            }
+            for (sb_x, sb_y) in [(0i32, 0i32), (8, 8), (24, 12)] {
+                for (dx, dy) in [(0i32, 0i32), (-5, 3), (30, -30), (-60, 60)] {
+                    for fx in [0i32, 1, 8, 15] {
+                        for fy in [0i32, 7, 15] {
+                            let mv = MotionVector {
+                                x: dx * 16 + fx,
+                                y: dy * 16 + fy,
+                            };
+                            let (pw, ph) = (20usize, 12usize);
+                            let got = bilinear_pred_array(&plane, sb_x, sb_y, pw, ph, mv, 2, bd);
+                            for yl in 0..ph {
+                                for xl in 0..pw {
+                                    let want = bilinear_sample(
+                                        &plane,
+                                        sb_x + (mv.x >> 4) - 2 + xl as i32,
+                                        sb_y + (mv.y >> 4) - 2 + yl as i32,
+                                        fx as usize,
+                                        fy as usize,
+                                        bd,
+                                    );
+                                    assert_eq!(got[yl * pw + xl], want, "bd={bd} mv={mv:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

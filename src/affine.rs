@@ -1053,8 +1053,6 @@ pub fn predict_luma_subblock_affine_high_precision(
     let y_int_base = dst_y as i32 + (mv.y >> 4);
     let x_frac = (mv.x & 15) as usize;
     let y_frac = (mv.y & 15) as usize;
-    let pic_w = src.width as i32;
-    let pic_h = src.height as i32;
 
     // Output is (sb_w + 2) × (sb_h + 2). Cell (cx, cy) carries the
     // §8.5.6.3 prediction for source-pixel offset `(cx - 1, cy - 1)`
@@ -1068,57 +1066,54 @@ pub fn predict_luma_subblock_affine_high_precision(
     let bd = src.bit_depth;
     let shift1 = std::cmp::min(4, bd as i32 - 8).max(0);
     let lift = 14 - bd as i32;
-    let fill = |c: i32, r: i32| -> i32 {
-        // Local pixel offset from sub-block top-left in luma samples.
-        // r = 0 / r = sb_h + 1 are halo rows.
-        let local_x = c - 1;
-        let local_y = r - 1;
-        // r447 — §8.5.6.3.2: the PROF / BDOF border samples
-        // (`xL ∈ {0, sbWidth + 1}` or `yL ∈ {0, sbHeight + 1}`) come
-        // from the §8.5.6.3.3 luma INTEGER sample fetch at the
-        // fraction-rounded position `(xInt + (xFrac >> 3) − 1,
-        // yInt + (yFrac >> 3) − 1)`, lifted `<< (14 − BitDepth)` —
-        // not from the interpolation filter.
-        if c == 0 || r == 0 || c == out_w as i32 - 1 || r == out_h as i32 - 1 {
-            let xi =
-                crate::inter::clip_ref_x(x_int_base + local_x + ((x_frac as i32) >> 3), pic_w, 1);
-            let yi =
-                crate::inter::clip_ref_y(y_int_base + local_y + ((y_frac as i32) >> 3), pic_h, 1);
-            return (src.samples[yi * src.stride + xi] as i32) << lift;
-        }
-        if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
-            // Integer-pel fast path: lift to BitDepth + 6 precision
-            // (eq. 932: `<< (14 - BitDepth)`).
-            let yi = crate::inter::clip_ref_y(y_int_base + local_y, pic_h, 1);
-            let xi = crate::inter::clip_ref_x(x_int_base + local_x, pic_w, 1);
-            return (src.samples[yi * src.stride + xi] as i32) << lift;
-        }
-        if y_frac == 0 {
-            let yi = crate::inter::clip_ref_y(y_int_base + local_y, pic_h, 1);
-            // Horizontal-only filter — the `>> shift1` H pass lands
-            // at BitDepth + 6 precision.
-            return h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
-        }
-        if x_frac == 0 {
-            let xi = crate::inter::clip_ref_x(x_int_base + local_x, pic_w, 1);
-            return v_only_tap(table, src, xi, y_int_base + local_y, y_frac) >> shift1;
-        }
-        // 2D — H pass at column `local_x`, V pass over an 8-row column.
-        let mut col = [0i32; 8];
-        for i in 0..8 {
-            let yi = crate::inter::clip_ref_y(y_int_base + local_y - 3 + i as i32, pic_h, 1);
-            col[i] = h_tap(table, src, x_int_base + local_x, yi, x_frac) >> shift1;
-        }
-        // v_tap applies `>> 6 = shift2 = 6`. After the H pass at
-        // `>> shift1` the V output lands at BitDepth + 6 — exactly
-        // the spec's predSamplesLN precision.
-        v_tap(table, &col, y_frac)
-    };
+    let (sw, sh) = (sb_w as usize, sb_h as usize);
 
-    for r in 0..out_h as i32 {
-        for c in 0..out_w as i32 {
-            out[r as usize * out_w + c as usize] = fill(c, r);
+    // r447 — §8.5.6.3.2: the PROF / BDOF border samples
+    // (`xL ∈ {0, sbWidth + 1}` or `yL ∈ {0, sbHeight + 1}`) come from
+    // the §8.5.6.3.3 luma INTEGER sample fetch at the
+    // fraction-rounded position `(xInt + (xFrac >> 3) − 1,
+    // yInt + (yFrac >> 3) − 1)`, lifted `<< (14 − BitDepth)` — not
+    // from the interpolation filter. r490 — one clamped rectangle
+    // serves the whole ring.
+    let ring = crate::inter::ref_window(
+        src,
+        x_int_base - 1 + ((x_frac as i32) >> 3),
+        y_int_base - 1 + ((y_frac as i32) >> 3),
+        out_w,
+        out_h,
+        1,
+        1,
+    );
+    for r in [0, out_h - 1] {
+        let row = ring.row(r, out_w);
+        for (d, &s) in out[r * out_w..][..out_w].iter_mut().zip(row) {
+            *d = i32::from(s) << lift;
         }
+    }
+    for r in 1..out_h - 1 {
+        let row = ring.row(r, out_w);
+        out[r * out_w] = i32::from(row[0]) << lift;
+        out[r * out_w + out_w - 1] = i32::from(row[out_w - 1]) << lift;
+    }
+
+    // The sub-block itself: the integer arm lifts to BitDepth + 6
+    // (eq. 932, filter set 0 only — the other sets run their row-0
+    // filter), a single-axis arm shifts by `shift1`, the two-axis arm
+    // shifts the H pass by `shift1` and the V pass by 6 — every arm
+    // lands at the spec's predSamplesLN precision.
+    let (cx, cy) = if x_frac == 0 && y_frac == 0 && filter_set == AffineLumaFilterSet::Set0 {
+        (None, None)
+    } else if y_frac == 0 {
+        (Some(&table[x_frac]), None)
+    } else if x_frac == 0 {
+        (None, Some(&table[y_frac]))
+    } else {
+        (Some(&table[x_frac]), Some(&table[y_frac]))
+    };
+    let win = crate::inter::ref_window(src, x_int_base - 3, y_int_base - 3, sw + 7, sh + 7, 1, 1);
+    let core = crate::inter::hp_separable::<8>(&win, sw, sh, cx, cy, shift1, lift);
+    for (r, row) in core.chunks_exact(sw).enumerate() {
+        out[(r + 1) * out_w + 1..][..sw].copy_from_slice(row);
     }
     Ok(AffineSubblockHpBlock {
         sb_width: sb_w,
