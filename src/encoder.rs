@@ -1085,7 +1085,12 @@ impl VvcEncoder {
         bw.write_ue(0); // num_ref_pic_lists[0] = 0
         bw.write_ue(0); // num_ref_pic_lists[1] = 0
         bw.write_bit(0); // ref_wraparound
-        bw.write_bit(0); // temporal_mvp
+        // r490 — temporal motion vector prediction on the inter
+        // configuration (the P pictures enable it in their PH).
+        bw.write_bit(inter as u8); // sps_temporal_mvp_enabled_flag
+        if inter {
+            bw.write_bit(0); // sps_sbtmvp_enabled_flag
+        }
         bw.write_bit(0); // amvr
         bw.write_bit(0); // bdof
         bw.write_bit(0); // smvd
@@ -1378,8 +1383,12 @@ impl VvcEncoder {
         }
         // pps_cu_qp_delta_enabled_flag = 1.
         bw.write_ue(0); // ph_cu_qp_delta_subdiv_inter_slice
-        // No temporal MVP / MMVD / BDOF / DMVR / PROF controls (SPS
-        // gates 0); the lists live in the slice header, so the
+        // sps_temporal_mvp_enabled_flag = 1. The lists live in the
+        // slice header (pps_rpl_info_in_ph_flag = 0), so no collocated
+        // elements follow here; a P slice with one active entry infers
+        // sh_collocated_from_l0_flag = 1, sh_collocated_ref_idx = 0.
+        bw.write_bit(1); // ph_temporal_mvp_enabled_flag
+        // No MMVD / BDOF / DMVR / PROF controls (SPS gates 0); the
         // presence condition of ph_mvd_l1_zero_flag holds.
         bw.write_bit(0); // ph_mvd_l1_zero_flag
         bw.rbsp_trailing_bits();

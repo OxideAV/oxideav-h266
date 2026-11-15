@@ -19,7 +19,9 @@
 //!   non-merge cascade (`mvd_coding()`, `mvp_l0_flag`, `cu_coded_flag`)
 //!   + residual. A 128x128 CU is only ever a skip CU.
 //! * **Predictors** — the merge list (§8.5.2.2: spatial candidates,
-//!   history candidates, pairwise average, zero padding) and the motion
+//!   the temporal candidate of §8.5.2.11 from the previous picture's
+//!   motion field as the decoder stored it, history candidates,
+//!   pairwise average, zero padding) and the motion
 //!   vector predictor list (§8.5.2.8 – §8.5.2.10) are the decoder's own
 //!   derivations ([`crate::inter`], [`crate::amvp`]) run against a
 //!   motion field and a history table the encoder maintains in coding
@@ -51,8 +53,8 @@
 //! candidate lists).
 //!
 //! Not in the P coding: intra CUs inside a P slice (a picture that
-//! would need them is coded as an IDR instead), bi-prediction, temporal
-//! motion vector prediction, adaptive motion vector resolution, the
+//! would need them is coded as an IDR instead), bi-prediction,
+//! adaptive motion vector resolution, the
 //! sub-block / affine / geometric tools, SAO, APS-signalled / chroma /
 //! cross-component ALF filters on P slices, and tiles / WPP / multiple
 //! slices.
@@ -64,8 +66,9 @@ use oxideav_core::{Error, Result};
 use crate::alf::AlfPicture;
 use crate::alf_syntax::{AlfCtxs, AlfNeighbours, AlfSyntaxConfig};
 use crate::amvp::{
-    AmvpRefContext, MAX_MVP_CAND, RefList, SpatialMvpCandidate, build_mvp_cand_list,
-    derive_hmvp_mvp_candidates, derive_spatial_mvp_candidates, round_mv_amvr,
+    AmvpRefContext, AmvpTemporalInputs, MAX_MVP_CAND, RefList, SpatialMvpCandidate,
+    build_mvp_cand_list, derive_hmvp_mvp_candidates, derive_spatial_mvp_candidates,
+    derive_temporal_amvp_candidate, round_mv_amvr,
 };
 use crate::amvr::AmvrShift;
 use crate::cabac_enc::ArithEncoder;
@@ -77,8 +80,9 @@ use crate::encoder_pipeline::{
     pad_source_to_coded,
 };
 use crate::inter::{
-    HmvpTable, MotionField, MotionVector, MvField, build_merge_cand_list,
-    derive_spatial_merge_candidates, predict_chroma_block, predict_luma_block,
+    HmvpTable, MotionField, MotionVector, MvField, ReferencePicture, TemporalMergeInputs,
+    build_merge_cand_list, derive_spatial_merge_candidates, derive_temporal_merge_candidate,
+    predict_chroma_block, predict_luma_block,
 };
 use crate::leaf_cu::LeafCuCtxs;
 use crate::nal::NalUnitType;
@@ -305,6 +309,9 @@ pub struct VideoEncoder {
     dec: StreamDecoder,
     /// Decoded previous picture at the coded geometry.
     reference: Option<Arc<PictureBuffer>>,
+    /// The motion field the decoder stored with the previous picture
+    /// (the collocated picture of the next P picture).
+    reference_motion: Option<Arc<MotionField>>,
     since_idr: u32,
     last_idr_bytes: usize,
 }
@@ -346,6 +353,7 @@ impl VideoEncoder {
             vvc,
             dec: StreamDecoder::new(),
             reference: None,
+            reference_motion: None,
             since_idr: 0,
             last_idr_bytes: 0,
         })
@@ -399,7 +407,7 @@ impl VideoEncoder {
                 );
                 let coded_src = padded.as_ref().unwrap_or(src);
                 let poc = self.since_idr as i32;
-                let (coded, mut stats) = self.encode_p(coded_src, &reference)?;
+                let (coded, mut stats) = self.encode_p(coded_src, &reference, poc)?;
                 let au = self.p_access_unit(poc, &coded.plain, None);
                 let scene_change = self.cfg.scene_cut
                     && self.last_idr_bytes != 0
@@ -449,6 +457,7 @@ impl VideoEncoder {
         self.dec.decode_annex_b(au, &mut |pic| {
             frame = Some(pic.frame);
         })?;
+        self.reference_motion = self.dec.newest_picture_motion();
         frame.ok_or_else(|| {
             Error::invalid("h266 video encoder: the coded access unit decoded to no picture")
         })
@@ -481,14 +490,22 @@ impl VideoEncoder {
     fn encode_p(
         &self,
         src: &PictureBuffer,
-        reference: &PictureBuffer,
+        reference: &Arc<PictureBuffer>,
+        poc: i32,
     ) -> Result<(CodedPicture, InterStats)> {
         let p = self.cfg.picture;
         let (sw, sh) = p.chroma_subsampling();
         crate::inter::set_chroma_subsampling(sw, sh);
         crate::inter::set_ref_subpic_clip(None);
         crate::inter::set_ref_wraparound(0);
-        let mut pe = PictureCoder::new(&self.cfg, src, reference);
+        // The collocated picture: the previous picture with the motion
+        // field the decoder stored for it.
+        let col = ReferencePicture {
+            poc: poc - 1,
+            frame: reference.clone(),
+            motion_field: self.reference_motion.clone(),
+        };
+        let mut pe = PictureCoder::new(&self.cfg, src, reference, col, poc);
         let nodes = pe.decide_picture()?;
         let plain = pe.emit_picture(&nodes, None)?;
         Ok((
@@ -799,6 +816,10 @@ struct PictureCoder<'a> {
     params: EffortParams,
     mf: MotionField,
     hmvp: HmvpTable,
+    /// The collocated picture (§8.5.2.11) and the current
+    /// `PicOrderCntVal`.
+    col: ReferencePicture,
+    poc: i32,
     /// Prediction scratch at the picture geometry (the interpolation
     /// writes a block at its picture position).
     pred: PictureBuffer,
@@ -816,7 +837,13 @@ struct Trial {
 }
 
 impl<'a> PictureCoder<'a> {
-    fn new(cfg: &VideoEncoderConfig, src: &'a PictureBuffer, reference: &'a PictureBuffer) -> Self {
+    fn new(
+        cfg: &VideoEncoderConfig,
+        src: &'a PictureBuffer,
+        reference: &'a PictureBuffer,
+        col: ReferencePicture,
+        poc: i32,
+    ) -> Self {
         let p = &cfg.picture;
         let (sw, sh) = p.chroma_subsampling();
         let w = p.coded_width() as usize;
@@ -839,6 +866,8 @@ impl<'a> PictureCoder<'a> {
             params: EffortParams::of(cfg.effort),
             mf: MotionField::new(w as u32, h as u32),
             hmvp: HmvpTable::new(),
+            col,
+            poc,
             pred: reference.clone(),
             est_ctxs: ResidualCtxs::init_with_init_type(cfg.qp, 1),
             stats: InterStats::default(),
@@ -1002,7 +1031,25 @@ impl<'a> PictureCoder<'a> {
     fn best_leaf(&mut self, x: usize, y: usize, size: usize, hint: MotionVector) -> Result<Trial> {
         let (xi, yi, si) = (x as i32, y as i32, size as i32);
         let spatial = derive_spatial_merge_candidates(xi, yi, si, si, &self.mf, LOG2_PAR_MRG_LEVEL);
-        let mlist = build_merge_cand_list(&spatial, MAX_NUM_MERGE_CAND, None, Some(&self.hmvp), 1);
+        // §8.5.2.11 — the temporal candidate (refIdxL0Col = 0), from
+        // the bottom-right or the centre collocated block.
+        let col = derive_temporal_merge_candidate(&TemporalMergeInputs {
+            xcb: xi,
+            ycb: yi,
+            cb_w: si,
+            cb_h: si,
+            pic_w: self.w as i32,
+            pic_h: self.h as i32,
+            ctb_log2_size_y: CTB_SIZE.trailing_zeros(),
+            current_poc: self.poc,
+            current_ref_poc: self.poc - 1,
+            col_pic: &self.col,
+            col_ref_poc: self.poc,
+            x: 0,
+            no_backward_pred: true,
+            collocated_from_l0: true,
+        });
+        let mlist = build_merge_cand_list(&spatial, MAX_NUM_MERGE_CAND, col, Some(&self.hmvp), 1);
 
         // Rank the distinct merge vectors by luma SAD + index bits.
         let mut best_merge: Option<(u32, f64)> = None;
@@ -1133,11 +1180,12 @@ impl<'a> PictureCoder<'a> {
         // One reference picture: every neighbour that predicts from
         // list 0 refers to it. The POC values only need to be
         // consistent (current = 1, reference = 0).
-        let poc_l0 = |idx: i32| -> Option<i32> { (idx == 0).then_some(0) };
+        let ref_poc = self.poc - 1;
+        let poc_l0 = |idx: i32| -> Option<i32> { (idx == 0).then_some(ref_poc) };
         let poc_l1 = |_: i32| -> Option<i32> { None };
         let ctx = AmvpRefContext {
             list: RefList::L0,
-            current_ref_poc: 0,
+            current_ref_poc: ref_poc,
             poc_of_l0_ref: &poc_l0,
             poc_of_l1_ref: &poc_l1,
         };
@@ -1157,8 +1205,33 @@ impl<'a> PictureCoder<'a> {
         } else {
             usize::from(spatial[1].available)
         };
-        let hmvp = derive_hmvp_mvp_candidates(&self.hmvp, &ctx, amvr, 2 - n_spatial.min(2));
-        build_mvp_cand_list(spatial, None, &hmvp)
+        // §8.5.2.11 — the temporal candidate, consulted unless both
+        // spatial candidates are present and differ (§8.5.2.9 step 3).
+        let col = derive_temporal_amvp_candidate(
+            &AmvpTemporalInputs {
+                xcb: x,
+                ycb: y,
+                cb_w: size,
+                cb_h: size,
+                pic_w: self.w as i32,
+                pic_h: self.h as i32,
+                ctb_log2_size_y: CTB_SIZE.trailing_zeros(),
+                current_poc: self.poc,
+                current_ref_poc: ref_poc,
+                col_ref_poc: self.poc,
+                ph_temporal_mvp_enabled: true,
+                x: 0,
+                no_backward_pred: true,
+                collocated_from_l0: true,
+            },
+            &self.col,
+            amvr,
+        );
+        let col_suppressed =
+            spatial[0].available && spatial[1].available && spatial[0].mv != spatial[1].mv;
+        let n_pre_hmvp = (n_spatial + usize::from(col.is_some() && !col_suppressed)).min(2);
+        let hmvp = derive_hmvp_mvp_candidates(&self.hmvp, &ctx, amvr, 2 - n_pre_hmvp);
+        build_mvp_cand_list(spatial, col, &hmvp)
     }
 
     // ---- prediction / distortion -----------------------------------

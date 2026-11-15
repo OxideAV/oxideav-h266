@@ -325,6 +325,14 @@ impl StreamDecoder {
         self.verify_picture_hash = on;
     }
 
+    /// r490 — the motion field stored with the most recently decoded
+    /// picture (what a later picture's §8.5.2.11 collocated derivation
+    /// reads); `None` before the first picture.
+    #[doc(hidden)]
+    pub fn newest_picture_motion(&self) -> Option<std::sync::Arc<MotionField>> {
+        self.dpb.last().and_then(|d| d.motion.clone())
+    }
+
     /// r487 — let the stages of a picture that are independent per
     /// CTB row (today: the adaptive loop filter, the largest single
     /// stage of a decode) run on up to `threads` threads. The default
