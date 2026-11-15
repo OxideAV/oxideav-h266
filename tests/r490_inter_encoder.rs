@@ -127,6 +127,7 @@ struct Coded {
     skip: u32,
     merge: u32,
     amvp: u32,
+    alf_ctbs: u32,
 }
 
 impl Coded {
@@ -151,6 +152,7 @@ fn encode_and_check(cfg: VideoEncoderConfig, frames: &[PictureBuffer], label: &s
         skip: 0,
         merge: 0,
         amvp: 0,
+        alf_ctbs: 0,
     };
     for (t, src) in frames.iter().enumerate() {
         let pic = enc
@@ -161,6 +163,7 @@ fn encode_and_check(cfg: VideoEncoderConfig, frames: &[PictureBuffer], label: &s
         out.skip += pic.stats.skip_cus;
         out.merge += pic.stats.merge_cus;
         out.amvp += pic.stats.amvp_cus;
+        out.alf_ctbs += pic.stats.alf_ctbs;
         out.stream.extend_from_slice(&pic.data);
         let rec = enc.reconstruction().expect("reconstruction");
         assert_eq!(rec.luma.width, src.luma.width, "{label}");
@@ -342,6 +345,53 @@ fn inter_coding_beats_all_intra_on_moving_content() {
             "qp {qp}: inter luma {:.2} dB vs intra {:.2} dB",
             inter.psnr_y,
             intra.psnr_y
+        );
+    }
+}
+
+/// The adaptive loop filter decision of the P pictures: CTBs elect a
+/// fixed filter set, the stream stays conformant (fresh decode against
+/// the encoder's references inside `encode_and_check`), the luma PSNR
+/// rises at (nearly) the same size, and switching the decision off or
+/// coding at effort 0 leaves every P slice unfiltered.
+#[test]
+fn adaptive_loop_filter_on_p_pictures_raises_luma_psnr() {
+    for &(w, h, cf, bd, qp) in &[
+        (256usize, 192usize, 1u32, 8u32, 32),
+        (200, 136, 3, 10, 36),
+        (144, 144, 0, 8, 30),
+    ] {
+        let frames = clip(w, h, cf, bd, 5, 77);
+        let base = VideoEncoderConfig::new(picture_cfg(w, h, cf, bd), qp).with_scene_cut(false);
+        let label = format!("{w}x{h} cf{cf} {bd}-bit qp {qp}");
+        let on = encode_and_check(base, &frames, &format!("{label} alf"));
+        let off = encode_and_check(base.with_alf(false), &frames, &format!("{label} no alf"));
+        eprintln!(
+            "{label}: no filter {} B {:.2} dB -> filter {} B {:.2} dB ({} CTBs filtered)",
+            off.bytes(),
+            off.psnr_y,
+            on.bytes(),
+            on.psnr_y,
+            on.alf_ctbs
+        );
+        assert_eq!(off.alf_ctbs, 0, "{label}");
+        assert!(on.alf_ctbs > 0, "{label}: no CTB elected a filter");
+        assert!(
+            on.psnr_y > off.psnr_y + 0.005,
+            "{label}: {:.3} dB with the filter, {:.3} dB without",
+            on.psnr_y,
+            off.psnr_y
+        );
+        assert!(
+            (on.bytes() as f64) < off.bytes() as f64 * 1.03,
+            "{label}: {} B with the filter, {} B without",
+            on.bytes(),
+            off.bytes()
+        );
+        let fast = encode_and_check(base.with_effort(0), &frames, &format!("{label} effort 0"));
+        assert_eq!(
+            fast.alf_ctbs, 0,
+            "{label}: effort 0 runs no filter decision"
         );
     }
 }

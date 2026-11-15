@@ -1394,10 +1394,50 @@ impl VvcEncoder {
     /// hiding off.
     #[doc(hidden)]
     pub fn emit_p_slice_header_bytes(&self, sh_qp_delta: i32) -> Vec<u8> {
+        self.emit_p_slice_header_bytes_with_alf(sh_qp_delta, None)
+    }
+
+    /// r490 — [`Self::emit_p_slice_header_bytes`] with the §7.3.7 ALF
+    /// chain of the slice: `None` writes `sh_alf_enabled_flag = 0`,
+    /// `Some(chain)` the luma APS ids, the Cb / Cr flags with their
+    /// APS id and the cross-component flags with theirs (the SAO
+    /// fields of `chain` are not used; SAO stays off on P slices).
+    #[doc(hidden)]
+    pub fn emit_p_slice_header_bytes_with_alf(
+        &self,
+        sh_qp_delta: i32,
+        alf: Option<&AlfPhChain>,
+    ) -> Vec<u8> {
         let mut bw = BitWriter::new();
         bw.write_bit(0); // sh_picture_header_in_slice_header_flag
         bw.write_ue(1); // sh_slice_type = P
-        bw.write_bit(0); // sh_alf_enabled_flag (sps_alf_enabled_flag = 1)
+        // sps_alf_enabled_flag = 1, pps_alf_info_in_ph_flag = 0.
+        match alf {
+            None => bw.write_bit(0), // sh_alf_enabled_flag
+            Some(chain) => {
+                bw.write_bit(1); // sh_alf_enabled_flag
+                bw.write_bits(chain.num_alf_aps_ids_luma as u32, 3);
+                for _ in 0..chain.num_alf_aps_ids_luma {
+                    bw.write_bits(chain.luma_aps_id as u32, 3); // sh_alf_aps_id_luma[i]
+                }
+                if self.config.chroma_format_idc != 0 {
+                    bw.write_bit(chain.ph_alf_cb_enabled_flag as u8);
+                    bw.write_bit(chain.ph_alf_cr_enabled_flag as u8);
+                    if chain.ph_alf_cb_enabled_flag || chain.ph_alf_cr_enabled_flag {
+                        bw.write_bits(chain.ph_alf_aps_id_chroma as u32, 3);
+                    }
+                    // sps_ccalf_enabled_flag = 1 whenever chroma exists.
+                    bw.write_bit(chain.ph_alf_cc_cb_enabled_flag as u8);
+                    if chain.ph_alf_cc_cb_enabled_flag {
+                        bw.write_bits(chain.ph_alf_cc_cb_aps_id as u32, 3);
+                    }
+                    bw.write_bit(chain.ph_alf_cc_cr_enabled_flag as u8);
+                    if chain.ph_alf_cc_cr_enabled_flag {
+                        bw.write_bits(chain.ph_alf_cc_cr_aps_id as u32, 3);
+                    }
+                }
+            }
+        }
         // ph_lmcs_enabled_flag = 0 → no sh_lmcs_used_flag.
         // ref_pic_lists( ) — no SPS candidates, so both structures
         // are coded here.

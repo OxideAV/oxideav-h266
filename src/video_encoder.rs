@@ -36,6 +36,13 @@
 //!   `cu_qp_delta_abs = 0` once per CTU (one quantization group per
 //!   CTU on inter slices).
 //!
+//! * **Adaptive loop filter** (§8.8.5) — the access unit is decoded
+//!   once without the filter; against that deblocked picture every
+//!   luma CTB elects one of the 16 fixed filter sets or no filter
+//!   (`alf_ctb_flag`, `alf_luma_fixed_filter_idx`, no APS), and when a
+//!   CTB elects one the slice is emitted again with the filter
+//!   signalled.
+//!
 //! The reference picture of the next P picture is obtained by decoding
 //! the access unit just written with [`crate::stream::StreamDecoder`]:
 //! deblocking and every rounding rule are the decoder's, so encoder and
@@ -46,13 +53,16 @@
 //! Not in the P coding: intra CUs inside a P slice (a picture that
 //! would need them is coded as an IDR instead), bi-prediction, temporal
 //! motion vector prediction, adaptive motion vector resolution, the
-//! sub-block / affine / geometric tools, SAO and ALF on P slices, and
-//! tiles / WPP / multiple slices.
+//! sub-block / affine / geometric tools, SAO, APS-signalled / chroma /
+//! cross-component ALF filters on P slices, and tiles / WPP / multiple
+//! slices.
 
 use std::sync::Arc;
 
 use oxideav_core::{Error, Result};
 
+use crate::alf::AlfPicture;
+use crate::alf_syntax::{AlfCtxs, AlfNeighbours, AlfSyntaxConfig};
 use crate::amvp::{
     AmvpRefContext, MAX_MVP_CAND, RefList, SpatialMvpCandidate, build_mvp_cand_list,
     derive_hmvp_mvp_candidates, derive_spatial_mvp_candidates, round_mv_amvr,
@@ -61,7 +71,7 @@ use crate::amvr::AmvrShift;
 use crate::cabac_enc::ArithEncoder;
 use crate::coding_tree::{SplitConstraints, TreeCtxs, TreeType};
 use crate::dequant::{DequantParams, dequantize_tb_flat};
-use crate::encoder::{EncoderConfig, VvcEncoder, annex_b_wrap};
+use crate::encoder::{AlfPhChain, EncoderConfig, VvcEncoder, annex_b_wrap};
 use crate::encoder_pipeline::{
     build_nal, chroma_qp_identity_bd, crop_picture, encode_idr_with_residuals_cfg, lambda_for_qp,
     pad_source_to_coded,
@@ -78,6 +88,7 @@ use crate::residual_enc::{
     encode_tb_coefficients_opts, write_cu_qp_delta, write_tu_cb_coded_flag, write_tu_cr_coded_flag,
     write_tu_y_coded_flag,
 };
+use crate::slice_header::SliceType;
 use crate::stream::StreamDecoder;
 use crate::syntax_enc::TreeNeighbours;
 use crate::transform::{TrType, inverse_transform_2d};
@@ -120,6 +131,9 @@ pub struct VideoEncoderConfig {
     /// Code a picture as an IDR when its P coding is larger than the
     /// last IDR picture (a scene change).
     pub scene_cut: bool,
+    /// Decide the adaptive loop filter of the P pictures (effort 1 and
+    /// above; effort 0 never runs it).
+    pub alf: bool,
 }
 
 impl VideoEncoderConfig {
@@ -132,6 +146,7 @@ impl VideoEncoderConfig {
             keyint: DEFAULT_KEYINT,
             effort: DEFAULT_EFFORT,
             scene_cut: true,
+            alf: true,
         }
     }
 
@@ -150,6 +165,12 @@ impl VideoEncoderConfig {
     /// Builder: scene-change detection.
     pub fn with_scene_cut(mut self, on: bool) -> Self {
         self.scene_cut = on;
+        self
+    }
+
+    /// Builder: the adaptive loop filter decision of the P pictures.
+    pub fn with_alf(mut self, on: bool) -> Self {
+        self.alf = on;
         self
     }
 }
@@ -174,6 +195,8 @@ pub struct InterStats {
     pub merge_cus: u32,
     /// Non-merge (explicit motion vector) CUs.
     pub amvp_cus: u32,
+    /// CTBs whose luma is filtered by the adaptive loop filter.
+    pub alf_ctbs: u32,
 }
 
 /// One coded access unit.
@@ -207,6 +230,9 @@ struct EffortParams {
     split_below_skip: bool,
     /// Eight-neighbour (instead of four-neighbour) integer pattern.
     eight_point: bool,
+    /// Decide the adaptive loop filter of the picture (a second emit
+    /// and decode of the access unit).
+    alf: bool,
 }
 
 impl EffortParams {
@@ -219,6 +245,7 @@ impl EffortParams {
                 min_cu: 16,
                 split_below_skip: false,
                 eight_point: false,
+                alf: false,
             },
             1 => Self {
                 max_step: 4,
@@ -227,6 +254,7 @@ impl EffortParams {
                 min_cu: 16,
                 split_below_skip: false,
                 eight_point: false,
+                alf: true,
             },
             2 => Self {
                 max_step: 8,
@@ -235,6 +263,7 @@ impl EffortParams {
                 min_cu: 8,
                 split_below_skip: false,
                 eight_point: false,
+                alf: true,
             },
             3 => Self {
                 max_step: 16,
@@ -243,6 +272,7 @@ impl EffortParams {
                 min_cu: 8,
                 split_below_skip: false,
                 eight_point: true,
+                alf: true,
             },
             _ => Self {
                 max_step: 32,
@@ -251,6 +281,7 @@ impl EffortParams {
                 min_cu: 8,
                 split_below_skip: true,
                 eight_point: true,
+                alf: true,
             },
         }
     }
@@ -261,13 +292,13 @@ impl EffortParams {
 /// Effort ladder of the P pictures (`effort`, default
 /// [`DEFAULT_EFFORT`]):
 ///
-/// | effort | integer search | fractional | smallest CU |
-/// | --- | --- | --- | --- |
-/// | 0 | steps 2, 1 (4 points) | none | 16x16 |
-/// | 1 | steps 4 … 1 (4 points) | half sample | 16x16 |
-/// | 2 | steps 8 … 1 (4 points) | quarter sample | 8x8 |
-/// | 3 | steps 16 … 1 (8 points) | quarter sample | 8x8 |
-/// | 4 | steps 32 … 1 (8 points), split tested under skip CUs | quarter sample | 8x8 |
+/// | effort | integer search | fractional | smallest CU | loop filter decision |
+/// | --- | --- | --- | --- | --- |
+/// | 0 | steps 2, 1 (4 points) | none | 16x16 | — |
+/// | 1 | steps 4 … 1 (4 points) | half sample | 16x16 | ALF |
+/// | 2 | steps 8 … 1 (4 points) | quarter sample | 8x8 | ALF |
+/// | 3 | steps 16 … 1 (8 points) | quarter sample | 8x8 | ALF |
+/// | 4 | steps 32 … 1 (8 points), split tested under skip CUs | quarter sample | 8x8 | ALF |
 pub struct VideoEncoder {
     cfg: VideoEncoderConfig,
     vvc: VvcEncoder,
@@ -368,12 +399,13 @@ impl VideoEncoder {
                 );
                 let coded_src = padded.as_ref().unwrap_or(src);
                 let poc = self.since_idr as i32;
-                let (au, stats) = self.encode_p(coded_src, &reference, poc)?;
+                let (coded, mut stats) = self.encode_p(coded_src, &reference)?;
+                let au = self.p_access_unit(poc, &coded.plain, None);
                 let scene_change = self.cfg.scene_cut
                     && self.last_idr_bytes != 0
                     && au.len() > self.last_idr_bytes;
                 if !scene_change {
-                    let data = self.commit(au)?;
+                    let data = self.commit_p(au, coded_src, poc, &coded, &mut stats)?;
                     self.since_idr += 1;
                     return Ok(EncodedPicture {
                         data,
@@ -398,72 +430,179 @@ impl VideoEncoder {
         })
     }
 
-    fn commit(&mut self, au: Vec<u8>) -> Result<Vec<u8>> {
-        self.commit_decoded(au, true)
-    }
-
     /// Decode `au` with the crate's decoder; the decoded picture is
     /// the next reference. With `append_hash` the configured decoded
     /// picture hash SEI message is appended (P pictures — the hash is
     /// of the decoder's reconstruction).
     fn commit_decoded(&mut self, mut au: Vec<u8>, append_hash: bool) -> Result<Vec<u8>> {
-        let mut frame: Option<PictureBuffer> = None;
-        self.dec.decode_annex_b(&au, &mut |pic| {
-            frame = Some(pic.frame);
-        })?;
-        let frame = frame.ok_or_else(|| {
-            Error::invalid("h266 video encoder: the coded access unit decoded to no picture")
-        })?;
-        let p = &self.cfg.picture;
+        let frame = self.decode_au(&au)?;
         if append_hash {
-            if let Some(method) = p.picture_hash {
-                let hash = crate::picture_hash::picture_hash(
-                    &frame,
-                    p.coded_width() as usize,
-                    p.coded_height() as usize,
-                    p.chroma_format_idc,
-                    u32::from(p.bit_depth),
-                    method,
-                );
-                let mut sei_rbsp = crate::sei_payload::write_sei_message(
-                    crate::sei_payload::payload_type::DECODED_PICTURE_HASH,
-                    &hash.write_payload(),
-                );
-                sei_rbsp.push(0x80); // rbsp_trailing_bits()
-                annex_b_wrap(
-                    &build_nal(NalUnitType::SuffixSeiNut, 0, 1, &sei_rbsp),
-                    &mut au,
-                );
-            }
+            self.append_hash(&mut au, &frame);
         }
         self.reference = Some(Arc::new(frame));
         Ok(au)
     }
 
-    /// Code one P picture: PH NAL + one P slice NAL.
+    /// Decode one access unit with the crate's decoder.
+    fn decode_au(&mut self, au: &[u8]) -> Result<PictureBuffer> {
+        let mut frame: Option<PictureBuffer> = None;
+        self.dec.decode_annex_b(au, &mut |pic| {
+            frame = Some(pic.frame);
+        })?;
+        frame.ok_or_else(|| {
+            Error::invalid("h266 video encoder: the coded access unit decoded to no picture")
+        })
+    }
+
+    /// Append the configured decoded picture hash SEI message of
+    /// `frame` to `au`.
+    fn append_hash(&self, au: &mut Vec<u8>, frame: &PictureBuffer) {
+        let p = &self.cfg.picture;
+        if let Some(method) = p.picture_hash {
+            let hash = crate::picture_hash::picture_hash(
+                frame,
+                p.coded_width() as usize,
+                p.coded_height() as usize,
+                p.chroma_format_idc,
+                u32::from(p.bit_depth),
+                method,
+            );
+            let mut sei_rbsp = crate::sei_payload::write_sei_message(
+                crate::sei_payload::payload_type::DECODED_PICTURE_HASH,
+                &hash.write_payload(),
+            );
+            sei_rbsp.push(0x80); // rbsp_trailing_bits()
+            annex_b_wrap(&build_nal(NalUnitType::SuffixSeiNut, 0, 1, &sei_rbsp), au);
+        }
+    }
+
+    /// Decide one P picture and emit its slice data without the
+    /// adaptive loop filter.
     fn encode_p(
         &self,
         src: &PictureBuffer,
         reference: &PictureBuffer,
-        poc: i32,
-    ) -> Result<(Vec<u8>, InterStats)> {
+    ) -> Result<(CodedPicture, InterStats)> {
         let p = self.cfg.picture;
         let (sw, sh) = p.chroma_subsampling();
         crate::inter::set_chroma_subsampling(sw, sh);
         crate::inter::set_ref_subpic_clip(None);
         crate::inter::set_ref_wraparound(0);
         let mut pe = PictureCoder::new(&self.cfg, src, reference);
-        let (cabac, stats) = pe.code_picture()?;
+        let nodes = pe.decide_picture()?;
+        let plain = pe.emit_picture(&nodes, None)?;
+        Ok((
+            CodedPicture {
+                nodes,
+                plain,
+                w: pe.w,
+                h: pe.h,
+            },
+            pe.stats,
+        ))
+    }
+
+    /// PH NAL + the P slice NAL around `slice_data`.
+    fn p_access_unit(&self, poc: i32, slice_data: &[u8], alf: Option<&AlfPhChain>) -> Vec<u8> {
         let mut au = Vec::new();
         annex_b_wrap(&self.vvc.emit_inter_picture_header_nal(poc as u32), &mut au);
-        let mut slice_rbsp = self.vvc.emit_p_slice_header_bytes(self.cfg.qp - 26);
-        slice_rbsp.extend_from_slice(&cabac);
+        let mut slice_rbsp = self
+            .vvc
+            .emit_p_slice_header_bytes_with_alf(self.cfg.qp - 26, alf);
+        slice_rbsp.extend_from_slice(slice_data);
         annex_b_wrap(
             &build_nal(NalUnitType::TrailNut, 0, 1, &slice_rbsp),
             &mut au,
         );
-        Ok((au, stats))
+        au
     }
+
+    /// Commit a P picture: decode the access unit (the decoded picture
+    /// is deblocked, nothing else), and — when the effort asks for it —
+    /// decide the adaptive loop filter against that picture, emit the
+    /// access unit again with the filter signalled and decode that one
+    /// as the reference.
+    ///
+    /// The second access unit replaces the first in the stream; the
+    /// crate's decoder is handed both, which it takes as two pictures
+    /// with the same picture order count: the second one resolves its
+    /// reference (the previous picture) exactly as the first did and
+    /// displaces the first from the reference pictures.
+    fn commit_p(
+        &mut self,
+        au: Vec<u8>,
+        src: &PictureBuffer,
+        poc: i32,
+        coded: &CodedPicture,
+        stats: &mut InterStats,
+    ) -> Result<Vec<u8>> {
+        let deblocked = self.decode_au(&au)?;
+        let p = self.cfg.picture;
+        let mut out = au;
+        let mut frame = deblocked;
+        if self.cfg.alf && EffortParams::of(self.cfg.effort).alf {
+            let bd = u32::from(p.bit_depth);
+            let cf = u32::from(p.chroma_format_idc);
+            let mut filtered = frame.clone();
+            let alf_pic = crate::alf_enc::alf_decide_and_apply_clipped(
+                src,
+                &mut filtered,
+                CTB_SIZE.trailing_zeros(),
+                bd,
+                cf,
+                None,
+            );
+            let mut on = 0u32;
+            for ry in 0..alf_pic.pic_height_in_ctbs_y {
+                for rx in 0..alf_pic.pic_width_in_ctbs_y {
+                    on += u32::from(alf_pic.get(rx, ry).luma_on);
+                }
+            }
+            if on > 0 {
+                // Fixed filter sets only: no APS, luma only.
+                let chain = AlfPhChain {
+                    num_alf_aps_ids_luma: 0,
+                    ph_alf_cb_enabled_flag: false,
+                    ph_alf_cr_enabled_flag: false,
+                    ph_alf_cc_cb_enabled_flag: false,
+                    ph_alf_cc_cr_enabled_flag: false,
+                    ..AlfPhChain::default_full()
+                };
+                let syntax = AlfSyntaxConfig {
+                    alf_enabled: true,
+                    cb_enabled: false,
+                    cr_enabled: false,
+                    cc_cb_enabled: false,
+                    cc_cr_enabled: false,
+                    sh_num_alf_aps_ids_luma: 0,
+                    alf_chroma_num_alt_filters_minus1: 0,
+                    alf_cc_cb_filters_signalled_minus1: 0,
+                    alf_cc_cr_filters_signalled_minus1: 0,
+                    chroma_format_idc: cf,
+                    slice_type: SliceType::P,
+                    sh_cabac_init_flag: false,
+                };
+                let slice_data = emit_slice_data(&self.cfg, coded, Some((&alf_pic, &syntax)))?;
+                let au2 = self.p_access_unit(poc, &slice_data, Some(&chain));
+                frame = self.decode_au(&au2)?;
+                out = au2;
+                stats.alf_ctbs = on;
+            }
+        }
+        self.append_hash(&mut out, &frame);
+        self.reference = Some(Arc::new(frame));
+        Ok(out)
+    }
+}
+
+/// A decided P picture: its coding trees and the slice data without
+/// the adaptive loop filter.
+struct CodedPicture {
+    /// `(x, y, tree)` of every CTB in coding order.
+    nodes: Vec<(usize, usize, Node)>,
+    plain: Vec<u8>,
+    w: usize,
+    h: usize,
 }
 
 // ---------------------------------------------------------------------
@@ -706,46 +845,40 @@ impl<'a> PictureCoder<'a> {
         }
     }
 
-    /// Decide and emit every CTU; returns the slice data bytes.
-    fn code_picture(&mut self) -> Result<(Vec<u8>, InterStats)> {
-        let mut enc = ArithEncoder::new();
-        let mut tree_ctxs = TreeCtxs::init_with_init_type(self.qp, 1);
-        let mut leaf_ctxs = LeafCuCtxs::init_with_init_type(self.qp, 1);
-        let mut grid = CuGrid::new(self.w, self.h);
-        let constraints = SplitConstraints {
-            min_qt_log2: 2,
-            max_mtt_depth: 0,
-            max_bt_size: 4,
-            max_tt_size: 4,
-            min_cb_log2: 2,
-            pic_w: self.w as u32,
-            pic_h: self.h as u32,
-            sub_w: self.sub_w as u32,
-            sub_h: self.sub_h as u32,
-        };
+    /// Decide every CTU; returns `(x, y, tree)` per CTB in coding
+    /// order.
+    fn decide_picture(&mut self) -> Result<Vec<(usize, usize, Node)>> {
+        let mut nodes = Vec::new();
         for ctb_y in (0..self.h).step_by(CTB_SIZE) {
             // §7.3.11.1 — the history table empties at the first CTB
             // of every CTB row.
             self.hmvp.reset();
             for ctb_x in (0..self.w).step_by(CTB_SIZE) {
                 let (node, _) = self.decide(ctb_x, ctb_y, CTB_SIZE, MotionVector::ZERO)?;
-                let Some(node) = node else { continue };
-                let mut em = Emitter {
-                    leaf_ctxs: &mut leaf_ctxs,
-                    grid: &mut grid,
-                    constraints: &constraints,
-                    w: self.w,
-                    h: self.h,
-                    sub_w: self.sub_w,
-                    sub_h: self.sub_h,
-                    chroma: self.chroma,
-                    qp_delta_pending: true,
-                };
-                em.emit_node(&mut enc, &mut tree_ctxs, &node, ctb_x, ctb_y, CTB_SIZE, 0)?;
+                if let Some(node) = node {
+                    nodes.push((ctb_x, ctb_y, node));
+                }
             }
         }
-        enc.encode_terminate(1)?; // end_of_slice_one_bit
-        Ok((enc.finish(), self.stats))
+        Ok(nodes)
+    }
+
+    /// The slice data of the decided picture (see [`emit_trees`]).
+    fn emit_picture(
+        &self,
+        nodes: &[(usize, usize, Node)],
+        alf: Option<(&AlfPicture, &AlfSyntaxConfig)>,
+    ) -> Result<Vec<u8>> {
+        emit_trees(
+            nodes,
+            self.w,
+            self.h,
+            self.sub_w,
+            self.sub_h,
+            self.chroma,
+            self.qp,
+            alf,
+        )
     }
 
     // ---- decision ---------------------------------------------------
@@ -1410,6 +1543,92 @@ impl<'a> PictureCoder<'a> {
 // ---------------------------------------------------------------------
 // Emission
 // ---------------------------------------------------------------------
+
+/// [`emit_trees`] for a [`CodedPicture`] under `cfg`.
+fn emit_slice_data(
+    cfg: &VideoEncoderConfig,
+    coded: &CodedPicture,
+    alf: Option<(&AlfPicture, &AlfSyntaxConfig)>,
+) -> Result<Vec<u8>> {
+    let p = &cfg.picture;
+    let (sw, sh) = p.chroma_subsampling();
+    emit_trees(
+        &coded.nodes,
+        coded.w,
+        coded.h,
+        sw as usize,
+        sh as usize,
+        p.chroma_format_idc != 0,
+        cfg.qp,
+        alf,
+    )
+}
+
+/// §7.3.11.1 `slice_data()` of the single P slice: per CTU the
+/// §7.3.11.2 ALF prefix (when the slice enables the filter) and the
+/// coding tree, then `end_of_slice_one_bit`.
+#[allow(clippy::too_many_arguments)]
+fn emit_trees(
+    nodes: &[(usize, usize, Node)],
+    w: usize,
+    h: usize,
+    sub_w: usize,
+    sub_h: usize,
+    chroma: bool,
+    qp: i32,
+    alf: Option<(&AlfPicture, &AlfSyntaxConfig)>,
+) -> Result<Vec<u8>> {
+    let mut enc = ArithEncoder::new();
+    let mut tree_ctxs = TreeCtxs::init_with_init_type(qp, 1);
+    let mut leaf_ctxs = LeafCuCtxs::init_with_init_type(qp, 1);
+    let mut alf_ctxs = AlfCtxs::init(qp);
+    let mut grid = CuGrid::new(w, h);
+    let constraints = SplitConstraints {
+        min_qt_log2: 2,
+        max_mtt_depth: 0,
+        max_bt_size: 4,
+        max_tt_size: 4,
+        min_cb_log2: 2,
+        pic_w: w as u32,
+        pic_h: h as u32,
+        sub_w: sub_w as u32,
+        sub_h: sub_h as u32,
+    };
+    for (ctb_x, ctb_y, node) in nodes {
+        let (ctb_x, ctb_y) = (*ctb_x, *ctb_y);
+        if let Some((alf_pic, syntax)) = alf {
+            // One slice, one tile: the left / above CTBs are available
+            // whenever they exist.
+            let (rx, ry) = ((ctb_x / CTB_SIZE) as u32, (ctb_y / CTB_SIZE) as u32);
+            crate::alf_syntax::encode_alf_ctu(
+                &mut enc,
+                &mut alf_ctxs,
+                syntax,
+                alf_pic,
+                rx,
+                ry,
+                AlfNeighbours {
+                    left_avail: rx > 0,
+                    up_avail: ry > 0,
+                },
+            )?;
+        }
+        let mut em = Emitter {
+            leaf_ctxs: &mut leaf_ctxs,
+            grid: &mut grid,
+            constraints: &constraints,
+            w,
+            h,
+            sub_w,
+            sub_h,
+            chroma,
+            qp_delta_pending: true,
+        };
+        em.emit_node(&mut enc, &mut tree_ctxs, node, ctb_x, ctb_y, CTB_SIZE, 0)?;
+    }
+    enc.encode_terminate(1)?; // end_of_slice_one_bit
+    Ok(enc.finish())
+}
 
 struct Emitter<'a> {
     leaf_ctxs: &'a mut LeafCuCtxs,
