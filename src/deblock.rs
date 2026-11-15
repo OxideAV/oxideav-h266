@@ -736,6 +736,7 @@ pub fn apply_deblocking_clipped(
         no_filter_cols,
         no_filter_rows,
         None,
+        1,
     )
 }
 
@@ -759,6 +760,7 @@ pub(crate) fn apply_deblocking_regions(
     no_filter_cols: &[u32],
     no_filter_rows: &[u32],
     region: Option<&crate::alf::LfRegionMap>,
+    workers: usize,
 ) {
     DBG_PIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DBG_CSTRONG.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -784,105 +786,120 @@ pub(crate) fn apply_deblocking_regions(
     // tree) shares the luma records.
     let chroma_grid = chroma_cus.map(|cc| CuGrid::build(out.luma.width, out.luma.height, cc));
 
-    // Vertical edges first (eq. EDGE_VER pass per §8.8.3.1).
-    let mut luma = PlaneCtx {
-        plane: &mut out.luma,
-        c_idx: 0,
-        sub_w: 1,
-        sub_h: 1,
-        beta_offset_div2: params.luma_beta_offset_div2,
-        tc_offset_div2: params.luma_tc_offset_div2,
-        qp_offset: 0,
-        bit_depth: params.bit_depth,
-        ctb_size_y: 1 << params.ctb_log2_size_y,
-        ladf: params.ladf.as_ref(),
+    // One component: vertical edges first (the EDGE_VER pass per
+    // §8.8.3.1), then horizontal edges over the vertically-filtered
+    // samples. A component reads and writes its own plane only.
+    let ctb_size_y = 1u32 << params.ctb_log2_size_y;
+    let run_luma = |plane: &mut PicturePlane| {
+        let mut ctx = PlaneCtx {
+            plane,
+            c_idx: 0,
+            sub_w: 1,
+            sub_h: 1,
+            beta_offset_div2: params.luma_beta_offset_div2,
+            tc_offset_div2: params.luma_tc_offset_div2,
+            qp_offset: 0,
+            bit_depth: params.bit_depth,
+            ctb_size_y,
+            ladf: params.ladf.as_ref(),
+        };
+        deblock_one_direction(
+            &mut ctx,
+            cus,
+            &grid,
+            mv_grid,
+            EdgeType::Vertical,
+            no_filter_cols,
+            region,
+        );
+        deblock_one_direction(
+            &mut ctx,
+            cus,
+            &grid,
+            mv_grid,
+            EdgeType::Horizontal,
+            no_filter_rows,
+            region,
+        );
     };
-    deblock_one_direction(
-        &mut luma,
-        cus,
-        &grid,
-        mv_grid,
-        EdgeType::Vertical,
-        no_filter_cols,
-        region,
-    );
-    deblock_one_direction(
-        &mut luma,
-        cus,
-        &grid,
-        mv_grid,
-        EdgeType::Horizontal,
-        no_filter_rows,
-        region,
-    );
+    let chroma_on = chroma_format_idc != 0 && !dbg_skip_stage("dbc");
+    let (c_cus, c_grid) = match (chroma_cus, chroma_grid.as_ref()) {
+        (Some(cc), Some(cg)) => (cc, cg),
+        _ => (cus, &grid),
+    };
+    let (csw, csh) = crate::reconstruct::chroma_subsampling(chroma_format_idc);
+    let (csw, csh) = (csw as u32, csh as u32);
+    let run_chroma = |plane: &mut PicturePlane, c_idx: u32| {
+        let (beta_offset_div2, tc_offset_div2, qp_offset) = if c_idx == 1 {
+            (
+                params.cb_beta_offset_div2,
+                params.cb_tc_offset_div2,
+                params.chroma_qp_offset_cb,
+            )
+        } else {
+            (
+                params.cr_beta_offset_div2,
+                params.cr_tc_offset_div2,
+                params.chroma_qp_offset_cr,
+            )
+        };
+        let mut ctx = PlaneCtx {
+            plane,
+            c_idx,
+            sub_w: csw,
+            sub_h: csh,
+            beta_offset_div2,
+            tc_offset_div2,
+            qp_offset,
+            bit_depth: params.bit_depth,
+            ctb_size_y,
+            ladf: None,
+        };
+        deblock_one_direction(
+            &mut ctx,
+            c_cus,
+            c_grid,
+            None,
+            EdgeType::Vertical,
+            no_filter_cols,
+            region,
+        );
+        deblock_one_direction(
+            &mut ctx,
+            c_cus,
+            c_grid,
+            None,
+            EdgeType::Horizontal,
+            no_filter_rows,
+            region,
+        );
+    };
 
-    if chroma_format_idc != 0 && !dbg_skip_stage("dbc") {
-        let (c_cus, c_grid) = match (chroma_cus, chroma_grid.as_ref()) {
-            (Some(cc), Some(cg)) => (cc, cg),
-            _ => (cus, &grid),
-        };
-        let (csw, csh) = crate::reconstruct::chroma_subsampling(chroma_format_idc);
-        let (csw, csh) = (csw as u32, csh as u32);
-        let mut cb = PlaneCtx {
-            plane: &mut out.cb,
-            c_idx: 1,
-            sub_w: csw,
-            sub_h: csh,
-            beta_offset_div2: params.cb_beta_offset_div2,
-            tc_offset_div2: params.cb_tc_offset_div2,
-            qp_offset: params.chroma_qp_offset_cb,
-            bit_depth: params.bit_depth,
-            ctb_size_y: 1 << params.ctb_log2_size_y,
-            ladf: None,
-        };
-        deblock_one_direction(
-            &mut cb,
-            c_cus,
-            c_grid,
-            None,
-            EdgeType::Vertical,
-            no_filter_cols,
-            region,
-        );
-        deblock_one_direction(
-            &mut cb,
-            c_cus,
-            c_grid,
-            None,
-            EdgeType::Horizontal,
-            no_filter_rows,
-            region,
-        );
-        let mut cr = PlaneCtx {
-            plane: &mut out.cr,
-            c_idx: 2,
-            sub_w: csw,
-            sub_h: csh,
-            beta_offset_div2: params.cr_beta_offset_div2,
-            tc_offset_div2: params.cr_tc_offset_div2,
-            qp_offset: params.chroma_qp_offset_cr,
-            bit_depth: params.bit_depth,
-            ctb_size_y: 1 << params.ctb_log2_size_y,
-            ladf: None,
-        };
-        deblock_one_direction(
-            &mut cr,
-            c_cus,
-            c_grid,
-            None,
-            EdgeType::Vertical,
-            no_filter_cols,
-            region,
-        );
-        deblock_one_direction(
-            &mut cr,
-            c_cus,
-            c_grid,
-            None,
-            EdgeType::Horizontal,
-            no_filter_rows,
-            region,
-        );
+    // r490 — the three components are independent, so a granted
+    // worker budget filters them side by side: Cb and Cr on one extra
+    // thread (two workers) or one each (three or more). The triage
+    // switches count filtered units in decode order and keep the
+    // serial walk.
+    let (luma, cb, cr) = (&mut out.luma, &mut out.cb, &mut out.cr);
+    if !chroma_on {
+        run_luma(luma);
+    } else if workers < 2 || crate::dbg_env::any_switch_set() {
+        run_luma(luma);
+        run_chroma(cb, 1);
+        run_chroma(cr, 2);
+    } else {
+        std::thread::scope(|scope| {
+            if workers == 2 {
+                scope.spawn(|| {
+                    run_chroma(cb, 1);
+                    run_chroma(cr, 2);
+                });
+            } else {
+                scope.spawn(|| run_chroma(cb, 1));
+                scope.spawn(|| run_chroma(cr, 2));
+            }
+            run_luma(luma);
+        });
     }
 }
 

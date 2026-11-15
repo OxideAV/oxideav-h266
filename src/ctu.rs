@@ -13417,6 +13417,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
             &no_filter_cols,
             &no_filter_rows,
             lf_region.as_ref(),
+            self.loop_filter_workers.max(1),
         );
         // SAO (§8.8.4) — runs after deblocking per §8.8.4.1. Per-CTB
         // SaoTypeIdx / SaoEoClass / SaoOffsetVal arrays come from
@@ -13438,6 +13439,7 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
                 .as_ref()
                 .map(|(c, r)| (c.as_slice(), r.as_slice())),
             lf_region.as_ref(),
+            self.loop_filter_workers.max(1),
         );
         // ALF (§8.8.5) — runs after SAO per §8.8.5.1. Gated on
         // `sh_alf_enabled_flag`. Per-CTB on/off + filter selection

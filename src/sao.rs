@@ -392,7 +392,7 @@ pub fn apply_sao_clipped(
     cfg: &SaoConfig,
     tile_bounds: Option<(&[u32], &[u32])>,
 ) {
-    apply_sao_regions(out, sao_pic, cfg, tile_bounds, None)
+    apply_sao_regions(out, sao_pic, cfg, tile_bounds, None, 1)
 }
 
 /// r456 — [`apply_sao_clipped`] with the CTB-granular slice /
@@ -404,6 +404,7 @@ pub(crate) fn apply_sao_regions(
     cfg: &SaoConfig,
     tile_bounds: Option<(&[u32], &[u32])>,
     region: Option<&crate::alf::LfRegionMap>,
+    workers: usize,
 ) {
     if sao_pic.is_all_not_applied() {
         return;
@@ -411,25 +412,6 @@ pub(crate) fn apply_sao_regions(
     if !cfg.luma_used && !cfg.chroma_used {
         return;
     }
-    // Stage pre-SAO copies of each plane that has anything to do. This
-    // mirrors `saoPicture` in eq. 1426 / 1429: reads come from the
-    // pre-SAO buffer, writes hit the live frame.
-    let luma_pre = if cfg.luma_used {
-        Some(out.luma.samples.clone())
-    } else {
-        None
-    };
-    let cb_pre = if cfg.chroma_used && cfg.chroma_format_idc != 0 {
-        Some(out.cb.samples.clone())
-    } else {
-        None
-    };
-    let cr_pre = if cfg.chroma_used && cfg.chroma_format_idc != 0 {
-        Some(out.cr.samples.clone())
-    } else {
-        None
-    };
-
     let (sub_w, sub_h) = cfg.chroma_subsampling();
     let ctb_size_y = 1u32 << cfg.ctb_log2_size_y;
     // r429 / r453 / r456 — the region containing each SAMPLE (tile
@@ -464,56 +446,66 @@ pub(crate) fn apply_sao_regions(
         (None, None)
     };
 
-    for ry in 0..sao_pic.pic_height_in_ctbs_y {
-        for rx in 0..sao_pic.pic_width_in_ctbs_y {
-            let p = sao_pic.get(rx, ry);
-            if cfg.luma_used && p.luma.sao_type_idx != SaoTypeIdx::NotApplied {
-                let pre = luma_pre.as_ref().unwrap();
-                apply_sao_ctb(
-                    &mut out.luma,
-                    pre,
-                    clip_y.clone(),
-                    rx,
-                    ry,
-                    ctb_size_y,
-                    ctb_size_y,
-                    cfg.bit_depth,
-                    &p.luma,
-                );
-            }
-            if cfg.chroma_used && cfg.chroma_format_idc != 0 {
-                let n_ctb_sw = ctb_size_y / sub_w;
-                let n_ctb_sh = ctb_size_y / sub_h;
-                if p.cb.sao_type_idx != SaoTypeIdx::NotApplied {
-                    let pre = cb_pre.as_ref().unwrap();
+    // One component: a pre-SAO copy of the plane (`saoPicture` reads
+    // in eqs. 1426 / 1429 come from it, writes hit the live plane),
+    // then every CTB that applies an offset.
+    let run_plane = |plane: &mut PicturePlane, c_idx: usize| {
+        let pre = plane.samples.clone();
+        let (n_ctb_sw, n_ctb_sh, clip) = if c_idx == 0 {
+            (ctb_size_y, ctb_size_y, &clip_y)
+        } else {
+            (ctb_size_y / sub_w, ctb_size_y / sub_h, &clip_c)
+        };
+        for ry in 0..sao_pic.pic_height_in_ctbs_y {
+            for rx in 0..sao_pic.pic_width_in_ctbs_y {
+                let p = sao_pic.get(rx, ry);
+                let ctb = match c_idx {
+                    0 => &p.luma,
+                    1 => &p.cb,
+                    _ => &p.cr,
+                };
+                if ctb.sao_type_idx != SaoTypeIdx::NotApplied {
                     apply_sao_ctb(
-                        &mut out.cb,
-                        pre,
-                        clip_c.clone(),
+                        plane,
+                        &pre,
+                        clip.clone(),
                         rx,
                         ry,
                         n_ctb_sw,
                         n_ctb_sh,
                         cfg.bit_depth,
-                        &p.cb,
-                    );
-                }
-                if p.cr.sao_type_idx != SaoTypeIdx::NotApplied {
-                    let pre = cr_pre.as_ref().unwrap();
-                    apply_sao_ctb(
-                        &mut out.cr,
-                        pre,
-                        clip_c.clone(),
-                        rx,
-                        ry,
-                        n_ctb_sw,
-                        n_ctb_sh,
-                        cfg.bit_depth,
-                        &p.cr,
+                        ctb,
                     );
                 }
             }
         }
+    };
+    // r490 — the components are independent: a granted worker budget
+    // filters them side by side (Cb and Cr share the one extra thread
+    // of a two-worker budget).
+    let chroma_on = cfg.chroma_used && cfg.chroma_format_idc != 0;
+    let (luma, cb, cr) = (&mut out.luma, &mut out.cb, &mut out.cr);
+    if workers < 2 || !chroma_on || !cfg.luma_used {
+        if cfg.luma_used {
+            run_plane(luma, 0);
+        }
+        if chroma_on {
+            run_plane(cb, 1);
+            run_plane(cr, 2);
+        }
+    } else {
+        std::thread::scope(|scope| {
+            if workers == 2 {
+                scope.spawn(|| {
+                    run_plane(cb, 1);
+                    run_plane(cr, 2);
+                });
+            } else {
+                scope.spawn(|| run_plane(cb, 1));
+                scope.spawn(|| run_plane(cr, 2));
+            }
+            run_plane(luma, 0);
+        });
     }
 }
 

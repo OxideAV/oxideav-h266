@@ -25,7 +25,7 @@ fn is_switch(name: &str) -> bool {
 }
 
 /// `true` when the process environment held any switch at first use.
-fn any_switch_set() -> bool {
+pub(crate) fn any_switch_set() -> bool {
     static ANY: OnceLock<bool> = OnceLock::new();
     *ANY.get_or_init(|| std::env::vars_os().any(|(k, _)| is_switch(&k.to_string_lossy())))
 }
