@@ -10936,7 +10936,6 @@ impl<'a, 'b> CtuWalker<'a, 'b> {
     /// plane and applies the chroma QP mapping (§8.7.3 — identity-plus-
     /// offset clamp here, matching the intra chroma path).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn add_inter_residual_plane(
         &self,
         c_idx: u32,
