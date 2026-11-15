@@ -13,6 +13,7 @@ All notable changes to this crate are recorded here.
 
 ### Fixed
 
+- r490 — PPS: `pps_slice_width_in_tiles_minus1`, `pps_slice_height_in_tiles_minus1` and `pps_exp_slice_height_in_ctus_minus1` are held to their §7.4.3.5 ranges as they are read; a value near 2^32 overflowed the slice-rectangle sum (a panic in overflow-checked builds, found by the `parse_annexb` fuzz target; the input is replayed by `tests/fuzz_regressions.rs`).
 - r490 — `vvcc`: the record builder looked for `sps_ptl_dpb_hrd_params_present_flag` one bit too far (the first bit of `general_profile_idc`) when it extracted the general constraint bytes, so `VvcDecoderConfigurationRecord::from_annex_b` refused every SPS that carries a `profile_tier_level()` with a profile below 64 (every Main 10 stream). Found by the video encoder's SPS, which is the first of this encoder to carry one.
 
 ### Changed

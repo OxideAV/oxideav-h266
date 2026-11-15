@@ -387,12 +387,32 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
                     // tile rectangle.
                     (num_tile_columns - tile_x, num_tile_rows - tile_y)
                 } else {
-                    let w = if !last_col { br.ue()? + 1 } else { 1 };
+                    // §7.4.3.5 — pps_slice_width_in_tiles_minus1 is in
+                    // 0..=NumTileColumns − 1 and
+                    // pps_slice_height_in_tiles_minus1 in
+                    // 0..=NumTileRows − 1: checked as read, before any
+                    // sum can leave the u32 range.
+                    let w = if !last_col {
+                        let v = br.ue()?;
+                        if v >= num_tile_columns {
+                            return Err(Error::invalid(format!(
+                                "h266 PPS: pps_slice_width_in_tiles_minus1 out of range ({v})"
+                            )));
+                        }
+                        v + 1
+                    } else {
+                        1
+                    };
                     // §7.4.3.5 — absent height infers 0 on the last
                     // tile row, else inherits the previous slice's
                     // value.
                     let h = if !last_row && (pps_tile_idx_delta_present_flag || tile_x == 0) {
                         let v = br.ue()?;
+                        if v >= num_tile_rows {
+                            return Err(Error::invalid(format!(
+                                "h266 PPS: pps_slice_height_in_tiles_minus1 out of range ({v})"
+                            )));
+                        }
                         prev_height_minus1 = v;
                         v + 1
                     } else if last_row {
@@ -425,7 +445,15 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
                     } else {
                         let mut remaining = row_h as i64;
                         for _ in 0..num_exp {
-                            let h = br.ue()? + 1;
+                            // pps_exp_slice_height_in_ctus_minus1 is
+                            // in 0..=RowHeightVal − 1.
+                            let v = br.ue()?;
+                            if v >= row_h {
+                                return Err(Error::invalid(format!(
+                                    "h266 PPS: pps_exp_slice_height_in_ctus_minus1 out of range ({v})"
+                                )));
+                            }
+                            let h = v + 1;
                             heights.push(h);
                             remaining -= h as i64;
                         }
