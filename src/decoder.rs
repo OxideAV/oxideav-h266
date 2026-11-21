@@ -257,7 +257,8 @@ impl H266Decoder {
     /// ISO/IEC 14496-15 `VvcDecoderConfigurationRecord`; `limits`
     /// caps the pictures the decoder will allocate.
     pub fn new(params: &CodecParameters) -> Result<Self> {
-        let opts: H266DecoderOptions = parse_options(&params.options)?;
+        let opts: H266DecoderOptions =
+            parse_options(&own_options::<H266DecoderOptions>(&params.options))?;
         let mut dec = Self {
             codec_id: CodecId::new(CODEC_ID_STR),
             inner: StreamDecoder::new(),
@@ -828,6 +829,25 @@ pub fn split_access_units(annex_b: &[u8]) -> Vec<&[u8]> {
         out.push(&annex_b[s..e]);
     }
     out
+}
+
+/// The options of `params` that belong to schema `T`.
+///
+/// A stream's parameter set also carries what its container recorded
+/// about the track (edit lists, bit-rate boxes, handler names, …) and
+/// may carry the options of the encoder that produced it; none of that
+/// configures this decoder, so only its own keys are parsed (a
+/// malformed value of one of them is still an error).
+fn own_options<T: oxideav_core::CodecOptionsStruct>(
+    options: &oxideav_core::CodecOptions,
+) -> oxideav_core::CodecOptions {
+    let mut own = oxideav_core::CodecOptions::default();
+    for (key, value) in options.iter() {
+        if T::SCHEMA.iter().any(|f| f.name == key) {
+            own.insert(key, value);
+        }
+    }
+    own
 }
 
 #[cfg(test)]
